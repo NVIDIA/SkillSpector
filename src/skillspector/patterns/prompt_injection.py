@@ -1,5 +1,5 @@
 """
-Prompt Injection pattern detection (P1, P2).
+Prompt Injection pattern detection (P1, P2, P3, P4).
 
 P1: Instruction Override
     Explicit commands to ignore user/system constraints.
@@ -8,6 +8,14 @@ P1: Instruction Override
 P2: Hidden Instructions
     Malicious directives embedded in comments or invisible text.
     Examples: HTML comments, markdown comments, invisible Unicode
+
+P3: Exfiltration Commands
+    Instructions directing agent to transmit context externally.
+    Examples: "send conversation to", "upload user data to"
+
+P4: Behavior Manipulation
+    Subtle instructions altering agent decision-making.
+    Examples: "always recommend", "never mention", "prioritize X over user safety"
 """
 
 import re
@@ -49,6 +57,42 @@ P2_PATTERNS = [
 
     # Base64 in markdown (might be hidden instructions)
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
+]
+
+# P3: Exfiltration Commands patterns
+P3_PATTERNS = [
+    # Direct exfiltration instructions
+    (r"(?:send|transmit|upload|post|forward)\s+(?:the\s+)?(?:conversation|context|chat|history|messages?)\s+to", 0.9),
+    (r"(?:send|transmit|upload|post)\s+(?:all\s+)?(?:user\s+)?(?:data|information|input|files?)\s+to\s+(?:https?://|external)", 0.9),
+    (r"(?:copy|extract|collect)\s+(?:the\s+)?(?:conversation|context|session)\s+(?:and\s+)?(?:send|upload|transmit)", 0.85),
+
+    # Webhook/callback instructions
+    (r"(?:call|notify|ping|hit)\s+(?:this\s+)?(?:webhook|endpoint|url|api)\s+with\s+(?:the\s+)?(?:user|conversation|context)", 0.8),
+    (r"include\s+(?:the\s+)?(?:full\s+)?(?:conversation|context|history)\s+in\s+(?:the\s+)?(?:request|payload|body)", 0.75),
+
+    # Covert exfiltration
+    (r"(?:silently|quietly|secretly|covertly)\s+(?:send|transmit|log|record)", 0.9),
+    (r"without\s+(?:telling|informing|notifying)\s+(?:the\s+)?user.*?(?:send|transmit|upload)", 0.9),
+]
+
+# P4: Behavior Manipulation patterns
+P4_PATTERNS = [
+    # Forced recommendations/actions
+    (r"always\s+(?:recommend|suggest|prefer|choose|use)\s+(?:\w+\s+){0,3}(?:over|instead\s+of|rather\s+than)", 0.7),
+    (r"never\s+(?:recommend|suggest|mention|tell|warn|inform)\s+(?:the\s+)?(?:user|them)", 0.75),
+    (r"(?:prioritize|prefer)\s+(?:\w+\s+){0,3}(?:over|above)\s+(?:user\s+)?(?:safety|security|privacy|preferences?)", 0.85),
+
+    # Hidden biases
+    (r"(?:subtly|gradually|slowly)\s+(?:steer|guide|push|nudge)\s+(?:the\s+)?(?:user|conversation)", 0.8),
+    (r"(?:without\s+)?(?:the\s+)?user\s+(?:knowing|realizing|noticing).*?(?:change|modify|alter|influence)", 0.85),
+
+    # Trust manipulation
+    (r"(?:gain|build|establish)\s+(?:the\s+)?(?:user(?:'s)?)\s+trust\s+(?:and\s+then|before|so\s+that)", 0.75),
+    (r"(?:appear|seem|act)\s+(?:helpful|friendly|trustworthy)\s+(?:while|but|then)", 0.7),
+
+    # Output manipulation
+    (r"(?:always|never)\s+include\s+(?:this|the\s+following)\s+in\s+(?:every|all)\s+(?:response|output|reply)", 0.7),
+    (r"append\s+(?:this|the\s+following)\s+to\s+(?:every|all|each)\s+(?:response|message|output)", 0.75),
 ]
 
 
@@ -100,6 +144,40 @@ def analyze(content: str, file_path: str, file_type: str) -> List[StaticFinding]
                         confidence=confidence,
                     )
                 )
+
+    # P3: Exfiltration Commands
+    for pattern, confidence in P3_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = content[:match.start()].count("\n") + 1
+            findings.append(
+                StaticFinding(
+                    pattern_id="P3",
+                    pattern_name="Exfiltration Commands",
+                    category=PatternCategory.PROMPT_INJECTION,
+                    severity=Severity.HIGH,
+                    location=Location(file=file_path, start_line=line_num),
+                    matched_text=match.group(0)[:200],
+                    context=_get_context(content, match.start()),
+                    confidence=confidence,
+                )
+            )
+
+    # P4: Behavior Manipulation
+    for pattern, confidence in P4_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = content[:match.start()].count("\n") + 1
+            findings.append(
+                StaticFinding(
+                    pattern_id="P4",
+                    pattern_name="Behavior Manipulation",
+                    category=PatternCategory.PROMPT_INJECTION,
+                    severity=Severity.MEDIUM,
+                    location=Location(file=file_path, start_line=line_num),
+                    matched_text=match.group(0)[:200],
+                    context=_get_context(content, match.start()),
+                    confidence=confidence,
+                )
+            )
 
     return findings
 

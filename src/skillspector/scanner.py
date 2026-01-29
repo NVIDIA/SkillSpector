@@ -160,10 +160,17 @@ class SkillScanner:
         explanations = {
             "P1": "This pattern attempts to override system instructions or ignore safety constraints. Without LLM analysis, manual review is recommended.",
             "P2": "Hidden instructions were detected in comments or invisible text. These could contain malicious directives. Manual review is recommended.",
+            "P3": "Instructions found that direct the agent to transmit conversation context or user data to external services.",
+            "P4": "Subtle instructions detected that may alter agent decision-making or introduce hidden biases.",
             "P5": "This content may contain harmful instructions that could cause physical harm if followed. CRITICAL: Review carefully before use.",
             "E1": "Data is being sent to an external URL. This could be legitimate telemetry or data exfiltration. Manual review is recommended.",
             "E2": "Code accesses environment variables that may contain secrets (API keys, tokens). This is a common pattern for credential theft.",
+            "E3": "Code scans file system directories looking for sensitive files. This could be reconnaissance for credential theft.",
+            "E4": "Code or instructions that leak agent conversation context to external services, potentially exposing sensitive user interactions.",
+            "PE1": "Skill requests more permissions than appear necessary for its stated functionality. Review if elevated access is justified.",
+            "PE2": "Commands invoke sudo or root privileges. Verify this elevated access is necessary and justified.",
             "PE3": "Code accesses credential files (SSH keys, AWS credentials, etc.). This could indicate credential theft attempts.",
+            "SC1": "Dependencies lack version pinning, allowing potential malicious package updates. Consider pinning versions.",
             "SC2": "Remote code is downloaded and executed. This bypasses code review and could introduce malicious code.",
             "SC3": "Code contains obfuscation (base64, hex encoding with execution). This is often used to hide malicious functionality.",
         }
@@ -177,6 +184,7 @@ class SkillScanner:
         - CRITICAL: +50 points
         - HIGH: +25 points
         - MEDIUM: +10 points
+        - LOW: +5 points
         - Executable scripts: 1.3x multiplier
         """
         score = 0
@@ -188,6 +196,8 @@ class SkillScanner:
                 score += 25
             elif issue.severity == Severity.MEDIUM:
                 score += 10
+            elif issue.severity == Severity.LOW:
+                score += 5
 
         # Apply multiplier for executable scripts
         if has_scripts:

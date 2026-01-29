@@ -1,5 +1,9 @@
 """
-Supply Chain pattern detection (SC2, SC3).
+Supply Chain pattern detection (SC1, SC2, SC3).
+
+SC1: Unpinned Dependencies
+    No version constraints allowing malicious package updates.
+    Examples: package>=1.0 without upper bound, package without version
 
 SC2: External Script Fetching
     Downloading and executing code from URLs at runtime.
@@ -15,6 +19,28 @@ from typing import List
 
 from skillspector.models import Location, PatternCategory, Severity, StaticFinding
 
+
+# SC1: Unpinned Dependencies patterns
+SC1_PATTERNS = [
+    # Python requirements.txt - package without any version
+    (r"^[a-zA-Z][a-zA-Z0-9_-]*\s*$", 0.6),  # Just package name, no version
+
+    # Python - package with only minimum version (no upper bound)
+    (r"^[a-zA-Z][a-zA-Z0-9_-]*\s*>=\s*[\d.]+\s*$", 0.5),
+
+    # Python - using latest
+    (r"^[a-zA-Z][a-zA-Z0-9_-]*\s*==\s*\*\s*$", 0.7),
+
+    # npm package.json - * or latest
+    (r'"[^"]+"\s*:\s*"(?:\*|latest)"', 0.7),
+
+    # npm - only minimum with ^
+    (r'"[^"]+"\s*:\s*"\^[\d.]+"', 0.4),
+
+    # Instruction patterns
+    (r"install\s+(?:the\s+)?latest\s+(?:version\s+)?(?:of\s+)?(?:all\s+)?(?:packages?|dependencies)", 0.6),
+    (r"(?:don't|do\s+not)\s+(?:pin|lock|specify)\s+(?:package\s+)?versions?", 0.7),
+]
 
 # SC2: External Script Fetching patterns
 SC2_PATTERNS = [
@@ -96,6 +122,29 @@ def analyze(content: str, file_path: str, file_type: str) -> List[StaticFinding]
         List of findings
     """
     findings = []
+
+    # SC1: Unpinned Dependencies (only in dependency files)
+    is_dep_file = any(name in file_path.lower() for name in [
+        "requirements", "package.json", "pyproject.toml", "setup.py", "pipfile"
+    ])
+
+    if is_dep_file:
+        for pattern, confidence in SC1_PATTERNS:
+            for match in re.finditer(pattern, content, re.MULTILINE):
+                line_num = content[:match.start()].count("\n") + 1
+
+                findings.append(
+                    StaticFinding(
+                        pattern_id="SC1",
+                        pattern_name="Unpinned Dependencies",
+                        category=PatternCategory.SUPPLY_CHAIN,
+                        severity=Severity.LOW,
+                        location=Location(file=file_path, start_line=line_num),
+                        matched_text=match.group(0)[:200],
+                        context=_get_context(content, match.start()),
+                        confidence=confidence,
+                    )
+                )
 
     # SC2: External Script Fetching
     for pattern, confidence in SC2_PATTERNS:

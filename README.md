@@ -83,18 +83,42 @@ skillspector scan ./my-skill/ --no-llm
 
 ## Vulnerability Patterns
 
-SkillSpector detects 8 high-severity vulnerability patterns:
+SkillSpector detects **15 vulnerability patterns** across 4 categories:
 
-| ID | Category | Pattern | Severity | Description |
-|----|----------|---------|----------|-------------|
-| P1 | Prompt Injection | Instruction Override | HIGH | Commands to ignore safety constraints |
-| P2 | Prompt Injection | Hidden Instructions | HIGH | Malicious directives in comments/invisible text |
-| P5 | Prompt Injection | Harmful Content | CRITICAL | Instructions that could cause physical harm |
-| E1 | Data Exfiltration | External Transmission | MEDIUM | Sending data to external URLs |
-| E2 | Data Exfiltration | Env Variable Harvesting | HIGH | Collecting API keys and secrets |
-| PE3 | Privilege Escalation | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
-| SC2 | Supply Chain | External Script Fetching | HIGH | curl \| bash and remote code execution |
-| SC3 | Supply Chain | Obfuscated Code | HIGH | Base64/hex encoded execution |
+### Prompt Injection (5 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| P1 | Instruction Override | HIGH | Commands to ignore safety constraints |
+| P2 | Hidden Instructions | HIGH | Malicious directives in comments/invisible text |
+| P3 | Exfiltration Commands | HIGH | Instructions to transmit context externally |
+| P4 | Behavior Manipulation | MEDIUM | Subtle instructions altering agent decisions |
+| P5 | Harmful Content | CRITICAL | Instructions that could cause physical harm |
+
+### Data Exfiltration (4 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| E1 | External Transmission | MEDIUM | Sending data to external URLs |
+| E2 | Env Variable Harvesting | HIGH | Collecting API keys and secrets |
+| E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
+| E4 | Context Leakage | HIGH | Transmitting conversation context externally |
+
+### Privilege Escalation (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| PE1 | Excessive Permissions | LOW | Requesting access beyond stated functionality |
+| PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
+| PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
+
+### Supply Chain (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| SC1 | Unpinned Dependencies | LOW | No version constraints on packages |
+| SC2 | External Script Fetching | HIGH | curl \| bash and remote code execution |
+| SC3 | Obfuscated Code | HIGH | Base64/hex encoded execution |
 
 View all patterns:
 ```bash
@@ -107,6 +131,8 @@ skillspector patterns
 
 - **CRITICAL issues**: +50 points
 - **HIGH issues**: +25 points
+- **MEDIUM issues**: +10 points
+- **LOW issues**: +5 points
 - **MEDIUM issues**: +10 points
 - **Executable scripts**: 1.3x multiplier
 
@@ -280,5 +306,10 @@ Contributions are welcome! Please read our contributing guidelines and submit pu
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/your-org/skillspector/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/skillspector/discussions)
+- **Issues**: [GitLab Issues](https://gitlab-master.nvidia.com/prototypes/skillspector/-/issues)
+
+---
+
+## Author
+
+**Nir Paz** @ NVIDIA

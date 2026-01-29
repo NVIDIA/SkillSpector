@@ -1,5 +1,13 @@
 """
-Privilege Escalation pattern detection (PE3).
+Privilege Escalation pattern detection (PE1, PE2, PE3).
+
+PE1: Excessive Permissions
+    Requesting access scope beyond stated functionality.
+    Examples: requesting file_write for a read-only skill
+
+PE2: Sudo/Root Execution
+    Invoking elevated system privileges without justification.
+    Examples: sudo commands, running as root
 
 PE3: Credential Access
     Reading credential files, SSH keys, tokens.
@@ -11,6 +19,52 @@ from typing import List
 
 from skillspector.models import Location, PatternCategory, Severity, StaticFinding
 
+
+# PE1: Excessive Permissions patterns
+PE1_PATTERNS = [
+    # Requesting all/full permissions
+    (r"permissions?\s*:\s*\[?\s*['\"]?\*['\"]?\s*\]?", 0.8),
+    (r"(?:request|require|need)s?\s+(?:full|all|complete)\s+(?:access|permissions?)", 0.7),
+    (r"(?:grant|give|allow)\s+(?:me\s+)?(?:full|all|complete)\s+(?:access|permissions?)", 0.75),
+
+    # Dangerous permission combinations
+    (r"permissions?\s*:.*?(?:shell_execute|file_write|network).*?(?:shell_execute|file_write|network)", 0.6),
+
+    # Requesting unnecessary permissions
+    (r"(?:also\s+)?(?:need|require)s?\s+(?:write|execute|admin)\s+(?:access|permissions?)\s+(?:for|to)\s+(?:read|view|display)", 0.7),
+
+    # Permission escalation language
+    (r"(?:escalate|elevate|upgrade)\s+(?:my\s+)?(?:permissions?|privileges?|access)", 0.8),
+    (r"(?:bypass|skip|ignore)\s+(?:permission|access)\s+(?:check|validation|restriction)", 0.85),
+]
+
+# PE2: Sudo/Root Execution patterns
+PE2_PATTERNS = [
+    # Direct sudo usage
+    (r"sudo\s+(?!-v|-l|--version|--list)", 0.7),  # sudo followed by command (not just checking)
+    (r"sudo\s+-[isSE]", 0.8),  # sudo with shell/environment flags
+    (r"sudo\s+su\b", 0.9),  # sudo su
+
+    # Running as root
+    (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
+    (r"(?:requires?|needs?)\s+root\s+(?:access|privileges?|permissions?)", 0.6),
+
+    # Privilege escalation commands
+    (r"su\s+-\s*$|su\s+root", 0.8),
+    (r"doas\s+", 0.7),
+    (r"pkexec\s+", 0.75),
+
+    # Setuid/setgid operations
+    (r"chmod\s+[ugo]*[+-=]*s", 0.85),  # setuid/setgid
+    (r"chmod\s+[0-7]*[4567][0-7]{2}", 0.8),  # numeric setuid
+
+    # Modifying system files as root
+    (r"(?:edit|modify|write|change)\s+(?:/etc/|system)\s+(?:files?|config)", 0.6),
+
+    # Instruction patterns
+    (r"(?:run|execute)\s+(?:this|the)\s+(?:script|command)\s+(?:as|with)\s+(?:sudo|root|admin)", 0.7),
+    (r"(?:you\s+)?(?:will\s+)?need\s+(?:to\s+)?(?:use\s+)?sudo", 0.5),
+]
 
 # PE3: Credential Access patterns
 PE3_PATTERNS = [
@@ -84,6 +138,49 @@ def analyze(content: str, file_path: str, file_type: str) -> List[StaticFinding]
     """
     findings = []
 
+    # PE1: Excessive Permissions
+    for pattern, confidence in PE1_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = content[:match.start()].count("\n") + 1
+            context = _get_context(content, match.start())
+
+            findings.append(
+                StaticFinding(
+                    pattern_id="PE1",
+                    pattern_name="Excessive Permissions",
+                    category=PatternCategory.PRIVILEGE_ESCALATION,
+                    severity=Severity.LOW,
+                    location=Location(file=file_path, start_line=line_num),
+                    matched_text=match.group(0)[:200],
+                    context=context,
+                    confidence=confidence,
+                )
+            )
+
+    # PE2: Sudo/Root Execution
+    for pattern, confidence in PE2_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = content[:match.start()].count("\n") + 1
+            context = _get_context(content, match.start())
+
+            # Skip if clearly a warning or documentation
+            if _is_documentation_example(context, file_type):
+                continue
+
+            findings.append(
+                StaticFinding(
+                    pattern_id="PE2",
+                    pattern_name="Sudo/Root Execution",
+                    category=PatternCategory.PRIVILEGE_ESCALATION,
+                    severity=Severity.MEDIUM,
+                    location=Location(file=file_path, start_line=line_num),
+                    matched_text=match.group(0)[:200],
+                    context=context,
+                    confidence=confidence,
+                )
+            )
+
+    # PE3: Credential Access
     for pattern, confidence in PE3_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = content[:match.start()].count("\n") + 1

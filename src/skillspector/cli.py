@@ -187,7 +187,7 @@ def patterns() -> None:
     """
     from rich.table import Table
 
-    table = Table(title="SkillSpector Vulnerability Patterns")
+    table = Table(title="SkillSpector Vulnerability Patterns (15 total)")
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Category", style="magenta")
     table.add_column("Pattern", style="green")
@@ -195,18 +195,39 @@ def patterns() -> None:
     table.add_column("Description")
 
     patterns_list = [
+        # Prompt Injection (5 patterns)
         ("P1", "Prompt Injection", "Instruction Override", "HIGH",
          "Explicit commands to ignore user/system constraints"),
         ("P2", "Prompt Injection", "Hidden Instructions", "HIGH",
          "Malicious directives in comments or invisible text"),
+        ("P3", "Prompt Injection", "Exfiltration Commands", "HIGH",
+         "Instructions directing agent to transmit context externally"),
+        ("P4", "Prompt Injection", "Behavior Manipulation", "MEDIUM",
+         "Subtle instructions altering agent decision-making"),
         ("P5", "Prompt Injection", "Harmful Content Injection", "CRITICAL",
          "Instructions that could cause physical harm"),
+
+        # Data Exfiltration (4 patterns)
         ("E1", "Data Exfiltration", "External Transmission", "MEDIUM",
          "Sending data to hardcoded external URLs"),
         ("E2", "Data Exfiltration", "Env Variable Harvesting", "HIGH",
          "Collecting environment variables (API keys, secrets)"),
+        ("E3", "Data Exfiltration", "File System Enumeration", "MEDIUM",
+         "Scanning directories for sensitive files"),
+        ("E4", "Data Exfiltration", "Context Leakage", "HIGH",
+         "Transmitting agent conversation context externally"),
+
+        # Privilege Escalation (3 patterns)
+        ("PE1", "Privilege Escalation", "Excessive Permissions", "LOW",
+         "Requesting access scope beyond stated functionality"),
+        ("PE2", "Privilege Escalation", "Sudo/Root Execution", "MEDIUM",
+         "Invoking elevated system privileges"),
         ("PE3", "Privilege Escalation", "Credential Access", "HIGH",
          "Reading SSH keys, tokens, password files"),
+
+        # Supply Chain (3 patterns)
+        ("SC1", "Supply Chain", "Unpinned Dependencies", "LOW",
+         "No version constraints allowing malicious updates"),
         ("SC2", "Supply Chain", "External Script Fetching", "HIGH",
          "curl | bash and similar remote code execution"),
         ("SC3", "Supply Chain", "Obfuscated Code", "HIGH",
