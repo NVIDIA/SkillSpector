@@ -232,7 +232,85 @@ def scan(
                 "version": __version__,
             },
         }
-        result = graph.invoke(state, config=trace_config)
+        if verbose:
+            result = graph.invoke(state, config=trace_config)
+        else:
+            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+            from skillspector.nodes.analyzers import ANALYZER_NODE_IDS
+            import warnings
+
+            # Suppress noisy Pydantic serialization warnings during structured LLM output
+            warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+
+            total_steps = 4 + len(ANALYZER_NODE_IDS)
+            result = dict(state)
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                task_id = progress.add_task("Resolving input...", total=total_steps)
+                
+                num_files = 0
+                analyzers_done = 0
+                total_analyzers = len(ANALYZER_NODE_IDS)
+
+                for update in graph.stream(state, config=trace_config, stream_mode="updates"):
+                    for node_name, node_output in update.items():
+                        progress.advance(task_id)
+                        
+                        # Accumulate scalar outputs needed by the CLI (report_body, risk_score, temp_dir, sarif_report)
+                        if "temp_dir_for_cleanup" in node_output:
+                            result["temp_dir_for_cleanup"] = node_output["temp_dir_for_cleanup"]
+                        if "report_body" in node_output:
+                            result["report_body"] = node_output["report_body"]
+                        if "sarif_report" in node_output:
+                            result["sarif_report"] = node_output["sarif_report"]
+                        if "risk_score" in node_output:
+                            result["risk_score"] = node_output["risk_score"]
+
+                        # Update UI text based on graph progression
+                        if node_name == "resolve_input":
+                            progress.update(task_id, description="Building context...")
+                        elif node_name == "build_context":
+                            components = node_output.get("components", [])
+                            num_files = len(components)
+                            progress.update(task_id, description=f"Analyzing {num_files} files (0/{total_analyzers} rules applied)...")
+                            
+                            # Print a proper report of the files and directories being scanned
+                            from rich.tree import Tree
+                            from pathlib import Path
+                            
+                            tree = Tree("[bold blue]Discovered Files to Scan[/bold blue]")
+                            nodes = {"": tree}
+                            for path in sorted(components):
+                                parts = Path(path).parts
+                                current = ""
+                                for part in parts:
+                                    parent = current
+                                    current = f"{current}/{part}" if current else part
+                                    if current not in nodes:
+                                        is_file = current == path
+                                        icon = "📄 " if is_file else "📁 "
+                                        style = "green" if is_file else "cyan"
+                                        nodes[current] = nodes[parent].add(f"[{style}]{icon}{part}[/{style}]")
+                            
+                            console.print(tree)
+                            console.print()
+                            
+                        elif node_name in ANALYZER_NODE_IDS:
+                            analyzers_done += 1
+                            progress.update(task_id, description=f"Analyzing {num_files} files ({analyzers_done}/{total_analyzers} rules applied)...")
+                            # Print which rule just finished above the progress bar
+                            console.print(f"[dim]✔ Rule completed: {node_name}[/dim]")
+                        elif node_name == "meta_analyzer":
+                            progress.update(task_id, description="Generating report...")
+                            console.print("[dim]✔ Rule completed: meta_analyzer (filtering findings)[/dim]")
 
         _write_result(result, output, format)
 
