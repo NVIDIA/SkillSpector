@@ -254,6 +254,7 @@ def scan(
             result = graph.invoke(state, config=trace_config)
         else:
             from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+            from rich.console import Console
             from skillspector.nodes.analyzers import ANALYZER_NODE_IDS
             import warnings
 
@@ -263,13 +264,16 @@ def scan(
             total_steps = 4 + len(ANALYZER_NODE_IDS)
             result = dict(state)
 
+            # Use stderr for progress so stdout remains clean for structured outputs
+            err_console = Console(stderr=True)
+
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
                 TimeElapsedColumn(),
-                console=console,
+                console=err_console,
                 transient=True,
             ) as progress:
                 task_id = progress.add_task("Resolving input...", total=total_steps)
@@ -318,17 +322,17 @@ def scan(
                                         style = "green" if is_file else "cyan"
                                         nodes[current] = nodes[parent].add(f"[{style}]{icon}{part}[/{style}]")
 
-                            console.print(tree)
-                            console.print()
+                            err_console.print(tree)
+                            err_console.print()
 
                         elif node_name in ANALYZER_NODE_IDS:
                             analyzers_done += 1
                             progress.update(task_id, description=f"Analyzing {num_files} files ({analyzers_done}/{total_analyzers} rules applied)...")
                             # Print which rule just finished above the progress bar
-                            console.print(f"[dim]✔ Rule completed: {node_name}[/dim]")
+                            err_console.print(f"[dim]✔ Rule completed: {node_name}[/dim]")
                         elif node_name == "meta_analyzer":
                             progress.update(task_id, description="Generating report...")
-                            console.print("[dim]✔ Rule completed: meta_analyzer (filtering findings)[/dim]")
+                            err_console.print("[dim]✔ Rule completed: meta_analyzer (filtering findings)[/dim]")
 
         _write_result(result, output, format)
 
