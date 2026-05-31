@@ -107,3 +107,6 @@ credentials.json
 
 # LangGraph API server
 .langgraph_api/
+
+# Reports
+report*
