@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -35,6 +36,8 @@ from typing import Annotated, cast
 import typer
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.tree import Tree
 
 from skillspector import __version__, transitive
 from skillspector.cleanup import cleanup_result
@@ -54,7 +57,7 @@ from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
-from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
 from skillspector.semantic_runtime import (
@@ -1283,6 +1286,7 @@ def _run_graph_scan(
     transitive_traversal: _TransitiveTraversalState | None = None,
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
+    stream_progress: bool = False,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1298,7 +1302,98 @@ def _run_graph_scan(
     if initial_inspection_ledger:
         state["inspection_ledger"] = initial_inspection_ledger
     trace_config = _build_trace_config(input_path, format, no_llm)
-    return cast(dict[str, object], graph.invoke(state, config=trace_config))
+    if not stream_progress:
+        return cast(dict[str, object], graph.invoke(state, config=trace_config))
+
+    total_analyzers = len(ANALYZER_NODE_IDS)
+    total_steps = 5 + total_analyzers
+    result = dict(state)
+
+    with (
+        warnings.catch_warnings(),
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=err_console,
+            transient=True,
+        ) as progress,
+    ):
+        warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+        task_id = progress.add_task("Resolving input...", total=total_steps)
+        num_files = 0
+        analyzers_done = 0
+
+        stream = graph.stream(
+            state,
+            config=trace_config,
+            stream_mode=["updates", "values"],
+        )
+        for stream_mode, chunk in stream:
+            if stream_mode == "values":
+                if isinstance(chunk, dict):
+                    result = dict(chunk)
+                continue
+            if stream_mode != "updates" or not isinstance(chunk, dict):
+                continue
+
+            for node_name, node_output in chunk.items():
+                progress.advance(task_id)
+                if not isinstance(node_output, dict):
+                    continue
+
+                if node_name == "resolve_input":
+                    progress.update(task_id, description="Building context...")
+                elif node_name == "build_context":
+                    raw_components = node_output.get("components")
+                    components = raw_components if isinstance(raw_components, list) else []
+                    paths = sorted(str(path) for path in components)
+                    num_files = len(paths)
+                    progress.update(
+                        task_id,
+                        description=(
+                            f"Analyzing {num_files} files "
+                            f"(0/{total_analyzers} rules applied)..."
+                        ),
+                    )
+
+                    tree = Tree("[bold blue]Discovered Files to Scan[/bold blue]")
+                    nodes = {"": tree}
+                    for path in paths:
+                        parts = Path(path).parts
+                        current = ""
+                        for part in parts:
+                            parent = current
+                            current = f"{current}/{part}" if current else part
+                            if current not in nodes:
+                                is_file = current == path
+                                icon = "📄 " if is_file else "📁 "
+                                style = "green" if is_file else "cyan"
+                                nodes[current] = nodes[parent].add(
+                                    f"[{style}]{icon}{part}[/{style}]"
+                                )
+
+                    err_console.print(tree)
+                    err_console.print()
+                elif node_name in ANALYZER_NODE_IDS:
+                    analyzers_done += 1
+                    progress.update(
+                        task_id,
+                        description=(
+                            f"Analyzing {num_files} files "
+                            f"({analyzers_done}/{total_analyzers} rules applied)..."
+                        ),
+                    )
+                    err_console.print(f"[dim]✔ Rule completed: {node_name}[/dim]")
+                elif node_name == "meta_analyzer":
+                    progress.update(task_id, description="Generating report...")
+                    err_console.print(
+                        "[dim]✔ Rule completed: meta_analyzer (filtering findings)[/dim]"
+                    )
+
+    return result
 
 
 def _run_graph_scan_for_source(
@@ -1311,6 +1406,7 @@ def _run_graph_scan_for_source(
     transitive_traversal: _TransitiveTraversalState | None = None,
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
+    stream_progress: bool = False,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
     if initial_inspection_ledger is not None:
@@ -1325,6 +1421,7 @@ def _run_graph_scan_for_source(
                 transitive_traversal=transitive_traversal,
                 initial_inspection_ledger=initial_inspection_ledger,
                 source_local_only=True,
+                stream_progress=stream_progress,
             )
         return _run_graph_scan(
             input_path=input_path,
@@ -1335,6 +1432,7 @@ def _run_graph_scan_for_source(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             initial_inspection_ledger=initial_inspection_ledger,
+            stream_progress=stream_progress,
         )
     if source_local_only:
         return _run_graph_scan(
@@ -1346,6 +1444,7 @@ def _run_graph_scan_for_source(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             source_local_only=True,
+            stream_progress=stream_progress,
         )
     return _run_graph_scan(
         input_path=input_path,
@@ -1355,6 +1454,7 @@ def _run_graph_scan_for_source(
         baseline=baseline,
         show_suppressed=show_suppressed,
         transitive_traversal=transitive_traversal,
+        stream_progress=stream_progress,
     )
 
 
@@ -2020,6 +2120,7 @@ def _scan_skill(
             transitive_traversal=transitive_traversal,
             initial_inspection_ledger=pre_scan_ledger_events,
             source_local_only=source_local_only,
+            stream_progress=not verbose,
         )
     else:
         result = _run_graph_scan_for_source(
@@ -2031,6 +2132,7 @@ def _scan_skill(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             source_local_only=source_local_only,
+            stream_progress=not verbose,
         )
     if not transitive_enabled:
         return result
