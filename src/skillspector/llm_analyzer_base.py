@@ -38,6 +38,7 @@ from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
+from skillspector.structured_output import build_structured_llm
 
 logger = get_logger(__name__)
 
@@ -242,7 +243,9 @@ class LLMAnalyzerBase:
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
         self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
+            build_structured_llm(self._llm, self.response_schema)
+            if self.response_schema
+            else None
         )
 
     # -- Batching -----------------------------------------------------------
