@@ -49,6 +49,10 @@ def _select_active_provider() -> ModelMetadataProvider:
         from .anthropic import AnthropicProvider
 
         return AnthropicProvider()
+    if name == "vertexai":
+        from .vertexai import VertexAIProvider
+
+        return VertexAIProvider()
     if name == "nv_build":
         return NvBuildProvider()
     if name in ("nv_inference", ""):
@@ -63,7 +67,7 @@ def _select_active_provider() -> ModelMetadataProvider:
 
     raise ValueError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
-        "Expected one of: openai, anthropic, nv_build (or unset)."
+        "Expected one of: openai, anthropic, vertexai, nv_build (or unset)."
     )
 
 

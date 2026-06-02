@@ -109,6 +109,14 @@ export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
 skillspector scan ./my-skill/
 
+# VertexAI (Google Cloud)
+export SKILLSPECTOR_PROVIDER=vertexai
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+export GOOGLE_CLOUD_PROJECT=your-project-id
+export GOOGLE_CLOUD_LOCATION=us-central1
+export SKILLSPECTOR_MODEL=gemini-2.5-pro
+skillspector scan ./my-skill/
+
 # Local Ollama or any OpenAI-compatible endpoint
 export SKILLSPECTOR_PROVIDER=openai
 export OPENAI_API_KEY=ollama
