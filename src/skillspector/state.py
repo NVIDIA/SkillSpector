@@ -73,6 +73,9 @@ class SkillspectorState(TypedDict, total=False):
     # Additional YARA rules directory (user-specified via --yara-rules-dir)
     yara_rules_dir: str | None
 
+    # Glob patterns (relative to scan root) to exclude from scanning (--exclude)
+    exclude_patterns: list[str]
+
 
 class AnalyzerNodeResponse(TypedDict):
     """Strict analyzer update payload for graph state."""

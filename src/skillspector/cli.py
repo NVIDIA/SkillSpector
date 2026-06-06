@@ -91,6 +91,7 @@ def _scan_state(
     format: FormatChoice,
     no_llm: bool,
     yara_rules_dir: str | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -100,6 +101,8 @@ def _scan_state(
     }
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
+    if exclude_patterns:
+        state["exclude_patterns"] = list(exclude_patterns)
     return state
 
 
@@ -171,6 +174,13 @@ def scan(
             help="Directory containing additional YARA rule files (.yar/.yara) to load alongside built-in rules.",
         ),
     ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude",
+            help="Glob pattern (relative to scan root) to exclude from the scan. Repeatable.",
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -208,7 +218,13 @@ def scan(
     result = None
     try:
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(input_path, format, no_llm, yara_rules_dir=yara_dir)
+        state = _scan_state(
+            input_path,
+            format,
+            no_llm,
+            yara_rules_dir=yara_dir,
+            exclude_patterns=exclude,
+        )
         if verbose:
             set_level("DEBUG")
             console.print("[dim]Running scan...[/dim]")
