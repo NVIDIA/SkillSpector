@@ -28,11 +28,13 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
@@ -44,6 +46,83 @@ logger = get_logger(__name__)
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
+
+# Concurrency / rate-limit handling for hosted providers (e.g. NVIDIA build
+# tier) that 429 under bursty parallelism. Override via env without code edits.
+DEFAULT_MAX_CONCURRENCY = int(os.environ.get("SKILLSPECTOR_MAX_CONCURRENCY", "2"))
+_RATE_LIMIT_MAX_RETRIES = int(os.environ.get("SKILLSPECTOR_RATELIMIT_RETRIES", "5"))
+_RATE_LIMIT_BASE_DELAY = float(os.environ.get("SKILLSPECTOR_RATELIMIT_BASE_DELAY", "2.0"))
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Heuristically detect a 429 / rate-limit error across SDKs."""
+    if getattr(exc, "status_code", None) == 429 or getattr(exc, "status", None) == 429:
+        return True
+    name = type(exc).__name__
+    text = str(exc)
+    return "RateLimit" in name or "429" in text or "Too Many Requests" in text
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Detect a transient request-timeout error across SDKs."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    return "Timeout" in name or "timed out" in text or "timeout" in text
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Transient errors worth retrying: rate limits and timeouts.
+
+    Deliberately excludes 4xx like context-overflow (400) — retrying those is
+    futile; the caller skips that batch instead.
+    """
+    return _is_rate_limit_error(exc) or _is_timeout_error(exc)
+
+
+async def _ainvoke_with_retry(coro_factory, label: str):
+    """Await ``coro_factory()``; on rate-limit errors retry with exponential backoff.
+
+    ``coro_factory`` must return a *fresh* awaitable each call (coroutines are
+    single-use). Non-rate-limit errors propagate immediately.
+    """
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return await coro_factory()
+        except Exception as exc:  # noqa: BLE001 - re-raised below unless rate limit
+            if not _is_retryable_error(exc) or attempt == _RATE_LIMIT_MAX_RETRIES:
+                raise
+            delay = _RATE_LIMIT_BASE_DELAY * (2**attempt)
+            logger.warning(
+                "Rate limited on %s (attempt %d/%d); backing off %.1fs",
+                label,
+                attempt + 1,
+                _RATE_LIMIT_MAX_RETRIES,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+
+def _invoke_with_retry(call_factory, label: str):
+    """Synchronous twin of :func:`_ainvoke_with_retry`.
+
+    ``call_factory`` must perform a *fresh* invocation each call and return its
+    result. Non-rate-limit errors propagate immediately.
+    """
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return call_factory()
+        except Exception as exc:  # noqa: BLE001 - re-raised below unless rate limit
+            if not _is_retryable_error(exc) or attempt == _RATE_LIMIT_MAX_RETRIES:
+                raise
+            delay = _RATE_LIMIT_BASE_DELAY * (2**attempt)
+            logger.warning(
+                "Rate limited on %s (attempt %d/%d); backing off %.1fs",
+                label,
+                attempt + 1,
+                _RATE_LIMIT_MAX_RETRIES,
+                delay,
+            )
+            time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -61,11 +140,24 @@ class LLMFinding(BaseModel):
     rule_id: str = Field(description="Identifier for the type of finding")
     message: str = Field(description="Short description of the finding")
     severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(description="Severity level")
-    start_line: int = Field(ge=1, description="Starting line number")
+    # NOTE: numeric range constraints (ge/le) are intentionally expressed in the
+    # description rather than as Field bounds. Pydantic bounds emit JSON-schema
+    # minimum/maximum, which some structured-output endpoints (e.g. Anthropic's
+    # OpenAI-compatible tool schema) reject. Consuming code clamps/guards values.
+    start_line: int = Field(description="Starting line number (>= 1)")
     end_line: int | None = Field(default=None, description="Ending line number (optional)")
-    confidence: float = Field(ge=0.0, le=1.0, default=0.5, description="Confidence score")
+    confidence: float = Field(default=0.5, description="Confidence score between 0.0 and 1.0")
     explanation: str = Field(default="", description="Why this is a finding (2-3 sentences)")
     remediation: str = Field(default="", description="Actionable steps to fix the issue")
+
+    @field_validator("confidence")
+    @classmethod
+    def _check_confidence(cls, v: float) -> float:
+        # Runtime bound only — kept out of the JSON schema (see note above) so
+        # structured-output endpoints that reject minimum/maximum still work.
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
+        return v
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""
@@ -352,12 +444,22 @@ class LLMAnalyzerBase:
                 estimate_tokens(prompt),
                 len(batch.findings),
             )
-            if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
-            else:
-                response = self._llm.invoke(prompt).content
-            logger.debug("LLM response for %s", batch.file_label)
-            parsed = self.parse_response(response, batch)
+            try:
+                if self._structured_llm:
+                    response = _invoke_with_retry(
+                        lambda p=prompt: self._structured_llm.invoke(p), batch.file_label
+                    )
+                else:
+                    response = _invoke_with_retry(
+                        lambda p=prompt: self._llm.invoke(p), batch.file_label
+                    ).content
+                logger.debug("LLM response for %s", batch.file_label)
+                parsed = self.parse_response(response, batch)
+            except NotImplementedError:
+                raise  # structural/subclass bug — never swallow
+            except Exception as exc:  # noqa: BLE001 - isolate one batch's failure
+                logger.warning("Skipping batch %s after error: %s", batch.file_label, exc)
+                continue
             results.append((batch, parsed))
         return results
 
@@ -365,7 +467,7 @@ class LLMAnalyzerBase:
         self,
         batches: list[Batch],
         *,
-        max_concurrency: int = 10,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
         **kwargs: object,
     ) -> list[tuple[Batch, list]]:
         """Execute LLM calls for all *batches* concurrently.
@@ -378,7 +480,7 @@ class LLMAnalyzerBase:
         """
         sem = asyncio.Semaphore(max_concurrency)
 
-        async def _process(batch: Batch) -> tuple[Batch, list]:
+        async def _process(batch: Batch) -> tuple[Batch, list] | None:
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
                 logger.debug(
@@ -387,14 +489,26 @@ class LLMAnalyzerBase:
                     estimate_tokens(prompt),
                     len(batch.findings),
                 )
-                if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
-                else:
-                    response = (await self._llm.ainvoke(prompt)).content
-                logger.debug("LLM response for %s", batch.file_label)
-                return (batch, self.parse_response(response, batch))
+                try:
+                    if self._structured_llm:
+                        response = await _ainvoke_with_retry(
+                            lambda: self._structured_llm.ainvoke(prompt), batch.file_label
+                        )
+                    else:
+                        invoked = await _ainvoke_with_retry(
+                            lambda: self._llm.ainvoke(prompt), batch.file_label
+                        )
+                        response = invoked.content
+                    logger.debug("LLM response for %s", batch.file_label)
+                    return (batch, self.parse_response(response, batch))
+                except NotImplementedError:
+                    raise  # structural/subclass bug — never swallow
+                except Exception as exc:  # noqa: BLE001 - isolate one batch's failure
+                    logger.warning("Skipping batch %s after error: %s", batch.file_label, exc)
+                    return None
 
-        return list(await asyncio.gather(*[_process(b) for b in batches]))
+        gathered = await asyncio.gather(*[_process(b) for b in batches])
+        return [r for r in gathered if r is not None]
 
     # -- Convenience --------------------------------------------------------
 

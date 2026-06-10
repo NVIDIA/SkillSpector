@@ -46,7 +46,17 @@ FILE_TYPES: dict[str, str] = {
     ".rs": "rust",
 }
 
-MAX_FILE_BYTES = 1_000_000
+MAX_FILE_BYTES = 50 * 1024 * 1024
+
+
+def raise_if_content_exceeds_limit(path: str, content: str) -> None:
+    """Fail closed if analyzer input exceeds the per-file analysis limit."""
+    size_bytes = len(content.encode("utf-8"))
+    if size_bytes > MAX_FILE_BYTES:
+        raise ValueError(
+            "Scan aborted: file size exceeds the per-file analysis limit "
+            f"({MAX_FILE_BYTES} bytes): {path} ({size_bytes} bytes)"
+        )
 
 
 def _infer_file_type(path: str) -> str:
@@ -107,14 +117,7 @@ def run_static_patterns(
         if content is None:
             logger.debug("Skipping %s: no content in file_cache", path)
             continue
-        if len(content) > MAX_FILE_BYTES:
-            logger.debug(
-                "Skipping %s: size %d exceeds MAX_FILE_BYTES (%d)",
-                path,
-                len(content),
-                MAX_FILE_BYTES,
-            )
-            continue
+        raise_if_content_exceeds_limit(path, content)
         file_type = _infer_file_type(path)
         for module in pattern_modules:
             raw = module.analyze(content=content, file_path=path, file_type=file_type)

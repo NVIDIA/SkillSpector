@@ -33,7 +33,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import analyzer_finding_to_finding, raise_if_content_exceeds_limit
 
 ANALYZER_ID = "static_yara"
 logger = get_logger(__name__)
@@ -243,9 +243,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         content = file_cache.get(path)
         if content is None:
             continue
-        if len(content) > MAX_FILE_BYTES:
-            logger.debug("%s: skipping %s (exceeds size limit)", ANALYZER_ID, path)
-            continue
+        raise_if_content_exceeds_limit(path, content)
         for af in _match_file(rules, content, path):
             findings.append(analyzer_finding_to_finding(af))
 

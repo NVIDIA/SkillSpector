@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from skillspector.nodes.analyzers import behavioral_taint_tracking
 
 
@@ -258,13 +260,13 @@ class TestEdgeCases:
         result = behavioral_taint_tracking.node(state)
         assert result["findings"] == []
 
-    def test_oversized_file_skipped(self):
+    def test_oversized_file_fails_scan(self):
         from skillspector.nodes.analyzers.static_runner import MAX_FILE_BYTES
 
         big = 'import os\nexec(os.environ.get("KEY"))\n' + ("x = 1\n" * MAX_FILE_BYTES)
         state = {"components": ["big.py"], "file_cache": {"big.py": big}}
-        result = behavioral_taint_tracking.node(state)
-        assert result["findings"] == []
+        with pytest.raises(ValueError, match="big\\.py"):
+            behavioral_taint_tracking.node(state)
 
     def test_multiple_files_produce_findings(self):
         state = {

@@ -36,7 +36,7 @@ from .common import (
     resolve_call_name_typed,
     resolve_dotted_name,
 )
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import analyzer_finding_to_finding, raise_if_content_exceeds_limit
 
 ANALYZER_ID = "behavioral_taint_tracking"
 logger = get_logger(__name__)
@@ -400,8 +400,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         if not path.endswith(".py"):
             continue
         content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_BYTES:
+        if content is None:
             continue
+        raise_if_content_exceeds_limit(path, content)
         raw = _analyze_python(content, path)
         all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
 

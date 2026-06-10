@@ -36,7 +36,9 @@ from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
     MetaAnalyzerFinding,
     MetaAnalyzerResult,
+    _fallback_filtered,
     _format_findings_for_prompt,
+    _partition_findings_by_batch_coverage,
 )
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1085,47 @@ class TestLLMMetaAnalyzerApplyFilter:
         assert len(result) == 1
         assert result[0].end_line == 10
         assert result[0].explanation == "Long block is dangerous"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_failed_chunk_findings_are_not_treated_as_analyzed(self) -> None:
+        """A successful chunk must not imply whole-file LLM coverage."""
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        covered = self._make_finding("big.py", "E1", line=50)
+        uncovered = self._make_finding("big.py", "E2", line=5000)
+        findings = [covered, uncovered]
+        successful_batch = Batch(
+            file_path="big.py",
+            content="chunk",
+            start_line=1,
+            end_line=100,
+            findings=[covered],
+        )
+        llm_items = [
+            {
+                "pattern_id": "E1",
+                "start_line": 50,
+                "is_vulnerability": True,
+                "confidence": 0.9,
+                "explanation": "Covered finding confirmed",
+                "remediation": "Fix covered",
+                "_file": "big.py",
+            }
+        ]
+
+        analyzed, unanalyzed = _partition_findings_by_batch_coverage(
+            findings,
+            [successful_batch],
+        )
+        filtered = analyzer.apply_filter(analyzed, [(successful_batch, llm_items)])
+        filtered = filtered + _fallback_filtered(unanalyzed)
+
+        assert [f.start_line for f in analyzed] == [50]
+        assert [f.start_line for f in unanalyzed] == [5000]
+        assert {f.start_line for f in filtered} == {50, 5000}
+        assert next(f for f in filtered if f.start_line == 50).explanation == (
+            "Covered finding confirmed"
+        )
+        assert next(f for f in filtered if f.start_line == 5000).message == "original"
 
 
 # ---------------------------------------------------------------------------

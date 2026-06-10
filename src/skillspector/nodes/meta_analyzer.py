@@ -63,7 +63,10 @@ class MetaAnalyzerFinding(BaseModel):
         description="The end line number from the finding's Location, if available.",
     )
     is_vulnerability: bool = Field(description="Whether this is a true vulnerability")
-    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0")
+    # ge/le omitted deliberately: they emit JSON-schema minimum/maximum, which
+    # Anthropic's structured-output tool schema rejects. Range is conveyed in the
+    # description; apply_filter coerces via float() and gates on confidence < 0.6.
+    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
     intent: Literal["malicious", "negligent", "benign"] = Field(
         description="Likely intent behind the finding"
     )
@@ -72,6 +75,15 @@ class MetaAnalyzerFinding(BaseModel):
     )
     explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
     remediation: str = Field(default="", description="How to fix the issue (actionable steps)")
+
+    @field_validator("confidence")
+    @classmethod
+    def _check_confidence(cls, v: float) -> float:
+        # Runtime bound only — kept out of the JSON schema (see note above) so
+        # Anthropic's structured-output tool schema accepts it.
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
+        return v
 
 
 class OverallAssessment(BaseModel):
@@ -217,6 +229,30 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
         )
         for f in findings
     ]
+
+
+def _finding_is_covered_by_batch(finding: Finding, batch: Batch) -> bool:
+    """Return whether a successful LLM batch covered this finding's location."""
+    if finding.file != batch.file_path:
+        return False
+    if batch.end_line is None:
+        return True
+    return batch.start_line <= finding.start_line <= batch.end_line
+
+
+def _partition_findings_by_batch_coverage(
+    findings: list[Finding],
+    successful_batches: list[Batch],
+) -> tuple[list[Finding], list[Finding]]:
+    """Split findings into LLM-covered and uncovered groups."""
+    analyzed: list[Finding] = []
+    unanalyzed: list[Finding] = []
+    for finding in findings:
+        if any(_finding_is_covered_by_batch(finding, batch) for batch in successful_batches):
+            analyzed.append(finding)
+        else:
+            unanalyzed.append(finding)
+    return analyzed, unanalyzed
 
 
 # ---------------------------------------------------------------------------
@@ -392,12 +428,29 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         )
 
         batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
-        filtered = analyzer.apply_filter(findings, batch_results)
+
+        # A batch may have been skipped (timeout / context-overflow / exhausted
+        # retries). Only findings whose file and line range were covered by a
+        # successful batch are eligible for filtering; findings in failed chunks
+        # are kept unfiltered rather than silently dropped.
+        successful_batches = [batch for batch, _ in batch_results]
+        analyzed, unanalyzed = _partition_findings_by_batch_coverage(findings, successful_batches)
+
+        filtered = analyzer.apply_filter(analyzed, batch_results)
+        if unanalyzed:
+            logger.warning(
+                "Meta-analyzer: %d findings across %d unanalyzed files kept unfiltered",
+                len(unanalyzed),
+                len({f.file for f in unanalyzed}),
+            )
+            filtered = filtered + _fallback_filtered(unanalyzed)
 
         logger.debug(
-            "LLM filtering done: %d findings -> %d after filter",
+            "LLM filtering done: %d findings -> %d after filter (%d analyzed, %d kept unfiltered)",
             len(findings),
             len(filtered),
+            len(analyzed),
+            len(unanalyzed),
         )
         return {"filtered_findings": filtered}
     except ValueError:

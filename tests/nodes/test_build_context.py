@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from skillspector.constants import MODEL_CONFIG
 from skillspector.nodes.build_context import build_context
 from skillspector.state import SkillspectorState
@@ -211,3 +213,64 @@ def test_build_context_parses_parameters_from_frontmatter(tmp_path: Path) -> Non
     assert result["manifest"]["parameters"] == [
         {"name": "path", "description": "file path to read"}
     ]
+
+
+def test_build_context_fails_on_oversized_file_before_reading_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oversized files fail the scan before content is materialized.
+
+    Regression guard for the security behavior: a file above the analysis
+    limit must not be silently cached as empty, because that makes the scan
+    report safe without analyzing the bytes. The spy also fails if the
+    oversized file is read via ``read_text`` before the size gate.
+    """
+    from skillspector.nodes.build_context import _MAX_READ_BYTES
+
+    (tmp_path / "SKILL.md").write_text("---\nname: big\n---\n", encoding="utf-8")
+    big = tmp_path / "huge.txt"
+    big.write_text("A" * (_MAX_READ_BYTES + 1), encoding="utf-8")
+
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "huge.txt":
+            raise AssertionError(f"oversized file read fully into memory: {self}")
+        return original_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+
+    with pytest.raises(ValueError, match="huge\\.txt"):
+        build_context(state)
+
+
+def test_build_context_oversized_manifest_fails_before_reading_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversized SKILL.md fails the scan before full-content reads.
+
+    The spy fails if SKILL.md is ever read via unbounded ``read_text`` before
+    the size gate rejects it.
+    """
+    from skillspector.nodes.build_context import _MAX_READ_BYTES
+
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: bigmanifest\ndescription: d\n---\n" + "A" * _MAX_READ_BYTES,
+        encoding="utf-8",
+    )
+
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name in ("SKILL.md", "skill.md"):
+            raise AssertionError(f"oversized manifest read fully into memory: {self}")
+        return original_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+
+    with pytest.raises(ValueError, match="SKILL\\.md"):
+        build_context(state)

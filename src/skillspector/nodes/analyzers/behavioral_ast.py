@@ -24,7 +24,7 @@ from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import get_context_from_lines, get_source_segment, resolve_call_name
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import analyzer_finding_to_finding, raise_if_content_exceeds_limit
 
 ANALYZER_ID = "behavioral_ast"
 logger = get_logger(__name__)
@@ -216,8 +216,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         if not path.endswith(".py"):
             continue
         content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_BYTES:
+        if content is None:
             continue
+        raise_if_content_exceeds_limit(path, content)
         raw = _analyze_python(content, path)
         all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
 
