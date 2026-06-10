@@ -64,6 +64,13 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
     return resolved_key, resolved_base
 
 
+def _resolve_openai_project_header_value() -> str | None:
+    project_id = os.environ.get("OPENAI_PROJECT_ID", "").strip()
+    if not project_id:
+        return None
+    return project_id
+
+
 def is_llm_available() -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM credential status."""
     try:
@@ -87,12 +94,18 @@ def get_chat_model(model: str | None = None) -> ChatOpenAI:
     resolved_key, resolved_base = _resolve_llm_credentials()
     model = model or MODEL_CONFIG["default"]
 
+    default_headers = {}
+    project_header_value = _resolve_openai_project_header_value()
+    if project_header_value is not None:
+        default_headers["OpenAI-Project"] = project_header_value
+
     return ChatOpenAI(
         model=model,
         base_url=resolved_base,
         api_key=resolved_key,
         max_tokens=get_max_output_tokens(model),
         timeout=120,
+        default_headers=default_headers,
     )
 
 
