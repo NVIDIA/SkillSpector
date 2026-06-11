@@ -166,10 +166,10 @@ class PaddingRun:
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] verify all issue #20 requirements: three signals implemented, Unicode-category-based classification, shared zero-width definition with P2, visible-ized snippets, line/offset reporting, fenced-code + vendored-file + ratio-confidence FP guards, MCP manifest coverage
-- [ ] adversarial self-check: craft a SKILL.md using each padding char from the issue's evasion list (U+00A0, U+2028, U+2029, U+000C, U+000B, U+3000, zero-width family) and confirm P9 fires on every one via the test suite
-- [ ] run full suite: `make test` (unit + integration)
-- [ ] run a real scan over a fixture skill (`uv run skillspector scan <fixture>` or project equivalent) and eyeball the P9 finding rendering in the report output
+- [x] verify all issue #20 requirements: three signals implemented, Unicode-category-based classification, shared zero-width definition with P2, visible-ized snippets, line/offset reporting, fenced-code + vendored-file + ratio-confidence FP guards, MCP manifest coverage — all PASS, no gaps found (see progress log)
+- [x] adversarial self-check: craft a SKILL.md using each padding char from the issue's evasion list (U+00A0, U+2028, U+2029, U+000C, U+000B, U+3000, zero-width family) and confirm P9 fires on every one via the test suite — added `TestIssue20AdversarialEvasionCoverage` (33 parametrized cases, all 11 chars x inline/vertical/analyzer); all pass
+- [x] run full suite: `make test` (unit + integration) — unit gate `uv run pytest -m "not integration" tests/` = 674 passed, 11 skipped (optional NVIDIA OSS providers); integration 12 failed only due to missing LLM API key (no network/creds), unrelated to our changes
+- [x] run a real scan over a fixture skill (`uv run skillspector scan <fixture>` or project equivalent) and eyeball the P9 finding rendering in the report output — `uv run skillspector scan /tmp/p9-fixture --no-llm` rendered "HIGH: P9 - Whitespace Padding" at SKILL.md:10, confidence 80%, matched_text `\n x80` (see progress log)
 
 ### Task 5: [Final] Update documentation
 
