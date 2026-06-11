@@ -145,12 +145,12 @@ class PaddingRun:
 - Modify: `src/skillspector/nodes/analyzers/pattern_defaults.py`
 - Modify: `tests/nodes/analyzers/test_static_patterns.py`
 
-- [ ] in `static_patterns_prompt_injection.py`: import the detector, add a P9 block in `analyze()` mapping `PaddingRun` → `AnalyzerFinding` (severity/confidence per the signal table above; `matched_text=run.summary`); add the vendored-filename skip; update module docstring "(P1–P4)" → "(P1–P4, P9)"
-- [ ] rebuild `P2_PATTERNS`' zero-width regex from the shared `ZERO_WIDTH_CHARS` constant (no behavior change — same five chars)
-- [ ] add P9 to `pattern_defaults.py`: `DEFAULT_EXPLANATIONS`, `RULE_ID_TO_CATEGORY` (→ `PatternCategory.PROMPT_INJECTION`), `PATTERN_NAMES` ("Whitespace Padding"), `DEFAULT_REMEDIATIONS`
-- [ ] write tests in `test_static_patterns.py`: a SKILL.md body with 80 blank lines then an injected instruction yields a P9 finding with HIGH severity, correct `start_line` (start of the gap), and a visible-ized `matched_text`; trailing-gap variant yields MEDIUM/0.6; horizontal and ratio variants yield their severities; `*.min.js` path yields no P9
-- [ ] write test: existing P2 zero-width detection still fires identically after the shared-constant refactor
-- [ ] run `make test-unit` — must pass before task 3
+- [x] in `static_patterns_prompt_injection.py`: import the detector, add a P9 block in `analyze()` mapping `PaddingRun` → `AnalyzerFinding` (severity/confidence per the signal table above; `matched_text=run.summary`); add the vendored-filename skip; update module docstring "(P1–P4)" → "(P1–P4, P9)"
+- [x] rebuild `P2_PATTERNS`' zero-width regex from the shared `ZERO_WIDTH_CHARS` constant (no behavior change — same five chars)
+- [x] add P9 to `pattern_defaults.py`: `DEFAULT_EXPLANATIONS`, `RULE_ID_TO_CATEGORY` (→ `PatternCategory.PROMPT_INJECTION`), `PATTERN_NAMES` ("Whitespace Padding"), `DEFAULT_REMEDIATIONS`
+- [x] write tests in `test_static_patterns.py`: a SKILL.md body with 80 blank lines then an injected instruction yields a P9 finding with HIGH severity, correct `start_line` (start of the gap), and a visible-ized `matched_text`; trailing-gap variant yields MEDIUM/0.6; horizontal and ratio variants yield their severities; `*.min.js` path yields no P9
+- [x] write test: existing P2 zero-width detection still fires identically after the shared-constant refactor
+- [x] run `make test-unit` — must pass before task 3 (ran `uv run pytest -m "not integration" tests/` — 634 passed)
 
 ### Task 3: P9 over MCP manifest description fields
 

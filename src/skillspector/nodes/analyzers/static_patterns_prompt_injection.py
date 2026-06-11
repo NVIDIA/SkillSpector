@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: prompt injection (P1–P4). Node and analyze() in one module."""
+"""Static patterns: prompt injection (P1–P4, P9). Node and analyze() in one module."""
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import sys
 
@@ -27,10 +28,33 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 from . import static_runner
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
+from .whitespace_padding import (
+    VERTICAL_HIGH_SEVERITY_LINES,
+    ZERO_WIDTH_CHARS,
+    detect_whitespace_padding,
+)
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_prompt_injection"
+
+# Generated/vendored filename globs for which the P9 whitespace-padding signal is
+# skipped (these legitimately carry large whitespace runs). Applies ONLY to P9.
+_P9_SKIP_GLOBS = (
+    "*.min.js",
+    "*.min.css",
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "*.svg",
+    "*.map",
+)
+
+
+def _is_p9_skipped_path(file_path: str) -> bool:
+    """Return True when *file_path* is a generated/vendored file P9 should skip."""
+    name = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _P9_SKIP_GLOBS)
 
 # P1: Instruction Override
 P1_PATTERNS = [
@@ -50,7 +74,9 @@ P1_PATTERNS = [
 P2_PATTERNS = [
     (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
     (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
-    (r"[\u200b\u200c\u200d\u2060\ufeff]", 0.6),
+    # Zero-width character class built from the shared ZERO_WIDTH_CHARS constant so
+    # P2 and the P9 detector cannot drift (same five code points as before).
+    ("[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]", 0.6),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
 # P3: Exfiltration Commands
@@ -187,6 +213,35 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                )
+            )
+    # P9: Whitespace Padding (skipped for generated/vendored files).
+    if not _is_p9_skipped_path(file_path):
+        for run in detect_whitespace_padding(content, file_type=file_type):
+            if run.kind == "vertical":
+                confidence = 0.8 if run.followed_by_content else 0.6
+                severity = (
+                    Severity.HIGH
+                    if run.followed_by_content
+                    and run.length >= VERTICAL_HIGH_SEVERITY_LINES
+                    else Severity.MEDIUM
+                )
+            elif run.kind == "horizontal":
+                confidence = 0.7
+                severity = Severity.MEDIUM
+            else:  # "block" or "ratio"
+                confidence = 0.4
+                severity = Severity.LOW
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="P9",
+                    message="Whitespace Padding",
+                    severity=severity,
+                    location=loc(run.start_line),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(run.start_offset),
+                    matched_text=run.summary,
                 )
             )
     return findings
