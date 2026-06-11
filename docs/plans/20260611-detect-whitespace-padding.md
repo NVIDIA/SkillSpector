@@ -130,13 +130,13 @@ class PaddingRun:
 - Create: `src/skillspector/nodes/analyzers/whitespace_padding.py`
 - Create: `tests/nodes/analyzers/test_whitespace_padding.py`
 
-- [ ] create `whitespace_padding.py` with `ZERO_WIDTH_CHARS`, `is_padding_char()` (unicodedata category `Z*` + controls + zero-width), threshold constants, `PaddingRun` dataclass, and `summarize_run()` visible-izer (`U+00A0 x82` / `\n x82` rendering)
-- [ ] implement `detect_whitespace_padding(content, *, file_type="other") -> list[PaddingRun]` covering all three signals: vertical blank-line runs (with `followed_by_content`), horizontal in-line runs, contiguous block > 2 KB and > 90%-of-file ratio
-- [ ] implement false-positive guards: Markdown fence-region skip for the horizontal signal, U+FFFD (binary-ish) bail-out, vertical-run/block dedup
-- [ ] write tests: each signal fires at its threshold and not below it (19 blank lines no, 20 yes; 79 ws chars no, 80 yes; 2 KB block boundary)
-- [ ] write tests: Unicode evasion cases — padding made of U+00A0, U+2028/U+2029, U+000B/U+000C, U+3000, and zero-width chars all detected; `summarize_run` renders `U+00A0 x82`-style output
-- [ ] write tests: guards — horizontal run inside a ``` fence not reported for markdown, reported for non-markdown; content with U+FFFD returns no runs; `followed_by_content` true/false distinguished
-- [ ] run `make test-unit` — must pass before task 2
+- [x] create `whitespace_padding.py` with `ZERO_WIDTH_CHARS`, `is_padding_char()` (unicodedata category `Z*` + controls + zero-width), threshold constants, `PaddingRun` dataclass, and `summarize_run()` visible-izer (`U+00A0 x82` / `\n x82` rendering)
+- [x] implement `detect_whitespace_padding(content, *, file_type="other") -> list[PaddingRun]` covering all three signals: vertical blank-line runs (with `followed_by_content`), horizontal in-line runs, contiguous block > 2 KB and > 90%-of-file ratio
+- [x] implement false-positive guards: Markdown fence-region skip for the horizontal signal, U+FFFD (binary-ish) bail-out, vertical-run/block dedup
+- [x] write tests: each signal fires at its threshold and not below it (19 blank lines no, 20 yes; 79 ws chars no, 80 yes; 2 KB block boundary)
+- [x] write tests: Unicode evasion cases — padding made of U+00A0, U+2028/U+2029, U+000B/U+000C, U+3000, and zero-width chars all detected; `summarize_run` renders `U+00A0 x82`-style output
+- [x] write tests: guards — horizontal run inside a ``` fence not reported for markdown, reported for non-markdown; content with U+FFFD returns no runs; `followed_by_content` true/false distinguished
+- [x] run `make test-unit` — must pass before task 2
 
 ### Task 2: P9 findings in the prompt-injection analyzer + shared zero-width definition
 
