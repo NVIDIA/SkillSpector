@@ -59,6 +59,13 @@ _REPLACEMENT_CHAR = "�"
 # Markdown fenced-code delimiter (``` or ~~~ with optional leading indentation).
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
+# Line-boundary characters/sequences that count as line separators when splitting
+# content into logical lines. Beyond ASCII LF, this includes CR / CRLF and the
+# Unicode line/paragraph separators U+2028 / U+2029 / U+0085 (NEL) — all of which
+# render as line breaks and are named in issue #20's evasion list. A multi-char
+# sequence (CRLF) must precede its single-char members so it is matched whole.
+_LINE_BOUNDARY_RE = re.compile("\r\n|\r|\n|\u2028|\u2029|\x85")
+
 # How many distinct code points to show in a summary before collapsing.
 _SUMMARY_MAX_SEGMENTS = 3
 
@@ -117,14 +124,65 @@ def summarize_run(text: str) -> str:
 
 @dataclass
 class PaddingRun:
-    """A contiguous run of whitespace padding detected in content."""
+    """A contiguous run of whitespace padding detected in content.
+
+    ``length`` is **overloaded by ``kind``** — read it as:
+
+    * ``"vertical"``  → number of blank/whitespace-only LINES in the run.
+    * ``"horizontal"`` → number of padding CHARACTERS in the in-line run.
+    * ``"block"``     → number of padding CHARACTERS in the contiguous block
+      (NOT bytes — char-based so unit-consistent with ``start_offset``).
+    * ``"ratio"``     → number of padding BYTES in the whole file.
+
+    Only ``"vertical"`` exposes a line count, so the analyzer's HIGH-severity
+    check (``run.length >= VERTICAL_HIGH_SEVERITY_LINES``) is meaningful for the
+    ``"vertical"`` kind alone.
+
+    ``end_offset`` is the char offset just past the run, kept unit-consistent
+    with ``start_offset`` so consumers can compute spans without re-deriving them
+    from ``length`` (whose unit varies). It defaults to ``start_offset`` and is
+    set by the detectors that produce span-based runs.
+    """
 
     kind: str  # "vertical" | "horizontal" | "block" | "ratio"
     start_offset: int  # char offset where the run starts
     start_line: int  # 1-based line number
-    length: int  # chars (or line count for "vertical")
+    length: int  # see class docstring — unit depends on kind
     followed_by_content: bool
     summary: str  # visible-ized snippet, e.g. "U+00A0 x82" or "\\n x82"
+    end_offset: int = -1  # char offset just past the run (-1 → unset, == start)
+
+    def __post_init__(self) -> None:
+        if self.end_offset < 0:
+            self.end_offset = self.start_offset
+
+
+def _split_lines(content: str) -> tuple[list[str], list[int]]:
+    """Split *content* into logical lines on Unicode line boundaries.
+
+    Treats LF, CR, CRLF, U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH SEPARATOR)
+    and U+0085 (NEL) as line separators — so padding built from any of them
+    counts toward the vertical blank-line signal (issue #20 evasion list).
+
+    Returns ``(lines, line_offsets)`` where ``lines[k]`` is the separator-free
+    text of line *k* and ``line_offsets[k]`` is its char offset in *content*.
+    ``line_offsets`` has one extra trailing entry equal to ``len(content)`` so
+    ``line_offsets[k + 1]`` always gives the start of the next line (or EOF),
+    which keeps offset arithmetic correct regardless of separator width.
+    """
+    lines: list[str] = []
+    line_offsets: list[int] = []
+    pos = 0
+    for m in _LINE_BOUNDARY_RE.finditer(content):
+        line_offsets.append(pos)
+        lines.append(content[pos : m.start()])
+        pos = m.end()
+    # Final line (text after the last separator, possibly empty).
+    line_offsets.append(pos)
+    lines.append(content[pos:])
+    # Trailing sentinel so line_offsets[k + 1] is always valid.
+    line_offsets.append(len(content))
+    return lines, line_offsets
 
 
 def _fence_line_flags(lines: list[str]) -> list[bool]:
@@ -144,29 +202,19 @@ def _fence_line_flags(lines: list[str]) -> list[bool]:
     return flags
 
 
-def _vertical_char_end(content: str, lines: list[str], run: PaddingRun) -> int:
-    """Return the char offset just past a vertical run (its blank lines)."""
-    # run.length blank lines starting at 1-based run.start_line.
-    end_line_idx = (run.start_line - 1) + run.length  # first line after the run
-    if end_line_idx >= len(lines):
-        return len(content)
-    # Offset of the start of end_line_idx == start_offset + sum of run line lengths.
-    offset = run.start_offset
-    for line in lines[run.start_line - 1 : end_line_idx]:
-        offset += len(line) + 1  # +1 for the newline split removed
-    return offset
+def _detect_vertical(
+    content: str, lines: list[str], line_offsets: list[int]
+) -> list[PaddingRun]:
+    """Detect runs of >= VERTICAL_BLANK_LINES consecutive blank/whitespace-only lines.
 
-
-def _detect_vertical(content: str, lines: list[str]) -> list[PaddingRun]:
-    """Detect runs of >= VERTICAL_BLANK_LINES consecutive blank/whitespace-only lines."""
+    ``line_offsets`` is the offset table from :func:`_split_lines` (one entry per
+    line plus a trailing ``len(content)`` sentinel), so ``line_offsets[j]`` is the
+    start of line *j* regardless of how wide each line's separator was. This keeps
+    char-offset arithmetic correct for CRLF and the Unicode line separators
+    (U+2028/U+2029/NEL), not just single-char ``\\n``.
+    """
     runs: list[PaddingRun] = []
     blank = [_is_blank_line(line) for line in lines]
-    # Precompute char offset of the start of each line.
-    line_offsets: list[int] = []
-    off = 0
-    for line in lines:
-        line_offsets.append(off)
-        off += len(line) + 1  # +1 for the newline that splitlines stripped
 
     i = 0
     n = len(lines)
@@ -181,8 +229,9 @@ def _detect_vertical(content: str, lines: list[str]) -> list[PaddingRun]:
         if run_len >= VERTICAL_BLANK_LINES:
             followed_by_content = j < n and not blank[j]
             start_offset = line_offsets[i]
-            # Summary built from the actual run text (the blank lines + newlines).
-            end_offset = line_offsets[j] if j < n else len(content)
+            # Offset just past the run = start of the first line after it (the
+            # sentinel guarantees line_offsets[j] is valid even at EOF).
+            end_offset = line_offsets[j]
             summary = summarize_run(content[start_offset:end_offset])
             runs.append(
                 PaddingRun(
@@ -192,6 +241,7 @@ def _detect_vertical(content: str, lines: list[str]) -> list[PaddingRun]:
                     length=run_len,
                     followed_by_content=followed_by_content,
                     summary=summary,
+                    end_offset=end_offset,
                 )
             )
         i = j
@@ -199,45 +249,47 @@ def _detect_vertical(content: str, lines: list[str]) -> list[PaddingRun]:
 
 
 def _detect_horizontal(
-    content: str, lines: list[str], file_type: str
+    content: str, lines: list[str], line_offsets: list[int], file_type: str
 ) -> list[PaddingRun]:
     """Detect in-line runs of >= HORIZONTAL_RUN_CHARS consecutive padding chars.
 
     For ``file_type == "markdown"``, runs whose line falls inside a fenced code
-    region are skipped (false-positive guard).
+    region are skipped (false-positive guard). ``line_offsets`` is the offset
+    table from :func:`_split_lines`, used so char offsets stay correct under
+    variable-width line separators.
     """
     runs: list[PaddingRun] = []
-    fence_flags = (
-        _fence_line_flags(lines) if file_type == "markdown" else [False] * len(lines)
-    )
-    line_offset = 0
+    # Only the markdown path needs fence flags; skip building the list otherwise.
+    fence_flags = _fence_line_flags(lines) if file_type == "markdown" else None
     for idx, line in enumerate(lines):
-        if not fence_flags[idx]:
-            k = 0
-            line_len = len(line)
-            while k < line_len:
-                if not is_padding_char(line[k]):
-                    k += 1
-                    continue
-                start = k
-                while k < line_len and is_padding_char(line[k]):
-                    k += 1
-                run_len = k - start
-                if run_len >= HORIZONTAL_RUN_CHARS:
-                    start_offset = line_offset + start
-                    followed_by_content = k < line_len
-                    summary = summarize_run(line[start:k])
-                    runs.append(
-                        PaddingRun(
-                            kind="horizontal",
-                            start_offset=start_offset,
-                            start_line=idx + 1,
-                            length=run_len,
-                            followed_by_content=followed_by_content,
-                            summary=summary,
-                        )
+        if fence_flags is not None and fence_flags[idx]:
+            continue
+        line_offset = line_offsets[idx]
+        k = 0
+        line_len = len(line)
+        while k < line_len:
+            if not is_padding_char(line[k]):
+                k += 1
+                continue
+            start = k
+            while k < line_len and is_padding_char(line[k]):
+                k += 1
+            run_len = k - start
+            if run_len >= HORIZONTAL_RUN_CHARS:
+                start_offset = line_offset + start
+                followed_by_content = k < line_len
+                summary = summarize_run(line[start:k])
+                runs.append(
+                    PaddingRun(
+                        kind="horizontal",
+                        start_offset=start_offset,
+                        start_line=idx + 1,
+                        length=run_len,
+                        followed_by_content=followed_by_content,
+                        summary=summary,
+                        end_offset=start_offset + run_len,
                     )
-        line_offset += len(line) + 1
+                )
     return runs
 
 
@@ -250,9 +302,12 @@ def _detect_block_and_ratio(content: str) -> list[PaddingRun]:
     runs: list[PaddingRun] = []
     n = len(content)
 
-    # Largest contiguous padding run (counted in bytes via UTF-8 length).
-    best_len = 0
+    # Largest contiguous padding run. The threshold is a BYTE budget (per the
+    # signal table), but the run's ``start_offset``/``end_offset``/``length`` are
+    # CHAR-based so they stay unit-consistent for span/overlap arithmetic.
+    best_byte_len = 0
     best_start = -1
+    best_end = -1
     i = 0
     while i < n:
         if not is_padding_char(content[i]):
@@ -262,18 +317,20 @@ def _detect_block_and_ratio(content: str) -> list[PaddingRun]:
         while i < n and is_padding_char(content[i]):
             i += 1
         byte_len = len(content[start:i].encode("utf-8"))
-        if byte_len > best_len:
-            best_len = byte_len
+        if byte_len > best_byte_len:
+            best_byte_len = byte_len
             best_start = start
-    if best_len > BLOCK_BYTE_BUDGET and best_start >= 0:
+            best_end = i
+    if best_byte_len > BLOCK_BYTE_BUDGET and best_start >= 0:
         runs.append(
             PaddingRun(
                 kind="block",
                 start_offset=best_start,
                 start_line=content[:best_start].count("\n") + 1,
-                length=best_len,
+                length=best_end - best_start,  # char count (unit-consistent)
                 followed_by_content=False,
                 summary=summarize_run(content[best_start : best_start + 200]),
+                end_offset=best_end,
             )
         )
 
@@ -317,35 +374,39 @@ def detect_whitespace_padding(
       (binary-ish content).
     - For ``file_type == "markdown"``, horizontal runs inside ``` fenced regions
       are skipped.
-    - A "block" run whose span equals a "vertical" run's span is suppressed
-      (the higher-signal vertical finding wins).
+
+    Dedup (at most one finding per overlapping span; higher-signal kind wins):
+    - "block" and "ratio" runs whose char span is already covered by a reported
+      "vertical" or "horizontal" run are suppressed. A single large whitespace
+      span therefore yields ONE finding (the vertical/horizontal one), not three.
     """
     if not content or _REPLACEMENT_CHAR in content:
         return []
 
-    lines = content.split("\n")
+    lines, line_offsets = _split_lines(content)
 
-    vertical = _detect_vertical(content, lines)
-    horizontal = _detect_horizontal(content, lines, file_type)
+    vertical = _detect_vertical(content, lines, line_offsets)
+    horizontal = _detect_horizontal(content, lines, line_offsets, file_type)
     block_ratio = _detect_block_and_ratio(content)
 
-    # Dedup: suppress a "block" run that overlaps a vertical run's span (the
-    # higher-signal vertical finding wins). A large vertical gap's contiguous
-    # padding naturally extends across the same bytes the block signal would flag.
-    def _block_overlaps_vertical(block: PaddingRun) -> bool:
-        block_end = block.start_offset + block.length
-        for run in vertical:
-            vert_start = run.start_offset
-            # Vertical length is in lines; recompute its char/byte span via offset.
-            vert_end_offset = _vertical_char_end(content, lines, run)
-            if block.start_offset < vert_end_offset and vert_start < block_end:
+    # Higher-signal runs whose spans suppress overlapping block/ratio runs.
+    # All offsets are char-based and unit-consistent (see PaddingRun docstring).
+    primary = vertical + horizontal
+
+    def _overlaps_primary(run: PaddingRun) -> bool:
+        for p in primary:
+            if run.start_offset < p.end_offset and p.start_offset < run.end_offset:
                 return True
         return False
 
-    block_ratio = [
-        run
-        for run in block_ratio
-        if not (run.kind == "block" and _block_overlaps_vertical(run))
-    ]
+    # "ratio" spans the whole file (offset 0..len), so treat it as covered when
+    # any primary run exists (a primary run is always a subspan of the file).
+    deduped_block_ratio: list[PaddingRun] = []
+    for run in block_ratio:
+        if run.kind == "block" and _overlaps_primary(run):
+            continue
+        if run.kind == "ratio" and primary:
+            continue
+        deduped_block_ratio.append(run)
 
-    return vertical + horizontal + block_ratio
+    return vertical + horizontal + deduped_block_ratio
