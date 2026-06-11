@@ -173,10 +173,10 @@ class PaddingRun:
 
 ### Task 5: [Final] Update documentation
 
-- [ ] add P9 row to the README Prompt Injection table and bump its "(5 patterns)" count and the total pattern count
-- [ ] update CLAUDE.md if a new pattern-authoring convention emerged (shared detector helper pattern)
-- [ ] comment on issue #20 summarizing the implemented signals/thresholds and the P9 id choice (P6–P8 were taken)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] add P9 row to the README Prompt Injection table and bump its "(5 patterns)" count and the total pattern count (5→6 patterns; total 64→65 in both the Features bullet and the Vulnerability Patterns intro)
+- [x] CLAUDE.md — no suitable section / not applicable (no CLAUDE.md exists in the repo; nothing to update)
+- [x] comment on issue #20 — drafted at docs/plans/p9-issue20-comment-draft.md (NOT posted; deferred to user)
+- [x] plan move deferred to harness (post-run)
 
 ## Post-Completion
 
