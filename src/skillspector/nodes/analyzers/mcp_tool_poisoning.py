@@ -25,6 +25,10 @@ import unicodedata
 
 from skillspector.llm_utils import chat_completion
 from skillspector.models import Finding
+from skillspector.nodes.analyzers.whitespace_padding import (
+    ZERO_WIDTH_CHARS,
+    detect_whitespace_padding,
+)
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -135,8 +139,14 @@ _HTML_COMMENT_RE = re.compile(r"<\\?!--.*?-->", re.DOTALL)
 # Markdown comment: [//]: # (...)
 _MARKDOWN_COMMENT_RE = re.compile(r"\[//\]:\s*#\s*\(.*?\)")
 
-# Zero-width chars followed by visible text
-_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d]+\S")
+# Zero-width chars followed by visible text.
+#
+# The character class is derived from the shared ``ZERO_WIDTH_CHARS`` constant in
+# ``whitespace_padding`` so TP1's hidden-text check and P2/P9 cannot drift apart
+# (single shared definition). Converging on the shared set also adds U+2060 (WORD
+# JOINER) and U+FEFF (ZERO WIDTH NO-BREAK SPACE / BOM) coverage to this check \u2014 a
+# strict improvement over the previous U+200B/U+200C/U+200D-only class.
+_ZERO_WIDTH_RE = re.compile("[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]+\\S")
 
 # Base64 blobs (>=50 chars) — checked AFTER data URI to avoid double-counting
 _BASE64_RE = re.compile(r"[A-Za-z0-9+/]{50,}={0,2}")
@@ -294,6 +304,59 @@ def _check_tp1(text: str, source_field: str) -> list[Finding]:
                 remediation=(
                     "Remove base64-encoded blobs from metadata fields. "
                     "Metadata should contain only human-readable plain text."
+                ),
+            )
+        )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# P9: Whitespace padding (shared detector)
+# ---------------------------------------------------------------------------
+
+
+def _check_p9_padding(text: str, source_field: str) -> list[Finding]:
+    """Detect whitespace-padding runs hidden in a metadata text field.
+
+    Uses the shared ``detect_whitespace_padding`` scanner. Only the "horizontal"
+    and "block" signals are kept: per-field ratio is skipped (manifest fields are
+    too short for the 4 KB floor to apply) and vertical blank-line gaps are not
+    meaningful at the granularity of a single description field. Emits one P9
+    finding per surviving run.
+    """
+    findings: list[Finding] = []
+
+    for run in detect_whitespace_padding(text):
+        if run.kind not in ("horizontal", "block"):
+            continue
+        if run.kind == "horizontal":
+            severity = "MEDIUM"
+            confidence = 0.7
+        else:  # "block"
+            severity = "LOW"
+            confidence = 0.4
+        findings.append(
+            Finding(
+                rule_id="P9",
+                message=(
+                    f"Whitespace padding found in '{source_field}': "
+                    "large whitespace run may hide instructions from reviewers."
+                ),
+                severity=severity,
+                confidence=confidence,
+                file="SKILL.md",
+                category=_CATEGORY,
+                tags=list(_FRAMEWORK_TAGS),
+                matched_text=run.summary,
+                explanation=(
+                    "Large runs of whitespace padding in metadata fields can push injected "
+                    "instructions out of a human reviewer's view while the AI agent still "
+                    "processes the full text."
+                ),
+                remediation=(
+                    "Remove oversized whitespace runs from metadata fields. "
+                    "Descriptions should contain normal, visible text only."
                 ),
             )
         )
@@ -847,6 +910,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     # TP2: Unicode deception — check all metadata fields
     for text, source_field, is_identifier in metadata_texts:
         findings.extend(_check_tp2(text, source_field, is_identifier))
+
+    # P9: Whitespace padding — check non-identifier (free-text) fields only
+    for text, source_field, is_identifier in metadata_texts:
+        if not is_identifier:
+            findings.extend(_check_p9_padding(text, source_field))
 
     # TP3: Parameter description injection — check parameters
     params = manifest.get("parameters") or []
