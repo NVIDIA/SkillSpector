@@ -158,11 +158,11 @@ class PaddingRun:
 - Modify: `src/skillspector/nodes/analyzers/mcp_tool_poisoning.py`
 - Modify: `tests/test_mcp_tool_poisoning.py`
 
-- [ ] add `_check_p9_padding(text, source_field) -> list[Finding]` using the shared detector (horizontal + contiguous-block signals; skip per-file ratio); wire it into `node()`'s metadata-text loop for non-identifier fields
-- [ ] rebuild `_ZERO_WIDTH_RE` from the shared `ZERO_WIDTH_CHARS` constant (adds U+2060/U+FEFF coverage to TP1's hidden-text check — strict improvement; note it in the docstring)
-- [ ] write tests: a tool description padded with 100 spaces before an instruction yields a P9 finding naming the source field; a normal multi-sentence description yields none; identifier fields are not scanned
-- [ ] write test: TP1 zero-width behavior unchanged for the original three chars, and now also fires on U+2060/U+FEFF
-- [ ] run `make test-unit` — must pass before task 4
+- [x] add `_check_p9_padding(text, source_field) -> list[Finding]` using the shared detector (horizontal + contiguous-block signals; skip per-file ratio); wire it into `node()`'s metadata-text loop for non-identifier fields
+- [x] rebuild `_ZERO_WIDTH_RE` from the shared `ZERO_WIDTH_CHARS` constant (adds U+2060/U+FEFF coverage to TP1's hidden-text check — strict improvement; note it in the docstring)
+- [x] write tests: a tool description padded with 100 spaces before an instruction yields a P9 finding naming the source field; a normal multi-sentence description yields none; identifier fields are not scanned
+- [x] write test: TP1 zero-width behavior unchanged for the original three chars, and now also fires on U+2060/U+FEFF
+- [x] run `make test-unit` — must pass before task 4 (ran `uv run pytest -m "not integration" tests/` — 641 passed)
 
 ### Task 4: Verify acceptance criteria
 
