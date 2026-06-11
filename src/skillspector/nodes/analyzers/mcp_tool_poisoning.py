@@ -319,13 +319,15 @@ def _check_tp1(text: str, source_field: str) -> list[Finding]:
 def _check_p9_padding(text: str, source_field: str) -> list[Finding]:
     """Detect whitespace-padding runs hidden in a metadata text field.
 
-    Uses the shared ``detect_whitespace_padding`` scanner. The "horizontal",
-    "vertical" and "block" signals are kept: per-field ratio is skipped (manifest
-    fields are too short for the 4 KB floor to apply). "vertical" runs matter here
-    because padding built from Unicode line separators (U+2028 / U+2029 / U+0085)
-    splits into many blank logical lines and is classified vertical, yet inside a
-    single description field it is still a hidden run that must surface a P9.
-    Emits one P9 finding per surviving run.
+    Uses the shared ``detect_whitespace_padding`` scanner. Severity is per kind:
+    "horizontal" and "vertical" runs surface as MEDIUM / 0.7 confidence, while
+    "block" runs (a contiguous multibyte span over the byte budget that stays
+    under the line/char primaries) surface as LOW / 0.4. The "ratio" signal is
+    skipped (manifest fields are too short for the 4 KB floor to apply).
+    "vertical" runs matter here because padding built from Unicode line
+    separators (U+2028 / U+2029 / U+0085) splits into many blank logical lines
+    and is classified vertical, yet inside a single description field it is still
+    a hidden run that must surface a P9. Emits one P9 finding per surviving run.
     """
     findings: list[Finding] = []
 
