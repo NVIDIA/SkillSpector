@@ -128,11 +128,18 @@ class TestRunStaticPatternsP9WhitespacePadding:
         assert len(horizontal) >= 1
         assert horizontal[0].confidence == 0.7
 
-    def test_block_or_ratio_low_severity(self):
-        """A whitespace-dominated file yields a P9 LOW (block/ratio) finding."""
-        # > 4 KB, > 90% whitespace, but no single line >= 80 ws and no >= 20
-        # blank-line vertical run, so only the block/ratio signal fires.
-        content = "x\n" + (" \n" * 3000)
+    def test_block_kind_low_severity(self):
+        """A contiguous >2 KB block (no vertical/horizontal) yields a P9 LOW finding.
+
+        Drives the ``block``-kind path through ``analyze()`` (it survives the
+        higher-signal dedup because it is neither a >=20-line vertical gap nor a
+        single >=80-char horizontal run). Uses U+3000 (3 bytes each) across 15
+        lines of 79 chars so the BYTE budget is exceeded while both other
+        thresholds stay below their trigger.
+        """
+        pad_line = "　" * 79  # 79 < 80, so no horizontal run
+        body = "\n".join([pad_line] * 15)  # 15 < 20, so no vertical gap
+        content = "x\n" + body + "\ny"
         state = {
             "components": ["pad.txt"],
             "file_cache": {"pad.txt": content},
@@ -141,6 +148,22 @@ class TestRunStaticPatternsP9WhitespacePadding:
         low = [f for f in findings if f.rule_id == "P9" and f.severity == "LOW"]
         assert len(low) >= 1
         assert low[0].confidence == 0.4
+
+    def test_single_span_yields_one_finding(self):
+        """A single 3 KB single-line space run yields ONE P9 finding (horizontal).
+
+        The same span would otherwise also trip the block and ratio signals; the
+        dedup keeps only the higher-signal horizontal finding.
+        """
+        content = "x" + (" " * 5000) + "y"
+        state = {
+            "components": ["pad.txt"],
+            "file_cache": {"pad.txt": content},
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        p9 = [f for f in findings if f.rule_id == "P9"]
+        assert len(p9) == 1, f"expected one P9, got {[(f.severity, f.matched_text) for f in p9]}"
+        assert p9[0].severity == "MEDIUM"  # horizontal
 
     def test_min_js_path_skipped(self):
         """A *.min.js path with heavy padding yields no P9 finding."""
@@ -163,6 +186,18 @@ class TestRunStaticPatternsP9WhitespacePadding:
         p2 = [f for f in findings if f.rule_id == "P2"]
         assert len(p2) >= 1
         assert any(f.confidence == 0.6 for f in p2)
+
+
+class TestP9PatternDefaults:
+    """P9 resolves correctly through pattern_defaults public accessors."""
+
+    def test_p9_category_and_name_and_text(self):
+        from skillspector.nodes.analyzers import pattern_defaults
+
+        assert pattern_defaults.get_category("P9") == "Prompt Injection"
+        assert pattern_defaults.get_pattern_name("P9") == "Whitespace Padding"
+        assert pattern_defaults.get_explanation("P9").strip()
+        assert pattern_defaults.get_remediation("P9").strip()
 
 
 class TestRunStaticPatternsDataExfiltration:

@@ -143,7 +143,7 @@ P4_PATTERNS = [
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Analyze content for prompt injection patterns (P1–P4)."""
+    """Analyze content for prompt injection patterns (P1–P4, P9)."""
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:

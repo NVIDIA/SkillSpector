@@ -22,7 +22,6 @@ import pytest
 from skillspector.nodes.analyzers.whitespace_padding import (
     BLOCK_BYTE_BUDGET,
     HORIZONTAL_RUN_CHARS,
-    RATIO_MIN_FILE_BYTES,
     VERTICAL_BLANK_LINES,
     ZERO_WIDTH_CHARS,
     PaddingRun,
@@ -80,12 +79,18 @@ class TestSummarizeRun:
         assert summarize_run("") == ""
 
     def test_mixed_collapses(self):
-        text = " " * 10 + " " * 5 + "　" * 2 + " "
+        # Four distinct code points; _SUMMARY_MAX_SEGMENTS top ones render, the
+        # rest collapse into a '+N more' tail. Build with explicit escapes so
+        # the exact counts are asserted.
+        text = "\u00A0" * 10 + "\u2003" * 7 + "\u3000" * 4 + "\u2009" * 2
         out = summarize_run(text)
-        # Top segments by frequency rendered; tail collapsed.
+        # Top three by frequency are rendered in full …
         assert "U+00A0 x10" in out
+        assert "U+2003 x7" in out
+        assert "U+3000 x4" in out
+        # … and the fourth (U+2009 x2) collapses into the tail.
+        assert "U+2009" not in out
         assert "+1 more" in out
-
 
 class TestVerticalSignal:
     def test_below_threshold_no_fire(self):
@@ -116,6 +121,49 @@ class TestVerticalSignal:
         assert "vertical" in _kinds(runs)
 
 
+    def test_u2028_line_separator_counts_as_vertical(self):
+        # A >=20-line vertical gap built purely from U+2028 (LINE SEPARATOR)
+        # must be detected even though it has no ASCII LF (issue #20 evasion).
+        sep = "\u2028"
+        content = "header" + sep + (sep * VERTICAL_BLANK_LINES) + "MALICIOUS"
+        runs = detect_whitespace_padding(content)
+        vert = [r for r in runs if r.kind == "vertical"]
+        assert len(vert) == 1
+        assert vert[0].followed_by_content is True
+
+    def test_u2029_paragraph_separator_counts_as_vertical(self):
+        sep = "\u2029"
+        content = "header" + sep + (sep * VERTICAL_BLANK_LINES) + "MALICIOUS"
+        runs = detect_whitespace_padding(content)
+        vert = [r for r in runs if r.kind == "vertical"]
+        assert len(vert) == 1
+        assert vert[0].followed_by_content is True
+
+    def test_padding_after_lf_header_detected(self):
+        # Regression for the body named in the review: a >=20-line gap of U+2028
+        # after an LF-terminated header still fires (mixed separators).
+        content = "header\n" + ("\u2028" * 25) + "MALICIOUS"
+        runs = detect_whitespace_padding(content)
+        assert "vertical" in _kinds(runs)
+
+    def test_lf_vertical_start_line_unchanged(self):
+        # The classic \n-delimited gap must still report the same start_line and
+        # start_offset as before the Unicode-aware split (arithmetic preserved).
+        content = "header\n" + "\n" * VERTICAL_BLANK_LINES + "tail"
+        vert = [r for r in detect_whitespace_padding(content) if r.kind == "vertical"]
+        assert len(vert) == 1
+        assert vert[0].start_line == 2
+        assert vert[0].start_offset == len("header\n")
+
+    def test_crlf_vertical_offsets_correct(self):
+        # CRLF separators are two chars; offsets must still be correct.
+        content = "header\r\n" + "\r\n" * VERTICAL_BLANK_LINES + "tail"
+        vert = [r for r in detect_whitespace_padding(content) if r.kind == "vertical"]
+        assert len(vert) == 1
+        assert vert[0].start_line == 2
+        assert vert[0].start_offset == len("header\r\n")
+
+
 class TestHorizontalSignal:
     def test_below_threshold_no_fire(self):
         content = "x" + " " * (HORIZONTAL_RUN_CHARS - 1) + "y"
@@ -144,17 +192,41 @@ class TestHorizontalSignal:
         assert horiz[0].summary == f"U+00A0 x{HORIZONTAL_RUN_CHARS}"
 
 
+def _block_only_padding(lines: int, chars_per_line: int) -> str:
+    """Build a contiguous whitespace block that does NOT trip vertical/horizontal.
+
+    Uses U+3000 (3 bytes each) so the byte budget is exceeded while staying under
+    both the >=80-char horizontal threshold (``chars_per_line`` < 80) and the >=20
+    blank-line vertical threshold (``lines`` < 20). The whole run (including the
+    line separators, which are padding chars) is one contiguous span, so only the
+    block (and possibly ratio) signal fires — vertical/horizontal do not.
+    """
+    pad_line = "　" * chars_per_line
+    return "a\n" + ("\n".join([pad_line] * lines)) + "\nb"
+
+
 class TestBlockAndRatioSignal:
     def test_block_boundary(self):
-        # Flank with non-padding chars (no newlines) so the contiguous run is
-        # exactly the space block. Exactly at the budget: no fire; one over: fires.
-        at_budget = "a" + " " * BLOCK_BYTE_BUDGET + "b"
-        assert "block" not in _kinds(detect_whitespace_padding(at_budget))
-        over = "a" + " " * (BLOCK_BYTE_BUDGET + 1) + "b"
-        assert "block" in _kinds(detect_whitespace_padding(over))
+        # A run that survives dedup: a contiguous multibyte block under the
+        # vertical (<20 lines) and horizontal (<80 chars/line) thresholds, so the
+        # block signal is reported on its own. Below the byte budget: no block.
+        below = "a\n" + ("\n".join(["　" * 5] * 3)) + "\nb"  # ~ tens of bytes
+        assert "block" not in _kinds(detect_whitespace_padding(below))
+        # 15 lines x 79 U+3000 (3 bytes) = far over BLOCK_BYTE_BUDGET, no vertical
+        # (15 < 20) and no horizontal (79 < 80) run to absorb it.
+        over = _block_only_padding(lines=15, chars_per_line=79)
+        runs = detect_whitespace_padding(over)
+        assert "block" in _kinds(runs)
+        assert "vertical" not in _kinds(runs)
+        assert "horizontal" not in _kinds(runs)
+        block = next(r for r in runs if r.kind == "block")
+        # length is a CHAR count (unit-consistent with start_offset), not bytes.
+        assert block.length == block.end_offset - block.start_offset
 
     def test_ratio_fires_for_large_whitespace_file(self):
-        content = "x" + " " * (RATIO_MIN_FILE_BYTES + 100)
+        # >4KB, >90% whitespace, but no single horizontal run and no vertical gap
+        # (single contiguous line of spaces would be horizontal, so spread it).
+        content = _block_only_padding(lines=19, chars_per_line=79)
         runs = detect_whitespace_padding(content)
         assert "ratio" in _kinds(runs)
 
@@ -255,9 +327,12 @@ class TestIssue20AdversarialEvasionCoverage:
         content = "x" + ch * 100 + "INJECT"
         runs = detect_whitespace_padding(content)
         assert runs, f"no P9 run for in-line U+{ord(ch):04X}"
-        # An in-line run forms a horizontal (and/or block) signal, never vertical.
-        assert "horizontal" in _kinds(runs) or "block" in _kinds(runs), (
-            f"in-line U+{ord(ch):04X} did not fire horizontal/block: {_kinds(runs)}"
+        # Most chars form a horizontal (and/or block) signal. The Unicode line
+        # separators U+2028/U+2029/NEL render as line breaks, so a run of 100 of
+        # them is detected as a VERTICAL gap (100 empty lines) instead — also a
+        # valid P9 hit. Accept any of the three span signals.
+        assert _kinds(runs) & {"horizontal", "block", "vertical"}, (
+            f"in-line U+{ord(ch):04X} fired no span signal: {_kinds(runs)}"
         )
 
     @pytest.mark.parametrize("ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS])
