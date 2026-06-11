@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from skillspector.nodes.analyzers.whitespace_padding import (
     BLOCK_BYTE_BUDGET,
     HORIZONTAL_RUN_CHARS,
@@ -206,3 +208,75 @@ class TestUnicodeEvasionEndToEnd:
             content = "header\n" + ((blank + "\n") * VERTICAL_BLANK_LINES) + "INJECT"
             runs = detect_whitespace_padding(content)
             assert "vertical" in _kinds(runs), f"failed for U+{ord(ch):04X}"
+
+
+# Every padding character enumerated in issue #20's evasion list. Each must cross
+# a P9 detection threshold so injected instructions hidden behind it are flagged.
+#   U+00A0 NBSP, U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR,
+#   U+000B VERTICAL TAB, U+000C FORM FEED, U+3000 IDEOGRAPHIC SPACE,
+#   and the zero-width family U+200B/U+200C/U+200D/U+2060/U+FEFF.
+_ISSUE20_EVASION_CHARS = [
+    " ",  # U+00A0 NO-BREAK SPACE (Zs)
+    " ",  # U+2028 LINE SEPARATOR (Zl)
+    " ",  # U+2029 PARAGRAPH SEPARATOR (Zp)
+    "",  # U+000B VERTICAL TAB
+    "",  # U+000C FORM FEED
+    "　",  # U+3000 IDEOGRAPHIC SPACE (Zs)
+    "​",  # U+200B ZERO WIDTH SPACE
+    "‌",  # U+200C ZERO WIDTH NON-JOINER
+    "‍",  # U+200D ZERO WIDTH JOINER
+    "⁠",  # U+2060 WORD JOINER
+    "﻿",  # U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM
+]
+
+
+class TestIssue20AdversarialEvasionCoverage:
+    """Adversarial self-check: P9 must fire on each issue #20 evasion character.
+
+    Two complementary constructions are exercised for every character:
+
+    * An in-line (horizontal) run of 100 copies of the char before a hidden
+      ``INJECT`` instruction — covers U+00A0/U+3000/U+000B/U+000C and the
+      zero-width family, which form horizontal/block runs within a line.
+    * A vertical run of 25 lines each consisting solely of the char — covers the
+      line-separator characters U+2028/U+2029 (Zl/Zp) whose "vertical-ish" runs
+      sit between a header and the hidden ``INJECT`` line. (All chars also pass
+      this construction since a whitespace-only line is a blank line regardless
+      of which padding char fills it.)
+
+    Both constructions cross a detection threshold (100 >= HORIZONTAL_RUN_CHARS,
+    25 >= VERTICAL_BLANK_LINES). If any character fails to fire, that is a real
+    detector bug per the issue's evasion list.
+    """
+
+    @pytest.mark.parametrize("ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS])
+    def test_inline_run_fires(self, ch: str):
+        assert 100 >= HORIZONTAL_RUN_CHARS
+        content = "x" + ch * 100 + "INJECT"
+        runs = detect_whitespace_padding(content)
+        assert runs, f"no P9 run for in-line U+{ord(ch):04X}"
+        # An in-line run forms a horizontal (and/or block) signal, never vertical.
+        assert "horizontal" in _kinds(runs) or "block" in _kinds(runs), (
+            f"in-line U+{ord(ch):04X} did not fire horizontal/block: {_kinds(runs)}"
+        )
+
+    @pytest.mark.parametrize("ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS])
+    def test_vertical_run_fires(self, ch: str):
+        assert 25 >= VERTICAL_BLANK_LINES
+        content = "header\n" + ((ch + "\n") * 25) + "INJECT"
+        runs = detect_whitespace_padding(content)
+        vert = [r for r in runs if r.kind == "vertical"]
+        assert vert, f"no vertical P9 run for U+{ord(ch):04X}"
+        assert vert[0].followed_by_content is True
+
+    @pytest.mark.parametrize("ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS])
+    def test_p9_analyzer_emits_finding(self, ch: str):
+        """End-to-end: the prompt-injection analyzer emits a P9 finding."""
+        from skillspector.nodes.analyzers import static_patterns_prompt_injection as spi
+
+        content = "x" + ch * 100 + "INJECT"
+        findings = spi.analyze(content, "SKILL.md", "other")
+        p9 = [f for f in findings if f.rule_id == "P9"]
+        assert p9, f"analyzer emitted no P9 finding for U+{ord(ch):04X}"
+        assert p9[0].message == "Whitespace Padding"
+        assert p9[0].matched_text, "P9 finding has empty matched_text"
