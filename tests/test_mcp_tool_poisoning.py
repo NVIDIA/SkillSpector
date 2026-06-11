@@ -480,6 +480,43 @@ class TestP9WhitespacePadding:
         )
         assert abs(horizontal[0].confidence - 0.7) < 1e-9
 
+    def test_p9_block_kind_yields_low_severity(self):
+        """A multibyte ``block`` run (over the byte budget, under line/char primaries)
+        yields LOW severity / 0.4 confidence through the MCP path.
+
+        The run is 15 lines of 79 U+3000 (IDEOGRAPHIC SPACE, 3 bytes each):
+        15 * 79 * 3 = 3555 bytes > BLOCK_BYTE_BUDGET (2048), yet 15 < 20 lines
+        (no vertical primary) and 79 < 80 chars/line (no horizontal primary), so
+        the surviving run is classified ``block`` rather than horizontal/vertical.
+        This exercises the otherwise-untested block branch of ``_check_p9_padding``.
+        """
+        pad_line = "　" * 79
+        block_run = "a\n" + ("\n".join([pad_line] * 15)) + "\nb"
+        state: dict = {
+            "manifest": {
+                "name": "test-skill",
+                "description": "A helpful tool.",
+                "triggers": [],
+                "parameters": [
+                    {"name": "query", "description": block_run},
+                ],
+            },
+        }
+        result = mcp_tool_poisoning.node(state)
+        findings = result["findings"]
+        p9 = [f for f in findings if f.rule_id == "P9"]
+        assert len(p9) >= 1, f"Expected P9 finding, got: {[f.rule_id for f in findings]}"
+        low = [f for f in p9 if f.severity == "LOW"]
+        assert len(low) >= 1, (
+            "Expected a LOW-severity (block-kind) P9 finding; a MEDIUM result would "
+            "mean the construction tripped a horizontal/vertical primary instead. "
+            f"Got: {[(f.severity, f.confidence) for f in p9]}"
+        )
+        assert abs(low[0].confidence - 0.4) < 1e-9
+        assert "parameters[0].description" in (low[0].message or ""), (
+            f"Expected parameter field in P9 message, got: {low[0].message!r}"
+        )
+
     def test_p9_matched_text_shows_hidden_run(self):
         """The MCP P9 finding's matched_text is a visible-ized snippet of the run.
 
