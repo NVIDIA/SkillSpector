@@ -106,6 +106,21 @@ class TestVerticalSignal:
         assert vert[0].followed_by_content is True
         assert vert[0].start_line == 2
 
+    def test_trailing_gap_boundary_no_off_by_one(self):
+        # A gap of blank lines at EOF (no trailing content) must use the same
+        # boundary as a gap followed by content: exactly VERTICAL_BLANK_LINES - 1
+        # trailing blank lines does NOT fire, and VERTICAL_BLANK_LINES does.
+        # "header" + N newlines yields 'header' followed by N empty (blank) lines,
+        # so the synthetic final empty segment is a genuine blank line, not an
+        # off-by-one extra. (Documents codex review finding #1 as handled.)
+        below = "header" + "\n" * (VERTICAL_BLANK_LINES - 1)
+        assert "vertical" not in _kinds(detect_whitespace_padding(below))
+        at = "header" + "\n" * VERTICAL_BLANK_LINES
+        vert = [r for r in detect_whitespace_padding(at) if r.kind == "vertical"]
+        assert len(vert) == 1
+        assert vert[0].length == VERTICAL_BLANK_LINES
+        assert vert[0].followed_by_content is False
+
     def test_followed_by_content_false_when_trailing(self):
         content = "header\n" + "\n" * (VERTICAL_BLANK_LINES + 5)
         runs = detect_whitespace_padding(content)
@@ -224,11 +239,26 @@ class TestBlockAndRatioSignal:
         assert block.length == block.end_offset - block.start_offset
 
     def test_ratio_fires_for_large_whitespace_file(self):
-        # >4KB, >90% whitespace, but no single horizontal run and no vertical gap
-        # (single contiguous line of spaces would be horizontal, so spread it).
+        # >4KB, >90% whitespace, but NO single contiguous block > 2 KB (each line
+        # is broken by a non-padding char so the longest padding span is small),
+        # no horizontal run (60 < 80) and no vertical gap (lines are non-blank).
+        # This isolates the ratio signal so block dedup does not absorb it.
+        content = "\n".join(["a" + " " * 60 for _ in range(120)])
+        runs = detect_whitespace_padding(content)
+        kinds = _kinds(runs)
+        assert "ratio" in kinds
+        assert "block" not in kinds
+
+    def test_block_and_ratio_dedup_to_single_finding(self):
+        # When a file trips BOTH the block (contiguous > 2 KB) and ratio (> 90%
+        # of a > 4 KB file) signals with no vertical/horizontal primary, signal 3
+        # must report at most ONE finding per file: the more specific "block",
+        # with the redundant "ratio" suppressed.
         content = _block_only_padding(lines=19, chars_per_line=79)
         runs = detect_whitespace_padding(content)
-        assert "ratio" in _kinds(runs)
+        signal3 = [r for r in runs if r.kind in ("block", "ratio")]
+        assert len(signal3) == 1
+        assert signal3[0].kind == "block"
 
     def test_ratio_not_for_small_file(self):
         content = " " * 100
