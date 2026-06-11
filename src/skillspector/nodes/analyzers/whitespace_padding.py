@@ -401,12 +401,18 @@ def detect_whitespace_padding(
 
     # "ratio" spans the whole file (offset 0..len), so treat it as covered when
     # any primary run exists (a primary run is always a subspan of the file).
+    # Signal 3 reports at most ONE finding per file: when both "block" and
+    # "ratio" qualify for the same oversized-whitespace condition, prefer the
+    # more specific/localized "block" run and drop the redundant "ratio".
     deduped_block_ratio: list[PaddingRun] = []
+    block_kept = False
     for run in block_ratio:
         if run.kind == "block" and _overlaps_primary(run):
             continue
-        if run.kind == "ratio" and primary:
+        if run.kind == "ratio" and (primary or block_kept):
             continue
+        if run.kind == "block":
+            block_kept = True
         deduped_block_ratio.append(run)
 
     return vertical + horizontal + deduped_block_ratio
