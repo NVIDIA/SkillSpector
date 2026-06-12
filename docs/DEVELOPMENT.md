@@ -266,6 +266,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). | `gpt-5.2` |
+| `SKILLSPECTOR_MAX_CONCURRENCY` | Maximum concurrent LLM requests. Defaults to 5 if unset. Lower values reduce rate limits but increase scan time. | `7` |
 
 ### Constants, token budgets, and LLM
 
