@@ -60,9 +60,9 @@ dev = [
 skillspector = "skillspector.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/NVIDIA/skillspector"
-Documentation = "https://github.com/NVIDIA/skillspector#readme"
-Issues = "https://github.com/NVIDIA/skillspector/issues"
+Homepage = "https://github.com/NVIDIA/SkillSpector"
+Documentation = "https://github.com/NVIDIA/SkillSpector#readme"
+Issues = "https://github.com/NVIDIA/SkillSpector/issues"
 
 [tool.hatch.build]
 exclude = [".claude/", ".cursor/", ".agents/"]

@@ -32,8 +32,8 @@ Create and activate a virtual environment first (all `make` targets assume the v
 
 ```bash
 # Clone the repository
-git clone https://github.com/NVIDIA/skillspector.git
-cd skillspector
+git clone https://github.com/NVIDIA/SkillSpector.git
+cd SkillSpector
 
 # Create and activate virtual environment
 uv venv .venv && source .venv/bin/activate
@@ -344,7 +344,7 @@ Issues (2)
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's default model. See the LLM Analysis table for each provider's default. | Optional |
-| `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>.yaml`) with a custom path. | Optional |
+| `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 
 ### CLI Options
@@ -368,8 +368,8 @@ All `make` targets assume a virtual environment is already created and activated
 
 ```bash
 # Clone, create venv, activate, install dev dependencies
-git clone https://github.com/NVIDIA/skillspector.git
-cd skillspector
+git clone https://github.com/NVIDIA/SkillSpector.git
+cd SkillSpector
 uv venv .venv && source .venv/bin/activate
 # or: python3 -m venv .venv && source .venv/bin/activate
 make install-dev
@@ -466,4 +466,4 @@ Contributions are welcome! Please read our contributing guidelines and submit pu
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/NVIDIA/skillspector/issues)
+- **Issues**: [GitHub Issues](https://github.com/NVIDIA/SkillSpector/issues)
