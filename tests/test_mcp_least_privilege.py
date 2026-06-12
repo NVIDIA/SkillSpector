@@ -258,6 +258,32 @@ class TestLP3NoPermissions:
         assert lp3.file == "SKILL.md"
 
 
+class TestLP3AllowedTools:
+    def test_allowed_tools_list_no_lp3(self):
+        """allowed-tools list form ([Bash, Read]) is a declaration → no LP3."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = ["Bash", "Read"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp3_findings = [f for f in findings if f.rule_id == "LP3"]
+        assert lp3_findings == [], (
+            f"allowed-tools should satisfy LP3, got: {[f.rule_id for f in findings]}"
+        )
+
+    def test_allowed_tools_comma_string_no_lp3(self):
+        """allowed-tools comma-string form ('Bash, Read') is also a declaration → no LP3."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = "Bash, Read"
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp3_findings = [f for f in findings if f.rule_id == "LP3"]
+        assert lp3_findings == [], (
+            f"allowed-tools should satisfy LP3, got: {[f.rule_id for f in findings]}"
+        )
+
+
 class TestLP4OverDeclared:
     def test_over_declared_detected(self):
         """mcp_overprivileged_skill declares bash/network/write but code only reads → LP4 for network and write."""
