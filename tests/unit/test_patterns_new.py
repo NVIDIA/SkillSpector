@@ -869,6 +869,66 @@ class TestSupplyChainDependencies:
         findings = sc_mod._analyze_dependencies("requests==2.31.0\n", "README.md")
         assert len(findings) == 0
 
+    def test_pyproject_metadata_keys_not_treated_as_packages(self) -> None:
+        """PEP 621 metadata keys (requires-python, name, ...) are not dependencies."""
+        content = (
+            "[project]\n"
+            'name = "example"\n'
+            'version = "0.1.0"\n'
+            'requires-python = ">=3.12"\n'
+            'dependencies = ["httpx>=0.28"]\n'
+        )
+        names = [p[0] for p in sc_mod._extract_packages_from_pyproject(content)]
+        assert names == ["httpx"]
+
+    def test_pyproject_optional_and_group_deps_extracted(self) -> None:
+        """optional-dependencies and PEP 735 dependency-groups are real packages."""
+        content = (
+            "[project]\n"
+            'dependencies = ["httpx"]\n'
+            "[project.optional-dependencies]\n"
+            'test = ["pytest>=8"]\n'
+            "[dependency-groups]\n"
+            'dev = ["ruff"]\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        assert names == ["httpx", "pytest", "ruff"]
+
+    def test_pyproject_malformed_returns_no_packages(self) -> None:
+        """Unparseable TOML yields no packages rather than raising."""
+        assert sc_mod._extract_packages_from_pyproject("[project\nbroken =") == []
+
+    def test_pyproject_vanilla_has_no_findings(self) -> None:
+        """A normal pyproject.toml produces no SC findings (regression for issue #2)."""
+        content = (
+            '[project]\nname = "example"\nrequires-python = ">=3.12"\ndependencies = ["httpx"]\n'
+        )
+        assert _analyze_deps(content, "pyproject.toml") == []
+
+    def test_pyproject_vulnerable_dependency_still_detected(self) -> None:
+        """Real vulnerable deps in pyproject are still flagged (SC4 via static fallback)."""
+        content = '[project]\nrequires-python = ">=3.12"\ndependencies = ["pycrypto==2.6.1"]\n'
+        sc4 = [f for f in _analyze_deps(content, "pyproject.toml") if f.rule_id == "SC4"]
+        assert len(sc4) >= 1
+        assert "pycrypto" in sc4[0].message.lower() or "CVE" in sc4[0].message
+
+    def test_pyproject_no_project_table(self) -> None:
+        """A tool-only pyproject (no [project] table) yields no packages."""
+        assert sc_mod._extract_packages_from_pyproject("[tool.black]\nline-length = 88\n") == []
+
+    def test_pyproject_skips_non_pep508_and_include_group_entries(self) -> None:
+        """Non-string group entries and non-PEP 508 strings are ignored."""
+        content = (
+            "[project]\n"
+            'name = "x"\n'  # no dependencies key
+            "[project.optional-dependencies]\n"
+            'test = ["pytest"]\n'
+            "[dependency-groups]\n"
+            'dev = ["ruff", {include-group = "test"}, "_bad"]\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        assert names == ["pytest", "ruff"]
+
 
 # ── Supply Chain Safe Patterns (SC2) ───────────────────────────────────
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
@@ -423,6 +424,49 @@ def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | N
     return results
 
 
+def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None, int]]:
+    """Extract (package_name, version_or_None, line_number) from pyproject.toml.
+
+    Only PEP 621 ``[project]`` ``dependencies`` / ``optional-dependencies`` and
+    PEP 735 ``[dependency-groups]`` hold real packages. Standard metadata keys
+    (``requires-python``, ``name``, ``version``, ...) are not dependencies and
+    must not be looked up as packages.
+    """
+    try:
+        data = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return []
+
+    specs: list[str] = []
+    project = data.get("project")
+    if isinstance(project, dict):
+        deps = project.get("dependencies")
+        if isinstance(deps, list):
+            specs.extend(d for d in deps if isinstance(d, str))
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, dict):
+            for group in optional.values():
+                if isinstance(group, list):
+                    specs.extend(d for d in group if isinstance(d, str))
+    groups = data.get("dependency-groups")
+    if isinstance(groups, dict):
+        for group in groups.values():
+            if isinstance(group, list):
+                specs.extend(d for d in group if isinstance(d, str))
+
+    results: list[tuple[str, str | None, int]] = []
+    for spec in specs:
+        m = re.match(r"^([a-zA-Z][a-zA-Z0-9._-]*)(?:\[.*?\])?\s*(?:([=<>!~]=?)\s*([\d.*]+))?", spec)
+        if not m:
+            continue
+        name = m.group(1)
+        version = m.group(3) if m.group(2) in ("==", "<=") else None
+        idx = content.find(spec)
+        line_num = get_line_number(content, idx) if idx >= 0 else 1
+        results.append((name, version, line_num))
+    return results
+
+
 def _version_lt(v1: str, v2: str) -> bool:
     """Simple version comparison: True if v1 < v2 (numeric tuple comparison)."""
 
@@ -695,7 +739,10 @@ def _analyze_dependencies(
         return findings
 
     if is_python_dep:
-        packages = _extract_packages_from_requirements(content)
+        if "pyproject.toml" in lower_path:
+            packages = _extract_packages_from_pyproject(content)
+        else:
+            packages = _extract_packages_from_requirements(content)
         ecosystem = ECOSYSTEM_PYPI
         fallback_db = _FALLBACK_VULNERABLE_PYPI
         popular = _POPULAR_PYPI
