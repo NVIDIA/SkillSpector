@@ -484,6 +484,42 @@ class TestARunBatches:
 
         assert seen_files == {f"file_{i}.py" for i in range(num_batches)}
 
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_failed_batch_does_not_abort_the_others(self) -> None:
+        """A transient failure costs only its own batch, not the whole fan-out."""
+
+        async def _flaky_ainvoke(prompt: str) -> LLMAnalysisResult:
+            if "b.py" in prompt:
+                raise RuntimeError("429 Too Many Requests")
+            return LLMAnalysisResult(findings=[])
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = _flaky_ainvoke
+
+        batches = [
+            Batch(file_path="a.py", content="code a"),
+            Batch(file_path="b.py", content="code b"),
+            Batch(file_path="c.py", content="code c"),
+        ]
+        results = await analyzer.arun_batches(batches)
+        assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_all_batches_failed_returns_empty(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=RuntimeError("boom"))
+        batches = [Batch(file_path="a.py", content="code")]
+        assert await analyzer.arun_batches(batches) == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_value_error_still_propagates(self) -> None:
+        """ValueError signals misconfiguration, not infra trouble — never swallowed."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=ValueError("no API key"))
+        batches = [Batch(file_path="a.py", content="code")]
+        with pytest.raises(ValueError, match="no API key"):
+            await analyzer.arun_batches(batches)
+
 
 # ---------------------------------------------------------------------------
 # _format_findings_for_prompt (per-file, no truncation)
