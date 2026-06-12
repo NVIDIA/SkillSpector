@@ -105,7 +105,7 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     return response.content or ""
 
 
-def retry_llm_call_sync(call_func, max_attempts=3):
+def retry_llm_call_sync(call_func, max_attempts=4):
     """Retry transient LLM errors (429, timeout) with exponential backoff (sync)."""
     for attempt in range(max_attempts):
         try:
@@ -130,7 +130,7 @@ def retry_llm_call_sync(call_func, max_attempts=3):
             time.sleep(wait)
 
 
-async def retry_llm_call(coro_func, max_attempts=3):
+async def retry_llm_call(coro_func, max_attempts=4):
     """Retry transient LLM errors (429, timeout) with exponential backoff (async)."""
     for attempt in range(max_attempts):
         try:
