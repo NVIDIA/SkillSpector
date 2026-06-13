@@ -172,3 +172,48 @@ class TestRunStaticPatternsFileTypeAndSkip:
         state = {"components": [], "file_cache": {}}
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
         assert findings == []
+
+
+class TestRunStaticPatternsTrojanSource:
+    """run_static_patterns with prompt_injection P9: bidirectional control chars (Trojan Source)."""
+
+    def test_p9_rlo_override_in_source_code_produces_finding(self):
+        """An RLO override (U+202E) inside a .py file yields P9, HIGH severity.
+
+        This is the Trojan Source gap (CVE-2021-42574): P2 only scans markdown, so
+        bidi-reordered source code was previously undetected by any analyzer.
+        """
+        state = {
+            "components": ["helper.py"],
+            "file_cache": {
+                "helper.py": "access_level = 'user'  # \u202eadmin not\u202c\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        p9 = [f for f in findings if f.rule_id == "P9"]
+        assert len(p9) >= 1
+        assert p9[0].severity == "HIGH"
+        assert p9[0].file == "helper.py"
+        assert p9[0].start_line >= 1
+        assert p9[0].remediation is not None
+        assert p9[0].matched_text == "U+202E"
+
+    def test_p9_isolate_in_markdown_produces_finding(self):
+        """A right-to-left isolate (U+2067) in SKILL.md body yields P9."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": "# Title\n\nNormal text \u2067hidden\u2069 here.\n"},
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert any(f.rule_id == "P9" for f in findings)
+
+    def test_safe_content_with_legitimate_rtl_no_p9(self):
+        """Legitimate RTL letters carry inherent directionality and must NOT trigger P9."""
+        state = {
+            "components": ["notes.md"],
+            "file_cache": {
+                "notes.md": "# Notes\n\nمرحبا بالعالم\n\nHello world.\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert not any(f.rule_id == "P9" for f in findings)
