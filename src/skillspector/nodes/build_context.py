@@ -77,8 +77,8 @@ def _walk_skill_files(skill_dir: Path, exclude_patterns: list[str] | None = None
     """Walk skill directory and return sorted relative path strings.
 
     Skips _SKIP_DIRS and hidden files except those starting with .claude.
-    Also skips paths matching any glob in ``exclude_patterns`` (fnmatch
-    semantics, matched against the path relative to ``skill_dir``).
+    Also skips paths matching shell-style patterns in ``exclude_patterns``
+    (Python fnmatch semantics, matched against paths relative to ``skill_dir``).
     """
     patterns = exclude_patterns or []
     paths: list[str] = []

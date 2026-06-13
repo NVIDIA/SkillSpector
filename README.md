@@ -61,10 +61,16 @@ skillspector scan https://github.com/user/my-skill
 # Scan a zip file
 skillspector scan ./my-skill.zip
 
-# Exclude paths by fnmatch-style glob pattern (repeatable). Useful for
+# Exclude paths by shell-style pattern (repeatable). Useful for
 # binary assets that can trip up the regex scanner with false positives.
 skillspector scan ./my-skill/ --exclude '*.pdf' --exclude 'assets/*'
 ```
+
+`--exclude` accepts shell-style patterns (`*`, `?`, and character ranges) matched
+against paths relative to the scan root. Quote patterns so your shell passes them
+through unchanged. Matching uses Python `fnmatch`, where `/` is not treated as a
+directory boundary; for example, `*.pdf` matches `assets/template.pdf`, and
+`assets/*` matches nested files under `assets/`.
 
 ### Output Formats
 
@@ -360,7 +366,7 @@ Options:
   -f, --format [terminal|json|markdown|sarif]  Output format [default: terminal]
   -o, --output PATH                            Output file path
   --no-llm                                     Skip LLM analysis (static only)
-  --exclude GLOB_PATTERN                       Exclude paths matching an fnmatch-style pattern relative to the scan root. Repeatable.
+  --exclude GLOB_PATTERN                       Exclude paths matching a shell-style pattern relative to the scan root. Repeatable.
   -V, --verbose                                Show detailed progress
   --help                                       Show this message and exit
 ```
