@@ -178,7 +178,7 @@ def scan(
         list[str] | None,
         typer.Option(
             "--exclude",
-            help="Glob pattern (relative to scan root) to exclude from the scan. Repeatable.",
+            help="Exclude paths matching an fnmatch-style pattern relative to the scan root. Repeatable.",
         ),
     ] = None,
     verbose: Annotated[
