@@ -366,7 +366,7 @@ Options:
   -f, --format [terminal|json|markdown|sarif]  Output format [default: terminal]
   -o, --output PATH                            Output file path
   --no-llm                                     Skip LLM analysis (static only)
-  --exclude GLOB_PATTERN                       Exclude paths matching a shell-style pattern relative to the scan root. Repeatable.
+  --exclude PATTERN                            Exclude paths matching a shell-style pattern relative to the scan root. Repeatable.
   -V, --verbose                                Show detailed progress
   --help                                       Show this message and exit
 ```

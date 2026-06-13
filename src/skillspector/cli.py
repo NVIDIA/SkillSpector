@@ -178,7 +178,7 @@ def scan(
         list[str] | None,
         typer.Option(
             "--exclude",
-            metavar="GLOB_PATTERN",
+            metavar="PATTERN",
             help="Exclude paths matching a shell-style pattern relative to the scan root. Repeatable.",
         ),
     ] = None,
