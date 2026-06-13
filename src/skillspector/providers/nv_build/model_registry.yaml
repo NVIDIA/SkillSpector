@@ -26,3 +26,24 @@ models:
   "openai/gpt-oss-120b":
     context_length: 128000
     max_output_tokens: 16384
+
+  # Google Gemini models (via VertexAI or AI Studio OpenAI-compatible endpoints)
+  "gemini-2.0-flash":
+    context_length: 1048576
+    max_output_tokens: 8192
+
+  "gemini-2.5-pro":
+    context_length: 1000000
+    max_output_tokens: 65536
+
+  "gemini-2.5-flash":
+    context_length: 1048576
+    max_output_tokens: 65535
+
+  "gemini-3.1-pro":
+    context_length: 1000000
+    max_output_tokens: 65536
+
+  "gemini-3.5-flash":
+    context_length: 1048576
+    max_output_tokens: 8192
