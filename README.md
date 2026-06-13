@@ -123,6 +123,40 @@ skillspector scan ./my-skill/
 skillspector scan ./my-skill/ --no-llm
 ```
 
+### MCP Server
+
+Run SkillSpector as a [Model Context Protocol](https://modelcontextprotocol.io)
+server so any MCP-capable agent (Claude Code, Codex CLI, Gemini CLI) or remote
+runtime can call scanning as a tool and **gate skill/MCP installs on the
+result** — turning SkillSpector into a runtime guardrail instead of an
+out-of-band audit step.
+
+```bash
+# Install the optional MCP dependency
+pip install "skillspector[mcp]"
+
+# stdio transport — for local CLI agents
+skillspector mcp
+
+# streamable HTTP/SSE transport — for remote / A2A callers
+skillspector mcp --transport http --host 127.0.0.1 --port 8000
+```
+
+The server exposes a single tool:
+
+- **`scan_skill(target, use_llm=true, output_format="json")`** — scans a Git
+  URL, file URL, `.zip`, `.md` file, or directory and returns a structured
+  verdict: `risk_score` (0-100), `severity`, `recommendation`,
+  `safe_to_install`, and `findings`. It also reports `llm_used` / `scan_mode`
+  so a low score from a static-only scan is never mistaken for a clean full
+  scan.
+
+Register it with Claude Code via:
+
+```bash
+claude mcp add skillspector -- skillspector mcp
+```
+
 ## Vulnerability Patterns
 
 SkillSpector detects **64 vulnerability patterns** across 16 categories:
