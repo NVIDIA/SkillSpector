@@ -61,8 +61,8 @@ skillspector scan https://github.com/user/my-skill
 # Scan a zip file
 skillspector scan ./my-skill.zip
 
-# Exclude files by glob (repeatable). Useful for binary assets that
-# can trip up the regex scanner with false positives.
+# Exclude paths by fnmatch-style glob pattern (repeatable). Useful for
+# binary assets that can trip up the regex scanner with false positives.
 skillspector scan ./my-skill/ --exclude '*.pdf' --exclude 'assets/*'
 ```
 
@@ -360,7 +360,7 @@ Options:
   -f, --format [terminal|json|markdown|sarif]  Output format [default: terminal]
   -o, --output PATH                            Output file path
   --no-llm                                     Skip LLM analysis (static only)
-  --exclude TEXT                               Glob (relative to scan root) to exclude. Repeatable.
+  --exclude GLOB_PATTERN                       Exclude paths matching an fnmatch-style pattern relative to the scan root. Repeatable.
   -V, --verbose                                Show detailed progress
   --help                                       Show this message and exit
 ```
