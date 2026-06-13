@@ -15,6 +15,7 @@
 
 """Tests for skillspector CLI (skillspector scan, --version)."""
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -22,6 +23,15 @@ from typer.testing import CliRunner
 from skillspector.cli import app
 
 runner = CliRunner()
+
+
+# Minimal PDF-like bytes containing a TM1 trigger (shell=True). The static
+# pattern scanner reads files with utf-8 + errors='replace', so binary assets
+# can match regex patterns and produce spurious HIGH findings — which is
+# exactly the false positive --exclude is meant to suppress.
+_PDF_WITH_TM1 = (
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n% subprocess.run(cmd, shell=True)\n%%EOF\n"
+)
 
 
 def test_cli_version() -> None:
@@ -67,3 +77,81 @@ def test_cli_scan_nonexistent_exits_2() -> None:
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])
     assert result.exit_code == 2
     assert "Error" in result.output or "error" in result.output.lower()
+
+
+def _make_pdf_fixture_skill(root: Path) -> Path:
+    """Create a skill dir whose only non-SKILL.md file is a PDF carrying TM1 bytes."""
+    skill_dir = root / "skill"
+    (skill_dir / "assets").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: exclude-test\n---\n# Skill\n", encoding="utf-8")
+    (skill_dir / "assets" / "template-style.pdf").write_bytes(_PDF_WITH_TM1)
+    return skill_dir
+
+
+def test_cli_scan_exclude_drops_pdf_from_components_and_findings(tmp_path: Path) -> None:
+    """--exclude '*.pdf' skips the PDF: no findings raised against it, not in components."""
+    skill_dir = _make_pdf_fixture_skill(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill_dir),
+            "--format",
+            "json",
+            "--no-llm",
+            "--exclude",
+            "*.pdf",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    component_paths = [c.get("path") for c in report.get("components", [])]
+    assert "assets/template-style.pdf" not in component_paths
+    issues = report.get("issues", [])
+    assert all(i.get("location", {}).get("file") != "assets/template-style.pdf" for i in issues)
+
+
+def test_cli_scan_exclude_repeatable(tmp_path: Path) -> None:
+    """Multiple --exclude flags compose; each pattern filters independently."""
+    skill_dir = _make_pdf_fixture_skill(tmp_path)
+    (skill_dir / "notes.txt").write_text("plain text", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill_dir),
+            "--format",
+            "json",
+            "--no-llm",
+            "--exclude",
+            "*.pdf",
+            "--exclude",
+            "*.txt",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    component_paths = [c.get("path") for c in report.get("components", [])]
+    assert "assets/template-style.pdf" not in component_paths
+    assert "notes.txt" not in component_paths
+
+
+def test_cli_scan_exclude_everything_succeeds(tmp_path: Path) -> None:
+    """Excluding every file is valid: scan succeeds with no findings."""
+    skill_dir = _make_pdf_fixture_skill(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill_dir),
+            "--format",
+            "json",
+            "--no-llm",
+            "--exclude",
+            "*",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert report.get("components", []) == []
+    assert report.get("issues", []) == []
