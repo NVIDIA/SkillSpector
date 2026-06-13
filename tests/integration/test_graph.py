@@ -18,6 +18,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from skillspector.graph import graph
 
 
@@ -28,6 +30,7 @@ def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
         {
             "skill_path": str(tmp_path),
             "output_format": "json",
+            "use_llm": False,
         }
     )
     body = result.get("report_body", "")
@@ -39,9 +42,9 @@ def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
     assert "components" in data
 
 
-def test_graph_invoke_returns_findings_and_report() -> None:
+def test_graph_invoke_returns_findings_and_report(tmp_path: Path) -> None:
     """Graph runs to completion; returns findings, SARIF report, report_body, risk_score."""
-    result = graph.invoke({"skill_path": "/tmp/dummy-skill"})
+    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
 
     assert "findings" in result
     assert isinstance(result["findings"], list)
@@ -50,3 +53,15 @@ def test_graph_invoke_returns_findings_and_report() -> None:
     assert "report_body" in result
     assert result["risk_score"] >= 0
     assert isinstance(result["report_body"], str)
+
+
+def test_graph_invalid_skill_path_raises() -> None:
+    """Invalid skill_path raises instead of returning a clean low-risk report."""
+    with pytest.raises(ValueError, match="not an existing directory"):
+        graph.invoke(
+            {
+                "skill_path": "/nonexistent/path/xyz",
+                "output_format": "json",
+                "use_llm": False,
+            }
+        )
