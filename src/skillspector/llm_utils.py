@@ -29,7 +29,9 @@ configured via the standard ``OPENAI_*`` envs.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 
 from langchain_openai import ChatOpenAI
 
@@ -101,3 +103,53 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     llm = get_chat_model(model=model)
     response = llm.invoke(prompt)
     return response.content or ""
+
+
+def retry_llm_call_sync(call_func, max_attempts=4):
+    """Retry transient LLM errors (429, timeout) with exponential backoff (sync)."""
+    for attempt in range(max_attempts):
+        try:
+            return call_func()  # Call it each retry
+        except Exception as e:
+            error_str = str(e).lower()
+            error_name = type(e).__name__.lower()
+
+            is_retryable = (
+                "429" in error_str
+                or "ratelimit" in error_name
+                or "timeout" in error_name
+                or "timeout" in error_str
+            )
+
+            if not is_retryable:
+                raise
+            if attempt == max_attempts - 1:
+                raise
+
+            wait = 2**attempt
+            time.sleep(wait)
+
+
+async def retry_llm_call(coro_func, max_attempts=4):
+    """Retry transient LLM errors (429, timeout) with exponential backoff (async)."""
+    for attempt in range(max_attempts):
+        try:
+            return await coro_func()
+        except Exception as e:
+            error_str = str(e).lower()
+            error_name = type(e).__name__.lower()
+
+            is_retryable = (
+                "429" in error_str
+                or "ratelimit" in error_name
+                or "timeout" in error_name
+                or "timeout" in error_str
+            )
+
+            if not is_retryable:
+                raise
+            if attempt == max_attempts - 1:
+                raise
+
+            wait = 2**attempt
+            await asyncio.sleep(wait)

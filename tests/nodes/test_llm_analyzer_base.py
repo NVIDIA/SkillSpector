@@ -1225,3 +1225,88 @@ class TestTokenBudgetFunctions:
         out = get_max_output_tokens("unknown/model")
         assert inp == int(mocked_ctx * 0.75)
         assert out == int(mocked_ctx * 0.25)
+
+
+# ---------------------------------------------------------------------------
+# Rate limit retry tests
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitRetry:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_run_batches_retries_on_429(self) -> None:
+        """Verify sync batch processing retries when 429 is raised."""
+        calls = 0
+        original_response = LLMAnalysisResult(
+            findings=[LLMFinding(rule_id="T-1", message="hit", severity="LOW", start_line=1)]
+        )
+
+        def flaky_invoke(prompt: str) -> LLMAnalysisResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise Exception("429 Too Many Requests")
+            return original_response
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = flaky_invoke
+        batch = Batch(file_path="a.py", content="code")
+
+        results = analyzer.run_batches([batch])
+        assert len(results) == 1
+        assert results[0][1][0].rule_id == "T-1"
+        assert calls == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_arun_batches_retries_on_429(self) -> None:
+        """Verify async batch processing retries when 429 is raised."""
+        calls = 0
+        original_response = LLMAnalysisResult(
+            findings=[LLMFinding(rule_id="T-1", message="hit", severity="LOW", start_line=1)]
+        )
+
+        async def flaky_ainvoke(prompt: str) -> LLMAnalysisResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise Exception("429 Too Many Requests")
+            return original_response
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = flaky_ainvoke
+        batch = Batch(file_path="a.py", content="code")
+
+        results = await analyzer.arun_batches([batch])
+        assert len(results) == 1
+        assert results[0][1][0].rule_id == "T-1"
+        assert calls == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_run_batches_fails_after_max_retries(self) -> None:
+        """Verify sync processing fails after exhausting retries."""
+
+        def always_fails(prompt: str) -> LLMAnalysisResult:
+            raise Exception("429 Too Many Requests")
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = always_fails
+        batch = Batch(file_path="a.py", content="code")
+
+        with pytest.raises(Exception, match="429"):
+            analyzer.run_batches([batch])
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_arun_batches_fails_after_max_retries(self) -> None:
+        """Verify async processing fails after exhausting retries."""
+
+        async def always_fails(prompt: str) -> LLMAnalysisResult:
+            raise Exception("429 Too Many Requests")
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = always_fails
+        batch = Batch(file_path="a.py", content="code")
+
+        with pytest.raises(Exception, match="429"):
+            await analyzer.arun_batches([batch])
