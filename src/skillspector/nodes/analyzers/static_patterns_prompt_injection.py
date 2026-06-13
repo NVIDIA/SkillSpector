@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: prompt injection (P1–P4). Node and analyze() in one module."""
+"""Static patterns: prompt injection (P1–P4, P9). Node and analyze() in one module."""
 
 from __future__ import annotations
 
@@ -114,10 +114,24 @@ P4_PATTERNS = [
         0.75,
     ),
 ]
+# P9: Bidirectional Control Characters (Trojan Source — CVE-2021-42574 / CVE-2021-42694).
+# These invisible Unicode controls reorder how source code or text is *displayed* without
+# changing what is *executed*, so a human reviewer can see different logic than the
+# interpreter runs. Unlike P2 (zero-width chars, markdown only), P9 scans every file type,
+# including source code where Trojan Source attacks hide. The left-to-right / right-to-left
+# overrides (LRO/RLO) are the core attack primitive; embeddings and isolates are weaker signals.
+P9_OVERRIDE_PATTERN = r"[\u202d\u202e]"  # LRO (U+202D), RLO (U+202E)
+P9_EMBED_PATTERN = (
+    r"[\u202a\u202b\u202c\u2066\u2067\u2068\u2069\u061c]"  # LRE/RLE/PDF, isolates, ALM
+)
+P9_PATTERNS = [
+    (P9_OVERRIDE_PATTERN, 0.9),
+    (P9_EMBED_PATTERN, 0.7),
+]
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Analyze content for prompt injection patterns (P1–P4)."""
+    """Analyze content for prompt injection patterns (P1–P4, P9)."""
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:
@@ -187,6 +201,22 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                )
+            )
+    # P9 runs on every file type — Trojan Source attacks hide in source code, not just prose.
+    for pattern, confidence in P9_PATTERNS:
+        for match in re.finditer(pattern, content):
+            line_num = get_line_number(content, match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="P9",
+                    message="Bidirectional Control Characters",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(match.start()),
+                    matched_text=f"U+{ord(match.group(0)):04X}",
                 )
             )
     return findings
