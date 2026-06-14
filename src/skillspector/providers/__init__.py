@@ -72,6 +72,17 @@ def get_metadata_provider() -> ModelMetadataProvider:
     return _select_active_provider()
 
 
+def is_anthropic_provider() -> bool:
+    """Return ``True`` when the active provider is Anthropic.
+
+    Anthropic is selected only via an explicit ``SKILLSPECTOR_PROVIDER=anthropic``
+    (see :func:`_select_active_provider`).  Callers use this to apply
+    Anthropic-specific tool-schema handling without paying the cost of
+    constructing the provider.
+    """
+    return os.environ.get("SKILLSPECTOR_PROVIDER", "").strip().lower() == "anthropic"
+
+
 def resolve_provider_credentials() -> tuple[str, str | None] | None:
     """Return ``(api_key, base_url)`` from the active provider.
 
@@ -85,5 +96,6 @@ __all__ = [
     "CredentialsProvider",
     "ModelMetadataProvider",
     "get_metadata_provider",
+    "is_anthropic_provider",
     "resolve_provider_credentials",
 ]
