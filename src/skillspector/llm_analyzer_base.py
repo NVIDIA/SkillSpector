@@ -374,6 +374,14 @@ class LLMAnalyzerBase:
         *max_concurrency* LLM requests in parallel.  Both cross-file and
         cross-chunk batches are parallelized in a single gather call.
 
+        Failures are isolated per batch: a transient error (timeout, 429,
+        oversized-chunk 400, ...) costs only its own batch, which is logged
+        and omitted from the result, so one bad call cannot cancel the rest
+        of the fan-out.  Callers can detect partial results by comparing the
+        returned batches against the submitted ones.  ``ValueError`` and
+        ``NotImplementedError`` signal misconfiguration rather than infra
+        trouble and keep propagating.
+
         The return type mirrors :meth:`run_batches`.
         """
         sem = asyncio.Semaphore(max_concurrency)
@@ -394,7 +402,16 @@ class LLMAnalyzerBase:
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 
-        return list(await asyncio.gather(*[_process(b) for b in batches]))
+        results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
+        successful: list[tuple[Batch, list]] = []
+        for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, (ValueError, NotImplementedError)):
+                raise result
+            if isinstance(result, BaseException):
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                continue
+            successful.append(result)
+        return successful
 
     # -- Convenience --------------------------------------------------------
 

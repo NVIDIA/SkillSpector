@@ -392,7 +392,28 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         )
 
         batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
-        filtered = analyzer.apply_filter(findings, batch_results)
+
+        if len(batch_results) < len(batches):
+            # Some batches never returned. A finding the LLM never saw has no
+            # verdict — keep it via the fallback path instead of letting
+            # apply_filter treat the missing confirmation as a rejection.
+            analysed_ids = {id(f) for batch, _ in batch_results for f in batch.findings}
+            analysed = [f for f in findings if id(f) in analysed_ids]
+            unanalysed = [f for f in findings if id(f) not in analysed_ids]
+        else:
+            analysed, unanalysed = findings, []
+
+        filtered = analyzer.apply_filter(analysed, batch_results)
+        if unanalysed:
+            logger.warning(
+                "Meta-analyzer: %d/%d batches failed; keeping %d findings in %d "
+                "files unfiltered (no LLM verdict)",
+                len(batches) - len(batch_results),
+                len(batches),
+                len(unanalysed),
+                len({f.file for f in unanalysed}),
+            )
+            filtered.extend(_fallback_filtered(unanalysed))
 
         logger.debug(
             "LLM filtering done: %d findings -> %d after filter",
