@@ -29,13 +29,32 @@ configured via the standard ``OPENAI_*`` envs.
 
 from __future__ import annotations
 
-import os
-
 from langchain_openai import ChatOpenAI
 
-from skillspector.constants import MODEL_CONFIG
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
-from skillspector.providers import resolve_provider_credentials
+from skillspector.providers import get_metadata_provider, resolve_provider_credentials
+from skillspector.providers.openai import OpenAIProvider
+
+
+def _resolve_llm_client_config() -> tuple[str, str | None, str]:
+    """Return ``(api_key, base_url, default_model)`` for the resolved endpoint."""
+    creds = resolve_provider_credentials()
+    if creds is not None:
+        api_key, base_url = creds
+        return api_key, base_url, get_metadata_provider().resolve_model()
+
+    openai_provider = OpenAIProvider()
+    openai_creds = openai_provider.resolve_credentials()
+    if openai_creds is not None:
+        api_key, base_url = openai_creds
+        return api_key, base_url, openai_provider.resolve_model()
+
+    raise ValueError(
+        "No LLM API key configured. Set the credential env var for the "
+        "active provider, or set OPENAI_API_KEY (and optionally "
+        "OPENAI_BASE_URL) to use a standard OpenAI-compatible endpoint. "
+        "Use --no-llm to skip LLM analysis and run static checks only."
+    )
 
 
 def _resolve_llm_credentials() -> tuple[str, str | None]:
@@ -47,20 +66,7 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
     Raises:
         ValueError: when no API key can be resolved from any source.
     """
-    creds = resolve_provider_credentials()
-    if creds is not None:
-        return creds
-
-    resolved_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not resolved_key:
-        raise ValueError(
-            "No LLM API key configured. Set the credential env var for the "
-            "active provider, or set OPENAI_API_KEY (and optionally "
-            "OPENAI_BASE_URL) to use a standard OpenAI-compatible endpoint. "
-            "Use --no-llm to skip LLM analysis and run static checks only."
-        )
-
-    resolved_base = os.environ.get("OPENAI_BASE_URL", "").strip() or None
+    resolved_key, resolved_base, _ = _resolve_llm_client_config()
     return resolved_key, resolved_base
 
 
@@ -84,8 +90,8 @@ def get_chat_model(model: str | None = None) -> ChatOpenAI:
     Raises:
         ValueError: when no API key is configured (see ``is_llm_available``).
     """
-    resolved_key, resolved_base = _resolve_llm_credentials()
-    model = model or MODEL_CONFIG["default"]
+    resolved_key, resolved_base, default_model = _resolve_llm_client_config()
+    model = model or default_model
 
     return ChatOpenAI(
         model=model,
