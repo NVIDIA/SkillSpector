@@ -1,0 +1,87 @@
+# SkillSpector CI — scans for security vulnerabilities in AI agent skills.
+#
+# This workflow runs on every pull request and push to main. It uses the
+# SARIF output format so findings appear inline on the GitHub PR diff via
+# GitHub Code Scanning (Advanced Security).
+#
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: SkillSpector Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual runs from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  # Required to upload SARIF results to GitHub Code Scanning
+  security-events: write
+  # Required to check out the repository
+  contents: read
+
+jobs:
+  scan:
+    name: Scan skills for vulnerabilities
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install SkillSpector
+        run: pip install skillspector
+
+      # ------------------------------------------------------------------ #
+      # Static-only scan (no LLM required, works without any API key).      #
+      # Scans the entire repository root as a single skill bundle.          #
+      # ------------------------------------------------------------------ #
+      - name: Run SkillSpector (static analysis)
+        id: skillspector
+        # Continue even on non-zero exit (risk > 50) so we can upload SARIF
+        continue-on-error: true
+        run: |
+          skillspector scan . \
+            --no-llm \
+            --format sarif \
+            --output skillspector-results.sarif
+
+      # ------------------------------------------------------------------ #
+      # Optional: LLM-enriched scan.                                        #
+      # Uncomment and set SKILLSPECTOR_PROVIDER + the matching API key      #
+      # secret in your repository settings to enable semantic analysis.     #
+      # ------------------------------------------------------------------ #
+      # - name: Run SkillSpector (with LLM analysis)
+      #   continue-on-error: true
+      #   env:
+      #     SKILLSPECTOR_PROVIDER: anthropic
+      #     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      #   run: |
+      #     skillspector scan . \
+      #       --format sarif \
+      #       --output skillspector-results.sarif
+
+      - name: Upload SARIF results to GitHub Code Scanning
+        # Always upload so findings appear even when the scan exits non-zero
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: skillspector-results.sarif
+          category: skillspector
+
+      # Fail the job if SkillSpector reported a high/critical risk score
+      - name: Check scan result
+        if: steps.skillspector.outcome == 'failure'
+        run: |
+          echo "::error::SkillSpector detected HIGH or CRITICAL risk (score > 50)."
+          echo "Review the Security tab for details, then fix or suppress findings."
+          exit 1
