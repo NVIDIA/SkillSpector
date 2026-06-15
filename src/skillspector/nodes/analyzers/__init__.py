@@ -17,101 +17,42 @@
 
 from __future__ import annotations
 
-from skillspector.nodes.analyzers.behavioral_ast import node as behavioral_ast_node
-from skillspector.nodes.analyzers.behavioral_taint_tracking import (
-    node as behavioral_taint_tracking_node,
-)
-from skillspector.nodes.analyzers.mcp_least_privilege import node as mcp_least_privilege_node
-from skillspector.nodes.analyzers.mcp_rug_pull import node as mcp_rug_pull_node
-from skillspector.nodes.analyzers.mcp_tool_poisoning import node as mcp_tool_poisoning_node
-from skillspector.nodes.analyzers.semantic_developer_intent import (
-    node as semantic_developer_intent_node,
-)
-from skillspector.nodes.analyzers.semantic_quality_policy import (
-    node as semantic_quality_policy_node,
-)
-from skillspector.nodes.analyzers.semantic_security_discovery import (
-    node as semantic_security_discovery_node,
-)
-from skillspector.nodes.analyzers.static_patterns_data_exfiltration import (
-    node as static_patterns_data_exfiltration_node,
-)
-from skillspector.nodes.analyzers.static_patterns_excessive_agency import (
-    node as static_patterns_excessive_agency_node,
-)
-from skillspector.nodes.analyzers.static_patterns_harmful_content import (
-    node as static_patterns_harmful_content_node,
-)
-from skillspector.nodes.analyzers.static_patterns_memory_poisoning import (
-    node as static_patterns_memory_poisoning_node,
-)
-from skillspector.nodes.analyzers.static_patterns_output_handling import (
-    node as static_patterns_output_handling_node,
-)
-from skillspector.nodes.analyzers.static_patterns_privilege_escalation import (
-    node as static_patterns_privilege_escalation_node,
-)
-from skillspector.nodes.analyzers.static_patterns_prompt_injection import (
-    node as static_patterns_prompt_injection_node,
-)
-from skillspector.nodes.analyzers.static_patterns_rogue_agent import (
-    node as static_patterns_rogue_agent_node,
-)
-from skillspector.nodes.analyzers.static_patterns_supply_chain import (
-    node as static_patterns_supply_chain_node,
-)
-from skillspector.nodes.analyzers.static_patterns_system_prompt_leakage import (
-    node as static_patterns_system_prompt_leakage_node,
-)
-from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
-    node as static_patterns_tool_misuse_node,
-)
-from skillspector.nodes.analyzers.static_yara import node as static_yara_node
+import importlib
+import pkgutil
+from typing import Any
 
-ANALYZER_NODE_IDS: list[str] = [
-    "static_patterns_prompt_injection",
-    "static_patterns_data_exfiltration",
-    "static_patterns_privilege_escalation",
-    "static_patterns_supply_chain",
-    "static_patterns_harmful_content",
-    "static_patterns_excessive_agency",
-    "static_patterns_output_handling",
-    "static_patterns_system_prompt_leakage",
-    "static_patterns_memory_poisoning",
-    "static_patterns_tool_misuse",
-    "static_patterns_rogue_agent",
-    "static_yara",
-    "behavioral_ast",
-    "behavioral_taint_tracking",
-    "mcp_least_privilege",
-    "mcp_tool_poisoning",
-    "mcp_rug_pull",
-    "semantic_security_discovery",
-    "semantic_developer_intent",
-    "semantic_quality_policy",
-]
+from skillspector.logging_config import get_logger
 
-ANALYZER_NODES = {
-    "static_patterns_prompt_injection": static_patterns_prompt_injection_node,
-    "static_patterns_data_exfiltration": static_patterns_data_exfiltration_node,
-    "static_patterns_privilege_escalation": static_patterns_privilege_escalation_node,
-    "static_patterns_supply_chain": static_patterns_supply_chain_node,
-    "static_patterns_harmful_content": static_patterns_harmful_content_node,
-    "static_patterns_excessive_agency": static_patterns_excessive_agency_node,
-    "static_patterns_output_handling": static_patterns_output_handling_node,
-    "static_patterns_system_prompt_leakage": static_patterns_system_prompt_leakage_node,
-    "static_patterns_memory_poisoning": static_patterns_memory_poisoning_node,
-    "static_patterns_tool_misuse": static_patterns_tool_misuse_node,
-    "static_patterns_rogue_agent": static_patterns_rogue_agent_node,
-    "static_yara": static_yara_node,
-    "behavioral_ast": behavioral_ast_node,
-    "behavioral_taint_tracking": behavioral_taint_tracking_node,
-    "mcp_least_privilege": mcp_least_privilege_node,
-    "mcp_tool_poisoning": mcp_tool_poisoning_node,
-    "mcp_rug_pull": mcp_rug_pull_node,
-    "semantic_security_discovery": semantic_security_discovery_node,
-    "semantic_developer_intent": semantic_developer_intent_node,
-    "semantic_quality_policy": semantic_quality_policy_node,
-}
+logger = get_logger(__name__)
 
-__all__ = ["ANALYZER_NODE_IDS", "ANALYZER_NODES"]
+ANALYZER_NODE_IDS: list[str] = []
+ANALYZER_NODES: dict[str, Any] = {}
+ANALYZER_MODULES: dict[str, Any] = {}
+
+def _discover_analyzers() -> None:
+    """Dynamically discover and register analyzer modules in this package."""
+    if ANALYZER_NODE_IDS:
+        return
+
+    for _, module_name, is_pkg in pkgutil.iter_modules(__path__):
+        if is_pkg:
+            continue
+
+        full_module_name = f"{__name__}.{module_name}"
+        try:
+            mod = importlib.import_module(full_module_name)
+        except Exception as exc:
+            logger.debug("Skipping module %s during discovery: %s", module_name, exc)
+            continue
+
+        analyzer_id = getattr(mod, "ANALYZER_ID", None)
+        node_func = getattr(mod, "node", None)
+
+        if analyzer_id and callable(node_func):
+            ANALYZER_NODE_IDS.append(analyzer_id)
+            ANALYZER_NODES[analyzer_id] = node_func
+            ANALYZER_MODULES[analyzer_id] = mod
+
+_discover_analyzers()
+
+__all__ = ["ANALYZER_NODE_IDS", "ANALYZER_NODES", "ANALYZER_MODULES"]
