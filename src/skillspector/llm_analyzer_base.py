@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from langchain_core.messages import BaseMessage
+from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field, field_validator
 
 from skillspector.llm_utils import get_chat_model
@@ -274,9 +275,21 @@ class LLMAnalyzerBase:
         self.model = model
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
-        self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
-        )
+        # Parse structured output from the text response rather than relying on
+        # the endpoint's native structured-output mode. ChatOpenAI defaults to
+        # method="json_schema" (strict response_format), which OpenAI-compatible
+        # endpoints are free to ignore -- they may wrap the JSON in markdown
+        # fences or surround it with prose. PydanticOutputParser uses langchain's
+        # fence-tolerant parser and supplies matching format instructions, so
+        # both strict and lenient endpoints work.
+        if self.response_schema:
+            self._parser = PydanticOutputParser(pydantic_object=self.response_schema)
+            self._structured_llm = self._llm | self._parser
+            self._format_instructions = self._parser.get_format_instructions()
+        else:
+            self._parser = None
+            self._structured_llm = None
+            self._format_instructions = ""
 
     # -- Batching -----------------------------------------------------------
 
@@ -336,6 +349,18 @@ class LLMAnalyzerBase:
 
     # -- Prompt / parse -----------------------------------------------------
 
+    def _with_format(self, prompt: str) -> str:
+        """Append schema format instructions for the structured-output chain.
+
+        Centralized here so both the default :meth:`build_prompt` and any
+        subclass override (e.g. the meta-analyzer) get the parser's format
+        guidance without each prompt template having to embed it. No-op when
+        running in raw-string mode (no ``response_schema``).
+        """
+        if not self._format_instructions:
+            return prompt
+        return f"{prompt}\n\n{self._format_instructions}"
+
     def build_prompt(self, batch: Batch, **kwargs: object) -> str:
         """Build the LLM prompt for a single batch.
 
@@ -386,7 +411,7 @@ class LLMAnalyzerBase:
                 len(batch.findings),
             )
             if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
+                response = self._structured_llm.invoke(self._with_format(prompt))
             else:
                 response = _message_text(self._llm.invoke(prompt))
             logger.debug("LLM response for %s", batch.file_label)
@@ -429,7 +454,7 @@ class LLMAnalyzerBase:
                     len(batch.findings),
                 )
                 if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
+                    response = await self._structured_llm.ainvoke(self._with_format(prompt))
                 else:
                     response = _message_text(await self._llm.ainvoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
