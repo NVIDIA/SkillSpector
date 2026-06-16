@@ -28,13 +28,14 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from skillspector.llm_utils import get_chat_model
+from skillspector.llm_utils import get_chat_model, retry_llm_call, retry_llm_call_sync
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
@@ -353,9 +354,13 @@ class LLMAnalyzerBase:
                 len(batch.findings),
             )
             if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
+                response = retry_llm_call_sync(
+                    lambda prompt=prompt: self._structured_llm.invoke(prompt)
+                )
             else:
-                response = self._llm.invoke(prompt).content
+                response = retry_llm_call_sync(
+                    lambda prompt=prompt: self._llm.invoke(prompt)
+                ).content
             logger.debug("LLM response for %s", batch.file_label)
             parsed = self.parse_response(response, batch)
             results.append((batch, parsed))
@@ -365,7 +370,7 @@ class LLMAnalyzerBase:
         self,
         batches: list[Batch],
         *,
-        max_concurrency: int = 10,
+        max_concurrency: int | None = None,
         **kwargs: object,
     ) -> list[tuple[Batch, list]]:
         """Execute LLM calls for all *batches* concurrently.
@@ -376,6 +381,9 @@ class LLMAnalyzerBase:
 
         The return type mirrors :meth:`run_batches`.
         """
+        if max_concurrency is None:
+            max_concurrency = int(os.environ.get("SKILLSPECTOR_MAX_CONCURRENCY", "5"))
+
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
@@ -388,9 +396,9 @@ class LLMAnalyzerBase:
                     len(batch.findings),
                 )
                 if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
+                    response = await retry_llm_call(lambda: self._structured_llm.ainvoke(prompt))
                 else:
-                    response = (await self._llm.ainvoke(prompt)).content
+                    response = (await retry_llm_call(lambda: self._llm.ainvoke(prompt))).content
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 
