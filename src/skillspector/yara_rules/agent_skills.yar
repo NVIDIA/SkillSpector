@@ -51,11 +51,9 @@ rule agent_skill_remote_bootstrap_execution
         confidence = "0.85"
         reference = "https://owasp.org/www-project-top-10-for-large-language-model-applications/"
     strings:
-        $curl_to_shell = /(curl|wget)\s+[^|\n;]+\|\s*(sudo\s+)?(bash|sh|zsh)/ nocase
-        $powershell_iex = /(Invoke-WebRequest|iwr|curl)\s+.*\|\s*(iex|Invoke-Expression)/ nocase
         $python_exec_requests = /exec\s*\(\s*(requests|httpx)\.get\s*\([^)]*\)\.(text|content)/ nocase
         $python_eval_urlopen = /(exec|eval)\s*\(\s*urlopen\s*\([^)]*\)\.read\s*\(\s*\)/ nocase
-        $node_eval_fetch = /eval\s*\(\s*(await\s+)?fetch\s*\(/ nocase
+        $node_eval_fetch = /eval\s*\(\s*await\s*\(\s*await\s+fetch\s*\([^)]*\)\s*\)\s*\.\s*text\s*\(\s*\)\s*\)/ nocase
         $npm_postinstall_remote = /"postinstall"\s*:\s*"[^"]*(curl|wget|powershell|node\s+-e)/ nocase
         $pip_remote_install = /pip\s+install\s+(--upgrade\s+)?(git\+https?:\/\/|https?:\/\/)/ nocase
     condition:
