@@ -208,3 +208,61 @@ def test_build_context_parses_parameters_from_frontmatter(tmp_path: Path) -> Non
     assert result["manifest"]["parameters"] == [
         {"name": "path", "description": "file path to read"}
     ]
+
+
+def test_build_context_exclude_glob_filters_components(tmp_path: Path) -> None:
+    """exclude_patterns drops matching files from components, file_cache, and metadata."""
+    _make_skill_spec_dir(tmp_path)
+    (tmp_path / "assets" / "template-style.pdf").write_bytes(b"%PDF-1.4\nshell=True\n%%EOF")
+    (tmp_path / "notes.pdf").write_bytes(b"%PDF-1.4 trailing")
+
+    state: SkillspectorState = {
+        "skill_path": str(tmp_path),
+        "exclude_patterns": ["*.pdf"],
+    }
+    result = build_context(state)
+
+    components = result["components"]
+    assert "assets/template-style.pdf" not in components
+    assert "notes.pdf" not in components
+    assert "SKILL.md" in components
+    assert "scripts/run.py" in components
+    assert "assets/template-style.pdf" not in result["file_cache"]
+    assert all(m.get("path") != "assets/template-style.pdf" for m in result["component_metadata"])
+
+
+def test_build_context_exclude_directory_pattern(tmp_path: Path) -> None:
+    """Glob like 'assets/*' excludes all files under that directory."""
+    _make_skill_spec_dir(tmp_path)
+    state: SkillspectorState = {
+        "skill_path": str(tmp_path),
+        "exclude_patterns": ["assets/*"],
+    }
+    result = build_context(state)
+    assert not any(p.startswith("assets/") for p in result["components"])
+    assert "scripts/run.py" in result["components"]
+
+
+def test_build_context_exclude_no_match_keeps_all(tmp_path: Path) -> None:
+    """Patterns that don't match anything leave the components list untouched."""
+    _make_skill_spec_dir(tmp_path)
+    state: SkillspectorState = {
+        "skill_path": str(tmp_path),
+        "exclude_patterns": ["*.xyz"],
+    }
+    result = build_context(state)
+    assert "SKILL.md" in result["components"]
+    assert "assets/icon.png" in result["components"]
+
+
+def test_build_context_exclude_everything_yields_empty(tmp_path: Path) -> None:
+    """Excluding every file is valid — empty components, empty file_cache."""
+    _make_skill_spec_dir(tmp_path)
+    state: SkillspectorState = {
+        "skill_path": str(tmp_path),
+        "exclude_patterns": ["*"],
+    }
+    result = build_context(state)
+    assert result["components"] == []
+    assert result["file_cache"] == {}
+    assert result["component_metadata"] == []

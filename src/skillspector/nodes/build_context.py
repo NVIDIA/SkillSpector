@@ -21,6 +21,7 @@ from a local skill directory.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from pathlib import Path
 
@@ -75,11 +76,14 @@ def _resolve_skill_dir(state: SkillspectorState) -> Path:
     return resolved
 
 
-def _walk_skill_files(skill_dir: Path) -> list[str]:
+def _walk_skill_files(skill_dir: Path, exclude_patterns: list[str] | None = None) -> list[str]:
     """Walk skill directory and return sorted relative path strings.
 
     Skips _SKIP_DIRS and hidden files except those starting with .claude.
+    Also skips paths matching shell-style patterns in ``exclude_patterns``
+    (Python fnmatch semantics, matched against paths relative to ``skill_dir``).
     """
+    patterns = exclude_patterns or []
     paths: list[str] = []
     for item in skill_dir.rglob("*"):
         if not item.is_file():
@@ -90,10 +94,15 @@ def _walk_skill_files(skill_dir: Path) -> list[str]:
             continue
         try:
             rel = item.relative_to(skill_dir)
-            paths.append(str(rel))
         except ValueError:
             logger.debug("Skipping path (not under skill_dir): %s", item)
             continue
+        rel_str = rel.as_posix()
+        matched = next((p for p in patterns if fnmatch.fnmatch(rel_str, p)), None)
+        if matched is not None:
+            logger.debug("Excluded by --exclude %r: %s", matched, rel_str)
+            continue
+        paths.append(str(rel))
     paths.sort()
     return paths
 
@@ -224,7 +233,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     """
     skill_dir = _resolve_skill_dir(state)
 
-    components = _walk_skill_files(skill_dir)
+    raw_patterns = state.get("exclude_patterns") or []
+    exclude_patterns = [p for p in raw_patterns if isinstance(p, str) and p]
+    components = _walk_skill_files(skill_dir, exclude_patterns)
     file_cache = _read_file_cache(skill_dir, components)
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)
