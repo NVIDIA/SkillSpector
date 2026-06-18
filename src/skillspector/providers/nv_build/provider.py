@@ -25,7 +25,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from langchain_core.language_models.chat_models import BaseChatModel
+
 from skillspector.providers import registry
+from skillspector.providers.chat_models import create_openai_compatible_chat_model
 
 BUILD_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -49,6 +52,21 @@ class NvBuildProvider:
         if not api_key:
             return None
         return api_key, BUILD_BASE_URL
+
+    def create_chat_model(
+        self,
+        model: str,
+        *,
+        max_tokens: int,
+        timeout: float | None = 120,
+    ) -> BaseChatModel | None:
+        """Create ``ChatOpenAI`` for the build.nvidia.com endpoint."""
+        return create_openai_compatible_chat_model(
+            model=model,
+            credentials=self.resolve_credentials(),
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
 
     def get_context_length(self, model: str) -> int | None:
         """Look up *model*'s context window in the bundled ``model_registry.yaml``."""

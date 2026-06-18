@@ -267,6 +267,19 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). | `gpt-5.2` |
 
+### Live provider tests
+
+The manual `test-provider` CI job and local `make test-provider` target perform live requests against provider default endpoints. Missing provider keys print a `WARNING:` line before pytest runs and skip that provider. In CI, missing keys also make the manual job exit with the configured warning code so GitLab displays the job as passed with warnings; if a key is present but invalid, or the provider request fails, the corresponding test fails.
+
+| Command | Required env var | Default URL | Optional model override |
+|---------|------------------|-------------|-------------------------|
+| `make test-provider openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `SKILLSPECTOR_OPENAI_TEST_MODEL` |
+| `make test-provider anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | `SKILLSPECTOR_ANTHROPIC_TEST_MODEL` |
+| `make test-provider nv_build` | `NVIDIA_INFERENCE_KEY` | `https://integrate.api.nvidia.com/v1` | `SKILLSPECTOR_NV_BUILD_TEST_MODEL` |
+| `make test-provider` | Any/all of the provider keys above | All provider default URLs above | Any/all provider model overrides above |
+
+Base URL env vars are not needed for live provider tests; the tests intentionally use provider defaults.
+
 ### Constants, token budgets, and LLM
 
 - **Constants** ([constants.py](../src/skillspector/constants.py)): `_SKILLSPECTOR_DEFAULT_MODEL`, `MODEL_CONFIG` (per-node model selection), `MAX_INPUT_TOKENS_PCT` (0.75), `DEFAULT_CONTEXT_LENGTH` (128k fallback).

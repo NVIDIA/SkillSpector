@@ -61,14 +61,17 @@ _EXECUTABLE_EXTENSIONS = frozenset(
 )
 
 
-def _resolve_skill_dir(state: SkillspectorState) -> Path | None:
-    """Resolve state skill_path to an existing directory Path, or None if missing/invalid."""
+def _resolve_skill_dir(state: SkillspectorState) -> Path:
+    """Resolve state skill_path to an existing directory Path."""
     skill_path = state.get("skill_path")
     if not skill_path or not isinstance(skill_path, str) or not skill_path.strip():
-        return None
-    resolved = Path(skill_path).resolve()
+        raise ValueError("skill_path is required; provide input_path or skill_path to scan")
+    try:
+        resolved = Path(skill_path).resolve()
+    except (OSError, RuntimeError) as e:
+        raise ValueError(f"Invalid skill_path: {skill_path}") from e
     if not resolved.is_dir():
-        return None
+        raise ValueError(f"Invalid skill_path: {skill_path} is not an existing directory")
     return resolved
 
 
@@ -212,32 +215,14 @@ def _parse_manifest(skill_dir: Path) -> dict[str, object]:
     return {}
 
 
-def _minimal_update() -> dict[str, object]:
-    """Return minimal state update when skill_dir is missing or invalid."""
-    return {
-        "components": [],
-        "file_cache": {},
-        "ast_cache": {},
-        "manifest": {},
-        "previous_manifest": None,
-        "model_config": MODEL_CONFIG,
-        "component_metadata": [],
-        "has_executable_scripts": False,
-    }
-
-
 def build_context(state: SkillspectorState) -> dict[str, object]:
     """Build flat ScanContext fields from state skill_path (local directory).
 
     Resolves skill_path to a directory, walks files, builds file_cache
     and manifest. Returns only context keys; leaves findings untouched.
-    If skill_path is missing or not an existing directory, returns minimal
-    empty context (no exception).
+    Raises ValueError if skill_path is missing or not an existing directory.
     """
     skill_dir = _resolve_skill_dir(state)
-    if skill_dir is None:
-        logger.debug("skill_path missing or not a directory; returning minimal context")
-        return _minimal_update()
 
     components = _walk_skill_files(skill_dir)
     file_cache = _read_file_cache(skill_dir, components)

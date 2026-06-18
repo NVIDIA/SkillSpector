@@ -22,14 +22,22 @@ NVIDIA catalog API) is covered by the layered tests in
 
 from __future__ import annotations
 
+import sys
+
 import pytest
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 
 from skillspector.providers import (
+    NO_LLM_API_KEY_MESSAGE,
+    create_chat_model,
     get_metadata_provider,
     registry,
+    resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
-from skillspector.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicProvider
+from skillspector.providers.anthropic import AnthropicProvider
+from skillspector.providers.chat_models import create_openai_compatible_chat_model
 from skillspector.providers.nv_build import BUILD_BASE_URL, NvBuildProvider
 from skillspector.providers.openai import OpenAIProvider
 
@@ -75,6 +83,17 @@ class TestNvBuildProvider:
         monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-x")
         creds = NvBuildProvider().resolve_credentials()
         assert creds == ("nvapi-x", BUILD_BASE_URL)
+
+    def test_creates_openai_compatible_chat_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-x")
+        llm = NvBuildProvider().create_chat_model(
+            "deepseek-ai/deepseek-v4-flash",
+            max_tokens=123,
+        )
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "deepseek-ai/deepseek-v4-flash"
+        assert llm.max_tokens == 123
+        assert str(llm.openai_api_base).rstrip("/") == BUILD_BASE_URL.rstrip("/")
 
     def test_metadata_known_model_from_bundled_yaml(self) -> None:
         """deepseek-v4-flash ships in nv_build/model_registry.yaml."""
@@ -122,6 +141,17 @@ class TestNvInferenceProvider:
         monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "internal-key")
         creds = NvInferenceProvider().resolve_credentials()
         assert creds == ("internal-key", INFERENCE_BASE_URL)
+
+    def test_creates_openai_compatible_chat_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "internal-key")
+        llm = NvInferenceProvider().create_chat_model(
+            "azure/anthropic/claude-sonnet-4-6",
+            max_tokens=123,
+        )
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "azure/anthropic/claude-sonnet-4-6"
+        assert llm.max_tokens == 123
+        assert str(llm.openai_api_base).rstrip("/") == INFERENCE_BASE_URL.rstrip("/")
 
     def test_metadata_key_not_required_for_credentials(
         self, monkeypatch: pytest.MonkeyPatch
@@ -179,6 +209,13 @@ class TestOpenAIProvider:
         creds = OpenAIProvider().resolve_credentials()
         assert creds == ("sk-x", "http://localhost:11434/v1")
 
+    def test_creates_chat_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        llm = OpenAIProvider().create_chat_model("gpt-5.4", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "gpt-5.4"
+        assert llm.max_tokens == 123
+
     def test_default_model(self) -> None:
         assert OpenAIProvider().resolve_model() == "gpt-5.4"
         # All slots inherit DEFAULT_MODEL — gpt-5.4 everywhere.
@@ -196,10 +233,23 @@ class TestAnthropicProvider:
     def test_returns_none_without_env_var(self) -> None:
         assert AnthropicProvider().resolve_credentials() is None
 
-    def test_resolves_to_anthropic_endpoint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolves_anthropic_api_key_without_openai_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
         creds = AnthropicProvider().resolve_credentials()
-        assert creds == ("sk-ant-x", ANTHROPIC_BASE_URL)
+        assert creds == ("sk-ant-x", None)
+
+    def test_creates_native_chat_anthropic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+        assert isinstance(llm, ChatAnthropic)
+        assert llm.model == "claude-opus-4-6"
+        assert llm.max_tokens == 123
+
+    def test_create_chat_model_returns_none_without_key(self) -> None:
+        # No ANTHROPIC_API_KEY → no client, signalling the caller to fall back.
+        assert AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123) is None
 
     def test_default_model_and_meta_downgrade(self) -> None:
         assert AnthropicProvider().resolve_model() == "claude-opus-4-6"
@@ -210,6 +260,31 @@ class TestAnthropicProvider:
         assert provider.get_context_length("claude-opus-4-6") == 1_000_000
         assert provider.get_max_output_tokens("claude-opus-4-6") == 128_000
         assert provider.get_context_length("claude-sonnet-4-6") == 1_000_000
+
+
+class TestOpenAICompatibleConstructor:
+    """The shared OpenAI-compatible chat-model constructor."""
+
+    def test_returns_none_when_credentials_missing(self) -> None:
+        assert (
+            create_openai_compatible_chat_model(
+                model="gpt-5.4",
+                credentials=None,
+                max_tokens=123,
+            )
+            is None
+        )
+
+    def test_builds_chat_openai_from_credentials(self) -> None:
+        llm = create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "gpt-5.4"
+        assert llm.max_tokens == 123
+        assert str(llm.openai_api_base).rstrip("/") == "http://localhost:1234/v1"
 
 
 class TestProviderSelection:
@@ -243,8 +318,25 @@ class TestProviderSelection:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
         creds = resolve_provider_credentials()
-        assert creds == ("sk-ant-x", ANTHROPIC_BASE_URL)
+        assert creds == ("sk-ant-x", None)
         assert isinstance(get_metadata_provider(), AnthropicProvider)
+
+    def test_create_chat_model_uses_native_anthropic_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-should-not-win")
+        llm = create_chat_model("claude-opus-4-6", max_tokens=123)
+        assert isinstance(llm, ChatAnthropic)
+        assert llm.model == "claude-opus-4-6"
+
+    def test_chat_model_credentials_fall_back_to_openai(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        creds = resolve_chat_model_credentials()
+        assert creds == ("sk-x", None)
 
     def test_select_nv_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nv_build")
@@ -257,3 +349,43 @@ class TestProviderSelection:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "vertex")
         with pytest.raises(ValueError, match="Unknown SKILLSPECTOR_PROVIDER"):
             get_metadata_provider()
+
+    def test_falls_back_to_nv_build_when_nv_inference_unimportable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the optional nv_inference subpackage can't be imported,
+        the default/``nv_inference`` selection degrades to ``NvBuildProvider``."""
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nv_inference")
+        # Setting the module entry to None forces ``import`` to raise ImportError.
+        monkeypatch.setitem(sys.modules, "skillspector.providers.nv_inference", None)
+        assert isinstance(get_metadata_provider(), NvBuildProvider)
+
+    def test_create_chat_model_falls_back_to_openai_when_provider_unconfigured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Active provider is anthropic but ANTHROPIC_API_KEY is unset, so it
+        # yields no client; OPENAI_API_KEY then satisfies the fallback.
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        llm = create_chat_model("gpt-5.4", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "gpt-5.4"
+
+    def test_create_chat_model_raises_when_no_credentials_anywhere(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Anthropic active, but neither ANTHROPIC_API_KEY nor OPENAI_API_KEY set.
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
+        with pytest.raises(ValueError) as exc_info:
+            create_chat_model("claude-opus-4-6", max_tokens=123)
+        assert str(exc_info.value) == NO_LLM_API_KEY_MESSAGE
+
+    def test_create_chat_model_raises_for_openai_provider_without_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # When the active provider is already OpenAI, there is no second
+        # fallback attempt — it raises directly.
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        with pytest.raises(ValueError) as exc_info:
+            create_chat_model("gpt-5.4", max_tokens=123)
+        assert str(exc_info.value) == NO_LLM_API_KEY_MESSAGE

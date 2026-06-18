@@ -32,6 +32,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
 
+from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field
 
 from skillspector.llm_utils import get_chat_model
@@ -189,6 +190,13 @@ def number_lines(content: str, start_line: int = 1) -> str:
     end = start_line + len(lines) - 1
     width = len(str(end))
     return "\n".join(f"L{start_line + i:0>{width}}: {line}" for i, line in enumerate(lines))
+
+
+def _message_text(response: object) -> str:
+    """Extract provider-normalized text from a LangChain chat response."""
+    if not isinstance(response, BaseMessage):
+        raise TypeError(f"Expected BaseMessage from chat model, got {type(response).__name__}")
+    return str(response.text)
 
 
 BASE_ANALYSIS_PROMPT = """\
@@ -355,7 +363,7 @@ class LLMAnalyzerBase:
             if self._structured_llm:
                 response = self._structured_llm.invoke(prompt)
             else:
-                response = self._llm.invoke(prompt).content
+                response = _message_text(self._llm.invoke(prompt))
             logger.debug("LLM response for %s", batch.file_label)
             parsed = self.parse_response(response, batch)
             results.append((batch, parsed))
@@ -390,7 +398,7 @@ class LLMAnalyzerBase:
                 if self._structured_llm:
                     response = await self._structured_llm.ainvoke(prompt)
                 else:
-                    response = (await self._llm.ainvoke(prompt)).content
+                    response = _message_text(await self._llm.ainvoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 

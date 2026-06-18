@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skillspector"
-version = "2.1.2"
+version = "2.2.3"
 description = "SkillSpector: Security scanner for AI agent skills (Claude Code, Cursor, and similar). Scans skills for vulnerabilities, malicious patterns, and security risks before installation. Supports Git repos, URLs, zips, and local directories; runs static pattern checks and optional LLM semantic analysis; outputs terminal, JSON, and Markdown reports with risk scoring."
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.15"
 keywords = [
     "security",
     "ai-agents",
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
 ]
@@ -38,6 +39,7 @@ dependencies = [
     "openai>=2.25.0",
     "langgraph>=1.0.10",
     "langgraph-cli[inmem]>=0.4.14",
+    "langchain-anthropic>=1.4.5",
     "langchain-core>=1.2.17",
     "langchain-openai>=1.1.10",
     "langsmith>=0.7.30",
@@ -97,5 +99,8 @@ source = ["src/skillspector"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-markers = ["integration: end-to-end tests that invoke the full graph (may call LLMs)"]
-addopts = "-m 'not integration'"
+markers = [
+    "integration: end-to-end tests that invoke the full graph (may call LLMs)",
+    "provider: live OpenAI/Anthropic/NVIDIA Build provider endpoint tests",
+]
+addopts = "-m 'not integration and not provider'"

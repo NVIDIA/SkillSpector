@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Anthropic provider package (api.anthropic.com OpenAI-compatibility endpoint)."""
+"""Anthropic provider package (native api.anthropic.com chat models)."""
 
 from .provider import ANTHROPIC_BASE_URL, REGISTRY_PATH, AnthropicProvider
 

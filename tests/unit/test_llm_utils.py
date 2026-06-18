@@ -15,22 +15,33 @@
 
 """Tests for the LLM credential resolution in llm_utils.
 
-Order: active NVIDIA provider (NVIDIA_INFERENCE_KEY) -> OPENAI_API_KEY /
-OPENAI_BASE_URL.  NVIDIA-specific behavior (which env var resolves to
-which endpoint) lives in the active provider — see ``tests/unit/test_providers.py``.
+Order: active SkillSpector provider -> OPENAI_API_KEY / OPENAI_BASE_URL.
+Provider-specific behavior (which env var resolves to which client) lives
+in the active provider — see ``tests/unit/test_providers.py``.
 """
 
 from __future__ import annotations
 
 import pytest
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage
 
-from skillspector.llm_utils import _resolve_llm_credentials, is_llm_available
-from skillspector.providers import resolve_provider_credentials
+from skillspector import llm_utils
+from skillspector.llm_utils import (
+    _resolve_llm_credentials,
+    chat_completion,
+    fetch_model_token_limits,
+    get_chat_model,
+    is_llm_available,
+)
+from skillspector.providers import NO_LLM_API_KEY_MESSAGE, resolve_provider_credentials
 
 _LLM_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "NVIDIA_INFERENCE_KEY",
+    "SKILLSPECTOR_PROVIDER",
 )
 
 
@@ -43,7 +54,7 @@ def _clean_llm_env(monkeypatch: pytest.MonkeyPatch):
 
 
 class TestCredentialResolution:
-    """Order: active NVIDIA provider first, then OPENAI_API_KEY / OPENAI_BASE_URL."""
+    """Order: active provider first, then OPENAI_API_KEY / OPENAI_BASE_URL."""
 
     def test_provider_wins_when_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvidia-key")
@@ -77,9 +88,77 @@ class TestCredentialResolution:
         _, base = _resolve_llm_credentials()
         assert base == provider_creds[1]
 
+    def test_anthropic_provider_wins_with_native_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+        key, base = _resolve_llm_credentials()
+        assert key == "sk-ant-x"
+        assert base is None
+
     def test_no_credentials_raises_with_helpful_message(self) -> None:
-        with pytest.raises(ValueError, match="API key"):
+        with pytest.raises(ValueError) as exc_info:
             _resolve_llm_credentials()
+        assert str(exc_info.value) == NO_LLM_API_KEY_MESSAGE
+
+    def test_get_chat_model_returns_native_anthropic_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        llm = get_chat_model(model="claude-opus-4-6")
+        assert isinstance(llm, ChatAnthropic)
+        assert llm.model == "claude-opus-4-6"
+
+
+class TestFetchModelTokenLimits:
+    def test_returns_input_and_output_token_pair(self) -> None:
+        max_input, max_output = fetch_model_token_limits("claude-opus-4-6")
+        assert isinstance(max_input, int)
+        assert isinstance(max_output, int)
+        assert max_input > 0
+        assert max_output > 0
+
+
+class TestChatCompletion:
+    """``chat_completion`` invokes the active chat model and normalizes content."""
+
+    def test_returns_string_content_directly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _FakeLLM:
+            def invoke(self, prompt: str) -> AIMessage:
+                assert prompt == "ping"
+                return AIMessage(content="hello world")
+
+        monkeypatch.setattr(llm_utils, "get_chat_model", lambda model=None: _FakeLLM())
+        assert chat_completion("ping") == "hello world"
+
+    def test_returns_text_from_langchain_content_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _FakeLLM:
+            def invoke(self, prompt: str) -> AIMessage:
+                return AIMessage(content=[{"type": "text", "text": "chunk"}])
+
+        captured: dict[str, str | None] = {}
+
+        def _fake_get_chat_model(model: str | None = None) -> _FakeLLM:
+            captured["model"] = model
+            return _FakeLLM()
+
+        monkeypatch.setattr(llm_utils, "get_chat_model", _fake_get_chat_model)
+        result = chat_completion("prompt", model="some-model")
+        assert result == "chunk"
+        assert captured["model"] == "some-model"
+
+    def test_returns_empty_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _FakeLLM:
+            def invoke(self, prompt: str) -> AIMessage:
+                return AIMessage(content="")
+
+        monkeypatch.setattr(llm_utils, "get_chat_model", lambda model=None: _FakeLLM())
+        assert chat_completion("prompt") == ""
 
 
 class TestIsLlmAvailable:
@@ -98,5 +177,4 @@ class TestIsLlmAvailable:
     def test_returns_false_with_message_when_no_credentials(self) -> None:
         ok, msg = is_llm_available()
         assert ok is False
-        assert msg is not None
-        assert "API key" in msg
+        assert msg == NO_LLM_API_KEY_MESSAGE

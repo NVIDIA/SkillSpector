@@ -46,6 +46,64 @@ make install
 make install-dev
 ```
 
+### Docker (no Python required)
+
+Run SkillSpector without installing Python by building it locally from the included [Dockerfile](Dockerfile). The image is based on the Docker Official Python `3.12-slim-bookworm` image.
+
+**Build the image:**
+
+```bash
+make docker-build
+# or: docker build -t skillspector .
+```
+
+**Scan a local directory** by mounting your current directory into `/scan`, the container's working directory:
+
+```bash
+docker run --rm -v "$PWD:/scan" skillspector scan ./my-skill/ --no-llm
+```
+
+**Scan with LLM analysis** by passing credentials with a local `.env` file:
+
+```bash
+cat > .env <<'EOF'
+SKILLSPECTOR_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+EOF
+```
+
+```bash
+docker run --rm \
+  -v "$PWD:/scan" \
+  --env-file .env \
+  skillspector scan ./my-skill/
+```
+
+Or pass credentials directly from your shell environment:
+
+```bash
+docker run --rm \
+  -v "$PWD:/scan" \
+  -e SKILLSPECTOR_PROVIDER=anthropic \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  skillspector scan ./my-skill/
+```
+
+**Write a report to the host filesystem** by writing to the mounted directory:
+
+```bash
+docker run --rm \
+  -v "$PWD:/scan" \
+  skillspector scan ./my-skill/ --no-llm --format json --output report.json
+```
+
+**Optional alias** for repeated static scans:
+
+```bash
+alias skillspector-docker='docker run --rm -v "$PWD:/scan" skillspector'
+skillspector-docker scan ./my-skill/ --no-llm
+```
+
 ### Basic Usage
 
 ```bash
@@ -87,7 +145,7 @@ local OpenAI-compatible servers (Ollama, vLLM, llama.cpp) and managed
 inference gateways.
 
 | Provider (`SKILLSPECTOR_PROVIDER`) | Credential env var | Endpoint | Default model |
-|----------|----|----|----|
+| ---------- | ---- | ---- | ---- |
 | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
@@ -344,7 +402,7 @@ Issues (2)
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's default model. See the LLM Analysis table for each provider's default. | Optional |
-| `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>.yaml`) with a custom path. | Optional |
+| `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 
 ### CLI Options

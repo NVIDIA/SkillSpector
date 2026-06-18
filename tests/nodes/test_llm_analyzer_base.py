@@ -20,6 +20,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from skillspector.llm_analyzer_base import (
     Batch,
@@ -162,6 +163,16 @@ def _mock_get_chat_model(*_args, **_kwargs):
 
 
 MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
+
+
+class _RawTextAnalyzer(LLMAnalyzerBase):
+    """Test analyzer for raw-string mode."""
+
+    response_schema = None
+
+    def parse_response(self, response: object, batch: Batch) -> list[str]:
+        assert isinstance(response, str)
+        return [response]
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +325,35 @@ class TestCollectFindings:
 
 
 # ---------------------------------------------------------------------------
+# LLMAnalyzerBase raw-string mode
+# ---------------------------------------------------------------------------
+
+
+class TestRawStringMode:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_run_batches_uses_message_text_for_content_blocks(self) -> None:
+        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
+        analyzer._llm.invoke.return_value = AIMessage(content=[{"type": "text", "text": "chunk"}])
+
+        results = analyzer.run_batches([Batch(file_path="a.py", content="code")])
+
+        assert results[0][1] == ["chunk"]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_arun_batches_uses_message_text_for_content_blocks(self) -> None:
+        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
+        analyzer._llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content=[{"type": "text", "text": "async chunk"}])
+        )
+
+        results = await analyzer.arun_batches([Batch(file_path="a.py", content="code")])
+
+        assert results[0][1] == ["async chunk"]
+
+
+# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.arun_batches (async parallel execution)
 # ---------------------------------------------------------------------------
 
@@ -407,9 +447,7 @@ class TestARunBatches:
         """When response_schema is None, arun_batches uses _llm.ainvoke."""
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm = None
-        mock_response = MagicMock()
-        mock_response.content = "raw text"
-        analyzer._llm.ainvoke = AsyncMock(return_value=mock_response)
+        analyzer._llm.ainvoke = AsyncMock(return_value=AIMessage(content="raw text"))
 
         batch = Batch(file_path="a.py", content="code")
         with pytest.raises(NotImplementedError):

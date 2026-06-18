@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Protocols for pluggable providers (model metadata + credentials)."""
+"""Protocols for pluggable LLM providers."""
 
 from __future__ import annotations
 
 from typing import Protocol
+
+from langchain_core.language_models.chat_models import BaseChatModel
 
 
 class ModelMetadataProvider(Protocol):
@@ -47,3 +49,19 @@ class CredentialsProvider(Protocol):
     """
 
     def resolve_credentials(self) -> tuple[str, str | None] | None: ...
+
+
+class ChatModelProvider(Protocol):
+    """Anything that can construct its native LangChain chat model."""
+
+    def create_chat_model(
+        self,
+        model: str,
+        *,
+        max_tokens: int,
+        timeout: float | None = 120,
+    ) -> BaseChatModel | None: ...
+
+
+class LLMProvider(ModelMetadataProvider, CredentialsProvider, ChatModelProvider, Protocol):
+    """Complete provider surface used by SkillSpector's LLM stack."""

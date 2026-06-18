@@ -15,11 +15,11 @@
 
 """Anthropic provider — Claude models via api.anthropic.com.
 
-Reads ``ANTHROPIC_API_KEY`` for credentials and points
-``langchain_openai.ChatOpenAI`` at Anthropic's OpenAI-compatibility
-endpoint.  Defaults to Opus 4.6 for analyzers and Sonnet 4.6 for
-``meta_analyzer`` (cheaper for the high-volume filter pass), mirroring
-the policy used by ``NvInferenceProvider``.
+Reads ``ANTHROPIC_API_KEY`` for credentials and constructs
+``langchain_anthropic.ChatAnthropic`` directly. Defaults to Opus 4.6 for
+analyzers and Sonnet 4.6 for ``meta_analyzer`` (cheaper for the
+high-volume filter pass), mirroring the policy used by
+``NvInferenceProvider``.
 """
 
 from __future__ import annotations
@@ -27,9 +27,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from langchain_anthropic import ChatAnthropic
+from langchain_core.language_models.chat_models import BaseChatModel
+from pydantic import SecretStr
+
 from skillspector.providers import registry
 
-ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1/"
+# Documented for completeness — ChatAnthropic defaults here when base_url=None.
+ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -47,7 +52,29 @@ class AnthropicProvider:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         if not api_key:
             return None
-        return api_key, ANTHROPIC_BASE_URL
+        return api_key, None
+
+    def create_chat_model(
+        self,
+        model: str,
+        *,
+        max_tokens: int,
+        timeout: float | None = 120,
+    ) -> BaseChatModel | None:
+        """Create ``ChatAnthropic`` using native Anthropic credentials."""
+        creds = self.resolve_credentials()
+        if creds is None:
+            return None
+
+        api_key, _ = creds
+        return ChatAnthropic(
+            model_name=model,
+            api_key=SecretStr(api_key),
+            base_url=ANTHROPIC_BASE_URL,
+            max_tokens_to_sample=max_tokens,
+            timeout=timeout,
+            stop=None,
+        )
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)

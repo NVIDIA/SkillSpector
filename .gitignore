@@ -97,6 +97,7 @@ venv.bak/
 tmp/
 temp/
 .skillspector/
+.provider-test-missing-keys
 
 # API Keys (never commit!)
 .env.local
