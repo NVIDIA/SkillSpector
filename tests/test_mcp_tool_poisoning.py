@@ -121,7 +121,7 @@ def _make_state(
             continue
         if item.name.startswith(".") and not item.name.startswith(".claude"):
             continue
-        rel = str(item.relative_to(fixture_dir))
+        rel = item.relative_to(fixture_dir).as_posix()
         components.append(rel)
     components.sort()
 

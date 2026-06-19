@@ -87,7 +87,7 @@ def _walk_skill_files(skill_dir: Path) -> list[str]:
             continue
         try:
             rel = item.relative_to(skill_dir)
-            paths.append(str(rel))
+            paths.append(rel.as_posix())
         except ValueError:
             logger.debug("Skipping path (not under skill_dir): %s", item)
             continue
