@@ -176,7 +176,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         prompt = ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest))
         analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model)
         batches = analyzer.get_batches(sorted(file_cache), file_cache)
-        results = asyncio.run(analyzer.arun_batches(batches))
+        try:
+            loop = asyncio.get_running_loop()
+            results = loop.run_until_complete(analyzer.arun_batches(batches))
+        except RuntimeError:
+            results = asyncio.run(analyzer.arun_batches(batches))
         findings = analyzer.collect_findings(results)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
         return {"findings": findings}

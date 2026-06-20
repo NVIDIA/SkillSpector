@@ -391,7 +391,11 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             model,
         )
 
-        batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        try:
+            loop = asyncio.get_running_loop()
+            batch_results = loop.run_until_complete(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        except RuntimeError:
+            batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
         filtered = analyzer.apply_filter(findings, batch_results)
 
         logger.debug(
