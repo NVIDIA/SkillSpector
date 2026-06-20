@@ -87,7 +87,9 @@ _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 
 
 def _compute_risk_score(
-    findings: list[Finding], has_executable_scripts: bool
+    findings: list[Finding],
+    has_executable_scripts: bool,
+    component_metadata: list[dict[str, object]] | None = None,
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
@@ -105,13 +107,20 @@ def _compute_risk_score(
     order so that the highest-severity occurrence always receives the full weight.
 
     Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
-    Multiplier: 1.3x if has_executable_scripts.
+    1.3x multiplier applied only to findings from executable script files;
+    findings from documentation files (markdown, text, json, yaml, toml)
+    are scored at base weight to avoid punishing security documentation.
     """
     severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     sorted_findings = sorted(
         findings,
         key=lambda f: (f.rule_id or "UNKNOWN", severity_rank.get((f.severity or "LOW").upper(), 4)),
     )
+
+    file_executable: dict[str, bool] = {}
+    if component_metadata:
+        for cm in component_metadata:
+            file_executable[str(cm.get("path", ""))] = bool(cm.get("executable", False))
 
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
@@ -132,10 +141,13 @@ def _compute_risk_score(
             continue
 
         weight = _DIMINISHING_WEIGHTS[count]
-        score += base_points * weight * confidence
+        contribution = base_points * weight * confidence
 
-    if has_executable_scripts:
-        score *= 1.3
+        # Apply 1.3x multiplier only to findings from executable files
+        if has_executable_scripts and file_executable.get(f.file, False):
+            contribution *= 1.3
+
+        score += contribution
 
     final_score = min(100, max(0, int(score)))
 
@@ -565,7 +577,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     # additionally de-duplicates so the same issue is not counted twice.
     findings_for_scoring = deduplicate(active_findings)
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
-        findings_for_scoring, has_executable_scripts
+        findings_for_scoring, has_executable_scripts, component_metadata
     )
     sarif_report = _build_sarif(active_findings, suppressed)
     analysis_completeness = _build_analysis_completeness(
