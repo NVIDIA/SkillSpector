@@ -498,9 +498,14 @@ _TP3_EXFILTRATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Malicious default: URLs (excluding localhost/127.0.0.1) or shell commands
+# Malicious default: URLs (excluding localhost/127.0.0.1) or shell commands.
+# The loopback exemption is anchored to a host boundary (port / path / query /
+# fragment / end of string). Without the boundary, the negative lookahead
+# matched the bare substring "localhost", so an attacker host that merely
+# starts with it (e.g. http://localhost.evil.com/exfil) was wrongly treated as
+# loopback and skipped detection.
 _TP3_MALICIOUS_URL_RE = re.compile(
-    r"https?://(?!localhost|127\.0\.0\.1)\S+",
+    r"https?://(?!(?:localhost|127\.0\.0\.1)(?:[:/?#]|$))\S+",
     re.IGNORECASE,
 )
 _TP3_SHELL_CMD_RE = re.compile(
