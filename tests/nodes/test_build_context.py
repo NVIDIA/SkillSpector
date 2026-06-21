@@ -269,3 +269,38 @@ def test_build_context_oversized_manifest_fails_before_reading_whole(
 
     with pytest.raises(ValueError, match="SKILL\\.md"):
         build_context(state)
+
+
+def test_parse_manifest_reads_bounded_byte_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_parse_manifest bounds bytes, not characters.
+
+    A text-mode read(_MAX_READ_BYTES) caps characters, which multibyte content
+    can inflate well past _MAX_READ_BYTES of memory. Reading a binary prefix
+    keeps the bound a true byte ceiling. Guard against a regression to text
+    mode by asserting the manifest is opened in binary, and that frontmatter
+    still parses through the decode.
+    """
+    from skillspector.nodes.build_context import _parse_manifest
+
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: m\ndescription: €€€\n---\nbody €" * 1,
+        encoding="utf-8",
+    )
+
+    modes: list[str] = []
+    real_open = Path.open
+
+    def spy_open(self: Path, mode: str = "r", *args: object, **kwargs: object):
+        if self.name == "SKILL.md":
+            modes.append(mode)
+        return real_open(self, mode, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", spy_open)
+
+    manifest = _parse_manifest(tmp_path)
+
+    assert manifest["name"] == "m"
+    assert manifest["description"] == "€€€"
+    assert modes and all("b" in m for m in modes)  # binary => byte-bounded read

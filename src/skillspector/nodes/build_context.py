@@ -224,13 +224,16 @@ def _parse_manifest(skill_dir: Path) -> dict[str, object]:
             continue
         try:
             # Only the leading YAML frontmatter is needed, and it sits at the
-            # top of the file. Read a bounded prefix so an oversized SKILL.md
-            # (e.g. a huge body, or a malicious multi-GB file) is never
-            # materialized whole — same memory bound as _read_file_cache. If a
-            # skill's frontmatter somehow exceeds this, the closing delimiter
-            # falls outside the prefix and parsing degrades to {} below.
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read(_MAX_READ_BYTES)
+            # top of the file. Read a bounded *byte* prefix (binary mode, then
+            # decode) so an oversized SKILL.md (a huge body, or a malicious
+            # multi-GB file) is never materialized whole. Reading bytes rather
+            # than text makes the cap a true byte ceiling: a text-mode
+            # read(_MAX_READ_BYTES) bounds characters, which multibyte content
+            # could inflate well past _MAX_READ_BYTES of memory. If a skill's
+            # frontmatter somehow exceeds this, the closing delimiter falls
+            # outside the prefix and parsing degrades to {} below.
+            with path.open("rb") as fh:
+                content = fh.read(_MAX_READ_BYTES).decode("utf-8", errors="replace")
         except OSError:
             logger.debug("Could not read manifest file: %s", name)
             return {}

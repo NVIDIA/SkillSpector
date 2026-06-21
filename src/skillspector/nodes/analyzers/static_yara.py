@@ -33,7 +33,11 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
-from .static_runner import analyzer_finding_to_finding, raise_if_content_exceeds_limit
+from .static_runner import (
+    MAX_FILE_BYTES,
+    analyzer_finding_to_finding,
+    raise_if_content_exceeds_limit,
+)
 
 ANALYZER_ID = "static_yara"
 logger = get_logger(__name__)
@@ -66,7 +70,31 @@ def _collect_rule_files(*dirs: Path) -> list[Path]:
             continue
         for ext in _RULE_EXTENSIONS:
             files.update(d.rglob(ext))
-    return sorted(files)
+
+    # Cap operator-supplied rule files (the --yara-rules-dir tree) at the same
+    # per-file byte limit the analyzers enforce, so an oversized or malicious
+    # rule file cannot exhaust memory at yara.compile() time, bypassing the gate
+    # that bounds scanned content. Built-in rules are small and trusted; an
+    # over-limit file is skipped (with a warning) rather than failing the scan,
+    # since rule files are operator config, not the artifact under analysis.
+    bounded: list[Path] = []
+    for p in sorted(files):
+        try:
+            size_bytes = p.stat().st_size
+        except OSError:
+            logger.debug("%s: could not stat rule file, skipping: %s", ANALYZER_ID, p)
+            continue
+        if size_bytes > MAX_FILE_BYTES:
+            logger.warning(
+                "%s: skipping rule file over the %d-byte limit: %s (%d bytes)",
+                ANALYZER_ID,
+                MAX_FILE_BYTES,
+                p,
+                size_bytes,
+            )
+            continue
+        bounded.append(p)
+    return bounded
 
 
 def _content_hash(rule_files: list[Path]) -> str:

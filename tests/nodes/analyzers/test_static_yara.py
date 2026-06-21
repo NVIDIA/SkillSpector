@@ -315,6 +315,19 @@ class TestHelpers:
         files = static_yara._collect_rule_files(tmp_path / "nope")
         assert files == []
 
+    def test_collect_rule_files_skips_oversized(self, tmp_path, monkeypatch):
+        """An operator-supplied rule file above the byte cap is skipped, not
+        compiled, so it cannot exhaust memory at yara.compile() time."""
+        small = tmp_path / "small.yar"
+        small.write_text("rule small { condition: false }")
+        huge = tmp_path / "huge.yar"
+        huge.write_text("x" * (MAX_FILE_BYTES + 1))
+
+        files = static_yara._collect_rule_files(tmp_path)
+        names = {f.name for f in files}
+        assert "small.yar" in names
+        assert "huge.yar" not in names
+
     def test_build_namespace_map(self, tmp_path):
         (tmp_path / "alpha.yar").write_text("")
         (tmp_path / "beta.yar").write_text("")
