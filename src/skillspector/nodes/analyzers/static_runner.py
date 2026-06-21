@@ -60,12 +60,27 @@ _EVAL_DATASET_FILES = {
 
 
 def raise_if_content_exceeds_limit(path: str, content: str) -> None:
-    """Fail closed if analyzer input exceeds the per-file analysis limit."""
-    size_bytes = len(content.encode("utf-8"))
-    if size_bytes > MAX_FILE_BYTES:
+    """Fail closed if analyzer input exceeds the per-file analysis limit.
+
+    Measures characters, not re-encoded bytes. The authoritative size gate is
+    on-disk bytes (build_context._validate_file_sizes, via stat), which runs
+    before any content is cached; this is a defense-in-depth guard for callers
+    that build a file_cache directly and bypass that gate. A decoded string's
+    character count is always <= its source UTF-8 byte length (every code point,
+    including the U+FFFD that errors="replace" emits for an undecodable byte,
+    consumes at least one byte), so content the on-disk gate admitted can never
+    trip this, while a programmatically injected oversized string still does.
+
+    Re-encoding the content to count bytes here would instead falsely abort a
+    legitimate sub-limit binary file: errors="replace" turns each undecodable
+    on-disk byte into a 3-byte U+FFFD, so a ~17 MiB binary that passed the
+    on-disk gate inflates past 50 MiB on re-encode and aborts the whole scan.
+    """
+    size = len(content)
+    if size > MAX_FILE_BYTES:
         raise ValueError(
-            "Scan aborted: file size exceeds the per-file analysis limit "
-            f"({MAX_FILE_BYTES} bytes): {path} ({size_bytes} bytes)"
+            "Scan aborted: file content exceeds the per-file analysis limit "
+            f"({MAX_FILE_BYTES} characters): {path} ({size} characters)"
         )
 
 

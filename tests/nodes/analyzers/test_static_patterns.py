@@ -177,19 +177,36 @@ class TestRunStaticPatternsFileTypeAndSkip:
 
 
 class TestStaticRunnerSizeLimit:
-    def test_content_limit_is_enforced_in_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Multibyte text over the byte cap must fail even when char count is under it."""
+    def test_content_limit_is_enforced_in_characters(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Content whose character count exceeds the cap fails closed."""
         monkeypatch.setattr(static_runner, "MAX_FILE_BYTES", 4)
 
-        with pytest.raises(ValueError, match=r"multi\.txt .*6 bytes"):
-            static_runner.raise_if_content_exceeds_limit("multi.txt", "ééé")
+        with pytest.raises(ValueError, match=r"multi\.txt .*5 characters"):
+            static_runner.raise_if_content_exceeds_limit("multi.txt", "xxxxx")
+
+    def test_sub_limit_multibyte_content_does_not_falsely_abort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A string under the char cap must not abort even if its UTF-8 byte
+        length is over it.
+
+        Regression guard: measuring re-encoded bytes here falsely aborts a
+        legitimate sub-limit binary file, whose errors="replace" decode inflates
+        each undecodable byte into a 3-byte U+FFFD. "ééé" is 3 chars but 6 bytes;
+        with a 4-unit cap the byte measure would raise, the char measure must not.
+        """
+        monkeypatch.setattr(static_runner, "MAX_FILE_BYTES", 4)
+
+        static_runner.raise_if_content_exceeds_limit("multi.txt", "ééé")  # must not raise
 
     def test_run_static_patterns_fails_on_oversized_content(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(static_runner, "MAX_FILE_BYTES", 4)
-        state = {"components": ["multi.md"], "file_cache": {"multi.md": "ééé"}}
+        state = {"components": ["multi.md"], "file_cache": {"multi.md": "xxxxx"}}
 
         with pytest.raises(ValueError, match=r"multi\.md"):
             static_runner.run_static_patterns(state, [prompt_injection_module])

@@ -775,13 +775,13 @@ class TestLLMMetaAnalyzerGetBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_oversized_file_cache_fails_closed(self) -> None:
-        """Content above the per-file byte limit must fail the scan, not get
+        """Content above the per-file analysis limit must fail the scan, not get
         chunked and sent to the LLM past the fail-closed gate."""
         from skillspector.nodes.analyzers.static_runner import MAX_FILE_BYTES
 
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
         file_cache = {"big.py": "A" * (MAX_FILE_BYTES + 1)}
-        with pytest.raises(ValueError, match="file size exceeds"):
+        with pytest.raises(ValueError, match="exceeds the per-file analysis limit"):
             analyzer.get_batches(["big.py"], file_cache, [])
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
