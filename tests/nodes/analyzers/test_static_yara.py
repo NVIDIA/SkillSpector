@@ -247,13 +247,13 @@ class TestEdgeCases:
         state = {"components": ["ghost.txt"], "file_cache": {}, "yara_rules_dir": str(tmp_path)}
         assert static_yara.node(state)["findings"] == []
 
-    def test_oversized_file_skipped(self, tmp_path):
+    def test_oversized_file_fails_scan(self, tmp_path):
         _write_rule(
             tmp_path, "rule_big", category="malware", severity="HIGH", strings={"a": "BIGMARKER"}
         )
         content = "BIGMARKER" + ("x" * MAX_FILE_BYTES)
-        findings = _run(content, "big.txt", str(tmp_path))
-        assert findings == []
+        with pytest.raises(ValueError, match="big\\.txt"):
+            _run(content, "big.txt", str(tmp_path))
 
     def test_nonexistent_rules_dir_returns_empty(self):
         state = {
@@ -314,6 +314,19 @@ class TestHelpers:
     def test_collect_rule_files_nonexistent_dir(self, tmp_path):
         files = static_yara._collect_rule_files(tmp_path / "nope")
         assert files == []
+
+    def test_collect_rule_files_skips_oversized(self, tmp_path, monkeypatch):
+        """An operator-supplied rule file above the byte cap is skipped, not
+        compiled, so it cannot exhaust memory at yara.compile() time."""
+        small = tmp_path / "small.yar"
+        small.write_text("rule small { condition: false }")
+        huge = tmp_path / "huge.yar"
+        huge.write_text("x" * (MAX_FILE_BYTES + 1))
+
+        files = static_yara._collect_rule_files(tmp_path)
+        names = {f.name for f in files}
+        assert "small.yar" in names
+        assert "huge.yar" not in names
 
     def test_build_namespace_map(self, tmp_path):
         (tmp_path / "alpha.yar").write_text("")

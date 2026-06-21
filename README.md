@@ -483,6 +483,7 @@ The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability 
 - **Encrypted/binary code**: Cannot analyze compiled or encrypted content
 - **Runtime behavior**: Static analysis only, no dynamic execution
 - **Offline SC4**: Without network access to `api.osv.dev`, SC4 uses a small static fallback list
+- **Per-file size limit**: Files larger than 50 MiB fail the scan closed rather than being silently skipped, so oversized content cannot hide from analysis. This is a per-file *analysis* limit, not an ingest limit: the upstream url/zip/git fetch in `input_handler` is not yet bounded, so a very large download or a decompression bomb can exhaust memory or disk before the per-file gate runs (tracked separately). Raising the limit from the previous 1 MB means mid-size files that used to be skipped are now analyzed and, with `--llm`, chunked and sent to the model, which improves detection but increases resource and token cost.
 
 ## Research Background
 

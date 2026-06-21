@@ -60,6 +60,11 @@ _EXECUTABLE_EXTENSIONS = frozenset(
     {".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".rb", ".go", ".rs", ".pl"}
 )
 
+# Per-file read cap. Files larger than this fail the scan rather than being
+# skipped, because skipping would let malicious content hide in an oversized
+# file. Aligned with static_runner.MAX_FILE_BYTES.
+_MAX_READ_BYTES = 50 * 1024 * 1024
+
 
 def _resolve_skill_dir(state: SkillspectorState) -> Path:
     """Resolve state skill_path to an existing directory Path."""
@@ -106,10 +111,26 @@ def _infer_file_type(path: str) -> str:
 
 
 def _count_lines(file_path: Path) -> int:
-    """Count lines in a file, handling binary and errors gracefully."""
+    """Count lines in a file, handling binary and errors gracefully.
+
+    Reads the file in fixed-size binary chunks and counts newline bytes so
+    peak memory stays bounded regardless of file size *or* line length — a
+    multi-gigabyte file with no newlines must not be materialized in memory
+    (consistent with the _MAX_READ_BYTES cap in _read_file_cache). The count
+    matches ``len(text.splitlines())`` for the common ``\\n`` / ``\\r\\n`` cases:
+    number of newline bytes, plus one for a final line without a trailing
+    newline.
+    """
     try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
-        return len(content.splitlines())
+        newline_count = 0
+        last_byte = b""
+        with file_path.open("rb") as fh:
+            while chunk := fh.read(65536):
+                newline_count += chunk.count(b"\n")
+                last_byte = chunk[-1:]
+        if last_byte and last_byte != b"\n":
+            newline_count += 1  # final line with no trailing newline
+        return newline_count
     except OSError:
         logger.debug("Could not read file for line count: %s", file_path)
         return 0
@@ -164,6 +185,33 @@ def _read_file_cache(skill_dir: Path, components: list[str]) -> dict[str, str]:
     return file_cache
 
 
+def _validate_file_sizes(skill_dir: Path, components: list[str]) -> None:
+    """Fail the scan if any discovered file exceeds the per-file read cap."""
+    oversized: list[tuple[str, int]] = []
+    for path in components:
+        full = skill_dir / path
+        if not full.is_file():
+            continue
+        try:
+            size_bytes = full.stat().st_size
+        except OSError:
+            logger.debug("Could not stat file for size validation: %s", path)
+            continue
+        if size_bytes > _MAX_READ_BYTES:
+            oversized.append((path, size_bytes))
+
+    if not oversized:
+        return
+
+    details = ", ".join(f"{path} ({size_bytes} bytes)" for path, size_bytes in oversized[:5])
+    if len(oversized) > 5:
+        details += f", and {len(oversized) - 5} more"
+    raise ValueError(
+        "Scan aborted: file size exceeds the per-file analysis limit "
+        f"({_MAX_READ_BYTES} bytes): {details}"
+    )
+
+
 def _parse_manifest(skill_dir: Path) -> dict[str, object]:
     """Parse SKILL.md or skill.md YAML frontmatter into a manifest dict.
 
@@ -175,7 +223,17 @@ def _parse_manifest(skill_dir: Path) -> dict[str, object]:
         if not path.is_file():
             continue
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            # Only the leading YAML frontmatter is needed, and it sits at the
+            # top of the file. Read a bounded *byte* prefix (binary mode, then
+            # decode) so an oversized SKILL.md (a huge body, or a malicious
+            # multi-GB file) is never materialized whole. Reading bytes rather
+            # than text makes the cap a true byte ceiling: a text-mode
+            # read(_MAX_READ_BYTES) bounds characters, which multibyte content
+            # could inflate well past _MAX_READ_BYTES of memory. If a skill's
+            # frontmatter somehow exceeds this, the closing delimiter falls
+            # outside the prefix and parsing degrades to {} below.
+            with path.open("rb") as fh:
+                content = fh.read(_MAX_READ_BYTES).decode("utf-8", errors="replace")
         except OSError:
             logger.debug("Could not read manifest file: %s", name)
             return {}
@@ -225,6 +283,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     skill_dir = _resolve_skill_dir(state)
 
     components = _walk_skill_files(skill_dir)
+    _validate_file_sizes(skill_dir, components)
     file_cache = _read_file_cache(skill_dir, components)
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)

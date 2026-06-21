@@ -276,9 +276,22 @@ class LLMAnalyzerBase:
             for f in findings:
                 findings_by_file[f.file].append(f)
 
+        # Fail closed on oversized cached content. A programmatic caller can
+        # build a file_cache directly (the semantic_* analyzers call this with
+        # the build_context cache, but nothing stops a caller injecting their
+        # own), so without this guard content above the per-file byte limit
+        # would be chunked and sent to the LLM, bypassing the same fail-closed
+        # gate the static/AST/taint/YARA entry points enforce. Imported lazily:
+        # a module-level import would cycle, since the analyzers package __init__
+        # imports the semantic_* analyzers, which import this module.
+        from skillspector.nodes.analyzers.static_runner import raise_if_content_exceeds_limit
+
         batches: list[Batch] = []
         for path in file_paths:
-            content = file_cache.get(path) or "No content available for this file."
+            cached = file_cache.get(path)
+            if cached is not None:
+                raise_if_content_exceeds_limit(path, cached)
+            content = cached or "No content available for this file."
             file_findings = findings_by_file.get(path, [])
 
             extra = self._estimate_extra_overhead(file_findings)

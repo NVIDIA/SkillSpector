@@ -20,6 +20,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from skillspector.cli import app
+from skillspector.nodes.build_context import _MAX_READ_BYTES
 
 runner = CliRunner()
 
@@ -67,3 +68,18 @@ def test_cli_scan_nonexistent_exits_2() -> None:
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])
     assert result.exit_code == 2
     assert "Error" in result.output or "error" in result.output.lower()
+
+
+def test_cli_scan_oversized_file_exits_2(tmp_path: Path) -> None:
+    """scan fails instead of silently skipping files above the analysis limit."""
+    (tmp_path / "SKILL.md").write_text("---\nname: oversized\n---\n# Skill", encoding="utf-8")
+    huge = tmp_path / "huge.txt"
+    with huge.open("wb") as fh:
+        fh.seek(_MAX_READ_BYTES)
+        fh.write(b"x")
+
+    result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
+
+    assert result.exit_code == 2
+    assert "file size exceeds" in result.output
+    assert "huge.txt" in result.output
