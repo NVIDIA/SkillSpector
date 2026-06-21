@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from skillspector.nodes.analyzers import (
     static_patterns_data_exfiltration as data_exfiltration_module,
 )
@@ -172,3 +174,22 @@ class TestRunStaticPatternsFileTypeAndSkip:
         state = {"components": [], "file_cache": {}}
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
         assert findings == []
+
+
+class TestStaticRunnerSizeLimit:
+    def test_content_limit_is_enforced_in_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Multibyte text over the byte cap must fail even when char count is under it."""
+        monkeypatch.setattr(static_runner, "MAX_FILE_BYTES", 4)
+
+        with pytest.raises(ValueError, match=r"multi\.txt .*6 bytes"):
+            static_runner.raise_if_content_exceeds_limit("multi.txt", "ééé")
+
+    def test_run_static_patterns_fails_on_oversized_content(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(static_runner, "MAX_FILE_BYTES", 4)
+        state = {"components": ["multi.md"], "file_cache": {"multi.md": "ééé"}}
+
+        with pytest.raises(ValueError, match=r"multi\.md"):
+            static_runner.run_static_patterns(state, [prompt_injection_module])

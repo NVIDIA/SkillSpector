@@ -247,13 +247,13 @@ class TestEdgeCases:
         state = {"components": ["ghost.txt"], "file_cache": {}, "yara_rules_dir": str(tmp_path)}
         assert static_yara.node(state)["findings"] == []
 
-    def test_oversized_file_skipped(self, tmp_path):
+    def test_oversized_file_fails_scan(self, tmp_path):
         _write_rule(
             tmp_path, "rule_big", category="malware", severity="HIGH", strings={"a": "BIGMARKER"}
         )
         content = "BIGMARKER" + ("x" * MAX_FILE_BYTES)
-        findings = _run(content, "big.txt", str(tmp_path))
-        assert findings == []
+        with pytest.raises(ValueError, match="big\\.txt"):
+            _run(content, "big.txt", str(tmp_path))
 
     def test_nonexistent_rules_dir_returns_empty(self):
         state = {
