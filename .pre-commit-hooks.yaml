@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# SkillSpector pre-commit hook definition.
+#
+# To use in your project, add the following to your .pre-commit-config.yaml:
+#
+#   repos:
+#     - repo: https://github.com/NVIDIA/skillspector
+#       rev: v2.1.4   # pin to a release tag
+#       hooks:
+#         - id: skillspector
+#
+# The hook runs a static-only scan (--no-llm) so it works without any API key.
+# For LLM-enriched results, override args in your local config:
+#
+#   hooks:
+#     - id: skillspector
+#       args: []   # removes --no-llm, requires SKILLSPECTOR_PROVIDER + credentials
+
+- id: skillspector
+  name: SkillSpector — AI skill security scan
+  description: >
+    Scans AI agent skill files for vulnerabilities, malicious patterns, and
+    security risks before they are committed. Exits non-zero when the risk
+    score exceeds 50 (HIGH or CRITICAL). Uses static analysis only by default
+    (no LLM API key required).
+  language: python
+  entry: skillspector scan
+  args: [--no-llm]
+  # Run once on the repo root, not per-file, so the graph can walk all files.
+  pass_filenames: false
+  # Trigger when any of these file types change inside a skill directory.
+  types_or: [markdown, python, yaml, json, shell, text]
+  # Always run so the scanner sees the full skill directory state.
+  always_run: false
+  # Requires skillspector to be installed in the pre-commit env.
+  additional_dependencies: []

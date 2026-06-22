@@ -429,6 +429,78 @@ Options:
   --help                                       Show this message and exit
 ```
 
+## CI/CD Integration
+
+### GitHub Actions
+
+The repository ships a ready-to-use workflow at
+[`.github/workflows/skillspector.yml`](.github/workflows/skillspector.yml)
+that you can copy into your own repository. It runs a static scan on every
+pull request and uploads the results to **GitHub Code Scanning** so findings
+appear inline on the PR diff.
+
+```yaml
+# .github/workflows/skillspector.yml  (copy this into your repo)
+name: SkillSpector Security Scan
+on: [push, pull_request]
+permissions:
+  security-events: write
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install skillspector
+      - name: Scan skills
+        continue-on-error: true
+        run: skillspector scan . --no-llm --format sarif --output results.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: {sarif_file: results.sarif}
+```
+
+> **Note**: GitHub Code Scanning (which displays SARIF findings) requires
+> GitHub Advanced Security, available on public repositories and on
+> GitHub Enterprise.
+
+### pre-commit Hook
+
+SkillSpector ships a [pre-commit](https://pre-commit.com) hook so you can
+scan skills automatically before every commit — no API key required.
+
+Add the following to your project's `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/NVIDIA/skillspector
+    rev: v2.1.4        # pin to a release tag
+    hooks:
+      - id: skillspector
+```
+
+Then install the hooks once:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+From that point on, every `git commit` that touches Markdown, Python, YAML,
+or shell files will trigger a static scan. The commit is blocked if the
+risk score exceeds 50.
+
+To enable LLM-enriched analysis in the hook, override `args` and set your
+provider credentials in the shell environment:
+
+```yaml
+hooks:
+  - id: skillspector
+    args: []          # removes --no-llm
+```
+
 ## Development
 
 ### Setup
