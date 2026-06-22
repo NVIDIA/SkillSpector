@@ -246,6 +246,14 @@ exec(marshal.loads(bytecode))
         assert len(findings) >= 1
         assert any(f.rule_id == "SC3" for f in findings)
 
+    def test_trusted_source_domain_spoofing(self) -> None:
+        """Verify that _is_trusted_source flags a spoofed URL as UNTRUSTED."""
+        from skillspector.nodes.analyzers.static_patterns_supply_chain import _is_trusted_source
+        assert not _is_trusted_source("https://github.com.evil.com/payload.sh")
+        assert _is_trusted_source("https://github.com/NVIDIA/SkillSpector")
+        assert _is_trusted_source("https://raw.githubusercontent.com/user/repo/main/install.sh")
+
+
 
 class TestHarmfulContent:
     """harmful_content.analyze() — P5."""

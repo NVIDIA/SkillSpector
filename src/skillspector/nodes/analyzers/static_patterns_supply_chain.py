@@ -533,8 +533,27 @@ _SAFE_INSTALL_PATTERN = re.compile(r"(?:pip|npm)\s+install", re.IGNORECASE)
 
 
 def _is_trusted_source(text: str) -> bool:
-    lower = text.lower()
-    return any(d in lower for d in _TRUSTED_DOMAINS)
+    from urllib.parse import urlparse
+    # Extract URLs using regex
+    urls = re.findall(r'https?://[^\s\'"]+', text)
+    if not urls:
+        # Fallback check if it is just a plain domain string
+        lower = text.lower().strip()
+        return any(lower == d or lower.endswith(f".{d}") for d in _TRUSTED_DOMAINS)
+    
+    for url in urls:
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname
+            if not hostname:
+                return False
+            hostname = hostname.lower()
+            # Check if hostname exactly matches or is a subdomain of a trusted domain
+            if not any(hostname == d or hostname.endswith(f".{d}") for d in _TRUSTED_DOMAINS):
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def _is_safe_supply_chain_pattern(text: str) -> bool:
