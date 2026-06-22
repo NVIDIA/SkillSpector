@@ -98,7 +98,7 @@ class TestGraphScanMaliciousSkill:
         assert "risk_score" in result
         # Malicious content: cyanide in SKILL.md + env harvesting in script
         assert len(result["findings"]) > 0
-        # When risk_score is implemented (TODO A.3.2): assert result["risk_score"] >= 50
+        assert result["risk_score"] >= 50, "Risk score failed to trigger on malicious content"
 
 
 class TestGraphRiskScoring:
