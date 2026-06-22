@@ -567,14 +567,15 @@ class TestLLMAnalysisResult:
         assert result.findings[0].confidence == 0.9
 
     def test_confidence_validation(self) -> None:
-        with pytest.raises(ValueError):
-            LLMFinding(
-                rule_id="X",
-                message="x",
-                severity="LOW",
-                start_line=1,
-                confidence=1.5,
-            )
+        # Now asserts clamp instead of ValueError
+        f = LLMFinding(
+            rule_id="X",
+            message="x",
+            severity="LOW",
+            start_line=1,
+            confidence=1.5,
+        )
+        assert f.confidence == 1.0
 
     def test_severity_validation(self) -> None:
         with pytest.raises(ValueError):
@@ -661,14 +662,15 @@ class TestMetaAnalyzerResult:
         assert result.findings[0].confidence == 0.9
 
     def test_confidence_validation(self) -> None:
-        with pytest.raises(ValueError):
-            MetaAnalyzerFinding(
-                pattern_id="E1",
-                is_vulnerability=True,
-                confidence=1.5,
-                intent="malicious",
-                impact="high",
-            )
+        # Now asserts clamp instead of ValueError
+        f = MetaAnalyzerFinding(
+            pattern_id="E1",
+            is_vulnerability=True,
+            confidence=1.5,
+            intent="malicious",
+            impact="high",
+        )
+        assert f.confidence == 1.0
 
     def test_intent_validation(self) -> None:
         with pytest.raises(ValueError):
@@ -1263,3 +1265,28 @@ class TestTokenBudgetFunctions:
         out = get_max_output_tokens("unknown/model")
         assert inp == int(mocked_ctx * 0.75)
         assert out == int(mocked_ctx * 0.25)
+
+
+class TestPydanticSchemaNoBoundsAndClamping:
+    def test_pydantic_schema_no_bounds_and_clamping(self):
+        from skillspector.llm_analyzer_base import LLMFinding
+        
+        # Check schema does not contain minimum or maximum
+        schema = LLMFinding.model_json_schema()
+        properties = schema.get("properties", {})
+        assert "minimum" not in properties.get("confidence", {})
+        assert "maximum" not in properties.get("confidence", {})
+        assert "minimum" not in properties.get("start_line", {})
+        
+        # Test clamping
+        finding = LLMFinding(
+            rule_id="TEST",
+            message="test",
+            severity="LOW",
+            confidence=1.5,
+            file="test.py",
+            start_line=0
+        )
+        assert finding.confidence == 1.0
+        assert finding.start_line == 1
+

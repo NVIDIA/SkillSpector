@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Literal
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from skillspector.cache import get_cached_findings, initialize_cache_db, set_cached_findings
 from skillspector.llm_utils import get_chat_model
@@ -67,11 +67,21 @@ class LLMFinding(BaseModel):
     rule_id: str = Field(description="Identifier for the type of finding")
     message: str = Field(description="Short description of the finding")
     severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(description="Severity level")
-    start_line: int = Field(ge=1, description="Starting line number")
+    start_line: int = Field(description="Starting line number")
     end_line: int | None = Field(default=None, description="Ending line number (optional)")
-    confidence: float = Field(ge=0.0, le=1.0, default=0.5, description="Confidence score")
+    confidence: float = Field(default=0.5, description="Confidence score")
     explanation: str = Field(default="", description="Why this is a finding (2-3 sentences)")
     remediation: str = Field(default="", description="Actionable steps to fix the issue")
+
+    @field_validator("confidence")
+    @classmethod
+    def clamp_confidence(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
+
+    @field_validator("start_line")
+    @classmethod
+    def clamp_start_line(cls, v: int) -> int:
+        return max(1, v)
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""

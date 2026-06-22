@@ -63,7 +63,7 @@ class MetaAnalyzerFinding(BaseModel):
         description="The end line number from the finding's Location, if available.",
     )
     is_vulnerability: bool = Field(description="Whether this is a true vulnerability")
-    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0")
+    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
     intent: Literal["malicious", "negligent", "benign"] = Field(
         description="Likely intent behind the finding"
     )
@@ -72,6 +72,11 @@ class MetaAnalyzerFinding(BaseModel):
     )
     explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
     remediation: str = Field(default="", description="How to fix the issue (actionable steps)")
+
+    @field_validator("confidence")
+    @classmethod
+    def clamp_confidence(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
 
 
 class OverallAssessment(BaseModel):
