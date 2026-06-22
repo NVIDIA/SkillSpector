@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import warnings
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -31,11 +32,14 @@ from typing import Annotated
 import typer
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.tree import Tree
 
 from skillspector import __version__
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
+from skillspector.nodes.analyzers import ANALYZER_NODE_IDS
 
 logger = get_logger(__name__)
 
@@ -253,21 +257,14 @@ def scan(
         if verbose:
             result = graph.invoke(state, config=trace_config)
         else:
-            from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-            from rich.console import Console
-            from skillspector.nodes.analyzers import ANALYZER_NODE_IDS
-            import warnings
-
-            # Suppress noisy Pydantic serialization warnings during structured LLM output
-            warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
-
             total_steps = 4 + len(ANALYZER_NODE_IDS)
             result = dict(state)
 
             # Use stderr for progress so stdout remains clean for structured outputs
             err_console = Console(stderr=True)
 
-            with Progress(
+            # Suppress noisy Pydantic serialization warnings scoped to the graph run
+            with warnings.catch_warnings(), Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
@@ -276,6 +273,7 @@ def scan(
                 console=err_console,
                 transient=True,
             ) as progress:
+                warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
                 task_id = progress.add_task("Resolving input...", total=total_steps)
 
                 num_files = 0
@@ -305,9 +303,6 @@ def scan(
                             progress.update(task_id, description=f"Analyzing {num_files} files (0/{total_analyzers} rules applied)...")
 
                             # Print a proper report of the files and directories being scanned
-                            from rich.tree import Tree
-                            from pathlib import Path
-
                             tree = Tree("[bold blue]Discovered Files to Scan[/bold blue]")
                             nodes = {"": tree}
                             for path in sorted(components):

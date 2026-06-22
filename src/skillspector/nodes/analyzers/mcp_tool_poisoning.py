@@ -799,8 +799,8 @@ Respond in JSON matching this exact schema:
             )
         ]
 
-    except Exception as exc:
-        logger.warning("%s: TP4 LLM check failed, skipping: %s", ANALYZER_ID, exc)
+    except Exception:
+        logger.warning("%s: TP4 LLM check failed, skipping", ANALYZER_ID, exc_info=True)
         return []
 
 
