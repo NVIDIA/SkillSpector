@@ -110,12 +110,12 @@ def _is_chain_sink(node: ast.Call) -> bool:
     return name in ("exec", "eval", "compile")
 
 
-def _contains_dangerous_source(node: ast.AST) -> str | None:
+def _contains_dangerous_source(node: ast.AST, import_aliases: dict[str, str] | None = None) -> str | None:
     """Walk children to find a nested dangerous call that forms a chain."""
     for child in ast.walk(node):
         if not isinstance(child, ast.Call):
             continue
-        name = resolve_call_name(child)
+        name = resolve_call_name(child, import_aliases)
         if name is None:
             continue
         if name in ("compile", "__import__"):
@@ -135,6 +135,9 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
     except SyntaxError:
         logger.debug("SyntaxError parsing %s, skipping", file_path)
         return []
+
+    from skillspector.nodes.analyzers.common import _build_import_aliases
+    import_aliases = _build_import_aliases(tree)
 
     lines = content.splitlines()
     findings: list[AnalyzerFinding] = []
@@ -162,7 +165,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         if not isinstance(ast_node, ast.Call):
             continue
 
-        call_name = resolve_call_name(ast_node)
+        call_name = resolve_call_name(ast_node, import_aliases)
         if call_name is None:
             continue
 
@@ -171,14 +174,14 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
 
         if call_name == "exec":
             if _is_chain_sink(ast_node) and ast_node.args:
-                source = _contains_dangerous_source(ast_node.args[0])
+                source = _contains_dangerous_source(ast_node.args[0], import_aliases)
                 if source:
                     _emit("AST8", lineno, end_lineno, f"Dangerous chain: exec() wrapping {source}")
             _emit("AST1", lineno, end_lineno)
 
         elif call_name == "eval":
             if _is_chain_sink(ast_node) and ast_node.args:
-                source = _contains_dangerous_source(ast_node.args[0])
+                source = _contains_dangerous_source(ast_node.args[0], import_aliases)
                 if source:
                     _emit("AST8", lineno, end_lineno, f"Dangerous chain: eval() wrapping {source}")
             _emit("AST2", lineno, end_lineno)

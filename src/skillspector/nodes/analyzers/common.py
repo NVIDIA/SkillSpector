@@ -104,9 +104,14 @@ def resolve_dotted_name(node: ast.expr) -> str | None:
     return None
 
 
-def resolve_call_name(node: ast.Call) -> str | None:
-    """Extract a dotted call name like ``'os.system'`` from a Call node."""
-    return resolve_dotted_name(node.func)
+def resolve_call_name(node: ast.Call, import_aliases: dict[str, str] | None = None) -> str | None:
+    """Extract a dotted call name like ``'os.system'`` from a Call node, resolving aliases."""
+    name = resolve_dotted_name(node.func)
+    if name and import_aliases:
+        root, _, rest = name.partition(".")
+        resolved_root = import_aliases.get(root, root)
+        return f"{resolved_root}.{rest}" if rest else resolved_root
+    return name
 
 
 def _build_import_aliases(tree: ast.Module) -> dict[str, str]:
