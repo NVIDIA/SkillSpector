@@ -72,34 +72,45 @@ def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note
 
 
 def _compute_risk_score(
-    findings: list[Finding], has_executable_scripts: bool
+    findings: list[Finding], component_metadata: list[dict[str, object]]
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
-    v1 rules: CRITICAL +50, HIGH +25, MEDIUM +10, LOW +5; 1.3x if has_executable_scripts.
+    v1 rules: CRITICAL +50, HIGH +25, MEDIUM +10, LOW +5; 1.3x only for executable components.
     """
-    score = 0
+    executable_files = {
+        str(comp.get("path"))
+        for comp in component_metadata
+        if comp.get("executable")
+    }
+    score = 0.0
     for f in findings:
+        base_score = 0
         sev = (f.severity or "LOW").upper()
         if sev == "CRITICAL":
-            score += 50
+            base_score = 50
         elif sev == "HIGH":
-            score += 25
+            base_score = 25
         elif sev == "MEDIUM":
-            score += 10
+            base_score = 10
         elif sev == "LOW":
-            score += 5
-    if has_executable_scripts:
-        score = int(score * 1.3)
-    score = min(100, max(0, score))
+            base_score = 5
+        
+        # Apply 1.3x only if the finding is in an executable file
+        if f.file in executable_files:
+            score += base_score * 1.3
+        else:
+            score += base_score
+
+    int_score = min(100, max(0, int(score)))
 
     severity_band = "LOW"
     for threshold, band in _RISK_SEVERITY_BANDS:
-        if score >= threshold:
+        if int_score >= threshold:
             severity_band = band
             break
     recommendation = _RISK_RECOMMENDATION.get(severity_band, "CAUTION")
-    return score, severity_band, recommendation
+    return int_score, severity_band, recommendation
 
 
 def _build_sarif(findings: list[Finding]) -> dict[str, object]:
@@ -361,7 +372,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     use_llm = state.get("use_llm", True)
 
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
-        findings, has_executable_scripts
+        findings, component_metadata
     )
     sarif_report = _build_sarif(findings)
 

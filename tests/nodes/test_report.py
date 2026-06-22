@@ -100,11 +100,12 @@ def test_report_high_severity_do_not_install() -> None:
 def test_report_executable_scripts_multiplier() -> None:
     """has_executable_scripts applies 1.3x to risk score (capped at 100)."""
     # 2 HIGH = 50, * 1.3 = 65
+    f1 = _finding("E2", "HIGH")
+    f1.file = "run.py"
+    f2 = _finding("PE3", "HIGH")
+    f2.file = "run.py"
     state: SkillspectorState = {
-        "filtered_findings": [
-            _finding("E2", "HIGH"),
-            _finding("PE3", "HIGH"),
-        ],
+        "filtered_findings": [f1, f2],
         "component_metadata": [
             {"path": "run.py", "type": "python", "lines": 5, "executable": True, "size_bytes": 200}
         ],
@@ -117,6 +118,33 @@ def test_report_executable_scripts_multiplier() -> None:
     assert result["risk_score"] == 65
     assert result["risk_severity"] == "HIGH"
     assert result["risk_recommendation"] == "DO_NOT_INSTALL"
+
+
+def test_scoring_multiplier_only_on_executables() -> None:
+    """Verify that 1.3x multiplier only applies to findings in executable files."""
+    f_non_exec = _finding("E2", "HIGH")
+    f_non_exec.file = "README.md"
+    
+    f_exec = _finding("PE3", "HIGH")
+    f_exec.file = "run.py"
+    
+    state: SkillspectorState = {
+        "filtered_findings": [f_non_exec, f_exec],
+        "component_metadata": [
+            {"path": "README.md", "type": "markdown", "lines": 10, "executable": False, "size_bytes": 100},
+            {"path": "run.py", "type": "python", "lines": 5, "executable": True, "size_bytes": 200}
+        ],
+        "has_executable_scripts": True,
+        "manifest": {},
+        "skill_path": "/tmp/skill",
+        "output_format": "json",
+    }
+    # Expected score:
+    # f_non_exec (HIGH = 25) -> not executable -> 25
+    # f_exec (HIGH = 25) -> executable -> 25 * 1.3 = 32
+    # Total expected score = 25 + 32 = 57
+    result = report(state)
+    assert result["risk_score"] == 57
 
 
 def test_report_output_format_json() -> None:
