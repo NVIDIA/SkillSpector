@@ -21,6 +21,15 @@ on:
   push:
     branches: ["main"]
 
+# Least privilege: these jobs only read the repo; no write scopes are needed.
+permissions:
+  contents: read
+
+# Cancel superseded runs when new commits are pushed to the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-and-test:
     name: Lint & Test (Python ${{ matrix.python-version }})
@@ -36,7 +45,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        # Pinned to a full commit SHA (third-party action); comment tracks the tag.
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -49,9 +59,6 @@ jobs:
 
       - name: Check formatting with ruff
         run: uv run ruff format --check src/ tests/
-
-      - name: Run unit tests
-        run: uv run pytest -m "not integration"
 
       - name: Run unit tests with coverage
         run: uv run pytest -m "not integration" --cov=src/skillspector --cov-report=term-missing
@@ -69,14 +76,19 @@ jobs:
         run: |
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.event.pull_request.head.sha }}
-          MISSING=$(git log --pretty=format:"%H %s" "${BASE}..${HEAD}" | while read -r sha msg; do
+          # Iterate SHAs directly rather than piping `git log` into `while read`:
+          # `git log` does not print a trailing newline after the final record,
+          # so a read-loop silently skips the last commit — and for a one-commit
+          # PR (the common case) the body never runs at all, letting an unsigned
+          # commit pass. A for-loop over the SHA list checks every commit.
+          status=0
+          for sha in $(git log --format=%H "${BASE}..${HEAD}"); do
             if ! git log -1 --format="%B" "$sha" | grep -q "^Signed-off-by:"; then
-              echo "  $sha: $msg"
+              echo "  missing Signed-off-by: $sha $(git log -1 --format=%s "$sha")"
+              status=1
             fi
-          done)
-          if [ -n "$MISSING" ]; then
-            echo "The following commits are missing Signed-off-by trailers:"
-            echo "$MISSING"
+          done
+          if [ "$status" -ne 0 ]; then
             echo ""
             echo "Please add a DCO sign-off (git commit -s) to all commits."
             exit 1
