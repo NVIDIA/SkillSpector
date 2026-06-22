@@ -41,8 +41,11 @@ def _discover_analyzers() -> None:
         full_module_name = f"{__name__}.{module_name}"
         try:
             mod = importlib.import_module(full_module_name)
+        except ImportError as exc:
+            logger.error("Failed to import analyzer module %s: %s", module_name, exc)
+            continue
         except Exception as exc:
-            logger.debug("Skipping module %s during discovery: %s", module_name, exc)
+            logger.error("Error loading analyzer module %s: %s", module_name, exc)
             continue
 
         analyzer_id = getattr(mod, "ANALYZER_ID", None)

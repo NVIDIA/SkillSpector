@@ -43,14 +43,17 @@ def create_graph():
 
     wired_analyzers = []
 
+    # Note: Discovery order is determined by pkgutil.iter_modules (filesystem order)
+    # rather than a curated list. Since analyzers run in parallel, execution order
+    # does not matter.
     for analyzer_id in ANALYZER_NODE_IDS:
         mod = ANALYZER_MODULES.get(analyzer_id)
-        
+
         is_available = getattr(mod, "is_available", None)
         if callable(is_available) and not is_available():
             logger.warning("Skipping analyzer %s: is_available() returned False", analyzer_id)
             continue
-            
+
         requires_api_key = getattr(mod, "requires_api_key", False)
         if requires_api_key:
             has_llm, _ = is_llm_available()
@@ -61,13 +64,15 @@ def create_graph():
         workflow.add_node(analyzer_id, ANALYZER_NODES[analyzer_id])
         wired_analyzers.append(analyzer_id)
 
+    if not wired_analyzers:
+        logger.warning("No analyzers were wired into the graph. Scan will produce no findings.")
+
     workflow.add_edge(START, "resolve_input")
     workflow.add_edge("resolve_input", "build_context")
-    
+
     for analyzer_id in wired_analyzers:
         workflow.add_edge("build_context", analyzer_id)
         workflow.add_edge(analyzer_id, "meta_analyzer")
-        
     workflow.add_edge("meta_analyzer", "report")
     workflow.add_edge("report", END)
     return workflow.compile()

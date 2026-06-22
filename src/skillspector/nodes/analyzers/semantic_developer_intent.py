@@ -30,6 +30,7 @@ from skillspector.logging_config import get_logger
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 ANALYZER_ID = "semantic_developer_intent"
+requires_api_key = True
 logger = get_logger(__name__)
 
 ANALYZER_PROMPT = """\
