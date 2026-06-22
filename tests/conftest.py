@@ -31,6 +31,14 @@ def mock_resolve_context_length():
         yield
 
 
+@pytest.fixture(autouse=True)
+def mock_cache_db_path(tmp_path: Path):
+    """Ensure every test uses a clean, isolated SQLite cache database."""
+    test_db_path = tmp_path / "scan_cache.db"
+    with patch("skillspector.cache.get_cache_db_path", return_value=test_db_path):
+        yield
+
+
 @pytest.fixture
 def safe_skill_dir(tmp_path: Path) -> Path:
     """Create a safe skill directory for testing."""
