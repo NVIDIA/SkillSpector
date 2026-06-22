@@ -81,7 +81,7 @@ MP1_PATTERNS = [
 
 # MP2: Context Window Stuffing — filling context to displace content
 MP2_PATTERNS = [
-    (r"((\S)(?!\2).{1,19}?)\1{20,}", 0.8),
+    (r"(.{2,20}?)\1{20,}", 0.8),
     (
         r"(?:repeat|duplicate|echo)\s+(?:this|the\s+following)\s+(?:\d{3,}|many|hundreds?|thousands?)\s+times?",
         0.85,
