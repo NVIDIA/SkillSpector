@@ -108,5 +108,7 @@ credentials.json
 # LangGraph API server
 .langgraph_api/
 
-# Reports
-report*
+# Reports (generated artifacts only — anchored to repo root)
+/report*.md
+/report*.json
+/report*.sarif
