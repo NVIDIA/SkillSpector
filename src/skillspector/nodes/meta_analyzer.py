@@ -304,8 +304,6 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         """
         _enrichment = tuple[str, str, float]
         confirmed_granular: dict[tuple[str, str, int, int | None], _enrichment] = {}
-        # Fallback index keyed without end_line (see lookup below). Issue #67.
-        confirmed_by_start: dict[tuple[str, str, int], _enrichment] = {}
         confirmed_coarse: dict[tuple[str, str], _enrichment] = {}
 
         for batch, llm_items in batch_results:
@@ -332,7 +330,6 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                             int(end_line) if end_line is not None else None,
                         )
                     ] = enrichment
-                    confirmed_by_start[(file_path, pattern_id, int(start_line))] = enrichment
                 else:
                     confirmed_coarse[(file_path, pattern_id)] = enrichment
 
@@ -341,13 +338,10 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             exact_key = (f.file, f.rule_id, f.start_line, f.end_line)
             start_only_key = (f.file, f.rule_id, f.start_line, None)
             coarse_key = (f.file, f.rule_id)
-            start_key = (f.file, f.rule_id, f.start_line) if f.start_line is not None else None
             if exact_key in confirmed_granular:
                 expl, rem, conf = confirmed_granular[exact_key]
             elif start_only_key in confirmed_granular:
                 expl, rem, conf = confirmed_granular[start_only_key]
-            elif f.end_line is None and start_key is not None and start_key in confirmed_by_start:
-                expl, rem, conf = confirmed_by_start[start_key]
             elif coarse_key in confirmed_coarse:
                 expl, rem, conf = confirmed_coarse[coarse_key]
             else:

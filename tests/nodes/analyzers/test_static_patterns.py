@@ -71,11 +71,12 @@ class TestRunStaticPatternsPromptInjection:
 
     def test_p2_bidi_control_chars_produce_finding(self):
         """Bidi control characters (Trojan Source CVE-2021-42574) yield P2."""
-        # ‮ is RIGHT-TO-LEFT OVERRIDE — a bidi control character
+        rlo = chr(0x202E)
+        pdf = chr(0x202C)
         state = {
             "components": ["SKILL.md"],
             "file_cache": {
-                "SKILL.md": "Normal text‮ evil hidden content‬",
+                "SKILL.md": f"Normal text{rlo} evil hidden content{pdf}",
             },
         }
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
@@ -83,8 +84,10 @@ class TestRunStaticPatternsPromptInjection:
         assert any(f.rule_id == "P2" for f in findings)
 
     def test_p2_bidi_rlo_edge_cases(self):
-        """Bidi override variants ‪-‮ and ⁦-⁩ all yield P2."""
-        bidi_chars = ["‪", "‫", "‬", "‭", "‮", "⁦", "⁧", "⁨", "⁩"]
+        """Bidi override variants all yield P2."""
+        bidi_chars = [chr(codepoint) for codepoint in range(0x202A, 0x202F)] + [
+            chr(codepoint) for codepoint in range(0x2066, 0x206A)
+        ]
         for ch in bidi_chars:
             state = {
                 "components": ["skill.md"],

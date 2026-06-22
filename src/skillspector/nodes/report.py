@@ -71,64 +71,35 @@ def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note
     }.get(severity.upper(), "note")  # type: ignore[return-value]
 
 
-_SEVERITY_POINTS: dict[str, int] = {
-    "CRITICAL": 50,
-    "HIGH": 25,
-    "MEDIUM": 10,
-    "LOW": 5,
-}
-
-_MAX_OCCURRENCES_PER_RULE = 3
-_DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
-
-
 def _compute_risk_score(
     findings: list[Finding], has_executable_scripts: bool
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
-
-    Scoring uses per-rule diminishing returns: the first occurrence of a rule_id
-    contributes full points, the second contributes half, and the third contributes
-    a quarter. Occurrences beyond the third are ignored for scoring purposes.
-    This prevents repeated pattern matches from inflating the score unboundedly.
-
-    Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
-    Multiplier: 1.3x if has_executable_scripts.
+    v1 rules: CRITICAL +50, HIGH +25, MEDIUM +10, LOW +5; 1.3x if has_executable_scripts.
     """
-    rule_occurrence_count: dict[str, int] = {}
-    score = 0.0
-
+    score = 0
     for f in findings:
-        confidence = max(0.0, min(1.0, f.confidence))
-        if confidence <= 0.0:
-            continue
-
         sev = (f.severity or "LOW").upper()
-        base_points = _SEVERITY_POINTS.get(sev, 5)
-
-        rule_id = f.rule_id or "UNKNOWN"
-        count = rule_occurrence_count.get(rule_id, 0)
-        rule_occurrence_count[rule_id] = count + 1
-
-        if count >= _MAX_OCCURRENCES_PER_RULE:
-            continue
-
-        weight = _DIMINISHING_WEIGHTS[count]
-        score += base_points * weight * confidence
-
+        if sev == "CRITICAL":
+            score += 50
+        elif sev == "HIGH":
+            score += 25
+        elif sev == "MEDIUM":
+            score += 10
+        elif sev == "LOW":
+            score += 5
     if has_executable_scripts:
-        score *= 1.3
-
-    final_score = min(100, max(0, int(score)))
+        score = int(score * 1.3)
+    score = min(100, max(0, score))
 
     severity_band = "LOW"
     for threshold, band in _RISK_SEVERITY_BANDS:
-        if final_score >= threshold:
+        if score >= threshold:
             severity_band = band
             break
     recommendation = _RISK_RECOMMENDATION.get(severity_band, "CAUTION")
-    return final_score, severity_band, recommendation
+    return score, severity_band, recommendation
 
 
 def _build_sarif(findings: list[Finding]) -> dict[str, object]:

@@ -279,7 +279,11 @@ def query_batch(
             if not vulns_raw:
                 name, version = packages[idx]
                 _put_cache(_cache_key(name, version, ecosystem), [])
-                logger.info("OSV.dev: no vulnerabilities found for %s==%s (passed)", name, version or "unspecified")
+                logger.info(
+                    "OSV.dev: no vulnerabilities found for %s==%s (passed)",
+                    name,
+                    version or "unspecified",
+                )
                 continue
 
             vuln_ids = [v["id"] for v in vulns_raw if "id" in v]

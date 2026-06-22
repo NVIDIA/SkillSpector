@@ -50,13 +50,22 @@ AS1_PATTERNS = [
     (r"open\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)/", 0.9),
     (r"(?:Path|pathlib\.Path)\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)/", 0.9),
     (r"os\.path\.(?:join|exists|isfile)\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)", 0.85),
-    (r"(?:read|load|open|access|fetch)\s+(?:the\s+)?(?:agent|claude|codex|gemini)\s+(?:config|configuration|settings?)\s+(?:from|at|in)\s+~?/?\.(?:claude|codex|gemini)", 0.9),
+    (
+        r"(?:read|load|open|access|fetch)\s+(?:the\s+)?(?:agent|claude|codex|gemini)\s+(?:config|configuration|settings?)\s+(?:from|at|in)\s+~?/?\.(?:claude|codex|gemini)",
+        0.9,
+    ),
     # Shell commands targeting config dirs
     (r"(?:cat|less|head|tail|grep|find)\s+[^|&;\n]*~?/?\.(claude|codex|gemini)/", 0.85),
     # Home-directory config paths
-    (r"~?/\.(?:claude|codex|gemini|continue)/(?:config|settings?|preferences?|credentials?)(?:\.(?:json|yaml|yml|toml))?", 0.9),
+    (
+        r"~?/\.(?:claude|codex|gemini|continue)/(?:config|settings?|preferences?|credentials?)(?:\.(?:json|yaml|yml|toml))?",
+        0.9,
+    ),
     # Generic "agent config" snooping instructions
-    (r"(?:read|access|inspect|examine|retrieve)\s+(?:the\s+)?(?:agent|assistant)\s+(?:config(?:uration)?|settings?|preferences?)\s+(?:file|directory|folder)", 0.8),
+    (
+        r"(?:read|access|inspect|examine|retrieve)\s+(?:the\s+)?(?:agent|assistant)\s+(?:config(?:uration)?|settings?|preferences?)\s+(?:file|directory|folder)",
+        0.8,
+    ),
 ]
 
 # AS2: MCP Config Access
@@ -67,10 +76,16 @@ AS2_PATTERNS = [
     (r"(?:Path|pathlib\.Path)\s*\(\s*['\"][^'\"]*mcp(?:_config)?\.json['\"]", 0.9),
     (r"(?:cat|less|head|grep)\s+[^|&;\n]*mcp(?:_config)?\.json", 0.9),
     # Instructions referencing MCP config
-    (r"(?:read|access|load|inspect)\s+(?:the\s+)?mcp(?:\.json|_config)?\s+(?:file|config(?:uration)?|settings?)", 0.9),
+    (
+        r"(?:read|access|load|inspect)\s+(?:the\s+)?mcp(?:\.json|_config)?\s+(?:file|config(?:uration)?|settings?)",
+        0.9,
+    ),
     (r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json", 0.95),
     # Listing MCP servers
-    (r"(?:list|enumerate|discover)\s+(?:all\s+)?(?:available\s+)?mcp\s+(?:servers?|tools?|services?)", 0.8),
+    (
+        r"(?:list|enumerate|discover)\s+(?:all\s+)?(?:available\s+)?mcp\s+(?:servers?|tools?|services?)",
+        0.8,
+    ),
     # Accessing MCP server URLs or API keys from config
     (r"mcp(?:_config)?\.json.*?(?:api_?key|token|secret|url|endpoint)", 0.9),
 ]
@@ -79,17 +94,29 @@ AS2_PATTERNS = [
 # Matches code/instructions that enumerate or read other installed skills.
 AS3_PATTERNS = [
     # Listing skill directories
-    (r"(?:os\.listdir|os\.scandir|glob\.glob|Path\.iterdir)\s*\([^)]*\.(?:claude|codex|gemini)/skills?", 0.9),
+    (
+        r"(?:os\.listdir|os\.scandir|glob\.glob|Path\.iterdir)\s*\([^)]*\.(?:claude|codex|gemini)/skills?",
+        0.9,
+    ),
     (r"(?:ls|find|dir)\s+[^|&;\n]*\.(?:claude|codex|gemini)/skills?", 0.85),
     # Reading other skills' SKILL.md files
     (r"open\s*\(\s*['\"][^'\"]*SKILL\.md['\"].*?\bother\b", 0.85),
-    (r"(?:read|access|inspect|enumerate)\s+(?:all\s+)?(?:installed|available|other)\s+skills?(?:\s+in\s+(?:the\s+)?(?:skills?|agent)\s+(?:directory|folder))?", 0.85),
+    (
+        r"(?:read|access|inspect|enumerate)\s+(?:all\s+)?(?:installed|available|other)\s+skills?(?:\s+in\s+(?:the\s+)?(?:skills?|agent)\s+(?:directory|folder))?",
+        0.85,
+    ),
     # Instructions to discover other skills
-    (r"(?:list|discover|find|enumerate|identify)\s+(?:all\s+)?(?:other|installed|available)\s+(?:skills?|agents?|tools?)\s+(?:in\s+)?(?:the\s+)?(?:\.(?:claude|codex|gemini)|\$HOME)", 0.85),
+    (
+        r"(?:list|discover|find|enumerate|identify)\s+(?:all\s+)?(?:other|installed|available)\s+(?:skills?|agents?|tools?)\s+(?:in\s+)?(?:the\s+)?(?:\.(?:claude|codex|gemini)|\$HOME)",
+        0.85,
+    ),
     # Accessing skills/CURRENT or adjacent skill directories
     (r"skills?/(?:(?!CURRENT)[A-Z][A-Za-z0-9_-]+)/SKILL\.md", 0.8),
     # Reading tool manifests of other agents
-    (r"(?:read|access|load)\s+(?:the\s+)?(?:SKILL|skill)\.md\s+(?:file\s+)?(?:of|from|for)\s+(?:another|other|different|all)\s+(?:skill|agent|tool)", 0.9),
+    (
+        r"(?:read|access|load)\s+(?:the\s+)?(?:SKILL|skill)\.md\s+(?:file\s+)?(?:of|from|for)\s+(?:another|other|different|all)\s+(?:skill|agent|tool)",
+        0.9,
+    ),
 ]
 
 

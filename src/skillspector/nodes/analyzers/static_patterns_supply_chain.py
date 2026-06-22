@@ -553,7 +553,9 @@ def _is_trusted_source(text: str) -> bool:
         token = match.group(0).strip("\"'`<>()[]{}")
         parsed = urlparse(token if "://" in token else f"//{token}")
         hostname = (parsed.hostname or "").rstrip(".").lower()
-        if any(hostname == domain or hostname.endswith(f".{domain}") for domain in _TRUSTED_DOMAINS):
+        if any(
+            hostname == domain or hostname.endswith(f".{domain}") for domain in _TRUSTED_DOMAINS
+        ):
             return True
     return False
 

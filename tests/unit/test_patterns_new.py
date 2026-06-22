@@ -52,7 +52,9 @@ from skillspector.nodes.analyzers.osv_client import VulnResult
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 _OSV_PATCH_TARGET = "skillspector.nodes.analyzers.static_patterns_supply_chain.query_batch"
-_WAS_OSV_REACHABLE_TARGET = "skillspector.nodes.analyzers.static_patterns_supply_chain.was_osv_reachable"
+_WAS_OSV_REACHABLE_TARGET = (
+    "skillspector.nodes.analyzers.static_patterns_supply_chain.was_osv_reachable"
+)
 
 
 def _make_vuln(

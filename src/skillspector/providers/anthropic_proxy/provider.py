@@ -44,7 +44,7 @@ import json
 import os
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import anthropic
 import httpx
@@ -57,11 +57,38 @@ from skillspector.providers import registry
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
 DEFAULT_API_VERSION = "vertex-2023-10-16"
+_PROXY_STRIPPED_HEADERS = frozenset({"x-api-key", "anthropic-version", "host", "content-length"})
 
 
 def _get_api_version() -> str:
     """Return the ``anthropic_version`` value from env or the default."""
     return os.environ.get("ANTHROPIC_PROXY_API_VERSION", "").strip() or DEFAULT_API_VERSION
+
+
+def _rewrite_proxy_request(
+    request: httpx.Request,
+    *,
+    endpoint_url: str,
+    bearer_token: str,
+) -> httpx.Request:
+    """Build a proxy-compatible request from an Anthropic SDK request."""
+    body = json.loads(request.content)
+    body["anthropic_version"] = _get_api_version()
+    body.pop("model", None)
+    encoded_body = json.dumps(body).encode("utf-8")
+
+    headers = httpx.Headers(
+        {k: v for k, v in request.headers.items() if k.lower() not in _PROXY_STRIPPED_HEADERS}
+    )
+    headers["authorization"] = f"Bearer {bearer_token}"
+    headers["content-length"] = str(len(encoded_body))
+
+    return httpx.Request(
+        method=request.method,
+        url=endpoint_url,
+        headers=headers,
+        content=encoded_body,
+    )
 
 
 class _ProxyTransport(httpx.BaseTransport):
@@ -79,26 +106,10 @@ class _ProxyTransport(httpx.BaseTransport):
         self._inner = httpx.HTTPTransport(verify=verify)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        body["anthropic_version"] = _get_api_version()
-        body.pop("model", None)
-        encoded_body = json.dumps(body).encode("utf-8")
-
-        headers = httpx.Headers(
-            {
-                k: v
-                for k, v in request.headers.items()
-                if k.lower() not in ("x-api-key", "anthropic-version", "host", "content-length")
-            }
-        )
-        headers["authorization"] = f"Bearer {self._bearer_token}"
-        headers["content-length"] = str(len(encoded_body))
-
-        new_request = httpx.Request(
-            method=request.method,
-            url=self._endpoint_url,
-            headers=headers,
-            content=encoded_body,
+        new_request = _rewrite_proxy_request(
+            request,
+            endpoint_url=self._endpoint_url,
+            bearer_token=self._bearer_token,
         )
         return self._inner.handle_request(new_request)
 
@@ -121,26 +132,10 @@ class _ProxyAsyncTransport(httpx.AsyncBaseTransport):
         self._inner = httpx.AsyncHTTPTransport(verify=verify)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        body["anthropic_version"] = _get_api_version()
-        body.pop("model", None)
-        encoded_body = json.dumps(body).encode("utf-8")
-
-        headers = httpx.Headers(
-            {
-                k: v
-                for k, v in request.headers.items()
-                if k.lower() not in ("x-api-key", "anthropic-version", "host", "content-length")
-            }
-        )
-        headers["authorization"] = f"Bearer {self._bearer_token}"
-        headers["content-length"] = str(len(encoded_body))
-
-        new_request = httpx.Request(
-            method=request.method,
-            url=self._endpoint_url,
-            headers=headers,
-            content=encoded_body,
+        new_request = _rewrite_proxy_request(
+            request,
+            endpoint_url=self._endpoint_url,
+            bearer_token=self._bearer_token,
         )
         return await self._inner.handle_async_request(new_request)
 
@@ -212,7 +207,7 @@ class AnthropicProxyProvider:
     """Anthropic proxy provider for Vertex-style raw-predict endpoints."""
 
     DEFAULT_MODEL = "claude-sonnet-4-6"
-    SLOT_DEFAULTS: dict[str, str] = {}
+    SLOT_DEFAULTS: ClassVar[dict[str, str]] = {}
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, endpoint_url)`` from proxy env vars."""

