@@ -196,6 +196,41 @@ class TestEdgeCases:
         assert result["findings"] == []
 
 
+class TestImportAliasEvasion:
+    """Dangerous calls must be detected through ``from ... import`` and ``import ... as``.
+
+    A skill can otherwise dodge the prefix-based matching simply by importing the
+    primitive under another name (e.g. ``from os import system``).
+    """
+
+    def test_from_os_import_system(self):
+        findings = _run("from os import system\nsystem('id')")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_import_os_as_alias(self):
+        findings = _run("import os as o\no.system('id')")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_from_subprocess_import_run(self):
+        findings = _run("from subprocess import run\nrun(['id'])")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_import_subprocess_as_alias(self):
+        findings = _run("import subprocess as sp\nsp.Popen(['id'])")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_aliased_chain_via_from_import(self):
+        """``from base64 import b64decode; eval(b64decode(...))`` is still a chain (AST8)."""
+        findings = _run("from base64 import b64decode\neval(b64decode(payload))")
+        ast8 = [f for f in findings if f.rule_id == "AST8"]
+        assert len(ast8) >= 1
+        assert "base64" in ast8[0].message
+
+    def test_aliased_safe_import_no_false_positive(self):
+        findings = _run("import json as j\ndata = j.loads('{}')\nprint(data)\n")
+        assert findings == []
+
+
 class TestMultipleFindings:
     def test_multiple_dangerous_calls_in_one_file(self):
         code = (

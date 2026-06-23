@@ -23,7 +23,12 @@ from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
-from .common import get_context_from_lines, get_source_segment, resolve_call_name
+from .common import (
+    build_import_aliases,
+    get_context_from_lines,
+    get_source_segment,
+    resolve_call_name,
+)
 from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
 
 ANALYZER_ID = "behavioral_ast"
@@ -104,18 +109,18 @@ _RULE_CONFIDENCES: dict[str, float] = {
 _TAG = "Dangerous Code Execution"
 
 
-def _is_chain_sink(node: ast.Call) -> bool:
+def _is_chain_sink(node: ast.Call, aliases: dict[str, str] | None = None) -> bool:
     """True if this call is exec(), eval(), or compile() — the outer dangerous call."""
-    name = resolve_call_name(node)
+    name = resolve_call_name(node, aliases)
     return name in ("exec", "eval", "compile")
 
 
-def _contains_dangerous_source(node: ast.AST, import_aliases: dict[str, str] | None = None) -> str | None:
+def _contains_dangerous_source(node: ast.AST, aliases: dict[str, str] | None = None) -> str | None:
     """Walk children to find a nested dangerous call that forms a chain."""
     for child in ast.walk(node):
         if not isinstance(child, ast.Call):
             continue
-        name = resolve_call_name(child, import_aliases)
+        name = resolve_call_name(child, aliases)
         if name is None:
             continue
         if name in ("compile", "__import__"):
@@ -136,9 +141,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         logger.debug("SyntaxError parsing %s, skipping", file_path)
         return []
 
-    from skillspector.nodes.analyzers.common import _build_import_aliases
-    import_aliases = _build_import_aliases(tree)
-
+    aliases = build_import_aliases(tree)
     lines = content.splitlines()
     findings: list[AnalyzerFinding] = []
 
@@ -165,7 +168,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         if not isinstance(ast_node, ast.Call):
             continue
 
-        call_name = resolve_call_name(ast_node, import_aliases)
+        call_name = resolve_call_name(ast_node, aliases)
         if call_name is None:
             continue
 
@@ -173,15 +176,15 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         end_lineno = getattr(ast_node, "end_lineno", None)
 
         if call_name == "exec":
-            if _is_chain_sink(ast_node) and ast_node.args:
-                source = _contains_dangerous_source(ast_node.args[0], import_aliases)
+            if _is_chain_sink(ast_node, aliases) and ast_node.args:
+                source = _contains_dangerous_source(ast_node.args[0], aliases)
                 if source:
                     _emit("AST8", lineno, end_lineno, f"Dangerous chain: exec() wrapping {source}")
             _emit("AST1", lineno, end_lineno)
 
         elif call_name == "eval":
-            if _is_chain_sink(ast_node) and ast_node.args:
-                source = _contains_dangerous_source(ast_node.args[0], import_aliases)
+            if _is_chain_sink(ast_node, aliases) and ast_node.args:
+                source = _contains_dangerous_source(ast_node.args[0], aliases)
                 if source:
                     _emit("AST8", lineno, end_lineno, f"Dangerous chain: eval() wrapping {source}")
             _emit("AST2", lineno, end_lineno)

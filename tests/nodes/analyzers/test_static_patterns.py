@@ -18,6 +18,9 @@
 from __future__ import annotations
 
 from skillspector.nodes.analyzers import (
+    static_patterns_agent_snooping as agent_snooping_module,
+)
+from skillspector.nodes.analyzers import (
     static_patterns_data_exfiltration as data_exfiltration_module,
 )
 from skillspector.nodes.analyzers import (
@@ -65,6 +68,34 @@ class TestRunStaticPatternsPromptInjection:
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
         assert len(findings) >= 1
         assert any(f.rule_id == "P2" for f in findings)
+
+    def test_p2_bidi_control_chars_produce_finding(self):
+        """Bidi control characters (Trojan Source CVE-2021-42574) yield P2."""
+        rlo = chr(0x202E)
+        pdf = chr(0x202C)
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": f"Normal text{rlo} evil hidden content{pdf}",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert len(findings) >= 1
+        assert any(f.rule_id == "P2" for f in findings)
+
+    def test_p2_bidi_rlo_edge_cases(self):
+        """Bidi override variants all yield P2."""
+        bidi_chars = [chr(codepoint) for codepoint in range(0x202A, 0x202F)] + [
+            chr(codepoint) for codepoint in range(0x2066, 0x206A)
+        ]
+        for ch in bidi_chars:
+            state = {
+                "components": ["skill.md"],
+                "file_cache": {"skill.md": f"text{ch}more"},
+            }
+            findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+            p2 = [f for f in findings if f.rule_id == "P2"]
+            assert len(p2) >= 1, f"Expected P2 for bidi char U+{ord(ch):04X}"
 
     def test_safe_content_no_p1_p2(self):
         """Safe content does not produce P1/P2."""
@@ -153,6 +184,68 @@ class TestRunStaticPatternsSupplyChain:
         sc2 = [f for f in findings if f.rule_id == "SC2"]
         assert len(sc2) >= 1
         assert sc2[0].severity == "HIGH"
+
+
+class TestRunStaticPatternsAgentSnooping:
+    """run_static_patterns with agent_snooping: AS1, AS2, AS3."""
+
+    def test_as1_agent_config_dir_access_python(self):
+        """Reading .claude/ config files in Python code yields AS1."""
+        state = {
+            "components": ["helper.py"],
+            "file_cache": {
+                "helper.py": "import json\nwith open('.claude/settings.json') as f:\n    cfg = json.load(f)",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        assert len(findings) >= 1
+        as1 = [f for f in findings if f.rule_id == "AS1"]
+        assert len(as1) >= 1
+        assert as1[0].severity == "HIGH"
+
+    def test_as1_codex_config_dir_access(self):
+        """Reading .codex/ config directory in instructions yields AS1."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": "Read the agent settings from ~/.codex/config.json to determine capabilities.",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        assert any(f.rule_id == "AS1" for f in findings)
+
+    def test_as2_mcp_config_access(self):
+        """Accessing mcp.json files yields AS2."""
+        state = {
+            "components": ["reader.py"],
+            "file_cache": {
+                "reader.py": "with open('.claude/mcp.json') as f:\n    servers = json.load(f)",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        assert any(f.rule_id == "AS2" for f in findings)
+
+    def test_as3_skill_enumeration(self):
+        """Listing installed skills from skill directories yields AS3."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": "Enumerate all installed skills by listing files in the .claude/skills/ directory.",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        assert any(f.rule_id == "AS3" for f in findings)
+
+    def test_safe_content_no_agent_snooping(self):
+        """Legitimate skill content produces no agent snooping findings."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": "# Code Helper\n\nHelps you write better Python code.\n\n## Usage\nAsk me to review your code.",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
+        assert not any(f.rule_id in ("AS1", "AS2", "AS3") for f in findings)
 
 
 class TestRunStaticPatternsFileTypeAndSkip:

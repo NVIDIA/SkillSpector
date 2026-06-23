@@ -67,21 +67,34 @@ class LLMFinding(BaseModel):
     rule_id: str = Field(description="Identifier for the type of finding")
     message: str = Field(description="Short description of the finding")
     severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(description="Severity level")
-    start_line: int = Field(description="Starting line number")
+    # start_line and confidence carry no ge/le Field bounds on purpose. Pydantic
+    # bounds emit JSON-schema minimum/maximum, which some OpenAI-compatible
+    # structured-output / tool-calling endpoints reject when they validate the
+    # response schema, failing the whole call. The ranges are enforced by the
+    # validators below instead, so the guarantee holds without those keywords in
+    # the emitted schema. start_line stays required (no default), so a finding
+    # with no location is still rejected rather than materialised at line 1;
+    # only the numeric bound is removed, not the requiredness.
+    start_line: int = Field(description="Starting line number (>= 1)")
     end_line: int | None = Field(default=None, description="Ending line number (optional)")
-    confidence: float = Field(default=0.5, description="Confidence score")
+    confidence: float = Field(default=0.5, description="Confidence score between 0.0 and 1.0")
     explanation: str = Field(default="", description="Why this is a finding (2-3 sentences)")
     remediation: str = Field(default="", description="Actionable steps to fix the issue")
 
-    @field_validator("confidence")
-    @classmethod
-    def clamp_confidence(cls, v: float) -> float:
-        return max(0.0, min(1.0, v))
-
     @field_validator("start_line")
     @classmethod
-    def clamp_start_line(cls, v: int) -> int:
-        return max(1, v)
+    def _clamp_start_line(cls, v: int) -> int:
+        # Clamp rather than raise: an LLM occasionally returns 0 for a
+        # whole-file finding, and normalising to the first line is better than
+        # dropping the finding over an off-by-one.
+        return v if v >= 1 else 1
+
+    @field_validator("confidence")
+    @classmethod
+    def _clamp_confidence(cls, v: float) -> float:
+        # Clamp into [0.0, 1.0] so a slightly out-of-range model value
+        # normalises instead of failing the structured-output parse.
+        return min(1.0, max(0.0, v))
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""

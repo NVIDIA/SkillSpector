@@ -98,7 +98,7 @@ def _make_state(fixture_name: str) -> dict:
             continue
         if item.name.startswith(".") and not item.name.startswith(".claude"):
             continue
-        rel = str(item.relative_to(fixture_dir))
+        rel = item.relative_to(fixture_dir).as_posix()  # forward slashes on every OS
         components.append(rel)
     components.sort()
 

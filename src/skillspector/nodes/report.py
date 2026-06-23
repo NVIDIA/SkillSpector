@@ -71,46 +71,78 @@ def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note
     }.get(severity.upper(), "note")  # type: ignore[return-value]
 
 
+_SEVERITY_POINTS: dict[str, int] = {
+    "CRITICAL": 50,
+    "HIGH": 25,
+    "MEDIUM": 10,
+    "LOW": 5,
+}
+
+_MAX_OCCURRENCES_PER_RULE = 3
+_DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
+
+
 def _compute_risk_score(
-    findings: list[Finding], component_metadata: list[dict[str, object]]
+    findings: list[Finding],
+    component_metadata: list[dict[str, object]] | bool = False,
+    has_executable_scripts: bool = False,
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
-    v1 rules: CRITICAL +50, HIGH +25, MEDIUM +10, LOW +5; 1.3x only for executable components.
+
+    Scoring uses per-rule diminishing returns: the first occurrence of a rule_id
+    contributes full points, the second contributes half, and the third contributes
+    a quarter. Occurrences beyond the third are ignored for scoring purposes.
+    This prevents repeated pattern matches from inflating the score unboundedly.
+
+    Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
+    Multiplier: 1.3x only for findings in executable files.
     """
+    if isinstance(component_metadata, bool):
+        has_executable_scripts = component_metadata
+        component_metadata = []
+
     executable_files = {
         str(comp.get("path"))
         for comp in component_metadata
         if comp.get("executable")
     }
+    rule_occurrence_count: dict[str, int] = {}
     score = 0.0
-    for f in findings:
-        base_score = 0
-        sev = (f.severity or "LOW").upper()
-        if sev == "CRITICAL":
-            base_score = 50
-        elif sev == "HIGH":
-            base_score = 25
-        elif sev == "MEDIUM":
-            base_score = 10
-        elif sev == "LOW":
-            base_score = 5
-        
-        # Apply 1.3x only if the finding is in an executable file
-        if f.file in executable_files:
-            score += base_score * 1.3
-        else:
-            score += base_score
 
-    int_score = min(100, max(0, int(score)))
+    for f in findings:
+        confidence = max(0.0, min(1.0, f.confidence))
+        if confidence <= 0.0:
+            continue
+
+        sev = (f.severity or "LOW").upper()
+        base_points = _SEVERITY_POINTS.get(sev, 5)
+
+        rule_id = f.rule_id or "UNKNOWN"
+        count = rule_occurrence_count.get(rule_id, 0)
+        rule_occurrence_count[rule_id] = count + 1
+
+        if count >= _MAX_OCCURRENCES_PER_RULE:
+            continue
+
+        weight = _DIMINISHING_WEIGHTS[count]
+        finding_score = base_points * weight * confidence
+
+        # Apply 1.3x only if the finding is in an executable file, or if has_executable_scripts is True (offline/test mode)
+        if f.file in executable_files or (has_executable_scripts and not component_metadata):
+            score += finding_score * 1.3
+        else:
+            score += finding_score
+
+    final_score = min(100, max(0, int(score)))
 
     severity_band = "LOW"
     for threshold, band in _RISK_SEVERITY_BANDS:
-        if int_score >= threshold:
+        if final_score >= threshold:
             severity_band = band
             break
     recommendation = _RISK_RECOMMENDATION.get(severity_band, "CAUTION")
-    return int_score, severity_band, recommendation
+    return final_score, severity_band, recommendation
 
 
 def _build_sarif(findings: list[Finding]) -> dict[str, object]:

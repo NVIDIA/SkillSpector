@@ -152,7 +152,7 @@ def _walk_skill_files(skill_dir: Path) -> list[str]:
                 "pubspec.lock",
             }:
                 continue
-            paths.append(str(p))
+            paths.append(item.as_posix())
         paths.sort()
         return paths
 
@@ -182,7 +182,7 @@ def _walk_skill_files(skill_dir: Path) -> list[str]:
             "pubspec.lock",
         }:
             continue
-        paths.append(str(rel))
+        paths.append(rel.as_posix())
     paths.sort()
     return paths
 

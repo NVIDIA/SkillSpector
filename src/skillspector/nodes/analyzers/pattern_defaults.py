@@ -38,6 +38,7 @@ class PatternCategory(StrEnum):
     YARA_MATCH = "YARA Match"
     MCP_LEAST_PRIVILEGE = "MCP Least Privilege"
     MCP_TOOL_POISONING = "MCP Tool Poisoning"
+    AGENT_SNOOPING = "Agent Snooping"
 
 
 # Pattern-specific explanations (why the finding is dangerous)
@@ -119,6 +120,10 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "TP2": "Unicode deception detected in skill identifiers or descriptions. Homoglyphs, RTL overrides, or invisible characters can make malicious content appear benign.",
     "TP3": "Instruction injection patterns found in parameter descriptions or default values. Parameter metadata is read by LLMs and can override intended behavior.",
     "TP4": "Skill description does not match actual code behavior. The declared purpose diverges from what the code actually does, indicating possible deception.",
+    # Agent Snooping (AS1–AS3)
+    "AS1": "Skill reads from agent configuration directories (.claude/, .codex/, .gemini/). These directories may contain API keys, personal settings, and other credentials that the skill has no legitimate need to access.",
+    "AS2": "Skill accesses MCP server configuration files (mcp.json). MCP configs contain server URLs, authentication tokens, and tool definitions — reading them allows the skill to discover and potentially abuse other tool integrations.",
+    "AS3": "Skill enumerates or reads other installed skills. Access to other skills' SKILL.md files or the skills directory reveals prompt instructions, capabilities, and secrets that should be invisible to peer skills.",
 }
 
 # Rule ID -> category (for report output)
@@ -182,6 +187,10 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "TP2": PatternCategory.MCP_TOOL_POISONING.value,
     "TP3": PatternCategory.MCP_TOOL_POISONING.value,
     "TP4": PatternCategory.MCP_TOOL_POISONING.value,
+    # Agent Snooping (AS1–AS3)
+    "AS1": PatternCategory.AGENT_SNOOPING.value,
+    "AS2": PatternCategory.AGENT_SNOOPING.value,
+    "AS3": PatternCategory.AGENT_SNOOPING.value,
 }
 
 # Rule ID -> pattern display name (for report output)
@@ -245,6 +254,10 @@ PATTERN_NAMES: dict[str, str] = {
     "TP2": "Unicode Deception",
     "TP3": "Parameter Description Injection",
     "TP4": "Description-Behavior Mismatch",
+    # Agent Snooping (AS1–AS3)
+    "AS1": "Agent Config Directory Access",
+    "AS2": "MCP Config Access",
+    "AS3": "Skill Enumeration",
 }
 
 # Pattern-specific remediations (how to fix the issue)
@@ -326,6 +339,10 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "TP2": "Replace non-ASCII characters in identifiers with ASCII equivalents. Remove RTL override and invisible formatting characters.",
     "TP3": "Remove injection patterns, system tokens, and suspicious content from parameter descriptions and default values.",
     "TP4": "Update the skill description to accurately reflect all capabilities, or remove undeclared functionality.",
+    # Agent Snooping (AS1–AS3)
+    "AS1": "Remove all code or instructions that access agent configuration directories (.claude/, .codex/, .gemini/). If configuration values are needed, pass them explicitly as parameters or environment variables — never read the agent's own config files.",
+    "AS2": "Remove all code or instructions that read MCP configuration files (mcp.json). MCP server details should be managed by the agent runtime, not read by individual skills.",
+    "AS3": "Remove all code or instructions that list or read other skills' files or directories. Skills should operate independently; cross-skill access is a privilege escalation.",
 }
 
 

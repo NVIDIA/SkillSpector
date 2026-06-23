@@ -51,6 +51,7 @@ P2_PATTERNS = [
     (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
     (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
     (r"[\u200b\u200c\u200d\u2060\ufeff]", 0.6),
+    (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
 # P3: Exfiltration Commands

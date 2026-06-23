@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import sys
+from urllib.parse import urlparse
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
@@ -35,7 +36,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import get_context, get_line_number
-from .osv_client import ECOSYSTEM_NPM, ECOSYSTEM_PYPI, VulnResult, query_batch
+from .osv_client import ECOSYSTEM_NPM, ECOSYSTEM_PYPI, VulnResult, query_batch, was_osv_reachable
 from .pattern_defaults import PatternCategory
 from .static_runner import analyzer_finding_to_finding
 
@@ -294,8 +295,19 @@ def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> st
         if len(normalized) < 3 or len(pop_norm) < 3:
             continue
         dist = _edit_distance(normalized, pop_norm)
-        if 0 < dist <= max_distance:
-            return popular_name
+        if not 0 < dist <= max_distance:
+            continue
+        # Relative-distance guard: a genuine typosquat perturbs only a small
+        # fraction of the name. Short, legitimate-but-distinct names collide
+        # under an absolute distance of 2 (e.g. "task" is edit-distance 2 from
+        # "flask" yet is a real package) and are not typosquats. Require
+        # dist/len <= 1/3, so short names need an all-but-one-character match
+        # while longer names may still differ by two (e.g. "reqeusts" vs
+        # "requests").
+        shorter = min(len(normalized), len(pop_norm))
+        if dist * 3 > shorter:
+            continue
+        return popular_name
     return None
 
 
@@ -530,30 +542,21 @@ _TRUSTED_DOMAINS: tuple[str, ...] = (
 )
 
 _SAFE_INSTALL_PATTERN = re.compile(r"(?:pip|npm)\s+install", re.IGNORECASE)
-
+_URL_TOKEN_PATTERN = re.compile(
+    r"https?://[^\s|;&)]+|(?<![?=&/])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s|;&)]*)?",
+    re.IGNORECASE,
+)
 
 def _is_trusted_source(text: str) -> bool:
-    from urllib.parse import urlparse
-    # Extract URLs using regex
-    urls = re.findall(r'https?://[^\s\'"]+', text)
-    if not urls:
-        # Fallback check if it is just a plain domain string
-        lower = text.lower().strip()
-        return any(lower == d or lower.endswith(f".{d}") for d in _TRUSTED_DOMAINS)
-    
-    for url in urls:
-        try:
-            parsed = urlparse(url)
-            hostname = parsed.hostname
-            if not hostname:
-                return False
-            hostname = hostname.lower()
-            # Check if hostname exactly matches or is a subdomain of a trusted domain
-            if not any(hostname == d or hostname.endswith(f".{d}") for d in _TRUSTED_DOMAINS):
-                return False
-        except Exception:
-            return False
-    return True
+    for match in _URL_TOKEN_PATTERN.finditer(text):
+        token = match.group(0).strip("\"'`<>()[]{}")
+        parsed = urlparse(token if "://" in token else f"//{token}")
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        if any(
+            hostname == domain or hostname.endswith(f".{domain}") for domain in _TRUSTED_DOMAINS
+        ):
+            return True
+    return False
 
 
 def _is_safe_supply_chain_pattern(text: str) -> bool:
@@ -732,6 +735,24 @@ def _analyze_dependencies(
     if fallback_findings:
         logger.debug(
             "SC4: using static fallback for %d uncovered packages", len(uncovered_packages)
+        )
+    elif uncovered_packages and not osv_findings and not was_osv_reachable():
+        # OSV.dev was unreachable and fallback found nothing — surface the gap
+        findings.append(
+            AnalyzerFinding(
+                rule_id="SC4",
+                message=(
+                    f"🟡 SC4: OSV.dev unreachable, using static fallback "
+                    f"({len(fallback_db)} packages). "
+                    "Results may be incomplete. Set SKILLSPECTOR_OSV_TIMEOUT to increase "
+                    "timeout or check network connectivity to api.osv.dev."
+                ),
+                severity=Severity.LOW,
+                location=Location(file=file_path, start_line=1),
+                confidence=1.0,
+                tags=tag,
+                matched_text="SC4 fallback active",
+            )
         )
     findings.extend(fallback_findings)
 
