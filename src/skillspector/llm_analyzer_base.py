@@ -28,14 +28,18 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from skillspector.llm_utils import get_chat_model, retry_llm_call, retry_llm_call_sync
+from skillspector.llm_utils import (
+    _resolve_max_concurrency,
+    get_chat_model,
+    retry_llm_call,
+    retry_llm_call_sync,
+)
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
@@ -381,15 +385,7 @@ class LLMAnalyzerBase:
 
         The return type mirrors :meth:`run_batches`.
         """
-        if max_concurrency is None:
-            raw = (os.environ.get("SKILLSPECTOR_MAX_CONCURRENCY") or "").strip()
-            try:
-                max_concurrency = int(raw) if raw else 5
-            except ValueError:
-                logger.warning("Invalid SKILLSPECTOR_MAX_CONCURRENCY=%r; defaulting to 5", raw)
-                max_concurrency = 5
-            if max_concurrency < 1:
-                max_concurrency = 1
+        max_concurrency = _resolve_max_concurrency(max_concurrency)
 
         sem = asyncio.Semaphore(max_concurrency)
 

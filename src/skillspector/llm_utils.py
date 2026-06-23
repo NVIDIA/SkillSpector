@@ -30,8 +30,9 @@ configured via the standard ``OPENAI_*`` envs.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-from random import random
+import random
 import time
 
 from langchain_openai import ChatOpenAI
@@ -39,6 +40,8 @@ from langchain_openai import ChatOpenAI
 from skillspector.constants import MODEL_CONFIG
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import resolve_provider_credentials
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_llm_credentials() -> tuple[str, str | None]:
@@ -135,7 +138,7 @@ def retry_llm_call_sync(call_func, max_attempts=4):
             if attempt == max_attempts - 1:
                 raise
 
-            wait = 2 ** attempt + random.uniform(0, 1)
+            wait = 2**attempt + random.uniform(0, 1)
             time.sleep(wait)
 
 
@@ -168,5 +171,25 @@ async def retry_llm_call(coro_func, max_attempts=4):
             if attempt == max_attempts - 1:
                 raise
 
-            wait = 2 ** attempt + random.uniform(0, 1)
+            wait = 2**attempt + random.uniform(0, 1)
             await asyncio.sleep(wait)
+
+
+def _resolve_max_concurrency(max_concurrency: int | None = None) -> int:
+    """Resolve max concurrency from an explicit value or environment."""
+
+    if max_concurrency is not None:
+        return max(max_concurrency, 1)
+
+    raw = (os.environ.get("SKILLSPECTOR_MAX_CONCURRENCY") or "").strip()
+
+    try:
+        max_concurrency = int(raw) if raw else 5
+    except ValueError:
+        logger.warning(
+            "Invalid SKILLSPECTOR_MAX_CONCURRENCY=%r; defaulting to 5",
+            raw,
+        )
+        max_concurrency = 5
+
+    return max(max_concurrency, 1)
