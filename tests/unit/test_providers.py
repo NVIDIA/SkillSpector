@@ -64,6 +64,7 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("NVIDIA_INFERENCE_METADATA_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
@@ -215,6 +216,15 @@ class TestOpenAIProvider:
         assert isinstance(llm, ChatOpenAI)
         assert llm.model_name == "gpt-5.4"
         assert llm.max_tokens == 123
+
+    def test_openai_project_id_sets_default_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        monkeypatch.setenv("OPENAI_PROJECT_ID", "proj_123")
+        llm = OpenAIProvider().create_chat_model("gpt-5.4", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.default_headers == {"OpenAI-Project": "proj_123"}
 
     def test_default_model(self) -> None:
         assert OpenAIProvider().resolve_model() == "gpt-5.4"

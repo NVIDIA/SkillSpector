@@ -1,0 +1,16 @@
+# Token-budget metadata for the Anthropic proxy provider.
+# Same models/budgets as the standard Anthropic provider — the proxy
+# forwards to the same Claude backends.
+
+models:
+  "claude-opus-4-5":
+    context_length: 200000
+    max_output_tokens: 64000
+
+  "claude-sonnet-4-6":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-opus-4-6":
+    context_length: 1000000
+    max_output_tokens: 128000

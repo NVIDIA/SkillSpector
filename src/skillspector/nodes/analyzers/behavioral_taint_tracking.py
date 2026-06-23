@@ -30,6 +30,8 @@ from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import (
+    apply_import_aliases,
+    build_import_aliases,
     build_type_map,
     get_context_from_lines,
     get_source_segment,
@@ -204,7 +206,11 @@ def _is_open_for_write(node: ast.Call) -> bool:
     return False
 
 
-def _find_source_in_expr(node: ast.expr, type_map: dict[str, str] | None = None) -> str | None:
+def _find_source_in_expr(
+    node: ast.expr,
+    type_map: dict[str, str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
     """Find a source call anywhere in an expression tree (handles chained calls).
 
     Handles patterns like ``open("f").read()``, ``requests.get(url).text``,
@@ -213,7 +219,7 @@ def _find_source_in_expr(node: ast.expr, type_map: dict[str, str] | None = None)
     for child in ast.walk(node):
         if not isinstance(child, ast.Call):
             continue
-        name = resolve_call_name_typed(child, type_map)
+        name = resolve_call_name_typed(child, type_map, aliases)
         if name is None or name not in _ALL_SOURCES:
             continue
         if name == "open" and _is_open_for_write(child):
@@ -223,7 +229,9 @@ def _find_source_in_expr(node: ast.expr, type_map: dict[str, str] | None = None)
 
 
 def _find_nested_sources(
-    node: ast.Call, type_map: dict[str, str] | None = None
+    node: ast.Call,
+    type_map: dict[str, str] | None = None,
+    aliases: dict[str, str] | None = None,
 ) -> list[tuple[str, ast.Call]]:
     """Walk children to find source calls nested inside a sink call."""
     results: list[tuple[str, ast.Call]] = []
@@ -232,7 +240,7 @@ def _find_nested_sources(
             continue
         if not isinstance(child, ast.Call):
             continue
-        name = resolve_call_name_typed(child, type_map)
+        name = resolve_call_name_typed(child, type_map, aliases)
         if name and name in _ALL_SOURCES:
             results.append((name, child))
     return results
@@ -298,6 +306,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         return []
 
     type_map = build_type_map(tree)
+    aliases = build_import_aliases(tree)
     lines = content.splitlines()
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
@@ -329,11 +338,13 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
     for ast_node in ast.walk(tree):
         # Record tainted assignments.
         if isinstance(ast_node, ast.Assign):
-            src_name = _find_source_in_expr(ast_node.value, type_map)
+            src_name = _find_source_in_expr(ast_node.value, type_map, aliases)
 
-            # Subscript sources like os.environ["KEY"]
+            # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
             if src_name is None and isinstance(ast_node.value, ast.Subscript):
                 base = resolve_dotted_name(ast_node.value.value)
+                if base is not None:
+                    base = apply_import_aliases(base, aliases)
                 if base and base in _CREDENTIAL_SOURCES:
                     src_name = base
 
@@ -352,7 +363,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         if not isinstance(ast_node, ast.Call):
             continue
 
-        sink_name = resolve_call_name_typed(ast_node, type_map)
+        sink_name = resolve_call_name_typed(ast_node, type_map, aliases)
         if not sink_name or sink_name not in _ALL_SINKS:
             continue
 
@@ -362,7 +373,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         lineno = getattr(ast_node, "lineno", 1)
         end_lineno = getattr(ast_node, "end_lineno", None)
 
-        for src_name, src_node in _find_nested_sources(ast_node, type_map):
+        for src_name, src_node in _find_nested_sources(ast_node, type_map, aliases):
             if src_name == "open" and _is_open_for_write(src_node):
                 continue
             rule = _pick_rule(src_name, sink_name, is_direct=True)

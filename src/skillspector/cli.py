@@ -35,6 +35,7 @@ from rich.console import Console
 from skillspector import __version__
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
+from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
 
 logger = get_logger(__name__)
 
@@ -171,6 +172,14 @@ def scan(
             help="Directory containing additional YARA rule files (.yar/.yara) to load alongside built-in rules.",
         ),
     ] = None,
+    recursive: Annotated[
+        bool,
+        typer.Option(
+            "--recursive",
+            "-r",
+            help="Scan directories containing multiple skills (immediate subdirectories with SKILL.md) independently.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -188,6 +197,7 @@ def scan(
         skillspector scan ./my-skill/
         skillspector scan ./my-skill/ --format json --output report.json
         skillspector scan https://github.com/user/my-skill --no-llm
+        skillspector scan ./skill-collection/ --recursive
 
     Environment variables:
 
@@ -205,12 +215,33 @@ def scan(
         ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
     """
+    if verbose:
+        set_level("DEBUG")
+
+    resolved_path = Path(input_path).resolve()
+    if recursive and resolved_path.is_dir():
+        detection = detect_skills(resolved_path)
+        if detection.is_multi_skill:
+            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
+            return
+        if not detection.has_root_skill and len(detection.skills) == 0:
+            console.print(
+                "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
+                "detected. Scanning as single skill."
+            )
+    elif resolved_path.is_dir():
+        detection = detect_skills(resolved_path)
+        if detection.is_multi_skill:
+            console.print(
+                f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
+                f"this directory. Use --recursive to scan each independently."
+            )
+
     result = None
     try:
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
         state = _scan_state(input_path, format, no_llm, yara_rules_dir=yara_dir)
         if verbose:
-            set_level("DEBUG")
             console.print("[dim]Running scan...[/dim]")
         logger.debug(
             "Scan started: input_path=%s, format=%s, use_llm=%s",
@@ -218,20 +249,7 @@ def scan(
             format,
             not no_llm,
         )
-        env = os.environ.get("ENV", "dev")
-        tags = ["skillspector", f"environment:{env}"]
-        extra_tags = os.environ.get("LANGCHAIN_TAGS_EXTRA", "")
-        tags.extend(t.strip() for t in extra_tags.split(",") if t.strip())
-        trace_config: RunnableConfig = {
-            "run_name": "skillspector-scan",
-            "tags": tags,
-            "metadata": {
-                "input_path": input_path,
-                "use_llm": not no_llm,
-                "output_format": format.value,
-                "version": __version__,
-            },
-        }
+        trace_config = _build_trace_config(input_path, format, no_llm)
         result = graph.invoke(state, config=trace_config)
 
         _write_result(result, output, format)
@@ -252,6 +270,108 @@ def scan(
     finally:
         if result is not None:
             _cleanup_result(result)
+
+
+def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> RunnableConfig:
+    """Build LangSmith trace config for a scan invocation."""
+    env = os.environ.get("ENV", "dev")
+    tags = ["skillspector", f"environment:{env}"]
+    extra_tags = os.environ.get("LANGCHAIN_TAGS_EXTRA", "")
+    tags.extend(t.strip() for t in extra_tags.split(",") if t.strip())
+    return {
+        "run_name": "skillspector-scan",
+        "tags": tags,
+        "metadata": {
+            "input_path": input_path,
+            "use_llm": not no_llm,
+            "output_format": format.value,
+            "version": __version__,
+        },
+    }
+
+
+def _scan_multi_skill(
+    detection: MultiSkillDetectionResult,
+    format: FormatChoice,
+    output: Path | None,
+    no_llm: bool,
+    yara_rules_dir: Path | None,
+    verbose: bool,
+) -> None:
+    """Scan each detected sub-skill independently and produce a combined report."""
+    skills = detection.skills
+    console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
+
+    results: list[dict[str, object]] = []
+    max_score = 0
+
+    for i, skill in enumerate(skills, 1):
+        console.print(
+            f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
+        )
+        yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
+        state = _scan_state(str(skill.path), format, no_llm, yara_rules_dir=yara_dir)
+        trace_config = _build_trace_config(str(skill.path), format, no_llm)
+
+        try:
+            result = graph.invoke(state, config=trace_config)
+            results.append(result)
+            score = result.get("risk_score") or 0
+            if isinstance(score, int) and score > max_score:
+                max_score = score
+            severity = result.get("risk_severity") or "LOW"
+            console.print(f"         Score: {score}/100 ({severity})\n")
+        except Exception as e:
+            console.print(f"         [red]Error:[/red] {e}\n")
+            results.append({"skill_name": skill.name, "error": str(e)})
+
+    console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
+    console.print(f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10}")
+    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10}")
+
+    for skill, result in zip(skills, results, strict=True):
+        if "error" in result:
+            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10}")
+            continue
+        score = result.get("risk_score", 0)
+        severity = result.get("risk_severity", "LOW")
+        filtered = result.get("filtered_findings") or result.get("findings")
+        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
+
+    console.print("")
+
+    if output and format == FormatChoice.json:
+        combined = {
+            "multi_skill": True,
+            "skill_count": len(skills),
+            "max_risk_score": max_score,
+            "skills": [],
+        }
+        for skill, result in zip(skills, results, strict=True):
+            if "error" in result:
+                combined["skills"].append({"name": skill.name, "error": result["error"]})
+            else:
+                combined["skills"].append(
+                    {
+                        "name": skill.name,
+                        "path": skill.relative_path,
+                        "risk_score": result.get("risk_score", 0),
+                        "risk_severity": result.get("risk_severity", "LOW"),
+                        "finding_count": len(
+                            result.get("filtered_findings") or result.get("findings") or []
+                        ),
+                    }
+                )
+        Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
+        console.print(f"[green]Combined report saved to:[/green] {output}")
+    elif output:
+        for _skill, result in zip(skills, results, strict=True):
+            if "error" not in result:
+                _write_result(result, None, format)
+
+    if max_score > 50:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

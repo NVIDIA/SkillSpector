@@ -28,6 +28,7 @@ def create_openai_compatible_chat_model(
     credentials: tuple[str, str | None] | None,
     max_tokens: int,
     timeout: float | None = 120,
+    default_headers: dict[str, str] | None = None,
 ) -> BaseChatModel | None:
     """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints."""
     if credentials is None:
@@ -40,4 +41,5 @@ def create_openai_compatible_chat_model(
         api_key=SecretStr(api_key),
         max_completion_tokens=max_tokens,
         timeout=timeout,
+        default_headers=default_headers,
     )

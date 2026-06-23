@@ -28,7 +28,9 @@ Ported from legacy implementation.
 
 from __future__ import annotations
 
+import ipaddress
 import shutil
+import socket
 import subprocess
 import tempfile
 import zipfile
@@ -40,6 +42,38 @@ import httpx
 from skillspector.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+ALLOWED_GIT_HOSTS = frozenset({
+    "github.com",
+    "gitlab.com",
+    "bitbucket.org",
+})
+
+ALLOWED_DOWNLOAD_HOSTS = frozenset({
+    "github.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+    "bitbucket.org",
+    "huggingface.co",
+})
+
+
+def _is_private_ip(host: str) -> bool:
+    """Return True if host resolves to a private/reserved IP address."""
+    try:
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+    except ValueError:
+        pass
+    try:
+        resolved = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for _, _, _, _, sockaddr in resolved:
+            addr = ipaddress.ip_address(sockaddr[0])
+            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                return True
+    except (socket.gaierror, OSError):
+        return True
+    return False
 
 
 class InputHandler:
@@ -107,8 +141,8 @@ class InputHandler:
         if not path.startswith(("http://", "https://", "git@")):
             return False
         parsed = urlparse(path)
-        git_hosts = ["github.com", "gitlab.com", "bitbucket.org"]
-        if any(host in parsed.netloc for host in git_hosts):
+        host = parsed.hostname or ""
+        if any(allowed in host for allowed in ALLOWED_GIT_HOSTS):
             if "/raw/" in path or "/blob/" in path or path.endswith((".md", ".py", ".sh")):
                 return False
             return True
@@ -122,8 +156,30 @@ class InputHandler:
             return False
         return not self._is_git_url(path)
 
+    def _validate_url_host(self, url: str, allowed_hosts: frozenset[str]) -> str:
+        """Validate URL host against allowlist and SSRF protections.
+
+        Returns the hostname on success, raises ValueError on blocked URLs.
+        """
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if not host:
+            raise ValueError(f"URL has no valid hostname: {url}")
+        if not any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts):
+            raise ValueError(
+                f"Host '{host}' is not in the allowed hosts list. "
+                f"Allowed: {sorted(allowed_hosts)}"
+            )
+        if _is_private_ip(host):
+            raise ValueError(
+                f"URL resolves to a private/internal IP address: {url}. "
+                "This is blocked to prevent SSRF attacks."
+            )
+        return host
+
     def _clone_git(self, url: str) -> Path:
         """Clone a Git repository to a temporary directory."""
+        self._validate_url_host(url, ALLOWED_GIT_HOSTS)
         temp_dir = self._get_temp_dir()
         clone_dir = temp_dir / "repo"
         try:
@@ -149,11 +205,12 @@ class InputHandler:
 
     def _download_file(self, url: str) -> Path:
         """Download a file from URL to a temporary directory."""
+        self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)
         temp_dir = self._get_temp_dir()
         parsed = urlparse(url)
         filename = Path(parsed.path).name or "SKILL.md"
         try:
-            with httpx.Client(follow_redirects=True, timeout=30) as client:
+            with httpx.Client(follow_redirects=False, timeout=30) as client:
                 response = client.get(url)
                 response.raise_for_status()
                 content = response.content
@@ -171,7 +228,7 @@ class InputHandler:
         return temp_dir
 
     def _extract_zip(self, zip_path: Path) -> Path:
-        """Extract a zip file to a temporary directory."""
+        """Extract a zip file to a temporary directory with path traversal protection."""
         if not zip_path.exists():
             raise FileNotFoundError(f"Zip file not found: {zip_path}") from None
         temp_dir = self._get_temp_dir()
@@ -179,6 +236,13 @@ class InputHandler:
         extract_dir.mkdir(exist_ok=True)
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
+                for member in zf.namelist():
+                    member_path = (extract_dir / member).resolve()
+                    if not str(member_path).startswith(str(extract_dir.resolve())):
+                        raise ValueError(
+                            f"Zip entry '{member}' would escape extraction directory (zip-slip). "
+                            "Archive is potentially malicious."
+                        )
                 zf.extractall(extract_dir)
         except zipfile.BadZipFile:
             logger.warning("Invalid zip or extract failed: %s", zip_path)

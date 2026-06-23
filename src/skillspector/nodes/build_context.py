@@ -90,7 +90,10 @@ def _walk_skill_files(skill_dir: Path) -> list[str]:
             continue
         try:
             rel = item.relative_to(skill_dir)
-            paths.append(str(rel))
+            # Use forward slashes on every OS: these relative paths are dict keys
+            # and SARIF/URI locations, so they must be portable (not OS-specific
+            # backslashes on Windows).
+            paths.append(rel.as_posix())
         except ValueError:
             logger.debug("Skipping path (not under skill_dir): %s", item)
             continue

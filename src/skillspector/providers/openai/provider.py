@@ -36,6 +36,13 @@ OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
 
+def _resolve_openai_project_headers() -> dict[str, str] | None:
+    project_id = os.environ.get("OPENAI_PROJECT_ID", "").strip()
+    if not project_id:
+        return None
+    return {"OpenAI-Project": project_id}
+
+
 class OpenAIProvider:
     """Stock OpenAI credentials + bundled-YAML metadata provider."""
 
@@ -63,6 +70,7 @@ class OpenAIProvider:
             credentials=self.resolve_credentials(),
             max_tokens=max_tokens,
             timeout=timeout,
+            default_headers=_resolve_openai_project_headers(),
         )
 
     def get_context_length(self, model: str) -> int | None:

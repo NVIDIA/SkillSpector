@@ -23,13 +23,28 @@ from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
-from .common import get_context_from_lines, get_source_segment, resolve_call_name
+from .common import (
+    build_import_aliases,
+    get_context_from_lines,
+    get_source_segment,
+    resolve_call_name,
+)
 from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
 
 ANALYZER_ID = "behavioral_ast"
 logger = get_logger(__name__)
 
 _DANGEROUS_BUILTINS = frozenset({"exec", "eval", "compile", "__import__"})
+
+# Names that turn ``getattr(obj, "<name>")`` into a reflective handle on a code- or
+# command-execution sink. ``getattr(os, "system")(cmd)`` and
+# ``getattr(builtins, "exec")(src)`` are functionally identical to ``os.system(cmd)``
+# / ``exec(src)`` but evade AST1/AST5: the inner ``getattr`` has a *constant* second
+# argument (so AST7 is intentionally skipped), and the outer call's ``func`` is an
+# ``ast.Call`` whose name does not resolve, so AST1/AST5 never fire. The set is kept
+# deliberately small — only names with essentially no legitimate ``getattr`` use — so
+# benign reflection such as ``getattr(obj, "name")`` stays unflagged.
+_DANGEROUS_GETATTR_NAMES = frozenset({"exec", "eval", "system", "popen", "__import__"})
 
 _SUBPROCESS_CALLS = frozenset(
     {
@@ -77,6 +92,7 @@ _RULE_MESSAGES: dict[str, str] = {
     "AST6": "compile() call detected",
     "AST7": "Dynamic attribute access via getattr()",
     "AST8": "Dangerous execution chain",
+    "AST9": "Reflective dangerous call via getattr() with a literal sink name",
 }
 
 _RULE_SEVERITIES: dict[str, Severity] = {
@@ -88,6 +104,7 @@ _RULE_SEVERITIES: dict[str, Severity] = {
     "AST6": Severity.MEDIUM,
     "AST7": Severity.LOW,
     "AST8": Severity.CRITICAL,
+    "AST9": Severity.HIGH,
 }
 
 _RULE_CONFIDENCES: dict[str, float] = {
@@ -99,23 +116,24 @@ _RULE_CONFIDENCES: dict[str, float] = {
     "AST6": 0.65,
     "AST7": 0.50,
     "AST8": 0.95,
+    "AST9": 0.85,
 }
 
 _TAG = "Dangerous Code Execution"
 
 
-def _is_chain_sink(node: ast.Call) -> bool:
+def _is_chain_sink(node: ast.Call, aliases: dict[str, str] | None = None) -> bool:
     """True if this call is exec(), eval(), or compile() — the outer dangerous call."""
-    name = resolve_call_name(node)
+    name = resolve_call_name(node, aliases)
     return name in ("exec", "eval", "compile")
 
 
-def _contains_dangerous_source(node: ast.AST) -> str | None:
+def _contains_dangerous_source(node: ast.AST, aliases: dict[str, str] | None = None) -> str | None:
     """Walk children to find a nested dangerous call that forms a chain."""
     for child in ast.walk(node):
         if not isinstance(child, ast.Call):
             continue
-        name = resolve_call_name(child)
+        name = resolve_call_name(child, aliases)
         if name is None:
             continue
         if name in ("compile", "__import__"):
@@ -136,6 +154,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         logger.debug("SyntaxError parsing %s, skipping", file_path)
         return []
 
+    aliases = build_import_aliases(tree)
     lines = content.splitlines()
     findings: list[AnalyzerFinding] = []
 
@@ -162,7 +181,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         if not isinstance(ast_node, ast.Call):
             continue
 
-        call_name = resolve_call_name(ast_node)
+        call_name = resolve_call_name(ast_node, aliases)
         if call_name is None:
             continue
 
@@ -170,15 +189,15 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         end_lineno = getattr(ast_node, "end_lineno", None)
 
         if call_name == "exec":
-            if _is_chain_sink(ast_node) and ast_node.args:
-                source = _contains_dangerous_source(ast_node.args[0])
+            if _is_chain_sink(ast_node, aliases) and ast_node.args:
+                source = _contains_dangerous_source(ast_node.args[0], aliases)
                 if source:
                     _emit("AST8", lineno, end_lineno, f"Dangerous chain: exec() wrapping {source}")
             _emit("AST1", lineno, end_lineno)
 
         elif call_name == "eval":
-            if _is_chain_sink(ast_node) and ast_node.args:
-                source = _contains_dangerous_source(ast_node.args[0])
+            if _is_chain_sink(ast_node, aliases) and ast_node.args:
+                source = _contains_dangerous_source(ast_node.args[0], aliases)
                 if source:
                     _emit("AST8", lineno, end_lineno, f"Dangerous chain: eval() wrapping {source}")
             _emit("AST2", lineno, end_lineno)
@@ -200,8 +219,14 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
                 _emit("AST5", lineno, end_lineno)
 
         elif call_name == "getattr" and len(ast_node.args) >= 2:
-            if not isinstance(ast_node.args[1], ast.Constant):
+            second_arg = ast_node.args[1]
+            if not isinstance(second_arg, ast.Constant):
                 _emit("AST7", lineno, end_lineno)
+            elif (
+                isinstance(second_arg.value, str)
+                and second_arg.value in _DANGEROUS_GETATTR_NAMES
+            ):
+                _emit("AST9", lineno, end_lineno)
 
     return findings
 
