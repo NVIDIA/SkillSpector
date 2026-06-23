@@ -44,6 +44,7 @@ from skillspector.sarif_models import (
     SarifMessage,
     SarifPhysicalLocation,
     SarifRegion,
+    SarifReportingDescriptor,
     SarifResult,
     SarifRun,
     SarifTool,
@@ -133,9 +134,17 @@ def _compute_risk_score(
 
 
 def _build_sarif(findings: list[Finding]) -> dict[str, object]:
-    """Build SARIF 2.1.0 log from findings."""
+    """Build SARIF 2.1.0 log from findings.
+
+    Filters out empty/malformed findings (missing rule_id or message) and
+    builds the required tool.driver.rules[] array from referenced rule IDs.
+    """
     results: list[SarifResult] = []
+    seen_rule_ids: dict[str, str] = {}
+
     for finding in findings:
+        if not finding.rule_id or not finding.message:
+            continue
         start_line = finding.start_line
         end_line = finding.end_line
         region = SarifRegion(start_line=start_line, end_line=end_line)
@@ -154,12 +163,27 @@ def _build_sarif(findings: list[Finding]) -> dict[str, object]:
                 ],
             )
         )
+        if finding.rule_id not in seen_rule_ids:
+            seen_rule_ids[finding.rule_id] = finding.message
+
+    rules = [
+        SarifReportingDescriptor(
+            id=rule_id,
+            short_description=SarifMessage(text=description),
+        )
+        for rule_id, description in sorted(seen_rule_ids.items())
+    ]
+
     sarif_log = SarifLog(
         schema_=SARIF_SCHEMA_URI,
         runs=[
             SarifRun(
                 tool=SarifTool(
-                    driver=SarifDriver(name="skillspector", version=skillspector_version)
+                    driver=SarifDriver(
+                        name="skillspector",
+                        version=skillspector_version,
+                        rules=rules if rules else None,
+                    )
                 ),
                 results=results,
             )
