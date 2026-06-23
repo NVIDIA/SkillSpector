@@ -1,0 +1,29 @@
+# Token-budget metadata for the OllamaProvider (local/self-hosted LLMs).
+# Bundled with the package; consulted whenever the active provider is
+# OllamaProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+
+models:
+  "llama3.1:8b":
+    context_length: 131072
+    max_output_tokens: 4096
+  "llama3.1:70b":
+    context_length: 131072
+    max_output_tokens: 4096
+  "mistral:7b":
+    context_length: 32768
+    max_output_tokens: 4096
+  "qwen2.5:7b":
+    context_length: 131072
+    max_output_tokens: 8192
+  "gemma2:9b":
+    context_length: 8192
+    max_output_tokens: 4096
+  "deepseek-v3:latest":
+    context_length: 65536
+    max_output_tokens: 8192
