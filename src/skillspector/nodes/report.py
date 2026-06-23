@@ -404,7 +404,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     use_llm = state.get("use_llm", True)
 
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
-        findings, component_metadata
+        findings, component_metadata, has_executable_scripts
     )
     sarif_report = _build_sarif(findings)
 

@@ -436,8 +436,8 @@ class TestReportNode:
         """has_executable_scripts applies 1.3x to risk score."""
         state: SkillspectorState = {
             "filtered_findings": [
-                _finding("E2", "HIGH", confidence=1.0),
-                _finding("PE3", "HIGH", confidence=1.0),
+                _finding("E2", "HIGH", confidence=1.0, file="run.py"),
+                _finding("PE3", "HIGH", confidence=1.0, file="run.py"),
             ],
             "component_metadata": [
                 {

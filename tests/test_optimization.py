@@ -116,9 +116,12 @@ def test_persistent_sqlite_cache():
 
 
 @pytest.mark.asyncio
-async def test_llm_analyzer_cache_integration():
+@unittest.mock.patch("skillspector.llm_analyzer_base.get_chat_model")
+async def test_llm_analyzer_cache_integration(mock_get_chat_model):
     """Verify that run_batches and arun_batches hit the cache and skip LLM calls."""
     # Create an analyzer instance
+    mock_llm = unittest.mock.MagicMock()
+    mock_get_chat_model.return_value = mock_llm
     analyzer = LLMAnalyzerBase("base prompt", "gpt-4")
 
     # Mock the LLM invocation using object.__setattr__ to bypass Pydantic restrictions
