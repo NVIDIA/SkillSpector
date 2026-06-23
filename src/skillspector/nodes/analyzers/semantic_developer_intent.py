@@ -26,6 +26,7 @@ import asyncio
 
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL, MODEL_CONFIG
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
@@ -176,11 +177,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         prompt = ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest))
         analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model)
         batches = analyzer.get_batches(sorted(file_cache), file_cache)
-        try:
-            loop = asyncio.get_running_loop()
-            results = loop.run_until_complete(analyzer.arun_batches(batches))
-        except RuntimeError:
-            results = asyncio.run(analyzer.arun_batches(batches))
+        results = run_async(analyzer.arun_batches(batches))
         findings = analyzer.collect_findings(results)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
         return {"findings": findings}

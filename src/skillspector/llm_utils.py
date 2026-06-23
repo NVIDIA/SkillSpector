@@ -30,8 +30,14 @@ other OpenAI-compatible endpoint is configured via the standard
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+from typing import Coroutine, TypeVar
+
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
+
+T = TypeVar("T")
 
 from skillspector.constants import MODEL_CONFIG
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
@@ -92,3 +98,30 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     if not isinstance(response, BaseMessage):
         raise TypeError(f"Expected BaseMessage from chat model, got {type(response).__name__}")
     return str(response.text)
+
+
+def run_async(coroutine: Coroutine[None, None, T]) -> T:
+    """
+    Run an async coroutine in a synchronous context, even if there's already a running event loop.
+
+    This function safely handles nested event loop scenarios (e.g. Jupyter Notebooks, FastAPI,
+    LangGraph Studio) by offloading the coroutine execution to a separate thread with its own
+    event loop when a running loop is detected.
+
+    Args:
+        coroutine: The async coroutine to run
+
+    Returns:
+        The result of the coroutine execution
+
+    Raises:
+        Any exception raised by the coroutine is re-raised as-is
+    """
+    try:
+        return asyncio.run(coroutine)
+    except RuntimeError as e:
+        if "This event loop is already running" in str(e):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, coroutine)
+                return future.result()
+        raise

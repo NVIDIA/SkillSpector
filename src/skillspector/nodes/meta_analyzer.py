@@ -33,6 +33,7 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     estimate_tokens,
 )
+from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.pattern_defaults import (
@@ -391,11 +392,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             model,
         )
 
-        try:
-            loop = asyncio.get_running_loop()
-            batch_results = loop.run_until_complete(analyzer.arun_batches(batches, metadata_text=metadata_text))
-        except RuntimeError:
-            batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        batch_results = run_async(analyzer.arun_batches(batches, metadata_text=metadata_text))
         filtered = analyzer.apply_filter(findings, batch_results)
 
         logger.debug(
