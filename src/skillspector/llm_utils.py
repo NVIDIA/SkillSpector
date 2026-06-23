@@ -87,8 +87,44 @@ def get_chat_model(model: str | None = None) -> BaseChatModel:
 
 def chat_completion(prompt: str, *, model: str | None = None) -> str:
     """Request a single chat completion and return the assistant text."""
-    llm = get_chat_model(model=model)
+    import hashlib
+    import json
+    from skillspector.cache import get_cached_findings, set_cached_findings, initialize_cache_db
+    from skillspector.constants import MODEL_CONFIG
+
+    resolved_model = model or MODEL_CONFIG["default"]
+
+    # Compute cache key
+    hasher = hashlib.sha256()
+    hasher.update(prompt.encode("utf-8"))
+    hasher.update(resolved_model.encode("utf-8"))
+    ckey = hasher.hexdigest()
+
+    # Check cache
+    initialize_cache_db()
+    cached = get_cached_findings(ckey)
+    if cached is not None:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    llm = get_chat_model(model=resolved_model)
     response = llm.invoke(prompt)
     if not isinstance(response, BaseMessage):
         raise TypeError(f"Expected BaseMessage from chat model, got {type(response).__name__}")
-    return str(response.text)
+    text = str(response.text)
+
+    # Save to cache
+    try:
+        set_cached_findings(
+            ckey,
+            json.dumps(text),
+            "chat_completion",
+            hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            resolved_model
+        )
+    except Exception:
+        pass
+
+    return text

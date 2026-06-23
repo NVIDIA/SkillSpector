@@ -1354,3 +1354,28 @@ class TestTokenBudgetFunctions:
         out = get_max_output_tokens("unknown/model")
         assert inp == int(mocked_ctx * 0.75)
         assert out == int(mocked_ctx * 0.25)
+
+
+class TestPydanticSchemaNoBoundsAndClamping:
+    def test_pydantic_schema_no_bounds_and_clamping(self):
+        from skillspector.llm_analyzer_base import LLMFinding
+        
+        # Check schema does not contain minimum or maximum
+        schema = LLMFinding.model_json_schema()
+        properties = schema.get("properties", {})
+        assert "minimum" not in properties.get("confidence", {})
+        assert "maximum" not in properties.get("confidence", {})
+        assert "minimum" not in properties.get("start_line", {})
+        
+        # Test clamping
+        finding = LLMFinding(
+            rule_id="TEST",
+            message="test",
+            severity="LOW",
+            confidence=1.5,
+            file="test.py",
+            start_line=0
+        )
+        assert finding.confidence == 1.0
+        assert finding.start_line == 1
+

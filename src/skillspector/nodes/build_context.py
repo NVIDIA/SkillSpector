@@ -34,7 +34,34 @@ logger = get_logger(__name__)
 
 # Directories to skip when walking
 _SKIP_DIRS = frozenset(
-    {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"}
+    {
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".tox",
+        ".pytest_cache",
+        ".harness-backup",
+        ".harness",
+        ".vscode",
+        ".github",
+        ".idea",
+        ".settings",
+        "docs",
+        "doc",
+        "brand",
+        "images",
+        "media",
+        "tests",
+        "test",
+        "spec",
+        "specs",
+        "build",
+        "dist",
+        "out",
+        "target",
+    }
 )
 
 # File type by extension
@@ -75,28 +102,87 @@ def _resolve_skill_dir(state: SkillspectorState) -> Path:
     return resolved
 
 
+def _get_git_files(skill_dir: Path) -> list[str] | None:
+    """Get list of files tracked or untracked by Git, excluding ignored files.
+
+    Returns None if the directory is not a Git repo or Git is not available.
+    """
+    import subprocess
+    if not (skill_dir / ".git").is_dir():
+        return None
+    try:
+        res = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=skill_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        files = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        return files
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+
+
 def _walk_skill_files(skill_dir: Path) -> list[str]:
     """Walk skill directory and return sorted relative path strings.
 
-    Skips _SKIP_DIRS and hidden files except those starting with .claude.
+    Skips _SKIP_DIRS, hidden files except those starting with .claude, package lockfiles, and respects gitignore.
     """
+    git_files = _get_git_files(skill_dir)
+    if git_files is not None:
+        paths = []
+        for p in git_files:
+            item = Path(p)
+            if any(skip in item.parts for skip in _SKIP_DIRS):
+                continue
+            if item.name.startswith(".") and not item.name.startswith(".claude"):
+                continue
+            if item.name in {
+                "package-lock.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "uv.lock",
+                "poetry.lock",
+                "Cargo.lock",
+                "composer.lock",
+                "Gemfile.lock",
+                "mix.lock",
+                "pubspec.lock",
+            }:
+                continue
+            paths.append(item.as_posix())
+        paths.sort()
+        return paths
+
     paths: list[str] = []
     for item in skill_dir.rglob("*"):
         if not item.is_file():
             continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
-            continue
-        if item.name.startswith(".") and not item.name.startswith(".claude"):
-            continue
         try:
             rel = item.relative_to(skill_dir)
-            # Use forward slashes on every OS: these relative paths are dict keys
-            # and SARIF/URI locations, so they must be portable (not OS-specific
-            # backslashes on Windows).
-            paths.append(rel.as_posix())
         except ValueError:
             logger.debug("Skipping path (not under skill_dir): %s", item)
             continue
+        if any(skip in rel.parts for skip in _SKIP_DIRS):
+            continue
+        if item.name.startswith(".") and not item.name.startswith(".claude"):
+            continue
+        if item.name in {
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "uv.lock",
+            "poetry.lock",
+            "Cargo.lock",
+            "composer.lock",
+            "Gemfile.lock",
+            "mix.lock",
+            "pubspec.lock",
+        }:
+            continue
+        paths.append(rel.as_posix())
     paths.sort()
     return paths
 
@@ -159,6 +245,17 @@ def _read_file_cache(skill_dir: Path, components: list[str]) -> dict[str, str]:
         if not full.is_file():
             continue
         try:
+            # Check if it is a binary file by looking for NUL bytes in the first 1024 bytes
+            try:
+                with open(full, "rb") as f:
+                    chunk = f.read(1024)
+                    if b"\x00" in chunk:
+                        logger.debug("Skipping binary file content in cache: %s", path)
+                        file_cache[path] = ""
+                        continue
+            except OSError:
+                pass
+
             content = full.read_text(encoding="utf-8", errors="replace")
             file_cache[path] = content
         except OSError:

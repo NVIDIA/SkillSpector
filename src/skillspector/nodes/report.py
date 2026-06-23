@@ -83,7 +83,9 @@ _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 
 
 def _compute_risk_score(
-    findings: list[Finding], has_executable_scripts: bool
+    findings: list[Finding],
+    component_metadata: list[dict[str, object]] | bool = False,
+    has_executable_scripts: bool = False,
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
@@ -94,8 +96,17 @@ def _compute_risk_score(
     This prevents repeated pattern matches from inflating the score unboundedly.
 
     Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
-    Multiplier: 1.3x if has_executable_scripts.
+    Multiplier: 1.3x only for findings in executable files.
     """
+    if isinstance(component_metadata, bool):
+        has_executable_scripts = component_metadata
+        component_metadata = []
+
+    executable_files = {
+        str(comp.get("path"))
+        for comp in component_metadata
+        if comp.get("executable")
+    }
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
 
@@ -115,10 +126,13 @@ def _compute_risk_score(
             continue
 
         weight = _DIMINISHING_WEIGHTS[count]
-        score += base_points * weight * confidence
+        finding_score = base_points * weight * confidence
 
-    if has_executable_scripts:
-        score *= 1.3
+        # Apply 1.3x only if the finding is in an executable file, or if has_executable_scripts is True (offline/test mode)
+        if f.file in executable_files or (has_executable_scripts and not component_metadata):
+            score += finding_score * 1.3
+        else:
+            score += finding_score
 
     final_score = min(100, max(0, int(score)))
 
@@ -390,7 +404,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     use_llm = state.get("use_llm", True)
 
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
-        findings, has_executable_scripts
+        findings, component_metadata, has_executable_scripts
     )
     sarif_report = _build_sarif(findings)
 

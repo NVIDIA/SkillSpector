@@ -15,6 +15,9 @@
 
 """Skillspector v2 LangGraph workflow package."""
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from importlib.metadata import version as _pkg_version
 
 __version__ = _pkg_version("skillspector")

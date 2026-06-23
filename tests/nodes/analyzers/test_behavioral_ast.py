@@ -246,3 +246,16 @@ class TestMultipleFindings:
         assert "AST2" in rule_ids
         assert "AST4" in rule_ids
         assert "AST5" in rule_ids
+
+
+class TestImportAliasEvasion:
+    def test_import_alias_sub_process_produces_ast4(self):
+        code = 'import subprocess as sp\nsp.run(["ls"])'
+        findings = _run(code)
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_from_import_system_produces_ast5(self):
+        code = 'from os import system as sys_run\nsys_run("ls")'
+        findings = _run(code)
+        assert any(f.rule_id == "AST5" for f in findings)
+

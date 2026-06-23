@@ -396,6 +396,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     findings: list[Finding] = state.get("findings", [])
     if not findings:
         return {"filtered_findings": []}
+    findings = sorted(findings, key=lambda f: (f.file or "", f.rule_id or "", f.start_line or 0, f.message or ""))
 
     if state.get("use_llm", True) is False:
         return {"filtered_findings": _fallback_filtered(findings)}

@@ -94,3 +94,22 @@ def test_cleanup_idempotent(tmp_path: Path) -> None:
     handler.resolve(str(tmp_path / "a.md"))
     handler.cleanup()
     handler.cleanup()
+
+
+def test_extract_zip_slip_traversal(tmp_path: Path) -> None:
+    """Verify that extracting a zip file containing directory traversal members raises a ValueError."""
+    import zipfile
+    from skillspector.input_handler import InputHandler
+
+    zip_file = tmp_path / "malicious.zip"
+    with zipfile.ZipFile(zip_file, "w") as zf:
+        zf.writestr("../../../evil.txt", "malicious payload")
+
+    handler = InputHandler()
+    # Force handler's temp dir to local tmp_path
+    handler._temp_dir = tmp_path
+
+    import pytest
+    with pytest.raises(ValueError, match="Zip Slip detected"):
+        handler._extract_zip(zip_file)
+

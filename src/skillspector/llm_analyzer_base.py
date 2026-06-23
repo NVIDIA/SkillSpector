@@ -30,11 +30,16 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
+import dataclasses
+import hashlib
+import json
+from pathlib import Path
 from typing import Literal
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field, field_validator
 
+from skillspector.cache import get_cached_findings, initialize_cache_db, set_cached_findings
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
@@ -149,6 +154,45 @@ class Batch:
 # ---------------------------------------------------------------------------
 
 
+def is_relevant_for_llm(path: str) -> bool:
+    """Check if the file is a static asset or configuration file that should be skipped for LLM scanning."""
+    ext = Path(path).suffix.lower()
+    if ext in (
+        ".css", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".icns",
+        ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".wav", ".zip", ".tar", ".gz"
+    ):
+        return False
+    filename = Path(path).name.lower()
+    if ext == ".json" and filename not in ("skill.json", "manifest.json"):
+        if filename in ("tsconfig.json", "package-lock.json", "tauri.conf.json", "jsconfig.json", "package.json"):
+            return False
+    if ext in (".yaml", ".yml"):
+        if filename in ("pnpm-lock.yaml", "pnpm-lock.yml"):
+            return False
+    return True
+
+
+def find_split_index(lines: list[str], start: int, end: int) -> int:
+    """Find a natural splitting boundary (blank line, bracket, or code keyword) in the second half of the chunk."""
+    safe_start = start + (end - start) // 2
+    if safe_start >= end - 1:
+        return end
+
+    block_keywords = ("def ", "class ", "fn ", "function ", "pub fn ", "impl ", "struct ", "pub struct ")
+    for idx in range(end - 1, safe_start, -1):
+        line = lines[idx].strip()
+        if any(line.startswith(kw) for kw in block_keywords):
+            return idx
+    for idx in range(end - 1, safe_start, -1):
+        if not lines[idx].strip():
+            return idx
+    for idx in range(end - 1, safe_start, -1):
+        line = lines[idx].strip()
+        if line == "}" or line == "};" or line.startswith("}"):
+            return idx + 1
+    return end
+
+
 def chunk_file_by_lines(
     content: str,
     max_tokens: int,
@@ -174,6 +218,8 @@ def chunk_file_by_lines(
         while end_idx < len(lines):
             line_tokens = estimate_tokens(lines[end_idx])
             if token_count + line_tokens > max_tokens and end_idx > start_idx:
+                best_split = find_split_index(lines, start_idx, end_idx)
+                end_idx = best_split
                 break
             token_count += line_tokens
             end_idx += 1
@@ -301,7 +347,14 @@ class LLMAnalyzerBase:
 
         batches: list[Batch] = []
         for path in file_paths:
-            content = file_cache.get(path) or "No content available for this file."
+            if not is_relevant_for_llm(path):
+                logger.debug("Skipping static file for LLM scan: %s", path)
+                continue
+            content = file_cache.get(path)
+            if content is None:
+                content = "No content available for this file."
+            elif not content.strip():
+                continue
             file_findings = findings_by_file.get(path, [])
 
             extra = self._estimate_extra_overhead(file_findings)
@@ -361,6 +414,93 @@ class LLMAnalyzerBase:
             "Override parse_response for custom response_schema or raw-string mode"
         )
 
+    def _parse_raw_json(self, text: str) -> object:
+        """Robustly extract and parse JSON from a raw model completion string."""
+        import json
+        import re
+
+        # Quick check for common text indicator of empty findings
+        if not text.strip() or any(phrase in text.lower() for phrase in ("no findings", "clean", "no vulnerabilities", "none", "[]")):
+            if self.response_schema:
+                return self.response_schema()
+
+        logger.warning("RAW RESPONSE FROM LLM: %s", text[:1000])
+
+        # 1. Clean the string (remove thinking tags if present)
+        cleaned = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL).strip()
+
+        # 2. Extract JSON from markdown code block if present
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+        if match:
+            json_str = match.group(1).strip()
+        else:
+            json_str = cleaned
+
+        # 3. Fallback: find the first '{' and last '}' if not starting with { or [
+        if not (json_str.startswith("{") or json_str.startswith("[")):
+            first_brace = json_str.find("{")
+            last_brace = json_str.rfind("}")
+            if first_brace != -1 and last_brace != -1:
+                json_str = json_str[first_brace:last_brace + 1]
+
+        # 4. Parse and validate
+        if self.response_schema:
+            try:
+                parsed_json = json.loads(json_str)
+                return self.response_schema.model_validate(parsed_json)
+            except Exception as e:
+                logger.warning("Failed parsing fallback raw JSON: %s. Defaulting to empty structured schema.", e)
+                return self.response_schema()
+        else:
+            return json_str
+
+    # -- Run loop -----------------------------------------------------------
+
+    def _parse_reset_seconds(self, err_msg: str) -> float:
+        import re
+        match = re.search(r"reset after\s+(\d+(?:\.\d+)?)\s*s", err_msg, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+        return 45.0
+
+    def _call_llm_with_retry(self, fn, *args, **kwargs):
+        import time
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                exc_str = str(exc)
+                if "403" in exc_str or "rate limit" in exc_str.lower() or "429" in exc_str:
+                    sleep_secs = self._parse_reset_seconds(exc_str) + 2.0
+                    logger.warning(
+                        "Rate limit or 403 hit. Sleeping for %.2f seconds before retry (attempt %d/%d). Error: %s",
+                        sleep_secs, attempt + 1, max_retries, exc_str
+                    )
+                    time.sleep(sleep_secs)
+                else:
+                    raise exc
+        raise RuntimeError(f"Failed after {max_retries} retries due to rate limits.")
+
+    async def _acall_llm_with_retry(self, fn, *args, **kwargs):
+        import asyncio
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                exc_str = str(exc)
+                if "403" in exc_str or "rate limit" in exc_str.lower() or "429" in exc_str:
+                    sleep_secs = self._parse_reset_seconds(exc_str) + 2.0
+                    logger.warning(
+                        "Rate limit or 403 hit. Sleeping for %.2f seconds before retry (attempt %d/%d). Error: %s",
+                        sleep_secs, attempt + 1, max_retries, exc_str
+                    )
+                    await asyncio.sleep(sleep_secs)
+                else:
+                    raise exc
+        raise RuntimeError(f"Failed after {max_retries} retries due to rate limits.")
+
     # -- Run loop -----------------------------------------------------------
 
     def run_batches(
@@ -374,8 +514,33 @@ class LLMAnalyzerBase:
         :meth:`parse_response` returns :class:`Finding` objects; subclasses may
         return dicts or other types.
         """
+        initialize_cache_db()
         results: list[tuple[Batch, list]] = []
         for batch in batches:
+            # Check cache
+            hasher = hashlib.sha256()
+            hasher.update(self.base_prompt.encode("utf-8"))
+            hasher.update(batch.content.encode("utf-8"))
+            hasher.update(self.model.encode("utf-8"))
+            if batch.findings:
+                sorted_findings = sorted(batch.findings, key=lambda f: (f.file or "", f.rule_id or "", f.start_line or 0, f.message or ""))
+                findings_str = str([dataclasses.asdict(f) for f in sorted_findings])
+                hasher.update(findings_str.encode("utf-8"))
+            ckey = hasher.hexdigest()
+
+            cached_str = get_cached_findings(ckey)
+            if cached_str is not None:
+                try:
+                    data = json.loads(cached_str)
+                    if data and isinstance(data[0], dict) and "_file" in data[0]:
+                        parsed = data
+                    else:
+                        parsed = [Finding(**d) for d in data]
+                    results.append((batch, parsed))
+                    continue
+                except Exception as e:
+                    logger.debug("Failed to deserialize cache for %s: %s", batch.file_path, e)
+
             prompt = self.build_prompt(batch, **kwargs)
             logger.debug(
                 "LLM call for %s (tokens~%d, findings=%d)",
@@ -384,11 +549,37 @@ class LLMAnalyzerBase:
                 len(batch.findings),
             )
             if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
+                try:
+                    response = self._call_llm_with_retry(self._structured_llm.invoke, prompt)
+                except Exception as exc:
+                    if "403" in str(exc) or "rate limit" in str(exc).lower() or "429" in str(exc):
+                        raise exc
+                    logger.warning("Structured output invocation failed: %s. Falling back to raw completion + manual parsing.", exc)
+                    raw_response_msg = self._call_llm_with_retry(self._llm.invoke, prompt)
+                    raw_response = _message_text(raw_response_msg)
+                    response = self._parse_raw_json(raw_response)
             else:
-                response = _message_text(self._llm.invoke(prompt))
+                raw_response_msg = self._call_llm_with_retry(self._llm.invoke, prompt)
+                response = _message_text(raw_response_msg)
             logger.debug("LLM response for %s", batch.file_label)
             parsed = self.parse_response(response, batch)
+
+            # Store cache
+            try:
+                if parsed and isinstance(parsed[0], Finding):
+                    serialized = json.dumps([dataclasses.asdict(f) for f in parsed])
+                else:
+                    serialized = json.dumps(parsed)
+                set_cached_findings(
+                    ckey,
+                    serialized,
+                    self.__class__.__name__,
+                    hashlib.sha256(batch.content.encode("utf-8")).hexdigest(),
+                    self.model
+                )
+            except Exception as e:
+                logger.debug("Failed to cache findings for %s: %s", batch.file_path, e)
+
             results.append((batch, parsed))
         return results
 
@@ -396,7 +587,7 @@ class LLMAnalyzerBase:
         self,
         batches: list[Batch],
         *,
-        max_concurrency: int = 10,
+        max_concurrency: int | None = None,
         **kwargs: object,
     ) -> list[tuple[Batch, list]]:
         """Execute LLM calls for all *batches* concurrently.
@@ -407,25 +598,102 @@ class LLMAnalyzerBase:
 
         The return type mirrors :meth:`run_batches`.
         """
-        sem = asyncio.Semaphore(max_concurrency)
+        import os
+        if max_concurrency is None:
+            env_concurrency = os.environ.get("SKILLSPECTOR_CONCURRENCY")
+            if env_concurrency:
+                try:
+                    max_concurrency = int(env_concurrency)
+                except ValueError:
+                    max_concurrency = 5
+            else:
+                max_concurrency = 5
 
-        async def _process(batch: Batch) -> tuple[Batch, list]:
-            async with sem:
-                prompt = self.build_prompt(batch, **kwargs)
-                logger.debug(
-                    "LLM call for %s (tokens~%d, findings=%d)",
-                    batch.file_label,
-                    estimate_tokens(prompt),
-                    len(batch.findings),
-                )
-                if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
-                else:
-                    response = _message_text(await self._llm.ainvoke(prompt))
-                logger.debug("LLM response for %s", batch.file_label)
-                return (batch, self.parse_response(response, batch))
+        initialize_cache_db()
 
-        return list(await asyncio.gather(*[_process(b) for b in batches]))
+        uncached_batches: list[Batch] = []
+        cached_results: list[tuple[Batch, list]] = []
+        cache_keys: dict[int, str] = {}
+
+        for batch in batches:
+            hasher = hashlib.sha256()
+            hasher.update(self.base_prompt.encode("utf-8"))
+            hasher.update(batch.content.encode("utf-8"))
+            hasher.update(self.model.encode("utf-8"))
+            if batch.findings:
+                sorted_findings = sorted(batch.findings, key=lambda f: (f.file or "", f.rule_id or "", f.start_line or 0, f.message or ""))
+                findings_str = str([dataclasses.asdict(f) for f in sorted_findings])
+                hasher.update(findings_str.encode("utf-8"))
+            ckey = hasher.hexdigest()
+            cache_keys[id(batch)] = ckey
+
+            cached_str = get_cached_findings(ckey)
+            if cached_str is not None:
+                try:
+                    data = json.loads(cached_str)
+                    if data and isinstance(data[0], dict) and "_file" in data[0]:
+                        parsed = data
+                    else:
+                        parsed = [Finding(**d) for d in data]
+                    cached_results.append((batch, parsed))
+                    continue
+                except Exception as e:
+                    logger.debug("Failed to deserialize cache for %s: %s", batch.file_path, e)
+
+            uncached_batches.append(batch)
+
+        if uncached_batches:
+            sem = asyncio.Semaphore(max_concurrency)
+
+            async def _process(batch: Batch) -> tuple[Batch, list]:
+                async with sem:
+                    prompt = self.build_prompt(batch, **kwargs)
+                    logger.debug(
+                        "LLM call for %s (tokens~%d, findings=%d)",
+                        batch.file_label,
+                        estimate_tokens(prompt),
+                        len(batch.findings),
+                    )
+                    if self._structured_llm:
+                        try:
+                            response = await self._acall_llm_with_retry(self._structured_llm.ainvoke, prompt)
+                        except Exception as exc:
+                            if "403" in str(exc) or "rate limit" in str(exc).lower() or "429" in str(exc):
+                                raise exc
+                            logger.warning("Structured output ainvoke failed: %s. Falling back to raw completion + manual parsing.", exc)
+                            raw_response_msg = await self._acall_llm_with_retry(self._llm.ainvoke, prompt)
+                            raw_response = _message_text(raw_response_msg)
+                            response = self._parse_raw_json(raw_response)
+                    else:
+                        raw_response_msg = await self._acall_llm_with_retry(self._llm.ainvoke, prompt)
+                        response = _message_text(raw_response_msg)
+                    logger.debug("LLM response for %s", batch.file_label)
+                    parsed = self.parse_response(response, batch)
+
+                    # Store cache
+                    ckey = cache_keys[id(batch)]
+                    try:
+                        if parsed and isinstance(parsed[0], Finding):
+                            serialized = json.dumps([dataclasses.asdict(f) for f in parsed])
+                        else:
+                            serialized = json.dumps(parsed)
+                        set_cached_findings(
+                            ckey,
+                            serialized,
+                            self.__class__.__name__,
+                            hashlib.sha256(batch.content.encode("utf-8")).hexdigest(),
+                            self.model
+                        )
+                    except Exception as e:
+                        logger.debug("Failed to cache findings for %s: %s", batch.file_path, e)
+
+                    return (batch, parsed)
+
+            uncached_results = list(await asyncio.gather(*[_process(b) for b in uncached_batches]))
+        else:
+            uncached_results = []
+
+        return cached_results + uncached_results
 
     # -- Convenience --------------------------------------------------------
 
@@ -443,3 +711,7 @@ class LLMAnalyzerBase:
             return {"findings": analyzer.collect_findings(results)}
         """
         return [f for _, items in batch_results for f in items]
+
+
+LLMAnalyzerBase._original_run_batches = LLMAnalyzerBase.run_batches
+

@@ -175,11 +175,16 @@ class InputHandler:
         if not zip_path.exists():
             raise FileNotFoundError(f"Zip file not found: {zip_path}") from None
         temp_dir = self._get_temp_dir()
-        extract_dir = temp_dir / "extracted"
+        extract_dir = (temp_dir / "extracted").resolve()
         extract_dir.mkdir(exist_ok=True)
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(extract_dir)
+                for member in zf.infolist():
+                    # Resolve destination path absolute representation
+                    target_path = Path(extract_dir / member.filename).resolve()
+                    if not target_path.is_relative_to(extract_dir):
+                        raise ValueError(f"Zip Slip detected: {member.filename} attempts traversal")
+                    zf.extract(member, extract_dir)
         except zipfile.BadZipFile:
             logger.warning("Invalid zip or extract failed: %s", zip_path)
             raise ValueError(f"Invalid zip file: {zip_path}") from None

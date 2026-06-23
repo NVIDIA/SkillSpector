@@ -547,7 +547,6 @@ _URL_TOKEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-
 def _is_trusted_source(text: str) -> bool:
     for match in _URL_TOKEN_PATTERN.finditer(text):
         token = match.group(0).strip("\"'`<>()[]{}")
