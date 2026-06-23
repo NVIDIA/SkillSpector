@@ -179,6 +179,10 @@ class InputHandler:
         extract_dir.mkdir(exist_ok=True)
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
+                for member in zf.infolist():
+                    member_path = (extract_dir / member.filename).resolve()
+                    if not member_path.is_relative_to(extract_dir):
+                        raise ValueError(f"Invalid zip entry: {member.filename} (path traversal attempt)")
                 zf.extractall(extract_dir)
         except zipfile.BadZipFile:
             logger.warning("Invalid zip or extract failed: %s", zip_path)
