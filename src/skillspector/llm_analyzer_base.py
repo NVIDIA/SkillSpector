@@ -382,7 +382,14 @@ class LLMAnalyzerBase:
         The return type mirrors :meth:`run_batches`.
         """
         if max_concurrency is None:
-            max_concurrency = int(os.environ.get("SKILLSPECTOR_MAX_CONCURRENCY", "5"))
+            raw = (os.environ.get("SKILLSPECTOR_MAX_CONCURRENCY") or "").strip()
+            try:
+                max_concurrency = int(raw) if raw else 5
+            except ValueError:
+                logger.warning("Invalid SKILLSPECTOR_MAX_CONCURRENCY=%r; defaulting to 5", raw)
+                max_concurrency = 5
+            if max_concurrency < 1:
+                max_concurrency = 1
 
         sem = asyncio.Semaphore(max_concurrency)
 
