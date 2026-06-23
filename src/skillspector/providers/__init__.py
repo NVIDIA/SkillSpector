@@ -22,9 +22,10 @@ is its own subpackage with a ``provider.py`` and a bundled
 
 Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
 
-    openai        → OpenAIProvider          (api.openai.com)
-    anthropic     → AnthropicProvider       (api.anthropic.com)
-    nv_build      → NvBuildProvider         (build.nvidia.com)
+    openai           → OpenAIProvider          (api.openai.com)
+    anthropic        → AnthropicProvider       (api.anthropic.com)
+    anthropic_proxy  → AnthropicProxyProvider  (Vertex-style raw-predict proxy)
+    nv_build         → NvBuildProvider         (build.nvidia.com)
 
 When unset, the selector defaults to ``nv_build``.
 """
@@ -64,6 +65,10 @@ def _select_active_provider() -> LLMProvider:
         from .anthropic import AnthropicProvider
 
         return AnthropicProvider()
+    if name == "anthropic_proxy":
+        from .anthropic_proxy import AnthropicProxyProvider
+
+        return AnthropicProxyProvider()
     if name == "nv_build":
         return NvBuildProvider()
     if name in ("nv_inference", ""):
@@ -78,7 +83,7 @@ def _select_active_provider() -> LLMProvider:
 
     raise ValueError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
-        "Expected one of: openai, anthropic, nv_build (or unset)."
+        "Expected one of: openai, anthropic, anthropic_proxy, nv_build (or unset)."
     )
 
 

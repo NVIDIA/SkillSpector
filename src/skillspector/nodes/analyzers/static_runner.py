@@ -22,6 +22,7 @@ from collections.abc import Callable
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding
 
+from .common import is_code_example
 from .pattern_defaults import get_category, get_explanation, get_pattern_name, get_remediation
 
 logger = get_logger(__name__)
@@ -69,6 +70,32 @@ def _infer_file_type(path: str) -> str:
 def _is_eval_dataset(path: str) -> bool:
     """Return True for authored eval datasets that contain test-case prose."""
     return path.replace("\\", "/") in _EVAL_DATASET_FILES
+
+
+_DOCUMENTATION_DIR_NAMES = (
+    "docs",
+    "documentation",
+    "procedures",
+    "references",
+    "examples",
+    "guides",
+)
+
+_DOCUMENTATION_CONFIDENCE_FACTOR = 0.3
+_CODE_EXAMPLE_CONFIDENCE_FACTOR = 0.5
+
+_NON_EXECUTABLE_FILE_TYPES = frozenset({"markdown", "text", "json", "yaml", "toml", "other"})
+
+
+def _is_documentation_markdown(path: str) -> bool:
+    """Return True for markdown files in documentation subdirectories (not SKILL.md)."""
+    normalized = path.replace("\\", "/").lower()
+    if not normalized.endswith((".md", ".markdown")):
+        return False
+    if normalized.endswith("skill.md"):
+        return False
+    parts = normalized.split("/")
+    return any(part in _DOCUMENTATION_DIR_NAMES for part in parts[:-1])
 
 
 def analyzer_finding_to_finding(
@@ -134,9 +161,30 @@ def run_static_patterns(
             )
             continue
         file_type = _infer_file_type(path)
+        is_doc_markdown = _is_documentation_markdown(path)
+        is_non_executable = file_type in _NON_EXECUTABLE_FILE_TYPES
         for module in pattern_modules:
             raw = module.analyze(content=content, file_path=path, file_type=file_type)
             for af in raw:
+                if af.context and is_code_example(af.context):
+                    if is_non_executable:
+                        logger.debug(
+                            "Filtered code-example finding in non-executable: %s in %s:%d",
+                            af.rule_id,
+                            path,
+                            af.location.start_line,
+                        )
+                        continue
+                    af.confidence *= _CODE_EXAMPLE_CONFIDENCE_FACTOR
+                    logger.debug(
+                        "Downweighted code-example finding in executable: %s in %s:%d (conf=%.2f)",
+                        af.rule_id,
+                        path,
+                        af.location.start_line,
+                        af.confidence,
+                    )
+                if is_doc_markdown:
+                    af.confidence *= _DOCUMENTATION_CONFIDENCE_FACTOR
                 findings.append(analyzer_finding_to_finding(af))
 
     return findings

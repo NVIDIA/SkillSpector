@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skillspector"
-version = "2.2.3"
+version = "2.3.1"
 description = "SkillSpector: Security scanner for AI agent skills (Claude Code, Cursor, and similar). Scans skills for vulnerabilities, malicious patterns, and security risks before installation. Supports Git repos, URLs, zips, and local directories; runs static pattern checks and optional LLM semantic analysis; outputs terminal, JSON, and Markdown reports with risk scoring."
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.12,<3.14"
 keywords = [
     "security",
     "ai-agents",
@@ -25,7 +25,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
 ]
@@ -60,6 +59,10 @@ dev = [
 
 [project.scripts]
 skillspector = "skillspector.cli:app"
+
+[tool.uv]
+# Enable `uv tool install git+https://github.com/NVIDIA/skillspector.git`
+# for a simpler single-command installation without cloning.
 
 [project.urls]
 Homepage = "https://github.com/NVIDIA/skillspector"

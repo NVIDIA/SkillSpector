@@ -151,16 +151,17 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 | `report.py` | Report node |
 | **nodes/analyzers/** | |
 | `__init__.py` | Registry: `ANALYZER_NODE_IDS`, `ANALYZER_NODES` |
-| `common.py` | Helpers (e.g. `make_dummy_finding`) for stub analyzers |
+| `common.py` | Shared analyzer helpers (line/context extraction, AST name resolution) |
 | `static_runner.py` | Runs static patterns; converts `AnalyzerFinding` → `Finding` |
 | `pattern_defaults.py` | Shared pattern metadata (category, explanation, remediation) |
 | `static_yara.py` | YARA-based static analyzer |
 | `osv_client.py` | OSV.dev API client for live vulnerability lookups (SC4); batch queries with caching and fallback |
 | `static_patterns_*.py` | 11 pattern-based analyzers (prompt_injection, data_exfiltration, etc.) |
 | `behavioral_ast.py` | AST-based behavioral analyzer (AST1–AST8): detects exec, eval, subprocess, os.system, compile, dynamic import/getattr, and dangerous execution chains |
-| `behavioral_taint_tracking.py` | Taint-tracking behavioral analyzer (stub) |
-| `mcp_least_privilege.py`, `mcp_tool_poisoning.py`, `mcp_rug_pull.py` | MCP analyzer stubs |
-| `semantic_security_discovery.py`, `semantic_developer_intent.py`, `semantic_quality_policy.py` | Semantic (LLM) analyzer stubs |
+| `behavioral_taint_tracking.py` | Taint-tracking behavioral analyzer (TT1–TT5): source→sink data-flow analysis over Python AST |
+| `mcp_least_privilege.py`, `mcp_tool_poisoning.py` | MCP analyzers (LP1–LP4 least-privilege; TP1–TP4 tool poisoning) |
+| `mcp_rug_pull.py` | MCP rug-pull analyzer (stub; RP1–RP3 planned) |
+| `semantic_security_discovery.py`, `semantic_developer_intent.py`, `semantic_quality_policy.py` | Semantic (LLM) analyzers; emit findings only when `use_llm` is enabled |
 
 ---
 
@@ -187,7 +188,7 @@ skillspector scan ./skill.zip --no-llm          # static analysis only
 skillspector --version
 ```
 
-The CLI passes `input_path` to the graph. The **resolve_input** node (using [input_handler.py](../src/skillspector/input_handler.py)) resolves Git URL, file URL, .zip, single .md file, or directory to a local directory and sets `skill_path` (and `temp_dir_for_cleanup` when a temp dir was created). The CLI cleans up `temp_dir_for_cleanup` after invoke. Exit code 1 if risk_score > 50; exit code 2 on error.
+The CLI passes `input_path` to the graph. The **resolve_input** node (using [input_handler.py](../src/skillspector/input_handler.py)) resolves Git URL, file URL, .zip, single .md file, or directory to a local directory and sets `skill_path` (and `temp_dir_for_cleanup` when a temp dir was created). The CLI cleans up `temp_dir_for_cleanup` after invoke. Exit code 1 if risk_score > 50; exit code 2 on error. See [Integrating SkillSpector](../README.md#integrating-skillspector) for the full exit-code and JSON contract.
 
 ### Programmatic
 
@@ -195,7 +196,7 @@ The CLI passes `input_path` to the graph. The **resolve_input** node (using [inp
 from skillspector import graph
 
 result = graph.invoke({
-    "input_path": "/path/to/skill",  // or "skill_path" for local dir only
+    "input_path": "/path/to/skill",  # or use "skill_path" for a local dir
     "output_format": "json",   # optional: terminal, json, markdown, sarif (default sarif)
     "use_llm": True,           # optional: False to skip LLM in meta_analyzer
 })
@@ -248,7 +249,7 @@ Use [pattern_defaults](../src/skillspector/nodes/analyzers/pattern_defaults.py) 
 
 ### Stub analyzers
 
-Return `{"findings": []}`. The behavioral, MCP, and semantic analyzer nodes are currently stubs (placeholders for future implementation).
+Return `{"findings": []}`. Most analyzer nodes are implemented; `mcp_rug_pull` remains a stub (returns no findings) pending rug-pull detection (RP1–RP3). Use this pattern for any new placeholder analyzer. The LLM-backed semantic analyzers also return `{"findings": []}` when `use_llm` is False.
 
 ---
 

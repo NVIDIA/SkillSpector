@@ -342,7 +342,7 @@ def _build_file_cache(skill_dir: Path) -> dict[str, str]:
     for item in sorted(skill_dir.rglob("*")):
         if not item.is_file():
             continue
-        rel = str(item.relative_to(skill_dir))
+        rel = item.relative_to(skill_dir).as_posix()  # forward slashes on every OS
         try:
             cache[rel] = item.read_text(encoding="utf-8", errors="replace")
         except OSError:

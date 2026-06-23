@@ -31,6 +31,7 @@ from skillspector.nodes.analyzers.osv_client import (
     _severity_from_vuln,
     clear_cache,
     query_batch,
+    was_osv_reachable,
 )
 
 
@@ -272,3 +273,40 @@ class TestQueryBatch:
 
         assert len(results) == 1
         assert results[0][0].vuln_id == "GHSA-npm1"
+
+    def test_was_osv_reachable_after_success(self) -> None:
+        """After a successful query, was_osv_reachable() returns True."""
+        mock_batch_response = {
+            "results": [
+                {"vulns": []},
+            ]
+        }
+
+        mock_client = MagicMock()
+        mock_post_resp = MagicMock()
+        mock_post_resp.json.return_value = mock_batch_response
+        mock_post_resp.raise_for_status = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = mock_post_resp
+
+        with patch(
+            "skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=mock_client
+        ):
+            query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert was_osv_reachable() is True
+
+    def test_was_osv_reachable_after_failure(self) -> None:
+        """After a failed query, was_osv_reachable() returns False."""
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.side_effect = httpx.ConnectError("Connection refused")
+
+        with patch(
+            "skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=mock_client
+        ):
+            query_batch([("jinja2", "2.4.1")], ECOSYSTEM_PYPI)
+
+        assert was_osv_reachable() is False

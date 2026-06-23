@@ -14,11 +14,12 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 ## Documentation
 
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
+- **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **64 vulnerability patterns** across 16 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **65 vulnerability patterns** across 16 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
@@ -29,6 +30,15 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 ### Installation
 
 Create and activate a virtual environment first (all `make` targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv` if available, otherwise `pip`.
+
+**Quick install with uv (no clone required):**
+
+```bash
+uv tool install git+https://github.com/NVIDIA/skillspector.git
+# Update later: uv tool update skillspector
+```
+
+**From source:**
 
 ```bash
 # Clone the repository
@@ -148,6 +158,7 @@ inference gateways.
 | ---------- | ---- | ---- | ---- |
 | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
+| `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
 
 ```bash
@@ -159,6 +170,13 @@ skillspector scan ./my-skill/
 # Anthropic
 export SKILLSPECTOR_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=sk-ant-...
+skillspector scan ./my-skill/
+
+# Anthropic via Vertex-style proxy (corporate gateways, GCP Vertex AI)
+export SKILLSPECTOR_PROVIDER=anthropic_proxy
+export ANTHROPIC_PROXY_ENDPOINT_URL=https://my-gateway.example.com/models/claude-sonnet-4-6:streamRawPredict
+export ANTHROPIC_PROXY_API_KEY=your-bearer-token
+export SKILLSPECTOR_MODEL=claude-sonnet-4-6
 skillspector scan ./my-skill/
 
 # NVIDIA build.nvidia.com
@@ -183,7 +201,7 @@ skillspector scan ./my-skill/ --no-llm
 
 ## Vulnerability Patterns
 
-SkillSpector detects **64 vulnerability patterns** across 16 categories:
+SkillSpector detects **65 vulnerability patterns** across 16 categories:
 
 ### Prompt Injection (5 patterns)
 
@@ -279,7 +297,7 @@ SkillSpector detects **64 vulnerability patterns** across 16 categories:
 | TR2 | Shadow Command Trigger | HIGH | Triggers that shadow built-in commands or other skills |
 | TR3 | Keyword Baiting Trigger | MEDIUM | Generic triggers designed to maximize activation |
 
-### Behavioral AST (8 patterns)
+### Behavioral AST (9 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -291,6 +309,7 @@ SkillSpector detects **64 vulnerability patterns** across 16 categories:
 | AST6 | compile() Call | MEDIUM | Code object creation from strings |
 | AST7 | Dynamic getattr() | MEDIUM | Arbitrary attribute access with non-literal names |
 | AST8 | Dangerous Execution Chain | CRITICAL | exec/eval combined with dynamic source (network, encoded data) |
+| AST9 | Reflective getattr() Sink | HIGH | Reflective exec via `getattr(os,'system')` / `getattr(builtins,'exec')` that evades AST1/AST5 |
 
 ### Taint Tracking (5 patterns)
 
@@ -401,6 +420,9 @@ Issues (2)
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
+| `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
+| `ANTHROPIC_PROXY_API_KEY` | Bearer token for the Anthropic proxy provider. | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
+| `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
 | `SKILLSPECTOR_MODEL` | Override the active provider's default model. See the LLM Analysis table for each provider's default. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
@@ -417,6 +439,61 @@ Options:
   -V, --verbose                                Show detailed progress
   --help                                       Show this message and exit
 ```
+
+## Integrating SkillSpector
+
+SkillSpector is built to be driven by other tools (CI pipelines, install gates, editor integrations). Its exit code and JSON output are a stable contract.
+
+### Exit codes
+
+`skillspector scan` exits with:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Scan completed, `risk_score` ≤ 50 (recommendation `SAFE` or `CAUTION`) |
+| `1` | Scan completed, `risk_score` > 50 (recommendation `DO_NOT_INSTALL`) |
+| `2` | Error (bad input, unreadable source, internal failure) |
+
+> The exit code collapses `SAFE` and `CAUTION` into `0`. To act differently on them (e.g. *warn* on `CAUTION` but *block* on `DO_NOT_INSTALL`), read the `recommendation` field from the JSON output rather than relying on the exit code.
+
+### Machine-readable output
+
+`--format json` produces a JSON report; with no `--output`/`-o` it is written to stdout:
+
+```bash
+skillspector scan ./my-skill/ --format json
+```
+
+The top-level shape is (this example shows a full LLM-backed scan; with `--no-llm`, `metadata.llm_requested` is `false`):
+
+```json
+{
+  "skill": { "name": "...", "source": "...", "scanned_at": "<ISO 8601>" },
+  "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
+  "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
+  "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 } } ],
+  "metadata": { "has_executable_scripts": false, "skillspector_version": "...", "llm_requested": true, "llm_available": true }
+}
+```
+
+- `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
+- `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
+- `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
+- The full per-issue shape is defined by `Finding.to_dict()` in [models.py](src/skillspector/models.py); rely on the fields above and treat any additional fields as best-effort.
+
+For CI/IDE tooling, `--format sarif` emits SARIF 2.1.0.
+
+### Recommended gate mapping
+
+When using SkillSpector as an install gate, map the recommendation to an action:
+
+| `recommendation` | Suggested action |
+|------------------|------------------|
+| `SAFE` | allow |
+| `CAUTION` | prompt / warn the user |
+| `DO_NOT_INSTALL` | block |
+
+SkillSpector computes the score band and recommendation; how strict the gate is (e.g. whether `CAUTION` blocks in CI) is a policy decision for the integrating tool.
 
 ## Development
 
@@ -475,6 +552,15 @@ SC4 uses the [OSV.dev](https://osv.dev) API to check dependencies against the fu
 - **Caching** — results are cached in-memory for 1 hour to avoid redundant API calls during a session.
 
 The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability data. When that is not available, findings are limited to the static fallback list.
+
+## Trust model and data egress
+
+SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not do before relying on it:
+
+- **It never executes the scanned skill.** All analysis is static (regex, Python AST, YARA) plus optional LLM evaluation of file *contents* — the skill's code is never run.
+- **LLM analysis sends file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. Use `--no-llm` to keep contents local (static analysis only).
+- **SC4 sends dependency names to OSV.dev.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable.
+- **It does not sandbox the host.** SkillSpector flags risky patterns *before* you install a skill; it does not contain or isolate a skill you choose to install anyway.
 
 ## Limitations
 

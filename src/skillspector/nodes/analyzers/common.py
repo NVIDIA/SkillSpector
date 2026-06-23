@@ -104,9 +104,38 @@ def resolve_dotted_name(node: ast.expr) -> str | None:
     return None
 
 
-def resolve_call_name(node: ast.Call) -> str | None:
-    """Extract a dotted call name like ``'os.system'`` from a Call node."""
-    return resolve_dotted_name(node.func)
+def apply_import_aliases(name: str, aliases: dict[str, str]) -> str:
+    """Rewrite a resolved call name to its fully-qualified form using import aliases.
+
+    Bridges two evasion-prone spellings back to the canonical dotted name that the
+    analyzers match against:
+
+    - ``from os import system`` → ``{"system": "os.system"}`` so a bare ``system``
+      call resolves to ``"os.system"``.
+    - ``import os as o`` → ``{"o": "os"}`` so ``o.system`` resolves to ``"os.system"``.
+
+    Idempotent for already-canonical names (``os.system`` stays ``os.system``).
+    """
+    if name in aliases:
+        return aliases[name]
+    root, sep, rest = name.partition(".")
+    if sep and root in aliases:
+        return f"{aliases[root]}.{rest}"
+    return name
+
+
+def resolve_call_name(node: ast.Call, aliases: dict[str, str] | None = None) -> str | None:
+    """Extract a dotted call name like ``'os.system'`` from a Call node.
+
+    When *aliases* (from :func:`build_import_aliases`) is supplied, locally aliased or
+    ``from``-imported names are normalized to their fully-qualified form so that
+    ``import os as o; o.system(...)`` and ``from os import system; system(...)`` both
+    resolve to ``"os.system"``.
+    """
+    name = resolve_dotted_name(node.func)
+    if name is not None and aliases:
+        name = apply_import_aliases(name, aliases)
+    return name
 
 
 def _build_import_aliases(tree: ast.Module) -> dict[str, str]:
@@ -128,6 +157,16 @@ def _build_import_aliases(tree: ast.Module) -> dict[str, str]:
                 local = alias.asname or alias.name
                 aliases[local] = f"{module}.{alias.name}" if module else alias.name
     return aliases
+
+
+def build_import_aliases(tree: ast.Module) -> dict[str, str]:
+    """Map locally bound names to their fully-qualified import paths.
+
+    Public entry point around the import scan already used by :func:`build_type_map`.
+    Callers pass the result to :func:`resolve_call_name` /
+    :func:`resolve_call_name_typed` to defeat import-alias evasion.
+    """
+    return _build_import_aliases(tree)
 
 
 def build_type_map(tree: ast.Module) -> dict[str, str]:
@@ -170,20 +209,36 @@ def build_type_map(tree: ast.Module) -> dict[str, str]:
     return type_map
 
 
-def resolve_call_name_typed(node: ast.Call, type_map: dict[str, str] | None = None) -> str | None:
+def resolve_call_name_typed(
+    node: ast.Call,
+    type_map: dict[str, str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
     """Like ``resolve_call_name`` but consults *type_map* for instance methods.
 
     For ``sock.recv(1024)`` where *type_map* maps ``sock`` → ``socket.socket``,
     this returns ``"socket.socket.recv"`` instead of ``"sock.recv"``.
+
+    When *aliases* (from :func:`build_import_aliases`) is supplied, import-aliased and
+    ``from``-imported names are also normalized, so ``import subprocess as sp; sp.run``
+    resolves to ``"subprocess.run"`` and ``from subprocess import run; run`` to the same.
     """
     plain = resolve_dotted_name(node.func)
-    if plain is None or type_map is None or "." not in plain:
-        return plain
-    root, _, rest = plain.partition(".")
-    inferred = type_map.get(root)
-    if inferred is None:
-        return plain
-    return f"{inferred}.{rest}"
+    if plain is None:
+        return None
+    # Normalize the locally written spelling first. ``type_map`` values are already
+    # canonical (``build_type_map`` resolves import aliases when recording them), so
+    # aliasing must run before — not after — the type-map lookup to avoid re-expanding
+    # an already-resolved name (e.g. ``from socket import socket`` would otherwise turn
+    # ``socket.socket.recv`` into ``socket.socket.socket.recv``).
+    if aliases:
+        plain = apply_import_aliases(plain, aliases)
+    if type_map is not None and "." in plain:
+        root, _, rest = plain.partition(".")
+        inferred = type_map.get(root)
+        if inferred is not None:
+            plain = f"{inferred}.{rest}"
+    return plain
 
 
 def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:

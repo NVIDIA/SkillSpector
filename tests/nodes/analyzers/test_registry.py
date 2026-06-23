@@ -33,6 +33,7 @@ EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "static_patterns_memory_poisoning",
     "static_patterns_tool_misuse",
     "static_patterns_rogue_agent",
+    "static_patterns_agent_snooping",
     "static_yara",
     "behavioral_ast",
     "behavioral_taint_tracking",

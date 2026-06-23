@@ -35,12 +35,15 @@ from skillspector.llm_utils import (
     is_llm_available,
 )
 from skillspector.providers import NO_LLM_API_KEY_MESSAGE, resolve_provider_credentials
+from skillspector.providers.nv_build import NvBuildProvider
+from skillspector.providers.openai import OpenAIProvider
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "NVIDIA_INFERENCE_KEY",
+    "SKILLSPECTOR_MODEL",
     "SKILLSPECTOR_PROVIDER",
 )
 
@@ -178,3 +181,37 @@ class TestIsLlmAvailable:
         ok, msg = is_llm_available()
         assert ok is False
         assert msg == NO_LLM_API_KEY_MESSAGE
+
+
+class TestGetChatModel:
+    def test_openai_fallback_uses_openai_default_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+        llm = get_chat_model()
+
+        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+
+    def test_explicit_model_still_overrides_openai_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+        llm = get_chat_model(model="custom/model")
+
+        assert _chat_model_name(llm) == "custom/model"
+
+    def test_provider_credentials_use_provider_default_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+
+        llm = get_chat_model()
+
+        assert _chat_model_name(llm) == NvBuildProvider.DEFAULT_MODEL
+
+
+def _chat_model_name(llm: object) -> str:
+    return str(getattr(llm, "model_name", None) or getattr(llm, "model", None))

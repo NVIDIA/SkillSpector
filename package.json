@@ -1,0 +1,15 @@
+{
+  "name": "skillspector-pi",
+  "version": "2.2.3",
+  "private": true,
+  "description": "Pi extension exposing SkillSpector as a local scan tool for agent skills.",
+  "keywords": ["pi-package", "skillspector", "agent-skills", "security"],
+  "pi": {
+    "extensions": ["./extensions/skillspector.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

@@ -33,13 +33,15 @@ from __future__ import annotations
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
-from skillspector.constants import MODEL_CONFIG
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
     create_chat_model,
+    get_metadata_provider,
     raise_no_llm_api_key_configured,
     resolve_chat_model_credentials,
+    resolve_provider_credentials,
 )
+from skillspector.providers.openai import OpenAIProvider
 
 
 def _resolve_llm_credentials() -> tuple[str, str | None]:
@@ -55,6 +57,18 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
     if creds is None:
         raise_no_llm_api_key_configured()
     return creds
+
+
+def _resolve_default_chat_model() -> str:
+    """Return the default chat model for the endpoint that will be used."""
+    if resolve_provider_credentials() is not None:
+        return get_metadata_provider().resolve_model()
+
+    openai_provider = OpenAIProvider()
+    if openai_provider.resolve_credentials() is not None:
+        return openai_provider.resolve_model()
+
+    raise_no_llm_api_key_configured()
 
 
 def is_llm_available() -> tuple[bool, str | None]:
@@ -77,7 +91,7 @@ def get_chat_model(model: str | None = None) -> BaseChatModel:
     Raises:
         ValueError: when no API key is configured (see ``is_llm_available``).
     """
-    model = model or MODEL_CONFIG["default"]
+    model = model or _resolve_default_chat_model()
     return create_chat_model(
         model=model,
         max_tokens=get_max_output_tokens(model),

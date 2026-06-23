@@ -120,6 +120,44 @@ class TestDynamicGetattr:
         assert not any(f.rule_id == "AST7" for f in findings)
 
 
+class TestReflectiveGetattrExec:
+    """getattr(obj, "<sink>")(...) is a reflective handle on an exec/os sink.
+
+    It evades AST1/AST5 (the inner getattr has a *constant* name so AST7 is skipped,
+    and the outer call's func is an ast.Call whose name does not resolve), so it must
+    be caught directly as AST9.
+    """
+
+    def test_getattr_os_system_produces_ast9(self):
+        findings = _run("import os\ngetattr(os, 'system')('id')")
+        ast9 = [f for f in findings if f.rule_id == "AST9"]
+        assert len(ast9) == 1
+        assert ast9[0].severity == "HIGH"
+
+    def test_getattr_builtins_exec_produces_ast9(self):
+        findings = _run("import builtins\ngetattr(builtins, 'exec')(payload)")
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_getattr_eval_double_quotes_produces_ast9(self):
+        findings = _run('import builtins\ngetattr(builtins, "eval")("2+2")')
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_getattr_os_popen_produces_ast9(self):
+        findings = _run("import os\nhandle = getattr(os, 'popen')('whoami')")
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_reflective_getattr_does_not_emit_ast7(self):
+        # A constant name must not also trip the non-literal AST7 rule.
+        findings = _run("import os\ngetattr(os, 'system')('id')")
+        assert not any(f.rule_id == "AST7" for f in findings)
+
+    def test_benign_constant_attr_no_ast9(self):
+        # Common, safe reflective access must stay unflagged (near-zero false positives).
+        for name in ("name", "timeout", "value", "data", "run", "compile"):
+            findings = _run(f"v = getattr(config, '{name}')")
+            assert not any(f.rule_id == "AST9" for f in findings), name
+
+
 class TestDangerousChains:
     def test_exec_compile_chain_produces_ast8(self):
         code = 'exec(compile("x = 1", "<string>", "exec"))'
@@ -194,6 +232,41 @@ class TestEdgeCases:
         state = {"components": ["missing.py"], "file_cache": {}}
         result = behavioral_ast.node(state)
         assert result["findings"] == []
+
+
+class TestImportAliasEvasion:
+    """Dangerous calls must be detected through ``from ... import`` and ``import ... as``.
+
+    A skill can otherwise dodge the prefix-based matching simply by importing the
+    primitive under another name (e.g. ``from os import system``).
+    """
+
+    def test_from_os_import_system(self):
+        findings = _run("from os import system\nsystem('id')")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_import_os_as_alias(self):
+        findings = _run("import os as o\no.system('id')")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_from_subprocess_import_run(self):
+        findings = _run("from subprocess import run\nrun(['id'])")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_import_subprocess_as_alias(self):
+        findings = _run("import subprocess as sp\nsp.Popen(['id'])")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_aliased_chain_via_from_import(self):
+        """``from base64 import b64decode; eval(b64decode(...))`` is still a chain (AST8)."""
+        findings = _run("from base64 import b64decode\neval(b64decode(payload))")
+        ast8 = [f for f in findings if f.rule_id == "AST8"]
+        assert len(ast8) >= 1
+        assert "base64" in ast8[0].message
+
+    def test_aliased_safe_import_no_false_positive(self):
+        findings = _run("import json as j\ndata = j.loads('{}')\nprint(data)\n")
+        assert findings == []
 
 
 class TestMultipleFindings:

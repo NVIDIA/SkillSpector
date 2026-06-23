@@ -76,11 +76,24 @@ class SarifResult(BaseModel):
     locations: list[SarifLocation]
 
 
+class SarifReportingDescriptor(BaseModel):
+    """Rule metadata (SARIF reportingDescriptor)."""
+
+    model_config = {"populate_by_name": True}
+
+    id: str
+    short_description: SarifMessage | None = Field(default=None, alias="shortDescription")
+    default_configuration: dict[str, object] | None = Field(
+        default=None, alias="defaultConfiguration"
+    )
+
+
 class SarifDriver(BaseModel):
-    """Tool driver (required: name; optional: version)."""
+    """Tool driver (required: name; optional: version, rules)."""
 
     name: str
     version: str | None = None
+    rules: list[SarifReportingDescriptor] | None = None
 
 
 class SarifTool(BaseModel):
