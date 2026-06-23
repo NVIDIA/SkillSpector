@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -31,6 +32,7 @@ from skillspector.llm_analyzer_base import (
     findings_in_range,
     number_lines,
 )
+from skillspector.llm_utils import _resolve_max_concurrency
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -1310,3 +1312,24 @@ class TestRateLimitRetry:
 
         with pytest.raises(Exception, match="429"):
             await analyzer.arun_batches([batch])
+
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            ({}, 5),
+            ({"SKILLSPECTOR_MAX_CONCURRENCY": ""}, 5),
+            ({"SKILLSPECTOR_MAX_CONCURRENCY": "   "}, 5),
+            ({"SKILLSPECTOR_MAX_CONCURRENCY": "auto"}, 5),
+            ({"SKILLSPECTOR_MAX_CONCURRENCY": "0"}, 1),
+            ({"SKILLSPECTOR_MAX_CONCURRENCY": "-3"}, 1),
+            ({"SKILLSPECTOR_MAX_CONCURRENCY": "8"}, 8),
+        ],
+    )
+    def test_max_concurrency_env_parsing(
+        self,
+        env: dict[str, str],
+        expected: int,
+    ) -> None:
+        """Verify SKILLSPECTOR_MAX_CONCURRENCY defaults and clamps safely."""
+        with patch.dict(os.environ, env, clear=True):
+            assert _resolve_max_concurrency() == expected
