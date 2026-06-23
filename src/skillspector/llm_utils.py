@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from random import random
 import time
 
 from langchain_openai import ChatOpenAI
@@ -106,7 +107,7 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
 
 
 def retry_llm_call_sync(call_func, max_attempts=4):
-    """Retry transient LLM errors (429, timeout) with exponential backoff (sync)."""
+    """Retry transient LLM errors (429, timeout, 5XX, etc) with exponential backoff (sync)."""
     for attempt in range(max_attempts):
         try:
             return call_func()  # Call it each retry
@@ -116,9 +117,17 @@ def retry_llm_call_sync(call_func, max_attempts=4):
 
             is_retryable = (
                 "429" in error_str
+                or "500" in error_str
+                or "502" in error_str
+                or "503" in error_str
+                or "529" in error_str
                 or "ratelimit" in error_name
                 or "timeout" in error_name
                 or "timeout" in error_str
+                or "overloaded" in error_str
+                or "service unavailable" in error_str
+                or "bad gateway" in error_str
+                or "connection" in error_name
             )
 
             if not is_retryable:
@@ -126,12 +135,12 @@ def retry_llm_call_sync(call_func, max_attempts=4):
             if attempt == max_attempts - 1:
                 raise
 
-            wait = 2**attempt
+            wait = 2 ** attempt + random.uniform(0, 1)
             time.sleep(wait)
 
 
 async def retry_llm_call(coro_func, max_attempts=4):
-    """Retry transient LLM errors (429, timeout) with exponential backoff (async)."""
+    """Retry transient LLM errors (429, timeout, 5XX, etc) with exponential backoff (async)."""
     for attempt in range(max_attempts):
         try:
             return await coro_func()
@@ -141,9 +150,17 @@ async def retry_llm_call(coro_func, max_attempts=4):
 
             is_retryable = (
                 "429" in error_str
+                or "500" in error_str
+                or "502" in error_str
+                or "503" in error_str
+                or "529" in error_str
                 or "ratelimit" in error_name
                 or "timeout" in error_name
                 or "timeout" in error_str
+                or "overloaded" in error_str
+                or "service unavailable" in error_str
+                or "bad gateway" in error_str
+                or "connection" in error_name
             )
 
             if not is_retryable:
@@ -151,5 +168,5 @@ async def retry_llm_call(coro_func, max_attempts=4):
             if attempt == max_attempts - 1:
                 raise
 
-            wait = 2**attempt
+            wait = 2 ** attempt + random.uniform(0, 1)
             await asyncio.sleep(wait)
