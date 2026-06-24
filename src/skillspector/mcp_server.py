@@ -28,6 +28,7 @@ installed.
 from __future__ import annotations
 
 import shutil
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from skillspector import __version__
@@ -46,11 +47,30 @@ VALID_FORMATS = ("json", "markdown", "sarif", "terminal")
 RISK_THRESHOLD = 50
 
 
+def _is_local_target(target: str) -> bool:
+    """Return True when ``target`` names local filesystem content."""
+    stripped = target.strip()
+    if stripped.startswith("file://"):
+        return True
+    if stripped.startswith(("http://", "https://", "git@", "ssh://", "git+ssh://")):
+        return False
+    if stripped.startswith(("\\\\", "//")):
+        return True
+
+    candidate = Path(stripped).expanduser()
+    if candidate.is_absolute() or candidate.drive:
+        return True
+    if "://" in stripped:
+        return False
+    return candidate.exists()
+
+
 async def run_scan(
     target: str,
     *,
     use_llm: bool = True,
     output_format: str = "json",
+    allow_local_targets: bool = True,
     yara_rules_dir: str | None = None,
 ) -> dict[str, Any]:
     """Invoke the SkillSpector graph and return a structured verdict.
@@ -62,6 +82,9 @@ async def run_scan(
             the returned payload reports what actually happened.
         output_format: Format of the embedded ``report`` string. One of
             :data:`VALID_FORMATS`.
+        allow_local_targets: Whether local filesystem targets are allowed.
+            HTTP MCP calls set this to ``False`` so routable servers do not
+            accept caller-controlled local paths.
         yara_rules_dir: Optional directory of additional YARA rules.
 
     Returns:
@@ -73,6 +96,8 @@ async def run_scan(
     """
     if output_format not in VALID_FORMATS:
         raise ValueError(f"output_format must be one of {VALID_FORMATS}, got {output_format!r}")
+    if not allow_local_targets and _is_local_target(target):
+        raise ValueError("local targets are disabled for this MCP transport")
 
     llm_available = resolve_provider_credentials() is not None
     llm_used = use_llm and llm_available
@@ -131,7 +156,7 @@ async def run_scan(
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def build_server(name: str = "skillspector") -> FastMCP:
+def build_server(name: str = "skillspector", *, allow_local_targets: bool = True) -> FastMCP:
     """Construct the FastMCP server exposing the ``scan_skill`` tool.
 
     Requires the optional ``mcp`` dependency (``pip install 'skillspector[mcp]'``).
@@ -164,14 +189,19 @@ def build_server(name: str = "skillspector") -> FastMCP:
         actually ran, so a low score from a static-only scan is not mistaken for
         a clean full scan.
         """
-        return await run_scan(target, use_llm=use_llm, output_format=output_format)
+        return await run_scan(
+            target,
+            use_llm=use_llm,
+            output_format=output_format,
+            allow_local_targets=allow_local_targets,
+        )
 
     return server
 
 
 def run(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
     """Run the MCP server over ``stdio`` (local agents) or ``http`` (remote/A2A)."""
-    server = build_server()
+    server = build_server(allow_local_targets=transport != "http")
     if transport == "stdio":
         server.run(transport="stdio")
     elif transport == "http":
