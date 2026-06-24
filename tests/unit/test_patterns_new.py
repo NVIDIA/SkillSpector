@@ -938,6 +938,80 @@ class TestSupplyChainDependencies:
         names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
         assert names == ["pytest", "ruff"]
 
+    def test_pyproject_poetry_deps_extracted(self) -> None:
+        """[tool.poetry.dependencies] and [tool.poetry.dev-dependencies] are scanned."""
+        content = (
+            '[tool.poetry]\nname = "mypkg"\nversion = "1.0.0"\n'
+            "[tool.poetry.dependencies]\n"
+            'python = "^3.11"\n'
+            'requests = "^2.28"\n'
+            'pycrypto = "*"\n'
+            "[tool.poetry.dev-dependencies]\n"
+            'pytest = "^7"\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        # python is the special marker key, not a package
+        assert "python" not in names
+        assert "requests" in names
+        assert "pycrypto" in names
+        assert "pytest" in names
+
+    def test_pyproject_poetry_groups_extracted(self) -> None:
+        """[tool.poetry.group.<name>.dependencies] (new-style groups) are scanned."""
+        content = (
+            '[tool.poetry]\nname = "mypkg"\n'
+            "[tool.poetry.group.dev.dependencies]\n"
+            'black = "^23"\n'
+            "[tool.poetry.group.docs.dependencies]\n"
+            'sphinx = ">=5"\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        assert names == ["black", "sphinx"]
+
+    def test_pyproject_pdm_dev_deps_extracted(self) -> None:
+        """[tool.pdm.dev-dependencies] groups of PEP 508 strings are scanned."""
+        content = (
+            '[project]\nname = "mypkg"\ndependencies = ["httpx"]\n'
+            "[tool.pdm.dev-dependencies]\n"
+            'test = ["pytest>=7", "coverage"]\n'
+            'lint = ["ruff"]\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        assert names == ["coverage", "httpx", "pytest", "ruff"]
+
+    def test_pyproject_hatch_env_deps_extracted(self) -> None:
+        """[tool.hatch.envs.<name>.dependencies] lists are scanned."""
+        content = (
+            '[project]\nname = "mypkg"\n'
+            "[tool.hatch.envs.default]\n"
+            'dependencies = ["pytest", "pytest-cov"]\n'
+            "[tool.hatch.envs.lint]\n"
+            'dependencies = ["ruff"]\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        assert names == ["pytest", "pytest-cov", "ruff"]
+
+    def test_pyproject_uv_dev_deps_extracted(self) -> None:
+        """[tool.uv] dev-dependencies list of PEP 508 strings is scanned."""
+        content = (
+            '[project]\nname = "mypkg"\ndependencies = ["httpx"]\n'
+            "[tool.uv]\n"
+            'dev-dependencies = ["ruff>=0.3", "pytest"]\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        assert names == ["httpx", "pytest", "ruff"]
+
+    def test_pyproject_tool_tables_no_false_positives_on_config_keys(self) -> None:
+        """Non-dependency tool config sections do not produce package findings."""
+        content = (
+            "[tool.black]\n"
+            "line-length = 88\n"
+            "[tool.mypy]\n"
+            'python_version = "3.11"\n'
+            "strict = true\n"
+        )
+        assert sc_mod._extract_packages_from_pyproject(content) == []
+
 
 # ── Supply Chain Safe Patterns (SC2) ───────────────────────────────────
 
