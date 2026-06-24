@@ -361,6 +361,30 @@ def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> 
     }
 
 
+def _result_finding_count(result: dict[str, object]) -> int:
+    """Count active (post-suppression) findings for the multi-skill summary.
+
+    The report node returns ``filtered_findings`` as the full LLM-filtered set
+    (kept plus baseline-suppressed) and the suppressed subset separately under
+    ``suppressed_findings`` (see ``nodes/report.py``). ``partition_findings``
+    guarantees ``kept + suppressed == filtered_findings``, so the active count is
+    ``len(filtered_findings) - len(suppressed_findings)`` and is never negative for
+    real report output; the ``max(..., 0)`` is only a display-safety floor against
+    a malformed result. Subtracting is done solely on this branch: the raw
+    ``findings`` fallback (reached only when ``filtered_findings`` is absent or not
+    a list, e.g. a malformed or error result, never real report output) must not
+    subtract, since raw findings are not the population that produced
+    ``suppressed_findings``.
+    """
+    filtered = result.get("filtered_findings")
+    if isinstance(filtered, list):
+        suppressed = result.get("suppressed_findings")
+        suppressed_count = len(suppressed) if isinstance(suppressed, list) else 0
+        return max(len(filtered) - suppressed_count, 0)
+    findings = result.get("findings")
+    return len(findings) if isinstance(findings, list) else 0
+
+
 def _scan_multi_skill(
     detection: MultiSkillDetectionResult,
     format: FormatChoice,
@@ -415,8 +439,7 @@ def _scan_multi_skill(
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        finding_count = _result_finding_count(result)
         console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
 
     console.print("")
@@ -438,9 +461,7 @@ def _scan_multi_skill(
                         "path": skill.relative_path,
                         "risk_score": result.get("risk_score", 0),
                         "risk_severity": result.get("risk_severity", "LOW"),
-                        "finding_count": len(
-                            result.get("filtered_findings") or result.get("findings") or []
-                        ),
+                        "finding_count": _result_finding_count(result),
                     }
                 )
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")

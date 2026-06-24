@@ -253,3 +253,104 @@ def test_cli_recursive_forwards_baseline_and_show_suppressed(
     for state in captured:
         assert "baseline" in state  # the baseline was loaded and threaded in
         assert state.get("show_suppressed") is True
+
+
+def test_cli_recursive_json_finding_count_excludes_suppressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The combined JSON report must count active (post-suppression) findings.
+
+    Regression for the over-count: the report node returns ``filtered_findings``
+    as the full pre-partition set (kept plus baseline-suppressed) and lists the
+    suppressed subset separately under ``suppressed_findings`` (see
+    ``nodes/report.py``); it never reduces ``filtered_findings`` to active-only.
+    So ``len(filtered_findings)`` reports pre-suppression totals and the count must
+    subtract ``suppressed_findings``. This test mirrors that real return shape (not
+    an empty ``filtered_findings``, which suppression never produces): one skill
+    fully suppressed (active 0) and one partially suppressed (active 1).
+    """
+    import skillspector.cli as cli_mod
+
+    collection = tmp_path / "collection"
+    for name in ("alpha", "beta"):
+        sub = collection / name
+        sub.mkdir(parents=True)
+        (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n", encoding="utf-8")
+
+    # Return states shaped exactly like nodes/report.py: filtered_findings holds
+    # every finding (kept + suppressed); suppressed_findings holds the suppressed
+    # subset. alpha is fully suppressed (active 0); beta suppresses 2 of 3 (active 1).
+    per_skill = {
+        "alpha": {
+            "findings": ["raw1", "raw2", "raw3"],
+            "filtered_findings": ["raw1", "raw2", "raw3"],
+            "suppressed_findings": ["raw1", "raw2", "raw3"],
+        },
+        "beta": {
+            "findings": ["raw1", "raw2", "raw3"],
+            "filtered_findings": ["raw1", "raw2", "raw3"],
+            "suppressed_findings": ["raw1", "raw2"],
+        },
+    }
+
+    def fake_invoke(state: dict[str, object], config: object = None) -> dict[str, object]:
+        # The scanned sub-skill path ends with the skill directory name.
+        name = Path(str(state["input_path"])).name
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "report_body": "{}",
+            **per_skill[name],
+        }
+
+    monkeypatch.setattr(cli_mod.graph, "invoke", fake_invoke)
+
+    out_file = tmp_path / "combined.json"
+    scan = runner.invoke(
+        app,
+        [
+            "scan",
+            str(collection),
+            "--recursive",
+            "--no-llm",
+            "--format",
+            "json",
+            "--output",
+            str(out_file),
+        ],
+    )
+
+    assert scan.exit_code == 0
+    data = json.loads(out_file.read_text())
+    by_name = {s["name"]: s["finding_count"] for s in data["skills"]}
+    assert by_name == {"alpha": 0, "beta": 1}
+
+
+def test_result_finding_count_branches() -> None:
+    """Unit-cover every branch of _result_finding_count directly.
+
+    Mirrors the report-node contract: filtered_findings is the full pre-partition
+    set, suppressed_findings its suppressed subset. The raw-findings fallback (only
+    when filtered_findings is absent or not a list) must NOT subtract suppressed,
+    since raw findings are not the population that produced suppressed_findings.
+    """
+    from skillspector.cli import _result_finding_count
+
+    # Real report shape: active = len(filtered) - len(suppressed).
+    assert (
+        _result_finding_count({"filtered_findings": [1, 2, 3], "suppressed_findings": [1, 2]}) == 1
+    )
+    assert (
+        _result_finding_count({"filtered_findings": [1, 2, 3], "suppressed_findings": [1, 2, 3]})
+        == 0
+    )
+    # No baseline: suppressed_findings absent -> full filtered count.
+    assert _result_finding_count({"filtered_findings": [1, 2, 3]}) == 3
+    # Fallback: filtered_findings absent -> raw findings length, WITHOUT subtracting
+    # suppressed (raw findings are not the suppressed population).
+    assert _result_finding_count({"findings": [1, 2, 3], "suppressed_findings": [1, 2]}) == 3
+    # Non-list filtered_findings also takes the fallback branch.
+    assert _result_finding_count({"filtered_findings": None, "findings": [1]}) == 1
+    # Nothing usable -> 0. Malformed (suppressed longer than filtered) floors at 0.
+    assert _result_finding_count({}) == 0
+    assert _result_finding_count({"filtered_findings": [1], "suppressed_findings": [1, 2, 3]}) == 0
