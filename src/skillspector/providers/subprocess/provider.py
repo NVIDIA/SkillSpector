@@ -208,6 +208,9 @@ class SubprocessProvider:
         The prompt is written to the command's stdin.
     """
 
+    DEFAULT_MODEL: str = _SENTINEL_MODEL
+    SLOT_DEFAULTS: dict[str, str] = {}
+
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return a sentinel tuple when SKILLSPECTOR_LLM_COMMAND is set, else None."""
         command = os.environ.get("SKILLSPECTOR_LLM_COMMAND", "").strip()
