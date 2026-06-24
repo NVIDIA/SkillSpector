@@ -205,6 +205,7 @@ class TestGetChatModel:
     def test_provider_credentials_use_provider_default_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nv_build")
         monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
 

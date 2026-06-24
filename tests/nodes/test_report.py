@@ -30,6 +30,7 @@ from skillspector.nodes.report import (
     report,
 )
 from skillspector.state import SkillspectorState
+from skillspector.suppression import Baseline, SuppressionRule
 
 
 def _finding(
@@ -530,3 +531,98 @@ class TestReportNode:
         assert reported_files == {"step0.py", "step1.py", "step2.py", "step3.py"}
         assert len(body["issues"]) == 4
         assert result["risk_score"] < 4 * 25
+
+
+def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
+    """A baseline-suppressed CRITICAL finding does not count toward the risk score."""
+    baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="false positive")])
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", "CRITICAL")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": baseline,
+    }
+    result = report(state)
+    assert result["risk_score"] == 0
+    assert result["risk_severity"] == "LOW"
+    assert result["risk_recommendation"] == "SAFE"
+    # Suppressed findings stay in SARIF but are marked with `suppressions`
+    # (audit trail) so consumers exclude them from counts.
+    sarif_results = result["sarif_report"]["runs"][0]["results"]
+    assert len(sarif_results) == 1
+    assert sarif_results[0]["suppressions"][0]["kind"] == "external"
+    assert len(result["suppressed_findings"]) == 1
+
+
+def test_report_baseline_keeps_unmatched_finding() -> None:
+    """Findings not matched by the baseline are kept and scored normally."""
+    baseline = Baseline(rules=[SuppressionRule(rule_id="SQP-1", reason="nit")])
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", "CRITICAL"), _finding("SQP-1", "MEDIUM")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": baseline,
+    }
+    result = report(state)
+    assert result["risk_score"] == 50  # only the CRITICAL counts
+    assert len(result["suppressed_findings"]) == 1
+
+
+def test_report_json_includes_suppressed_section() -> None:
+    """JSON output reports suppressed_count and a suppressed array."""
+    baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="fp")])
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", "CRITICAL")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": baseline,
+    }
+    data = json.loads(report(state)["report_body"])
+    assert data["suppressed_count"] == 1
+    assert data["issues"] == []
+    assert data["suppressed"][0]["suppression_reason"] == "fp"
+
+
+def test_report_markdown_show_suppressed_lists_rows() -> None:
+    """Markdown lists suppressed findings only when show_suppressed is set."""
+    baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="fp")])
+    base_state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", "CRITICAL")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "markdown",
+        "baseline": baseline,
+    }
+    hidden = report({**base_state})["report_body"]
+    assert "## Suppressed (1)" in hidden
+    assert "--show-suppressed" in hidden
+
+    shown = report({**base_state, "show_suppressed": True})["report_body"]
+    assert "## Suppressed (1)" in shown
+    assert "fp" in shown
+
+
+def test_report_no_baseline_unchanged() -> None:
+    """Without a baseline, scoring is unchanged and nothing is suppressed."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", "CRITICAL")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+    }
+    result = report(state)
+    assert result["risk_score"] == 50
+    assert result["suppressed_findings"] == []

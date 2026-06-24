@@ -59,8 +59,11 @@ class TestBuildAnalysisCompleteness:
         findings = [_make_finding()]
         with patch("skillspector.nodes.report.is_llm_available", return_value=(True, None)):
             result = _build_analysis_completeness(
-                components, file_cache, use_llm=True,
-                findings_pre_filter=findings, findings_post_filter=findings,
+                components,
+                file_cache,
+                use_llm=True,
+                findings_pre_filter=findings,
+                findings_post_filter=findings,
             )
         assert result["total_components"] == 2
         assert result["scanned_components"] == 2
@@ -74,8 +77,11 @@ class TestBuildAnalysisCompleteness:
         file_cache = {"a.py": "code"}
         with patch("skillspector.nodes.report.is_llm_available", return_value=(True, None)):
             result = _build_analysis_completeness(
-                components, file_cache, use_llm=True,
-                findings_pre_filter=[], findings_post_filter=[],
+                components,
+                file_cache,
+                use_llm=True,
+                findings_pre_filter=[],
+                findings_post_filter=[],
             )
         assert result["total_components"] == 3
         assert result["scanned_components"] == 1
@@ -89,8 +95,11 @@ class TestBuildAnalysisCompleteness:
             return_value=(False, "OPENAI_API_KEY not set"),
         ):
             result = _build_analysis_completeness(
-                ["a.py"], {"a.py": "code"}, use_llm=True,
-                findings_pre_filter=[], findings_post_filter=[],
+                ["a.py"],
+                {"a.py": "code"},
+                use_llm=True,
+                findings_pre_filter=[],
+                findings_post_filter=[],
             )
         assert result["llm_analysis"] == "skipped"
         assert result["is_complete"] is False
@@ -99,8 +108,11 @@ class TestBuildAnalysisCompleteness:
     def test_llm_disabled_noted(self) -> None:
         with patch("skillspector.nodes.report.is_llm_available", return_value=(True, None)):
             result = _build_analysis_completeness(
-                ["a.py"], {"a.py": "code"}, use_llm=False,
-                findings_pre_filter=[], findings_post_filter=[],
+                ["a.py"],
+                {"a.py": "code"},
+                use_llm=False,
+                findings_pre_filter=[],
+                findings_post_filter=[],
             )
         assert result["llm_analysis"] == "skipped"
         assert result["is_complete"] is False
@@ -111,8 +123,11 @@ class TestBuildAnalysisCompleteness:
         post = [_make_finding()]
         with patch("skillspector.nodes.report.is_llm_available", return_value=(True, None)):
             result = _build_analysis_completeness(
-                ["a.py"], {"a.py": "code"}, use_llm=True,
-                findings_pre_filter=pre, findings_post_filter=post,
+                ["a.py"],
+                {"a.py": "code"},
+                use_llm=True,
+                findings_pre_filter=pre,
+                findings_post_filter=post,
             )
         assert result["findings_before_filtering"] == 3
         assert result["findings_after_filtering"] == 1
@@ -121,8 +136,11 @@ class TestBuildAnalysisCompleteness:
     def test_empty_components_gives_100_coverage(self) -> None:
         with patch("skillspector.nodes.report.is_llm_available", return_value=(True, None)):
             result = _build_analysis_completeness(
-                [], {}, use_llm=True,
-                findings_pre_filter=[], findings_post_filter=[],
+                [],
+                {},
+                use_llm=True,
+                findings_pre_filter=[],
+                findings_post_filter=[],
             )
         assert result["coverage_percent"] == 100.0
         assert result["total_components"] == 0

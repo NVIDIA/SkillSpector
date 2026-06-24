@@ -217,9 +217,7 @@ class TestOpenAIProvider:
         assert llm.model_name == "gpt-5.4"
         assert llm.max_tokens == 123
 
-    def test_openai_project_id_sets_default_header(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_openai_project_id_sets_default_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
         monkeypatch.setenv("OPENAI_PROJECT_ID", "proj_123")
         llm = OpenAIProvider().create_chat_model("gpt-5.4", max_tokens=123)

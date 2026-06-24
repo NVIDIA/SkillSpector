@@ -17,8 +17,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from skillspector.models import Finding
 from skillspector.nodes.report import _build_sarif
 

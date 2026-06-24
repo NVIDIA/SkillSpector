@@ -492,8 +492,8 @@ class TestContentHashInvalidation:
         rules_v2 = static_yara._load_rules(tmp_path)
         assert rules_v2 is not None
 
-        content_with_a = 'AAAA is here'
-        content_with_b = 'BBBB is here'
+        content_with_a = "AAAA is here"
+        content_with_b = "BBBB is here"
 
         matches_a = rules_v2.match(data=content_with_a.encode())
         matches_b = rules_v2.match(data=content_with_b.encode())

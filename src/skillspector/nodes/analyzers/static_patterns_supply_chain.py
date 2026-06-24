@@ -441,10 +441,10 @@ def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | N
 def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
-    Only PEP 621 ``[project]`` ``dependencies`` / ``optional-dependencies`` and
-    PEP 735 ``[dependency-groups]`` hold real packages. Standard metadata keys
-    (``requires-python``, ``name``, ``version``, ...) are not dependencies and
-    must not be looked up as packages.
+    Reads PEP 621 ``[project]`` ``dependencies`` / ``optional-dependencies``,
+    PEP 735 ``[dependency-groups]``, and ``[build-system].requires``. Standard
+    metadata keys (``requires-python``, ``name``, ``version``, ...) are not
+    dependencies and must not be looked up as packages.
     """
     try:
         data = tomllib.loads(content)
@@ -467,6 +467,11 @@ def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None
         for group in groups.values():
             if isinstance(group, list):
                 specs.extend(d for d in group if isinstance(d, str))
+    build_system = data.get("build-system")
+    if isinstance(build_system, dict):
+        requires = build_system.get("requires")
+        if isinstance(requires, list):
+            specs.extend(d for d in requires if isinstance(d, str))
 
     results: list[tuple[str, str | None, int]] = []
     for spec in specs:

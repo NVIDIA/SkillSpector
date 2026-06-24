@@ -43,19 +43,23 @@ from skillspector.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-ALLOWED_GIT_HOSTS = frozenset({
-    "github.com",
-    "gitlab.com",
-    "bitbucket.org",
-})
+ALLOWED_GIT_HOSTS = frozenset(
+    {
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+    }
+)
 
-ALLOWED_DOWNLOAD_HOSTS = frozenset({
-    "github.com",
-    "raw.githubusercontent.com",
-    "gitlab.com",
-    "bitbucket.org",
-    "huggingface.co",
-})
+ALLOWED_DOWNLOAD_HOSTS = frozenset(
+    {
+        "github.com",
+        "raw.githubusercontent.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "huggingface.co",
+    }
+)
 
 
 def _is_private_ip(host: str) -> bool:
@@ -167,8 +171,7 @@ class InputHandler:
             raise ValueError(f"URL has no valid hostname: {url}")
         if not any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts):
             raise ValueError(
-                f"Host '{host}' is not in the allowed hosts list. "
-                f"Allowed: {sorted(allowed_hosts)}"
+                f"Host '{host}' is not in the allowed hosts list. Allowed: {sorted(allowed_hosts)}"
             )
         if _is_private_ip(host):
             raise ValueError(

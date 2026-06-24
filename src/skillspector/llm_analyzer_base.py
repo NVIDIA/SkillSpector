@@ -87,11 +87,11 @@ class LLMFinding(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
-        """Accept 0-100 scale (e.g. from Ollama) and normalize to [0, 1]."""
-        v = float(v)  # raises TypeError/ValueError for non-numeric inputs
-        if v > 1.0:
+        # Accept 0-100 scale values from some models, then clamp into [0, 1].
+        v = float(v)
+        if v > 2.0:
             v = v / 100.0
-        return max(0.0, min(1.0, v))
+        return min(1.0, max(0.0, v))
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""
@@ -407,6 +407,14 @@ class LLMAnalyzerBase:
         *max_concurrency* LLM requests in parallel.  Both cross-file and
         cross-chunk batches are parallelized in a single gather call.
 
+        Failures are isolated per batch: a transient error (timeout, 429,
+        oversized-chunk 400, ...) costs only its own batch, which is logged
+        and omitted from the result, so one bad call cannot cancel the rest
+        of the fan-out.  Callers can detect partial results by comparing the
+        returned batches against the submitted ones.  ``ValueError`` and
+        ``NotImplementedError`` signal misconfiguration rather than infra
+        trouble and keep propagating.
+
         The return type mirrors :meth:`run_batches`.
         """
         sem = asyncio.Semaphore(max_concurrency)
@@ -427,7 +435,18 @@ class LLMAnalyzerBase:
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 
-        return list(await asyncio.gather(*[_process(b) for b in batches]))
+        results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
+        successful: list[tuple[Batch, list]] = []
+        for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, (ValueError, NotImplementedError)):
+                raise result
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                continue
+            successful.append(result)
+        return successful
 
     # -- Convenience --------------------------------------------------------
 
