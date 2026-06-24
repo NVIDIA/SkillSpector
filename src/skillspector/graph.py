@@ -32,6 +32,7 @@ from skillspector.state import SkillspectorState
 
 logger = get_logger(__name__)
 
+
 def create_graph():
     """Create and compile Skillspector workflow graph."""
     workflow = StateGraph(SkillspectorState)

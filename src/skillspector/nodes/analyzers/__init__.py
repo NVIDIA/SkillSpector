@@ -29,6 +29,7 @@ ANALYZER_NODE_IDS: list[str] = []
 ANALYZER_NODES: dict[str, Any] = {}
 ANALYZER_MODULES: dict[str, Any] = {}
 
+
 def _discover_analyzers() -> None:
     """Dynamically discover and register analyzer modules in this package."""
     if ANALYZER_NODE_IDS:
@@ -55,6 +56,7 @@ def _discover_analyzers() -> None:
             ANALYZER_NODE_IDS.append(analyzer_id)
             ANALYZER_NODES[analyzer_id] = node_func
             ANALYZER_MODULES[analyzer_id] = mod
+
 
 _discover_analyzers()
 
