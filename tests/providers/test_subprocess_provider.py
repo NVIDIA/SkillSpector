@@ -122,3 +122,20 @@ class TestSubprocessProvider:
         p = SubprocessProvider()
         tokens = p.get_max_output_tokens("subprocess")
         assert tokens == 8_192
+
+
+from skillspector.providers import _select_active_provider, create_chat_model
+
+
+class TestSubprocessProviderSelection:
+    def test_select_active_provider_returns_subprocess(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "subprocess")
+        monkeypatch.setenv("SKILLSPECTOR_LLM_COMMAND", "echo hi")
+        provider = _select_active_provider()
+        assert isinstance(provider, SubprocessProvider)
+
+    def test_create_chat_model_uses_subprocess_command(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "subprocess")
+        monkeypatch.setenv("SKILLSPECTOR_LLM_COMMAND", "echo hi")
+        model = create_chat_model("subprocess", max_tokens=512)
+        assert isinstance(model, SubprocessChatModel)
