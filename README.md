@@ -24,6 +24,7 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
 - **Risk scoring**: 0-100 score with severity labels and clear recommendations
+- **Baseline / false-positive suppression**: Accept known findings via a glob-rule or fingerprint baseline so re-scans surface only *new* issues ([docs](docs/SUPPRESSION.md))
 
 ## Quick Start
 
@@ -145,6 +146,26 @@ skillspector scan ./my-skill/ --format markdown --output report.md
 # SARIF output - for CI/CD integration and IDE tooling
 skillspector scan ./my-skill/ --format sarif --output report.sarif
 ```
+
+### Suppressing False Positives (baseline)
+
+Suppress known/accepted findings so the risk score reflects only un-triaged
+issues and re-scans surface only *new* findings. See the
+[suppression guide](docs/SUPPRESSION.md) for the full reference.
+
+```bash
+# Accept all current findings into a baseline (run once), then commit it.
+skillspector baseline ./my-skill/ -o .skillspector-baseline.yaml
+
+# Scan against the baseline — only NEW findings are reported and scored.
+skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml
+
+# Review what was suppressed (still excluded from the score).
+skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml --show-suppressed
+```
+
+A baseline can also use drift-tolerant glob rules (by rule id, file path, or
+message) — see [`.skillspector-baseline.example.yaml`](.skillspector-baseline.example.yaml).
 
 ### LLM Analysis
 
@@ -436,8 +457,14 @@ Options:
   -f, --format [terminal|json|markdown|sarif]  Output format [default: terminal]
   -o, --output PATH                            Output file path
   --no-llm                                     Skip LLM analysis (static only)
+  --yara-rules-dir PATH                        Extra YARA rules directory
+  -b, --baseline PATH                          Suppress findings listed in a baseline
+  --show-suppressed                            List baseline-suppressed findings
   -V, --verbose                                Show detailed progress
   --help                                       Show this message and exit
+
+# Generate a baseline of all current findings (see docs/SUPPRESSION.md)
+skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
 ```
 
 ## Integrating SkillSpector

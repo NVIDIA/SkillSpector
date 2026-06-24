@@ -47,6 +47,14 @@ class SkillspectorState(TypedDict, total=False):
     findings: Annotated[list[Finding], operator.add]
     filtered_findings: list[Finding]
 
+    # Baseline / false-positive suppression. `baseline` is a loaded
+    # skillspector.suppression.Baseline (set by CLI/API); the report node drops
+    # matching findings before scoring. `show_suppressed` keeps them in the
+    # report (marked) for review; `suppressed_findings` is the report output.
+    baseline: object | None
+    show_suppressed: bool
+    suppressed_findings: list[object]
+
     # Model IDs per LLM-using node: e.g. {"default": "...", "meta_analyzer": "..."}
     model_config: dict[str, str]
 

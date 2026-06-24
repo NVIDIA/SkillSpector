@@ -36,6 +36,7 @@ from skillspector import __version__
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
+from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
 
 logger = get_logger(__name__)
 
@@ -92,6 +93,8 @@ def _scan_state(
     format: FormatChoice,
     no_llm: bool,
     yara_rules_dir: str | None = None,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -101,6 +104,10 @@ def _scan_state(
     }
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
+    if baseline is not None:
+        # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
+        state["baseline"] = load_baseline(baseline)
+        state["show_suppressed"] = show_suppressed
     return state
 
 
@@ -180,6 +187,23 @@ def scan(
             help="Scan directories containing multiple skills (immediate subdirectories with SKILL.md) independently.",
         ),
     ] = False,
+    baseline: Annotated[
+        Path | None,
+        typer.Option(
+            "--baseline",
+            "-b",
+            help="Baseline file (YAML/JSON) of suppressed findings. Matching findings "
+            "are dropped before scoring. Generate one with 'skillspector baseline'.",
+        ),
+    ] = None,
+    show_suppressed: Annotated[
+        bool,
+        typer.Option(
+            "--show-suppressed",
+            help="List findings suppressed by the baseline in the report (they still "
+            "do not count toward the risk score).",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -240,7 +264,14 @@ def scan(
     result = None
     try:
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(input_path, format, no_llm, yara_rules_dir=yara_dir)
+        state = _scan_state(
+            input_path,
+            format,
+            no_llm,
+            yara_rules_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+        )
         if verbose:
             console.print("[dim]Running scan...[/dim]")
         logger.debug(
@@ -372,6 +403,83 @@ def _scan_multi_skill(
 
     if max_score > 50:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def baseline(
+    input_path: Annotated[
+        str,
+        typer.Argument(
+            help="Path or URL to scan. Supports: Git URL, file URL, zip file, .md file, or directory.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Where to write the baseline file (YAML; .json extension writes JSON).",
+        ),
+    ] = Path(".skillspector-baseline.yaml"),
+    no_llm: Annotated[
+        bool,
+        typer.Option(
+            "--no-llm",
+            help="Skip LLM analysis when generating the baseline (static analysis only).",
+        ),
+    ] = False,
+    reason: Annotated[
+        str,
+        typer.Option(
+            "--reason",
+            help="Reason recorded for every suppressed finding in the baseline.",
+        ),
+    ] = "Accepted finding (auto-generated baseline)",
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-V", help="Show detailed progress."),
+    ] = False,
+) -> None:
+    """
+    Generate a baseline file that suppresses every finding in the current scan.
+
+    Run this once to accept all existing findings, then commit the file and pass
+    it to future scans with --baseline so only NEW findings are reported.
+
+    Examples:
+
+        skillspector baseline ./my-skill/
+        skillspector baseline ./my-skill/ -o team-baseline.yaml --no-llm
+        skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml
+    """
+    result = None
+    try:
+        if verbose:
+            set_level("DEBUG")
+            console.print("[dim]Scanning to build baseline...[/dim]")
+        # output_format is irrelevant here; we consume findings, not report_body.
+        state = _scan_state(input_path, FormatChoice.json, no_llm)
+        result = graph.invoke(state)
+        findings = result.get("filtered_findings") or result.get("findings") or []
+        data = build_baseline_dict(findings, reason=reason)
+        dump_baseline(data, output)
+        console.print(
+            f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
+        )
+    except typer.Exit:
+        raise
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    except Exception as e:
+        if verbose:
+            console.print_exception()
+        else:
+            console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    finally:
+        if result is not None:
+            _cleanup_result(result)
 
 
 if __name__ == "__main__":

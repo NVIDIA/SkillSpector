@@ -65,6 +65,13 @@ class SarifMessage(BaseModel):
     text: str
 
 
+class SarifSuppression(BaseModel):
+    """SARIF suppression object — marks a result as suppressed (e.g. via a baseline)."""
+
+    kind: Literal["inSource", "external"] = "external"
+    justification: str | None = None
+
+
 class SarifResult(BaseModel):
     """A single analysis result (finding)."""
 
@@ -74,6 +81,9 @@ class SarifResult(BaseModel):
     message: SarifMessage
     level: Literal["error", "warning", "note"] = "warning"
     locations: list[SarifLocation]
+    # When present, the result is suppressed; SARIF consumers (e.g. GitHub code
+    # scanning) exclude suppressed results from counts but keep them for audit.
+    suppressions: list[SarifSuppression] | None = None
 
 
 class SarifReportingDescriptor(BaseModel):
