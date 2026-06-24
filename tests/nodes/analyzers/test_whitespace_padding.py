@@ -60,6 +60,12 @@ class TestIsPaddingChar:
         for ch in ZERO_WIDTH_CHARS:
             assert is_padding_char(ch)
 
+    def test_extra_padding_chars(self):
+        # U+0085 (NEL) and U+180E fall outside Zs/Zl/Zp but must still count so a
+        # horizontal/block run built from them is not a P9 bypass.
+        for ch in ["\x85", "᠎"]:
+            assert is_padding_char(ch)
+
     def test_non_padding(self):
         for ch in "aZ9.#":
             assert not is_padding_char(ch)
@@ -275,9 +281,20 @@ class TestBlockAndRatioSignal:
 
 
 class TestGuards:
-    def test_replacement_char_bails_out(self):
-        content = "x�" + " " * (HORIZONTAL_RUN_CHARS + 10) + "y"
+    def test_high_density_replacement_chars_bail_out(self):
+        # Mostly-U+FFFD content (genuine binary decoded with errors="replace")
+        # is still skipped entirely.
+        content = "�" * 100 + " " * (HORIZONTAL_RUN_CHARS + 10)
         assert detect_whitespace_padding(content) == []
+
+    def test_single_embedded_replacement_char_does_not_suppress(self):
+        # Regression: a lone U+FFFD must NOT disable P9 for the whole file —
+        # otherwise an attacker could drop one in and then pad freely (the
+        # bailout itself becoming the evasion vector). Density stays far below
+        # the threshold, so the horizontal pad is still reported.
+        content = "x�" + " " * (HORIZONTAL_RUN_CHARS + 10) + "y"
+        runs = detect_whitespace_padding(content)
+        assert "horizontal" in _kinds(runs)
 
     def test_markdown_fence_skips_horizontal(self):
         inner = "x" + " " * HORIZONTAL_RUN_CHARS + "y"
@@ -310,6 +327,14 @@ class TestUnicodeEvasionEndToEnd:
             content = "header\n" + ((blank + "\n") * VERTICAL_BLANK_LINES) + "INJECT"
             runs = detect_whitespace_padding(content)
             assert "vertical" in _kinds(runs), f"failed for U+{ord(ch):04X}"
+
+    def test_mongolian_vowel_separator_horizontal_run(self):
+        # U+180E is category Cf and not a line separator, so before it was added
+        # to the padding set an in-line run of it slipped past the horizontal
+        # signal. Lock in that a 100-char run is now detected.
+        content = "x" + "᠎" * (HORIZONTAL_RUN_CHARS + 20) + "INJECT"
+        runs = detect_whitespace_padding(content)
+        assert _kinds(runs) & {"horizontal", "block"}
 
 
 # Every padding character enumerated in issue #20's evasion list. Each must cross
