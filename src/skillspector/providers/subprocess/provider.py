@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
+import subprocess  # nosec B404 — subprocess is the intentional mechanism for this provider
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +69,7 @@ def _augment_messages_with_json_instruction(
     augmented: list[BaseMessage] = []
     for i, msg in enumerate(messages):
         if i == len(messages) - 1 and isinstance(msg, HumanMessage):
-            augmented.append(HumanMessage(content=msg.content + instruction))
+            augmented.append(HumanMessage(content=str(msg.content) + instruction))
         else:
             augmented.append(msg)
     return augmented
@@ -135,17 +135,17 @@ class SubprocessChatModel(BaseChatModel):
     def _call_subprocess(self, prompt: str) -> str:
         args = shlex.split(self.command, posix=(os.name != "nt"))
         try:
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603 — shell=False (the safe default); args is shlex-split, not user-controlled shell input
                 args,
                 input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
                 f"LLM subprocess timed out after {self.timeout}s (command: {self.command!r})"
-            )
+            ) from exc
         if result.returncode != 0:
             raise RuntimeError(
                 f"LLM subprocess failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -173,7 +173,7 @@ class SubprocessChatModel(BaseChatModel):
 
             def inject_and_parse_dict(messages: list[BaseMessage]) -> Any:
                 augmented = _augment_messages_with_json_instruction(messages, schema_str)
-                raw_text = self.invoke(augmented).content
+                raw_text = str(self.invoke(augmented).content)
                 clean = _strip_fences(raw_text)
                 return json.loads(clean)
 
@@ -183,7 +183,7 @@ class SubprocessChatModel(BaseChatModel):
 
             def inject_and_parse(messages: list[BaseMessage]) -> BaseModel:
                 augmented = _augment_messages_with_json_instruction(messages, schema_str)
-                raw_text = self.invoke(augmented).content
+                raw_text = str(self.invoke(augmented).content)
                 clean = _strip_fences(raw_text)
                 return schema.model_validate_json(clean)
 
@@ -238,13 +238,16 @@ class SubprocessProvider:
         return SubprocessChatModel(command=command, timeout=timeout or 120.0)
 
     def get_context_length(self, model: str) -> int | None:
+        """Return context window size for the given model identifier."""
         stored = registry.lookup_context_length(REGISTRY_PATH, model)
         return stored if stored is not None else _DEFAULT_CONTEXT_LENGTH
 
     def get_max_output_tokens(self, model: str) -> int | None:
+        """Return maximum output tokens for the given model identifier."""
         stored = registry.lookup_max_output_tokens(REGISTRY_PATH, model)
         return stored if stored is not None else _DEFAULT_MAX_OUTPUT_TOKENS
 
     def resolve_model(self, slot: str = "default") -> str:
+        """Resolve model name from SKILLSPECTOR_MODEL env var or sentinel default."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or _SENTINEL_MODEL

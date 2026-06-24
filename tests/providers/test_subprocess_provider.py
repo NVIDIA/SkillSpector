@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import subprocess as sp
 from unittest.mock import MagicMock, patch
 
@@ -38,7 +36,7 @@ class TestSubprocessChatModelGenerate:
                 SystemMessage(content="You are a security analyst."),
                 HumanMessage(content="Review this file."),
             ]
-            result = model.invoke(messages)
+            model.invoke(messages)
 
         assert len(captured) == 1
         assert "You are a security analyst." in captured[0]
@@ -147,14 +145,17 @@ class TestSubprocessProviderSelection:
 
 class TestHelperFunctions:
     def test_strip_fences_removes_markdown(self):
+        """Test that markdown code fences are stripped from response text."""
         text = "```json\n{\"key\": \"value\"}\n```"
         assert _strip_fences(text) == '{"key": "value"}'
 
     def test_strip_fences_passthrough_plain(self):
+        """Test that plain JSON passes through unchanged."""
         text = '{"key": "value"}'
         assert _strip_fences(text) == '{"key": "value"}'
 
     def test_augment_messages_appends_to_last_human(self):
+        """Test that JSON schema instruction is appended to the last HumanMessage."""
         msgs = [
             SystemMessage(content="sys"),
             HumanMessage(content="ask"),
@@ -163,3 +164,100 @@ class TestHelperFunctions:
         assert isinstance(augmented[-1], HumanMessage)
         assert "JSON Schema" in augmented[-1].content
         assert augmented[0].content == "sys"
+
+
+class TestFormatMessages:
+    """Tests for _format_messages covering all message type branches."""
+
+    def test_ai_message_renders_as_assistant_tag(self):
+        """Test that AIMessage content is wrapped in assistant tags."""
+        from skillspector.providers.subprocess.provider import _format_messages
+
+        msgs = [AIMessage(content="I am the assistant.")]
+        result = _format_messages(msgs)
+        assert "<assistant>" in result
+        assert "I am the assistant." in result
+
+    def test_fallback_string_content_renders_as_str(self):
+        """Test that unknown message types with string content are rendered."""
+        from langchain_core.messages import ChatMessage
+
+        from skillspector.providers.subprocess.provider import _format_messages
+
+        msgs = [ChatMessage(content="raw text", role="custom")]
+        result = _format_messages(msgs)
+        assert "raw text" in result
+
+    def test_fallback_list_content_extracts_str_items(self):
+        """Test that list content with string items is joined correctly."""
+        from langchain_core.messages import ChatMessage
+
+        from skillspector.providers.subprocess.provider import _format_messages
+
+        msgs = [ChatMessage(content=["part one", "part two"], role="custom")]
+        result = _format_messages(msgs)
+        assert "part one" in result
+        assert "part two" in result
+
+    def test_fallback_list_content_extracts_dict_text_key(self):
+        """Test that list content with dict items extracts the 'text' key."""
+        from langchain_core.messages import ChatMessage
+
+        from skillspector.providers.subprocess.provider import _format_messages
+
+        msgs = [ChatMessage(content=[{"type": "text", "text": "hello"}], role="custom")]
+        result = _format_messages(msgs)
+        assert "hello" in result
+
+
+class TestWithStructuredOutput:
+    """Tests for SubprocessChatModel.with_structured_output paths."""
+
+    def test_pydantic_schema_path_parses_json_response(self):
+        """Test that a Pydantic BaseModel schema returns a validated model instance."""
+        from pydantic import BaseModel as PydanticModel
+
+        class MySchema(PydanticModel):
+            value: str
+
+        model = _model()
+        runnable = model.with_structured_output(MySchema)
+
+        with patch.object(model, "_call_subprocess", return_value='{"value": "ok"}'):
+            result = runnable.invoke([HumanMessage(content="test")])
+
+        assert isinstance(result, MySchema)
+        assert result.value == "ok"
+
+    def test_dict_schema_path_returns_parsed_dict(self):
+        """Test that a dict JSON Schema returns a parsed Python dict."""
+        model = _model()
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        runnable = model.with_structured_output(schema)
+
+        with patch.object(model, "_call_subprocess", return_value='{"x": 42}'):
+            result = runnable.invoke([HumanMessage(content="test")])
+
+        assert result == {"x": 42}
+
+    def test_invalid_schema_type_raises_type_error(self):
+        """Test that an unsupported schema type raises TypeError."""
+        model = _model()
+        with pytest.raises(TypeError, match="requires a Pydantic BaseModel"):
+            model.with_structured_output("not-a-schema")  # type: ignore[arg-type]
+
+    def test_pydantic_path_strips_markdown_fences(self):
+        """Test that markdown fences in the response are stripped before parsing."""
+        from pydantic import BaseModel as PydanticModel
+
+        class MySchema(PydanticModel):
+            value: str
+
+        model = _model()
+        runnable = model.with_structured_output(MySchema)
+        fenced = '```json\n{"value": "fenced"}\n```'
+
+        with patch.object(model, "_call_subprocess", return_value=fenced):
+            result = runnable.invoke([HumanMessage(content="test")])
+
+        assert result.value == "fenced"
