@@ -44,6 +44,15 @@ ZERO_WIDTH_CHARS = frozenset("​‌‍⁠﻿")
 # vertical tab, form feed.
 _ASCII_CONTROL_PADDING = frozenset("\t\n\r\v\f")
 
+# Non-ASCII characters that render as (or were historically classified as)
+# whitespace but fall outside the Zs/Zl/Zp categories, so unicodedata.category
+# alone would miss them:
+#   U+0085 NEXT LINE (NEL)            — category Cc; splits lines, but a *horizontal*
+#                                       or block run built from it must still count.
+#   U+180E MONGOLIAN VOWEL SEPARATOR  — category Cf today (was Zs pre-Unicode 6.3).
+# Listed explicitly so padding runs built from them are not a P9 bypass (issue #20).
+_EXTRA_PADDING_CHARS = frozenset("\x85᠎")
+
 # Threshold constants (module-level so tuning is a one-line change).
 VERTICAL_BLANK_LINES = 20
 VERTICAL_HIGH_SEVERITY_LINES = 40
@@ -52,9 +61,12 @@ BLOCK_BYTE_BUDGET = 2048
 RATIO_THRESHOLD = 0.90
 RATIO_MIN_FILE_BYTES = 4096
 
-# Replacement character emitted by errors="replace" decoding; its presence marks
-# binary-ish content, which we bail out of entirely.
+# Replacement character emitted by errors="replace" decoding; a high *density* of
+# it marks binary-ish content, which we bail out of entirely. We key on density
+# rather than mere presence so a single embedded U+FFFD cannot disable P9 for an
+# otherwise-textual file (which would itself be a trivial bypass of this rule).
 _REPLACEMENT_CHAR = "�"
+_REPLACEMENT_CHAR_DENSITY_THRESHOLD = 0.30
 
 # Markdown fenced-code delimiter (``` or ~~~ with optional leading indentation).
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -74,10 +86,15 @@ def is_padding_char(ch: str) -> bool:
     """Return True when *ch* is a whitespace/padding character.
 
     Covers ASCII controls (``\\t \\n \\r \\v \\f``), Unicode whitespace categories
-    ``Zs``/``Zl``/``Zp`` (e.g. U+00A0, U+2028, U+2029, U+3000), and the zero-width
-    family (which is category ``Cf``/``Bn`` and so must be listed explicitly).
+    ``Zs``/``Zl``/``Zp`` (e.g. U+00A0, U+2028, U+2029, U+3000), the zero-width
+    family (category ``Cf``/``Bn``, listed explicitly), and the extra padding
+    chars U+0085/U+180E (see ``_EXTRA_PADDING_CHARS``).
     """
-    if ch in _ASCII_CONTROL_PADDING or ch in ZERO_WIDTH_CHARS:
+    # ASCII fast-path: the only padding code points below U+0080 are the five
+    # control chars and the space, so the common case skips unicodedata entirely.
+    if ord(ch) < 0x80:
+        return ch == " " or ch in _ASCII_CONTROL_PADDING
+    if ch in ZERO_WIDTH_CHARS or ch in _EXTRA_PADDING_CHARS:
         return True
     return unicodedata.category(ch) in ("Zs", "Zl", "Zp")
 
@@ -370,8 +387,10 @@ def detect_whitespace_padding(
        >``RATIO_THRESHOLD`` whitespace ratio for files over ``RATIO_MIN_FILE_BYTES``.
 
     Guards:
-    - Bails out entirely (returns ``[]``) when *content* contains U+FFFD
-      (binary-ish content).
+    - Bails out entirely (returns ``[]``) when the U+FFFD density of *content*
+      exceeds ``_REPLACEMENT_CHAR_DENSITY_THRESHOLD`` (binary-ish content). Keying
+      on density rather than mere presence means a single embedded U+FFFD cannot
+      suppress detection for an otherwise-textual file.
     - For ``file_type == "markdown"``, horizontal runs inside ``` fenced regions
       are skipped.
 
@@ -380,7 +399,10 @@ def detect_whitespace_padding(
       "vertical" or "horizontal" run are suppressed. A single large whitespace
       span therefore yields ONE finding (the vertical/horizontal one), not three.
     """
-    if not content or _REPLACEMENT_CHAR in content:
+    if not content:
+        return []
+    replacement_count = content.count(_REPLACEMENT_CHAR)
+    if replacement_count / len(content) > _REPLACEMENT_CHAR_DENSITY_THRESHOLD:
         return []
 
     lines, line_offsets = _split_lines(content)
