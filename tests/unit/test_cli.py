@@ -178,3 +178,53 @@ def test_cli_recursive_forwards_baseline_and_show_suppressed(
     for state in captured:
         assert "baseline" in state  # the baseline was loaded and threaded in
         assert state.get("show_suppressed") is True
+
+
+def test_cli_recursive_json_finding_count_excludes_suppressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The combined JSON report must count post-suppression findings, not raw ones.
+
+    Regression for the empty-filtered-list fallback: when baseline suppression
+    empties ``filtered_findings``, ``filtered or findings`` falls through to the
+    unfiltered ``findings`` and over-reports finding_count. A fully-suppressed
+    sub-skill (score 0, filtered_findings == []) must report finding_count 0.
+    """
+    import skillspector.cli as cli_mod
+
+    collection = tmp_path / "collection"
+    for name in ("alpha", "beta"):
+        sub = collection / name
+        sub.mkdir(parents=True)
+        (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n", encoding="utf-8")
+
+    def fake_invoke(state: dict[str, object], config: object = None) -> dict[str, object]:
+        # Three raw findings, all suppressed (empty filtered set, score 0).
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "findings": ["raw1", "raw2", "raw3"],
+            "filtered_findings": [],
+            "report_body": "{}",
+        }
+
+    monkeypatch.setattr(cli_mod.graph, "invoke", fake_invoke)
+
+    out_file = tmp_path / "combined.json"
+    scan = runner.invoke(
+        app,
+        [
+            "scan",
+            str(collection),
+            "--recursive",
+            "--no-llm",
+            "--format",
+            "json",
+            "--output",
+            str(out_file),
+        ],
+    )
+
+    assert scan.exit_code == 0
+    data = json.loads(out_file.read_text())
+    assert [s["finding_count"] for s in data["skills"]] == [0, 0]

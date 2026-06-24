@@ -365,6 +365,21 @@ def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> 
     }
 
 
+def _result_finding_count(result: dict[str, object]) -> int:
+    """Count post-suppression findings, treating an empty filtered list as zero.
+
+    The report node always sets ``filtered_findings`` (possibly empty after
+    baseline suppression), so fall back to the raw ``findings`` only when the
+    filtered key is genuinely absent. A plain ``filtered or findings`` miscounts a
+    fully-suppressed skill, since an empty list is falsy and the ``or`` then
+    reports the unfiltered findings.
+    """
+    filtered = result.get("filtered_findings")
+    if filtered is None:
+        filtered = result.get("findings")
+    return len(filtered) if isinstance(filtered, list) else 0
+
+
 def _scan_multi_skill(
     detection: MultiSkillDetectionResult,
     format: FormatChoice,
@@ -419,8 +434,7 @@ def _scan_multi_skill(
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        finding_count = _result_finding_count(result)
         console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
 
     console.print("")
@@ -442,9 +456,7 @@ def _scan_multi_skill(
                         "path": skill.relative_path,
                         "risk_score": result.get("risk_score", 0),
                         "risk_severity": result.get("risk_severity", "LOW"),
-                        "finding_count": len(
-                            result.get("filtered_findings") or result.get("findings") or []
-                        ),
+                        "finding_count": _result_finding_count(result),
                     }
                 )
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
