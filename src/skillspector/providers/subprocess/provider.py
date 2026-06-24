@@ -60,7 +60,12 @@ def _format_messages(messages: list[BaseMessage]) -> str:
         elif isinstance(msg, AIMessage):
             parts.append(f"<assistant>\n{msg.content}\n</assistant>")
         else:
-            parts.append(str(msg.content))
+            content = msg.content
+            if isinstance(content, list):
+                text_parts = [item if isinstance(item, str) else "" for item in content]
+                parts.append("\n".join(p for p in text_parts if p))
+            else:
+                parts.append(str(content))
     return "\n\n".join(parts)
 
 
@@ -85,7 +90,7 @@ class SubprocessChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         prompt = _format_messages(messages)
-        text = self._call_subprocess(prompt).strip()
+        text = self._call_subprocess(prompt)
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
 
     def _call_subprocess(self, prompt: str) -> str:
@@ -103,9 +108,9 @@ class SubprocessChatModel(BaseChatModel):
             )
         return result.stdout.strip()
 
-    def with_structured_output(  # type: ignore[override]
+    def with_structured_output(
         self,
-        schema: type[BaseModel],
+        schema: type | dict[str, Any],
         *,
         include_raw: bool = False,
         **kwargs: Any,
@@ -118,6 +123,10 @@ class SubprocessChatModel(BaseChatModel):
         2. Calling _generate() normally.
         3. Parsing the JSON from the response with Pydantic.
         """
+        if not (isinstance(schema, type) and issubclass(schema, BaseModel)):
+            raise TypeError(
+                "SubprocessChatModel.with_structured_output requires a Pydantic BaseModel subclass."
+            )
         json_schema = schema.model_json_schema()
         schema_str = json.dumps(json_schema, indent=2)
         instruction = (

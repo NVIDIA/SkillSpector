@@ -38,7 +38,7 @@ class TestSubprocessChatModelGenerate:
 
     def test_returns_ai_message_with_subprocess_output(self):
         model = _model()
-        with patch.object(model, "_call_subprocess", return_value="  hello world  "):
+        with patch.object(model, "_call_subprocess", return_value="hello world"):
             result = model.invoke([HumanMessage(content="hi")])
 
         assert isinstance(result, AIMessage)
@@ -57,8 +57,6 @@ class TestSubprocessChatModelGenerate:
                 model.invoke([HumanMessage(content="hi")])
 
     def test_passes_full_prompt_to_stdin(self):
-        import subprocess as sp
-
         model = _model(command="cat -")  # echoes stdin
         prompt_seen: list[str] = []
 
