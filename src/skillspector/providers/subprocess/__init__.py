@@ -15,6 +15,6 @@
 
 """Subprocess LLM provider — routes prompts through a configured shell command."""
 
-from .provider import SubprocessChatModel
+from .provider import SubprocessChatModel, SubprocessProvider
 
-__all__ = ["SubprocessChatModel"]
+__all__ = ["SubprocessChatModel", "SubprocessProvider"]

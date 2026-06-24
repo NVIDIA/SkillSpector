@@ -35,8 +35,10 @@ subprocess calls).
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
@@ -46,7 +48,13 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable, RunnableLambda
 from pydantic import BaseModel, Field
 
+from skillspector.providers import registry
+
 _DEFAULT_TIMEOUT = 120.0
+_DEFAULT_CONTEXT_LENGTH = 200_000
+_DEFAULT_MAX_OUTPUT_TOKENS = 8_192
+_SENTINEL_MODEL = "subprocess"
+REGISTRY_PATH = str(Path(__file__).parent / "model_registry.yaml")
 
 
 def _format_messages(messages: list[BaseMessage]) -> str:
@@ -149,3 +157,49 @@ class SubprocessChatModel(BaseChatModel):
             return schema.model_validate_json(clean)
 
         return RunnableLambda(inject_and_parse)
+
+
+class SubprocessProvider:
+    """LLM provider that routes calls through a configurable shell command.
+
+    Required environment variables
+    --------------------------------
+    SKILLSPECTOR_PROVIDER=subprocess
+    SKILLSPECTOR_LLM_COMMAND=<shell command>
+        e.g.  claude -p
+              antigravity ask
+              openclaw chat
+        The prompt is written to the command's stdin.
+    """
+
+    def resolve_credentials(self) -> tuple[str, str | None] | None:
+        """Return a sentinel tuple when SKILLSPECTOR_LLM_COMMAND is set, else None."""
+        command = os.environ.get("SKILLSPECTOR_LLM_COMMAND", "").strip()
+        if not command:
+            return None
+        return ("subprocess", None)
+
+    def create_chat_model(
+        self,
+        model: str,
+        *,
+        max_tokens: int,
+        timeout: float | None = 120,
+    ) -> SubprocessChatModel | None:
+        """Return a SubprocessChatModel using the configured command, or None."""
+        command = os.environ.get("SKILLSPECTOR_LLM_COMMAND", "").strip()
+        if not command:
+            return None
+        return SubprocessChatModel(command=command, timeout=timeout or 120.0)
+
+    def get_context_length(self, model: str) -> int | None:
+        stored = registry.lookup_context_length(REGISTRY_PATH, model)
+        return stored if stored is not None else _DEFAULT_CONTEXT_LENGTH
+
+    def get_max_output_tokens(self, model: str) -> int | None:
+        stored = registry.lookup_max_output_tokens(REGISTRY_PATH, model)
+        return stored if stored is not None else _DEFAULT_MAX_OUTPUT_TOKENS
+
+    def resolve_model(self, slot: str = "default") -> str:
+        user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
+        return user_input or _SENTINEL_MODEL

@@ -71,3 +71,54 @@ class TestSubprocessChatModelGenerate:
             model.invoke([HumanMessage(content="test prompt")])
 
         assert "test prompt" in prompt_seen[0]
+
+
+import os
+from unittest.mock import patch
+
+from skillspector.providers.subprocess.provider import SubprocessProvider
+
+
+class TestSubprocessProvider:
+    def test_resolve_credentials_returns_command_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_LLM_COMMAND", "claude -p")
+        p = SubprocessProvider()
+        creds = p.resolve_credentials()
+        assert creds == ("subprocess", None)
+
+    def test_resolve_credentials_returns_none_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("SKILLSPECTOR_LLM_COMMAND", raising=False)
+        p = SubprocessProvider()
+        assert p.resolve_credentials() is None
+
+    def test_create_chat_model_returns_subprocess_model(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_LLM_COMMAND", "cat -")
+        p = SubprocessProvider()
+        model = p.create_chat_model("subprocess", max_tokens=512, timeout=30.0)
+        assert isinstance(model, SubprocessChatModel)
+        assert model.command == "cat -"
+
+    def test_create_chat_model_returns_none_when_no_command(self, monkeypatch):
+        monkeypatch.delenv("SKILLSPECTOR_LLM_COMMAND", raising=False)
+        p = SubprocessProvider()
+        assert p.create_chat_model("subprocess", max_tokens=512) is None
+
+    def test_resolve_model_returns_skillspector_model_env(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "my-local-model")
+        p = SubprocessProvider()
+        assert p.resolve_model() == "my-local-model"
+
+    def test_resolve_model_falls_back_to_sentinel(self, monkeypatch):
+        monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
+        p = SubprocessProvider()
+        assert p.resolve_model() == "subprocess"
+
+    def test_get_context_length_returns_default(self):
+        p = SubprocessProvider()
+        length = p.get_context_length("subprocess")
+        assert length == 200_000
+
+    def test_get_max_output_tokens_returns_default(self):
+        p = SubprocessProvider()
+        tokens = p.get_max_output_tokens("subprocess")
+        assert tokens == 8_192
