@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 
 from skillspector.logging_config import get_logger
@@ -65,6 +66,63 @@ def _infer_file_type(path: str) -> str:
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
+
+
+_BINARY_EXTENSIONS = frozenset({
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a",
+    ".pyc", ".pyo", ".class", ".wasm",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".webm",
+    ".sqlite", ".db",
+})
+
+_NULL_BYTE_SAMPLE_SIZE = 512
+
+
+def _is_binary_file(path: str, content: str) -> bool:
+    """Detect binary files by extension or null-byte presence in the first 512 chars."""
+    idx = path.rfind(".")
+    if idx >= 0 and path[idx:].lower() in _BINARY_EXTENSIONS:
+        return True
+    return "\x00" in content[:_NULL_BYTE_SAMPLE_SIZE]
+
+
+_PE3_ENV_REFERENCE_CONTEXT = re.compile(
+    r"(?:create|copy|rename|add|set up|configure|make)\s+.*\.env",
+    re.IGNORECASE,
+)
+
+
+def _is_env_file_reference_in_docs(finding: AnalyzerFinding, file_type: str, file_path: str = "") -> bool:
+    """Return True if a PE3 finding is a documentation reference to .env files, not actual access.
+
+    SKILL.md is exempt: it is the agent's primary instruction file, so `.env`
+    references there may be genuine credential-access instructions.
+    """
+    if finding.rule_id != "PE3":
+        return False
+    if file_type not in ("markdown", "text"):
+        return False
+    if file_path.replace("\\", "/").lower().endswith("skill.md"):
+        return False
+    if not finding.context:
+        return False
+    if _PE3_ENV_REFERENCE_CONTEXT.search(finding.context):
+        return True
+    ctx_lower = finding.context.lower()
+    doc_phrases = (
+        ".env.example",
+        "cp .env",
+        "copy .env",
+        "mv .env",
+        "rename .env",
+        ".env file",
+        "environment file",
+        "dotenv",
+    )
+    return any(phrase in ctx_lower for phrase in doc_phrases)
 
 
 def _is_eval_dataset(path: str) -> bool:
@@ -160,12 +218,21 @@ def run_static_patterns(
                 MAX_FILE_BYTES,
             )
             continue
+        if _is_binary_file(path, content):
+            logger.debug("Skipping binary file: %s", path)
+            continue
         file_type = _infer_file_type(path)
         is_doc_markdown = _is_documentation_markdown(path)
         is_non_executable = file_type in _NON_EXECUTABLE_FILE_TYPES
         for module in pattern_modules:
             raw = module.analyze(content=content, file_path=path, file_type=file_type)
             for af in raw:
+                if _is_env_file_reference_in_docs(af, file_type, path):
+                    logger.debug(
+                        "Filtered PE3 .env doc reference: %s in %s:%d",
+                        af.rule_id, path, af.location.start_line,
+                    )
+                    continue
                 if af.context and is_code_example(af.context):
                     if is_non_executable:
                         logger.debug(

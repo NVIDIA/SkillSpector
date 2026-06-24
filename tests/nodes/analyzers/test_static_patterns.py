@@ -333,6 +333,115 @@ class TestRunStaticPatternsAgentSnooping:
         assert any(f.rule_id == "AS1" for f in result["findings"])
 
 
+class TestRunStaticPatternsPrivilegeEscalationPE4:
+    """run_static_patterns with privilege_escalation: PE4 (Docker socket access)."""
+
+    def test_pe4_docker_sock_path_produces_finding(self):
+        """Direct reference to /var/run/docker.sock yields PE4 (HIGH)."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": 'client = docker.DockerClient(base_url="unix:///var/run/docker.sock")\n',
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe4 = [f for f in findings if f.rule_id == "PE4"]
+        assert len(pe4) >= 1
+        assert pe4[0].severity == "HIGH"
+        assert pe4[0].file == "skill.py"
+        assert pe4[0].start_line >= 1
+        assert pe4[0].remediation is not None
+        assert pe4[0].context is not None
+        assert pe4[0].matched_text is not None
+
+    def test_pe4_combined_line_produces_exactly_one_finding(self):
+        """A line matching multiple PE4 patterns must produce exactly one PE4 finding."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": 'client = docker.DockerClient(base_url="unix:///var/run/docker.sock")\n',
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe4 = [f for f in findings if f.rule_id == "PE4"]
+        assert len(pe4) == 1, (
+            f"Expected 1 PE4 finding, got {len(pe4)}: {[f.matched_text for f in pe4]}"
+        )
+        assert (
+            pe4[0].confidence == 0.9
+        )  # /var/run/docker.sock has higher confidence than DockerClient(
+
+    def test_pe4_docker_from_env_produces_finding(self):
+        """docker.from_env() yields PE4 (HIGH)."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "import docker\nclient = docker.from_env()\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe4 = [f for f in findings if f.rule_id == "PE4"]
+        assert len(pe4) >= 1
+        assert pe4[0].severity == "HIGH"
+
+    def test_pe4_docker_client_constructor_produces_finding(self):
+        """DockerClient( instantiation yields PE4 (HIGH)."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "from docker import DockerClient\nclient = DockerClient(base_url='tcp://...')\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert any(f.rule_id == "PE4" for f in findings)
+
+    def test_pe4_http_unix_socket_produces_finding(self):
+        """http+unix:// reference to docker.sock yields PE4 (HIGH)."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": 'url = "http+unix://%2Fvar%2Frun%2Fdocker.sock/containers/json"\n',
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert any(f.rule_id == "PE4" for f in findings)
+
+    def test_pe4_safe_docker_subprocess_not_flagged(self):
+        """subprocess call to docker CLI without socket reference produces no PE4."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['docker', 'ps', '--format', 'json'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert not any(f.rule_id == "PE4" for f in findings)
+
+    def test_pe4_documentation_example_not_flagged(self):
+        """docker.from_env() inside a markdown code block is filtered as documentation."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": (
+                    "# Docker SDK\n\nFor example:\n```python\nclient = docker.from_env()\n```\n"
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert not any(f.rule_id == "PE4" for f in findings)
+
+    def test_pe4_node_runs_over_state(self):
+        """The node entrypoint runs PE4 detection over state and returns findings."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "client = docker.from_env()\n",
+            },
+        }
+        result = privilege_escalation_module.node(state)
+        assert any(f.rule_id == "PE4" for f in result["findings"])
+
+
 class TestRunStaticPatternsSSRF:
     """run_static_patterns with ssrf: SSRF1, SSRF2, SSRF3."""
 
