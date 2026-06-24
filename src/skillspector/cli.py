@@ -277,7 +277,16 @@ def scan(
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
-            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
+            _scan_multi_skill(
+                detection,
+                format,
+                output,
+                no_llm,
+                yara_rules_dir,
+                verbose,
+                baseline=baseline,
+                show_suppressed=show_suppressed,
+            )
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
             console.print(
@@ -359,6 +368,8 @@ def _scan_multi_skill(
     no_llm: bool,
     yara_rules_dir: Path | None,
     verbose: bool,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     skills = detection.skills
@@ -372,7 +383,14 @@ def _scan_multi_skill(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(str(skill.path), format, no_llm, yara_rules_dir=yara_dir)
+        state = _scan_state(
+            str(skill.path),
+            format,
+            no_llm,
+            yara_rules_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+        )
         trace_config = _build_trace_config(str(skill.path), format, no_llm)
 
         try:
