@@ -181,6 +181,7 @@ inference gateways.
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
+| `subprocess` | `SKILLSPECTOR_LLM_COMMAND` (shell command) | User-configured CLI (e.g. `claude -p`) | N/A — depends on command |
 
 ```bash
 # Stock OpenAI
@@ -214,6 +215,11 @@ skillspector scan ./my-skill/
 
 # Override the provider's default model
 export SKILLSPECTOR_MODEL=gpt-5.2
+skillspector scan ./my-skill/
+
+# Inside Claude Code, OpenClaw, or Antigravity — no API key needed
+export SKILLSPECTOR_PROVIDER=subprocess
+export SKILLSPECTOR_LLM_COMMAND="claude -p"   # or: antigravity ask / openclaw chat
 skillspector scan ./my-skill/
 
 # Skip LLM analysis (faster, static analysis only)
@@ -478,7 +484,8 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, or `nv_build`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `nv_build`, or `subprocess`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_LLM_COMMAND` | Shell command for `SKILLSPECTOR_PROVIDER=subprocess`. The prompt is written to stdin; the response is read from stdout. No API key required — use the AI session directly (e.g. `claude -p`, `antigravity ask`, `openclaw chat`). | Required when `SKILLSPECTOR_PROVIDER=subprocess` |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
