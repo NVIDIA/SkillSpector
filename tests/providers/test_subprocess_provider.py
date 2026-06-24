@@ -4,12 +4,20 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess as sp
 from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from skillspector.providers.subprocess.provider import SubprocessChatModel
+from skillspector.providers import _select_active_provider, create_chat_model
+from skillspector.providers.subprocess.provider import (
+    SubprocessChatModel,
+    SubprocessProvider,
+    _augment_messages_with_json_instruction,
+    _strip_fences,
+)
 
 
 def _model(command: str = "echo") -> SubprocessChatModel:
@@ -45,8 +53,6 @@ class TestSubprocessChatModelGenerate:
         assert result.content == "hello world"
 
     def test_raises_on_nonzero_exit(self):
-        import subprocess
-
         model = _model(command="false")  # always exits 1
         fake_result = MagicMock()
         fake_result.returncode = 1
@@ -72,11 +78,11 @@ class TestSubprocessChatModelGenerate:
 
         assert "test prompt" in prompt_seen[0]
 
-
-import os
-from unittest.mock import patch
-
-from skillspector.providers.subprocess.provider import SubprocessProvider
+    def test_raises_on_timeout(self):
+        model = _model()
+        with patch("subprocess.run", side_effect=sp.TimeoutExpired(cmd="echo", timeout=120)):
+            with pytest.raises(RuntimeError, match="timed out"):
+                model.invoke([HumanMessage(content="hi")])
 
 
 class TestSubprocessProvider:
@@ -98,10 +104,11 @@ class TestSubprocessProvider:
         assert isinstance(model, SubprocessChatModel)
         assert model.command == "cat -"
 
-    def test_create_chat_model_returns_none_when_no_command(self, monkeypatch):
+    def test_create_chat_model_raises_when_no_command(self, monkeypatch):
         monkeypatch.delenv("SKILLSPECTOR_LLM_COMMAND", raising=False)
         p = SubprocessProvider()
-        assert p.create_chat_model("subprocess", max_tokens=512) is None
+        with pytest.raises(ValueError, match="SKILLSPECTOR_LLM_COMMAND"):
+            p.create_chat_model("subprocess", max_tokens=512)
 
     def test_resolve_model_returns_skillspector_model_env(self, monkeypatch):
         monkeypatch.setenv("SKILLSPECTOR_MODEL", "my-local-model")
@@ -124,9 +131,6 @@ class TestSubprocessProvider:
         assert tokens == 8_192
 
 
-from skillspector.providers import _select_active_provider, create_chat_model
-
-
 class TestSubprocessProviderSelection:
     def test_select_active_provider_returns_subprocess(self, monkeypatch):
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "subprocess")
@@ -139,3 +143,23 @@ class TestSubprocessProviderSelection:
         monkeypatch.setenv("SKILLSPECTOR_LLM_COMMAND", "echo hi")
         model = create_chat_model("subprocess", max_tokens=512)
         assert isinstance(model, SubprocessChatModel)
+
+
+class TestHelperFunctions:
+    def test_strip_fences_removes_markdown(self):
+        text = "```json\n{\"key\": \"value\"}\n```"
+        assert _strip_fences(text) == '{"key": "value"}'
+
+    def test_strip_fences_passthrough_plain(self):
+        text = '{"key": "value"}'
+        assert _strip_fences(text) == '{"key": "value"}'
+
+    def test_augment_messages_appends_to_last_human(self):
+        msgs = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="ask"),
+        ]
+        augmented = _augment_messages_with_json_instruction(msgs, '{"type": "object"}')
+        assert isinstance(augmented[-1], HumanMessage)
+        assert "JSON Schema" in augmented[-1].content
+        assert augmented[0].content == "sys"

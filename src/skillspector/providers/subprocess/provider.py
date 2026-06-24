@@ -57,6 +57,32 @@ _SENTINEL_MODEL = "subprocess"
 REGISTRY_PATH = str(Path(__file__).parent / "model_registry.yaml")
 
 
+def _augment_messages_with_json_instruction(
+    messages: list[BaseMessage], schema_str: str
+) -> list[BaseMessage]:
+    """Append JSON schema instruction to the last HumanMessage."""
+    instruction = (
+        "\n\n---\nRespond with a single valid JSON object that conforms to "
+        "this JSON Schema (no markdown fences, no explanation, only JSON):\n"
+        f"{schema_str}"
+    )
+    augmented: list[BaseMessage] = []
+    for i, msg in enumerate(messages):
+        if i == len(messages) - 1 and isinstance(msg, HumanMessage):
+            augmented.append(HumanMessage(content=msg.content + instruction))
+        else:
+            augmented.append(msg)
+    return augmented
+
+
+def _strip_fences(text: str) -> str:
+    """Strip markdown code fences from a string."""
+    clean = text.strip()
+    if clean.startswith("```"):
+        clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    return clean
+
+
 def _format_messages(messages: list[BaseMessage]) -> str:
     """Render a LangChain message list as a plain-text prompt."""
     parts: list[str] = []
@@ -70,7 +96,12 @@ def _format_messages(messages: list[BaseMessage]) -> str:
         else:
             content = msg.content
             if isinstance(content, list):
-                text_parts = [item if isinstance(item, str) else "" for item in content]
+                text_parts = []
+                for item in content:
+                    if isinstance(item, str):
+                        text_parts.append(item)
+                    elif isinstance(item, dict):
+                        text_parts.append(item.get("text", ""))
                 parts.append("\n".join(p for p in text_parts if p))
             else:
                 parts.append(str(content))
@@ -102,14 +133,19 @@ class SubprocessChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
 
     def _call_subprocess(self, prompt: str) -> str:
-        args = shlex.split(self.command)
-        result = subprocess.run(
-            args,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout,
-        )
+        args = shlex.split(self.command, posix=(os.name != "nt"))
+        try:
+            result = subprocess.run(
+                args,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"LLM subprocess timed out after {self.timeout}s (command: {self.command!r})"
+            )
         if result.returncode != 0:
             raise RuntimeError(
                 f"LLM subprocess failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -129,34 +165,34 @@ class SubprocessChatModel(BaseChatModel):
         output is implemented by:
         1. Appending JSON schema + instructions to the last human message.
         2. Calling _generate() normally.
-        3. Parsing the JSON from the response with Pydantic.
+        3. Parsing the JSON from the response with Pydantic (for BaseModel) or
+           json.loads (for dict schemas).
         """
-        if not (isinstance(schema, type) and issubclass(schema, BaseModel)):
+        if isinstance(schema, dict):
+            schema_str = json.dumps(schema, indent=2)
+
+            def inject_and_parse_dict(messages: list[BaseMessage]) -> Any:
+                augmented = _augment_messages_with_json_instruction(messages, schema_str)
+                raw_text = self.invoke(augmented).content
+                clean = _strip_fences(raw_text)
+                return json.loads(clean)
+
+            return RunnableLambda(inject_and_parse_dict)
+        elif isinstance(schema, type) and issubclass(schema, BaseModel):
+            schema_str = json.dumps(schema.model_json_schema(), indent=2)
+
+            def inject_and_parse(messages: list[BaseMessage]) -> BaseModel:
+                augmented = _augment_messages_with_json_instruction(messages, schema_str)
+                raw_text = self.invoke(augmented).content
+                clean = _strip_fences(raw_text)
+                return schema.model_validate_json(clean)
+
+            return RunnableLambda(inject_and_parse)
+        else:
             raise TypeError(
-                "SubprocessChatModel.with_structured_output requires a Pydantic BaseModel subclass."
+                f"SubprocessChatModel.with_structured_output requires a Pydantic BaseModel subclass "
+                f"or a dict JSON Schema, got {type(schema)!r}."
             )
-        json_schema = schema.model_json_schema()
-        schema_str = json.dumps(json_schema, indent=2)
-        instruction = (
-            "\n\n---\nRespond with a single valid JSON object that conforms to "
-            "this JSON Schema (no markdown fences, no explanation, only JSON):\n"
-            f"{schema_str}"
-        )
-
-        def inject_and_parse(messages: list[BaseMessage]) -> BaseModel:
-            augmented: list[BaseMessage] = []
-            for i, msg in enumerate(messages):
-                if i == len(messages) - 1 and isinstance(msg, HumanMessage):
-                    augmented.append(HumanMessage(content=msg.content + instruction))
-                else:
-                    augmented.append(msg)
-            raw_text = self.invoke(augmented).content
-            clean = raw_text.strip()
-            if clean.startswith("```"):
-                clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            return schema.model_validate_json(clean)
-
-        return RunnableLambda(inject_and_parse)
 
 
 class SubprocessProvider:
@@ -185,11 +221,17 @@ class SubprocessProvider:
         *,
         max_tokens: int,
         timeout: float | None = 120,
-    ) -> SubprocessChatModel | None:
-        """Return a SubprocessChatModel using the configured command, or None."""
+    ) -> SubprocessChatModel:
+        """Return a SubprocessChatModel using the configured command.
+
+        Raises ValueError if SKILLSPECTOR_LLM_COMMAND is not set.
+        """
         command = os.environ.get("SKILLSPECTOR_LLM_COMMAND", "").strip()
         if not command:
-            return None
+            raise ValueError(
+                "SKILLSPECTOR_PROVIDER=subprocess requires SKILLSPECTOR_LLM_COMMAND to be set. "
+                "Example: SKILLSPECTOR_LLM_COMMAND=claude -p"
+            )
         return SubprocessChatModel(command=command, timeout=timeout or 120.0)
 
     def get_context_length(self, model: str) -> int | None:
