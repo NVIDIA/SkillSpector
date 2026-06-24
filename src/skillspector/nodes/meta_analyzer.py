@@ -28,6 +28,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from skillspector.constants import MODEL_CONFIG
 from skillspector.llm_analyzer_base import (
     Batch,
     LLMAnalyzerBase,
@@ -516,14 +517,13 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     file_cache: dict[str, str] = state.get("file_cache") or {}
     manifest: dict[str, object] = state.get("manifest") or {}
     model_config: dict[str, str] = state.get("model_config") or {}
-    model = model_config.get("meta_analyzer")
+    model = model_config.get("meta_analyzer") or MODEL_CONFIG.get("meta_analyzer")
 
     metadata_text = _format_metadata(manifest)
     files_with_findings = sorted({f.file for f in findings})
 
-    analyzer = LLMMetaAnalyzer(model=model)
-
     try:
+        analyzer = LLMMetaAnalyzer(model=model)
         batches = analyzer.get_batches(files_with_findings, file_cache, findings)
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
@@ -568,5 +568,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     except ValueError:
         raise
     except Exception as e:
-        logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
+        logger.warning(
+            "LLM call failed, passing all findings through (fail-closed): %s", e, exc_info=True
+        )
         return {"filtered_findings": _passthrough_with_defaults(findings)}

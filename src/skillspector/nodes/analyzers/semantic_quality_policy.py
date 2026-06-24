@@ -152,5 +152,5 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     except ValueError:
         raise
     except Exception as exc:
-        logger.warning("%s failed: %s", ANALYZER_ID, exc)
+        logger.warning("%s failed: %s", ANALYZER_ID, exc, exc_info=True)
         return {"findings": []}

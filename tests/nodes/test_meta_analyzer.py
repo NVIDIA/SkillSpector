@@ -39,11 +39,13 @@ def _analyzer() -> LLMMetaAnalyzer:
     return LLMMetaAnalyzer.__new__(LLMMetaAnalyzer)
 
 
-def _finding(rule_id: str, start_line: int, end_line: int | None = None) -> Finding:
+def _finding(
+    rule_id: str, start_line: int, end_line: int | None = None, severity: str = "CRITICAL"
+) -> Finding:
     return Finding(
         rule_id=rule_id,
         message=f"static finding {rule_id}",
-        severity="CRITICAL",
+        severity=severity,
         confidence=0.9,
         file="requirements.txt",
         start_line=start_line,
@@ -90,8 +92,8 @@ def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
 
 
 def test_rejected_finding_still_dropped() -> None:
-    """The end_line-agnostic fallback must not resurrect rejected findings."""
-    findings = [_finding("SC4", 4)]
+    """LLM-rejected MEDIUM findings are dropped (no severity floor for MEDIUM/LOW)."""
+    findings = [_finding("SC4", 4, severity="MEDIUM")]
     items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
     batch = Batch(file_path="requirements.txt", content="", findings=findings)
 
@@ -101,14 +103,26 @@ def test_rejected_finding_still_dropped() -> None:
 
 
 def test_low_confidence_finding_dropped() -> None:
-    """Confirmations below the confidence threshold are not kept."""
-    findings = [_finding("SC4", 4)]
+    """MEDIUM confirmations below the confidence threshold are dropped."""
+    findings = [_finding("SC4", 4, severity="MEDIUM")]
     items = [_llm_item("SC4", 4, end_line=4, confidence=0.3)]
     batch = Batch(file_path="requirements.txt", content="", findings=findings)
 
     kept = _analyzer().apply_filter(findings, [(batch, items)])
 
     assert kept == []
+
+
+def test_critical_finding_kept_when_rejected_by_llm() -> None:
+    """CRITICAL findings survive LLM rejection — security floor prevents false negatives."""
+    findings = [_finding("SC4", 4, severity="CRITICAL")]
+    items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert len(kept) == 1
+    assert "llm-unconfirmed" in kept[0].tags
 
 
 def test_exact_end_line_match_still_works() -> None:

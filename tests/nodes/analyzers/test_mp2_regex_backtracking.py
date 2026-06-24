@@ -46,8 +46,7 @@ class TestMP2DetectsStuffing:
         content = "hello world. " * 5
         findings = mp_module.analyze(content, "normal.md", "markdown")
         mp2_repetition = [
-            f for f in findings
-            if f.rule_id == "MP2" and "Context Window Stuffing" in f.message
+            f for f in findings if f.rule_id == "MP2" and "Context Window Stuffing" in f.message
         ]
         assert len(mp2_repetition) == 0
 
