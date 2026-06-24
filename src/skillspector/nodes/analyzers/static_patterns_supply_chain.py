@@ -441,10 +441,18 @@ def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | N
 def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
-    Only PEP 621 ``[project]`` ``dependencies`` / ``optional-dependencies`` and
-    PEP 735 ``[dependency-groups]`` hold real packages. Standard metadata keys
-    (``requires-python``, ``name``, ``version``, ...) are not dependencies and
-    must not be looked up as packages.
+    Reads all standard and tool-specific dependency tables:
+
+    * PEP 621 ``[project].dependencies`` / ``[project.optional-dependencies]``
+    * PEP 735 ``[dependency-groups]``
+    * ``[tool.poetry.dependencies]``, ``[tool.poetry.dev-dependencies]``,
+      ``[tool.poetry.group.<name>.dependencies]``
+    * ``[tool.pdm.dev-dependencies]``
+    * ``[tool.hatch.envs.<name>.dependencies]``
+    * ``[tool.uv.dev-dependencies]``
+
+    Standard metadata keys (``requires-python``, ``name``, ``version``, …) and
+    Poetry's special ``python`` key are not packages and are never yielded.
     """
     try:
         data = tomllib.loads(content)
@@ -467,6 +475,57 @@ def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None
         for group in groups.values():
             if isinstance(group, list):
                 specs.extend(d for d in group if isinstance(d, str))
+
+    tool = data.get("tool")
+    if isinstance(tool, dict):
+        # Poetry: keys are package names, values are version strings or config dicts.
+        poetry = tool.get("poetry")
+        if isinstance(poetry, dict):
+            for table_name in ("dependencies", "dev-dependencies"):
+                table = poetry.get(table_name)
+                if isinstance(table, dict):
+                    specs.extend(
+                        pkg for pkg in table if isinstance(pkg, str) and pkg != "python"
+                    )
+            # [tool.poetry.group.<name>.dependencies]
+            poetry_groups = poetry.get("group")
+            if isinstance(poetry_groups, dict):
+                for group_data in poetry_groups.values():
+                    if isinstance(group_data, dict):
+                        group_deps = group_data.get("dependencies")
+                        if isinstance(group_deps, dict):
+                            specs.extend(
+                                pkg
+                                for pkg in group_deps
+                                if isinstance(pkg, str) and pkg != "python"
+                            )
+
+        # PDM: [tool.pdm.dev-dependencies] is a dict of lists of PEP 508 strings.
+        pdm = tool.get("pdm")
+        if isinstance(pdm, dict):
+            pdm_dev = pdm.get("dev-dependencies")
+            if isinstance(pdm_dev, dict):
+                for group in pdm_dev.values():
+                    if isinstance(group, list):
+                        specs.extend(d for d in group if isinstance(d, str))
+
+        # Hatch: [tool.hatch.envs.<name>.dependencies] is a list of PEP 508 strings.
+        hatch = tool.get("hatch")
+        if isinstance(hatch, dict):
+            hatch_envs = hatch.get("envs")
+            if isinstance(hatch_envs, dict):
+                for env in hatch_envs.values():
+                    if isinstance(env, dict):
+                        env_deps = env.get("dependencies")
+                        if isinstance(env_deps, list):
+                            specs.extend(d for d in env_deps if isinstance(d, str))
+
+        # uv: [tool.uv.dev-dependencies] is a list of PEP 508 strings.
+        uv = tool.get("uv")
+        if isinstance(uv, dict):
+            uv_dev = uv.get("dev-dependencies")
+            if isinstance(uv_dev, list):
+                specs.extend(d for d in uv_dev if isinstance(d, str))
 
     results: list[tuple[str, str | None, int]] = []
     for spec in specs:
