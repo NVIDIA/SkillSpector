@@ -155,10 +155,10 @@ Path 3 — use_llm=True, connection error:
 
 ---
 
-## The 7 Safety Patches (Import-Time, Thread-Safe)
+## The 7 Safety Patches (Explicit context manager)
 
 ```
-runner.py module load (before any ThreadPoolExecutor starts)
+setup_deepseek_compat() context manager
 │
 ├─ Patch 1: LLMAnalyzerBase.__init__
 │   self.response_schema = None  (instance attr, thread-isolated)
@@ -183,4 +183,7 @@ runner.py module load (before any ThreadPoolExecutor starts)
     suppress "Event loop is closed" from httpx cleanup
 ```
 
-**Key insight:** Patch 1 uses instance attributes (`self.__dict__`), not class attributes. Each analyzer instance gets its own `None` — zero shared state, zero race conditions.
+**Key insight:** Patch 1 uses instance attributes (`self.__dict__`), not class
+attributes. Each analyzer instance gets its own `None` — zero shared state, zero
+race conditions.  Nesting depth is tracked: only the outermost ``setup_deepseek_compat()``
+exit restores the originals.

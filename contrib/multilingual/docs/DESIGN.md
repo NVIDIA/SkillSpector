@@ -53,11 +53,12 @@ concurrently; the workers don't know the graph fans out internally.
 - `graph.invoke()` is a pure function — same state → same result, no shared state
 - Each thread operates on its own state dict, isolated from other threads
 
-## The 7 import-time patches
+## DeepSeek compatibility patches
 
-All patches execute at module import (`runner.py`) — before any thread starts.
-Each wraps an upstream constructor to inject behavior without modifying
-`src/skillspector/`.
+Call ``setup_deepseek_compat()`` before any LLM activity to apply seven targeted
+monkey-patches.  The patches are applied explicitly (not at import time) via a
+context manager that restores originals on exit.  Nesting is tracked internally
+— only the outermost exit restores.
 
 | # | Target | Mechanism | Why |
 |---|--------|-----------|-----|
@@ -133,6 +134,10 @@ runs via `ApiKeyPool` for key failover, and appends findings to the graph result
 
 ## API Pool
 
+Call ``set_api_pool(pool)`` before scanning to route **all** LLM calls — both
+graph-internal analyzers (SSD/SDI/SQP/meta, 20 per skill) and the gap-fill pass —
+through a shared key pool.  ``set_api_pool(None)`` restores the original factory.
+
 Kubernetes-scheduler-inspired design:
 
 ```
@@ -141,6 +146,10 @@ release(success=True)  → mark idle
 release(success=False) → mark rate_limited, backoff 30s × 2^n (cap 300s)
 acquire after 429      → picks different key automatically
 ```
+
+The pool is created once and passed to ``set_api_pool()``, which replaces the
+global ``get_chat_model`` factory with a pooled version.  Every ``ChatOpenAI``
+instance created thereafter draws from the same key ring.
 
 ## cleanup_result resilience
 
@@ -176,17 +185,24 @@ HTTP-level timeouts (Patch 6) prevent most hangs from reaching the 90s ceiling.
 contrib/multilingual/
 ├── __init__.py          # package init + dotenv preload
 ├── batch_scan.py        # CLI + ThreadPoolExecutor
-├── runner.py            # graph wrapper + 7 patches
-├── discovery.py         # SKILL.md finder (24 lines)
-├── detection.py         # language detection (77 lines)
-├── annotation.py        # finding compatibility labels (86 lines)
-├── gap_fill.py          # GapFillAnalyzer (~290 lines)
-├── api_pool.py          # ApiKeyPool + PooledChatModel (~570 lines)
-├── reports.py           # Terminal / JSON / Markdown (~400 lines)
+├── runner.py            # graph wrapper + setup_deepseek_compat()
+├── discovery.py         # SKILL.md finder
+├── detection.py         # language detection
+├── annotation.py        # finding compatibility labels
+├── gap_fill.py          # GapFillAnalyzer
+├── api_pool.py          # ApiKeyPool + PooledChatModel + set_api_pool()
+├── reports.py           # Terminal / JSON / Markdown
 ├── .env.example         # configuration template
+├── tests/
+│   ├── test_api_pool.py
+│   ├── test_gap_fill.py
+│   ├── test_pool_wiring.py
+│   └── test_runner_patches.py
 └── docs/
     ├── README.md        # user-facing guide
-    └── DESIGN.md        # this file
+    ├── DESIGN.md        # this file
+    ├── CONTRIBUTING.md  # developer guide
+    └── archive/         # design history & future direction
 ```
 
 ## Rejected Alternatives

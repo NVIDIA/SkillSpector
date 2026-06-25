@@ -179,12 +179,16 @@ class GapFillAnalyzer(LLMAnalyzerBase):
     # response_format.  JSON is parsed manually in parse_response().
     response_schema: type | None = None
 
-    def __init__(self, language: str, model: str | None = None):
+    def __init__(self, language: str, model: str | None = None, api_pool: "ApiKeyPool | None" = None):
         self.language = language
         resolved_model = model or MODEL_CONFIG.get("default", "gpt-5.4")
         # Inject language into the base prompt before passing to parent
         prompt = GAP_FILL_ANALYZER_PROMPT.format(language=language)
         super().__init__(base_prompt=prompt, model=resolved_model)
+        # Wire multi-key pool into gap-fill LLM calls
+        if api_pool:
+            from .api_pool import PooledChatModel
+            self.chat_model = PooledChatModel(api_pool)
 
     # -- Prompt ---------------------------------------------------------------
 
@@ -262,6 +266,7 @@ def run_gap_fill(
     file_cache: dict[str, str],
     language: str,
     model: str | None = None,
+    api_pool: "ApiKeyPool | None" = None,
 ) -> list[Finding]:
     """Run a single targeted LLM pass covering the 8 gap-fill rules.
 
@@ -289,7 +294,7 @@ def run_gap_fill(
         return []
 
     try:
-        analyzer = GapFillAnalyzer(language=language, model=model)
+        analyzer = GapFillAnalyzer(language=language, model=model, api_pool=api_pool)
         batches = analyzer.get_batches(list(file_cache.keys()), file_cache)
         results = analyzer.run_batches(batches, language=language)
         return analyzer.collect_findings(results)

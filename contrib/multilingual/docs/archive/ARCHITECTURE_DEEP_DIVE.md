@@ -159,21 +159,26 @@ ThreadPoolExecutor(max_workers=N)
 | Paid basic | 4 (default) | 25-40 |
 | Enterprise | 8 | 50-80 |
 
-### Supplemental: ApiKeyPool for gap-fill calls
+### ApiKeyPool for all LLM calls
 
-Gap-fill analyzer calls go through a K8s-scheduler-style key pool:
+All LLM calls — both graph-internal analyzers (SSD/SDI/SQP/meta, 20 per skill)
+and the gap-fill pass — route through a shared K8s-scheduler-style key pool via
+``set_api_pool()``.  The pool replaces the global ``get_chat_model`` factory,
+so every ``ChatOpenAI`` instance draws from the same key ring.
+
 - **Acquire**: least-loaded idle key
 - **Rate-limit recovery**: exponential backoff `30s × 2^n`, capped at 300s
 - **Automatic failover**: 429 → mark key rate-limited → next acquire picks different key
 - **Retry**: `PooledChatModel` wraps LangChain `BaseChatModel` with transparent retry up to 5 attempts
 
-Note: graph-internal LLM calls (SSD/SDI/SQP/meta) do NOT go through the pool — they use the single-key path via `get_chat_model()`. The pool is for gap-fill only.
-
 ---
 
-## 5. Thread Safety: The 7 Import-Time Patches
+## 5. Thread Safety: The 7 Compatibility Patches
 
-All patches execute at module import (runner.py) — before any thread starts. Each addresses a specific DeepSeek compatibility constraint without modifying upstream source.
+Call ``setup_deepseek_compat()`` to apply seven targeted monkey-patches.  The
+patches are applied explicitly via a context manager that tracks nesting depth —
+only the outermost exit restores originals.  Each addresses a specific DeepSeek
+compatibility constraint without modifying upstream source.
 
 ### Why patches are needed
 

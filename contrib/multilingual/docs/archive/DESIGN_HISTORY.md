@@ -18,7 +18,7 @@
 
 ---
 
-## Phase 2: Architecture Design (DESIGN_V3)
+## Phase 2: Architecture Design (see `docs/DESIGN.md`)
 
 ### Four-layer model
 
@@ -93,24 +93,34 @@ Chose stdlib `unicodedata` over ML-based detectors (e.g., `langdetect`, `fasttex
 
 ## Phase 5: Implementation Summary
 
-### Files created (8 source + 5 docs)
+### Files created (9 source + tests + docs)
 
 ```
 contrib/multilingual/
 ├── __init__.py                       # Package init + dotenv pre-loading
-├── discovery.py                      # Recursive SKILL.md finder (24 lines)
-├── detection.py                      # Unicode script-ratio detection (77 lines)
-├── annotation.py                     # Finding language-compatibility (86 lines)
-├── api_pool.py                       # ApiKeyPool + PooledChatModel (~570 lines)
-├── gap_fill.py                       # GapFillAnalyzer(LLMAnalyzerBase) (~290 lines)
-├── batch_scan.py                     # CLI + ThreadPoolExecutor (~440 lines)
-├── runner.py                         # Graph wrapper + 7 safety patches (~450 lines)
-├── reports.py                        # Terminal / JSON / Markdown (~400 lines)
-├── ARCHITECTURE_DEEP_DIVE.md         # Architecture + concurrency deep dive
-├── DESIGN_HISTORY.md                 # This file
-├── FLOW_DIAGRAM.md                   # Visual architecture flowchart
-├── HEALTH_REPORT.md                  # Code audit & issue tracker
-└── PR_OVERVIEW.md                    # NVIDIA-facing PR introduction
+├── discovery.py                      # Recursive SKILL.md finder
+├── detection.py                      # Unicode script-ratio detection
+├── annotation.py                     # Finding language-compatibility
+├── api_pool.py                       # ApiKeyPool + PooledChatModel + set_api_pool()
+├── gap_fill.py                       # GapFillAnalyzer(LLMAnalyzerBase)
+├── batch_scan.py                     # CLI + ThreadPoolExecutor
+├── runner.py                         # Graph wrapper + setup_deepseek_compat()
+├── reports.py                        # Terminal / JSON / Markdown
+├── tests/
+│   ├── test_api_pool.py
+│   ├── test_gap_fill.py
+│   ├── test_pool_wiring.py
+│   └── test_runner_patches.py
+├── docs/
+│   ├── README.md
+│   ├── DESIGN.md
+│   ├── CONTRIBUTING.md
+│   └── archive/
+│       ├── ARCHITECTURE_DEEP_DIVE.md
+│       ├── DESIGN_HISTORY.md         # This file
+│       ├── FLOW_DIAGRAM.md
+│       ├── QUICKSTART.md
+│       └── FUTURE_WORK.md
 ```
 
 ### Performance (23-skill test suite, Mac Mini M4)

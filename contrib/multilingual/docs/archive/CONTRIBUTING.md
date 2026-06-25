@@ -39,15 +39,16 @@ output).  Upstream's `LLMAnalyzerBase` calls `with_structured_output()`
 unconditionally.  Sending `response_format` to DeepSeek returns HTTP 400,
 corrupting the connection pool.
 
-Our 7 import-time patches (`runner.py`) work around this by:
+Our 7 safety patches (`runner.py`) work around this by:
 1. Disabling structured output (instance-level `response_schema = None`)
 2. Adding JSON format instructions to every prompt
 3. Parsing raw JSON strings manually
 4. Enforcing HTTP timeouts to prevent hung connections
 5. Silencing harmless asyncio cleanup noise
 
-All patches execute at module import — before any thread starts.  Each uses
-instance attributes (not class attributes) for thread safety.
+Call ``setup_deepseek_compat()`` before any LLM activity to apply them.
+The function uses a context manager that tracks nesting depth — only the
+outermost exit restores originals.
 
 ## Mapping to Upstream SkillSpector
 
@@ -94,17 +95,11 @@ original constructor runs.
 
 ### High-impact, moderate-effort
 
-1. **Route graph-internal LLM calls through ApiKeyPool.**  Currently only
-   gap-fill uses the pool.  SSD/SDI/SQP/meta share a single key.  Fix: patch
-   `LLMAnalyzerBase.__init__` to use `PooledChatModel` when
-   `SKILLSPECTOR_API_KEYS` is configured.  Requires solving pool visibility
-   (the pool instance must be reachable from the patched `__init__`).
-
-2. **Add checkpoint/resume.**  Write per-skill results to
+1. **Add checkpoint/resume.**  Write per-skill results to
    `_batch_checkpoint.jsonl` as each skill completes.  On restart, skip skills
    already in the checkpoint.  A 50-line change to `batch_scan.py`.
 
-3. **Add language-detection unit tests.**  Create `tests/test_detection.py`
+2. **Add language-detection unit tests.**  Create `tests/test_detection.py`
    with known zh/ja/ko/en file content and verify `detect_language()` output.
    Low complexity, high confidence payoff.
 
@@ -146,7 +141,33 @@ This module follows SkillSpector upstream conventions exactly:
 
 ## Testing
 
-### Manual verification (current)
+### Automated tests (120 tests, 4 modules)
+
+```bash
+# Run all tests in randomized order (seed=42)
+cd contrib/multilingual/tests/tests-pro && python random_numbered.py
+
+# Or with pytest
+pytest contrib/multilingual/tests/ -v
+```
+
+| Module | Tests | Covers |
+|--------|-------|--------|
+| `test_api_pool.py` | 45 | acquire/release, rate-limit backoff, concurrency, edge cases |
+| `test_gap_fill.py` | 41 | parse_response, JSON recovery, prompt building, batch/collect |
+| `test_runner_patches.py` | 24 | `setup_deepseek_compat()`, context manager, nesting, isolation |
+| `test_annotation.py` | 10 | `is_language_compatible`, `annotate_findings` |
+
+### Mutation testing
+
+```bash
+python contrib/multilingual/tests/tests-pro/mutation_max.py
+```
+
+Injects 30 deliberate bugs across Max's 4 risk areas, verifies tests catch them.
+Current score: 21/30 caught.
+
+### Manual verification
 
 ```bash
 # Static mode (sub-second)
@@ -158,19 +179,6 @@ python -m contrib.multilingual.batch_scan ./tests/fixtures/ -f terminal --worker
 
 Verify: 23/23 skills scanned, exit code 1 (HIGH/CRITICAL skills present),
 `safe_skill` and `ssd_clean` both 0/100.
-
-### Writing new tests
-
-Test files should mirror the source structure:
-```
-tests/
-├── test_detection.py    # for contrib/multilingual/detection.py
-├── test_api_pool.py     # for contrib/multilingual/api_pool.py
-└── ...
-```
-
-Use the upstream project's test infrastructure: `pytest --verbose`.
-LLM-dependent tests should mock `get_chat_model()` and `chat_completion()`.
 
 ## Commit Style
 

@@ -113,6 +113,54 @@ Total: 23 skill(s) scanned
 **LR column:** Language Reliability. ✓ = English (full static + LLM coverage).
 ⚠ = non-English (gap-fill applied, 8 extra rules covered).
 
+### Example: JSON output (excerpt)
+
+```json
+{
+  "batch": {
+    "scanned_at": "2026-06-19T01:20:00+00:00",
+    "total_skills": 23,
+    "scan_mode": "multilingual-enhanced",
+    "enhancements": {
+      "language_detection": "unicode-script-ratio",
+      "gap_fill_applied": 0,
+      "gap_fill_findings": 0
+    }
+  },
+  "skills": [
+    {
+      "skill": {
+        "name": "malicious_skill",
+        "source": "malicious_skill",
+        "source_group": ".",
+        "language": "en",
+        "scanned_at": "2026-06-19T01:20:05+00:00"
+      },
+      "risk_assessment": {
+        "score": 100,
+        "severity": "CRITICAL",
+        "recommendation": "DO NOT INSTALL"
+      },
+      "issues": [
+        {
+          "id": "E1",
+          "message": "Skill executes shell commands without user consent",
+          "severity": "CRITICAL",
+          "confidence": 1.0,
+          "language_compatible": true
+        }
+      ],
+      "scan_mode": "multilingual-enhanced",
+      "enhancements": {
+        "gap_fill_applied": false,
+        "gap_fill_findings": 0,
+        "english_keyword_rules_skipped": 0
+      }
+    }
+  ]
+}
+```
+
 ### LLM vs static comparison (same 23 fixtures, 8 workers)
 
 | Skill | `--no-llm` | LLM mode | What LLM caught |
@@ -134,6 +182,22 @@ Total: 23 skill(s) scanned
 categories that English-keyword static patterns miss completely.  Clean skills
 remain clean — no false-positive inflation.  For skills already flagged by
 static rules, LLM finds 2–8 additional issues per skill.
+
+### Quick comparison: upstream vs batch
+
+```bash
+# Upstream — scan one skill
+skillspector scan ./skills/my-skill/ -f json -o upstream.json
+
+# Batch — scan all skills
+python -m contrib.multilingual.batch_scan ./skills/ -f json -o batch.json
+```
+
+Key differences in batch output:
+- `scan_mode: "multilingual-enhanced"` — provenance marker
+- `enhancements.gap_fill_applied` — true if LLM gap-fill was used
+- `enhancements.english_keyword_rules_skipped` — count of static rules bypassed
+- `skill.language` — detected language tag
 
 ## Tuning `--workers`
 
@@ -162,6 +226,15 @@ static rules, LLM finds 2–8 additional issues per skill.
 | 1 | ≥1 skill has HIGH or CRITICAL risk |
 | 2 | Scan errors occurred |
 
+CI usage:
+
+```bash
+python -m contrib.multilingual.batch_scan ./skills/ -f json -o report.json
+if [ $? -eq 0 ]; then
+    echo "All clean"
+fi
+```
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -174,13 +247,14 @@ static rules, LLM finds 2–8 additional issues per skill.
 
 ## Known Limitations
 
-1. **Graph-internal LLM calls don't route through ApiKeyPool.**  SSD/SDI/SQP/meta
-   share a single key.  Pool failover protects gap-fill only.
-2. **No checkpoint/resume.**  A failure at skill 847 of 1000 loses all progress.
-3. **Language detection covers 4 scripts.**  Arabic, Hindi, Cyrillic are
+1. **No checkpoint/resume.**  A failure at skill 847 of 1000 loses all progress.
+2. **Language detection covers 4 scripts.**  Arabic, Hindi, Cyrillic are
    classified as English and lose gap-fill coverage.
-4. **No SARIF output.**  Upstream supports it; this contrib adds terminal/JSON/Markdown.
-5. **No automated tests.**  All verification has been manual against `tests/fixtures/`.
-6. **Gap-fill quality not benchmarked for non-English.**  No ground-truth comparison exists.
+3. **No SARIF output.**  Upstream supports it; this contrib adds terminal/JSON/Markdown.
+4. **Gap-fill quality not benchmarked for non-English.**  No ground-truth comparison exists.
+5. **`parse_response` JSON recovery is best-effort.**  When the LLM returns
+   malformed JSON, the analyzer returns empty findings (no crash).  This is a
+   graceful-degradation choice: a single malformed response won't block the
+   pipeline, but the user won't know which findings were lost.
 
-See `DESIGN.md` for architecture details and `FUTURE_WORK.md` for suggested directions.
+See `DESIGN.md` for architecture details and `docs/archive/FUTURE_WORK.md` for suggested directions.

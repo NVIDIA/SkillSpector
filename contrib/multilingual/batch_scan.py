@@ -34,8 +34,9 @@ sits on top of two built-in parallelism layers:
 * **Layer 3** — ``ThreadPoolExecutor(max_workers)`` across skills (this module)
 
 API rate-limit protection is provided by the :class:`~.api_pool.ApiKeyPool`
-for GapFill calls.  Graph-internal LLM calls are throttled by the worker
-count and the built-in :class:`~asyncio.Semaphore`\\(10).
+for **all** LLM calls — graph-internal analyzers, meta-analyzer, and gap-fill
+alike.  The pool is wired in via :func:`~.runner.set_api_pool` (monkey-patches
+:func:`~skillspector.llm_utils.get_chat_model`) before any scan work starts.
 
 Usage::
 
@@ -132,6 +133,7 @@ def _scan_skill(
     use_llm: bool,
     lang: str,
     require_llm: bool,
+    api_pool=None,
 ) -> tuple[dict[str, object], str | None, str]:
     """Scan a single skill through the full pipeline.
 
@@ -156,7 +158,7 @@ def _scan_skill(
     if lang != "en" and use_llm and not error_msg:
         fc = _read_skill_files(skill_dir)
         gap_findings = run_gap_fill(
-            fc, lang, model=MODEL_CONFIG.get("default")
+            fc, lang, model=MODEL_CONFIG.get("default"), api_pool=api_pool
         )
         if gap_findings:
             existing = list(entry.get("issues", []))
@@ -178,6 +180,17 @@ def _scan_skill(
 
 def main() -> None:
     """Entry point for the batch scanner CLI."""
+    # -- DeepSeek compatibility patches (scoped context manager) --------------
+    # Patches are active for the entire scan and restored on exit — even if
+    # an exception occurs.  Pattern: Save → Patch → Yield → Restore (finally).
+    from .runner import deepseek_compat
+
+    with deepseek_compat():
+        _main_impl()
+
+
+def _main_impl() -> None:
+    """Body of main(), wrapped by deepseek_compat context manager."""
     # -- Windows Unicode support ---------------------------------------------
     if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
@@ -287,11 +300,15 @@ def main() -> None:
 
     # -- API Pool (optional — returns None if single-key) --------------------
     api_pool = create_api_key_pool_from_env()
+    if api_pool:
+        from .runner import set_api_pool
+        set_api_pool(api_pool)
     use_llm = not args.no_llm
 
     # -- Header --------------------------------------------------------------
     pool_note = (
-        f", [green]{api_pool.keys_configured} API keys[/green]"
+        f", [green]{api_pool.keys_configured} keys "
+        f"({api_pool.total_capacity} slots)[/green]"
         if api_pool
         else ""
     )
@@ -330,6 +347,7 @@ def main() -> None:
                 use_llm=use_llm,
                 lang=lang_map[skill_dir],
                 require_llm=args.require_llm,
+                api_pool=api_pool,
             ): idx
             for idx, skill_dir in enumerate(skill_dirs, 1)
         }
@@ -405,12 +423,20 @@ def main() -> None:
     # -- API Pool summary (if active) ----------------------------------------
     if api_pool:
         snap = api_pool.snapshot()
-        if snap.get("rate_limits_hit", 0) > 0:
-            _print(
-                f"\n[dim]API Pool: {snap['rate_limits_hit']} rate-limit(s) hit, "
-                f"{snap['retry_successes']} retried successfully "
-                f"({snap['keys_configured']} keys configured)[/dim]"
+        _parts = [
+            f"{snap['total_requests_served']} requests served",
+        ]
+        if snap.get("peak_active_requests", 0) > 0:
+            _parts.append(
+                f"peak {snap['peak_active_requests']}/{snap['total_capacity']} slots"
             )
+        if snap.get("rate_limits_hit", 0) > 0:
+            _parts.append(
+                f"{snap['rate_limits_hit']} rate-limit(s), "
+                f"{snap['retry_successes']} retried"
+            )
+        _parts.append(f"{snap['keys_configured']} keys")
+        _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]")
 
     # -- Output --------------------------------------------------------------
     fmt = args.format

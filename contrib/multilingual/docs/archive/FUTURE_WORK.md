@@ -5,13 +5,17 @@
 
 ---
 
-## 1. API Key Pool Coverage
+## 1. API Key Pool Coverage ✅
 
-**Current state:** Only the gap-fill analyzer routes through `ApiKeyPool`. Graph-internal LLM calls (SSD, SDI, SQP, meta-analyzer) use the single-key path via `get_chat_model()`. This means N parallel workers share a single API key for the bulk of LLM work.
+**Current state:** All LLM calls — both graph-internal analyzers (SSD, SDI, SQP,
+meta, 20 per skill) and the gap-fill pass — route through a shared key pool via
+``set_api_pool()``.  The pool replaces the global ``get_chat_model`` factory so
+every ``ChatOpenAI`` instance draws from the same key ring.
 
-**Impact:** With `--workers 4`, the single key receives concurrent requests from all four skills' internal analyzers, occasionally triggering rate limits. The pool's 10-key failover currently only protects gap-fill.
-
-**Suggested direction:** Patch `LLMAnalyzerBase.__init__` to route `get_chat_model()` through the pool when `SKILLSPECTOR_API_KEYS` is configured. Requires solving the pool-visibility problem (the pool instance must be reachable from the patched `__init__` without global state).
+**Remaining gap:** ``set_api_pool`` uses a module-level global for pool reference.
+A cleaner approach would be to thread the pool through the graph state or use a
+context variable, but the current design is adequate for batch workloads where
+the pool is set once before scanning and not changed mid-run.
 
 ---
 
@@ -29,14 +33,27 @@
 
 **Current state:** Unicode script-ratio detection supports four languages (en, zh, ja, ko). Japanese text with high kanji density and low kana frequency can be misclassified as Chinese. Mixed-language skills take a majority vote with no confidence score.
 
-**Impact:** Non-CJK languages (Arabic, Hindi, Cyrillic) are classified as English and lose non-English gap-fill coverage.
+**Impact:** Non-CJK languages (Arabic, Hindi, Cyrillic, Latin-extended) are classified as English and lose non-English gap-fill coverage.
 
-**Suggested direction:**
-- Add Cyrillic script range (U+0400–U+04FF) → `ru` / `uk`
-- Add Arabic script range (U+0600–U+06FF) → `ar`
-- Add Devanagari range (U+0900–U+097F) → `hi`
-- Return confidence scores alongside language tags for mixed-content skills
-- Consider a `--confidence-threshold` flag to control when gap-fill is applied
+**Candidate languages (ranked by AI adoption density):**
+
+| Script | Language | Unicode range | Difficulty |
+|--------|----------|--------------|------------|
+| Cyrillic | Russian (ru) | 0x0400–0x04FF | Low |
+| Arabic | Arabic (ar) | 0x0600–0x06FF | Medium — RTL |
+| Latin extended | French (fr), German (de), Spanish (es) | 0x00C0–0x024F | Low — diacritics |
+| Devanagari | Hindi (hi) | 0x0900–0x097F | Medium |
+| Thai | Thai (th) | 0x0E00–0x0E7F | Low |
+
+**Suggested direction (three phases):**
+
+1. **Phase 1 — detection.py extension:** Add Unicode ranges + thresholds. The architecture separates language detection from analysis, so adding a language is adding constants.
+
+2. **Phase 2 — prompt optimization per script family:** Languages in the same script family (e.g., Latin-extended) can share validated prompt templates, reducing maintenance cost.
+
+3. **Phase 3 — standalone contrib module:** If the module grows past 10+ languages, split `detection.py` into an independent multilingual detection layer with gap-fill prompts grouped by script family.
+
+Also: return confidence scores alongside language tags for mixed-content skills, and consider a `--confidence-threshold` flag to control when gap-fill is applied.
 
 ---
 
@@ -52,17 +69,18 @@ Additionally, a **diff mode** (`--diff report1.json report2.json`) that shows wh
 
 ---
 
-## 5. Automated Testing
+## 5. Automated Testing ✅ (partial)
 
-**Current state:** All verification has been manual — running the 23-skill fixture suite and inspecting terminal output. There are no unit tests for any of the 8 contrib modules.
+**Current state:** 120 unit tests across 4 modules (`test_api_pool.py`,
+`test_gap_fill.py`, `test_runner_patches.py`, `test_annotation.py`), covering
+pool acquire/release, JSON parsing, patch application, and language compatibility.
+Mutation testing catches 21/30 injected bugs.
 
-**Impact:** Refactoring any module risks silent breakage. Language detection accuracy has no baseline measurement.
-
-**Suggested direction:**
-- **Unit tests** for pure functions: `detect_language()`, `_strip_markdown_fences()`, `_sanitize_meta_finding()`, `is_language_compatible()`
-- **Integration tests** with `--no-llm` against `tests/fixtures/`: verify 23/23 skills complete, exit code matches expectation, JSON output schema is valid
-- **Mocked LLM tests** for `GapFillAnalyzer.parse_response()`, `_patched_base_parse()`, `_patched_meta_parse()`
-- **Language detection accuracy** benchmark against a curated set of real multi-language skill files
+**Remaining gaps:**
+- **Language detection** has no unit tests (`detect_language()`, script-ratio thresholds)
+- **Integration tests** against `tests/fixtures/` are still manual
+- **Non-English ground-truth** fixtures don't exist yet
+- **`test_pool_wiring.py`** is a smoke test only — needs expansion
 
 ---
 
@@ -76,15 +94,85 @@ Additionally, a **diff mode** (`--diff report1.json report2.json`) that shows wh
 
 ---
 
-## Summary
+## 7. Worker Scheduling
+
+**Current state:** Workers are dispatched via `ThreadPoolExecutor(max_workers=N)` with no awareness of API pool capacity. When workers exceed the effective API concurrency limit, excess workers queue and waste resources.
+
+**Empirical finding:** 10–15 workers provides the best observed throughput. Below 10, skills queue unnecessarily. Above 15–20, thread overhead and API contention offset gains. The exact optimal value depends on API provider behavior (account-level concurrency limits, per-request latency variance).
+
+**Suggested direction:** Adaptive worker count based on pool slot availability. If all slots are full, pause skill submission. If slots are idle, ramp up. An `--auto-workers` flag could derive N from pool capacity.
+
+---
+
+## 8. ChatOpenAI Per-Call Instantiation
+
+**Current state:** `_build_llm()` creates a new `ChatOpenAI` instance for every LLM call. With ~800 calls per 23-skill scan, this adds measurable overhead.
+
+**Failed attempt:** Pool-level instance caching was tried but made things slower — `ChatOpenAI`'s internal `AsyncClient` is event-loop-bound.
+
+**Suggested direction:** Per-event-loop caching, or leveraging LangChain's built-in connection pooling more effectively. Estimated ~15–20% speed improvement.
+
+---
+
+## 9. Pool Observability
+
+**Current state:** `try_acquire()` (non-blocking fast path) and `acquire()` (blocking fallback) are both implemented, but we don't track how often each succeeds.
+
+**Suggested direction:** Expose `try_acquire_hits / try_acquire_misses` in `snapshot()` to help operators determine whether the pool has enough capacity.
+
+---
+
+## 10. DeepSeek-Specific Constraints
+
+- **No `response_format` support:** Patch 1 (`response_schema = None`) is required. Any attempt to use `with_structured_output()` returns HTTP 400.
+- **Account-level rate limiting:** Multiple API keys under the same DeepSeek account share one concurrency budget. A 10-key pool cannot bypass this limit.
+- **API speed variance:** Observed per-skill time varies 2–3× depending on time of day (API server load). The pool provides retry/backoff stability but cannot increase throughput beyond the account rate limit.
+
+---
+
+## 11. Custom Pool vs. Established Libraries
+
+The current `ApiKeyPool` was built from scratch. This works but the problem space is well-traveled territory:
+
+| Library | Pitch |
+|---------|-------|
+| `rotapool` | Resource pool with health-check-per-call, `CooldownResource` lifecycle — closest to our design |
+| `apirotater` | Lightweight key rotation with per-key rate windows |
+| `llm-keypool` | Full-featured: multi-provider, capability tags, 429 cooldown, built-in proxy |
+| `envrotate` | Minimal: reads keys from env vars, random / round-robin |
+| `pyrate-limiter` | General-purpose rate limiter (token bucket, sliding window) — complementary |
+
+**Why not now:** The custom pool is battle-tested, fully understood, and integrated. Replacing it adds a dependency and migration risk. Revisit if maintenance burden grows or a library gains community trust with a benchmark showing clear improvement.
+
+---
+
+## 12. Additional Directions
+
+### MetaAnalyzer Parallelization
+The MetaAnalyzer runs after all analyzers complete (graph topology: `analyzers → meta_analyzer → report`). Its LLM calls are inherently sequential to the fan-out phase, accounting for 20–30% of per-skill wall time. Parallelizing the meta-analyzer would require modifying upstream graph topology.
+
+### Local Model Compatibility
+The pool and DeepSeek compat patches are designed for OpenAI-compatible endpoints. Ollama and llama.cpp expose similar endpoints — verifying and documenting compatibility would expand deployment options for air-gapped or cost-sensitive environments.
+
+### Cross-File Dataflow Analysis
+Gap-fill batches files by token budget; related files may land in different batches. Introducing file-level import dependency analysis during batch construction could improve finding quality for multi-file skills.
+
+### File Cache Optimization
+`_read_skill_files()` reads disk twice (language detection + gap-fill) with no cache. Per-skill file I/O is negligible (<5ms) at current scale, but a process-internal dict cache could eliminate redundant reads for large skill directories. Low priority — the bottleneck is LLM calls (seconds), not disk I/O (milliseconds).
 
 | # | Area | Status | Next Step |
 |---|------|--------|-----------|
-| 1 | Pool coverage | Gap-fill only | Route graph-internal calls through pool |
+| 1 | Pool coverage | ✅ All LLM paths | Refine global-state approach (context var) |
 | 2 | Checkpoint | None | JSONL progress log + skip-on-restart |
-| 3 | Language detection | 4 languages, no confidence | Add Cyrillic/Arabic/Devanagari; return confidence |
+| 3 | Language detection | 4 languages, no confidence | Expand to 9+ languages; return confidence scores |
 | 4 | Output formats | Terminal/JSON/Markdown | Add SARIF + diff mode |
-| 5 | Testing | Manual only | Unit + integration + mocked LLM tests |
+| 5 | Testing | ✅ 120 tests, 21/30 mutation | Language detection tests + integration tests |
 | 6 | Gap-fill baseline | Not measured | Non-English fixture set + precision/recall |
+| 7 | Worker scheduling | Naive ThreadPoolExecutor | Adaptive scheduling based on pool capacity |
+| 8 | ChatOpenAI caching | New instance per call | Per-event-loop caching |
+| 9 | Pool observability | No hit/miss counters | Expose try_acquire metrics in snapshot |
+| 10 | DeepSeek constraints | Documented | Upstream `response_format` opt-out would remove Patches 1–5 |
+| 11 | Pool vs. libraries | Custom, battle-tested | Revisit if maintenance burden grows |
+| 12 | Additional directions | Not started | MetaAnalyzer parallelization, local model compat, cross-file dataflow, file cache |
 
-All six are additive — none require breaking changes to the current API. A contributor can pick one area and ship independently.
+All items are additive — none require breaking changes to the current API. A contributor can pick one area and ship independently.
