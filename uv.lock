@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12, <3.14"
 
 [[package]]
@@ -2014,7 +2014,7 @@ wheels = [
 
 [[package]]
 name = "skillspector"
-version = "2.3.7"
+version = "2.3.8"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

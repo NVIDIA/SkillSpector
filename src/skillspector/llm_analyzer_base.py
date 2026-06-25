@@ -434,7 +434,7 @@ class LLMAnalyzerBase:
                     response = _message_text(await self._llm.ainvoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
-
+#                prompt = prompt + "请使用中文回答,关键词请使用英文"
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         successful: list[tuple[Batch, list]] = []
         for batch, result in zip(batches, results, strict=True):

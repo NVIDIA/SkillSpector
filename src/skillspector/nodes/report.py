@@ -314,10 +314,10 @@ def _format_terminal(
             icon = severity_icons.get((f.severity or "LOW").upper(), f.severity)
             console.print(f"  {icon}: {f.rule_id} - {f.message[:60]}...")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
-            console.print(f"    [dim]Location:[/dim] {f.file}:{f.start_line}{end}")
-            console.print(f"    [dim]Confidence:[/dim] {f.confidence:.0%}")
+            console.print(f"    [dim]位置:[/dim] {f.file}:{f.start_line}{end}")
+            console.print(f"    [dim]置信度:[/dim] {f.confidence:.0%}")
             if f.remediation:
-                console.print(f"    [dim]Remediation:[/dim] {(f.remediation or '')[:150]}...")
+                console.print(f"    [dim]解决方案:[/dim] {(f.remediation or '')[:150]}...")
             console.print()
     else:
         console.print("\n[green]No security issues detected.[/green]\n")

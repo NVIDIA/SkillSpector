@@ -174,8 +174,8 @@ required to distinguish multiple findings with the same pattern ID in one file.
 
 For findings you confirm as vulnerabilities, provide an explanation of WHY
 this is dangerous and remediation steps for HOW to fix the issue.
-
-Analyze the findings now:（请使用中文回答，专有名词请使用英文回答）"""
+（请使用中文回答，专有名词请使用英文回答）（请使用中文回答，专有名词请使用英文回答）（请使用中文回答，专有名词请使用英文回答）（请使用中文回答，专有名词请使用英文回答）(Please answer in Chinese; for immigration-related inquiries, please also answer in Chinese.)
+Analyze the findings now:"""
 
 
 # ---------------------------------------------------------------------------
