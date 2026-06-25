@@ -83,12 +83,16 @@ def _parse_bundle_payload(bundle_path: Path, payload: object) -> dict[str, objec
     if system_msg.get("role") != "system":
         return None
 
-    user_content = user_msg.get("content")
-    contract = _find_contract_payload(user_content)
-    if contract is None:
+    user_content = _normalize_mapping(user_msg.get("content"))
+    if user_content is None:
         return None
 
     if user_msg.get("role") != "user":
+        return None
+
+    aisop_payload = _normalize_mapping(user_content.get("aisop"))
+    aisp_contract = _normalize_mapping(user_content.get("aisp_contract"))
+    if aisop_payload is None and aisp_contract is None:
         return None
 
     layout_kind = protocol.split()[0]
@@ -96,14 +100,27 @@ def _parse_bundle_payload(bundle_path: Path, payload: object) -> dict[str, objec
         (
             system_content.get("declared_tools"),
             system_content.get("tools"),
-            contract.get("declared_tools"),
-            contract.get("tools"),
+            user_content.get("declared_tools"),
+            user_content.get("tools"),
+            aisop_payload.get("declared_tools") if aisop_payload else None,
+            aisop_payload.get("tools") if aisop_payload else None,
+            aisp_contract.get("declared_tools") if aisp_contract else None,
+            aisp_contract.get("tools") if aisp_contract else None,
         )
     )
-    functions = contract.get("functions")
+    functions = user_content.get("functions")
+    if functions is None and aisop_payload is not None:
+        functions = aisop_payload.get("functions")
+    if functions is None and aisp_contract is not None:
+        functions = aisp_contract.get("functions")
     function_names = _extract_function_names(functions)
     constraint_anchors = _extract_constraint_anchors(functions)
-    resource_anchors = _extract_resource_anchors(contract.get("resources"))
+    resource_anchors = _extract_resource_anchors(
+        aisp_contract.get("resources") if aisp_contract is not None else None
+    )
+
+    if not function_names and not resource_anchors:
+        return None
 
     return {
         "layout_kind": layout_kind,
@@ -120,19 +137,6 @@ def _parse_bundle_payload(bundle_path: Path, payload: object) -> dict[str, objec
 def _normalize_mapping(value: object) -> dict[str, object] | None:
     """Return a dict if *value* is a mapping object."""
     return value if isinstance(value, dict) else None
-
-
-def _find_contract_payload(content: object) -> dict[str, object] | None:
-    """Locate the AISOP/AISP contract payload in a user message."""
-    container = _normalize_mapping(content)
-    if container is None:
-        return None
-
-    for key in ("aisop", "aisp_contract"):
-        value = container.get(key)
-        if isinstance(value, dict):
-            return value
-    return None
 
 
 def _first_non_empty(values: tuple[object, ...]) -> list[str]:
@@ -189,6 +193,19 @@ def _extract_constraint_anchors(functions: object) -> list[str]:
     anchors: list[str] = []
     seen: set[str] = set()
 
+    def _collect(constraint: object) -> None:
+        if isinstance(constraint, str):
+            anchor = constraint.strip()
+        elif isinstance(constraint, dict):
+            raw_anchor = constraint.get("anchor")
+            anchor = raw_anchor.strip() if isinstance(raw_anchor, str) else ""
+        else:
+            anchor = ""
+
+        if anchor and anchor not in seen:
+            seen.add(anchor)
+            anchors.append(anchor)
+
     def _walk(nodes: object) -> None:
         if isinstance(nodes, dict):
             for maybe_node in nodes.values():
@@ -196,21 +213,18 @@ def _extract_constraint_anchors(functions: object) -> list[str]:
                     constraints = maybe_node.get("constraints")
                     if isinstance(constraints, list):
                         for constraint in constraints:
-                            if not isinstance(constraint, dict):
-                                continue
-                            anchor = constraint.get("anchor")
-                            if isinstance(anchor, str):
-                                a = anchor.strip()
-                                if a and a not in seen:
-                                    seen.add(a)
-                                    anchors.append(a)
+                            _collect(constraint)
                     _walk(maybe_node.get("functions"))
                 elif isinstance(maybe_node, list):
                     _walk(maybe_node)
         elif isinstance(nodes, list):
             for item in nodes:
                 if isinstance(item, dict):
-                    _walk(item)
+                    constraints = item.get("constraints")
+                    if isinstance(constraints, list):
+                        for constraint in constraints:
+                            _collect(constraint)
+                    _walk(item.get("functions"))
 
     _walk(functions)
     return anchors

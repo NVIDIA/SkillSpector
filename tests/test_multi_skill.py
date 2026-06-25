@@ -79,13 +79,12 @@ def _write_aisop_bundle(path: Path) -> None:
         {
             "role": "user",
             "content": {
-                "aisop": {
-                    "declared_tools": ["search", "calendar"],
-                    "functions": {
-                        "lookup": {"constraints": [{"anchor": "query"}]},
-                        "schedule": {"constraints": [{"anchor": "time"}]},
-                    },
+                "aisop": {"main": "graph TD"},
+                "functions": {
+                    "lookup": {"constraints": ["query"]},
+                    "schedule": {"constraints": ["time"]},
                 },
+                "declared_tools": ["search", "calendar"],
                 "aisp_contract": {
                     "resources": {
                         "calendar": {"path": "resources/calendar.json"},
