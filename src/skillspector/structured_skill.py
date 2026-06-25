@@ -153,10 +153,11 @@ def _first_non_empty(values: tuple[object, ...]) -> list[str]:
     return result
 
 
-def _extract_function_names(functions: object) -> list[str]:
+def _extract_function_names(functions: object, seen: set[str] | None = None) -> list[str]:
     """Extract function names from a dictionary/list of workflow nodes."""
     names: list[str] = []
-    seen: set[str] = set()
+    if seen is None:
+        seen = set()
 
     if isinstance(functions, dict):
         items = functions.items()
@@ -167,7 +168,7 @@ def _extract_function_names(functions: object) -> list[str]:
                     seen.add(n)
                     names.append(n)
             if isinstance(node, dict):
-                names.extend(_extract_function_names(node.get("functions")))
+                names.extend(_extract_function_names(node.get("functions"), seen))
     elif isinstance(functions, list):
         for item in functions:
             if not isinstance(item, dict):
@@ -178,7 +179,7 @@ def _extract_function_names(functions: object) -> list[str]:
                 if n and n not in seen:
                     seen.add(n)
                     names.append(n)
-            names.extend(_extract_function_names(item.get("functions")))
+            names.extend(_extract_function_names(item.get("functions"), seen))
 
     return names
 
