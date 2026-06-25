@@ -38,11 +38,12 @@ def _write_aisop_bundle(path: Path) -> None:
     "role": "user",
     "content": {
       "aisop": {
-        "declared_tools": ["search", "calendar"],
-        "functions": {
-          "lookup": {"constraints": [{"anchor": "query"}]}
-        }
-      }
+        "main": "graph TD"
+      },
+      "functions": {
+        "lookup": {"constraints": ["query"]}
+      },
+      "declared_tools": ["search", "calendar"]
     }
   }
 ]
