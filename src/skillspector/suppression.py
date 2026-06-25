@@ -226,11 +226,8 @@ def load_baseline(path: str | Path) -> Baseline:
 def partition_findings(
     findings: list[Finding], baseline: Baseline | None
 ) -> tuple[list[Finding], list[SuppressedFinding]]:
-    """Split *findings* into (kept, suppressed) using *baseline*.
-
-    With no baseline, everything is kept. Suppressed findings never count toward
-    the risk score and are excluded from the SARIF results.
-    """
+    """将 *findings* 拆分为（保留的，被抑制的）两组，使用 *baseline* 进行判断。
+    如果没有基线，所有发现项都将保留。被抑制的发现项不计入风险评分，并从 SARIF 结果中排除。    """
     if baseline is None or baseline.is_empty():
         return list(findings), []
     kept: list[Finding] = []

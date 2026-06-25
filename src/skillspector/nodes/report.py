@@ -505,10 +505,10 @@ def _format_markdown(
             emoji = severity_emoji.get(sev, "")
             lines.append(f"### {emoji} {sev}: {f.rule_id}\n")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
-            lines.append(f"**Location:** `{f.file}:{f.start_line}{end}`  ")
-            lines.append(f"**Confidence:** {f.confidence:.0%}  ")
+            lines.append(f"**位置:** `{f.file}:{f.start_line}{end}`  ")
+            lines.append(f"**置信度:** {f.confidence:.0%}  ")
             lines.append("")
-            lines.append(f"**Message:** {f.message}")
+            lines.append(f"**修复建议:** {f.message}")
             lines.append("")
             if f.remediation:
                 lines.append(f"**Remediation:** {f.remediation}")
@@ -557,6 +557,9 @@ def report(state: SkillspectorState) -> dict[str, object]:
 
     baseline = state.get("baseline")
     show_suppressed = state.get("show_suppressed", False)
+    # 将 filtered_findings 分为两部分：
+    # - active_findings：未被 baseline 抑制的发现，会计入风险评分和 SARIF 报告
+    # - suppressed：与 baseline 匹配的发现，不计入风险评分，仅在 --show-suppressed 时展示
     active_findings, suppressed = partition_findings(
         filtered_findings, baseline if isinstance(baseline, Baseline) else None
     )
