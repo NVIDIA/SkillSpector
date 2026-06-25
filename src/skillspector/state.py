@@ -70,6 +70,8 @@ class SkillspectorState(TypedDict, total=False):
     # Component metadata for reporting and risk scoring (from build_context)
     component_metadata: list[dict[str, object]]
     has_executable_scripts: bool
+    # Structured workflow context for phase-1 AISOP/AISP summaries
+    structured_skill_context: dict[str, object]
 
     # Output: report node writes formatted string here
     output_format: str

@@ -20,6 +20,7 @@ Uses skill spec layout: SKILL.md, references/, scripts/, assets/
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -200,7 +201,7 @@ def test_build_context_parses_parameters_from_frontmatter(tmp_path: Path) -> Non
         "parameters:\n"
         "  - name: path\n"
         "    description: file path to read\n"
-        "  - not-a-dict\n"  # non-dict entries are dropped
+        "  - not-a-dict\n"
         "---\n",
         encoding="utf-8",
     )
@@ -242,3 +243,136 @@ def test_build_context_parses_allowed_tools_comma_string(tmp_path: Path) -> None
     state: SkillspectorState = {"skill_path": str(tmp_path)}
     result = build_context(state)
     assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
+
+
+def _write_aisop_bundle(path: Path) -> None:
+    """Write a valid minimal AISOP/AISP bundle file."""
+    bundle = [
+        {
+            "role": "system",
+            "content": {
+                "protocol": "AISP V1",
+                "format": "contract",
+            },
+        },
+        {
+            "role": "user",
+            "content": {
+                "functions": {
+                    "inbox": {"constraints": ["Read-only inspection must not modify files."]}
+                },
+                "aisp_contract": {
+                    "resources": {
+                        "state": {"path": "resources/state.json"},
+                    },
+                    "declared_tools": ["mail", "search"],
+                },
+            },
+        },
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+
+def _make_nested_functions(depth: int) -> dict[str, object]:
+    """Build a deeply nested functions tree for recursion-guard tests."""
+    current: dict[str, object] = {"constraints": ["depth.guard"]}
+    for idx in range(depth, -1, -1):
+        current = {f"node_{idx}": {"constraints": [f"depth_{idx}"], "functions": current}}
+    return current
+
+
+def test_build_context_populates_structured_skill_context(tmp_path: Path) -> None:
+    """Valid AISOP/AISP bundle yields structured_skill_context metadata in scan context."""
+    _write_aisop_bundle(tmp_path / "workflow.aisop.json")
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+
+    assert "structured_skill_context" in result
+    context = result["structured_skill_context"]
+    assert isinstance(context, dict)
+    assert context["protocol"] == "AISP V1"
+    assert context["layout_kind"] == "AISP"
+    assert context["format"] == "contract"
+    assert context["bundle_path"] == str((tmp_path / "workflow.aisop.json").resolve())
+    assert context["workflow_nodes"] == ["inbox"]
+    assert context["constraint_anchors"] == ["Read-only inspection must not modify files."]
+    assert context["resource_anchors"] == ["resources/state.json"]
+    assert context["declared_tools"] == ["mail", "search"]
+
+
+def test_build_context_manifest_may_be_empty_when_only_structured(tmp_path: Path) -> None:
+    """A structured bundle can populate context while manifest stays empty."""
+    _write_aisop_bundle(tmp_path / "workflow.aisop.json")
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"] == {}
+    assert "structured_skill_context" in result
+
+
+def test_build_context_structured_context_absent_for_malformed_bundle(tmp_path: Path) -> None:
+    """Malformed AISOP/AISP JSON leaves structured_skill_context unset."""
+    (tmp_path / "bad.aisop.json").write_text(
+        json.dumps([{"role": "system", "content": {"protocol": "AISOP V1"}}, {}]),
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert "structured_skill_context" not in result
+
+
+def test_build_context_deduplicates_nested_workflow_names(tmp_path: Path) -> None:
+    """Nested function names stay unique in structured_skill_context."""
+    bundle = [
+        {
+            "role": "system",
+            "content": {
+                "protocol": "AISOP V1",
+                "format": "workflow",
+            },
+        },
+        {
+            "role": "user",
+            "content": {
+                "aisop": {"main": "graph TD"},
+                "functions": {
+                    "lookup": {
+                        "functions": {
+                            "lookup": {
+                                "constraints": ["nested.query"],
+                            }
+                        }
+                    }
+                },
+            },
+        },
+    ]
+    (tmp_path / "nested.aisop.json").write_text(json.dumps(bundle), encoding="utf-8")
+    result = build_context({"skill_path": str(tmp_path)})
+    context = result["structured_skill_context"]
+    assert context["workflow_nodes"] == ["lookup"]
+
+
+def test_build_context_ignores_over_nested_structured_bundle(tmp_path: Path) -> None:
+    """Over-nested structured bundles fail closed instead of crashing build_context."""
+    bundle = [
+        {
+            "role": "system",
+            "content": {
+                "protocol": "AISOP V1",
+                "format": "workflow",
+            },
+        },
+        {
+            "role": "user",
+            "content": {
+                "aisop": {"main": "graph TD"},
+                "functions": _make_nested_functions(140),
+            },
+        },
+    ]
+    (tmp_path / "deep.aisop.json").write_text(json.dumps(bundle), encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "structured_skill_context" not in result
