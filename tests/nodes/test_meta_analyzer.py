@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from skillspector.llm_analyzer_base import Batch
 from skillspector.models import Finding
@@ -227,3 +229,38 @@ class TestMetaAnalyzerPartialBatchFailure:
 
         kept = {(f.file, f.rule_id) for f in result["filtered_findings"]}
         assert kept == {("a.py", "R1")}
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_meta_analyzer_llm_failure_prints_stderr_hint(capsys) -> None:
+    """When LLM call fails, a stderr hint about --no-llm must be printed."""
+    finding = Finding(
+        rule_id="E1",
+        message="E1 test finding",
+        severity="HIGH",
+        confidence=0.8,
+        file="SKILL.md",
+        start_line=1,
+    )
+    state: dict[str, object] = {
+        "findings": [finding],
+        "use_llm": True,
+        "file_cache": {"SKILL.md": "# test\nsome content"},
+        "manifest": {"name": "test"},
+        "model_config": {},
+    }
+    batch = Batch(file_path="SKILL.md", content="# test\nsome content", findings=[finding])
+    with (
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]),
+        patch.object(
+            LLMMetaAnalyzer,
+            "arun_batches",
+            new_callable=AsyncMock,
+            side_effect=Exception("provider not available"),
+        ),
+    ):
+        result = meta_analyzer(state)
+
+    captured = capsys.readouterr()
+    assert "--no-llm" in captured.err, "stderr must mention --no-llm when LLM fails"
+    assert result["filtered_findings"], "fail-closed: findings still returned"

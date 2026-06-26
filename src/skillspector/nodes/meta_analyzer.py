@@ -571,4 +571,12 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         logger.warning(
             "LLM call failed, passing all findings through (fail-closed): %s", e, exc_info=True
         )
+        import sys as _sys
+
+        print(
+            f"LLM analysis unavailable (provider error: {e}). Static findings only.\n"
+            "Re-run with --no-llm to suppress this warning.",
+            file=_sys.stderr,
+            flush=True,
+        )
         return {"filtered_findings": _passthrough_with_defaults(findings)}

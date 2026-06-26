@@ -147,6 +147,15 @@ class SubprocessChatModel(BaseChatModel):
                 f"LLM subprocess timed out after {self.timeout}s (command: {self.command!r})"
             ) from exc
         if result.returncode != 0:
+            if not result.stdout.strip() and "claude" in args[0].lower():
+                raise RuntimeError(
+                    f"subprocess LLM command exited with code {result.returncode} and no output. "
+                    "If using 'claude -p' as the LLM command, note that headless claude processes "
+                    "cannot inherit enterprise session credentials. "
+                    "Consider SKILLSPECTOR_PROVIDER=anthropic_proxy with an enterprise API gateway, "
+                    "or use the file-based IPC bridge pattern. See docs/enterprise-setup.md.\n"
+                    "Tip: re-run with --no-llm to get static-only results immediately."
+                )
             raise RuntimeError(
                 f"LLM subprocess failed (exit {result.returncode}): {result.stderr.strip()}"
             )

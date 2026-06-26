@@ -261,3 +261,31 @@ class TestWithStructuredOutput:
             result = runnable.invoke([HumanMessage(content="test")])
 
         assert result.value == "fenced"
+
+
+class TestExitCode1Diagnostic:
+    """exit code 1 diagnostic hint for headless claude sessions."""
+
+    def test_exit_code_1_no_stdout_gives_enterprise_hint(self):
+        """exit code 1 with no stdout and 'claude' in command should raise with enterprise hint."""
+        model = SubprocessChatModel(command="claude -p", timeout=10.0)
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        with patch("subprocess.run", return_value=mock_result):
+            with pytest.raises(RuntimeError, match="enterprise session credentials"):
+                model._call_subprocess("test prompt")
+
+    def test_exit_code_1_with_stdout_gives_generic_error(self):
+        """exit code 1 with stdout present should give the generic error (not enterprise hint)."""
+        model = SubprocessChatModel(command="some-other-tool", timeout=10.0)
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = "some output"
+        mock_result.stderr = "error detail"
+        with patch("subprocess.run", return_value=mock_result):
+            with pytest.raises(RuntimeError) as exc_info:
+                model._call_subprocess("test prompt")
+        assert "enterprise session credentials" not in str(exc_info.value)
+        assert "exit 1" in str(exc_info.value)
