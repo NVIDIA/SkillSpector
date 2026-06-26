@@ -207,3 +207,63 @@ def test_recursive_depth_fallback_warning_message(safe_skill_dir: Path, tmp_path
         app, ["scan", str(col), "--recursive", "--no-llm", "--format", "json"]
     )
     assert "--depth 2" in result.output or "--depth 2" in result.output.lower()
+
+
+def test_recursive_json_detail_includes_issues(tmp_path: Path) -> None:
+    """--recursive --format json --detail must include issues[] per skill."""
+    # Create two minimal skills
+    for name in ("skill-a", "skill-b"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\n# {name}\n",
+            encoding="utf-8",
+        )
+    out_file = tmp_path / "results.json"
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--format",
+            "json",
+            "--detail",
+            "--no-llm",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert result.exit_code in (0, 1)
+    assert out_file.exists()
+    data = json.loads(out_file.read_text())
+    assert "summary" in data
+    assert "skills" in data
+    for _path, skill_data in data["skills"].items():
+        assert "issues" in skill_data, "each skill entry must have issues[]"
+
+
+def test_recursive_json_without_detail_no_issues(tmp_path: Path) -> None:
+    """Without --detail, recursive JSON must NOT include issues[] (backward compat)."""
+    for name in ("skill-a", "skill-b"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+    out_file = tmp_path / "results.json"
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--format",
+            "json",
+            "--no-llm",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert out_file.exists()
+    data = json.loads(out_file.read_text())
+    for skill_data in data.get("skills", {}).values():
+        assert "issues" not in skill_data

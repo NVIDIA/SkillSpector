@@ -286,6 +286,13 @@ def scan(
             help="Skip auto-discovery of .skillspector-baseline.yaml in the scanned directory.",
         ),
     ] = False,
+    detail: Annotated[
+        bool,
+        typer.Option(
+            "--detail",
+            help="Include full finding details (issues[]) in recursive JSON output.",
+        ),
+    ] = False,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -331,7 +338,7 @@ def scan(
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path, depth=depth)
         if detection.is_multi_skill:
-            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
+            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose, detail)
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
             console.print(
@@ -429,6 +436,7 @@ def _scan_multi_skill(
     no_llm: bool,
     yara_rules_dir: Path | None,
     verbose: bool,
+    detail: bool = False,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     skills = detection.skills
@@ -474,27 +482,41 @@ def _scan_multi_skill(
     console.print("")
 
     if output and format == FormatChoice.json:
-        combined = {
-            "multi_skill": True,
-            "skill_count": len(skills),
-            "max_risk_score": max_score,
-            "skills": [],
-        }
+        # Count by severity across all skills for the summary.
+        sev_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        skills_dict: dict[str, object] = {}
         for skill, result in zip(skills, results, strict=True):
             if "error" in result:
-                combined["skills"].append({"name": skill.name, "error": result["error"]})
-            else:
-                combined["skills"].append(
-                    {
-                        "name": skill.name,
-                        "path": skill.relative_path,
-                        "risk_score": result.get("risk_score", 0),
-                        "risk_severity": result.get("risk_severity", "LOW"),
-                        "finding_count": len(
-                            result.get("filtered_findings") or result.get("findings") or []
-                        ),
-                    }
-                )
+                skills_dict[f"./{skill.relative_path}"] = {
+                    "name": skill.name,
+                    "error": result["error"],
+                }
+                continue
+            findings_list = result.get("filtered_findings") or result.get("findings") or []
+            for f in findings_list:
+                sev = (
+                    f.severity if isinstance(f.severity, str) else str(f.severity)
+                ).lower()
+                if sev in sev_counts:
+                    sev_counts[sev] += 1
+            entry: dict[str, object] = {
+                "score": result.get("risk_score", 0),
+                "severity": result.get("risk_severity", "LOW"),
+                "finding_count": len(findings_list),
+            }
+            if detail:
+                entry["issues"] = [
+                    f.to_dict() for f in findings_list if hasattr(f, "to_dict")
+                ]
+            skills_dict[f"./{skill.relative_path}"] = entry
+
+        combined: dict[str, object] = {
+            "summary": {
+                "total_skills": len(skills),
+                **sev_counts,
+            },
+            "skills": skills_dict,
+        }
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
     elif output:
