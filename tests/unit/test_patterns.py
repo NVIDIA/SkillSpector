@@ -309,3 +309,47 @@ For tough stains, mix bleach and ammonia together.
 """
         findings = harmful_content_module.analyze(content, "SKILL.md", "markdown")
         assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# MCP Least Privilege: LP1/LP3 remediation content
+# ---------------------------------------------------------------------------
+
+from skillspector.nodes.analyzers.mcp_least_privilege import node as lp_node  # noqa: E402
+
+
+def _make_state_with_shell(has_permissions: bool = False) -> dict:
+    """Build a minimal state dict that triggers shell capability detection."""
+    return {
+        "manifest": {
+            "name": "test",
+            "permissions": ["network"] if has_permissions else [],
+        },
+        "file_cache": {"scripts/run.py": "import subprocess\nsubprocess.run(['ls'])"},
+        "component_metadata": [
+            {"path": "scripts/run.py", "executable": True, "type": "python"}
+        ],
+    }
+
+
+def test_lp1_remediation_lists_accepted_types() -> None:
+    """LP1 remediation must name the accepted permission types."""
+    state = _make_state_with_shell(has_permissions=True)  # has network but not shell
+    findings = lp_node(state)["findings"]
+    lp1 = [f for f in findings if f.rule_id == "LP1"]
+    assert lp1, "Expected LP1 finding"
+    assert "file_read" in lp1[0].remediation, "LP1 remediation must list accepted types"
+    assert "shell" in lp1[0].remediation
+
+
+def test_lp3_remediation_includes_snippet() -> None:
+    """LP3 remediation must include a copy-pasteable permissions YAML snippet."""
+    state = _make_state_with_shell(has_permissions=False)
+    # Remove the empty list so LP3 fires (permissions absent)
+    state["manifest"]["permissions"] = None
+    findings = lp_node(state)["findings"]
+    lp3 = [f for f in findings if f.rule_id == "LP3"]
+    assert lp3, "Expected LP3 finding"
+    assert "permissions:" in lp3[0].remediation, "LP3 remediation must include YAML snippet"
+    assert "shell" in lp3[0].remediation, "snippet must use correct capability type name"
+    assert "subprocess" not in lp3[0].remediation, "snippet must NOT use 'subprocess'"

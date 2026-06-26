@@ -89,6 +89,29 @@ _CAPABILITY_PATTERNS: dict[str, list[str]] = {
     ],
 }
 
+# Canonical type names accepted in the permissions field (for remediation snippets)
+_ACCEPTED_PERMISSION_TYPES = (
+    "file_read",
+    "file_write",
+    "shell",
+    "network",
+    "http_request",
+    "env_read",
+    "env_write",
+    "mcp",
+)
+_ACCEPTED_TYPES_STR = ", ".join(_ACCEPTED_PERMISSION_TYPES)
+
+# Internal capability name → canonical permission type for snippet generation
+_CAP_TO_PERMISSION_TYPE: dict[str, str] = {
+    "shell": "shell",
+    "network": "network",
+    "file_read": "file_read",
+    "file_write": "file_write",
+    "env": "env_read",
+    "mcp": "mcp",
+}
+
 # Permission string → capability category mapping (case-insensitive word-boundary matching)
 _PERM_TO_CAPABILITY: dict[str, str] = {
     "bash": "shell",
@@ -156,6 +179,27 @@ def _has_wildcard(permissions: list[str]) -> bool:
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
+
+
+def _build_permissions_snippet(caps: set[str], file_capabilities: dict[str, set[str]]) -> str:
+    """Build a copy-pasteable YAML permissions snippet from detected capabilities."""
+    lines = [
+        "",
+        "Suggested permissions block for SKILL.md frontmatter:",
+        "```yaml",
+        "permissions:",
+    ]
+    for cap in sorted(caps):
+        perm_type = _CAP_TO_PERMISSION_TYPE.get(cap, cap)
+        # Find one source file as an example
+        source = next(
+            (p for p, c in file_capabilities.items() if cap in c),
+            "your_script.py",
+        )
+        lines.append(f"  - type: {perm_type}")
+        lines.append(f'    description: "Detected {cap} usage in {source}"')
+    lines.append("```")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +297,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 ),
                 remediation=(
                     "Add a 'permissions' field to SKILL.md listing the capabilities this skill requires."
+                    + _build_permissions_snippet(all_caps, file_capabilities)
                 ),
             )
         )
@@ -304,7 +349,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             "This may indicate deceptive intent or missing permission declarations."
                         ),
                         remediation=(
-                            f"Add the '{cap}' permission to SKILL.md, or remove the code that requires it."
+                            f"Add the '{_CAP_TO_PERMISSION_TYPE.get(cap, cap)}' permission to SKILL.md, "
+                            f"or remove the code that requires it. "
+                            f"Accepted permission types: {_ACCEPTED_TYPES_STR}."
                         ),
                     )
                 )
