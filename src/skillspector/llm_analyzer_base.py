@@ -36,6 +36,7 @@ from typing import Literal
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field, field_validator
 
+from skillspector.llm_cache import LLMResponseCache, make_cache_key
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
@@ -270,14 +271,30 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
 
-    def __init__(self, base_prompt: str, model: str, analyzer_id: str = ""):
+    def __init__(
+        self,
+        base_prompt: str,
+        model: str,
+        analyzer_id: str = "",
+        cache: LLMResponseCache | None = None,
+    ) -> None:
         self.base_prompt = base_prompt
         self.model = model
         self.analyzer_id = analyzer_id
+        self._cache = cache
+        self._schema_version = self.response_schema.__name__ if self.response_schema else "raw"
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
+        )
+
+    def _cache_key(self, batch: Batch) -> object:
+        """Build a cache key for *batch* using content and prompt template hashes."""
+        return make_cache_key(
+            content=batch.content,
+            prompt_template=self.base_prompt,
+            schema_version=self._schema_version,
         )
 
     def _emit_progress(self, file_label: str, stage: str, detail: str = "") -> None:
@@ -388,9 +405,39 @@ class LLMAnalyzerBase:
         The element type of the inner list depends on the subclass: the default
         :meth:`parse_response` returns :class:`Finding` objects; subclasses may
         return dicts or other types.
+
+        When a cache is configured, each batch is looked up before the LLM call.
+        On a cache hit the stored JSON is re-parsed through the response schema and
+        the LLM call is skipped entirely.  New responses are stored in the cache
+        after a successful LLM call.
         """
+        import json as _json
+
         results: list[tuple[Batch, list]] = []
         for batch in batches:
+            # --- Cache check -------------------------------------------------
+            if self._cache is not None:
+                key = self._cache_key(batch)
+                cached = self._cache.get(key)
+                if cached is not None:
+                    self._emit_progress(batch.file_label, "cache hit")
+                    try:
+                        raw = _json.loads(cached)
+                        if self.response_schema and hasattr(self.response_schema, "model_validate"):
+                            response: object = self.response_schema.model_validate(raw)
+                        else:
+                            response = raw
+                        parsed = self.parse_response(response, batch)
+                        results.append((batch, parsed))
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "Cache hit but parse failed, calling LLM: %s", exc
+                        )
+            else:
+                key = None  # type: ignore[assignment]
+
+            # --- LLM call ----------------------------------------------------
             prompt = self.build_prompt(batch, **kwargs)
             self._emit_progress(batch.file_label, "requesting...")
             logger.debug(
@@ -404,6 +451,17 @@ class LLMAnalyzerBase:
             else:
                 response = _message_text(self._llm.invoke(prompt))
             logger.debug("LLM response for %s", batch.file_label)
+
+            # --- Store in cache ----------------------------------------------
+            if self._cache is not None and key is not None:
+                try:
+                    if hasattr(response, "model_dump"):
+                        self._cache.put(key, _json.dumps(response.model_dump()))  # type: ignore[union-attr]
+                    else:
+                        self._cache.put(key, _json.dumps(response))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Cache write failed: %s", exc)
+
             parsed = self.parse_response(response, batch)
             self._emit_progress(batch.file_label, "done", f"{len(parsed)} findings")
             results.append((batch, parsed))
@@ -430,11 +488,39 @@ class LLMAnalyzerBase:
         ``NotImplementedError`` signal misconfiguration rather than infra
         trouble and keep propagating.
 
+        When a cache is configured, cache hits are resolved synchronously before
+        the async fan-out so they never consume semaphore slots.
+
         The return type mirrors :meth:`run_batches`.
         """
+        import json as _json
+
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
+            # --- Cache check (sync — SQLite is not async) --------------------
+            if self._cache is not None:
+                key = self._cache_key(batch)
+                cached = self._cache.get(key)
+                if cached is not None:
+                    self._emit_progress(batch.file_label, "cache hit")
+                    try:
+                        raw = _json.loads(cached)
+                        if self.response_schema and hasattr(
+                            self.response_schema, "model_validate"
+                        ):
+                            response: object = self.response_schema.model_validate(raw)
+                        else:
+                            response = raw
+                        parsed = self.parse_response(response, batch)
+                        return (batch, parsed)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "Cache hit but parse failed, calling LLM: %s", exc
+                        )
+            else:
+                key = None  # type: ignore[assignment]
+
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
                 self._emit_progress(batch.file_label, "requesting...")
@@ -449,6 +535,17 @@ class LLMAnalyzerBase:
                 else:
                     response = _message_text(await self._llm.ainvoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
+
+                # --- Store in cache ------------------------------------------
+                if self._cache is not None and key is not None:
+                    try:
+                        if hasattr(response, "model_dump"):
+                            self._cache.put(key, _json.dumps(response.model_dump()))  # type: ignore[union-attr]
+                        else:
+                            self._cache.put(key, _json.dumps(response))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Cache write failed: %s", exc)
+
                 parsed = self.parse_response(response, batch)
                 self._emit_progress(batch.file_label, "done", f"{len(parsed)} findings")
                 return (batch, parsed)

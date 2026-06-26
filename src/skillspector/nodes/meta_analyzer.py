@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -34,6 +35,7 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     estimate_tokens,
 )
+from skillspector.llm_cache import LLMResponseCache
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.pattern_defaults import (
@@ -321,8 +323,13 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
     response_schema = MetaAnalyzerResult
 
-    def __init__(self, model: str):
-        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model, analyzer_id="meta_analyzer")
+    def __init__(self, model: str, cache: LLMResponseCache | None = None) -> None:
+        super().__init__(
+            base_prompt=PER_FILE_ANALYSIS_PROMPT,
+            model=model,
+            analyzer_id="meta_analyzer",
+            cache=cache,
+        )
 
     def _estimate_extra_overhead(self, findings: list[Finding]) -> int:
         if not findings:
@@ -527,7 +534,9 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     files_with_findings = sorted({f.file for f in findings})
 
     try:
-        analyzer = LLMMetaAnalyzer(model=model)
+        cache_dir = state.get("llm_cache_dir")
+        cache = LLMResponseCache(Path(cache_dir)) if cache_dir else None
+        analyzer = LLMMetaAnalyzer(model=model, cache=cache)
         batches = analyzer.get_batches(files_with_findings, file_cache, findings)
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",

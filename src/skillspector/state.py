@@ -90,6 +90,9 @@ class SkillspectorState(TypedDict, total=False):
     # When True, meta_analyzer skips LLM calls and returns all findings (fast / cheap mode)
     skip_meta: bool
 
+    # Directory for LLM response cache (set by build_context from skill_path)
+    llm_cache_dir: str | None
+
 
 class AnalyzerNodeResponse(TypedDict):
     """Strict analyzer update payload for graph state."""

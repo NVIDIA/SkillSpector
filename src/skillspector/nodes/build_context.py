@@ -259,4 +259,5 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
         "skill_classification": classification,
+        "llm_cache_dir": str(skill_dir / ".skillspector-cache"),
     }
