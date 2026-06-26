@@ -37,7 +37,7 @@ from typing import Literal
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field, field_validator
 
-from skillspector.llm_cache import LLMResponseCache, make_cache_key
+from skillspector.llm_cache import CacheKey, LLMResponseCache, make_cache_key
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
@@ -290,7 +290,7 @@ class LLMAnalyzerBase:
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
 
-    def _cache_key(self, batch: Batch) -> object:
+    def _cache_key(self, batch: Batch) -> CacheKey:
         """Build a cache key for *batch* using content and prompt template hashes."""
         return make_cache_key(
             content=batch.content,
@@ -415,6 +415,7 @@ class LLMAnalyzerBase:
         results: list[tuple[Batch, list]] = []
         for batch in batches:
             # --- Cache check -------------------------------------------------
+            key: CacheKey | None = None
             if self._cache is not None:
                 key = self._cache_key(batch)
                 cached = self._cache.get(key)
@@ -433,8 +434,6 @@ class LLMAnalyzerBase:
                         logger.debug(
                             "Cache hit but parse failed, calling LLM: %s", exc
                         )
-            else:
-                key = None  # type: ignore[assignment]
 
             # --- LLM call ----------------------------------------------------
             prompt = self.build_prompt(batch, **kwargs)
@@ -455,7 +454,7 @@ class LLMAnalyzerBase:
             if self._cache is not None and key is not None:
                 try:
                     if hasattr(response, "model_dump"):
-                        self._cache.put(key, json.dumps(response.model_dump()))  # type: ignore[union-attr]
+                        self._cache.put(key, json.dumps(response.model_dump()))
                     else:
                         self._cache.put(key, json.dumps(response))
                 except Exception as exc:  # noqa: BLE001
@@ -496,6 +495,7 @@ class LLMAnalyzerBase:
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
             # --- Cache check (sync — SQLite is not async) --------------------
+            key: CacheKey | None = None
             if self._cache is not None:
                 key = self._cache_key(batch)
                 cached = self._cache.get(key)
@@ -515,8 +515,6 @@ class LLMAnalyzerBase:
                         logger.debug(
                             "Cache hit but parse failed, calling LLM: %s", exc
                         )
-            else:
-                key = None  # type: ignore[assignment]
 
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
@@ -537,7 +535,7 @@ class LLMAnalyzerBase:
                 if self._cache is not None and key is not None:
                     try:
                         if hasattr(response, "model_dump"):
-                            self._cache.put(key, json.dumps(response.model_dump()))  # type: ignore[union-attr]
+                            self._cache.put(key, json.dumps(response.model_dump()))
                         else:
                             self._cache.put(key, json.dumps(response))
                     except Exception as exc:  # noqa: BLE001
