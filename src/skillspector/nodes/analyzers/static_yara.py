@@ -23,6 +23,7 @@ hack tools) based on industry open-source patterns. Users can supply additional 
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 import yara
@@ -52,6 +53,73 @@ _CATEGORY_MAP: dict[str, tuple[str, Severity]] = {
 _DEFAULT_RULE_ID = "YR4"
 _DEFAULT_SEVERITY = Severity.MEDIUM
 _DEFAULT_CONFIDENCE = 0.7
+
+# Negation words that, when near a flagged phrase, suggest defensive framing
+_NEGATION_WORDS = frozenset({
+    "not", "never", "don't", "dont", "avoid", "prevent", "untrusted",
+    "block", "reject", "refuse", "warning", "do not", "must not",
+    "should not", "shouldn't", "prohibited", "forbidden",
+})
+
+# Section headers that indicate security-education context
+_EDUCATION_HEADERS = re.compile(
+    r"^#{1,3}\s+(safety|trust\s+boundaries?|security\s+boundaries?|"
+    r"threat\s+model|security\s+considerations?|security\s+notes?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Rules that should be checked for negation context (YR1, YR4)
+_NEGATION_CHECK_RULES = frozenset({"YR1", "YR4"})
+# Confidence multiplier when negation context detected
+_NEGATION_CONFIDENCE_FACTOR = 0.50
+
+
+def _has_negation_context(context: str) -> bool:
+    """Return True when the context snippet contains negating words."""
+    if not context:
+        return False
+    context_lower = context.lower()
+    return any(word in context_lower for word in _NEGATION_WORDS)
+
+
+def _has_education_header(file_content: str) -> bool:
+    """Return True when the file contains a security-education section header."""
+    return bool(_EDUCATION_HEADERS.search(file_content))
+
+
+def _apply_negation_context_filter(
+    findings: list[AnalyzerFinding],
+    file_content: str,
+) -> list[AnalyzerFinding]:
+    """Post-process YARA findings: reduce confidence when negation/education context is present."""
+    has_education = _has_education_header(file_content)
+    result: list[AnalyzerFinding] = []
+    for f in findings:
+        if f.rule_id not in _NEGATION_CHECK_RULES:
+            result.append(f)
+            continue
+        tags = list(f.tags or [])
+        new_confidence = f.confidence
+        if has_education and "security_education" not in tags:
+            tags.append("security_education")
+        if _has_negation_context(f.context or ""):
+            new_confidence = round(f.confidence * _NEGATION_CONFIDENCE_FACTOR, 4)
+            if "likely_false_positive" not in tags:
+                tags.append("likely_false_positive")
+        result.append(
+            AnalyzerFinding(
+                rule_id=f.rule_id,
+                message=f.message,
+                severity=f.severity,
+                location=f.location,
+                confidence=new_confidence,
+                tags=tags,
+                context=f.context,
+                matched_text=f.matched_text,
+            )
+        )
+    return result
+
 
 # Module-level cache keyed by a content hash of all rule directories.
 _compiled_rules: yara.Rules | None = None
@@ -226,7 +294,9 @@ def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[Analyze
                 matched_text=matched_text,
             )
         )
-    return findings
+
+    # Post-filter: reduce confidence when negation/education context detected
+    return _apply_negation_context_filter(findings, content)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
