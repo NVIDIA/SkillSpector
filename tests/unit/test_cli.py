@@ -146,3 +146,27 @@ def test_baseline_warns_on_overwrite(safe_skill_dir: Path) -> None:
     assert result.exit_code in (0, 1)
     assert "overwriting existing baseline" in result.output.lower()
     assert "1 prior" in result.output.lower()
+
+
+def test_baseline_auto_discovered(safe_skill_dir: Path) -> None:
+    """baseline file in scanned dir is auto-loaded when --baseline not given."""
+    baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
+    baseline_file.write_text(
+        "version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8"
+    )
+    result = runner.invoke(
+        app, ["scan", str(safe_skill_dir), "--no-llm", "--format", "json"]
+    )
+    assert "Baseline: applying" in result.output
+
+
+def test_no_baseline_flag_skips_auto_discovery(safe_skill_dir: Path) -> None:
+    """--no-baseline must skip the auto-discovered baseline."""
+    baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
+    baseline_file.write_text(
+        "version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8"
+    )
+    result = runner.invoke(
+        app, ["scan", str(safe_skill_dir), "--no-llm", "--no-baseline", "--format", "json"]
+    )
+    assert "Baseline: applying" not in result.output

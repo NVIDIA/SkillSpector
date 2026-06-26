@@ -123,6 +123,20 @@ def main(
     pass
 
 
+def _auto_discover_baseline(input_path: str) -> Path | None:
+    """Return the auto-discovered baseline path, or None if not found.
+
+    Looks for ``.skillspector-baseline.yaml`` in the resolved directory
+    when *input_path* points to a local directory.
+    """
+    candidate = Path(input_path)
+    if candidate.is_dir():
+        bl = candidate.resolve() / ".skillspector-baseline.yaml"
+        if bl.exists():
+            return bl
+    return None
+
+
 def _scan_state(
     input_path: str,
     format: FormatChoice,
@@ -258,6 +272,13 @@ def scan(
                  "sys.executable, /etc/passwd in test assertion). Default: downgrade these to INFO.",
         ),
     ] = False,
+    no_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--no-baseline",
+            help="Skip auto-discovery of .skillspector-baseline.yaml in the scanned directory.",
+        ),
+    ] = False,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -320,12 +341,26 @@ def scan(
     result = None
     try:
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
+
+        # Auto-discover baseline if not explicitly given
+        effective_baseline = baseline
+        if effective_baseline is None and not no_baseline:
+            auto_bl = _auto_discover_baseline(input_path)
+            if auto_bl is not None:
+                effective_baseline = auto_bl
+                try:
+                    _loaded = load_baseline(auto_bl)
+                    n = len(_loaded.fingerprints or {}) + len(_loaded.rules or [])
+                except Exception:  # noqa: BLE001
+                    n = "?"
+                console.print(f"Baseline: applying {auto_bl.name} ({n} suppression(s))")
+
         state = _scan_state(
             input_path,
             format,
             no_llm,
             yara_rules_dir=yara_dir,
-            baseline=baseline,
+            baseline=effective_baseline,
             show_suppressed=show_suppressed,
             include_test_fixtures=include_test_fixtures,
         )
