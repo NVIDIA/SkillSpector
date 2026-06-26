@@ -85,7 +85,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
 
     try:
-        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model)
+        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model, analyzer_id=ANALYZER_ID)
         batches = analyzer.get_batches(components, file_cache)
         results = analyzer.run_batches(batches)
         findings = analyzer.collect_findings(results)

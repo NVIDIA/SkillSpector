@@ -322,7 +322,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
     response_schema = MetaAnalyzerResult
 
     def __init__(self, model: str):
-        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model)
+        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model, analyzer_id="meta_analyzer")
 
     def _estimate_extra_overhead(self, findings: list[Finding]) -> int:
         if not findings:

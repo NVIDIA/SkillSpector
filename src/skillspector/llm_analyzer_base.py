@@ -28,6 +28,7 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
@@ -269,13 +270,25 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
 
-    def __init__(self, base_prompt: str, model: str):
+    def __init__(self, base_prompt: str, model: str, analyzer_id: str = ""):
         self.base_prompt = base_prompt
         self.model = model
+        self.analyzer_id = analyzer_id
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
+        )
+
+    def _emit_progress(self, file_label: str, stage: str, detail: str = "") -> None:
+        """Print a single-line LLM progress indicator to stderr."""
+        if not self.analyzer_id:
+            return
+        suffix = f" ({detail})" if detail else ""
+        print(
+            f"[LLM] {self.analyzer_id}: {file_label} ({stage}){suffix}",
+            file=sys.stderr,
+            flush=True,
         )
 
     # -- Batching -----------------------------------------------------------
@@ -379,6 +392,7 @@ class LLMAnalyzerBase:
         results: list[tuple[Batch, list]] = []
         for batch in batches:
             prompt = self.build_prompt(batch, **kwargs)
+            self._emit_progress(batch.file_label, "requesting...")
             logger.debug(
                 "LLM call for %s (tokens~%d, findings=%d)",
                 batch.file_label,
@@ -391,6 +405,7 @@ class LLMAnalyzerBase:
                 response = _message_text(self._llm.invoke(prompt))
             logger.debug("LLM response for %s", batch.file_label)
             parsed = self.parse_response(response, batch)
+            self._emit_progress(batch.file_label, "done", f"{len(parsed)} findings")
             results.append((batch, parsed))
         return results
 
@@ -422,6 +437,7 @@ class LLMAnalyzerBase:
         async def _process(batch: Batch) -> tuple[Batch, list]:
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
+                self._emit_progress(batch.file_label, "requesting...")
                 logger.debug(
                     "LLM call for %s (tokens~%d, findings=%d)",
                     batch.file_label,
@@ -433,7 +449,9 @@ class LLMAnalyzerBase:
                 else:
                     response = _message_text(await self._llm.ainvoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
-                return (batch, self.parse_response(response, batch))
+                parsed = self.parse_response(response, batch)
+                self._emit_progress(batch.file_label, "done", f"{len(parsed)} findings")
+                return (batch, parsed)
 
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         successful: list[tuple[Batch, list]] = []
