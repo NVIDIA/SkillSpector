@@ -486,6 +486,39 @@ def mcp(
         raise typer.Exit(code=2) from e
 
 
+def _resolve_baseline_output(input_path: str, explicit_output: Path | None) -> Path:
+    """Return the path where the baseline file should be written.
+
+    Priority:
+    1. Explicit --output path (always honoured).
+    2. <input_path>/.skillspector-baseline.yaml when input_path is a local directory.
+    3. CWD/.skillspector-baseline.yaml as a last resort (remote / archive inputs).
+    """
+    if explicit_output is not None:
+        return explicit_output
+    candidate = Path(input_path)
+    if candidate.is_dir():
+        return candidate.resolve() / ".skillspector-baseline.yaml"
+    return Path(".skillspector-baseline.yaml")
+
+
+def _warn_if_overwriting(output: Path) -> None:
+    """Print a warning if a baseline file already exists at *output*."""
+    if not output.exists():
+        return
+    try:
+        import yaml as _yaml  # noqa: PLC0415
+
+        data = _yaml.safe_load(output.read_text(encoding="utf-8")) or {}
+        prior = len(data.get("fingerprints") or []) + len(data.get("rules") or [])
+    except Exception:  # noqa: BLE001
+        prior = "unknown"
+    console.print(
+        f"[yellow]Warning:[/yellow] overwriting existing baseline at {output} "
+        f"({prior} prior suppression(s))"
+    )
+
+
 @app.command()
 def baseline(
     input_path: Annotated[
@@ -495,13 +528,16 @@ def baseline(
         ),
     ],
     output: Annotated[
-        Path,
+        Path | None,
         typer.Option(
             "--output",
             "-o",
-            help="Where to write the baseline file (YAML; .json extension writes JSON).",
+            help=(
+                "Where to write the baseline file (YAML; .json extension writes JSON). "
+                "Defaults to <target-dir>/.skillspector-baseline.yaml."
+            ),
         ),
-    ] = Path(".skillspector-baseline.yaml"),
+    ] = None,
     no_llm: Annotated[
         bool,
         typer.Option(
@@ -543,9 +579,11 @@ def baseline(
         result = graph.invoke(state)
         findings = result.get("filtered_findings") or result.get("findings") or []
         data = build_baseline_dict(findings, reason=reason)
-        dump_baseline(data, output)
+        resolved_output = _resolve_baseline_output(input_path, output)
+        _warn_if_overwriting(resolved_output)
+        dump_baseline(data, resolved_output)
         console.print(
-            f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
+            f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {resolved_output}"
         )
     except typer.Exit:
         raise

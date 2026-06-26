@@ -113,3 +113,36 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     data = json.loads(scan.output)
     assert data["issues"] == []
     assert data["risk_assessment"]["score"] == 0
+
+
+def test_baseline_writes_to_target_directory(safe_skill_dir: Path) -> None:
+    """baseline <path> should write into <path>/, not CWD."""
+    result = runner.invoke(app, ["baseline", str(safe_skill_dir), "--no-llm"])
+    assert result.exit_code in (0, 1)  # 1 is OK (risk score exit), 2 is error
+    baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
+    assert baseline_file.exists(), "baseline file must land in target directory"
+
+
+def test_baseline_explicit_output_still_honoured(safe_skill_dir: Path, tmp_path: Path) -> None:
+    """--output path overrides the default target-dir placement."""
+    custom = tmp_path / "custom.yaml"
+    result = runner.invoke(
+        app, ["baseline", str(safe_skill_dir), "--output", str(custom), "--no-llm"]
+    )
+    assert result.exit_code in (0, 1)
+    assert custom.exists()
+    assert not (safe_skill_dir / ".skillspector-baseline.yaml").exists()
+
+
+def test_baseline_warns_on_overwrite(safe_skill_dir: Path) -> None:
+    """Second baseline call prints 'overwriting existing baseline' with prior count."""
+    existing = safe_skill_dir / ".skillspector-baseline.yaml"
+    existing.write_text(
+        "version: 1\nrules: []\nfingerprints:\n"
+        "  - hash: 'sha256:aabbccdd11223344'\n    rule_id: T1\n    file: f.md\n    reason: test\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["baseline", str(safe_skill_dir), "--no-llm"])
+    assert result.exit_code in (0, 1)
+    assert "overwriting existing baseline" in result.output.lower()
+    assert "1 prior" in result.output.lower()
