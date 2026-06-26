@@ -1,22 +1,25 @@
 /*
     SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
     SPDX-License-Identifier: Apache-2.0
 
-    AI agent skill abuse detection rules for source and manifest scanning.
+    用于源代码和清单文件扫描的 AI Agent Skill 滥用检测规则。
 
-    These rules complement the generic malware/webshell/cryptominer/hacktool
-    rules with patterns that are specific to agent skills and MCP/tool
-    metadata: credential exfiltration via commodity webhooks, prompt/tool
-    poisoning, remote bootstrap execution, and destructive autonomous actions.
+    这些规则补充了通用的恶意软件、WebShell、加密货币挖矿程序和黑客工具检测规则，
 
-    Conditions intentionally combine multiple indicators where possible to
-    reduce false positives in documentation-heavy skill bundles.
+    重点检测与 Agent Skill 和 MCP/工具元数据相关的风险行为，包括：
+
+    通过常见 Webhook 进行凭据窃取、提示词或工具投毒、远程引导执行以及具有破坏性的自主操作。
+
+    检测条件在可能的情况下会组合多个特征指标，
+
+    以降低包含大量文档内容的 Skill 包产生误报的概率。
 */
 
 rule agent_skill_credential_exfiltration_webhook
 {
     meta:
-        description = "AI agent skill credential harvesting followed by webhook or external exfiltration"
+        description = "AI Agent Skill 收集凭据并通过 Webhook 或外部渠道进行数据泄露"
         category = "malware"
         severity = "CRITICAL"
         confidence = "0.85"
@@ -45,7 +48,7 @@ rule agent_skill_credential_exfiltration_webhook
 rule agent_skill_remote_bootstrap_execution
 {
     meta:
-        description = "Remote script or code download followed by execution/bootstrap installation"
+        description = "下载远程脚本或代码后立即执行，或进行远程引导安装"
         category = "malware"
         severity = "HIGH"
         confidence = "0.85"
@@ -63,7 +66,7 @@ rule agent_skill_remote_bootstrap_execution
 rule agent_skill_prompt_injection_hidden_instructions
 {
     meta:
-        description = "Prompt injection or hidden instructions embedded in AI agent skill text"
+        description = "AI Agent Skill 文本中嵌入的提示词注入或隐藏指令"
         category = "hack_tool"
         severity = "HIGH"
         confidence = "0.80"
@@ -85,7 +88,7 @@ rule agent_skill_prompt_injection_hidden_instructions
 rule agent_skill_mcp_tool_poisoning_metadata
 {
     meta:
-        description = "MCP/tool metadata poisoning indicators in tool schemas or skill manifests"
+        description = "工具 Schema 或 Skill 清单中的 MCP/工具元数据投毒特征"
         category = "hack_tool"
         severity = "HIGH"
         confidence = "0.80"
@@ -120,7 +123,7 @@ rule agent_skill_mcp_tool_poisoning_metadata
 rule agent_skill_destructive_autonomous_actions
 {
     meta:
-        description = "Autonomous destructive filesystem, shell history, or repository actions in AI agent skills"
+        description = "AI Agent Skill 中的自主破坏性文件系统、命令历史或代码仓库操作"
         category = "malware"
         severity = "HIGH"
         confidence = "0.75"

@@ -1,13 +1,13 @@
 /*
-    Webshell detection rules for source code scanning.
-    Based on patterns from Neo23x0/signature-base (DRL-1.1) and community research.
-    Adapted for AI agent skill artifact scanning.
+    用于源代码扫描的 WebShell 检测规则。
+    基于 Neo23x0/signature-base（DRL-1.1）和社区研究中的模式。
+    已适配 AI Agent Skill 工件扫描场景。
 */
 
 rule php_webshell_generic
 {
     meta:
-        description = "Generic PHP webshell — eval/assert on user-controlled input"
+        description = "通用 PHP WebShell —— 对用户可控输入执行 eval/assert"
         category = "webshell"
         severity = "CRITICAL"
         confidence = "0.85"
@@ -27,7 +27,7 @@ rule php_webshell_generic
 rule php_webshell_obfuscated
 {
     meta:
-        description = "Obfuscated PHP webshell — eval(base64_decode/gzinflate/str_rot13)"
+        description = "混淆型 PHP WebShell —— 使用 base64_decode、gzinflate 或 str_rot13 等方式隐藏恶意代码"
         category = "webshell"
         severity = "CRITICAL"
         confidence = "0.8"
@@ -46,7 +46,7 @@ rule php_webshell_obfuscated
 rule php_webshell_known
 {
     meta:
-        description = "Known PHP webshell families (c99, r57, b374k, WSO, etc.)"
+        description = "已知 PHP WebShell 家族（如 c99、r57、b374k、WSO 等）"
         category = "webshell"
         severity = "CRITICAL"
         confidence = "0.9"
@@ -72,7 +72,7 @@ rule php_webshell_known
 rule python_webshell
 {
     meta:
-        description = "Python webshell — exec/eval/os.popen on request input"
+        description = "Python WebShell —— 对用户请求中的输入执行 exec、eval 或系统命令"
         category = "webshell"
         severity = "HIGH"
         confidence = "0.75"
@@ -90,7 +90,7 @@ rule python_webshell
 rule jsp_webshell
 {
     meta:
-        description = "JSP webshell — Runtime.exec on request parameter"
+        description = "JSP WebShell —— 将请求参数传递给 Runtime.exec 执行系统命令"
         category = "webshell"
         severity = "HIGH"
         confidence = "0.8"
@@ -104,7 +104,7 @@ rule jsp_webshell
 rule aspx_webshell
 {
     meta:
-        description = "ASPX webshell — Process.Start on Request input"
+        description = "ASPX WebShell —— 使用 Request 输入调用 Process.Start 执行系统命令"
         category = "webshell"
         severity = "HIGH"
         confidence = "0.8"

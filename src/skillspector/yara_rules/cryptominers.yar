@@ -1,13 +1,13 @@
 /*
-    Crypto miner detection rules for source code scanning.
-    Based on patterns from Neo23x0/signature-base and community threat intelligence.
-    Covers stratum protocol, known pools, mining software references, and browser-based miners.
+   用于源代码扫描的加密挖矿检测规则。 
+   基于 Neo23x0/signature-base 和社区威胁情报中的模式。 
+   覆盖 Stratum 协议、已知矿池、挖矿软件引用以及基于浏览器的挖矿程序。
 */
 
 rule crypto_stratum_protocol
 {
     meta:
-        description = "Stratum mining protocol usage (stratum+tcp/ssl, mining.subscribe/authorize)"
+        description = "检测 Stratum 加密货币挖矿协议通信特征"
         category = "cryptominer"
         severity = "HIGH"
         confidence = "0.9"
@@ -25,7 +25,7 @@ rule crypto_stratum_protocol
 rule crypto_mining_pools
 {
     meta:
-        description = "Connection to known cryptocurrency mining pools"
+        description = "检测与已知加密货币矿池建立连接的行为"
         category = "cryptominer"
         severity = "HIGH"
         confidence = "0.85"
@@ -56,7 +56,7 @@ rule crypto_mining_pools
 rule crypto_miner_software
 {
     meta:
-        description = "References to known cryptocurrency mining software"
+        description = "检测加密货币挖矿程序及相关组件特征"
         category = "cryptominer"
         severity = "HIGH"
         confidence = "0.8"
@@ -80,7 +80,7 @@ rule crypto_miner_software
 rule crypto_coinjacking
 {
     meta:
-        description = "Browser-based cryptojacking scripts (CoinHive, CryptoLoot, etc.)"
+        description = "检测网页挖矿（Cryptojacking）脚本及相关恶意代码"
         category = "cryptominer"
         severity = "CRITICAL"
         confidence = "0.9"

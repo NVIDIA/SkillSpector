@@ -1,14 +1,18 @@
 /*
-    Hack tool and exploit kit detection rules for source code scanning.
-    Based on patterns from Neo23x0/signature-base and community research.
-    Detects references to known offensive tools, exploit frameworks, and
-    attack utilities that should not appear in legitimate AI agent skills.
+    黑客工具与漏洞利用工具检测规则（用于源代码扫描）。
+
+    规则参考 Neo23x0/signature-base 以及安全社区研究成果，
+    用于检测已知攻击工具、漏洞利用框架、渗透测试工具以及
+    攻击辅助程序相关特征。
+
+    这些工具和框架通常不应出现在合法的 AI Agent Skill、
+    自动化工作流或生产环境业务代码中。
 */
 
 rule offensive_tool_references
 {
     meta:
-        description = "References to well-known offensive security tools"
+        description = "检测常见渗透测试工具及攻击框架特征"
         category = "hack_tool"
         severity = "HIGH"
         confidence = "0.7"
@@ -32,7 +36,7 @@ rule offensive_tool_references
 rule network_reconnaissance
 {
     meta:
-        description = "Network reconnaissance and scanning patterns"
+        description = "检测网络侦察与资产扫描行为特征"
         category = "hack_tool"
         severity = "MEDIUM"
         confidence = "0.65"
@@ -50,7 +54,7 @@ rule network_reconnaissance
 rule privilege_escalation_tools
 {
     meta:
-        description = "Privilege escalation tools and techniques"
+        description = "检测权限提升工具及提权技术相关特征"
         category = "hack_tool"
         severity = "HIGH"
         confidence = "0.75"
@@ -70,7 +74,7 @@ rule privilege_escalation_tools
 rule exploit_framework
 {
     meta:
-        description = "Exploit framework components and payloads"
+        description = "检测漏洞利用框架组件及攻击载荷特征"
         category = "exploit"
         severity = "HIGH"
         confidence = "0.8"
@@ -89,7 +93,7 @@ rule exploit_framework
 rule phishing_kit
 {
     meta:
-        description = "Phishing kit indicators in source code"
+        description = "检测钓鱼页面、凭据收集及信息窃取代码特征"
         category = "hack_tool"
         severity = "HIGH"
         confidence = "0.7"

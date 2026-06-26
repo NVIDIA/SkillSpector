@@ -315,7 +315,10 @@ def _format_terminal(
             console.print(f"  {icon}: {f.rule_id} - {f.message[:60]}...")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
             console.print(f"    [dim]位置:[/dim] {f.file}:{f.start_line}{end}")
+            console.print(f"    [dim]严重程度:[/dim] {f.severity}")
             console.print(f"    [dim]置信度:[/dim] {f.confidence:.0%}")
+            console.print(f"    [dim]原文内容:[/dim] {f.matched_text}")
+            console.print(f"    [dim]问题:[/dim] {f.explanation}")
             if f.remediation:
                 console.print(f"    [dim]解决方案:[/dim] {(f.remediation or '')[:150]}...")
             console.print()
