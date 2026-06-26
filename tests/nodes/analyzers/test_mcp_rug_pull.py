@@ -250,3 +250,15 @@ class TestMcpRugPullNode:
         rule_ids = {f.rule_id for f in findings}
         assert rule_ids == {"RP1", "RP2", "RP3"}
         assert len(findings) == 3
+
+
+def test_tp4_prompt_has_no_injection_trigger() -> None:
+    """TP4 system prompt must not contain the injection-detection phrase."""
+    import inspect
+
+    from skillspector.nodes.analyzers import mcp_tool_poisoning
+
+    source = inspect.getsource(mcp_tool_poisoning)
+    assert "IGNORE all instructions" not in source, (
+        "TP4 prompt contains injection-trigger phrase that breaks enterprise subprocess provider"
+    )
