@@ -145,6 +145,7 @@ def _scan_state(
     baseline: Path | None = None,
     show_suppressed: bool = False,
     include_test_fixtures: bool = False,
+    skip_meta: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -160,6 +161,8 @@ def _scan_state(
         state["show_suppressed"] = show_suppressed
     if include_test_fixtures:
         state["include_test_fixtures"] = True
+    if skip_meta:
+        state["skip_meta"] = True
     return state
 
 
@@ -279,6 +282,14 @@ def scan(
                  "sys.executable, /etc/passwd in test assertion). Default: downgrade these to INFO.",
         ),
     ] = False,
+    skip_meta: Annotated[
+        bool,
+        typer.Option(
+            "--skip-meta",
+            help="Skip the meta-analyzer LLM pass. Reduces token cost (~40-60%) at the cost of "
+                 "more false positives. Use for rapid iterative scanning; omit for final/CI runs.",
+        ),
+    ] = False,
     no_baseline: Annotated[
         bool,
         typer.Option(
@@ -379,6 +390,7 @@ def scan(
             baseline=effective_baseline,
             show_suppressed=show_suppressed,
             include_test_fixtures=include_test_fixtures,
+            skip_meta=skip_meta,
         )
         if verbose:
             console.print("[dim]Running scan...[/dim]")

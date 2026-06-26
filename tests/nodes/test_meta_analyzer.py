@@ -231,6 +231,24 @@ class TestMetaAnalyzerPartialBatchFailure:
         assert kept == {("a.py", "R1")}
 
 
+def test_skip_meta_bypasses_llm_entirely() -> None:
+    """skip_meta=True must return all findings without any LLM call."""
+    from skillspector.state import SkillspectorState
+
+    state = SkillspectorState(
+        findings=[_finding("E1", 1), _finding("P1", 2)],
+        use_llm=True,
+        skip_meta=True,
+        file_cache={"SKILL.md": "content"},
+        manifest={},
+        model_config={},
+    )
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
+        result = meta_analyzer(state)
+    mock_cls.assert_not_called()
+    assert len(result["filtered_findings"]) == 2
+
+
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
 def test_meta_analyzer_llm_failure_prints_stderr_hint(capsys) -> None:
     """When LLM call fails, a stderr hint about --no-llm must be printed."""

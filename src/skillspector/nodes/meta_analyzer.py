@@ -511,6 +511,10 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     if not findings:
         return {"filtered_findings": []}
 
+    if state.get("skip_meta", False):
+        logger.info("meta_analyzer: --skip-meta specified, skipping LLM filter")
+        return {"filtered_findings": _passthrough_with_defaults(findings)}
+
     if state.get("use_llm", True) is False:
         return {"filtered_findings": _fallback_filtered(findings)}
 

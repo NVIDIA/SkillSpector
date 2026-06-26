@@ -87,6 +87,9 @@ class SkillspectorState(TypedDict, total=False):
     # Classification of the skill (general | security_research | offensive_security)
     skill_classification: str | None
 
+    # When True, meta_analyzer skips LLM calls and returns all findings (fast / cheap mode)
+    skip_meta: bool
+
 
 class AnalyzerNodeResponse(TypedDict):
     """Strict analyzer update payload for graph state."""
