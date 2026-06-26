@@ -268,6 +268,13 @@ def scan(
         skillspector scan ./my-skill/ --format json --output report.json
         skillspector scan https://github.com/user/my-skill --no-llm
         skillspector scan ./skill-collection/ --recursive
+        skillspector scan ./my-skill/ --include-test-fixtures
+
+    Flags:
+
+        --include-test-fixtures: Include AST4/PE3 findings that are likely test-harness
+                                 patterns (shell=False + sys.executable, /etc/passwd in
+                                 test assertion). Default: downgrade these to INFO.
 
     Environment variables:
 

@@ -118,10 +118,12 @@ def _is_pe3_test_fixture(content: str, match_start: int, file_path: str) -> bool
     # Check 15 lines before for a test function definition
     start = max(0, line_idx - 15)
     surrounding = "\n".join(lines[start : line_idx + 1]).lower()
-    # Must be a test_ function that mentions a traversal-related keyword
-    has_test_func = re.search(r"\bdef\s+test_\w+", surrounding) is not None
-    has_keyword = any(kw in surrounding for kw in _PE3_TEST_FUNCTION_KEYWORDS)
-    return has_test_func and has_keyword
+    # Must be a test_ function whose name contains a traversal-related keyword
+    has_test_func = re.search(
+        r"\bdef\s+test_\w*(?:traversal|path|inject|sanitize|escape|neutralize)\w*",
+        surrounding,
+    ) is not None
+    return has_test_func
 
 
 def analyze(content: str, file_path: str, file_type: str, include_test_fixtures: bool = False) -> list[AnalyzerFinding]:
