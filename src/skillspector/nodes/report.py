@@ -567,6 +567,13 @@ def report(state: SkillspectorState) -> dict[str, object]:
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings_for_scoring, has_executable_scripts
     )
+
+    # Offensive security override: authorized tools get a context-aware recommendation
+    # rather than a blanket DO_NOT_INSTALL, regardless of score-based severity.
+    classification = state.get("skill_classification")
+    if classification == "offensive_security":
+        risk_recommendation = "AUTHORIZED OFFENSIVE TOOL — review findings in context"
+
     sarif_report = _build_sarif(active_findings, suppressed)
     analysis_completeness = _build_analysis_completeness(
         components, file_cache, use_llm, raw_findings, filtered_findings

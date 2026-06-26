@@ -84,6 +84,9 @@ class SkillspectorState(TypedDict, total=False):
     # When True, test-fixture heuristics do not downgrade AST4/PE3 confidence
     include_test_fixtures: bool
 
+    # Classification of the skill (general | security_research | offensive_security)
+    skill_classification: str | None
+
 
 class AnalyzerNodeResponse(TypedDict):
     """Strict analyzer update payload for graph state."""
