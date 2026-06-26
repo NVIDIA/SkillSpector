@@ -23,9 +23,11 @@ its actual code behavior using LLM-based analysis.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL, MODEL_CONFIG
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.llm_cache import LLMResponseCache
 from skillspector.logging_config import get_logger
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
@@ -173,8 +175,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
 
     try:
+        cache_dir = state.get("llm_cache_dir")
+        cache = LLMResponseCache(Path(cache_dir)) if cache_dir else None
         prompt = ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest))
-        analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model, analyzer_id=ANALYZER_ID)
+        analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model, analyzer_id=ANALYZER_ID, cache=cache)
         batches = analyzer.get_batches(sorted(file_cache), file_cache)
         results = asyncio.run(analyzer.arun_batches(batches))
         findings = analyzer.collect_findings(results)

@@ -28,6 +28,7 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -411,8 +412,6 @@ class LLMAnalyzerBase:
         the LLM call is skipped entirely.  New responses are stored in the cache
         after a successful LLM call.
         """
-        import json as _json
-
         results: list[tuple[Batch, list]] = []
         for batch in batches:
             # --- Cache check -------------------------------------------------
@@ -422,7 +421,7 @@ class LLMAnalyzerBase:
                 if cached is not None:
                     self._emit_progress(batch.file_label, "cache hit")
                     try:
-                        raw = _json.loads(cached)
+                        raw = json.loads(cached)
                         if self.response_schema and hasattr(self.response_schema, "model_validate"):
                             response: object = self.response_schema.model_validate(raw)
                         else:
@@ -456,9 +455,9 @@ class LLMAnalyzerBase:
             if self._cache is not None and key is not None:
                 try:
                     if hasattr(response, "model_dump"):
-                        self._cache.put(key, _json.dumps(response.model_dump()))  # type: ignore[union-attr]
+                        self._cache.put(key, json.dumps(response.model_dump()))  # type: ignore[union-attr]
                     else:
-                        self._cache.put(key, _json.dumps(response))
+                        self._cache.put(key, json.dumps(response))
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Cache write failed: %s", exc)
 
@@ -493,8 +492,6 @@ class LLMAnalyzerBase:
 
         The return type mirrors :meth:`run_batches`.
         """
-        import json as _json
-
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
@@ -505,7 +502,7 @@ class LLMAnalyzerBase:
                 if cached is not None:
                     self._emit_progress(batch.file_label, "cache hit")
                     try:
-                        raw = _json.loads(cached)
+                        raw = json.loads(cached)
                         if self.response_schema and hasattr(
                             self.response_schema, "model_validate"
                         ):
@@ -540,9 +537,9 @@ class LLMAnalyzerBase:
                 if self._cache is not None and key is not None:
                     try:
                         if hasattr(response, "model_dump"):
-                            self._cache.put(key, _json.dumps(response.model_dump()))  # type: ignore[union-attr]
+                            self._cache.put(key, json.dumps(response.model_dump()))  # type: ignore[union-attr]
                         else:
-                            self._cache.put(key, _json.dumps(response))
+                            self._cache.put(key, json.dumps(response))
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("Cache write failed: %s", exc)
 
