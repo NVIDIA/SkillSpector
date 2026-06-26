@@ -81,6 +81,9 @@ class SkillspectorState(TypedDict, total=False):
     # Additional YARA rules directory (user-specified via --yara-rules-dir)
     yara_rules_dir: str | None
 
+    # When True, test-fixture heuristics do not downgrade AST4/PE3 confidence
+    include_test_fixtures: bool
+
 
 class AnalyzerNodeResponse(TypedDict):
     """Strict analyzer update payload for graph state."""

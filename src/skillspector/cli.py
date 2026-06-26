@@ -130,6 +130,7 @@ def _scan_state(
     yara_rules_dir: str | None = None,
     baseline: Path | None = None,
     show_suppressed: bool = False,
+    include_test_fixtures: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -143,6 +144,8 @@ def _scan_state(
         # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
         state["baseline"] = load_baseline(baseline)
         state["show_suppressed"] = show_suppressed
+    if include_test_fixtures:
+        state["include_test_fixtures"] = True
     return state
 
 
@@ -247,6 +250,14 @@ def scan(
             help="Show detailed progress.",
         ),
     ] = False,
+    include_test_fixtures: Annotated[
+        bool,
+        typer.Option(
+            "--include-test-fixtures",
+            help="Include AST4/PE3 findings that are likely test-harness patterns (shell=False + "
+                 "sys.executable, /etc/passwd in test assertion). Default: downgrade these to INFO.",
+        ),
+    ] = False,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -309,6 +320,7 @@ def scan(
             yara_rules_dir=yara_dir,
             baseline=baseline,
             show_suppressed=show_suppressed,
+            include_test_fixtures=include_test_fixtures,
         )
         if verbose:
             console.print("[dim]Running scan...[/dim]")

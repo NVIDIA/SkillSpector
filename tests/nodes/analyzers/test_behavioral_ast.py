@@ -284,3 +284,59 @@ class TestMultipleFindings:
         assert "AST2" in rule_ids
         assert "AST4" in rule_ids
         assert "AST5" in rule_ids
+
+
+_SAFE_SUBPROCESS_TEST = """\
+import sys
+import subprocess
+
+def test_script_runs_cleanly():
+    result = subprocess.run([sys.executable, "scripts/tool.py", "--help"], shell=False, capture_output=True)
+    assert result.returncode == 0
+"""
+
+_UNSAFE_SUBPROCESS_PROD = """\
+import subprocess
+
+def render():
+    subprocess.run(["bash", "-c", user_input])
+"""
+
+
+class TestAST4TestFixtureHeuristic:
+    """AST4 test-fixture heuristic: downgrade confidence for safe test harness patterns."""
+
+    def test_ast4_test_fixture_downgraded(self):
+        """subprocess.run(shell=False, [sys.executable, ...]) in test file → downgraded to INFO."""
+        state = {
+            "components": ["test_runner.py"],
+            "file_cache": {"test_runner.py": _SAFE_SUBPROCESS_TEST},
+        }
+        result = behavioral_ast.node(state)
+        ast4 = [f for f in result["findings"] if f.rule_id == "AST4"]
+        assert ast4, "AST4 should still fire (it's a finding, just downgraded)"
+        assert ast4[0].confidence < 0.3, "test-fixture AST4 should be low confidence"
+        assert "likely_test_fixture" in ast4[0].tags
+
+    def test_ast4_production_code_not_downgraded(self):
+        """subprocess.run in non-test file stays at original confidence."""
+        state = {
+            "components": ["render.py"],
+            "file_cache": {"render.py": _UNSAFE_SUBPROCESS_PROD},
+        }
+        result = behavioral_ast.node(state)
+        ast4 = [f for f in result["findings"] if f.rule_id == "AST4"]
+        assert ast4
+        assert ast4[0].confidence >= 0.5
+
+    def test_ast4_test_fixture_not_downgraded_when_include_flag(self):
+        """--include-test-fixtures keeps test-file AST4 at full confidence."""
+        state = {
+            "components": ["test_runner.py"],
+            "file_cache": {"test_runner.py": _SAFE_SUBPROCESS_TEST},
+            "include_test_fixtures": True,
+        }
+        result = behavioral_ast.node(state)
+        ast4 = [f for f in result["findings"] if f.rule_id == "AST4"]
+        assert ast4
+        assert ast4[0].confidence >= 0.5, "include_test_fixtures=True means NO downgrade"
