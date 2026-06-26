@@ -170,3 +170,40 @@ def test_no_baseline_flag_skips_auto_discovery(safe_skill_dir: Path) -> None:
         app, ["scan", str(safe_skill_dir), "--no-llm", "--no-baseline", "--format", "json"]
     )
     assert "Baseline: applying" not in result.output
+
+
+def test_detect_skills_depth_2(tmp_path: Path) -> None:
+    """detect_skills with depth=2 should find skills nested two levels deep."""
+    from skillspector.multi_skill import detect_skills
+
+    # Create: root/category/skill-a/SKILL.md
+    skill_a = tmp_path / "category" / "skill-a"
+    skill_a.mkdir(parents=True)
+    (skill_a / "SKILL.md").write_text("---\nname: skill-a\n---\n", encoding="utf-8")
+    skill_b = tmp_path / "category" / "skill-b"
+    skill_b.mkdir()
+    (skill_b / "SKILL.md").write_text("---\nname: skill-b\n---\n", encoding="utf-8")
+
+    result_depth1 = detect_skills(tmp_path, depth=1)
+    assert not result_depth1.is_multi_skill, "depth=1 should NOT find nested skills"
+
+    result_depth2 = detect_skills(tmp_path, depth=2)
+    assert result_depth2.is_multi_skill, "depth=2 should find both skills"
+    names = {s.name for s in result_depth2.skills}
+    assert "skill-a" in names
+    assert "skill-b" in names
+
+
+def test_recursive_depth_fallback_warning_message(safe_skill_dir: Path, tmp_path: Path) -> None:
+    """When --recursive finds nothing at depth 1, the warning must suggest --depth 2."""
+    # Create a collection with skills nested 2 levels deep
+    col = tmp_path / "collection"
+    col.mkdir()
+    deep = col / "category" / "my-skill"
+    deep.mkdir(parents=True)
+    (deep / "SKILL.md").write_text("---\nname: deep\n---\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["scan", str(col), "--recursive", "--no-llm", "--format", "json"]
+    )
+    assert "--depth 2" in result.output or "--depth 2" in result.output.lower()

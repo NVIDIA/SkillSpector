@@ -239,6 +239,13 @@ def scan(
             help="Scan directories containing multiple skills (immediate subdirectories with SKILL.md) independently.",
         ),
     ] = False,
+    depth: Annotated[
+        int,
+        typer.Option(
+            "--depth",
+            help="Directory depth to search for sub-skills with --recursive. Default: 1.",
+        ),
+    ] = 1,
     baseline: Annotated[
         Path | None,
         typer.Option(
@@ -289,6 +296,7 @@ def scan(
         skillspector scan ./my-skill/ --format json --output report.json
         skillspector scan https://github.com/user/my-skill --no-llm
         skillspector scan ./skill-collection/ --recursive
+        skillspector scan ./skill-collection/ --recursive --depth 2
         skillspector scan ./my-skill/ --include-test-fixtures
 
     Flags:
@@ -321,14 +329,15 @@ def scan(
 
     resolved_path = Path(input_path).resolve()
     if recursive and resolved_path.is_dir():
-        detection = detect_skills(resolved_path)
+        detection = detect_skills(resolved_path, depth=depth)
         if detection.is_multi_skill:
             _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
             console.print(
-                "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
-                "detected. Scanning as single skill."
+                f"[yellow]Warning:[/yellow] no sub-skills found at depth {depth} under {input_path}.\n"
+                f"If skills are nested deeper, try --depth {depth + 1} or --depth {depth + 2}.\n"
+                "Falling back to flat scan of the entire directory."
             )
     elif resolved_path.is_dir():
         detection = detect_skills(resolved_path)
