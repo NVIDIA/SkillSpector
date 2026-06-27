@@ -241,38 +241,42 @@ def test_meta_analyzer_batches_large_finding_sets(monkeypatch) -> None:
     monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "3")
     importlib.reload(skillspector.constants)
 
-    # 6 findings across 6 files
-    findings = [
-        Finding(
-            rule_id=f"E{i}",
-            message=f"finding {i}",
-            severity="MEDIUM",
-            confidence=0.8,
-            file=f"file{i}.py",
-            start_line=i,
+    try:
+        # 6 findings across 6 files
+        findings = [
+            Finding(
+                rule_id=f"E{i}",
+                message=f"finding {i}",
+                severity="MEDIUM",
+                confidence=0.8,
+                file=f"file{i}.py",
+                start_line=i,
+            )
+            for i in range(6)
+        ]
+        from skillspector.state import SkillspectorState
+
+        state = SkillspectorState(
+            findings=findings,
+            use_llm=True,
+            file_cache={f"file{i}.py": f"# file {i}" for i in range(6)},
+            manifest={},
+            model_config={},
         )
-        for i in range(6)
-    ]
-    from skillspector.state import SkillspectorState
 
-    state = SkillspectorState(
-        findings=findings,
-        use_llm=True,
-        file_cache={f"file{i}.py": f"# file {i}" for i in range(6)},
-        manifest={},
-        model_config={},
-    )
+        call_count = {"n": 0}
 
-    call_count = {"n": 0}
+        async def fake_arun_batches(self_or_batches, batches_or_nothing=None, **kwargs):
+            call_count["n"] += 1
+            return []  # return empty so filtered_findings is empty (fine for count test)
 
-    async def fake_arun_batches(self_or_batches, batches_or_nothing=None, **kwargs):
-        call_count["n"] += 1
-        return []  # return empty so filtered_findings is empty (fine for count test)
+        with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches):
+            meta_analyzer(state)
 
-    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches):
-        meta_analyzer(state)
-
-    assert call_count["n"] >= 2, "Should split into multiple arun_batches calls when findings > batch size"
+        assert call_count["n"] >= 2, "Should split into multiple arun_batches calls when findings > batch size"
+    finally:
+        monkeypatch.delenv("SKILLSPECTOR_META_BATCH_SIZE", raising=False)
+        importlib.reload(skillspector.constants)
 
 
 def test_split_files_into_batches_groups_files_correctly() -> None:
@@ -319,31 +323,35 @@ def test_meta_analyzer_reads_batch_size_at_call_time(monkeypatch) -> None:
     monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "1")
     importlib.reload(skillspector.constants)
 
-    # 2 findings in 2 files; batch size=1 means each file is its own group
-    findings = [
-        Finding(rule_id="E1", message="m", severity="MEDIUM", confidence=0.8, file="f1.py", start_line=1),
-        Finding(rule_id="E2", message="m", severity="MEDIUM", confidence=0.8, file="f2.py", start_line=1),
-    ]
-    from skillspector.state import SkillspectorState
+    try:
+        # 2 findings in 2 files; batch size=1 means each file is its own group
+        findings = [
+            Finding(rule_id="E1", message="m", severity="MEDIUM", confidence=0.8, file="f1.py", start_line=1),
+            Finding(rule_id="E2", message="m", severity="MEDIUM", confidence=0.8, file="f2.py", start_line=1),
+        ]
+        from skillspector.state import SkillspectorState
 
-    state = SkillspectorState(
-        findings=findings,
-        use_llm=True,
-        file_cache={"f1.py": "# f1", "f2.py": "# f2"},
-        manifest={},
-        model_config={},
-    )
+        state = SkillspectorState(
+            findings=findings,
+            use_llm=True,
+            file_cache={"f1.py": "# f1", "f2.py": "# f2"},
+            manifest={},
+            model_config={},
+        )
 
-    call_count = {"n": 0}
+        call_count = {"n": 0}
 
-    async def fake_arun_batches_call_time(_self, _batches, **kwargs):
-        call_count["n"] += 1
-        return []
+        async def fake_arun_batches_call_time(_self, _batches, **kwargs):
+            call_count["n"] += 1
+            return []
 
-    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches_call_time):
-        meta_analyzer(state)
+        with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches_call_time):
+            meta_analyzer(state)
 
-    assert call_count["n"] == 2, "With batch size=1 and 2 files, expect 2 separate LLM calls"
+        assert call_count["n"] == 2, "With batch size=1 and 2 files, expect 2 separate LLM calls"
+    finally:
+        monkeypatch.delenv("SKILLSPECTOR_META_BATCH_SIZE", raising=False)
+        importlib.reload(skillspector.constants)
 
 
 def test_skip_meta_bypasses_llm_entirely() -> None:

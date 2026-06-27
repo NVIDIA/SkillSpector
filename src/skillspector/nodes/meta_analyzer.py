@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Literal
 
@@ -514,8 +515,6 @@ def _split_files_into_batches(
     has more than *max_findings* findings on its own it gets its own group (no
     further split, as the batch chunker handles oversized files).
     """
-    from collections import Counter
-
     counts: Counter[str] = Counter(f.file for f in findings)
     groups: list[list[str]] = []
     current_group: list[str] = []
