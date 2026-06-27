@@ -749,6 +749,9 @@ Respond in JSON matching this exact schema:
   "explanation": "why this is or is not a mismatch"
 }}"""
 
+        # NOTE: This direct LLM call is not cache-wired (see llm_cache.py for other nodes).
+        # TP4 prompt injection detection may yield subtly different results on re-runs;
+        # caching it requires further validation and is intentionally deferred.
         response = chat_completion(prompt, model=model)
 
         # Parse JSON — handle optional ```json code blocks

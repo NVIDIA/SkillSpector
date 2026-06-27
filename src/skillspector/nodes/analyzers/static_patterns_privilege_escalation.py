@@ -31,6 +31,8 @@ from .pattern_defaults import PatternCategory
 _PE3_TEST_FUNCTION_KEYWORDS = frozenset({
     "traversal", "path", "inject", "sanitize", "escape", "neutralize",
 })
+_kw = "|".join(sorted(_PE3_TEST_FUNCTION_KEYWORDS))
+_PE3_FIXTURE_FUNC_RE = re.compile(rf"\bdef\s+test_\w*(?:{_kw})\w*")
 
 logger = get_logger(__name__)
 
@@ -119,10 +121,7 @@ def _is_pe3_test_fixture(content: str, match_start: int, file_path: str) -> bool
     start = max(0, line_idx - 15)
     surrounding = "\n".join(lines[start : line_idx + 1]).lower()
     # Must be a test_ function whose name contains a traversal-related keyword
-    has_test_func = re.search(
-        r"\bdef\s+test_\w*(?:traversal|path|inject|sanitize|escape|neutralize)\w*",
-        surrounding,
-    ) is not None
+    has_test_func = _PE3_FIXTURE_FUNC_RE.search(surrounding) is not None
     return has_test_func
 
 

@@ -135,3 +135,7 @@ class LLMResponseCache:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def __del__(self) -> None:
+        """Close the database connection when the object is garbage collected."""
+        self.close()
