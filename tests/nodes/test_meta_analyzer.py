@@ -231,6 +231,121 @@ class TestMetaAnalyzerPartialBatchFailure:
         assert kept == {("a.py", "R1")}
 
 
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_meta_analyzer_batches_large_finding_sets(monkeypatch) -> None:
+    """When findings > META_BATCH_SIZE, meta_analyzer splits into multiple LLM calls."""
+    import importlib
+
+    import skillspector.constants
+
+    monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "3")
+    importlib.reload(skillspector.constants)
+
+    # 6 findings across 6 files
+    findings = [
+        Finding(
+            rule_id=f"E{i}",
+            message=f"finding {i}",
+            severity="MEDIUM",
+            confidence=0.8,
+            file=f"file{i}.py",
+            start_line=i,
+        )
+        for i in range(6)
+    ]
+    from skillspector.state import SkillspectorState
+
+    state = SkillspectorState(
+        findings=findings,
+        use_llm=True,
+        file_cache={f"file{i}.py": f"# file {i}" for i in range(6)},
+        manifest={},
+        model_config={},
+    )
+
+    call_count = {"n": 0}
+
+    async def fake_arun_batches(self_or_batches, batches_or_nothing=None, **kwargs):
+        call_count["n"] += 1
+        return []  # return empty so filtered_findings is empty (fine for count test)
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches):
+        meta_analyzer(state)
+
+    assert call_count["n"] >= 2, "Should split into multiple arun_batches calls when findings > batch size"
+
+
+def test_split_files_into_batches_groups_files_correctly() -> None:
+    """_split_files_into_batches correctly groups files within the max size."""
+    from skillspector.nodes.meta_analyzer import _split_files_into_batches
+
+    # 3 files with 2, 3, 2 findings each; max_findings=4
+    findings = (
+        [Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="a.py", start_line=i) for i in range(2)]
+        + [Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="b.py", start_line=i) for i in range(3)]
+        + [Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="c.py", start_line=i) for i in range(2)]
+    )
+    files = ["a.py", "b.py", "c.py"]
+    groups = _split_files_into_batches(files, findings, max_findings=4)
+    # a.py (2) + b.py (3) = 5 > 4, so a.py alone, then b.py alone (3<=4), then c.py
+    # Actually: a.py (2) fits in first group; adding b.py (3) = 5 > 4, so b.py starts group 2;
+    # adding c.py (2) to group 2 = 5 > 4, so c.py starts group 3
+    assert len(groups) == 3
+    assert groups[0] == ["a.py"]
+    assert groups[1] == ["b.py"]
+    assert groups[2] == ["c.py"]
+
+
+def test_split_files_into_batches_single_group_when_under_limit() -> None:
+    """All files in one group when total findings <= max_findings."""
+    from skillspector.nodes.meta_analyzer import _split_files_into_batches
+
+    findings = [
+        Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="a.py", start_line=1),
+        Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="b.py", start_line=1),
+    ]
+    groups = _split_files_into_batches(["a.py", "b.py"], findings, max_findings=10)
+    assert len(groups) == 1
+    assert groups[0] == ["a.py", "b.py"]
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_meta_analyzer_reads_batch_size_at_call_time(monkeypatch) -> None:
+    """META_BATCH_SIZE is read from constants at call time, not at import time."""
+    import importlib
+
+    import skillspector.constants
+
+    monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "1")
+    importlib.reload(skillspector.constants)
+
+    # 2 findings in 2 files; batch size=1 means each file is its own group
+    findings = [
+        Finding(rule_id="E1", message="m", severity="MEDIUM", confidence=0.8, file="f1.py", start_line=1),
+        Finding(rule_id="E2", message="m", severity="MEDIUM", confidence=0.8, file="f2.py", start_line=1),
+    ]
+    from skillspector.state import SkillspectorState
+
+    state = SkillspectorState(
+        findings=findings,
+        use_llm=True,
+        file_cache={"f1.py": "# f1", "f2.py": "# f2"},
+        manifest={},
+        model_config={},
+    )
+
+    call_count = {"n": 0}
+
+    async def fake_arun_batches_call_time(_self, _batches, **kwargs):
+        call_count["n"] += 1
+        return []
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches_call_time):
+        meta_analyzer(state)
+
+    assert call_count["n"] == 2, "With batch size=1 and 2 files, expect 2 separate LLM calls"
+
+
 def test_skip_meta_bypasses_llm_entirely() -> None:
     """skip_meta=True must return all findings without any LLM call."""
     from skillspector.state import SkillspectorState

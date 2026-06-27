@@ -29,6 +29,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+import skillspector.constants
 from skillspector.constants import MODEL_CONFIG
 from skillspector.llm_analyzer_base import (
     Batch,
@@ -498,6 +499,41 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
 
 # ---------------------------------------------------------------------------
+# Batching helper
+# ---------------------------------------------------------------------------
+
+
+def _split_files_into_batches(
+    files: list[str],
+    findings: list[Finding],
+    max_findings: int,
+) -> list[list[str]]:
+    """Split *files* into groups where each group has at most *max_findings* total findings.
+
+    Keeps all findings for a single file together in the same group.  If one file
+    has more than *max_findings* findings on its own it gets its own group (no
+    further split, as the batch chunker handles oversized files).
+    """
+    from collections import Counter
+
+    counts: Counter[str] = Counter(f.file for f in findings)
+    groups: list[list[str]] = []
+    current_group: list[str] = []
+    current_count = 0
+    for file_path in files:
+        file_count = counts.get(file_path, 0)
+        if current_group and current_count + file_count > max_findings:
+            groups.append(current_group)
+            current_group = []
+            current_count = 0
+        current_group.append(file_path)
+        current_count += file_count
+    if current_group:
+        groups.append(current_group)
+    return groups if groups else [[]]
+
+
+# ---------------------------------------------------------------------------
 # Graph node
 # ---------------------------------------------------------------------------
 
@@ -537,15 +573,37 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         cache_dir = state.get("llm_cache_dir")
         cache = LLMResponseCache(Path(cache_dir)) if cache_dir else None
         analyzer = LLMMetaAnalyzer(model=model, cache=cache)
-        batches = analyzer.get_batches(files_with_findings, file_cache, findings)
-        logger.debug(
-            "Meta-analyzer: %d files -> %d batches (model=%s)",
+        # Read META_BATCH_SIZE at call time so env patches take effect in tests.
+        meta_batch_size: int = skillspector.constants.META_BATCH_SIZE
+
+        # Split files into groups so no single LLM call exceeds META_BATCH_SIZE findings.
+        file_groups = _split_files_into_batches(files_with_findings, findings, meta_batch_size)
+        logger.info(
+            "Meta-analyzer: %d files, %d findings → %d group(s) (META_BATCH_SIZE=%d)",
             len(files_with_findings),
-            len(batches),
-            model,
+            len(findings),
+            len(file_groups),
+            meta_batch_size,
         )
 
-        batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        all_batch_results: list[tuple[Batch, list[dict[str, object]]]] = []
+        all_batches: list[Batch] = []
+        for group_files in file_groups:
+            group_files_set = set(group_files)
+            group_findings = [f for f in findings if f.file in group_files_set]
+            batches = analyzer.get_batches(group_files, file_cache, group_findings)
+            all_batches.extend(batches)
+            logger.debug(
+                "Meta-analyzer group: %d files -> %d batches (model=%s)",
+                len(group_files),
+                len(batches),
+                model,
+            )
+            group_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
+            all_batch_results.extend(group_results)
+
+        batch_results = all_batch_results
+        batches = all_batches
 
         if len(batch_results) < len(batches):
             # Some batches never returned. A finding the LLM never saw has no

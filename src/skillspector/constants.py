@@ -50,3 +50,7 @@ MODEL_CONFIG: dict[str, str] = {slot: _provider.resolve_model(slot) for slot in 
 
 # Log level: from env or fallback (DEBUG, INFO, WARNING, ERROR).
 SKILLSPECTOR_LOG_LEVEL = os.environ.get("SKILLSPECTOR_LOG_LEVEL", "WARNING")
+
+# Maximum number of findings per meta-analyzer LLM call group.
+# Keeps individual calls within context limits for large skill directories.
+META_BATCH_SIZE: int = int(os.environ.get("SKILLSPECTOR_META_BATCH_SIZE", "20"))
