@@ -25,6 +25,7 @@ _SKIP_DIRS = frozenset(
 )
 
 _AISOP_PROTOCOL_PREFIXES = ("AISOP V", "AISP V")
+_MAX_BUNDLE_NESTING = 128
 
 
 def extract_structured_skill_context(skill_dir: Path) -> dict[str, object] | None:
@@ -58,9 +59,9 @@ def _parse_bundle_path(bundle_path: Path) -> dict[str, object] | None:
     """Parse and validate one AISOP/AISP bundle path."""
     try:
         data = json.loads(bundle_path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
+        return _parse_bundle_payload(bundle_path, data)
+    except (OSError, json.JSONDecodeError, RecursionError, ValueError):
         return None
-    return _parse_bundle_payload(bundle_path, data)
 
 
 def _parse_bundle_payload(bundle_path: Path, payload: object) -> dict[str, object] | None:
@@ -157,8 +158,11 @@ def _first_non_empty(values: tuple[object, ...]) -> list[str]:
     return result
 
 
-def _extract_function_names(functions: object, seen: set[str] | None = None) -> list[str]:
+def _extract_function_names(
+    functions: object, seen: set[str] | None = None, depth: int = 0
+) -> list[str]:
     """Extract function names from a dictionary/list of workflow nodes."""
+    _ensure_supported_nesting(depth)
     names: list[str] = []
     if seen is None:
         seen = set()
@@ -172,7 +176,7 @@ def _extract_function_names(functions: object, seen: set[str] | None = None) -> 
                     seen.add(n)
                     names.append(n)
             if isinstance(node, dict):
-                names.extend(_extract_function_names(node.get("functions"), seen))
+                names.extend(_extract_function_names(node.get("functions"), seen, depth + 1))
     elif isinstance(functions, list):
         for item in functions:
             if not isinstance(item, dict):
@@ -183,7 +187,7 @@ def _extract_function_names(functions: object, seen: set[str] | None = None) -> 
                 if n and n not in seen:
                     seen.add(n)
                     names.append(n)
-            names.extend(_extract_function_names(item.get("functions"), seen))
+            names.extend(_extract_function_names(item.get("functions"), seen, depth + 1))
 
     return names
 
@@ -206,7 +210,8 @@ def _extract_constraint_anchors(functions: object) -> list[str]:
             seen.add(anchor)
             anchors.append(anchor)
 
-    def _walk(nodes: object) -> None:
+    def _walk(nodes: object, depth: int = 0) -> None:
+        _ensure_supported_nesting(depth)
         if isinstance(nodes, dict):
             for maybe_node in nodes.values():
                 if isinstance(maybe_node, dict):
@@ -214,9 +219,9 @@ def _extract_constraint_anchors(functions: object) -> list[str]:
                     if isinstance(constraints, list):
                         for constraint in constraints:
                             _collect(constraint)
-                    _walk(maybe_node.get("functions"))
+                    _walk(maybe_node.get("functions"), depth + 1)
                 elif isinstance(maybe_node, list):
-                    _walk(maybe_node)
+                    _walk(maybe_node, depth + 1)
         elif isinstance(nodes, list):
             for item in nodes:
                 if isinstance(item, dict):
@@ -224,7 +229,7 @@ def _extract_constraint_anchors(functions: object) -> list[str]:
                     if isinstance(constraints, list):
                         for constraint in constraints:
                             _collect(constraint)
-                    _walk(item.get("functions"))
+                    _walk(item.get("functions"), depth + 1)
 
     _walk(functions)
     return anchors
@@ -241,14 +246,15 @@ def _extract_resource_anchors(resources: object) -> list[str]:
             seen.add(p)
             paths.append(p)
 
-    def _walk(value: object) -> None:
+    def _walk(value: object, depth: int = 0) -> None:
+        _ensure_supported_nesting(depth)
         if isinstance(value, dict):
             for val in value.values():
                 if isinstance(val, dict):
                     resource_path = val.get("path")
                     if isinstance(resource_path, str):
                         _collect(resource_path)
-                    _walk(val.get("resources"))
+                    _walk(val.get("resources"), depth + 1)
                 elif isinstance(val, str):
                     _collect(val)
         elif isinstance(value, list):
@@ -259,7 +265,13 @@ def _extract_resource_anchors(resources: object) -> list[str]:
                     resource_path = item.get("path")
                     if isinstance(resource_path, str):
                         _collect(resource_path)
-                    _walk(item.get("resources"))
+                    _walk(item.get("resources"), depth + 1)
 
     _walk(resources)
     return paths
+
+
+def _ensure_supported_nesting(depth: int) -> None:
+    """Reject bundles whose nested workflow metadata exceeds the supported depth."""
+    if depth > _MAX_BUNDLE_NESTING:
+        raise ValueError("structured bundle nesting exceeds supported depth")
