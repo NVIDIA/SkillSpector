@@ -97,6 +97,14 @@ def _write_aisop_bundle(path: Path) -> None:
     path.write_text(json.dumps(bundle), encoding="utf-8")
 
 
+def _make_nested_resources(depth: int) -> dict[str, object]:
+    """Build a deeply nested resources tree for recursion-guard tests."""
+    current: dict[str, object] = {"path": "resources/final.json"}
+    for idx in range(depth, -1, -1):
+        current = {f"resource_{idx}": {"resources": current}}
+    return current
+
+
 class TestDetectSkills:
     """Tests for detect_skills()."""
 
@@ -151,6 +159,33 @@ class TestDetectSkills:
             encoding="utf-8",
         )
         result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 0
+
+    def test_structured_bundle_ignored_when_over_nested(self, tmp_path: Path) -> None:
+        """Over-nested structured bundles fail closed instead of crashing detection."""
+        nested = tmp_path / "deep-bundle"
+        nested.mkdir()
+        bundle = [
+            {
+                "role": "system",
+                "content": {
+                    "protocol": "AISP V1",
+                    "format": "contract",
+                },
+            },
+            {
+                "role": "user",
+                "content": {
+                    "functions": {"lookup": {"constraints": ["query"]}},
+                    "aisp_contract": {"resources": _make_nested_resources(140)},
+                },
+            },
+        ]
+        (nested / "workflow.aisop.json").write_text(json.dumps(bundle), encoding="utf-8")
+
+        result = detect_skills(tmp_path)
+
         assert result.is_multi_skill is False
         assert len(result.skills) == 0
 
