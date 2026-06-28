@@ -571,6 +571,132 @@ class TestRunStaticPatternsPrivilegeEscalationPE4:
         assert any(f.rule_id == "PE4" for f in result["findings"])
 
 
+class TestRunStaticPatternsPrivilegeEscalationPE5:
+    """run_static_patterns with privilege_escalation: PE5 (privileged container / container escape)."""
+
+    def test_pe5_privileged_flag_produces_finding(self):
+        """docker run --privileged yields PE5 (HIGH)."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['docker', 'run', '--privileged', 'alpine', 'id'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe5 = [f for f in findings if f.rule_id == "PE5"]
+        assert len(pe5) >= 1
+        assert pe5[0].severity == "HIGH"
+        assert pe5[0].file == "skill.py"
+        assert pe5[0].start_line >= 1
+        assert pe5[0].remediation is not None
+        assert pe5[0].context is not None
+        assert pe5[0].matched_text is not None
+
+    def test_pe5_host_root_mount_produces_finding(self):
+        """docker run -v /:/host (host root filesystem mount) yields PE5 (HIGH)."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['docker', 'run', '-v', '/:/host', 'alpine', 'ls', '/host'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert any(f.rule_id == "PE5" and f.severity == "HIGH" for f in findings)
+
+    def test_pe5_cap_add_sys_admin_produces_finding(self):
+        """--cap-add=SYS_ADMIN yields PE5."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['docker', 'run', '--cap-add=SYS_ADMIN', 'alpine', 'id'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert any(f.rule_id == "PE5" for f in findings)
+
+    def test_pe5_host_namespace_produces_finding(self):
+        """--pid=host / --net=host (shared host namespaces) yields PE5."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['docker', 'run', '--pid=host', '--net=host', 'alpine', 'ps'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert any(f.rule_id == "PE5" for f in findings)
+
+    def test_pe5_nsenter_produces_finding(self):
+        """nsenter into host PID 1 yields PE5 (HIGH)."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['nsenter', '--target', '1', '--mount', '--pid', 'id'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert any(f.rule_id == "PE5" and f.severity == "HIGH" for f in findings)
+
+    def test_pe5_cgroup_release_agent_produces_finding(self):
+        """cgroup release_agent write (CVE-2022-0492 class) yields PE5 at highest confidence."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "open('/sys/fs/cgroup/release_agent', 'w').write('/tmp/x.sh')\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe5 = [f for f in findings if f.rule_id == "PE5"]
+        assert len(pe5) >= 1
+        assert pe5[0].confidence == 0.95
+
+    def test_pe5_unshare_produces_finding(self):
+        """unshare --user --map-root-user yields PE5."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['unshare', '--user', '--map-root-user', 'bash'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert any(f.rule_id == "PE5" for f in findings)
+
+    def test_pe5_combined_line_produces_exactly_one_finding(self):
+        """A single docker run line matching multiple PE5 flags yields exactly one PE5 finding."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['docker', 'run', '--privileged', '--cap-add=SYS_ADMIN', '--pid=host', 'alpine'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe5 = [f for f in findings if f.rule_id == "PE5"]
+        assert len(pe5) == 1, (
+            f"Expected 1 PE5 finding, got {len(pe5)}: {[f.matched_text for f in pe5]}"
+        )
+
+    def test_pe5_safe_docker_run_not_flagged(self):
+        """Plain docker run without dangerous flags produces no PE5."""
+        state = {
+            "components": ["skill.py"],
+            "file_cache": {
+                "skill.py": "subprocess.run(['docker', 'run', 'alpine', 'echo', 'hi'])\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert not any(f.rule_id == "PE5" for f in findings)
+
+    def test_pe5_documentation_example_not_flagged(self):
+        """--privileged inside a markdown code block is filtered as documentation."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": "# Docker\n\nFor example:\n```bash\ndocker run --privileged alpine id\n```\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        assert not any(f.rule_id == "PE5" for f in findings)
+
+
 class TestRunStaticPatternsSSRF:
     """run_static_patterns with ssrf: SSRF1, SSRF2, SSRF3."""
 
