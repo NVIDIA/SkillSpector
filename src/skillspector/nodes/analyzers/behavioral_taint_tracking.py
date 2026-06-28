@@ -37,6 +37,7 @@ from .common import (
     get_source_segment,
     resolve_call_name_typed,
     resolve_dotted_name,
+    resolve_dynamic_import_call,
 )
 from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
 
@@ -168,6 +169,24 @@ _SINK_CATEGORIES: list[tuple[frozenset[str], str]] = [
     (_EXEC_SINKS, "code execution"),
     (_FILE_WRITE_SINKS, "file write"),
 ]
+
+
+def _resolve_sink_name(
+    node: ast.Call,
+    type_map: dict[str, str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve a call to its canonical sink name, including dynamic-import chains.
+
+    Wraps :func:`resolve_call_name_typed` (type-/alias-aware resolution) and falls back
+    to :func:`resolve_dynamic_import_call` so that
+    ``importlib.import_module('subprocess').run(...)`` resolves to ``'subprocess.run'``
+    and re-enters ``_EXEC_SINKS`` like the statically-imported form would.
+    """
+    name = resolve_call_name_typed(node, type_map, aliases)
+    if name is None:
+        name = resolve_dynamic_import_call(node, aliases)
+    return name
 
 
 def _classify(name: str, categories: list[tuple[frozenset[str], str]], default: str) -> str:
@@ -363,7 +382,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         if not isinstance(ast_node, ast.Call):
             continue
 
-        sink_name = resolve_call_name_typed(ast_node, type_map, aliases)
+        sink_name = _resolve_sink_name(ast_node, type_map, aliases)
         if not sink_name or sink_name not in _ALL_SINKS:
             continue
 

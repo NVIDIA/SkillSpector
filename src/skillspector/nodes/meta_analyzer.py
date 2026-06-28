@@ -239,7 +239,7 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
 
     result: list[Finding] = []
     for f in findings:
-        severity_upper = f.severity.upper()
+        severity_upper = (f.severity or "LOW").upper()
         confidence = f.confidence
         if f.context and is_code_example(f.context):
             confidence *= _CODE_EXAMPLE_DOWNWEIGHT

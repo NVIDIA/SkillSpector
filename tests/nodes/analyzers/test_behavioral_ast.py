@@ -284,3 +284,92 @@ class TestMultipleFindings:
         assert "AST2" in rule_ids
         assert "AST4" in rule_ids
         assert "AST5" in rule_ids
+
+
+# ── builtins / importlib import-chain evasion ─────────────────────────
+
+
+class TestBuiltinsImportEvasion:
+    """Dangerous builtins hidden behind the ``builtins`` module must still alert.
+
+    The analyzer matches dangerous builtins by their bare name (``exec``/``eval``/
+    ``compile``/``__import__``). Writing ``from builtins import exec`` or
+    ``import builtins; builtins.exec(...)`` resolves, through the import-alias map,
+    to the qualified spelling ``builtins.exec`` — which would slip past the bare-name
+    checks unless it is canonicalized back. Since ``builtins.exec is exec``, the
+    collapse is semantically exact. Complements the ``getattr`` branch (PR #166).
+    """
+
+    def test_from_builtins_import_exec(self):
+        """``from builtins import exec; exec(code)`` must still raise AST1."""
+        findings = _run("from builtins import exec\nexec('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_from_builtins_import_eval(self):
+        """``from builtins import eval`` must still raise AST2."""
+        findings = _run("from builtins import eval\neval('2 + 2')\n")
+        assert any(f.rule_id == "AST2" for f in findings)
+
+    def test_from_builtins_import_compile(self):
+        """``from builtins import compile`` must still raise AST6."""
+        findings = _run("from builtins import compile\ncompile('x', '<s>', 'exec')\n")
+        assert any(f.rule_id == "AST6" for f in findings)
+
+    def test_from_builtins_import_dunder_import(self):
+        """``from builtins import __import__`` must still raise AST3."""
+        findings = _run("from builtins import __import__\n__import__('os')\n")
+        assert any(f.rule_id == "AST3" for f in findings)
+
+    def test_import_builtins_dot_exec(self):
+        """``import builtins; builtins.exec(...)`` must still raise AST1."""
+        findings = _run("import builtins\nbuiltins.exec('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_import_builtins_as_alias_dot_exec(self):
+        """``import builtins as b2; b2.exec(...)`` must still raise AST1."""
+        findings = _run("import builtins as b2\nb2.exec('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_from_builtins_import_exec_as_alias(self):
+        """``from builtins import exec as e; e(...)`` must still raise AST1."""
+        findings = _run("from builtins import exec as e\ne('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_user_module_exec_helper_no_false_positive(self):
+        """A benign helper merely *named* like a sink must not match (FP-neighbor).
+
+        ``from mymod import exec_helper; exec_helper()`` imports an unrelated
+        third-party callable — it is not ``builtins.exec`` and must stay clean.
+        """
+        findings = _run("from mymod import exec_helper\nexec_helper()\n")
+        assert findings == []
+
+
+class TestImportlibDynamicChainEvasion:
+    """``importlib.import_module('mod').attr(...)`` is a dynamic-import sink chain.
+
+    It mirrors ``__import__('mod')`` but lets the dangerous module name live in a
+    string literal so it never appears as a static ``import``. The chain is resolved
+    to the canonical dotted sink (``os.system``/``subprocess.run``) so it re-enters
+    the existing ``os.``/``subprocess.`` sink ladders.
+    """
+
+    def test_importlib_import_module_os_system(self):
+        """``importlib.import_module('os').system(...)`` must raise AST5."""
+        findings = _run("import importlib\nimportlib.import_module('os').system('id')\n")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_importlib_import_module_subprocess_run(self):
+        """``importlib.import_module('subprocess').run(...)`` must raise AST4."""
+        findings = _run("import importlib\nimportlib.import_module('subprocess').run(['id'])\n")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_from_importlib_import_module_os_system(self):
+        """Bare-imported ``import_module('os').system(...)`` must raise AST5."""
+        findings = _run("from importlib import import_module\nimport_module('os').system('id')\n")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_importlib_import_module_benign_no_false_positive(self):
+        """A benign dynamic import (``json.loads``) must not match a sink ladder."""
+        findings = _run("import importlib\nimportlib.import_module('json').loads('{}')\n")
+        assert findings == []

@@ -25,6 +25,7 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     openai           → OpenAIProvider          (api.openai.com)
     anthropic        → AnthropicProvider       (api.anthropic.com)
     anthropic_proxy  → AnthropicProxyProvider  (Vertex-style raw-predict proxy)
+    bedrock          → BedrockProvider         (AWS Bedrock Runtime, SigV4)
     nv_build         → NvBuildProvider         (build.nvidia.com)
 
 When unset, the selector defaults to ``nv_build``.
@@ -69,6 +70,10 @@ def _select_active_provider() -> LLMProvider:
         from .anthropic_proxy import AnthropicProxyProvider
 
         return AnthropicProxyProvider()
+    if name == "bedrock":
+        from .bedrock import BedrockProvider
+
+        return BedrockProvider()
     if name == "nv_build":
         return NvBuildProvider()
     if name in ("nv_inference", ""):
@@ -83,7 +88,7 @@ def _select_active_provider() -> LLMProvider:
 
     raise ValueError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
-        "Expected one of: openai, anthropic, anthropic_proxy, nv_build (or unset)."
+        "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build (or unset)."
     )
 
 

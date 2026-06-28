@@ -22,6 +22,8 @@ based on state["output_format"]. Single place for formatting (CLI and REST API r
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from io import StringIO
 from typing import Literal
@@ -65,6 +67,38 @@ _RISK_RECOMMENDATION: dict[str, str] = {
 }
 
 
+# Scanned skill content (and LLM output that quotes it) can carry ANSI escape
+# sequences and control bytes (e.g. NUL, ESC) into finding text. Left in, they
+# make a rendered report register as binary — GitLab/editors show "download"
+# instead of the Markdown, and terminals emit garbled output. Strip them from
+# every finding text field so all report formats stay clean UTF-8.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Finding free-text fields that may carry scanned/LLM content.
+_SANITIZED_FIELDS = (
+    "message",
+    "explanation",
+    "remediation",
+    "finding",
+    "context",
+    "matched_text",
+    "code_snippet",
+)
+
+
+def _clean_text(value: str | None) -> str | None:
+    """Strip ANSI escape sequences and disallowed control chars (keep tab/newline)."""
+    if not isinstance(value, str):
+        return value
+    return _CONTROL_RE.sub("", _ANSI_RE.sub("", value))
+
+
+def _sanitize_finding(finding: Finding) -> Finding:
+    """Return a copy of *finding* with control/ANSI bytes stripped from text fields."""
+    return replace(finding, **{f: _clean_text(getattr(finding, f)) for f in _SANITIZED_FIELDS})
+
+
 def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note"]:
     """Map Finding.severity to SARIF result level."""
     return {
@@ -87,7 +121,9 @@ _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 
 
 def _compute_risk_score(
-    findings: list[Finding], has_executable_scripts: bool
+    findings: list[Finding],
+    has_executable_scripts: bool,
+    component_metadata: list[dict[str, object]] | None = None,
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
@@ -105,13 +141,20 @@ def _compute_risk_score(
     order so that the highest-severity occurrence always receives the full weight.
 
     Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
-    Multiplier: 1.3x if has_executable_scripts.
+    1.3x multiplier applied only to findings from executable script files;
+    findings from documentation files (markdown, text, json, yaml, toml)
+    are scored at base weight to avoid punishing security documentation.
     """
     severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     sorted_findings = sorted(
         findings,
         key=lambda f: (f.rule_id or "UNKNOWN", severity_rank.get((f.severity or "LOW").upper(), 4)),
     )
+
+    file_executable: dict[str, bool] = {}
+    if component_metadata:
+        for cm in component_metadata:
+            file_executable[str(cm.get("path", ""))] = bool(cm.get("executable", False))
 
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
@@ -132,10 +175,13 @@ def _compute_risk_score(
             continue
 
         weight = _DIMINISHING_WEIGHTS[count]
-        score += base_points * weight * confidence
+        contribution = base_points * weight * confidence
 
-    if has_executable_scripts:
-        score *= 1.3
+        # Apply 1.3x multiplier only to findings from executable files
+        if has_executable_scripts and file_executable.get(f.file, False):
+            contribution *= 1.3
+
+        score += contribution
 
     final_score = min(100, max(0, int(score)))
 
@@ -546,6 +592,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
     """
     raw_findings = state.get("findings", [])
     filtered_findings = state.get("filtered_findings", raw_findings)
+    # Strip ANSI/control bytes once here so every downstream format (terminal,
+    # json, markdown, sarif) and the returned findings stay clean UTF-8. Applied
+    # before partition/dedup so active and suppressed findings are both clean.
+    filtered_findings = [_sanitize_finding(f) for f in filtered_findings]
     component_metadata = state.get("component_metadata") or []
     components = state.get("components") or []
     file_cache = state.get("file_cache") or {}
@@ -565,7 +615,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     # additionally de-duplicates so the same issue is not counted twice.
     findings_for_scoring = deduplicate(active_findings)
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
-        findings_for_scoring, has_executable_scripts
+        findings_for_scoring, has_executable_scripts, component_metadata
     )
     sarif_report = _build_sarif(active_findings, suppressed)
     analysis_completeness = _build_analysis_completeness(

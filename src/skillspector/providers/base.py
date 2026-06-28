@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -31,7 +31,13 @@ class ModelMetadataProvider(Protocol):
     ``resolve_model`` runs the per-provider waterfall:
     ``SKILLSPECTOR_MODEL`` env var → provider's slot-specific default →
     provider's general default.  Always returns a non-empty string.
+
+    ``DEFAULT_MODEL`` is the provider's general default model label.
+    ``SLOT_DEFAULTS`` maps specific slots to their preferred models.
     """
+
+    DEFAULT_MODEL: ClassVar[str]
+    SLOT_DEFAULTS: ClassVar[dict[str, str]]
 
     def get_context_length(self, model: str) -> int | None: ...
 

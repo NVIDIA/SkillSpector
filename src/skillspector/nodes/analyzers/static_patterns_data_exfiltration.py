@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: data exfiltration (E1–E4). Node and analyze() in one module."""
+"""Static patterns: data exfiltration (E1–E5). Node and analyze() in one module."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import get_context, get_line_number, is_code_example
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -104,10 +104,23 @@ E4_PATTERNS = [
         0.8,
     ),
 ]
+# E5: data shipped out via cloud-storage SDKs/CLIs (the cloud counterpart of E1's
+# HTTP sinks). Confidence is deliberately low — legitimate skills also back up to
+# cloud storage — so a single call is a low-confidence MEDIUM, never a hard block.
+E5_PATTERNS = [
+    (r"\.put_object\s*\(", 0.55),  # boto3 S3
+    (r"\.upload_file(?:obj)?\s*\(", 0.55),  # boto3 S3
+    (r"\baws\s+s3\s+(?:cp|sync|mv)\b", 0.6),  # AWS CLI
+    (r"\baws\s+s3api\s+put-object\b", 0.65),  # AWS CLI (api)
+    (r"\bgsutil\s+(?:cp|rsync|mv)\b", 0.6),  # GCS CLI
+    (r"\.upload_from_(?:filename|string|file)\s*\(", 0.55),  # google-cloud-storage
+    (r"\baz\s+storage\s+blob\s+upload\b", 0.6),  # Azure CLI
+    (r"\.upload_blob\s*\(", 0.55),  # Azure SDK
+]
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Analyze content for data exfiltration patterns (E1–E4)."""
+    """Analyze content for data exfiltration patterns (E1–E5)."""
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:
@@ -180,6 +193,26 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     confidence=confidence,
                     tags=tag,
                     context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                )
+            )
+    # E5: cloud-storage exfiltration. Filtered through is_code_example() because
+    # upload calls commonly appear in SKILL.md docs and examples.
+    for pattern, confidence in E5_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            context = ctx(match.start())
+            if is_code_example(context):
+                continue
+            line_num = get_line_number(content, match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="E5",
+                    message="Cloud Storage Exfiltration",
+                    severity=Severity.MEDIUM,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=context,
                     matched_text=match.group(0)[:200],
                 )
             )

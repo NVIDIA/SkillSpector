@@ -115,6 +115,23 @@ result = subprocess.run(cmd, shell=True)
         for f in tm1_findings:
             assert f.confidence > 0
 
+    def test_extensionless_file_not_hard_dropped_by_code_example(self) -> None:
+        """An extensionless file (inferred as 'other') in code-example context is downweighted, not dropped."""
+        content = """\
+#!/bin/bash
+# Example: cleanup old builds
+rm -rf /tmp/build-cache
+"""
+        state = {
+            "components": ["cleanup_script"],
+            "file_cache": {"cleanup_script": content},
+        }
+        findings = static_runner.run_static_patterns(state, [tm_module])
+        tm1_findings = [f for f in findings if f.rule_id == "TM1"]
+        assert len(tm1_findings) >= 1, (
+            "Extensionless files must not have code-example findings hard-dropped"
+        )
+
     def test_skill_md_findings_are_not_filtered_by_backticks(self) -> None:
         """SKILL.md is the primary instruction file — backticks alone shouldn't filter."""
         content = """\

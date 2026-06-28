@@ -177,7 +177,7 @@ _DOCUMENTATION_DIR_NAMES = (
 _DOCUMENTATION_CONFIDENCE_FACTOR = 0.3
 _CODE_EXAMPLE_CONFIDENCE_FACTOR = 0.5
 
-_NON_EXECUTABLE_FILE_TYPES = frozenset({"markdown", "text", "json", "yaml", "toml", "other"})
+_NON_EXECUTABLE_FILE_TYPES = frozenset({"markdown", "text", "json", "yaml", "toml"})
 
 
 def _is_documentation_markdown(path: str) -> bool:

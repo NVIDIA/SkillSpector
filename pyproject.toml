@@ -39,8 +39,10 @@ dependencies = [
     "langgraph>=1.0.10",
     "langgraph-cli[inmem]>=0.4.14",
     "langchain-anthropic>=1.4.5",
+    "langchain-aws>=0.2.0",
     "langchain-core>=1.2.17",
     "langchain-openai>=1.1.10",
+    "boto3>=1.34.0",
     "langsmith>=0.7.30",
     "yara-python>=4.5.0",
 ]
