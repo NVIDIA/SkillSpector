@@ -86,6 +86,9 @@ All targets assume the virtual environment is **already created and activated**.
 | `output_format` | Requested report format: `terminal`, `json`, `markdown`, or `sarif` |
 | `report_body` | Formatted report string (set by report node from `output_format`) |
 | `use_llm` | When False, meta_analyzer skips LLM and uses fallback (e.g. for `--no-llm`) |
+| `baseline` | Loaded `suppression.Baseline` (set by CLI/API from `--baseline`); report node drops matching findings before scoring |
+| `show_suppressed` | When True, baseline-suppressed findings are listed in the report (still excluded from the risk score) |
+| `suppressed_findings` | List of `SuppressedFinding` (finding + reason) produced by the report node |
 | `findings` | All raw findings from analyzers (reducer: `operator.add`) |
 | `filtered_findings` | Findings after meta_analyzer |
 | `model_config` | Optional model IDs per node (e.g. default, meta_analyzer) |
@@ -124,9 +127,9 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 |------|------|--------|
 | **resolve_input** | Consumes `input_path` or `skill_path`; resolves URLs/zips/files via InputHandler; sets `skill_path` and (when needed) `temp_dir_for_cleanup` | [resolve_input.py](../src/skillspector/nodes/resolve_input.py) |
 | **build_context** | Reads `skill_path`, populates `components`, `file_cache`, `ast_cache`, `manifest`, `component_metadata`, `has_executable_scripts` | [build_context.py](../src/skillspector/nodes/build_context.py) |
-| **Analyzers** | 20 nodes; each returns `AnalyzerNodeResponse` (list of `Finding`). State reducer appends to `findings`. | [nodes/analyzers/__init__.py](../src/skillspector/nodes/analyzers/__init__.py) (`ANALYZER_NODE_IDS`, `ANALYZER_NODES`) |
+| **Analyzers** | 22 nodes; each returns `AnalyzerNodeResponse` (list of `Finding`). State reducer appends to `findings`. | [nodes/analyzers/__init__.py](../src/skillspector/nodes/analyzers/__init__.py) (`ANALYZER_NODE_IDS`, `ANALYZER_NODES`) |
 | **meta_analyzer** | Per-file LLM filter/enrich of `findings` → `filtered_findings` via `LLMMetaAnalyzer`; one LLM call per file (or per chunk for oversized files); token budgets from `constants.py`; falls back when `use_llm` is False | [meta_analyzer.py](../src/skillspector/nodes/meta_analyzer.py), [llm_analyzer_base.py](../src/skillspector/nodes/llm_analyzer_base.py) |
-| **report** | Builds SARIF 2.1.0, computes `risk_score`, `risk_severity`, `risk_recommendation`; writes `report_body` from `output_format` (terminal/json/markdown/sarif) | [report.py](../src/skillspector/nodes/report.py) |
+| **report** | Applies baseline suppression (`state["baseline"]`), then builds SARIF 2.1.0, computes `risk_score`, `risk_severity`, `risk_recommendation` from the non-suppressed findings; writes `report_body` from `output_format` (terminal/json/markdown/sarif) | [report.py](../src/skillspector/nodes/report.py) |
 
 ---
 
@@ -142,6 +145,7 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 | `llm_utils.py` | `chat_completion()` for OpenAI-compatible / NVIDIA Inference API |
 | `cli.py` | Typer app: `scan` (with input resolution, `--format`, `--no-llm`), `--version` |
 | `input_handler.py` | Resolves Git URL, file URL, .zip, single file, or directory to a local directory path |
+| `suppression.py` | Baseline / false-positive suppression: `Baseline`, `SuppressionRule`, `load_baseline`, `partition_findings`, `finding_fingerprint`, `build_baseline_dict` (see [SUPPRESSION.md](SUPPRESSION.md)) |
 | `__init__.py` | Package version (from pyproject.toml via `importlib.metadata`) |
 | `sarif_models.py` | SARIF 2.1.0 Pydantic models and `validate_sarif_report()` |
 | **nodes/** | |
@@ -156,7 +160,7 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 | `pattern_defaults.py` | Shared pattern metadata (category, explanation, remediation) |
 | `static_yara.py` | YARA-based static analyzer |
 | `osv_client.py` | OSV.dev API client for live vulnerability lookups (SC4); batch queries with caching and fallback |
-| `static_patterns_*.py` | 11 pattern-based analyzers (prompt_injection, data_exfiltration, etc.) |
+| `static_patterns_*.py` | 13 pattern-based analyzers (prompt_injection, data_exfiltration, anti_refusal, etc.) |
 | `behavioral_ast.py` | AST-based behavioral analyzer (AST1–AST8): detects exec, eval, subprocess, os.system, compile, dynamic import/getattr, and dangerous execution chains |
 | `behavioral_taint_tracking.py` | Taint-tracking behavioral analyzer (TT1–TT5): source→sink data-flow analysis over Python AST |
 | `mcp_least_privilege.py`, `mcp_tool_poisoning.py` | MCP analyzers (LP1–LP4 least-privilege; TP1–TP4 tool poisoning) |

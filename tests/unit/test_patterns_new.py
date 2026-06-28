@@ -938,6 +938,17 @@ class TestSupplyChainDependencies:
         names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
         assert names == ["pytest", "ruff"]
 
+    def test_pyproject_build_system_requires_extracted(self) -> None:
+        """[build-system].requires packages are scanned (e.g. setuptools, hatchling)."""
+        content = (
+            '[project]\nname = "mypkg"\n'
+            "[build-system]\n"
+            'requires = ["setuptools>=68", "wheel"]\n'
+            'build-backend = "setuptools.build_meta"\n'
+        )
+        names = sorted(p[0] for p in sc_mod._extract_packages_from_pyproject(content))
+        assert names == ["setuptools", "wheel"]
+
 
 # ── Supply Chain Safe Patterns (SC2) ───────────────────────────────────
 

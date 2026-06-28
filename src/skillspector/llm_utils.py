@@ -32,14 +32,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-from typing import Coroutine, TypeVar
+from collections.abc import Coroutine
+from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
-T = TypeVar("T")
-
-from skillspector.constants import MODEL_CONFIG
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
     create_chat_model,
@@ -115,7 +113,7 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     return str(response.text)
 
 
-def run_async(coroutine: Coroutine[None, None, T]) -> T:
+def run_async(coroutine: Coroutine) -> Any:
     """
     Run an async coroutine in a synchronous context, even if there's already a running event loop.
 
@@ -133,10 +131,9 @@ def run_async(coroutine: Coroutine[None, None, T]) -> T:
         Any exception raised by the coroutine is re-raised as-is
     """
     try:
+        asyncio.get_running_loop()
+    except RuntimeError:
         return asyncio.run(coroutine)
-    except RuntimeError as e:
-        if "This event loop is already running" in str(e):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, coroutine)
-                return future.result()
-        raise
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coroutine).result()

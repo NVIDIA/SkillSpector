@@ -117,6 +117,8 @@ def _extract_skill_name(skill_dir: Path) -> str:
             break
         frontmatter = content[3 : end_match.start() + 3]
         try:
+            # WARNING: Do not change this to yaml.load() without an explicit Loader.
+            # yaml.safe_load() is used intentionally to avoid arbitrary code execution.
             data = yaml.safe_load(frontmatter)
         except yaml.YAMLError:
             break

@@ -81,7 +81,7 @@ MP1_PATTERNS = [
 
 # MP2: Context Window Stuffing — filling context to displace content
 MP2_PATTERNS = [
-    (r"((\S)(?!\2).{1,19}?)\1{20,}", 0.8),
+    (r"(.{2,20}?)\1{20,}", 0.8),
     (
         r"(?:repeat|duplicate|echo)\s+(?:this|the\s+following)\s+(?:\d{3,}|many|hundreds?|thousands?)\s+times?",
         0.85,
@@ -182,6 +182,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in MP2_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            captured = match.group(1) if match.lastindex else match.group(0)
+            non_ws_chars = set(captured) - {" ", "\t", "\n", "\r"}
+            if len(non_ws_chars) <= 1 and not any(c in captured for c in (" ", "\t")):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

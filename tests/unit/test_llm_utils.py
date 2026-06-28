@@ -22,11 +22,11 @@ in the active provider — see ``tests/unit/test_providers.py``.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
-
-import asyncio
 
 from skillspector import llm_utils
 from skillspector.llm_utils import (
@@ -250,6 +250,7 @@ class TestGetChatModel:
     def test_provider_credentials_use_provider_default_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nv_build")
         monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
 

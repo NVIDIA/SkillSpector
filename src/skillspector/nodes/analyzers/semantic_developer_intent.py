@@ -22,8 +22,6 @@ its actual code behavior using LLM-based analysis.
 
 from __future__ import annotations
 
-import asyncio
-
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL, MODEL_CONFIG
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.llm_utils import run_async

@@ -22,7 +22,6 @@ LangChain structured output for validated, schema-driven LLM responses.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Literal
 
@@ -68,6 +67,16 @@ class MetaAnalyzerFinding(BaseModel):
     # minimum/maximum, which some OpenAI-compatible structured-output endpoints
     # reject. The range is enforced by the validator below instead.
     confidence: float = Field(description="Confidence score between 0.0 and 1.0")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: object) -> float:
+        # Accept 0-100 scale values from some models, then clamp into [0, 1].
+        v = float(v)
+        if v > 2.0:
+            v = v / 100.0
+        return min(1.0, max(0.0, v))
+
     intent: Literal["malicious", "negligent", "benign"] = Field(
         description="Likely intent behind the finding"
     )
@@ -76,15 +85,6 @@ class MetaAnalyzerFinding(BaseModel):
     )
     explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
     remediation: str = Field(default="", description="How to fix the issue (actionable steps)")
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _normalize_confidence(cls, v: object) -> float:
-        """Accept 0-100 scale (e.g. from Ollama) and normalize to [0, 1]."""
-        v = float(v)  # raises TypeError/ValueError for non-numeric inputs
-        if v > 1.0:
-            v = v / 100.0
-        return max(0.0, min(1.0, v))
 
 
 class OverallAssessment(BaseModel):
@@ -353,6 +353,14 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
     # -- Apply filter (keyed by file + rule_id + start/end_line) -------------
 
+    # Severities that must never be silently dropped by LLM filtering.
+    # Because the LLM receives attacker-controlled skill content, a prompt-injection
+    # payload could cause it to omit or deny a real CRITICAL/HIGH static finding.
+    # For these severities a false-negative (hiding a real vulnerability) is far
+    # worse than a false-positive, so we keep the original static finding regardless
+    # of what the LLM says and mark it "llm-unconfirmed" via the tags field.
+    _HIGH_SEVERITY_FLOOR = frozenset({"CRITICAL", "HIGH"})
+
     def apply_filter(
         self,
         findings: list[Finding],
@@ -366,6 +374,15 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         is included in the key when provided but falls back to ``None`` so
         callers that omit it still match.  Falls back to coarse
         ``(file, rule_id)`` keying for LLM responses that omit ``start_line``.
+
+        Severity-gated floor (security invariant)
+        ------------------------------------------
+        CRITICAL and HIGH static findings are **always** kept in the output even
+        if the LLM did not confirm them.  When the LLM omits or denies such a
+        finding the original static finding is preserved unchanged and the tag
+        ``"llm-unconfirmed"`` is appended so consumers can distinguish it from
+        LLM-validated findings.  MEDIUM and LOW findings continue to be filtered
+        by the LLM as before (false-positive reduction).
         """
         _enrichment = tuple[str, str, float]
         confirmed_granular: dict[tuple[str, str, int, int | None], _enrichment] = {}
@@ -416,6 +433,37 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             elif coarse_key in confirmed_coarse:
                 expl, rem, conf = confirmed_coarse[coarse_key]
             else:
+                # Security: CRITICAL/HIGH static findings must survive LLM filtering.
+                # A prompt-injection payload in the scanned skill could cause the LLM
+                # to deny or omit a real high-severity finding; silently dropping it
+                # would be a false-negative in a security gate.  Keep the original
+                # finding and tag it so consumers know it was not LLM-validated.
+                if f.severity in self._HIGH_SEVERITY_FLOOR:
+                    unconfirmed_tags = list(f.tags)
+                    if "llm-unconfirmed" not in unconfirmed_tags:
+                        unconfirmed_tags.append("llm-unconfirmed")
+                    result.append(
+                        Finding(
+                            rule_id=f.rule_id,
+                            message=f.message,
+                            severity=f.severity,
+                            confidence=f.confidence,
+                            file=f.file,
+                            start_line=f.start_line,
+                            end_line=f.end_line,
+                            remediation=f.remediation or get_remediation(f.rule_id),
+                            tags=unconfirmed_tags,
+                            context=f.context,
+                            matched_text=f.matched_text,
+                            category=getattr(f, "category", None),
+                            pattern=getattr(f, "pattern", None),
+                            finding=getattr(f, "finding", None),
+                            explanation=getattr(f, "explanation", None),
+                            code_snippet=getattr(f, "code_snippet", None) or f.context,
+                            intent=None,
+                        )
+                    )
+                # MEDIUM/LOW: preserve existing behaviour (LLM may filter as false-positive).
                 continue
             result.append(
                 Finding(
@@ -485,7 +533,28 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         )
 
         batch_results = run_async(analyzer.arun_batches(batches, metadata_text=metadata_text))
-        filtered = analyzer.apply_filter(findings, batch_results)
+
+        if len(batch_results) < len(batches):
+            # Some batches never returned. A finding the LLM never saw has no
+            # verdict — keep it via the fallback path instead of letting
+            # apply_filter treat the missing confirmation as a rejection.
+            analysed_ids = {id(f) for batch, _ in batch_results for f in batch.findings}
+            analysed = [f for f in findings if id(f) in analysed_ids]
+            unanalysed = [f for f in findings if id(f) not in analysed_ids]
+        else:
+            analysed, unanalysed = findings, []
+
+        filtered = analyzer.apply_filter(analysed, batch_results)
+        if unanalysed:
+            logger.warning(
+                "Meta-analyzer: %d/%d batches failed; keeping %d findings in %d "
+                "files unfiltered (no LLM verdict)",
+                len(batches) - len(batch_results),
+                len(batches),
+                len(unanalysed),
+                len({f.file for f in unanalysed}),
+            )
+            filtered.extend(_fallback_filtered(unanalysed))
 
         logger.debug(
             "LLM filtering done: %d findings -> %d after filter",

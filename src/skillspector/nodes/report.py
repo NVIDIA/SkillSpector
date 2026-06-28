@@ -47,9 +47,11 @@ from skillspector.sarif_models import (
     SarifReportingDescriptor,
     SarifResult,
     SarifRun,
+    SarifSuppression,
     SarifTool,
 )
 from skillspector.state import SkillspectorState
+from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 
 logger = get_logger(__name__)
 
@@ -95,13 +97,26 @@ def _compute_risk_score(
     a quarter. Occurrences beyond the third are ignored for scoring purposes.
     This prevents repeated pattern matches from inflating the score unboundedly.
 
+    Each finding's contribution is also scaled by its confidence value (clamped
+    to [0, 1]). Findings with confidence <= 0 are skipped entirely — they do not
+    contribute to the score but remain in the reported findings list.
+
+    Within each rule_id bucket, findings are processed in severity-descending
+    order so that the highest-severity occurrence always receives the full weight.
+
     Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
     Multiplier: 1.3x if has_executable_scripts.
     """
+    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    sorted_findings = sorted(
+        findings,
+        key=lambda f: (f.rule_id or "UNKNOWN", severity_rank.get((f.severity or "LOW").upper(), 4)),
+    )
+
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
 
-    for f in findings:
+    for f in sorted_findings:
         confidence = max(0.0, min(1.0, f.confidence))
         if confidence <= 0.0:
             continue
@@ -133,7 +148,10 @@ def _compute_risk_score(
     return final_score, severity_band, recommendation
 
 
-def _build_sarif(findings: list[Finding]) -> dict[str, object]:
+def _build_sarif(
+    findings: list[Finding],
+    suppressed: list[SuppressedFinding] | None = None,
+) -> dict[str, object]:
     """Build SARIF 2.1.0 log from findings.
 
     Filters out empty/malformed findings (missing rule_id or message) and
@@ -161,6 +179,33 @@ def _build_sarif(findings: list[Finding]) -> dict[str, object]:
                         )
                     )
                 ],
+            )
+        )
+        if finding.rule_id not in seen_rule_ids:
+            seen_rule_ids[finding.rule_id] = finding.message
+
+    # Baseline-suppressed findings are kept in the SARIF for an audit trail, but
+    # marked with the `suppressions` property so consumers exclude them from counts.
+    for sf in suppressed or []:
+        finding = sf.finding
+        if not finding.rule_id or not finding.message:
+            continue
+        results.append(
+            SarifResult(
+                rule_id=finding.rule_id,
+                message=SarifMessage(text=finding.message),
+                level=_severity_to_sarif_level(finding.severity),
+                locations=[
+                    SarifLocation(
+                        physical_location=SarifPhysicalLocation(
+                            artifact_location=SarifArtifactLocation(uri=finding.file),
+                            region=SarifRegion(
+                                start_line=finding.start_line, end_line=finding.end_line
+                            ),
+                        )
+                    )
+                ],
+                suppressions=[SarifSuppression(kind="external", justification=sf.reason)],
             )
         )
         if finding.rule_id not in seen_rule_ids:
@@ -201,8 +246,11 @@ def _format_terminal(
     risk_severity: str,
     risk_recommendation: str,
     has_executable_scripts: bool,
+    suppressed: list[SuppressedFinding] | None = None,
+    show_suppressed: bool = False,
 ) -> str:
     """Generate Rich terminal output and export as string."""
+    suppressed = suppressed or []
     console = Console(record=True, force_terminal=True, width=80, file=StringIO())
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
     source = skill_path or ""
@@ -274,6 +322,20 @@ def _format_terminal(
     else:
         console.print("\n[green]No security issues detected.[/green]\n")
 
+    if suppressed:
+        console.print(
+            f"[dim]Suppressed by baseline: {len(suppressed)} (not counted toward risk score)[/dim]"
+        )
+        if show_suppressed:
+            for sf in suppressed:
+                f = sf.finding
+                console.print(
+                    f"  [dim]- {f.rule_id} {f.file}:{f.start_line} (reason: {sf.reason})[/dim]"
+                )
+        else:
+            console.print("[dim]Use --show-suppressed to list them.[/dim]")
+        console.print()
+
     console.print(f"[dim]Executable scripts: {'Yes' if has_executable_scripts else 'No'}[/dim]")
     return console.export_text()
 
@@ -325,9 +387,7 @@ def _build_analysis_completeness(
 
     findings_dropped = len(findings_pre_filter) - len(findings_post_filter)
     if findings_dropped > 0:
-        limitations.append(
-            f"{findings_dropped} finding(s) filtered by meta-analyzer or heuristics"
-        )
+        limitations.append(f"{findings_dropped} finding(s) filtered by meta-analyzer or heuristics")
 
     completeness: dict[str, object] = {
         "total_components": total_components,
@@ -355,8 +415,10 @@ def _format_json(
     has_executable_scripts: bool,
     use_llm: bool = True,
     analysis_completeness: dict[str, object] | None = None,
+    suppressed: list[SuppressedFinding] | None = None,
 ) -> str:
     """Generate JSON report string."""
+    suppressed = suppressed or []
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
     data: dict[str, object] = {
         "skill": {
@@ -380,6 +442,8 @@ def _format_json(
             for c in component_metadata
         ],
         "issues": [f.to_dict() for f in findings],
+        "suppressed_count": len(suppressed),
+        "suppressed": [sf.to_dict() for sf in suppressed],
         "metadata": _build_metadata(has_executable_scripts, use_llm),
     }
     if analysis_completeness is not None:
@@ -396,8 +460,11 @@ def _format_markdown(
     risk_severity: str,
     risk_recommendation: str,
     has_executable_scripts: bool,
+    suppressed: list[SuppressedFinding] | None = None,
+    show_suppressed: bool = False,
 ) -> str:
     """Generate Markdown report string."""
+    suppressed = suppressed or []
     lines: list[str] = []
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
     source = skill_path or ""
@@ -448,6 +515,22 @@ def _format_markdown(
                 lines.append("")
             lines.append("---\n")
 
+    if suppressed:
+        lines.append(f"## Suppressed ({len(suppressed)})\n")
+        lines.append(
+            "These findings matched the baseline and are **not** counted toward the risk score.\n"
+        )
+        if show_suppressed:
+            lines.append("| Rule | Location | Reason |")
+            lines.append("|------|----------|--------|")
+            for sf in suppressed:
+                f = sf.finding
+                reason = sf.reason.replace("|", "\\|")
+                lines.append(f"| {f.rule_id} | `{f.file}:{f.start_line}` | {reason} |")
+            lines.append("")
+        else:
+            lines.append("_Run with `--show-suppressed` to list them._\n")
+
     lines.append("## Metadata\n")
     lines.append(f"- **Executable Scripts:** {'Yes' if has_executable_scripts else 'No'}")
     lines.append(f"\n*Generated by SkillSpector v{skillspector_version}*")
@@ -455,10 +538,14 @@ def _format_markdown(
 
 
 def report(state: SkillspectorState) -> dict[str, object]:
-    """Generate SARIF, compute risk score, and set report_body from output_format."""
-    raw_findings = state.get("filtered_findings", state.get("findings", []))
-    findings_for_scoring = deduplicate(raw_findings)
-    filtered_findings = raw_findings
+    """Generate SARIF, compute risk score, and set report_body from output_format.
+
+    A baseline (state["baseline"]) suppresses matching findings: they never count
+    toward the risk score and are excluded from SARIF. They are shown in the
+    human-readable report only when state["show_suppressed"] is True.
+    """
+    raw_findings = state.get("findings", [])
+    filtered_findings = state.get("filtered_findings", raw_findings)
     component_metadata = state.get("component_metadata") or []
     components = state.get("components") or []
     file_cache = state.get("file_cache") or {}
@@ -468,17 +555,26 @@ def report(state: SkillspectorState) -> dict[str, object]:
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
 
+    baseline = state.get("baseline")
+    show_suppressed = state.get("show_suppressed", False)
+    active_findings, suppressed = partition_findings(
+        filtered_findings, baseline if isinstance(baseline, Baseline) else None
+    )
+
+    # Risk and SARIF reflect only the active (non-suppressed) findings; scoring
+    # additionally de-duplicates so the same issue is not counted twice.
+    findings_for_scoring = deduplicate(active_findings)
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings_for_scoring, has_executable_scripts
     )
-    sarif_report = _build_sarif(filtered_findings)
+    sarif_report = _build_sarif(active_findings, suppressed)
     analysis_completeness = _build_analysis_completeness(
         components, file_cache, use_llm, raw_findings, filtered_findings
     )
 
     if output_format == "terminal":
         report_body = _format_terminal(
-            filtered_findings,
+            active_findings,
             component_metadata,
             manifest,
             skill_path,
@@ -486,10 +582,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_severity,
             risk_recommendation,
             has_executable_scripts,
+            suppressed=suppressed,
+            show_suppressed=show_suppressed,
         )
     elif output_format == "json":
         report_body = _format_json(
-            filtered_findings,
+            active_findings,
             component_metadata,
             manifest,
             skill_path,
@@ -499,10 +597,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
             has_executable_scripts,
             use_llm=use_llm,
             analysis_completeness=analysis_completeness,
+            suppressed=suppressed,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
-            filtered_findings,
+            active_findings,
             component_metadata,
             manifest,
             skill_path,
@@ -510,14 +609,17 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_severity,
             risk_recommendation,
             has_executable_scripts,
+            suppressed=suppressed,
+            show_suppressed=show_suppressed,
         )
     else:
         report_body = json.dumps(sarif_report, indent=2)
 
     logger.debug(
-        "Report generated: format=%s, findings_count=%d",
+        "Report generated: format=%s, findings_count=%d, suppressed_count=%d",
         output_format,
-        len(filtered_findings),
+        len(active_findings),
+        len(suppressed),
     )
 
     out: dict[str, object] = {
@@ -527,5 +629,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "risk_recommendation": risk_recommendation,
         "report_body": report_body,
         "filtered_findings": filtered_findings,
+        "suppressed_findings": suppressed,
     }
     return out

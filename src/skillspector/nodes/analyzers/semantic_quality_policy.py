@@ -22,8 +22,6 @@ natural-language policy violations that static/behavioral tools cannot detect.
 
 from __future__ import annotations
 
-import asyncio
-
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.llm_utils import run_async

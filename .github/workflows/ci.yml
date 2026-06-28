@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+# Least privilege: these jobs only read the repo; no write scopes are needed.
+permissions:
+  contents: read
+
+# Cancel superseded runs when new commits are pushed to the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # Windows is excluded: the test suite has known path-separator failures
+    # in build_context that are out of scope for this workflow.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        # Pinned to a full commit SHA (third-party action); comment tracks the tag.
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Lint with ruff
+        run: uv run ruff check src/ tests/
+
+      - name: Check formatting with ruff
+        run: uv run ruff format --check src/ tests/
+
+      - name: Run unit tests with coverage
+        run: uv run pytest -m "not integration" --cov=src/skillspector --cov-report=term-missing
+
+  dco:
+    name: DCO Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify DCO sign-off on all commits
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          # Iterate SHAs directly rather than piping `git log` into `while read`:
+          # `git log` does not print a trailing newline after the final record,
+          # so a read-loop silently skips the last commit — and for a one-commit
+          # PR (the common case) the body never runs at all, letting an unsigned
+          # commit pass. A for-loop over the SHA list checks every commit.
+          status=0
+          for sha in $(git log --format=%H "${BASE}..${HEAD}"); do
+            if ! git log -1 --format="%B" "$sha" | grep -q "^Signed-off-by:"; then
+              echo "  missing Signed-off-by: $sha $(git log -1 --format=%s "$sha")"
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo ""
+            echo "Please add a DCO sign-off (git commit -s) to all commits."
+            exit 1
+          fi
+          echo "All commits have DCO sign-off."

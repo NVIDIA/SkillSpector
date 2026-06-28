@@ -222,10 +222,7 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
             second_arg = ast_node.args[1]
             if not isinstance(second_arg, ast.Constant):
                 _emit("AST7", lineno, end_lineno)
-            elif (
-                isinstance(second_arg.value, str)
-                and second_arg.value in _DANGEROUS_GETATTR_NAMES
-            ):
+            elif isinstance(second_arg.value, str) and second_arg.value in _DANGEROUS_GETATTR_NAMES:
                 _emit("AST9", lineno, end_lineno)
 
     return findings

@@ -19,11 +19,12 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **65 vulnerability patterns** across 16 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **68 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
 - **Risk scoring**: 0-100 score with severity labels and clear recommendations
+- **Baseline / false-positive suppression**: Accept known findings via a glob-rule or fingerprint baseline so re-scans surface only *new* issues ([docs](docs/SUPPRESSION.md))
 
 ## Quick Start
 
@@ -146,6 +147,26 @@ skillspector scan ./my-skill/ --format markdown --output report.md
 skillspector scan ./my-skill/ --format sarif --output report.sarif
 ```
 
+### Suppressing False Positives (baseline)
+
+Suppress known/accepted findings so the risk score reflects only un-triaged
+issues and re-scans surface only *new* findings. See the
+[suppression guide](docs/SUPPRESSION.md) for the full reference.
+
+```bash
+# Accept all current findings into a baseline (run once), then commit it.
+skillspector baseline ./my-skill/ -o .skillspector-baseline.yaml
+
+# Scan against the baseline — only NEW findings are reported and scored.
+skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml
+
+# Review what was suppressed (still excluded from the score).
+skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml --show-suppressed
+```
+
+A baseline can also use drift-tolerant glob rules (by rule id, file path, or
+message) — see [`.skillspector-baseline.example.yaml`](.skillspector-baseline.example.yaml).
+
 ### LLM Analysis
 
 For the best results, configure an OpenAI-compatible LLM endpoint for
@@ -199,9 +220,43 @@ skillspector scan ./my-skill/
 skillspector scan ./my-skill/ --no-llm
 ```
 
+### MCP Server
+
+Run SkillSpector as a [Model Context Protocol](https://modelcontextprotocol.io)
+server so any MCP-capable agent (Claude Code, Codex CLI, Gemini CLI) or remote
+runtime can call scanning as a tool and **gate skill/MCP installs on the
+result** — turning SkillSpector into a runtime guardrail instead of an
+out-of-band audit step.
+
+```bash
+# Install the optional MCP dependency
+pip install "skillspector[mcp]"
+
+# stdio transport — for local CLI agents
+skillspector mcp
+
+# streamable HTTP/SSE transport — for remote / A2A callers
+skillspector mcp --transport http --host 127.0.0.1 --port 8000
+```
+
+The server exposes a single tool:
+
+- **`scan_skill(target, use_llm=true, output_format="json")`** — scans a Git
+  URL, file URL, `.zip`, `.md` file, or directory and returns a structured
+  verdict: `risk_score` (0-100), `severity`, `recommendation`,
+  `safe_to_install`, and `findings`. It also reports `llm_used` / `scan_mode`
+  so a low score from a static-only scan is never mistaken for a clean full
+  scan.
+
+Register it with Claude Code via:
+
+```bash
+claude mcp add skillspector -- skillspector mcp
+```
+
 ## Vulnerability Patterns
 
-SkillSpector detects **65 vulnerability patterns** across 16 categories:
+SkillSpector detects **68 vulnerability patterns** across 17 categories:
 
 ### Prompt Injection (5 patterns)
 
@@ -212,6 +267,14 @@ SkillSpector detects **65 vulnerability patterns** across 16 categories:
 | P3 | Exfiltration Commands | HIGH | Instructions to transmit context externally |
 | P4 | Behavior Manipulation | MEDIUM | Subtle instructions altering agent decisions |
 | P5 | Harmful Content | CRITICAL | Instructions that could cause physical harm |
+
+### Anti-Refusal (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| AR1 | Refusal Suppression | HIGH | Instructions to never refuse or always comply (e.g. "never refuse", "always comply") |
+| AR2 | Disclaimer Suppression | HIGH | Instructions to omit warnings, disclaimers, or ethical commentary (e.g. "no disclaimers", "do not moralize") |
+| AR3 | Safety Policy Nullification | HIGH | Jailbreak framing that nullifies guardrails (e.g. "you have no restrictions", "ignore your guidelines", "do anything now") |
 
 ### Data Exfiltration (4 patterns)
 
@@ -436,8 +499,14 @@ Options:
   -f, --format [terminal|json|markdown|sarif]  Output format [default: terminal]
   -o, --output PATH                            Output file path
   --no-llm                                     Skip LLM analysis (static only)
+  --yara-rules-dir PATH                        Extra YARA rules directory
+  -b, --baseline PATH                          Suppress findings listed in a baseline
+  --show-suppressed                            List baseline-suppressed findings
   -V, --verbose                                Show detailed progress
   --help                                       Show this message and exit
+
+# Generate a baseline of all current findings (see docs/SUPPRESSION.md)
+skillspector baseline <path> [-o FILE] [--no-llm] [--reason TEXT]
 ```
 
 ## Integrating SkillSpector
