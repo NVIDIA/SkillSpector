@@ -17,9 +17,37 @@
 
 from __future__ import annotations
 
+import logging
+from urllib.parse import urlparse
+
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
+
+logger = logging.getLogger(__name__)
+
+
+def validate_base_url(url: str | None) -> None:
+    """Warn if *url* is not a well-formed http(s) URL.
+
+    Raises nothing — misconfigured URLs will still fail at the HTTP
+    layer, but an early warning helps operators catch typos.
+    """
+    if url is None:
+        return
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        logger.warning(
+            "Provider base_url %r has scheme %r — expected http or https. "
+            "Requests will likely fail.",
+            url,
+            parsed.scheme or "(empty)",
+        )
+    if not parsed.netloc:
+        logger.warning(
+            "Provider base_url %r has no host component. Requests will likely fail.",
+            url,
+        )
 
 
 def create_openai_compatible_chat_model(
@@ -35,6 +63,7 @@ def create_openai_compatible_chat_model(
         return None
 
     api_key, base_url = credentials
+    validate_base_url(base_url)
     return ChatOpenAI(
         model=model,
         base_url=base_url,

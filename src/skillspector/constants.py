@@ -15,9 +15,12 @@
 
 """Shared constants for skillspector (env-driven where applicable)."""
 
+import logging
 import os
 
 from skillspector.providers import get_metadata_provider
+
+logger = logging.getLogger(__name__)
 
 # % of model's max tokens used for input. 1-MAX_INPUT_TOKENS_PCT is used for output.
 MAX_INPUT_TOKENS_PCT = 0.75
@@ -33,7 +36,7 @@ _provider = get_metadata_provider()
 
 # Exposed for analyzers that need a final fallback symbol (e.g.,
 # ``model = state.model or MODEL_CONFIG[ANALYZER_ID] or _SKILLSPECTOR_DEFAULT_MODEL``).
-_SKILLSPECTOR_DEFAULT_MODEL = _provider.DEFAULT_MODEL  # type: ignore[attr-defined]
+_SKILLSPECTOR_DEFAULT_MODEL = _provider.DEFAULT_MODEL
 
 _MODEL_SLOTS: tuple[str, ...] = (
     "default",
@@ -46,7 +49,56 @@ _MODEL_SLOTS: tuple[str, ...] = (
     "meta_analyzer",
 )
 
-MODEL_CONFIG: dict[str, str] = {slot: _provider.resolve_model(slot) for slot in _MODEL_SLOTS}
+
+def _resolve_slot_model(slot: str) -> str:
+    """Resolve the model for *slot* with per-slot env var override support.
+
+    Precedence: ``SKILLSPECTOR_MODEL_{SLOT}`` env var > provider
+    ``resolve_model(slot)`` (which itself runs ``SKILLSPECTOR_MODEL`` env >
+    provider slot default > provider ``DEFAULT_MODEL``).
+    """
+    env_key = f"SKILLSPECTOR_MODEL_{slot.upper()}"
+    env_val = os.environ.get(env_key, "").strip()
+    if env_val:
+        return env_val
+    return _provider.resolve_model(slot)
+
+
+MODEL_CONFIG: dict[str, str] = {slot: _resolve_slot_model(slot) for slot in _MODEL_SLOTS}
+
+
+def _validate_model_config() -> None:
+    """Warn about models not found in the provider's model registry.
+
+    When ``SKILLSPECTOR_STRICT_MODEL_VALIDATION=true``, raises
+    ``ValueError`` instead of logging warnings.
+    """
+    unknown: list[str] = []
+    for slot, model in MODEL_CONFIG.items():
+        ctx = _provider.get_context_length(model)  # type: ignore[attr-defined]
+        if ctx is None:
+            unknown.append(f"  {slot}: {model}")
+            logger.warning(
+                "Model '%s' (slot: %s) not found in model_registry.yaml. "
+                "Using fallback context length (%d). Token budgeting may be "
+                "inaccurate — add the model to the registry or verify the "
+                "model ID.",
+                model,
+                slot,
+                DEFAULT_CONTEXT_LENGTH,
+            )
+
+    strict = os.environ.get("SKILLSPECTOR_STRICT_MODEL_VALIDATION", "").lower() == "true"
+    if strict and unknown:
+        raise ValueError(
+            "Strict model validation enabled. Unknown models:\n"
+            + "\n".join(unknown)
+            + "\nAdd them to model_registry.yaml or disable "
+            "SKILLSPECTOR_STRICT_MODEL_VALIDATION."
+        )
+
+
+_validate_model_config()
 
 # Log level: from env or fallback (DEBUG, INFO, WARNING, ERROR).
 SKILLSPECTOR_LOG_LEVEL = os.environ.get("SKILLSPECTOR_LOG_LEVEL", "WARNING")

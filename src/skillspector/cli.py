@@ -49,21 +49,14 @@ def _ensure_utf8_streams() -> None:
     box-drawing characters and icons used in the terminal report, which raises
     UnicodeEncodeError. Reconfiguring with errors="replace" makes output robust
     across platforms without crashing.
-
-    Streams that already use UTF-8 are left untouched, so strict encoding
-    behaviour is preserved where it already works (e.g. most POSIX consoles).
     """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
-        encoding = getattr(stream, "encoding", None)
-        if encoding and encoding.lower().replace("-", "") == "utf8":
-            continue
-        try:
-            reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            logger.debug("Could not reconfigure %s to UTF-8", stream)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                logger.debug("Could not reconfigure %s to UTF-8", stream)
 
 
 _ensure_utf8_streams()
@@ -239,7 +232,7 @@ def scan(
         typer.Option(
             "--recursive",
             "-r",
-            help="Scan directories containing multiple skills (immediate subdirectories with SKILL.md) independently.",
+            help="Scan immediate subdirectories that each contain a SKILL.md as independent skills.",
         ),
     ] = False,
     depth: Annotated[
@@ -326,9 +319,10 @@ def scan(
     Environment variables:
 
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
-                               anthropic_proxy | nv_build | subprocess.
-                               Defaults to the NVIDIA path (nv_inference,
-                               falling back to nv_build in OSS builds).
+                               anthropic_proxy | bedrock | nv_build |
+                               nv_inference | subprocess. Defaults to the
+                               NVIDIA path (nv_inference, falling back to
+                               nv_build in OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
                                model (applies to every analyzer slot).
         SKILLSPECTOR_LOG_LEVEL DEBUG | INFO | WARNING | ERROR (default WARNING).
@@ -337,6 +331,9 @@ def scan(
 
         OPENAI_API_KEY [+ OPENAI_BASE_URL]   for SKILLSPECTOR_PROVIDER=openai
         ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
+        AWS_PROFILE (optional) + AWS_REGION  for SKILLSPECTOR_PROVIDER=bedrock
+                                             (AWS_PROFILE: standard boto3 credential
+                                             chain when unset; AWS_REGION default: us-west-2)
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
         SKILLSPECTOR_LLM_COMMAND             for SKILLSPECTOR_PROVIDER=subprocess
                                              (shell command; prompt via stdin —
@@ -543,7 +540,7 @@ def mcp(
         typer.Option(
             "--transport",
             "-t",
-            help="Transport: stdio for local CLI agents, http for remote/A2A callers.",
+            help="Transport: FastMCP stdio for local CLI agents, http for remote/A2A callers.",
             case_sensitive=False,
         ),
     ] = TransportChoice.stdio,
@@ -563,12 +560,13 @@ def mcp(
     Codex CLI, Gemini CLI) or remote runtime can scan a skill and gate installs
     on the verdict.
 
+    Requires the optional mcp extra. Reinstall the GitHub tool package with
+    that extra enabled, as shown in the README Quick Start section.
+
     Examples:
 
-        skillspector mcp                      # stdio (local agents)
+        skillspector mcp                      # FastMCP stdio for local CLI agents
         skillspector mcp --transport http --port 8000
-
-    Requires the optional ``mcp`` dependency: pip install "skillspector[mcp]".
     """
     try:
         from skillspector.mcp_server import run as run_mcp

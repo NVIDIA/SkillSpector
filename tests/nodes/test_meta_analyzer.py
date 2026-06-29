@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for LLMMetaAnalyzer filtering and partial batch failure handling."""
+"""Tests for the meta_analyzer node."""
 
 from __future__ import annotations
 
@@ -42,7 +42,10 @@ def _analyzer() -> LLMMetaAnalyzer:
 
 
 def _finding(
-    rule_id: str, start_line: int, end_line: int | None = None, severity: str = "CRITICAL"
+    rule_id: str,
+    start_line: int,
+    end_line: int | None = None,
+    severity: str = "CRITICAL",
 ) -> Finding:
     return Finding(
         rule_id=rule_id,
@@ -67,6 +70,57 @@ def _llm_item(rule_id: str, start_line: int, **kw: object) -> dict[str, object]:
     return item
 
 
+def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
+    """Regression: a static finding with end_line=None must still match a
+    confirmation whose end_line is populated (e.g. end_line == start_line, as
+    some models return). Previously these confirmed findings were silently
+    dropped. See issue #67."""
+    findings = [_finding("SC4", 4), _finding("SC4", 5)]
+    items = [_llm_item("SC4", 4, end_line=4), _llm_item("SC4", 5, end_line=5)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert {f.start_line for f in kept} == {4, 5}
+    assert len(kept) == 2
+
+
+def test_rejected_finding_still_dropped() -> None:
+    """The end_line-agnostic fallback must not resurrect findings the LLM
+    rejected (is_vulnerability=False)."""
+    findings = [_finding("SC4", 4, severity="MEDIUM")]
+    items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert kept == []
+
+
+def test_low_confidence_finding_dropped() -> None:
+    """Confirmations below the confidence threshold are not kept."""
+    findings = [_finding("SC4", 4, severity="MEDIUM")]
+    items = [_llm_item("SC4", 4, end_line=4, confidence=0.3)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert kept == []
+
+
+def test_exact_end_line_match_still_works() -> None:
+    """Existing behaviour: when both sides carry the same concrete end_line,
+    the finding is kept (no regression from the new fallback)."""
+    findings = [_finding("AST1", 21, end_line=21)]
+    items = [_llm_item("AST1", 21, end_line=21)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert len(kept) == 1
+    assert kept[0].rule_id == "AST1"
+
+
 def _confirm(pattern_id: str, file: str, start_line: int) -> dict[str, object]:
     """LLM item confirming a finding, as parse_response would emit it."""
     return {
@@ -81,40 +135,6 @@ def _confirm(pattern_id: str, file: str, start_line: int) -> dict[str, object]:
     }
 
 
-def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
-    """A finding with end_line=None matches confirmation with end_line=start_line."""
-    findings = [_finding("SC4", 4), _finding("SC4", 5)]
-    items = [_llm_item("SC4", 4, end_line=4), _llm_item("SC4", 5, end_line=5)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert {f.start_line for f in kept} == {4, 5}
-    assert len(kept) == 2
-
-
-def test_rejected_finding_still_dropped() -> None:
-    """LLM-rejected MEDIUM findings are dropped (no severity floor for MEDIUM/LOW)."""
-    findings = [_finding("SC4", 4, severity="MEDIUM")]
-    items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert kept == []
-
-
-def test_low_confidence_finding_dropped() -> None:
-    """MEDIUM confirmations below the confidence threshold are dropped."""
-    findings = [_finding("SC4", 4, severity="MEDIUM")]
-    items = [_llm_item("SC4", 4, end_line=4, confidence=0.3)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert kept == []
-
-
 def test_critical_finding_kept_when_rejected_by_llm() -> None:
     """CRITICAL findings survive LLM rejection — security floor prevents false negatives."""
     findings = [_finding("SC4", 4, severity="CRITICAL")]
@@ -126,17 +146,6 @@ def test_critical_finding_kept_when_rejected_by_llm() -> None:
     assert len(kept) == 1
     assert "llm-unconfirmed" in kept[0].tags
 
-
-def test_exact_end_line_match_still_works() -> None:
-    """Existing behavior: matching concrete end_line keeps the finding."""
-    findings = [_finding("AST1", 21, end_line=21)]
-    items = [_llm_item("AST1", 21, end_line=21)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert len(kept) == 1
-    assert kept[0].rule_id == "AST1"
 
 
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
@@ -177,8 +186,10 @@ class TestMetaAnalyzerPartialBatchFailure:
         filtered = result["filtered_findings"]
         kept = {(f.file, f.rule_id) for f in filtered}
 
+        # the real filter still applies to the batch that came back
         assert ("a.py", "R1") in kept
         assert ("a.py", "R2") not in kept
+        # the finding the LLM never saw must NOT be silently dropped
         assert ("b.py", "R1") in kept
 
         confirmed = next(f for f in filtered if f.file == "a.py")

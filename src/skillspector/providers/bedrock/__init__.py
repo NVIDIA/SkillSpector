@@ -12,3 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""AWS Bedrock provider package (Claude via SigV4-authenticated Bedrock Runtime)."""
+
+from .provider import (
+    BEDROCK_DEFAULT_MODEL,
+    BEDROCK_DEFAULT_REGION,
+    REGISTRY_PATH,
+    BedrockProvider,
+)
+
+__all__ = [
+    "BEDROCK_DEFAULT_MODEL",
+    "BEDROCK_DEFAULT_REGION",
+    "REGISTRY_PATH",
+    "BedrockProvider",
+]

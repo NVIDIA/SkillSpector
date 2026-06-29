@@ -1,6 +1,6 @@
 # B.3.2: MCP Tool-Poisoning Detection (TP1 -- TP4)
 
-**Author:** Nir Paz | **Date:** 2026-03-30 | **Status:** Implemented  
+**Author:** Nir Paz | **Date:** 2026-03-30 | **Status:** Implemented
 **Component:** `src/skillspector/nodes/analyzers/mcp_tool_poisoning.py`
 
 ---

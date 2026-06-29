@@ -104,24 +104,47 @@ def resolve_dotted_name(node: ast.expr) -> str | None:
     return None
 
 
+def _strip_builtins_prefix(name: str) -> str:
+    """Collapse a ``builtins``-qualified name back to its bare builtin name.
+
+    ``builtins.exec`` → ``exec`` (and ``builtins.eval``/``compile``/``__import__``…).
+    The analyzers match dangerous builtins by their bare name (``call_name == "exec"``,
+    ``name in _EXEC_SINKS``), but ``from builtins import exec`` / ``import builtins;
+    builtins.exec(...)`` resolve, through the import-alias map, to the *qualified*
+    spelling ``builtins.exec`` — which would otherwise slip past those checks. Since
+    ``builtins.exec is exec`` at runtime, collapsing the prefix is semantically exact
+    and re-enters the existing bare-name detection.
+
+    Only the single-segment form ``builtins.<attr>`` is collapsed; deeper chains
+    (``builtins.foo.bar``) are left untouched as they are not direct builtin calls.
+    """
+    root, sep, rest = name.partition(".")
+    if root == "builtins" and sep and "." not in rest:
+        return rest
+    return name
+
+
 def apply_import_aliases(name: str, aliases: dict[str, str]) -> str:
     """Rewrite a resolved call name to its fully-qualified form using import aliases.
 
-    Bridges two evasion-prone spellings back to the canonical dotted name that the
+    Bridges several evasion-prone spellings back to the canonical name that the
     analyzers match against:
 
     - ``from os import system`` → ``{"system": "os.system"}`` so a bare ``system``
       call resolves to ``"os.system"``.
     - ``import os as o`` → ``{"o": "os"}`` so ``o.system`` resolves to ``"os.system"``.
+    - ``from builtins import exec`` / ``import builtins; builtins.exec(...)`` → the
+      bare builtin ``exec`` (via :func:`_strip_builtins_prefix`), so dangerous
+      builtins matched by bare name are not hidden behind a ``builtins.`` qualifier.
 
     Idempotent for already-canonical names (``os.system`` stays ``os.system``).
     """
     if name in aliases:
-        return aliases[name]
+        return _strip_builtins_prefix(aliases[name])
     root, sep, rest = name.partition(".")
     if sep and root in aliases:
-        return f"{aliases[root]}.{rest}"
-    return name
+        return _strip_builtins_prefix(f"{aliases[root]}.{rest}")
+    return _strip_builtins_prefix(name)
 
 
 def resolve_call_name(node: ast.Call, aliases: dict[str, str] | None = None) -> str | None:
@@ -136,6 +159,50 @@ def resolve_call_name(node: ast.Call, aliases: dict[str, str] | None = None) -> 
     if name is not None and aliases:
         name = apply_import_aliases(name, aliases)
     return name
+
+
+def _dynamic_import_target(node: ast.expr, aliases: dict[str, str] | None = None) -> str | None:
+    """Return the imported module name for an ``importlib.import_module('mod')`` call.
+
+    Recognizes both ``importlib.import_module('os')`` and the bare-imported
+    ``from importlib import import_module; import_module('os')`` (resolved via the
+    import-alias map), returning the string literal module name (``'os'``) when the
+    first positional argument is a constant. Returns ``None`` for anything else
+    (non-literal argument, unrelated call), so callers stay precise and avoid false
+    positives on dynamic module names the analyzer cannot resolve statically.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func_name = resolve_dotted_name(node.func)
+    if func_name is not None and aliases:
+        func_name = apply_import_aliases(func_name, aliases)
+    if func_name not in ("importlib.import_module", "import_module"):
+        return None
+    if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+        return node.args[0].value
+    return None
+
+
+def resolve_dynamic_import_call(
+    node: ast.Call, aliases: dict[str, str] | None = None
+) -> str | None:
+    """Resolve ``importlib.import_module('mod').attr(...)`` to the dotted sink ``'mod.attr'``.
+
+    Bridges the dynamic-import evasion that mirrors ``__import__``: a skill writes
+    ``importlib.import_module('os').system(cmd)`` (or imports ``import_module`` bare)
+    so the dangerous module never appears as a static ``import``. When *node*'s callee
+    is an attribute access on such a chain, this returns the canonical sink name
+    (``'os.system'``, ``'subprocess.run'``) that the existing sink ladders already
+    match. Returns ``None`` when the chain is not a literal dynamic import, keeping the
+    resolution precise (no false positives on un-resolvable dynamic names).
+    """
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    module_name = _dynamic_import_target(func.value, aliases)
+    if module_name is None:
+        return None
+    return f"{module_name}.{func.attr}"
 
 
 def _build_import_aliases(tree: ast.Module) -> dict[str, str]:

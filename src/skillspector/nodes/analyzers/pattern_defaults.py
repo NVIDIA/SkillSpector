@@ -39,8 +39,8 @@ class PatternCategory(StrEnum):
     MCP_LEAST_PRIVILEGE = "MCP Least Privilege"
     MCP_TOOL_POISONING = "MCP Tool Poisoning"
     AGENT_SNOOPING = "Agent Snooping"
-    SERVER_SIDE_REQUEST_FORGERY = "Server-Side Request Forgery"
     ANTI_REFUSAL = "Anti-Refusal"
+    SERVER_SIDE_REQUEST_FORGERY = "Server-Side Request Forgery"
 
 
 # Pattern-specific explanations (why the finding is dangerous)
@@ -54,6 +54,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "E2": "Code accesses environment variables that may contain secrets (API keys, tokens). This is a common pattern for credential theft.",
     "E3": "Code scans file system directories looking for sensitive files. This could be reconnaissance for credential theft.",
     "E4": "Code or instructions that leak agent conversation context to external services, potentially exposing sensitive user interactions.",
+    "E5": "Data is uploaded to cloud storage (S3 / GCS / Azure Blob). This may be a legitimate backup or exfiltration to an external bucket. Manual review is recommended.",
     "PE1": "Skill requests more permissions than appear necessary for its stated functionality. Review if elevated access is justified.",
     "PE2": "Commands invoke sudo or root privileges. Verify this elevated access is necessary and justified.",
     "PE3": "Code accesses credential files (SSH keys, AWS credentials, etc.). This could indicate credential theft attempts.",
@@ -127,14 +128,14 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "AS1": "Skill reads from agent configuration directories (.claude/, .codex/, .gemini/). These directories may contain API keys, personal settings, and other credentials that the skill has no legitimate need to access.",
     "AS2": "Skill accesses MCP server configuration files (mcp.json). MCP configs contain server URLs, authentication tokens, and tool definitions — reading them allows the skill to discover and potentially abuse other tool integrations.",
     "AS3": "Skill enumerates or reads other installed skills. Access to other skills' SKILL.md files or the skills directory reveals prompt instructions, capabilities, and secrets that should be invisible to peer skills.",
-    # Server-Side Request Forgery (SSRF)
-    "SSRF1": "Code accesses a cloud instance metadata endpoint (e.g. 169.254.169.254). A single request can return temporary IAM credentials, making this a high-value SSRF target for credential theft.",
-    "SSRF2": "Code issues a request to a loopback, link-local, or private-range host. This can reach internal services not meant to be exposed and is a common SSRF pivot.",
-    "SSRF3": "Request target host is built from a dynamic or untrusted value. If the host is attacker-influenced, this enables SSRF to arbitrary internal or metadata endpoints.",
     # Anti-Refusal Statements (jailbreak)
     "AR1": "Skill instructs the agent to never refuse or to always comply. Suppressing the agent's ability to decline removes a core safety control and enables downstream harmful requests to succeed.",
     "AR2": "Skill instructs the agent to omit warnings, disclaimers, or ethical commentary. Stripping safety caveats hides risk from the user and is a common jailbreak preamble.",
     "AR3": "Skill attempts to nullify the agent's safety policies or restrictions ('you have no restrictions', 'ignore your guidelines', 'do anything now'). This is a direct jailbreak that disables guardrails.",
+    # Server-Side Request Forgery (SSRF)
+    "SSRF1": "Code accesses a cloud instance metadata endpoint (e.g. 169.254.169.254). A single request can return temporary IAM credentials, making this a high-value SSRF target for credential theft.",
+    "SSRF2": "Code issues a request to a loopback, link-local, or private-range host. This can reach internal services not meant to be exposed and is a common SSRF pivot.",
+    "SSRF3": "Request target host is built from a dynamic or untrusted value. If the host is attacker-influenced, this enables SSRF to arbitrary internal or metadata endpoints.",
 }
 
 # Rule ID -> category (for report output)
@@ -151,6 +152,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "E2": PatternCategory.DATA_EXFILTRATION.value,
     "E3": PatternCategory.DATA_EXFILTRATION.value,
     "E4": PatternCategory.DATA_EXFILTRATION.value,
+    "E5": PatternCategory.DATA_EXFILTRATION.value,
     "PE1": PatternCategory.PRIVILEGE_ESCALATION.value,
     "PE2": PatternCategory.PRIVILEGE_ESCALATION.value,
     "PE3": PatternCategory.PRIVILEGE_ESCALATION.value,
@@ -202,14 +204,14 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "AS1": PatternCategory.AGENT_SNOOPING.value,
     "AS2": PatternCategory.AGENT_SNOOPING.value,
     "AS3": PatternCategory.AGENT_SNOOPING.value,
-    # Server-Side Request Forgery
-    "SSRF1": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
-    "SSRF2": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
-    "SSRF3": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
     # Anti-Refusal Statements (jailbreak)
     "AR1": PatternCategory.ANTI_REFUSAL.value,
     "AR2": PatternCategory.ANTI_REFUSAL.value,
     "AR3": PatternCategory.ANTI_REFUSAL.value,
+    # Server-Side Request Forgery
+    "SSRF1": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
+    "SSRF2": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
+    "SSRF3": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
 }
 
 # Rule ID -> pattern display name (for report output)
@@ -226,6 +228,7 @@ PATTERN_NAMES: dict[str, str] = {
     "E2": "Env Variable Harvesting",
     "E3": "File System Enumeration",
     "E4": "Conversation Context Leak",
+    "E5": "Cloud Storage Exfiltration",
     "PE1": "Excessive Permissions",
     "PE2": "Sudo/Root Invocation",
     "PE3": "Credential File Access",
@@ -277,14 +280,14 @@ PATTERN_NAMES: dict[str, str] = {
     "AS1": "Agent Config Directory Access",
     "AS2": "MCP Config Access",
     "AS3": "Skill Enumeration",
-    # Server-Side Request Forgery
-    "SSRF1": "Cloud Metadata Access",
-    "SSRF2": "Internal Network Request",
-    "SSRF3": "Dynamic Request Target",
     # Anti-Refusal Statements (jailbreak)
     "AR1": "Refusal Suppression",
     "AR2": "Disclaimer Suppression",
     "AR3": "Safety Policy Nullification",
+    # Server-Side Request Forgery
+    "SSRF1": "Cloud Metadata Access",
+    "SSRF2": "Internal Network Request",
+    "SSRF3": "Dynamic Request Target",
 }
 
 # Pattern-specific remediations (how to fix the issue)
@@ -298,6 +301,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "E2": "Avoid reading sensitive env vars (API keys, tokens) unless strictly required. Use secrets managers or secure config. Never log or transmit credentials.",
     "E3": "Remove unnecessary filesystem scanning. If file access is needed, use explicit, scoped paths. Avoid reading ~/.ssh, ~/.aws, or credential directories.",
     "E4": "Remove any code that sends prompts, responses, or session data externally. Preserve user privacy; never exfiltrate conversation content.",
+    "E5": "Verify the destination bucket is trusted and owned by you. Never upload credentials, secrets, or workspace contents to external or unverified cloud storage.",
     "PE1": "Request only the minimum permissions required. Document why each permission is needed. Remove broad permissions like '*' or 'all'.",
     "PE2": "Avoid sudo/root unless strictly required. Prefer least-privilege patterns. If elevation is needed, document the justification and scope.",
     "PE3": "Remove references to credential paths. Use environment variables or secrets managers. For docs, use placeholder paths (e.g., /path/to/config). Never load .env or token files in production code paths.",
@@ -371,14 +375,14 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "AS1": "Remove all code or instructions that access agent configuration directories (.claude/, .codex/, .gemini/). If configuration values are needed, pass them explicitly as parameters or environment variables — never read the agent's own config files.",
     "AS2": "Remove all code or instructions that read MCP configuration files (mcp.json). MCP server details should be managed by the agent runtime, not read by individual skills.",
     "AS3": "Remove all code or instructions that list or read other skills' files or directories. Skills should operate independently; cross-skill access is a privilege escalation.",
-    # Server-Side Request Forgery
-    "SSRF1": "Remove access to cloud metadata endpoints unless strictly required. If metadata is needed, restrict it (e.g. IMDSv2 with hop limit) and never expose returned credentials.",
-    "SSRF2": "Avoid requests to loopback/link-local/private hosts from skill code. If internal access is intended, document it and validate the target against an allowlist.",
-    "SSRF3": "Do not build request URLs from untrusted input. Validate the host against an allowlist and reject internal/metadata addresses before issuing the request.",
     # Anti-Refusal Statements (jailbreak)
     "AR1": "Remove any instruction telling the agent to never refuse or always comply. The agent must retain the ability to decline unsafe, out-of-scope, or harmful requests.",
     "AR2": "Remove instructions that suppress warnings, disclaimers, or ethical commentary. Let the agent surface safety-relevant caveats to the user.",
     "AR3": "Remove jailbreak framing that nullifies safety policies or restrictions. Skill content must not instruct the agent to ignore its guidelines or operate without guardrails.",
+    # Server-Side Request Forgery
+    "SSRF1": "Remove access to cloud metadata endpoints unless strictly required. If metadata is needed, restrict it (e.g. IMDSv2 with hop limit) and never expose returned credentials.",
+    "SSRF2": "Avoid requests to loopback/link-local/private hosts from skill code. If internal access is intended, document it and validate the target against an allowlist.",
+    "SSRF3": "Do not build request URLs from untrusted input. Validate the host against an allowlist and reject internal/metadata addresses before issuing the request.",
 }
 
 

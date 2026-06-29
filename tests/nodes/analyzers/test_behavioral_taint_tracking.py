@@ -464,3 +464,62 @@ class TestTypeAwareResolution:
         )
         findings = _run(code)
         assert not any(f.rule_id == "TT4" for f in findings)
+
+
+# ── builtins / importlib exec-sink evasion ────────────────────────────
+
+
+class TestBuiltinsImportlibSinkEvasion:
+    """Exec sinks reached via ``builtins.*`` or ``importlib.import_module`` must alert.
+
+    ``_EXEC_SINKS`` matches by bare/qualified name (``"exec"``, ``"os.system"``).
+    ``from builtins import exec`` resolves to ``builtins.exec`` (collapsed back to
+    ``exec``) and ``importlib.import_module('subprocess').run`` resolves to the
+    canonical ``subprocess.run`` — both must re-enter the exec-sink path so a
+    user-input → exec flow is flagged as TT5. Complements the ``getattr`` branch
+    (PR #166): this covers the import/builtins/importlib branch.
+    """
+
+    def test_from_builtins_import_exec_sink(self):
+        """``from builtins import exec`` with tainted input must raise TT5."""
+        code = "from builtins import exec\ncode = input()\nexec(code)\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_import_builtins_dot_exec_sink(self):
+        """``import builtins; builtins.exec(input())`` must raise TT5."""
+        code = "import builtins\ncode = input()\nbuiltins.exec(code)\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_import_builtins_as_alias_sink(self):
+        """``import builtins as b2; b2.exec(input())`` must raise TT5."""
+        code = "import builtins as b2\ncode = input()\nb2.exec(code)\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_importlib_import_module_os_system_sink(self):
+        """``importlib.import_module('os').system(input())`` must raise TT5."""
+        code = "import importlib\ncmd = input()\nimportlib.import_module('os').system(cmd)\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_importlib_import_module_subprocess_run_sink(self):
+        """``importlib.import_module('subprocess').run(input())`` must raise TT5."""
+        code = "import importlib\ncmd = input()\nimportlib.import_module('subprocess').run(cmd)\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_from_importlib_import_module_sink(self):
+        """Bare-imported ``import_module('os').system(input())`` must raise TT5."""
+        code = (
+            "from importlib import import_module\ncmd = input()\nimport_module('os').system(cmd)\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT5" for f in findings)
+
+    def test_importlib_benign_module_no_false_positive(self):
+        """A benign dynamic import (``json.loads``) must not be treated as an exec sink."""
+        code = "import importlib\ndata = input()\nimportlib.import_module('json').loads(data)\n"
+        findings = _run(code)
+        assert not any(f.rule_id == "TT5" for f in findings)

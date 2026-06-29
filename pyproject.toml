@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skillspector"
-version = "2.3.5"
+version = "2.3.7"
 description = "SkillSpector: Security scanner for AI agent skills (Claude Code, Cursor, and similar). Scans skills for vulnerabilities, malicious patterns, and security risks before installation. Supports Git repos, URLs, zips, and local directories; runs static pattern checks and optional LLM semantic analysis; outputs terminal, JSON, and Markdown reports with risk scoring."
 readme = "README.md"
 license = "Apache-2.0"
@@ -39,8 +39,10 @@ dependencies = [
     "langgraph>=1.0.10",
     "langgraph-cli[inmem]>=0.4.14",
     "langchain-anthropic>=1.4.5",
+    "langchain-aws>=0.2.0",
     "langchain-core>=1.2.17",
     "langchain-openai>=1.1.10",
+    "boto3>=1.34.0",
     "langsmith>=0.7.30",
     "yara-python>=4.5.0",
 ]
