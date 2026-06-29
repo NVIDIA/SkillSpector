@@ -133,6 +133,10 @@ _AR_DIRECT_INTENT_PATTERNS = (
         r"\bnever\s+say\s+(?:that\s+)?(?:you\s+)?(?:can'?t|cannot|won'?t|no)\b", re.IGNORECASE
     ),
     re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+(?:lecture|moralize|moralise|preach|judge|warn)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
         r"\byou\s+have\s+no\s+(?:restrictions?|limitations?|guidelines?|policies?)\b", re.IGNORECASE
     ),
     re.compile(r"\b(?:answer|respond)\s+directly\b", re.IGNORECASE),
@@ -211,10 +215,28 @@ def _emitted_context(context: str, match_line: str, is_directive: bool) -> str:
     return context
 
 
+def _has_benign_continuation_source(
+    previous_line: str,
+    earlier_line: str | None = None,
+) -> bool:
+    """Return True when a continuation label belongs to an explicit benign scaffold."""
+    previous_line_lower = previous_line.lower()
+    if not _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower):
+        return False
+    if not earlier_line:
+        return False
+    earlier_line_lower = earlier_line.lower()
+    return bool(
+        _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(earlier_line_lower)
+        or _BENIGN_AR_TOOL_FIELD_PATTERN.search(earlier_line_lower)
+    )
+
+
 def _is_quoted_or_labeled_benign_match(
     match_line: str,
     matched_text: str,
     previous_line: str | None = None,
+    earlier_line: str | None = None,
 ) -> bool:
     """Return True when a direct phrase appears only as quoted or declared reference text."""
     matched_text_lower = matched_text.lower()
@@ -244,7 +266,7 @@ def _is_quoted_or_labeled_benign_match(
         return True
     if _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower):
         return quoted_match
-    if _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower):
+    if _has_benign_continuation_source(previous_line, earlier_line=earlier_line):
         return bool(re.search(r"^\s+", match_line)) or quoted_match
     if _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower):
         return bool(re.search(r"^\s*(?:[-*]\s*)?\S", match_line))
@@ -258,6 +280,7 @@ def _is_benign_ar_context(
     match_line: str,
     match: str,
     previous_line: str | None = None,
+    earlier_line: str | None = None,
 ) -> bool:
     """Return True for high-confidence non-malicious prose patterns around AR matches."""
     match_line_lower = match_line.lower()
@@ -273,7 +296,7 @@ def _is_benign_ar_context(
         previous_line_lower = previous_line.lower()
         has_previous_line_benign_marker = bool(
             _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower)
-            or _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower)
+            or _has_benign_continuation_source(previous_line, earlier_line=earlier_line)
             or _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower)
             or _BENIGN_AR_FIXTURE_INTRO_PATTERN.search(previous_line_lower)
             or (
@@ -287,6 +310,7 @@ def _is_benign_ar_context(
         match_line,
         match,
         previous_line=previous_line,
+        earlier_line=earlier_line,
     )
     if _is_directly_instructive(match_line_lower, match):
         return (has_inline_role_marker or has_previous_line_benign_marker) and role_labeled_match
@@ -309,6 +333,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 line_num = get_line_number(content, match.start())
                 match_line = lines[line_num - 1] if lines else content
                 previous_line = lines[line_num - 2] if line_num > 1 else None
+                earlier_line = lines[line_num - 3] if line_num > 2 else None
                 context = get_context(content, match.start(), context_lines=3)
                 is_directive = _is_directly_instructive(match_line.lower(), match.group(0))
                 confidence = base_confidence
@@ -319,6 +344,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         match_line,
                         match.group(0),
                         previous_line=previous_line,
+                        earlier_line=earlier_line,
                     )
                 ):
                     confidence -= _EXAMPLE_PENALTY
@@ -327,6 +353,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     match_line,
                     match.group(0),
                     previous_line=previous_line,
+                    earlier_line=earlier_line,
                 ):
                     continue
                 if confidence < _MIN_CONFIDENCE:
