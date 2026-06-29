@@ -166,6 +166,20 @@ def _write_result(
             print(report_body)
 
 
+def _recursive_json_payload(result: dict[str, object]) -> dict[str, object] | None:
+    """Return parsed report_body when it is valid JSON object text."""
+    raw_report_body = result.get("report_body")
+    if not isinstance(raw_report_body, str):
+        return None
+
+    try:
+        parsed = json.loads(raw_report_body)
+    except json.JSONDecodeError:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _cleanup_result(result: dict[str, object]) -> None:
     """Remove temp dir from graph result if set."""
     temp_dir = result.get("temp_dir_for_cleanup")
@@ -420,17 +434,25 @@ def _scan_multi_skill(
             if "error" in result:
                 combined["skills"].append({"name": skill.name, "error": result["error"]})
             else:
-                combined["skills"].append(
-                    {
-                        "name": skill.name,
-                        "path": skill.relative_path,
-                        "risk_score": result.get("risk_score", 0),
-                        "risk_severity": result.get("risk_severity", "LOW"),
-                        "finding_count": len(
-                            result.get("filtered_findings") or result.get("findings") or []
-                        ),
-                    }
+                payload = _recursive_json_payload(result) or {}
+                entry = {
+                    "name": skill.name,
+                    "path": skill.relative_path,
+                    "risk_score": result.get("risk_score", 0),
+                    "risk_severity": result.get("risk_severity", "LOW"),
+                    "finding_count": len(
+                        result.get("filtered_findings") or result.get("findings") or []
+                    ),
+                }
+                entry.update(payload)
+                entry["name"] = skill.name
+                entry["path"] = skill.relative_path
+                entry["risk_score"] = result.get("risk_score", 0)
+                entry["risk_severity"] = result.get("risk_severity", "LOW")
+                entry["finding_count"] = len(
+                    result.get("filtered_findings") or result.get("findings") or []
                 )
+                combined["skills"].append(entry)
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
     elif output:
