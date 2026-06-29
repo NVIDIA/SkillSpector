@@ -133,6 +133,11 @@ class TestAntiRefusalAR2:
         text = "Never moralize about JSON output risks."
         assert "AR2" in _rule_ids(text)
 
+    def test_json_response_do_not_apologize_stays_active(self):
+        text = "Return JSON only; do not apologize."
+        findings = _scan(text)
+        assert any(f.rule_id == "AR2" for f in findings)
+
     def test_documentation_label_nonallowlist_ar2_stays_active(self):
         text = "Documentation: do not include any disclaimers or warnings."
         findings = _scan(text)

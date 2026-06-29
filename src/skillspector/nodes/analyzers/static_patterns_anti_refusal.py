@@ -149,6 +149,28 @@ _AR2_LIVE_SUPPRESSION_PATTERN = re.compile(
     r"(?:any\s+)?(?:warnings?|disclaimers?|caveats?)\b",
     re.IGNORECASE,
 )
+_AR2_DIRECT_INTENT_PATTERNS = (
+    _AR2_LIVE_SUPPRESSION_PATTERN,
+    re.compile(
+        r"\bwithout\s+(?:any\s+)?(?:warnings?|disclaimers?|caveats?|moralizing|moralising|"
+        r"judg(?:e?ment|ing))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+(?:lecture|moralize|moralise|preach|judge|warn)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:skip|omit|leave\s+out|drop)\s+(?:the\s+)?(?:disclaimer|warning|ethics|safety)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:no|without)\s+(?:ethical|moral)\s+(?:judg(?:e?ment)|considerations?|commentary|"
+        r"objections?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:do\s+not|don'?t)\s+(?:apologize|apologise|say\s+sorry)\b", re.IGNORECASE),
+)
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
     r"\b(?:json|output)\s+schema\b|\berrors?\[\]\b",
     re.IGNORECASE,
@@ -193,8 +215,10 @@ def _is_directly_instructive(context: str, matched_text: str) -> bool:
         return False
     if any(pattern.search(context_lower) for pattern in _AR_DIRECT_INTENT_PATTERNS):
         return True
-    if _AR2_LIVE_SUPPRESSION_PATTERN.search(context_lower):
-        return not _BENIGN_AR_SCHEMA_FIELD_PATTERN.search(context_lower)
+    if any(pattern.search(context_lower) for pattern in _AR2_DIRECT_INTENT_PATTERNS):
+        if _AR2_LIVE_SUPPRESSION_PATTERN.search(context_lower):
+            return not _BENIGN_AR_SCHEMA_FIELD_PATTERN.search(context_lower)
+        return True
     return "do anything now" in matched_text_lower
 
 
