@@ -136,6 +136,15 @@ _AR_DIRECT_INTENT_PATTERNS = (
     re.compile(r"\bact\s+as\s+\w+", re.IGNORECASE),
     re.compile(r"\balways\s+comply\b", re.IGNORECASE),
 )
+_AR2_LIVE_SUPPRESSION_PATTERN = re.compile(
+    r"\b(?:do\s+not|don'?t|never|no)\s+(?:include|add|give|provide|use|append)?\s*"
+    r"(?:any\s+)?(?:warnings?|disclaimers?|caveats?)\b",
+    re.IGNORECASE,
+)
+_BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
+    r"\b(?:json|output)\s+schema\b|\berrors?\[\]\b",
+    re.IGNORECASE,
+)
 
 _BENIGN_AR_VALUE_LABEL_PATTERN = re.compile(
     r"^\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description)\s*:\s*",
@@ -155,6 +164,8 @@ _BENIGN_AR_DECLARATION_INLINE_PATTERN = re.compile(
     r"^\s*(?:deny-?list|tool)\s+declaration\s*:\s*",
     re.IGNORECASE,
 )
+_BENIGN_AR_TOOL_FIELD_PATTERN = re.compile(r"^\s*tool\s*:\s*\S", re.IGNORECASE)
+_BENIGN_AR_DESCRIPTION_FIELD_PATTERN = re.compile(r"^\s*description\s*:\s*", re.IGNORECASE)
 _BENIGN_AR_FIXTURE_INTRO_PATTERN = re.compile(
     r"^\s*(?:#\s*)?(?:defensive\s+fixture|unit\s+test|test\s+case)\b",
     re.IGNORECASE,
@@ -168,11 +179,14 @@ _EXPLICIT_EXAMPLE_CONTEXT_PATTERN = re.compile(
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
     """Return True when the match still looks like an active adversarial instruction."""
     context_lower = context.lower()
+    matched_text_lower = matched_text.lower()
     if re.search(r"\bwould\s+always\s+comply\b", context_lower):
         return False
     if any(pattern.search(context_lower) for pattern in _AR_DIRECT_INTENT_PATTERNS):
         return True
-    return "do anything now" in matched_text.lower()
+    if _AR2_LIVE_SUPPRESSION_PATTERN.search(context_lower):
+        return not _BENIGN_AR_SCHEMA_FIELD_PATTERN.search(context_lower)
+    return "do anything now" in matched_text_lower
 
 
 def _is_explicit_example_context(context: str) -> bool:
@@ -204,11 +218,13 @@ def _is_quoted_or_labeled_benign_match(
         return True
     if _BENIGN_AR_DECLARATION_INLINE_PATTERN.search(match_line_lower):
         return True
-    if _BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line_lower):
-        return True
     if not previous_line:
         return False
     previous_line_lower = previous_line.lower()
+    if _BENIGN_AR_TOOL_FIELD_PATTERN.search(
+        previous_line_lower
+    ) and _BENIGN_AR_DESCRIPTION_FIELD_PATTERN.search(match_line_lower):
+        return True
     if _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower):
         return quoted_match
     if _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower):
@@ -243,6 +259,10 @@ def _is_benign_ar_context(
             or _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower)
             or _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower)
             or _BENIGN_AR_FIXTURE_INTRO_PATTERN.search(previous_line_lower)
+            or (
+                _BENIGN_AR_TOOL_FIELD_PATTERN.search(previous_line_lower)
+                and _BENIGN_AR_DESCRIPTION_FIELD_PATTERN.search(match_line)
+            )
         )
     if re.search(r"\bwould\s+always\s+comply\b", match_line_lower):
         return True
