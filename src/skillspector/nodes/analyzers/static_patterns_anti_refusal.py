@@ -145,7 +145,13 @@ _AR_DIRECT_INTENT_PATTERNS = (
 )
 
 _BENIGN_AR_VALUE_LABEL_PATTERN = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description|prompt)\s*:\s*",
+    r"^\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description)\s*:\s*",
+    re.IGNORECASE,
+)
+
+_BENIGN_AR_WARNING_INTRO_PATTERN = re.compile(r"^\s*(?:warning|note)\s*:\s*$", re.IGNORECASE)
+_BENIGN_AR_CONTINUATION_LABEL_PATTERN = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description)\s*:\s*(?:[|>])?\s*$",
     re.IGNORECASE,
 )
 
@@ -160,32 +166,62 @@ def _is_directly_instructive(context: str, matched_text: str) -> bool:
     return "do anything now" in matched_text.lower()
 
 
-def _is_quoted_or_labeled_benign_match(match_line: str, matched_text: str) -> bool:
+def _is_quoted_or_labeled_benign_match(
+    match_line: str,
+    matched_text: str,
+    previous_line: str | None = None,
+) -> bool:
     """Return True when a direct phrase appears only as quoted or declared reference text."""
     matched_text_lower = matched_text.lower()
     match_line_lower = match_line.lower()
-    if any(f"{quote}{matched_text_lower}{quote}" in match_line_lower for quote in ('"', "'", "`")):
+    quoted_match = any(
+        f"{quote}{matched_text_lower}{quote}" in match_line_lower for quote in ('"', "'", "`")
+    )
+    if quoted_match:
         return True
     if re.search(
         rf"\bthe\s+phrase\s+[\"'`]?{re.escape(matched_text_lower)}[\"'`]?",
         match_line_lower,
     ):
         return True
-    return bool(_BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line_lower))
+    if _BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line_lower):
+        return True
+    if not previous_line:
+        return False
+    previous_line_lower = previous_line.lower()
+    if _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower):
+        return quoted_match or bool(re.search(r'^[\s"\']', match_line))
+    if _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower):
+        return bool(re.search(r"^\s+", match_line)) or quoted_match
+    return False
 
 
-def _is_benign_ar_context(context: str, match_line: str, match: str) -> bool:
+def _is_benign_ar_context(
+    context: str,
+    match_line: str,
+    match: str,
+    previous_line: str | None = None,
+) -> bool:
     """Return True for high-confidence non-malicious prose patterns around AR matches."""
-    context_lower = context.lower()
     match_line_lower = match_line.lower()
     has_benign_marker = any(
         pattern.search(match_line_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS
     )
     has_benign_marker = has_benign_marker or bool(_BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line))
-    if re.search(r"\bwould\s+always\s+comply\b", context_lower):
+    if previous_line:
+        previous_line_lower = previous_line.lower()
+        has_benign_marker = has_benign_marker or bool(
+            _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower)
+            or _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower)
+        )
+    if re.search(r"\bwould\s+always\s+comply\b", match_line_lower):
         return True
     if _is_directly_instructive(match_line_lower, match):
-        return has_benign_marker and _is_quoted_or_labeled_benign_match(match_line, match)
+        return has_benign_marker and _is_quoted_or_labeled_benign_match(
+            match_line,
+            match,
+            previous_line=previous_line,
+        )
     return has_benign_marker
 
 
@@ -200,11 +236,17 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 lines = content.splitlines()
                 line_num = get_line_number(content, match.start())
                 match_line = lines[line_num - 1] if lines else content
+                previous_line = lines[line_num - 2] if line_num > 1 else None
                 context = get_context(content, match.start(), context_lines=3)
                 confidence = base_confidence
                 if is_code_example(context):
                     confidence -= _EXAMPLE_PENALTY
-                if _is_benign_ar_context(context, match_line, match.group(0)):
+                if _is_benign_ar_context(
+                    context,
+                    match_line,
+                    match.group(0),
+                    previous_line=previous_line,
+                ):
                     continue
                 if confidence < _MIN_CONFIDENCE:
                     continue
