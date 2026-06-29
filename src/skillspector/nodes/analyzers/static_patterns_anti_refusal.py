@@ -151,6 +151,14 @@ _BENIGN_AR_DECLARATION_INTRO_PATTERN = re.compile(
     r"^\s*(?:deny-?list|tool)\s+declaration\s*:\s*$",
     re.IGNORECASE,
 )
+_BENIGN_AR_DECLARATION_INLINE_PATTERN = re.compile(
+    r"^\s*(?:deny-?list|tool)\s+declaration\s*:\s*",
+    re.IGNORECASE,
+)
+_BENIGN_AR_FIXTURE_INTRO_PATTERN = re.compile(
+    r"^\s*(?:#\s*)?(?:defensive\s+fixture|unit\s+test|test\s+case)\b",
+    re.IGNORECASE,
+)
 _EXPLICIT_EXAMPLE_CONTEXT_PATTERN = re.compile(
     r"(?:```|example:|for example|e\.g\.|such as|# warning:|# note:|\*\*warning\*\*|\*\*note\*\*|// ✅|// ❌|// good:|// bad:|// correct:|// incorrect:|// wrong:)",
     re.IGNORECASE,
@@ -194,6 +202,8 @@ def _is_quoted_or_labeled_benign_match(
         match_line_lower,
     ):
         return True
+    if _BENIGN_AR_DECLARATION_INLINE_PATTERN.search(match_line_lower):
+        return True
     if _BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line_lower):
         return True
     if not previous_line:
@@ -205,6 +215,8 @@ def _is_quoted_or_labeled_benign_match(
         return bool(re.search(r"^\s+", match_line)) or quoted_match
     if _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower):
         return bool(re.search(r"^\s*(?:[-*]\s*)?\S", match_line))
+    if _BENIGN_AR_FIXTURE_INTRO_PATTERN.search(previous_line_lower):
+        return quoted_match
     return False
 
 
@@ -220,6 +232,9 @@ def _is_benign_ar_context(
         pattern.search(match_line_lower) for pattern in _BENIGN_AR_TECHNICAL_CONTEXT_PATTERNS
     )
     has_inline_role_marker = bool(_BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line))
+    has_inline_role_marker = has_inline_role_marker or bool(
+        _BENIGN_AR_DECLARATION_INLINE_PATTERN.search(match_line)
+    )
     has_previous_line_benign_marker = False
     if previous_line:
         previous_line_lower = previous_line.lower()
@@ -227,6 +242,7 @@ def _is_benign_ar_context(
             _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower)
             or _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower)
             or _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower)
+            or _BENIGN_AR_FIXTURE_INTRO_PATTERN.search(previous_line_lower)
         )
     if re.search(r"\bwould\s+always\s+comply\b", match_line_lower):
         return True
