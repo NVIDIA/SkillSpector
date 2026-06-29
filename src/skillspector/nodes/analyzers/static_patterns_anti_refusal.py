@@ -121,14 +121,7 @@ _RULES = [("AR1", AR1_PATTERNS), ("AR2", AR2_PATTERNS), ("AR3", AR3_PATTERNS)]
 _EXAMPLE_PENALTY = 0.4
 _MIN_CONFIDENCE = 0.5
 
-_BENIGN_AR_CONTEXT_PATTERNS = (
-    re.compile(r"\b(for\s+example|e\.g\.|i\.e\.|anti-?example)\b", re.IGNORECASE),
-    re.compile(r"\b(deny-?list|allow-?list|tool\s+declaration|tool(s)?\s*:\s*)\b", re.IGNORECASE),
-    re.compile(r"\b(fixture|unit\s+test|test\s+case|defensive)\b", re.IGNORECASE),
-    re.compile(
-        r"(?:\b(?:warning|note)\s*:|\b(?:documentation|doc(s)?|tutorial|reference)\b)",
-        re.IGNORECASE,
-    ),
+_BENIGN_AR_TECHNICAL_CONTEXT_PATTERNS = (
     re.compile(r"\b(json|schema|errors?\[\])\b", re.IGNORECASE),
 )
 
@@ -158,6 +151,10 @@ _BENIGN_AR_DECLARATION_INTRO_PATTERN = re.compile(
     r"^\s*(?:deny-?list|tool)\s+declaration\s*:\s*$",
     re.IGNORECASE,
 )
+_EXPLICIT_EXAMPLE_CONTEXT_PATTERN = re.compile(
+    r"(?:```|example:|for example|e\.g\.|such as|# warning:|# note:|\*\*warning\*\*|\*\*note\*\*|// ✅|// ❌|// good:|// bad:|// correct:|// incorrect:|// wrong:)",
+    re.IGNORECASE,
+)
 
 
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
@@ -170,6 +167,11 @@ def _is_directly_instructive(context: str, matched_text: str) -> bool:
     return "do anything now" in matched_text.lower()
 
 
+def _is_explicit_example_context(context: str) -> bool:
+    """Return True only for explicit example-style scaffolding, not generic docs labels."""
+    return bool(_EXPLICIT_EXAMPLE_CONTEXT_PATTERN.search(context))
+
+
 def _is_quoted_or_labeled_benign_match(
     match_line: str,
     matched_text: str,
@@ -179,12 +181,16 @@ def _is_quoted_or_labeled_benign_match(
     matched_text_lower = matched_text.lower()
     match_line_lower = match_line.lower()
     quoted_match = any(
-        f"{quote}{matched_text_lower}{quote}" in match_line_lower for quote in ('"', "'", "`")
+        re.search(
+            rf"{re.escape(quote)}[^{re.escape(quote)}\n]*{re.escape(matched_text_lower)}[^{re.escape(quote)}\n]*{re.escape(quote)}",
+            match_line_lower,
+        )
+        for quote in ('"', "'", "`")
     )
     if quoted_match:
         return True
     if re.search(
-        rf"\bthe\s+phrase\s+[\"'`]?{re.escape(matched_text_lower)}[\"'`]?",
+        rf"\bthe\s+phrase\b.*?[\"'`][^\"'`\n]*{re.escape(matched_text_lower)}[^\"'`\n]*[\"'`]",
         match_line_lower,
     ):
         return True
@@ -194,7 +200,7 @@ def _is_quoted_or_labeled_benign_match(
         return False
     previous_line_lower = previous_line.lower()
     if _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower):
-        return quoted_match or bool(re.search(r'^[\s"\']', match_line))
+        return quoted_match
     if _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower):
         return bool(re.search(r"^\s+", match_line)) or quoted_match
     if _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower):
@@ -210,12 +216,10 @@ def _is_benign_ar_context(
 ) -> bool:
     """Return True for high-confidence non-malicious prose patterns around AR matches."""
     match_line_lower = match_line.lower()
-    has_inline_benign_marker = any(
-        pattern.search(match_line_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS
+    has_technical_benign_marker = any(
+        pattern.search(match_line_lower) for pattern in _BENIGN_AR_TECHNICAL_CONTEXT_PATTERNS
     )
-    has_inline_benign_marker = has_inline_benign_marker or bool(
-        _BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line)
-    )
+    has_inline_role_marker = bool(_BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line))
     has_previous_line_benign_marker = False
     if previous_line:
         previous_line_lower = previous_line.lower()
@@ -232,8 +236,10 @@ def _is_benign_ar_context(
         previous_line=previous_line,
     )
     if _is_directly_instructive(match_line_lower, match):
-        return (has_inline_benign_marker or has_previous_line_benign_marker) and role_labeled_match
-    if has_inline_benign_marker:
+        return (has_inline_role_marker or has_previous_line_benign_marker) and role_labeled_match
+    if has_technical_benign_marker:
+        return True
+    if has_inline_role_marker:
         return True
     return has_previous_line_benign_marker and role_labeled_match
 
@@ -252,7 +258,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 previous_line = lines[line_num - 2] if line_num > 1 else None
                 context = get_context(content, match.start(), context_lines=3)
                 confidence = base_confidence
-                if is_code_example(context):
+                if (
+                    is_code_example(context)
+                    and _is_explicit_example_context(context)
+                    and not _is_quoted_or_labeled_benign_match(
+                        match_line,
+                        match.group(0),
+                        previous_line=previous_line,
+                    )
+                ):
                     confidence -= _EXAMPLE_PENALTY
                 if _is_benign_ar_context(
                     context,
