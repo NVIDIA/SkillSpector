@@ -121,6 +121,47 @@ _RULES = [("AR1", AR1_PATTERNS), ("AR2", AR2_PATTERNS), ("AR3", AR3_PATTERNS)]
 _EXAMPLE_PENALTY = 0.4
 _MIN_CONFIDENCE = 0.5
 
+_BENIGN_AR_CONTEXT_PATTERNS = (
+    re.compile(r"\b(for\s+example|e\.g\.|i\.e\.|anti-?example)\b", re.IGNORECASE),
+    re.compile(r"\b(deny-?list|allow-?list|tool\s+declaration|tool(s)?\s*:\s*)\b", re.IGNORECASE),
+    re.compile(r"\b(fixture|unit\s+test|test\s+case|defensive)\b", re.IGNORECASE),
+    re.compile(r"\b(warning|note|documentation|doc(s)?|tutorial|reference)\b", re.IGNORECASE),
+    re.compile(r"\b(json|schema|errors?\[\])\b", re.IGNORECASE),
+)
+
+_AR_DIRECT_INTENT_PATTERNS = (
+    re.compile(r"\byou\s+(?:must|will|should|can|cannot|can'?t|are|were)\b", re.IGNORECASE),
+    re.compile(r"\bfrom\s+now\s+on\b", re.IGNORECASE),
+    re.compile(
+        r"\byou\s+have\s+no\s+(?:restrictions?|limitations?|guidelines?|policies?)\b", re.IGNORECASE
+    ),
+    re.compile(r"\bignore\s+your\s+(?:guidelines|policy|safety|content|rules?)\b", re.IGNORECASE),
+    re.compile(r"\bact\s+as\s+\w+", re.IGNORECASE),
+    re.compile(r"\balways\s+comply\b", re.IGNORECASE),
+)
+
+
+def _is_directly_instructive(context: str, matched_text: str) -> bool:
+    """Return True when the match still looks like an active adversarial instruction."""
+    context_lower = context.lower()
+    if re.search(r"\bwould\s+always\s+comply\b", context_lower):
+        return False
+    if any(pattern.search(context_lower) for pattern in _AR_DIRECT_INTENT_PATTERNS):
+        return True
+    return "do anything now" in matched_text.lower()
+
+
+def _is_benign_ar_context(context: str, match: str) -> bool:
+    """Return True for high-confidence non-malicious prose patterns around AR matches."""
+    context_lower = context.lower()
+    if _is_directly_instructive(context_lower, match):
+        return False
+    if re.search(r"\bwould\s+always\s+comply\b", context_lower):
+        return True
+    if any(pattern.search(context_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS):
+        return True
+    return False
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for anti-refusal statements (AR1-AR3)."""
@@ -134,6 +175,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 confidence = base_confidence
                 if is_code_example(context):
                     confidence -= _EXAMPLE_PENALTY
+                if _is_benign_ar_context(context, match.group(0)):
+                    continue
                 if confidence < _MIN_CONFIDENCE:
                     continue
                 findings.append(
