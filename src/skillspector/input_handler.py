@@ -62,6 +62,26 @@ ALLOWED_DOWNLOAD_HOSTS = frozenset(
     }
 )
 
+_DIRECT_FILE_URL_SUFFIXES = (
+    ".md",
+    ".py",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".js",
+    ".ts",
+    ".rb",
+    ".go",
+    ".rs",
+    ".pl",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".txt",
+    ".zip",
+)
+
 
 def _is_private_ip(host: str) -> bool:
     """Return True if host resolves to a private/reserved IP address."""
@@ -148,7 +168,11 @@ class InputHandler:
         parsed = urlparse(path)
         host = parsed.hostname or ""
         if any(allowed in host for allowed in ALLOWED_GIT_HOSTS):
-            if "/raw/" in path or "/blob/" in path or path.endswith((".md", ".py", ".sh")):
+            if (
+                "/raw/" in path
+                or "/blob/" in path
+                or path.lower().endswith(_DIRECT_FILE_URL_SUFFIXES)
+            ):
                 return False
             return True
         if path.endswith(".git"):

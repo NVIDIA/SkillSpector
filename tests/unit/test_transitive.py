@@ -16,6 +16,7 @@
 """Tests for transitive source extraction and traversal planning."""
 
 from skillspector import transitive
+from skillspector.input_handler import InputHandler
 
 
 def test_plan_blocks_circular_reference() -> None:
@@ -74,6 +75,15 @@ def test_extract_keeps_repos_with_reserved_word_names() -> None:
         "https://github.com/org/actions",
         "https://github.com/badger/skill",
     ]
+
+
+def test_input_handler_treats_github_archive_zip_as_file_url() -> None:
+    """GitHub archive ZIP links should download as files, not route through git clone."""
+    handler = InputHandler()
+    url = "https://github.com/org/repo/archive/refs/heads/main.zip"
+
+    assert handler._is_git_url(url) is False
+    assert handler._is_file_url(url) is True
 
 
 def test_plan_depth_limit_prevents_next_wave() -> None:
