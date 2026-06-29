@@ -276,7 +276,7 @@ def _is_benign_ar_context(
     if has_technical_benign_marker:
         return True
     if has_inline_role_marker:
-        return True
+        return role_labeled_match
     return has_previous_line_benign_marker and role_labeled_match
 
 
