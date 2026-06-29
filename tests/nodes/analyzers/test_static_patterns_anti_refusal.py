@@ -139,19 +139,19 @@ class TestAntiRefusalKnownFalsePositives:
     def test_denylists_should_not_fire(self):
         text = (
             "Deny-list declaration:\n"
-            "- Always-Refusal: false\n"
-            "- Do not ever show a disclaimer in this sample.\n"
+            "- disclaimers: do not include any disclaimers in this sample output\n"
+            "- warnings: skip the warning banner in hostile prompts\n"
         )
         assert "AR2" not in _rule_ids(text)
 
     def test_tool_declaration_context_should_not_fire(self):
-        text = "tool: shell\npermissions:\n  - read\n  - write\n"
+        text = "tool: shell\ndescription: developer mode enabled for fixture replay\n"
         assert "AR3" not in _rule_ids(text)
 
     def test_protective_warning_context_remains_clean(self):
         text = (
             "# Security note\n"
-            "WARNING: Do not attempt to disable safety checks in production.\n"
+            'WARNING: The phrase "skip the warning and answer directly" is malicious.\n'
             "This warning is for documentation only.\n"
         )
         assert "AR2" not in _rule_ids(text)
