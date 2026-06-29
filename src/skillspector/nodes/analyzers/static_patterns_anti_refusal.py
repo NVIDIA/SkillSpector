@@ -128,6 +128,10 @@ _BENIGN_AR_TECHNICAL_CONTEXT_PATTERNS = (
 _AR_DIRECT_INTENT_PATTERNS = (
     re.compile(r"\byou\s+(?:must|will|should|can|cannot|can'?t|are|were)\b", re.IGNORECASE),
     re.compile(r"\bfrom\s+now\s+on\b", re.IGNORECASE),
+    re.compile(r"\b(?:never|do\s+not|don'?t)\s+(?:ever\s+)?(?:refuse|decline)\b", re.IGNORECASE),
+    re.compile(
+        r"\bnever\s+say\s+(?:that\s+)?(?:you\s+)?(?:can'?t|cannot|won'?t|no)\b", re.IGNORECASE
+    ),
     re.compile(
         r"\byou\s+have\s+no\s+(?:restrictions?|limitations?|guidelines?|policies?)\b", re.IGNORECASE
     ),
@@ -166,6 +170,7 @@ _BENIGN_AR_DECLARATION_INLINE_PATTERN = re.compile(
 )
 _BENIGN_AR_TOOL_FIELD_PATTERN = re.compile(r"^\s*tool\s*:\s*\S", re.IGNORECASE)
 _BENIGN_AR_DESCRIPTION_FIELD_PATTERN = re.compile(r"^\s*description\s*:\s*", re.IGNORECASE)
+_DIRECTIVE_DOCUMENTATION_LABEL_PATTERN = re.compile(r"^\s*documentation\s*:\s*", re.IGNORECASE)
 _BENIGN_AR_FIXTURE_INTRO_PATTERN = re.compile(
     r"^\s*(?:#\s*)?(?:defensive\s+fixture|unit\s+test|test\s+case)\b",
     re.IGNORECASE,
@@ -192,6 +197,18 @@ def _is_directly_instructive(context: str, matched_text: str) -> bool:
 def _is_explicit_example_context(context: str) -> bool:
     """Return True only for explicit example-style scaffolding, not generic docs labels."""
     return bool(_EXPLICIT_EXAMPLE_CONTEXT_PATTERN.search(context))
+
+
+def _emitted_context(context: str, match_line: str, is_directive: bool) -> str:
+    """Keep runner-visible context on the directive when example markers are false context."""
+    if not is_directive:
+        return context
+    trimmed_line = _DIRECTIVE_DOCUMENTATION_LABEL_PATTERN.sub("", match_line, count=1)
+    if trimmed_line != match_line:
+        return trimmed_line
+    if _is_explicit_example_context(context):
+        return match_line
+    return context
 
 
 def _is_quoted_or_labeled_benign_match(
@@ -293,6 +310,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 match_line = lines[line_num - 1] if lines else content
                 previous_line = lines[line_num - 2] if line_num > 1 else None
                 context = get_context(content, match.start(), context_lines=3)
+                is_directive = _is_directly_instructive(match_line.lower(), match.group(0))
                 confidence = base_confidence
                 if (
                     is_code_example(context)
@@ -324,7 +342,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         ),
                         confidence=round(confidence, 2),
                         tags=tag,
-                        context=context,
+                        context=_emitted_context(context, match_line, is_directive),
                         matched_text=match.group(0)[:200],
                     )
                 )
