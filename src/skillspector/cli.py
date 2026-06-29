@@ -279,7 +279,7 @@ def scan(
         typer.Option(
             "--include-test-fixtures",
             help="Include AST4/PE3 findings that are likely test-harness patterns (shell=False + "
-                 "sys.executable, /etc/passwd in test assertion). Default: downgrade these to INFO.",
+            "sys.executable, /etc/passwd in test assertion). Default: downgrade these to INFO.",
         ),
     ] = False,
     skip_meta: Annotated[
@@ -287,7 +287,7 @@ def scan(
         typer.Option(
             "--skip-meta",
             help="Skip the meta-analyzer LLM pass. Reduces token cost (~40-60%) at the cost of "
-                 "more false positives. Use for rapid iterative scanning; omit for final/CI runs.",
+            "more false positives. Use for rapid iterative scanning; omit for final/CI runs.",
         ),
     ] = False,
     no_baseline: Annotated[
@@ -506,9 +506,7 @@ def _scan_multi_skill(
                 continue
             findings_list = result.get("filtered_findings") or result.get("findings") or []
             for f in findings_list:
-                sev = (
-                    f.severity if isinstance(f.severity, str) else str(f.severity)
-                ).lower()
+                sev = (f.severity if isinstance(f.severity, str) else str(f.severity)).lower()
                 if sev in sev_counts:
                     sev_counts[sev] += 1
             entry: dict[str, object] = {
@@ -517,9 +515,7 @@ def _scan_multi_skill(
                 "finding_count": len(findings_list),
             }
             if detail:
-                entry["issues"] = [
-                    f.to_dict() for f in findings_list if hasattr(f, "to_dict")
-                ]
+                entry["issues"] = [f.to_dict() for f in findings_list if hasattr(f, "to_dict")]
             skills_dict[f"./{skill.relative_path}"] = entry
 
         combined: dict[str, object] = {
