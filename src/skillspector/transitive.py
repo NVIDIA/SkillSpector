@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import ParseResult, unquote, urlparse, urlunparse
 
 from skillspector.input_handler import ALLOWED_DOWNLOAD_HOSTS, ALLOWED_GIT_HOSTS
 
@@ -159,7 +159,7 @@ def plan_transitive_targets(
     return targets
 
 
-def _parse_url(url: str) -> object:
+def _parse_url(url: str) -> ParseResult:
     token = _clean_token(url)
     if token.startswith("git@"):
         return _parse_git_ssh_url(token)
@@ -169,7 +169,7 @@ def _parse_url(url: str) -> object:
     return parsed
 
 
-def _parse_git_ssh_url(url: str):
+def _parse_git_ssh_url(url: str) -> ParseResult:
     match = re.fullmatch(r"git@([^:]+):(.+)", url)
     if not match:
         raise ValueError(f"Unsupported git URL format: {url}")

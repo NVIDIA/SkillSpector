@@ -15,6 +15,11 @@
 
 """Tests for transitive source extraction and traversal planning."""
 
+from pathlib import Path
+
+import httpx
+
+from skillspector import input_handler as input_handler_module
 from skillspector import transitive
 from skillspector.input_handler import InputHandler
 
@@ -84,6 +89,67 @@ def test_input_handler_treats_github_archive_zip_as_file_url() -> None:
 
     assert handler._is_git_url(url) is False
     assert handler._is_file_url(url) is True
+
+
+def test_input_handler_resolves_github_archive_zip_via_validated_redirect(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """GitHub archive ZIP redirects should still resolve as downloadable archives."""
+
+    class FakeResponse:
+        def __init__(
+            self,
+            status_code: int,
+            *,
+            headers: dict[str, str] | None = None,
+            content: bytes = b"",
+        ) -> None:
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                request = httpx.Request("GET", "https://example.invalid")
+                response = httpx.Response(
+                    self.status_code,
+                    headers=self.headers,
+                    content=self.content,
+                    request=request,
+                )
+                raise httpx.HTTPStatusError(
+                    f"HTTP error {self.status_code}", request=request, response=response
+                )
+
+    class FakeClient:
+        def __init__(self, responses: list[FakeResponse], **kwargs) -> None:
+            self._responses = responses
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def get(self, url: str) -> FakeResponse:
+            return self._responses.pop(0)
+
+    archive_url = "https://github.com/org/repo/archive/refs/heads/main.zip"
+    redirected_url = "https://codeload.github.com/org/repo/zip/refs/heads/main"
+    responses = [
+        FakeResponse(302, headers={"location": redirected_url}),
+        FakeResponse(200, headers={"content-type": "application/zip"}, content=b"zip-bytes"),
+    ]
+    handler = InputHandler()
+
+    monkeypatch.setattr(input_handler_module, "_is_private_ip", lambda host: False)
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: FakeClient(responses, **kwargs))
+    monkeypatch.setattr(handler, "_extract_zip", lambda zip_path: tmp_path / Path(zip_path).stem)
+
+    resolved_path, source_type = handler.resolve(archive_url)
+
+    assert source_type == "url"
+    assert resolved_path == tmp_path / "download"
 
 
 def test_plan_depth_limit_prevents_next_wave() -> None:
