@@ -24,6 +24,9 @@ from skillspector.nodes.analyzers import (
     static_patterns_data_exfiltration as data_exfiltration_module,
 )
 from skillspector.nodes.analyzers import (
+    static_patterns_memory_poisoning as memory_poisoning_module,
+)
+from skillspector.nodes.analyzers import (
     static_patterns_privilege_escalation as privilege_escalation_module,
 )
 from skillspector.nodes.analyzers import (
@@ -316,6 +319,34 @@ class TestRunStaticPatternsSupplyChain:
         sc2 = [f for f in findings if f.rule_id == "SC2"]
         assert len(sc2) >= 1
         assert sc2[0].severity == "HIGH"
+
+
+class TestRunStaticPatternsMemoryPoisoning:
+    """run_static_patterns with memory_poisoning: MP2."""
+
+    def test_mp2_box_drawing_layout_is_suppressed(self):
+        """Repeated box-drawing layout should not yield MP2."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": "╔═╗\n╚═╝\n╔═╗\n╚═╝\n" * 20},
+        }
+        findings = static_runner.run_static_patterns(state, [memory_poisoning_module])
+        assert not any(f.rule_id == "MP2" for f in findings)
+
+    def test_mp2_whitespace_layout_is_suppressed(self):
+        """Whitespace-heavy layout spanning repeated lines should not yield MP2."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": ("   \n" * 120) + "END"},
+        }
+        findings = static_runner.run_static_patterns(state, [memory_poisoning_module])
+        assert not any(f.rule_id == "MP2" for f in findings)
+
+    def test_mp2_semantic_stuffing_still_fires(self):
+        """Semantically meaningful stuffing phrases still yield MP2."""
+        state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": "ha" * 80}}
+        findings = static_runner.run_static_patterns(state, [memory_poisoning_module])
+        assert any(f.rule_id == "MP2" for f in findings)
 
 
 class TestRunStaticPatternsAgentSnoopingAdditional:
