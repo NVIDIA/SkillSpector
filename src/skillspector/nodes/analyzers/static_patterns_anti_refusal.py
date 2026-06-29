@@ -197,6 +197,7 @@ _BENIGN_AR_DECLARATION_INLINE_PATTERN = re.compile(
 _BENIGN_AR_TOOL_FIELD_PATTERN = re.compile(r"^\s*tool\s*:\s*\S", re.IGNORECASE)
 _BENIGN_AR_DESCRIPTION_FIELD_PATTERN = re.compile(r"^\s*description\s*:\s*", re.IGNORECASE)
 _DIRECTIVE_DOCUMENTATION_LABEL_PATTERN = re.compile(r"^\s*documentation\s*:\s*", re.IGNORECASE)
+_DOCUMENTATION_HEADING_PATTERN = re.compile(r"^\s*documentation\s*:\s*$", re.IGNORECASE)
 _BENIGN_AR_FIXTURE_INTRO_PATTERN = re.compile(
     r"^\s*(?:#\s*)?(?:defensive\s+fixture|unit\s+test|test\s+case)\b",
     re.IGNORECASE,
@@ -227,13 +228,20 @@ def _is_explicit_example_context(context: str) -> bool:
     return bool(_EXPLICIT_EXAMPLE_CONTEXT_PATTERN.search(context))
 
 
-def _emitted_context(context: str, match_line: str, is_directive: bool) -> str:
+def _emitted_context(
+    context: str,
+    match_line: str,
+    is_directive: bool,
+    previous_line: str | None = None,
+) -> str:
     """Keep runner-visible context on the directive when example markers are false context."""
     if not is_directive:
         return context
     trimmed_line = _DIRECTIVE_DOCUMENTATION_LABEL_PATTERN.sub("", match_line, count=1)
     if trimmed_line != match_line:
         return trimmed_line
+    if previous_line and _DOCUMENTATION_HEADING_PATTERN.search(previous_line):
+        return match_line
     if _is_explicit_example_context(context):
         return match_line
     return context
@@ -393,7 +401,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         ),
                         confidence=round(confidence, 2),
                         tags=tag,
-                        context=_emitted_context(context, match_line, is_directive),
+                        context=_emitted_context(
+                            context,
+                            match_line,
+                            is_directive,
+                            previous_line=previous_line,
+                        ),
                         matched_text=match.group(0)[:200],
                     )
                 )
