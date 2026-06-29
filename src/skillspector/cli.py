@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import sys
+from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -33,10 +34,12 @@ import typer
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 
-from skillspector import __version__
+from skillspector import __version__, transitive
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
+from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
+from skillspector.nodes.report import report
 from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
 
 logger = get_logger(__name__)
@@ -237,6 +240,36 @@ def scan(
             "do not count toward the risk score).",
         ),
     ] = False,
+    transitive: Annotated[
+        bool,
+        typer.Option(
+            "--transitive",
+            help="Follow transitive external references after the initial scan.",
+        ),
+    ] = False,
+    transitive_depth: Annotated[
+        int,
+        typer.Option(
+            "--transitive-depth",
+            help="Maximum transitive depth to scan for external references.",
+        ),
+    ] = 1,
+    transitive_allow_prefix: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--transitive-allow-prefix",
+            help=(
+                "Only scan transitive targets matching at least one canonical prefix. Repeatable."
+            ),
+        ),
+    ] = None,
+    transitive_deny_prefix: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--transitive-deny-prefix",
+            help=("Skip transitive targets matching any canonical prefix. Repeatable."),
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -280,10 +313,24 @@ def scan(
         set_level("DEBUG")
 
     resolved_path = Path(input_path).resolve()
+    yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
-            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
+            _scan_multi_skill(
+                detection=detection,
+                format=format,
+                output=output,
+                no_llm=no_llm,
+                baseline=baseline,
+                show_suppressed=show_suppressed,
+                transitive_enabled=transitive,
+                transitive_depth=transitive_depth,
+                transitive_allow_prefix=transitive_allow_prefix,
+                transitive_deny_prefix=transitive_deny_prefix,
+                yara_dir=yara_dir,
+                verbose=verbose,
+            )
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
             console.print(
@@ -300,26 +347,19 @@ def scan(
 
     result = None
     try:
-        yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(
-            input_path,
-            format,
-            no_llm,
-            yara_rules_dir=yara_dir,
+        result = _scan_skill(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
             baseline=baseline,
+            yara_rules_dir=Path(yara_dir) if yara_dir else None,
+            verbose=verbose,
             show_suppressed=show_suppressed,
+            transitive_enabled=transitive,
+            transitive_depth=transitive_depth,
+            transitive_allow_prefix=transitive_allow_prefix,
+            transitive_deny_prefix=transitive_deny_prefix,
         )
-        if verbose:
-            console.print("[dim]Running scan...[/dim]")
-        logger.debug(
-            "Scan started: input_path=%s, format=%s, use_llm=%s",
-            input_path,
-            format,
-            not no_llm,
-        )
-        trace_config = _build_trace_config(input_path, format, no_llm)
-        result = graph.invoke(state, config=trace_config)
-
         _write_result(result, output, format)
 
         if (result.get("risk_score") or 0) > 50:
@@ -358,62 +398,312 @@ def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> 
     }
 
 
+def _coerce_str_path_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
+
+
+def _coerce_findings_list(value: object) -> list[Finding]:
+    if not isinstance(value, list):
+        return []
+    return [finding for finding in value if isinstance(finding, Finding)]
+
+
+def _merge_unique_by_path(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in items:
+        path = str(item.get("path", ""))
+        if path in seen:
+            continue
+        seen.add(path)
+        merged.append(item)
+    return merged
+
+
+def _scan_state_with_baseline(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    *,
+    yara_rules_dir: str | None = None,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
+) -> dict[str, object]:
+    return _scan_state(
+        input_path=input_path,
+        format=format,
+        no_llm=no_llm,
+        yara_rules_dir=yara_rules_dir,
+        baseline=baseline,
+        show_suppressed=show_suppressed,
+    )
+
+
+def _run_graph_scan(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    yara_dir: str | None = None,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
+) -> dict[str, object]:
+    state = _scan_state_with_baseline(
+        input_path=input_path,
+        format=format,
+        no_llm=no_llm,
+        yara_rules_dir=yara_dir,
+        baseline=baseline,
+        show_suppressed=show_suppressed,
+    )
+    trace_config = _build_trace_config(input_path, format, no_llm)
+    return graph.invoke(state, config=trace_config)
+
+
+def _annotate_transitive_findings(
+    findings: list[Finding],
+    source_url: str,
+    transitive_depth: int,
+) -> list[Finding]:
+    return [
+        replace(finding, transitive_depth=transitive_depth, source_url=source_url)
+        for finding in findings
+    ]
+
+
+def _scan_transitive(
+    initial_result: dict[str, object],
+    format: FormatChoice,
+    no_llm: bool,
+    max_depth: int,
+    transitive_allow_prefix: tuple[str, ...] | list[str] | None,
+    transitive_deny_prefix: tuple[str, ...] | list[str] | None,
+    baseline: Path | None,
+    show_suppressed: bool,
+    visited: set[str],
+    yara_dir: str | None = None,
+) -> dict[str, object]:
+    if max_depth <= 0:
+        return report(initial_result)
+
+    transitive_sources: set[str] = set()
+    merged_filtered_findings: list[Finding] = _coerce_findings_list(
+        initial_result.get("filtered_findings")
+    )
+    merged_findings: list[Finding] = _coerce_findings_list(initial_result.get("findings"))
+    merged_components = _coerce_str_path_list(initial_result.get("components"))
+    merged_file_cache = initial_result.get("file_cache") or {}
+    file_cache = merged_file_cache if isinstance(merged_file_cache, dict) else {}
+    component_metadata = _coerce_component_metadata(initial_result.get("component_metadata"))
+    has_executable_scripts = bool(initial_result.get("has_executable_scripts", False))
+
+    frontier: list[tuple[int, list[str]]] = [(1, transitive.extract_external_refs(file_cache))]
+
+    while frontier:
+        current_depth, refs = frontier.pop(0)
+        targets = transitive.plan_transitive_targets(
+            refs=refs,
+            visited=visited,
+            current_depth=current_depth,
+            max_depth=max_depth,
+            allow_prefixes=transitive_allow_prefix,
+            deny_prefixes=transitive_deny_prefix,
+        )
+        for target in targets:
+            child_result: dict[str, object] | None = None
+            try:
+                child_result = _run_graph_scan(
+                    input_path=target,
+                    format=format,
+                    no_llm=no_llm,
+                    yara_dir=yara_dir,
+                    baseline=baseline,
+                    show_suppressed=show_suppressed,
+                )
+                transitive_sources.add(target)
+                child_filtered_findings = _coerce_findings_list(
+                    child_result.get("filtered_findings")
+                )
+                child_findings = _coerce_findings_list(child_result.get("findings"))
+                merged_filtered_findings.extend(
+                    _annotate_transitive_findings(
+                        child_filtered_findings, source_url=target, transitive_depth=current_depth
+                    )
+                )
+                merged_findings.extend(
+                    _annotate_transitive_findings(
+                        child_findings, source_url=target, transitive_depth=current_depth
+                    )
+                )
+
+                child_metadata = _coerce_component_metadata(child_result.get("component_metadata"))
+                component_metadata.extend(child_metadata)
+                if any(entry.get("executable") for entry in child_metadata):
+                    has_executable_scripts = True
+                merged_components.extend(_coerce_str_path_list(child_result.get("components")))
+
+                if current_depth < max_depth:
+                    child_file_cache = child_result.get("file_cache") or {}
+                    if isinstance(child_file_cache, dict):
+                        child_refs = transitive.extract_external_refs(child_file_cache)
+                        frontier.append((current_depth + 1, child_refs))
+            except Exception as e:
+                if format == FormatChoice.json:
+                    logger.warning("Transitive scan failed for %s: %s", target, e)
+                else:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] Transitive scan failed for {target}: {e}"
+                    )
+            finally:
+                if child_result is not None:
+                    _cleanup_result(child_result)
+
+    merged_result: dict[str, object] = {
+        **initial_result,
+        "filtered_findings": merged_filtered_findings,
+        "findings": merged_findings,
+        "components": merged_components,
+        "component_metadata": _merge_unique_by_path(component_metadata),
+        "has_executable_scripts": has_executable_scripts,
+    }
+    report_result = report(merged_result)
+    report_result["transitive_finding_count"] = len(transitive_sources)
+    report_result["transitive_sources"] = sorted(transitive_sources)
+    return report_result
+
+
+def _coerce_component_metadata(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _scan_skill(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    baseline: Path | None,
+    yara_rules_dir: Path | None,
+    verbose: bool,
+    show_suppressed: bool,
+    transitive_enabled: bool,
+    transitive_depth: int,
+    transitive_allow_prefix: tuple[str, ...] | list[str] | None,
+    transitive_deny_prefix: tuple[str, ...] | list[str] | None,
+    visited: set[str] | None = None,
+) -> dict[str, object]:
+    yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
+    active_visited = visited if visited is not None else set()
+    try:
+        if verbose:
+            console.print("[dim]Running scan...[/dim]")
+        logger.debug(
+            "Scan started: input_path=%s, format=%s, use_llm=%s, transitive=%s",
+            input_path,
+            format,
+            not no_llm,
+            transitive_enabled,
+        )
+        result = _run_graph_scan(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
+            yara_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+        )
+        if not transitive_enabled:
+            return result
+        transitive_allow_prefix = tuple(transitive_allow_prefix or ())
+        transitive_deny_prefix = tuple(transitive_deny_prefix or ())
+        try:
+            active_visited.add(transitive.canonicalize_source_identity(input_path))
+        except ValueError:
+            pass
+        return _scan_transitive(
+            initial_result=result,
+            format=format,
+            no_llm=no_llm,
+            max_depth=transitive_depth,
+            transitive_allow_prefix=transitive_allow_prefix,
+            transitive_deny_prefix=transitive_deny_prefix,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            visited=active_visited,
+            yara_dir=yara_dir,
+        )
+    except Exception:
+        raise
+
+
 def _scan_multi_skill(
     detection: MultiSkillDetectionResult,
     format: FormatChoice,
     output: Path | None,
     no_llm: bool,
-    yara_rules_dir: Path | None,
+    baseline: Path | None,
+    show_suppressed: bool,
+    transitive_enabled: bool,
+    transitive_depth: int,
+    transitive_allow_prefix: tuple[str, ...] | list[str] | None,
+    transitive_deny_prefix: tuple[str, ...] | list[str] | None,
+    yara_dir: str | None,
     verbose: bool,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     skills = detection.skills
     console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
 
+    visited: set[str] = set()
     results: list[dict[str, object]] = []
     max_score = 0
+    transitive_finding_count = 0
+    transitive_sources: set[str] = set()
 
     for i, skill in enumerate(skills, 1):
         console.print(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
-        yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(str(skill.path), format, no_llm, yara_rules_dir=yara_dir)
-        trace_config = _build_trace_config(str(skill.path), format, no_llm)
-
         try:
-            result = graph.invoke(state, config=trace_config)
+            result = _scan_skill(
+                input_path=str(skill.path),
+                format=format,
+                no_llm=no_llm,
+                baseline=baseline,
+                yara_rules_dir=Path(yara_dir) if yara_dir else None,
+                verbose=verbose,
+                show_suppressed=show_suppressed,
+                transitive_enabled=transitive_enabled,
+                transitive_depth=transitive_depth,
+                transitive_allow_prefix=transitive_allow_prefix,
+                transitive_deny_prefix=transitive_deny_prefix,
+                visited=visited,
+            )
             results.append(result)
             score = result.get("risk_score") or 0
             if isinstance(score, int) and score > max_score:
                 max_score = score
+            transitive_finding_count += int(result.get("transitive_finding_count") or 0)
+            for source in _coerce_str_path_list(result.get("transitive_sources")):
+                transitive_sources.add(source)
             severity = result.get("risk_severity") or "LOW"
             console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
             console.print(f"         [red]Error:[/red] {e}\n")
             results.append({"skill_name": skill.name, "error": str(e)})
 
-    console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
-    console.print(f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10}")
-    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10}")
-
-    for skill, result in zip(skills, results, strict=True):
-        if "error" in result:
-            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10}")
-            continue
-        score = result.get("risk_score", 0)
-        severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
-        console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
-
-    console.print("")
+    # Existing direct output behavior remains, but shared traversal and visited state
+    # are now handled by _scan_skill, including transitive helper path.
+    _print_multi_summary(skills, results)
 
     if output and format == FormatChoice.json:
         combined = {
             "multi_skill": True,
             "skill_count": len(skills),
             "max_risk_score": max_score,
+            "transitive_finding_count": transitive_finding_count,
+            "transitive_sources": sorted(transitive_sources),
             "skills": [],
         }
         for skill, result in zip(skills, results, strict=True):
@@ -429,6 +719,8 @@ def _scan_multi_skill(
                         "finding_count": len(
                             result.get("filtered_findings") or result.get("findings") or []
                         ),
+                        "transitive_finding_count": result.get("transitive_finding_count", 0),
+                        "transitive_sources": result.get("transitive_sources", []),
                     }
                 )
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
@@ -444,6 +736,22 @@ def _scan_multi_skill(
 
     if max_score > 50:
         raise typer.Exit(code=1)
+
+
+def _print_multi_summary(skills: list, results: list[dict[str, object]]) -> None:
+    console.print("\n[bold]=== Multi-Skill Summary ===[/bold]\n")
+    console.print(f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10}")
+    console.print(f"  {'-' * 30} {'-' * 8} {'-' * 12} {'-' * 10}")
+
+    for skill, result in zip(skills, results, strict=True):
+        if "error" in result:
+            console.print(f"  {skill.name:<30} {'ERROR':<8} {'n/a':<12} {'n/a':<10}")
+            continue
+        score = result.get("risk_score", 0)
+        severity = result.get("risk_severity", "LOW")
+        filtered = result.get("filtered_findings") or result.get("findings")
+        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
 
 
 @app.command()

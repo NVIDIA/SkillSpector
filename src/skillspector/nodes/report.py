@@ -216,6 +216,9 @@ def _build_sarif(
     results: list[SarifResult] = []
     seen_rule_ids: dict[str, str] = {}
 
+    def _finding_properties(finding: Finding) -> dict[str, object]:
+        return {"transitiveDepth": finding.transitive_depth, "sourceUrl": finding.source_url}
+
     for finding in findings:
         if not finding.rule_id or not finding.message:
             continue
@@ -235,6 +238,7 @@ def _build_sarif(
                         )
                     )
                 ],
+                properties=_finding_properties(finding),
             )
         )
         if finding.rule_id not in seen_rule_ids:
@@ -261,6 +265,7 @@ def _build_sarif(
                         )
                     )
                 ],
+                properties=_finding_properties(finding),
                 suppressions=[SarifSuppression(kind="external", justification=sf.reason)],
             )
         )
@@ -645,6 +650,8 @@ def _format_markdown(
             lines.append(f"### {emoji} {sev}: {f.rule_id}\n")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
             lines.append(f"**Location:** `{f.file}:{f.start_line}{end}`  ")
+            if f.transitive_depth > 0 and f.source_url:
+                lines.append(f"**Transitive:** depth={f.transitive_depth}, source={f.source_url}  ")
             lines.append(f"**Confidence:** {f.confidence:.0%}  ")
             lines.append("")
             lines.append(f"**Message:** {f.message}")

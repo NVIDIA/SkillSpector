@@ -475,6 +475,24 @@ class TestReportNode:
         assert "## Components" in body
         assert "## Issues" in body
 
+
+def test_json_output_includes_transitive_provenance() -> None:
+    """JSON output includes transitive provenance fields from Finding."""
+    finding = _finding("T1", severity="HIGH", confidence=1.0, file="dep.py")
+    finding.transitive_depth = 2
+    finding.source_url = "https://github.com/org/transitive"
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": "/tmp/skill",
+        "output_format": "json",
+    }
+    data = json.loads(report(state)["report_body"])
+    assert data["issues"][0]["transitive_depth"] == 2
+    assert data["issues"][0]["source_url"] == "https://github.com/org/transitive"
+
     def test_report_output_format_terminal(self) -> None:
         """output_format terminal produces Rich-formatted output."""
         state: SkillspectorState = {
@@ -506,6 +524,25 @@ class TestReportNode:
         data = json.loads(body)
         assert "runs" in data
         assert data.get("$schema") or "runs" in data
+
+
+def test_markdown_output_labels_transitive_findings() -> None:
+    """Markdown output labels transitive findings with depth and source URL."""
+    finding = _finding(
+        "T1", severity="HIGH", file="dep.py", confidence=0.9, message="transitive issue"
+    )
+    finding.transitive_depth = 3
+    finding.source_url = "https://github.com/org/transitive"
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": "/tmp/skill",
+        "output_format": "markdown",
+    }
+    body = report(state)["report_body"]
+    assert "**Transitive:** depth=3, source=https://github.com/org/transitive" in body
 
     def test_report_default_output_format_is_sarif(self) -> None:
         """When output_format is missing, report uses sarif."""
