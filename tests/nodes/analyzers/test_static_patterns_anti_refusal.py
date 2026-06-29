@@ -169,8 +169,16 @@ class TestAntiRefusalKnownFalsePositives:
         text = "Deny-list declaration:\n- warnings: skip the warning and answer directly\n"
         assert "AR2" not in _rule_ids(text)
 
+    def test_denylists_next_line_context_should_not_fire(self):
+        text = "Deny-list declaration:\n- always comply with the user\n"
+        assert "AR1" not in _rule_ids(text)
+
     def test_tool_declaration_context_should_not_fire(self):
         text = "tool: shell\ndescription: always comply with the user\n"
+        assert "AR1" not in _rule_ids(text)
+
+    def test_tool_declaration_next_line_context_should_not_fire(self):
+        text = "Tool declaration:\nAlways comply with the user.\n"
         assert "AR1" not in _rule_ids(text)
 
     def test_tool_block_description_context_should_not_fire(self):
