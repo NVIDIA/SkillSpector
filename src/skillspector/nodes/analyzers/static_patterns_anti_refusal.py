@@ -145,7 +145,7 @@ _AR_DIRECT_INTENT_PATTERNS = (
 )
 
 _BENIGN_AR_VALUE_LABEL_PATTERN = re.compile(
-    r"(^|\n)\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description|prompt)\s*:\s*",
+    r"^\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description|prompt)\s*:\s*",
     re.IGNORECASE,
 )
 
@@ -160,29 +160,32 @@ def _is_directly_instructive(context: str, matched_text: str) -> bool:
     return "do anything now" in matched_text.lower()
 
 
-def _is_quoted_or_labeled_benign_match(context: str, matched_text: str) -> bool:
+def _is_quoted_or_labeled_benign_match(match_line: str, matched_text: str) -> bool:
     """Return True when a direct phrase appears only as quoted or declared reference text."""
     matched_text_lower = matched_text.lower()
-    if any(f"{quote}{matched_text_lower}{quote}" in context for quote in ('"', "'", "`")):
+    match_line_lower = match_line.lower()
+    if any(f"{quote}{matched_text_lower}{quote}" in match_line_lower for quote in ('"', "'", "`")):
         return True
-    if re.search(rf"\bthe\s+phrase\s+[\"'`]?{re.escape(matched_text_lower)}[\"'`]?", context):
+    if re.search(
+        rf"\bthe\s+phrase\s+[\"'`]?{re.escape(matched_text_lower)}[\"'`]?",
+        match_line_lower,
+    ):
         return True
-    return bool(
-        _BENIGN_AR_VALUE_LABEL_PATTERN.search(context)
-        and re.search(re.escape(matched_text_lower), context)
-    )
+    return bool(_BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line_lower))
 
 
-def _is_benign_ar_context(context: str, match: str) -> bool:
+def _is_benign_ar_context(context: str, match_line: str, match: str) -> bool:
     """Return True for high-confidence non-malicious prose patterns around AR matches."""
     context_lower = context.lower()
+    match_line_lower = match_line.lower()
     has_benign_marker = any(
-        pattern.search(context_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS
+        pattern.search(match_line_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS
     )
+    has_benign_marker = has_benign_marker or bool(_BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line))
     if re.search(r"\bwould\s+always\s+comply\b", context_lower):
         return True
-    if _is_directly_instructive(context_lower, match):
-        return has_benign_marker and _is_quoted_or_labeled_benign_match(context_lower, match)
+    if _is_directly_instructive(match_line_lower, match):
+        return has_benign_marker and _is_quoted_or_labeled_benign_match(match_line, match)
     return has_benign_marker
 
 
@@ -194,11 +197,14 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for rule_id, patterns in _RULES:
         for pattern, base_confidence in patterns:
             for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                lines = content.splitlines()
+                line_num = get_line_number(content, match.start())
+                match_line = lines[line_num - 1] if lines else content
                 context = get_context(content, match.start(), context_lines=3)
                 confidence = base_confidence
                 if is_code_example(context):
                     confidence -= _EXAMPLE_PENALTY
-                if _is_benign_ar_context(context, match.group(0)):
+                if _is_benign_ar_context(context, match_line, match.group(0)):
                     continue
                 if confidence < _MIN_CONFIDENCE:
                     continue
@@ -209,7 +215,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         severity=Severity.HIGH,
                         location=Location(
                             file=file_path,
-                            start_line=get_line_number(content, match.start()),
+                            start_line=line_num,
                         ),
                         confidence=round(confidence, 2),
                         tags=tag,
