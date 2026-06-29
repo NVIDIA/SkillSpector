@@ -295,7 +295,7 @@ def test_scan_transitive_ignores_non_scannable_urls(tmp_path: Path, monkeypatch)
     file_cache = {
         "SKILL.md": (
             "badge: https://img.shields.io/github/stars/x/y "
-            "docs: https://github.com/org/wiki/SkillSpector "
+            "docs: https://github.com/org/repo/wiki/SkillSpector "
             "issue: https://github.com/org/repo/issues/12"
         )
     }
@@ -649,6 +649,33 @@ def test_scan_transitive_preserves_root_cleanup_and_counts_findings(
     assert merged["temp_dir_for_cleanup"] == str(cleanup_root)
     assert merged["transitive_finding_count"] == 2
     assert merged["transitive_sources"] == ["https://github.com/org/transitive"]
+
+
+def test_scan_transitive_zero_depth_preserves_root_cleanup(tmp_path: Path, monkeypatch) -> None:
+    """Zero-depth transitive scans preserve root cleanup metadata and do not recurse."""
+    cleanup_root = tmp_path / "cleanup-root"
+    initial_result = _mock_graph_result(findings=[_finding("D1", "direct finding")])
+    initial_result["temp_dir_for_cleanup"] = str(cleanup_root)
+
+    def fail_run_graph_scan(*args, **kwargs) -> dict[str, object]:
+        raise AssertionError("zero-depth transitive scan should not recurse")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fail_run_graph_scan)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=0,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    assert merged["temp_dir_for_cleanup"] == str(cleanup_root)
+    assert merged["transitive_finding_count"] == 0
+    assert merged["transitive_sources"] == []
 
 
 def test_recursive_transitive_json_includes_sources(tmp_path: Path, monkeypatch) -> None:

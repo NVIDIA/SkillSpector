@@ -58,6 +58,24 @@ def test_extract_excludes_badges_docs_and_issue_urls() -> None:
     ]
 
 
+def test_extract_keeps_repos_with_reserved_word_names() -> None:
+    """Reserved UI words in org or repo names should not block valid repository targets."""
+    file_cache = {
+        "SKILL.md": (
+            "https://github.com/wiki-tools/skill.git "
+            "https://github.com/org/actions.git "
+            "https://github.com/badger/skill.git"
+        ),
+    }
+
+    refs = transitive.extract_external_refs(file_cache)
+    assert refs == [
+        "https://github.com/wiki-tools/skill",
+        "https://github.com/org/actions",
+        "https://github.com/badger/skill",
+    ]
+
+
 def test_plan_depth_limit_prevents_next_wave() -> None:
     """When current depth exceeds max depth, no targets are returned."""
     refs = ["https://github.com/org/repo.git"]

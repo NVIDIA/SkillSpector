@@ -485,7 +485,11 @@ def _scan_transitive(
     yara_dir: str | None = None,
 ) -> dict[str, object]:
     if max_depth <= 0:
-        return report(initial_result)
+        report_result = report(initial_result)
+        report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
+        report_result["transitive_finding_count"] = 0
+        report_result["transitive_sources"] = []
+        return report_result
 
     transitive_sources: set[str] = set()
     merged_filtered_findings: list[Finding] = _coerce_findings_list(

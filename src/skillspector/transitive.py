@@ -227,12 +227,26 @@ def _is_source_reference(identity: str) -> bool:
 
 
 def _has_excluded_path_marker(path: str) -> bool:
-    for marker in _EXCLUDED_PATH_MARKERS:
-        if marker in path:
-            return True
     if path.endswith(".svg"):
         return True
-    return False
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) < 3:
+        return False
+    ui_segment = segments[2]
+    return ui_segment in {
+        "actions",
+        "badge",
+        "badges",
+        "blob",
+        "checks",
+        "ci",
+        "issues",
+        "pull",
+        "pulls",
+        "tree",
+        "wiki",
+        "workflows",
+    }
 
 
 def _looks_like_git_reference(host: str, path: str) -> bool:
@@ -250,7 +264,7 @@ def _looks_like_git_reference(host: str, path: str) -> bool:
     segments = [segment for segment in path.split("/") if segment]
     if len(segments) < 2:
         return False
-    if any(segment == "actions" for segment in segments):
+    if len(segments) >= 3 and segments[2] == "actions":
         return False
 
     lower = path.lower()
