@@ -144,6 +144,11 @@ _AR_DIRECT_INTENT_PATTERNS = (
     re.compile(r"\balways\s+comply\b", re.IGNORECASE),
 )
 
+_BENIGN_AR_VALUE_LABEL_PATTERN = re.compile(
+    r"(^|\n)\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description|prompt)\s*:\s*",
+    re.IGNORECASE,
+)
+
 
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
     """Return True when the match still looks like an active adversarial instruction."""
@@ -155,16 +160,30 @@ def _is_directly_instructive(context: str, matched_text: str) -> bool:
     return "do anything now" in matched_text.lower()
 
 
+def _is_quoted_or_labeled_benign_match(context: str, matched_text: str) -> bool:
+    """Return True when a direct phrase appears only as quoted or declared reference text."""
+    matched_text_lower = matched_text.lower()
+    if any(f"{quote}{matched_text_lower}{quote}" in context for quote in ('"', "'", "`")):
+        return True
+    if re.search(rf"\bthe\s+phrase\s+[\"'`]?{re.escape(matched_text_lower)}[\"'`]?", context):
+        return True
+    return bool(
+        _BENIGN_AR_VALUE_LABEL_PATTERN.search(context)
+        and re.search(re.escape(matched_text_lower), context)
+    )
+
+
 def _is_benign_ar_context(context: str, match: str) -> bool:
     """Return True for high-confidence non-malicious prose patterns around AR matches."""
     context_lower = context.lower()
-    if _is_directly_instructive(context_lower, match):
-        return False
+    has_benign_marker = any(
+        pattern.search(context_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS
+    )
     if re.search(r"\bwould\s+always\s+comply\b", context_lower):
         return True
-    if any(pattern.search(context_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS):
-        return True
-    return False
+    if _is_directly_instructive(context_lower, match):
+        return has_benign_marker and _is_quoted_or_labeled_benign_match(context_lower, match)
+    return has_benign_marker
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
