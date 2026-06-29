@@ -154,6 +154,10 @@ _BENIGN_AR_CONTINUATION_LABEL_PATTERN = re.compile(
     r"^\s*(?:[-*]\s*)?(?:warnings?|disclaimers?|description)\s*:\s*(?:[|>])?\s*$",
     re.IGNORECASE,
 )
+_BENIGN_AR_DECLARATION_INTRO_PATTERN = re.compile(
+    r"^\s*(?:deny-?list|tool)\s+declaration\s*:\s*$",
+    re.IGNORECASE,
+)
 
 
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
@@ -193,6 +197,8 @@ def _is_quoted_or_labeled_benign_match(
         return quoted_match or bool(re.search(r'^[\s"\']', match_line))
     if _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower):
         return bool(re.search(r"^\s+", match_line)) or quoted_match
+    if _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower):
+        return bool(re.search(r"^\s*(?:[-*]\s*)?\S", match_line))
     return False
 
 
@@ -204,25 +210,32 @@ def _is_benign_ar_context(
 ) -> bool:
     """Return True for high-confidence non-malicious prose patterns around AR matches."""
     match_line_lower = match_line.lower()
-    has_benign_marker = any(
+    has_inline_benign_marker = any(
         pattern.search(match_line_lower) for pattern in _BENIGN_AR_CONTEXT_PATTERNS
     )
-    has_benign_marker = has_benign_marker or bool(_BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line))
+    has_inline_benign_marker = has_inline_benign_marker or bool(
+        _BENIGN_AR_VALUE_LABEL_PATTERN.search(match_line)
+    )
+    has_previous_line_benign_marker = False
     if previous_line:
         previous_line_lower = previous_line.lower()
-        has_benign_marker = has_benign_marker or bool(
+        has_previous_line_benign_marker = bool(
             _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line_lower)
             or _BENIGN_AR_CONTINUATION_LABEL_PATTERN.search(previous_line_lower)
+            or _BENIGN_AR_DECLARATION_INTRO_PATTERN.search(previous_line_lower)
         )
     if re.search(r"\bwould\s+always\s+comply\b", match_line_lower):
         return True
+    role_labeled_match = _is_quoted_or_labeled_benign_match(
+        match_line,
+        match,
+        previous_line=previous_line,
+    )
     if _is_directly_instructive(match_line_lower, match):
-        return has_benign_marker and _is_quoted_or_labeled_benign_match(
-            match_line,
-            match,
-            previous_line=previous_line,
-        )
-    return has_benign_marker
+        return (has_inline_benign_marker or has_previous_line_benign_marker) and role_labeled_match
+    if has_inline_benign_marker:
+        return True
+    return has_previous_line_benign_marker and role_labeled_match
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
