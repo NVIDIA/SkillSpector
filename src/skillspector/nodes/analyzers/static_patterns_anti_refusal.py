@@ -125,7 +125,10 @@ _BENIGN_AR_CONTEXT_PATTERNS = (
     re.compile(r"\b(for\s+example|e\.g\.|i\.e\.|anti-?example)\b", re.IGNORECASE),
     re.compile(r"\b(deny-?list|allow-?list|tool\s+declaration|tool(s)?\s*:\s*)\b", re.IGNORECASE),
     re.compile(r"\b(fixture|unit\s+test|test\s+case|defensive)\b", re.IGNORECASE),
-    re.compile(r"\b(warning|note|documentation|doc(s)?|tutorial|reference)\b", re.IGNORECASE),
+    re.compile(
+        r"(?:\b(?:warning|note)\s*:|\b(?:documentation|doc(s)?|tutorial|reference)\b)",
+        re.IGNORECASE,
+    ),
     re.compile(r"\b(json|schema|errors?\[\])\b", re.IGNORECASE),
 )
 
@@ -135,6 +138,7 @@ _AR_DIRECT_INTENT_PATTERNS = (
     re.compile(
         r"\byou\s+have\s+no\s+(?:restrictions?|limitations?|guidelines?|policies?)\b", re.IGNORECASE
     ),
+    re.compile(r"\b(?:answer|respond)\s+directly\b", re.IGNORECASE),
     re.compile(r"\bignore\s+your\s+(?:guidelines|policy|safety|content|rules?)\b", re.IGNORECASE),
     re.compile(r"\bact\s+as\s+\w+", re.IGNORECASE),
     re.compile(r"\balways\s+comply\b", re.IGNORECASE),

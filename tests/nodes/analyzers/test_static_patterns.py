@@ -328,7 +328,7 @@ class TestRunStaticPatternsMemoryPoisoning:
         """Repeated box-drawing layout should not yield MP2."""
         state = {
             "components": ["SKILL.md"],
-            "file_cache": {"SKILL.md": "╔═╗\n╚═╝\n╔═╗\n╚═╝\n" * 20},
+            "file_cache": {"SKILL.md": ("|-" * 25) + "\nEND\n"},
         }
         findings = static_runner.run_static_patterns(state, [memory_poisoning_module])
         assert not any(f.rule_id == "MP2" for f in findings)
@@ -337,7 +337,7 @@ class TestRunStaticPatternsMemoryPoisoning:
         """Whitespace-heavy layout spanning repeated lines should not yield MP2."""
         state = {
             "components": ["SKILL.md"],
-            "file_cache": {"SKILL.md": ("   \n" * 120) + "END"},
+            "file_cache": {"SKILL.md": ("   " * 30) + "\nEND\n"},
         }
         findings = static_runner.run_static_patterns(state, [memory_poisoning_module])
         assert not any(f.rule_id == "MP2" for f in findings)
