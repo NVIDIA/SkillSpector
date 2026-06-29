@@ -190,13 +190,19 @@ def _clean_token(token: str) -> str:
 def _normalize_prefix(prefix: str) -> str:
     if not prefix:
         return ""
-    canonical = canonicalize_source_identity(prefix)
-    # Keep queryless, fragmentless, no-fragment canonical output for string compare.
-    return canonical.rstrip("/")
+    return canonicalize_source_identity(prefix)
 
 
 def _matches_any_prefix(url: str, prefixes: tuple[str, ...]) -> bool:
-    return any(url.startswith(prefix) for prefix in prefixes if prefix)
+    return any(_matches_prefix(url, prefix) for prefix in prefixes if prefix)
+
+
+def _matches_prefix(url: str, prefix: str) -> bool:
+    if url == prefix:
+        return True
+    if prefix.endswith("/"):
+        return url.startswith(prefix)
+    return url.startswith(prefix + "/")
 
 
 def _is_source_reference(identity: str) -> bool:

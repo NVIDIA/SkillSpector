@@ -605,6 +605,52 @@ def test_scan_transitive_does_not_rescan_root_source(monkeypatch) -> None:
     assert calls == [root_source]
 
 
+def test_scan_transitive_preserves_root_cleanup_and_counts_findings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Transitive merge keeps the root cleanup path and counts findings, not sources."""
+    cleanup_root = tmp_path / "cleanup-root"
+    initial_result = _mock_graph_result(
+        findings=[_finding("D1", "direct finding")],
+        file_cache={"SKILL.md": "https://github.com/org/transitive.git"},
+    )
+    initial_result["temp_dir_for_cleanup"] = str(cleanup_root)
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline=None,
+        show_suppressed: bool = False,
+    ) -> dict[str, object]:
+        assert input_path == "https://github.com/org/transitive"
+        return _mock_graph_result(
+            findings=[
+                _finding("T1", "transitive finding"),
+                _finding("T2", "second transitive finding"),
+            ],
+            output_format=format.value,
+        )
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    assert merged["temp_dir_for_cleanup"] == str(cleanup_root)
+    assert merged["transitive_finding_count"] == 2
+    assert merged["transitive_sources"] == ["https://github.com/org/transitive"]
+
+
 def test_recursive_transitive_json_includes_sources(tmp_path: Path, monkeypatch) -> None:
     """Recursive combined JSON output records transitive source summaries."""
     root = tmp_path / "root"
@@ -619,6 +665,7 @@ def test_recursive_transitive_json_includes_sources(tmp_path: Path, monkeypatch)
         "https://github.com/org/weather-transitive",
         "https://github.com/org/email-transitive",
     ]
+    expected_counts = [2, 1]
 
     def fake_scan_transitive(*args, **kwargs) -> dict[str, object]:
         index = len(calls)
@@ -627,7 +674,7 @@ def test_recursive_transitive_json_includes_sources(tmp_path: Path, monkeypatch)
             "report_body": "{}",
             "risk_score": 0,
             "risk_severity": "LOW",
-            "transitive_finding_count": 1,
+            "transitive_finding_count": expected_counts[index],
             "transitive_sources": [expected_sources[index]],
         }
 
@@ -666,7 +713,7 @@ def test_recursive_transitive_json_includes_sources(tmp_path: Path, monkeypatch)
     assert result.exit_code == 0
     assert out_file.exists()
     data = json.loads(out_file.read_text(encoding="utf-8"))
-    assert data["transitive_finding_count"] == 2
+    assert data["transitive_finding_count"] == sum(expected_counts)
     assert sorted(data["transitive_sources"]) == sorted(expected_sources)
 
 

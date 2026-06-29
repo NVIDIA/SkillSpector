@@ -567,8 +567,12 @@ def _scan_transitive(
         "component_metadata": _merge_unique_by_path(component_metadata),
         "has_executable_scripts": has_executable_scripts,
     }
+    transitive_finding_count = sum(
+        1 for finding in merged_filtered_findings if finding.source_url is not None
+    )
     report_result = report(merged_result)
-    report_result["transitive_finding_count"] = len(transitive_sources)
+    report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
+    report_result["transitive_finding_count"] = transitive_finding_count
     report_result["transitive_sources"] = sorted(transitive_sources)
     return report_result
 

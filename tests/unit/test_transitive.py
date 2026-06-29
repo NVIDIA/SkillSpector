@@ -96,6 +96,26 @@ def test_plan_applies_allow_prefix() -> None:
     assert result == ["https://github.com/ok/repo"]
 
 
+def test_plan_allow_prefix_respects_path_boundaries() -> None:
+    """Allow prefixes should not match sibling org names sharing a string prefix."""
+    refs = [
+        "https://github.com/trusted/repo.git",
+        "https://github.com/trusted-malicious/repo.git",
+    ]
+    visited: set[str] = set()
+
+    result = transitive.plan_transitive_targets(
+        refs=refs,
+        visited=visited,
+        current_depth=1,
+        max_depth=2,
+        allow_prefixes=("https://github.com/trusted/",),
+        deny_prefixes=(),
+    )
+
+    assert result == ["https://github.com/trusted/repo"]
+
+
 def test_plan_applies_deny_prefix() -> None:
     """Deny prefixes skip matching identities even if they are otherwise valid."""
     refs = [
@@ -115,3 +135,23 @@ def test_plan_applies_deny_prefix() -> None:
     )
 
     assert result == ["https://github.com/ok/repo"]
+
+
+def test_plan_deny_prefix_respects_path_boundaries() -> None:
+    """Deny prefixes should not block sibling org names that only share a string prefix."""
+    refs = [
+        "https://github.com/trusted/repo.git",
+        "https://github.com/trusted-malicious/repo.git",
+    ]
+    visited: set[str] = set()
+
+    result = transitive.plan_transitive_targets(
+        refs=refs,
+        visited=visited,
+        current_depth=1,
+        max_depth=2,
+        allow_prefixes=(),
+        deny_prefixes=("https://github.com/trusted/",),
+    )
+
+    assert result == ["https://github.com/trusted-malicious/repo"]
