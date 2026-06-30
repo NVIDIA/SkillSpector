@@ -239,6 +239,21 @@ class TestRunStaticPatternsSupplyChain:
         findings = static_runner.run_static_patterns(state, [supply_chain_module])
         assert not any(f.rule_id == "SC7" for f in findings)
 
+    def test_sc7_example_marker_in_executable_still_fires(self):
+        """An 'example' marker near a bypass in an executable .sh must NOT suppress SC7.
+
+        Example filtering belongs to the runner, which only downweights (does not
+        skip) executables — so a nearby '# for example' cannot be used to evade SC7.
+        """
+        state = {
+            "components": ["setup.sh"],
+            "file_cache": {
+                "setup.sh": "# for example\ndocker pull --disable-content-trust registry.io/x",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [supply_chain_module])
+        assert any(f.rule_id == "SC7" for f in findings)
+
 
 class TestRunStaticPatternsAgentSnoopingAdditional:
     """run_static_patterns with agent_snooping: AS1, AS2, AS3."""

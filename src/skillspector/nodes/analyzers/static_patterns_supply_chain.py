@@ -37,7 +37,7 @@ from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number, is_code_example
+from .common import get_context, get_line_number
 from .osv_client import ECOSYSTEM_NPM, ECOSYSTEM_PYPI, VulnResult, query_batch, was_osv_reachable
 from .pattern_defaults import PatternCategory
 from .static_runner import analyzer_finding_to_finding
@@ -585,13 +585,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         matched_text=match.group(0)[:200],
                     )
                 )
-    # SC7: untrusted container image. Filtered through is_code_example() because
-    # these flags appear in SKILL.md docs and "never do this" warnings.
+    # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            context_text = ctx(match.start())
-            if is_code_example(context_text):
-                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -601,7 +597,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     location=loc(line_num),
                     confidence=confidence,
                     tags=tag,
-                    context=context_text,
+                    context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                 )
             )
