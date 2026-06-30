@@ -15,10 +15,23 @@
 
 """Skillspector v2 LangGraph workflow package."""
 
+import warnings
 from importlib.metadata import version as _pkg_version
 
 __version__ = _pkg_version("skillspector")
 
-from skillspector.graph import create_graph, graph
+# ponytail: langgraph deserializes with langchain's allowed_objects default,
+# which warns. langchain_core's import re-enables that warning via
+# surface_langchain_deprecation_warnings(), so import it first, then prepend our
+# ignore filter so it wins. Drop this once langgraph pins an explicit default.
+import langchain_core  # noqa: F401  (force its warning-filter setup before ours)
+
+warnings.filterwarnings(
+    "ignore",
+    message="The default value of `allowed_objects` will change",
+    category=Warning,
+)
+
+from skillspector.graph import create_graph, graph  # noqa: E402 (after filter setup)
 
 __all__ = ["create_graph", "graph", "__version__"]

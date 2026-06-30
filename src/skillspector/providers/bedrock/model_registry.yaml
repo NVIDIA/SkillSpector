@@ -1,0 +1,29 @@
+# Token-budget metadata for the BedrockProvider (AWS Bedrock Runtime).
+# Bundled with the package; consulted whenever the active provider is
+# BedrockProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+#
+# Keys are public Bedrock cross-region inference profile IDs.  Users can
+# also point SKILLSPECTOR_MODEL at a stock Bedrock model ID or their own
+# application-inference-profile ARN — those won't be in this registry,
+# so the scanner falls back to the default token budget for unknown
+# models.  Add entries here if you have a private ARN you want metadata
+# for.
+
+models:
+  "us.anthropic.claude-sonnet-4-6-20250915-v1:0":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "us.anthropic.claude-opus-4-6-20250915-v1:0":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "us.anthropic.claude-opus-4-5-20250514-v1:0":
+    context_length: 200000
+    max_output_tokens: 64000

@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LangGraph workflow for Skillspector stub analyzers."""
+"""LangGraph workflow wiring Skillspector's analyzer nodes."""
 
-# TODO(SADD A.2.1–A.2.4): Analyzer discovery, stage-as-category with meta last, wire registry; respect requires_api_key/is_available() and skip or warn when API key missing or analyzer unavailable. See SADD for skillspector § A.2.
-# TODO(SADD A.5.1): Implement skillspector serve (FastAPI): POST /scan (zip), GET /results/{id}, GET /health. See SADD for skillspector § A.5.1.
+# Roadmap: analyzer auto-discovery and stage-as-category ordering (meta_analyzer last); respect
+# requires_api_key / is_available() so analyzers are skipped or warned when unavailable.
+# Roadmap: optional `skillspector serve` HTTP API (POST /scan, GET /results/{id}, GET /health).
 
 from __future__ import annotations
 
