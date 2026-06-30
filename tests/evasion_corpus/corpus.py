@@ -115,11 +115,25 @@ EQUIVALENT_SPELLINGS: tuple[Spelling, ...] = (
         "spec.loader.exec_module(mod)",
         "__import__",
     ),
+    Spelling(
+        # Aliased importlib must keep its provenance: the spec variable still resolves to
+        # importlib (build_type_map normalizes the alias), so ``.loader.exec_module`` fires.
+        "spec_loader_exec_module_alias",
+        "import importlib.util as iu\nspec = iu.module_from_spec(s)\nspec.loader.exec_module(mod)",
+        "__import__",
+    ),
     # ── code-exec siblings (→ exec class) ─────────────────────────────
     Spelling("code_interact", "import code\ncode.interact()", "exec"),
     Spelling(
         "code_runsource",
         "import code\ncode.InteractiveInterpreter().runsource(x)",
+        "exec",
+    ),
+    Spelling(
+        # Aliased ``code`` import must not evade: the receiver type is alias-normalized back
+        # to ``code.InteractiveInterpreter`` before the gate check.
+        "code_runsource_alias",
+        "import code as c\nc.InteractiveInterpreter().runsource(x)",
         "exec",
     ),
 )
@@ -146,4 +160,8 @@ FALSE_POSITIVE_NEIGHBOURS: tuple[Neighbour, ...] = (
     ),
     Neighbour("user_runsource_method", "ci = MyRepl()\nci.runsource(x)"),
     Neighbour("user_loader_unrelated", "loader = MyLoader()\nloader.exec_module(m)"),
+    # An arbitrary object's ``.loader.exec_module(...)`` (no importlib provenance on the
+    # base) must NOT be treated as a dynamic import — the ``.loader`` attribute alone is
+    # not enough, any plugin object can expose one.
+    Neighbour("arbitrary_loader_attr_exec_module", "self.widget.loader.exec_module(mod)"),
 )

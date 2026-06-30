@@ -582,7 +582,7 @@ def _analyze_python(
             # the __import__/exec arms below.
             call_name = (
                 canonical_sibling_sink(call_name)
-                or canonical_sibling_method(ast_node, type_map)
+                or canonical_sibling_method(ast_node, type_map, aliases)
                 or call_name
             )
         if call_name is None:
