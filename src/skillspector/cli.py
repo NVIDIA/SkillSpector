@@ -25,18 +25,22 @@ import json
 import os
 import shutil
 import sys
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from time import monotonic
 from typing import Annotated
 
 import typer
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 
-from skillspector import __version__
+from skillspector import __version__, transitive
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
+from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
+from skillspector.nodes.report import report
 from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
 
 logger = get_logger(__name__)
@@ -70,6 +74,10 @@ app = typer.Typer(
 
 console = Console()
 
+_TRANSITIVE_MAX_TARGETS = 32
+_TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
+_TRANSITIVE_MAX_SECONDS = 60.0
+
 
 class FormatChoice(StrEnum):
     """Output format choices for the CLI."""
@@ -85,6 +93,59 @@ class TransportChoice(StrEnum):
 
     stdio = "stdio"
     http = "http"
+
+
+@dataclass(slots=True)
+class _TransitiveBudget:
+    max_targets: int = _TRANSITIVE_MAX_TARGETS
+    max_bytes: int = _TRANSITIVE_MAX_BYTES
+    max_seconds: float = _TRANSITIVE_MAX_SECONDS
+
+
+@dataclass(slots=True)
+class _CachedTransitiveResult:
+    filtered_findings: list[Finding]
+    findings: list[Finding]
+    components: list[str]
+    component_metadata: list[dict[str, object]]
+    file_cache: dict[str, str]
+    has_executable_scripts: bool
+    refs: list[str]
+    bytes_scanned: int
+
+
+@dataclass(slots=True)
+class _TransitiveTraversalState:
+    cache: dict[str, _CachedTransitiveResult] = field(default_factory=dict)
+    budget: _TransitiveBudget = field(default_factory=_TransitiveBudget)
+    started_at: float = field(default_factory=monotonic)
+    scanned_targets: int = 0
+    scanned_bytes: int = 0
+    truncation_reasons: list[str] = field(default_factory=list)
+
+    def note_truncation(self, reason: str) -> None:
+        if reason not in self.truncation_reasons:
+            self.truncation_reasons.append(reason)
+
+    def can_scan_more(self) -> bool:
+        if self.scanned_targets >= self.budget.max_targets:
+            self.note_truncation(f"target budget {self.budget.max_targets} reached")
+            return False
+        if self.scanned_bytes >= self.budget.max_bytes:
+            self.note_truncation(f"byte budget {self.budget.max_bytes} reached")
+            return False
+        if monotonic() - self.started_at >= self.budget.max_seconds:
+            self.note_truncation(f"time budget {self.budget.max_seconds:.0f}s reached")
+            return False
+        return True
+
+    def record_scan(self, bytes_scanned: int) -> None:
+        self.scanned_targets += 1
+        self.scanned_bytes += max(0, bytes_scanned)
+        if self.scanned_bytes >= self.budget.max_bytes:
+            self.note_truncation(f"byte budget {self.budget.max_bytes} reached")
+        if monotonic() - self.started_at >= self.budget.max_seconds:
+            self.note_truncation(f"time budget {self.budget.max_seconds:.0f}s reached")
 
 
 def version_callback(value: bool) -> None:
@@ -237,6 +298,36 @@ def scan(
             "do not count toward the risk score).",
         ),
     ] = False,
+    transitive: Annotated[
+        bool,
+        typer.Option(
+            "--transitive",
+            help="Follow transitive external references after the initial scan.",
+        ),
+    ] = False,
+    transitive_depth: Annotated[
+        int,
+        typer.Option(
+            "--transitive-depth",
+            help="Maximum transitive depth to scan for external references.",
+        ),
+    ] = 1,
+    transitive_allow_prefix: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--transitive-allow-prefix",
+            help=(
+                "Only scan transitive targets matching at least one canonical prefix. Repeatable."
+            ),
+        ),
+    ] = None,
+    transitive_deny_prefix: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--transitive-deny-prefix",
+            help=("Skip transitive targets matching any canonical prefix. Repeatable."),
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -280,10 +371,24 @@ def scan(
         set_level("DEBUG")
 
     resolved_path = Path(input_path).resolve()
+    yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
-            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
+            _scan_multi_skill(
+                detection=detection,
+                format=format,
+                output=output,
+                no_llm=no_llm,
+                baseline=baseline,
+                show_suppressed=show_suppressed,
+                transitive_enabled=transitive,
+                transitive_depth=transitive_depth,
+                transitive_allow_prefix=transitive_allow_prefix,
+                transitive_deny_prefix=transitive_deny_prefix,
+                yara_dir=yara_dir,
+                verbose=verbose,
+            )
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
             console.print(
@@ -300,26 +405,19 @@ def scan(
 
     result = None
     try:
-        yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(
-            input_path,
-            format,
-            no_llm,
-            yara_rules_dir=yara_dir,
+        result = _scan_skill(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
             baseline=baseline,
+            yara_rules_dir=Path(yara_dir) if yara_dir else None,
+            verbose=verbose,
             show_suppressed=show_suppressed,
+            transitive_enabled=transitive,
+            transitive_depth=transitive_depth,
+            transitive_allow_prefix=transitive_allow_prefix,
+            transitive_deny_prefix=transitive_deny_prefix,
         )
-        if verbose:
-            console.print("[dim]Running scan...[/dim]")
-        logger.debug(
-            "Scan started: input_path=%s, format=%s, use_llm=%s",
-            input_path,
-            format,
-            not no_llm,
-        )
-        trace_config = _build_trace_config(input_path, format, no_llm)
-        result = graph.invoke(state, config=trace_config)
-
         _write_result(result, output, format)
 
         if (result.get("risk_score") or 0) > 50:
@@ -358,62 +456,428 @@ def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> 
     }
 
 
+def _coerce_str_path_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str)]
+
+
+def _coerce_findings_list(value: object) -> list[Finding]:
+    if not isinstance(value, list):
+        return []
+    return [finding for finding in value if isinstance(finding, Finding)]
+
+
+def _coerce_file_cache(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(path): content
+        for path, content in value.items()
+        if isinstance(path, str) and isinstance(content, str)
+    }
+
+
+def _transitive_component_key(source_url: str | None, path: str) -> str:
+    return f"{source_url}::{path}" if source_url else path
+
+
+def _decorate_component_metadata(
+    metadata: list[dict[str, object]], source_url: str | None
+) -> list[dict[str, object]]:
+    decorated: list[dict[str, object]] = []
+    for item in metadata:
+        path = str(item.get("path", ""))
+        entry = {**item, "coverage_key": _transitive_component_key(source_url, path)}
+        if source_url:
+            entry["source_url"] = source_url
+        decorated.append(entry)
+    return decorated
+
+
+def _source_aware_components(paths: list[str], source_url: str | None) -> list[str]:
+    return [_transitive_component_key(source_url, path) for path in paths]
+
+
+def _source_aware_file_cache(file_cache: dict[str, str], source_url: str | None) -> dict[str, str]:
+    return {
+        _transitive_component_key(source_url, path): content for path, content in file_cache.items()
+    }
+
+
+def _component_identity(item: dict[str, object]) -> str:
+    coverage_key = item.get("coverage_key")
+    if isinstance(coverage_key, str) and coverage_key:
+        return coverage_key
+    path = str(item.get("path", ""))
+    source_url = item.get("source_url")
+    return _transitive_component_key(source_url if isinstance(source_url, str) else None, path)
+
+
+def _merge_unique_component_metadata(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in items:
+        identity = _component_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(item)
+    return merged
+
+
+def _estimate_scan_bytes(result: dict[str, object]) -> int:
+    size_bytes = 0
+    for entry in _coerce_component_metadata(result.get("component_metadata")):
+        raw_size = entry.get("size_bytes", 0)
+        if isinstance(raw_size, int):
+            size_bytes += max(0, raw_size)
+    if size_bytes > 0:
+        return size_bytes
+    return sum(
+        len(content.encode("utf-8"))
+        for content in _coerce_file_cache(result.get("file_cache")).values()
+    )
+
+
+def _cache_transitive_result(
+    target: str, child_result: dict[str, object]
+) -> _CachedTransitiveResult:
+    child_file_cache = _coerce_file_cache(child_result.get("file_cache"))
+    child_metadata = _decorate_component_metadata(
+        _coerce_component_metadata(child_result.get("component_metadata")), target
+    )
+    return _CachedTransitiveResult(
+        filtered_findings=_coerce_findings_list(child_result.get("filtered_findings")),
+        findings=_coerce_findings_list(child_result.get("findings")),
+        components=_source_aware_components(
+            _coerce_str_path_list(child_result.get("components")), target
+        ),
+        component_metadata=child_metadata,
+        file_cache=_source_aware_file_cache(child_file_cache, target),
+        has_executable_scripts=bool(child_result.get("has_executable_scripts", False))
+        or any(bool(entry.get("executable", False)) for entry in child_metadata),
+        refs=transitive.extract_external_refs(child_file_cache),
+        bytes_scanned=_estimate_scan_bytes(child_result),
+    )
+
+
+def _scan_state_with_baseline(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    *,
+    yara_rules_dir: str | None = None,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
+) -> dict[str, object]:
+    return _scan_state(
+        input_path=input_path,
+        format=format,
+        no_llm=no_llm,
+        yara_rules_dir=yara_rules_dir,
+        baseline=baseline,
+        show_suppressed=show_suppressed,
+    )
+
+
+def _run_graph_scan(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    yara_dir: str | None = None,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
+) -> dict[str, object]:
+    state = _scan_state_with_baseline(
+        input_path=input_path,
+        format=format,
+        no_llm=no_llm,
+        yara_rules_dir=yara_dir,
+        baseline=baseline,
+        show_suppressed=show_suppressed,
+    )
+    trace_config = _build_trace_config(input_path, format, no_llm)
+    return graph.invoke(state, config=trace_config)
+
+
+def _annotate_transitive_findings(
+    findings: list[Finding],
+    source_url: str,
+    transitive_depth: int,
+) -> list[Finding]:
+    return [
+        replace(finding, transitive_depth=transitive_depth, source_url=source_url)
+        for finding in findings
+    ]
+
+
+def _scan_transitive(
+    initial_result: dict[str, object],
+    format: FormatChoice,
+    no_llm: bool,
+    max_depth: int,
+    transitive_allow_prefix: tuple[str, ...] | list[str] | None,
+    transitive_deny_prefix: tuple[str, ...] | list[str] | None,
+    baseline: Path | None,
+    show_suppressed: bool,
+    visited: set[str],
+    scan_cache: dict[str, _CachedTransitiveResult] | None = None,
+    budget: _TransitiveBudget | None = None,
+    yara_dir: str | None = None,
+) -> dict[str, object]:
+    if max_depth <= 0:
+        report_result = report(initial_result)
+        report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
+        report_result["transitive_finding_count"] = 0
+        report_result["transitive_sources"] = []
+        report_result["transitive_targets_scanned"] = 0
+        report_result["transitive_bytes_scanned"] = 0
+        report_result["transitive_truncated"] = False
+        report_result["transitive_truncation_reasons"] = []
+        return report_result
+
+    traversal = _TransitiveTraversalState(
+        cache=scan_cache if scan_cache is not None else {},
+        budget=budget if budget is not None else _TransitiveBudget(),
+    )
+    transitive_sources: set[str] = set()
+    merged_filtered_findings: list[Finding] = _coerce_findings_list(
+        initial_result.get("filtered_findings")
+    )
+    merged_findings: list[Finding] = _coerce_findings_list(initial_result.get("findings"))
+    merged_components = _source_aware_components(
+        _coerce_str_path_list(initial_result.get("components")), None
+    )
+    file_cache = _coerce_file_cache(initial_result.get("file_cache"))
+    merged_file_cache = _source_aware_file_cache(file_cache, None)
+    component_metadata = _decorate_component_metadata(
+        _coerce_component_metadata(initial_result.get("component_metadata")), None
+    )
+    has_executable_scripts = bool(initial_result.get("has_executable_scripts", False))
+
+    frontier: list[tuple[int, list[str]]] = [(1, transitive.extract_external_refs(file_cache))]
+
+    while frontier:
+        if not traversal.can_scan_more():
+            break
+        current_depth, refs = frontier.pop(0)
+        targets = transitive.plan_transitive_targets(
+            refs=refs,
+            visited=visited,
+            current_depth=current_depth,
+            max_depth=max_depth,
+            allow_prefixes=transitive_allow_prefix,
+            deny_prefixes=transitive_deny_prefix,
+        )
+        for target in targets:
+            if not traversal.can_scan_more():
+                break
+            try:
+                cached = traversal.cache.get(target)
+                child_result: dict[str, object] | None = None
+                if cached is None:
+                    child_result = _run_graph_scan(
+                        input_path=target,
+                        format=format,
+                        no_llm=no_llm,
+                        yara_dir=yara_dir,
+                        baseline=baseline,
+                        show_suppressed=show_suppressed,
+                    )
+                    cached = _cache_transitive_result(target, child_result)
+                    traversal.cache[target] = cached
+                    traversal.record_scan(cached.bytes_scanned)
+                transitive_sources.add(target)
+                merged_filtered_findings.extend(
+                    _annotate_transitive_findings(
+                        cached.filtered_findings, source_url=target, transitive_depth=current_depth
+                    )
+                )
+                merged_findings.extend(
+                    _annotate_transitive_findings(
+                        cached.findings, source_url=target, transitive_depth=current_depth
+                    )
+                )
+
+                component_metadata.extend(cached.component_metadata)
+                if cached.has_executable_scripts:
+                    has_executable_scripts = True
+                merged_components.extend(cached.components)
+                merged_file_cache.update(cached.file_cache)
+
+                if current_depth < max_depth:
+                    frontier.append((current_depth + 1, cached.refs))
+            except Exception as e:
+                if format == FormatChoice.json:
+                    logger.warning("Transitive scan failed for %s: %s", target, e)
+                else:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] Transitive scan failed for {target}: {e}"
+                    )
+            finally:
+                if child_result is not None:
+                    _cleanup_result(child_result)
+
+    merged_result: dict[str, object] = {
+        **initial_result,
+        "filtered_findings": merged_filtered_findings,
+        "findings": merged_findings,
+        "components": merged_components,
+        "component_metadata": _merge_unique_component_metadata(component_metadata),
+        "file_cache": merged_file_cache,
+        "has_executable_scripts": has_executable_scripts,
+        "transitive_targets_scanned": traversal.scanned_targets,
+        "transitive_bytes_scanned": traversal.scanned_bytes,
+        "transitive_truncated": bool(traversal.truncation_reasons),
+        "transitive_truncation_reasons": traversal.truncation_reasons,
+    }
+    transitive_finding_count = sum(
+        1 for finding in merged_filtered_findings if finding.source_url is not None
+    )
+    report_result = report(merged_result)
+    report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
+    report_result["transitive_finding_count"] = transitive_finding_count
+    report_result["transitive_sources"] = sorted(transitive_sources)
+    report_result["transitive_targets_scanned"] = traversal.scanned_targets
+    report_result["transitive_bytes_scanned"] = traversal.scanned_bytes
+    report_result["transitive_truncated"] = bool(traversal.truncation_reasons)
+    report_result["transitive_truncation_reasons"] = traversal.truncation_reasons
+    return report_result
+
+
+def _coerce_component_metadata(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _scan_skill(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    baseline: Path | None,
+    yara_rules_dir: Path | None,
+    verbose: bool,
+    show_suppressed: bool,
+    transitive_enabled: bool,
+    transitive_depth: int,
+    transitive_allow_prefix: tuple[str, ...] | list[str] | None,
+    transitive_deny_prefix: tuple[str, ...] | list[str] | None,
+    transitive_cache: dict[str, _CachedTransitiveResult] | None = None,
+) -> dict[str, object]:
+    yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
+    active_visited: set[str] = set()
+    try:
+        if verbose:
+            console.print("[dim]Running scan...[/dim]")
+        logger.debug(
+            "Scan started: input_path=%s, format=%s, use_llm=%s, transitive=%s",
+            input_path,
+            format,
+            not no_llm,
+            transitive_enabled,
+        )
+        result = _run_graph_scan(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
+            yara_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+        )
+        if not transitive_enabled:
+            return result
+        transitive_allow_prefix = tuple(transitive_allow_prefix or ())
+        transitive_deny_prefix = tuple(transitive_deny_prefix or ())
+        try:
+            active_visited.add(transitive.canonicalize_source_identity(input_path))
+        except ValueError:
+            pass
+        return _scan_transitive(
+            initial_result=result,
+            format=format,
+            no_llm=no_llm,
+            max_depth=transitive_depth,
+            transitive_allow_prefix=transitive_allow_prefix,
+            transitive_deny_prefix=transitive_deny_prefix,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            visited=active_visited,
+            scan_cache=transitive_cache,
+            yara_dir=yara_dir,
+        )
+    except Exception:
+        raise
+
+
 def _scan_multi_skill(
     detection: MultiSkillDetectionResult,
     format: FormatChoice,
     output: Path | None,
     no_llm: bool,
-    yara_rules_dir: Path | None,
+    baseline: Path | None,
+    show_suppressed: bool,
+    transitive_enabled: bool,
+    transitive_depth: int,
+    transitive_allow_prefix: tuple[str, ...] | list[str] | None,
+    transitive_deny_prefix: tuple[str, ...] | list[str] | None,
+    yara_dir: str | None,
     verbose: bool,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     skills = detection.skills
     console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
 
+    shared_transitive_cache: dict[str, _CachedTransitiveResult] = {}
     results: list[dict[str, object]] = []
     max_score = 0
+    transitive_finding_count = 0
+    transitive_sources: set[str] = set()
 
     for i, skill in enumerate(skills, 1):
         console.print(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
-        yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(str(skill.path), format, no_llm, yara_rules_dir=yara_dir)
-        trace_config = _build_trace_config(str(skill.path), format, no_llm)
-
         try:
-            result = graph.invoke(state, config=trace_config)
+            result = _scan_skill(
+                input_path=str(skill.path),
+                format=format,
+                no_llm=no_llm,
+                baseline=baseline,
+                yara_rules_dir=Path(yara_dir) if yara_dir else None,
+                verbose=verbose,
+                show_suppressed=show_suppressed,
+                transitive_enabled=transitive_enabled,
+                transitive_depth=transitive_depth,
+                transitive_allow_prefix=transitive_allow_prefix,
+                transitive_deny_prefix=transitive_deny_prefix,
+                transitive_cache=shared_transitive_cache,
+            )
             results.append(result)
             score = result.get("risk_score") or 0
             if isinstance(score, int) and score > max_score:
                 max_score = score
+            transitive_finding_count += int(result.get("transitive_finding_count") or 0)
+            for source in _coerce_str_path_list(result.get("transitive_sources")):
+                transitive_sources.add(source)
             severity = result.get("risk_severity") or "LOW"
             console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
             console.print(f"         [red]Error:[/red] {e}\n")
             results.append({"skill_name": skill.name, "error": str(e)})
 
-    console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
-    console.print(f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10}")
-    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10}")
-
-    for skill, result in zip(skills, results, strict=True):
-        if "error" in result:
-            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10}")
-            continue
-        score = result.get("risk_score", 0)
-        severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
-        console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
-
-    console.print("")
+    # Existing direct output behavior remains, but shared traversal and visited state
+    # are now handled by _scan_skill, including transitive helper path.
+    _print_multi_summary(skills, results)
 
     if output and format == FormatChoice.json:
         combined = {
             "multi_skill": True,
             "skill_count": len(skills),
             "max_risk_score": max_score,
+            "transitive_finding_count": transitive_finding_count,
+            "transitive_sources": sorted(transitive_sources),
             "skills": [],
         }
         for skill, result in zip(skills, results, strict=True):
@@ -429,6 +893,8 @@ def _scan_multi_skill(
                         "finding_count": len(
                             result.get("filtered_findings") or result.get("findings") or []
                         ),
+                        "transitive_finding_count": result.get("transitive_finding_count", 0),
+                        "transitive_sources": result.get("transitive_sources", []),
                     }
                 )
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
@@ -444,6 +910,22 @@ def _scan_multi_skill(
 
     if max_score > 50:
         raise typer.Exit(code=1)
+
+
+def _print_multi_summary(skills: list, results: list[dict[str, object]]) -> None:
+    console.print("\n[bold]=== Multi-Skill Summary ===[/bold]\n")
+    console.print(f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10}")
+    console.print(f"  {'-' * 30} {'-' * 8} {'-' * 12} {'-' * 10}")
+
+    for skill, result in zip(skills, results, strict=True):
+        if "error" in result:
+            console.print(f"  {skill.name:<30} {'ERROR':<8} {'n/a':<12} {'n/a':<10}")
+            continue
+        score = result.get("risk_score", 0)
+        severity = result.get("risk_severity", "LOW")
+        filtered = result.get("filtered_findings") or result.get("findings")
+        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
 
 
 @app.command()

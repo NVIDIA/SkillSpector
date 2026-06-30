@@ -87,6 +87,14 @@ class SkillspectorState(TypedDict, total=False):
     sarif_report: dict[str, object]
     risk_score: int
 
+    # Transitive traversal metadata for report output and CLI summaries.
+    transitive_finding_count: int
+    transitive_sources: list[str]
+    transitive_targets_scanned: int
+    transitive_bytes_scanned: int
+    transitive_truncated: bool
+    transitive_truncation_reasons: list[str]
+
     # Additional YARA rules directory (user-specified via --yara-rules-dir)
     yara_rules_dir: str | None
 

@@ -101,6 +101,31 @@ def _sanitize_finding(finding: Finding) -> Finding:
     return replace(finding, **{f: _clean_text(getattr(finding, f)) for f in _SANITIZED_FIELDS})
 
 
+def _component_coverage_key(component: dict[str, object]) -> str:
+    coverage_key = component.get("coverage_key")
+    if isinstance(coverage_key, str) and coverage_key:
+        return coverage_key
+    path = str(component.get("path", ""))
+    source_url = component.get("source_url")
+    if isinstance(source_url, str) and source_url:
+        return f"{source_url}::{path}"
+    return path
+
+
+def _finding_component_key(finding: Finding) -> str:
+    if finding.source_url:
+        return f"{finding.source_url}::{finding.file}"
+    return finding.file
+
+
+def _display_component_path(component: dict[str, object]) -> str:
+    path = str(component.get("path", ""))
+    source_url = component.get("source_url")
+    if isinstance(source_url, str) and source_url:
+        return f"{path} ({source_url})"
+    return path
+
+
 def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note"]:
     """Map Finding.severity to SARIF result level."""
     return {
@@ -156,7 +181,7 @@ def _compute_risk_score(
     file_executable: dict[str, bool] = {}
     if component_metadata:
         for cm in component_metadata:
-            file_executable[str(cm.get("path", ""))] = bool(cm.get("executable", False))
+            file_executable[_component_coverage_key(cm)] = bool(cm.get("executable", False))
 
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
@@ -180,7 +205,7 @@ def _compute_risk_score(
         contribution = base_points * weight * confidence
 
         # Apply 1.3x multiplier only to findings from executable files
-        if has_executable_scripts and file_executable.get(f.file, False):
+        if has_executable_scripts and file_executable.get(_finding_component_key(f), False):
             contribution *= 1.3
 
         score += contribution
@@ -216,6 +241,9 @@ def _build_sarif(
     results: list[SarifResult] = []
     seen_rule_ids: dict[str, str] = {}
 
+    def _finding_properties(finding: Finding) -> dict[str, object]:
+        return {"transitiveDepth": finding.transitive_depth, "sourceUrl": finding.source_url}
+
     for finding in findings:
         if not finding.rule_id or not finding.message:
             continue
@@ -235,6 +263,7 @@ def _build_sarif(
                         )
                     )
                 ],
+                properties=_finding_properties(finding),
             )
         )
         if finding.rule_id not in seen_rule_ids:
@@ -261,6 +290,7 @@ def _build_sarif(
                         )
                     )
                 ],
+                properties=_finding_properties(finding),
                 suppressions=[SarifSuppression(kind="external", justification=sf.reason)],
             )
         )
@@ -318,6 +348,7 @@ def _format_terminal(
     llm_call_log: list[dict[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
+    transitive_truncation_reasons: list[str] | None = None,
 ) -> str:
     """Generate Rich terminal output and export as string."""
     suppressed = suppressed or []
@@ -361,7 +392,7 @@ def _format_terminal(
     comp_table.add_column("Lines", justify="right")
     comp_table.add_column("Executable")
     for comp in component_metadata[:15]:
-        path = comp.get("path", "")
+        path = _display_component_path(comp)
         typ = comp.get("type", "")
         lines = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
@@ -379,6 +410,16 @@ def _format_terminal(
                 f"[bold]Degraded scan[/bold]\n{degraded_notice}",
                 title="[bold red]WARNING[/bold red]",
                 border_style="red",
+            )
+        )
+
+    if transitive_truncation_reasons:
+        console.print()
+        console.print(
+            Panel(
+                "Transitive traversal stopped early: " + "; ".join(transitive_truncation_reasons),
+                title="[bold yellow]NOTICE[/bold yellow]",
+                border_style="yellow",
             )
         )
 
@@ -451,6 +492,9 @@ def _build_metadata(
     has_executable_scripts: bool,
     use_llm: bool,
     llm_call_log: list[dict[str, object]] | None = None,
+    transitive_targets_scanned: int | None = None,
+    transitive_bytes_scanned: int | None = None,
+    transitive_truncation_reasons: list[str] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
@@ -486,11 +530,19 @@ def _build_metadata(
         )
     elif use_llm and not llm_available:
         meta["llm_error"] = llm_error
+    if transitive_targets_scanned is not None:
+        meta["transitive_targets_scanned"] = transitive_targets_scanned
+    if transitive_bytes_scanned is not None:
+        meta["transitive_bytes_scanned"] = transitive_bytes_scanned
+    if transitive_truncation_reasons:
+        meta["transitive_truncated"] = True
+        meta["transitive_truncation_reasons"] = transitive_truncation_reasons
     return meta
 
 
 def _build_analysis_completeness(
     components: list[str],
+    component_metadata: list[dict[str, object]],
     file_cache: dict[str, str],
     use_llm: bool,
     findings_pre_filter: list[Finding],
@@ -501,8 +553,10 @@ def _build_analysis_completeness(
     Helps consumers understand what was NOT analyzed and whether findings
     can be trusted as comprehensive.
     """
-    total_components = len(components)
-    scanned_components = sum(1 for c in components if c in file_cache)
+    coverage_keys = [_component_coverage_key(component) for component in component_metadata]
+    component_keys = coverage_keys if coverage_keys else components
+    total_components = len(component_keys)
+    scanned_components = sum(1 for key in component_keys if key in file_cache)
 
     llm_available, llm_error = is_llm_available()
     llm_used = use_llm and llm_available
@@ -548,6 +602,9 @@ def _format_json(
     llm_call_log: list[dict[str, object]] | None = None,
     analysis_completeness: dict[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
+    transitive_targets_scanned: int | None = None,
+    transitive_bytes_scanned: int | None = None,
+    transitive_truncation_reasons: list[str] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -570,13 +627,21 @@ def _format_json(
                 "lines": c.get("lines"),
                 "executable": c.get("executable"),
                 "size_bytes": c.get("size_bytes"),
+                "source_url": c.get("source_url"),
             }
             for c in component_metadata
         ],
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
         "suppressed": [sf.to_dict() for sf in suppressed],
-        "metadata": _build_metadata(has_executable_scripts, use_llm, llm_call_log),
+        "metadata": _build_metadata(
+            has_executable_scripts,
+            use_llm,
+            llm_call_log,
+            transitive_targets_scanned=transitive_targets_scanned,
+            transitive_bytes_scanned=transitive_bytes_scanned,
+            transitive_truncation_reasons=transitive_truncation_reasons,
+        ),
     }
     if analysis_completeness is not None:
         data["analysis_completeness"] = analysis_completeness
@@ -596,6 +661,7 @@ def _format_markdown(
     llm_call_log: list[dict[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
+    transitive_truncation_reasons: list[str] | None = None,
 ) -> str:
     """Generate Markdown report string."""
     suppressed = suppressed or []
@@ -614,6 +680,12 @@ def _format_markdown(
         lines.append(f"> ⚠️ **Degraded scan:** {degraded_notice}")
         lines.append("")
 
+    if transitive_truncation_reasons:
+        lines.append(
+            "> ⚠️ **Transitive traversal truncated:** " + "; ".join(transitive_truncation_reasons)
+        )
+        lines.append("")
+
     lines.append("## Risk Assessment\n")
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
@@ -626,7 +698,7 @@ def _format_markdown(
     lines.append("| File | Type | Lines | Executable |")
     lines.append("|------|------|-------|------------|")
     for comp in component_metadata:
-        path = comp.get("path", "")
+        path = _display_component_path(comp)
         typ = comp.get("type", "")
         line_count = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
@@ -645,6 +717,8 @@ def _format_markdown(
             lines.append(f"### {emoji} {sev}: {f.rule_id}\n")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
             lines.append(f"**Location:** `{f.file}:{f.start_line}{end}`  ")
+            if f.transitive_depth > 0 and f.source_url:
+                lines.append(f"**Transitive:** depth={f.transitive_depth}, source={f.source_url}  ")
             lines.append(f"**Confidence:** {f.confidence:.0%}  ")
             lines.append("")
             lines.append(f"**Message:** {f.message}")
@@ -698,6 +772,13 @@ def report(state: SkillspectorState) -> dict[str, object]:
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
     llm_call_log = state.get("llm_call_log") or []
+    transitive_targets_scanned = state.get("transitive_targets_scanned")
+    transitive_bytes_scanned = state.get("transitive_bytes_scanned")
+    transitive_truncation_reasons = [
+        str(reason)
+        for reason in state.get("transitive_truncation_reasons", [])
+        if isinstance(reason, str)
+    ]
 
     # Surface a silent degradation: deep scan requested but every LLM call failed
     # at runtime, so the report reflects static analysis only. Logged here (once,
@@ -727,7 +808,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     )
     sarif_report = _build_sarif(active_findings, suppressed, degraded_notice=degraded_notice)
     analysis_completeness = _build_analysis_completeness(
-        components, file_cache, use_llm, raw_findings, filtered_findings
+        components, component_metadata, file_cache, use_llm, raw_findings, filtered_findings
     )
 
     # Fail closed on a degraded deep scan: when the LLM stage was requested but
@@ -755,6 +836,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             suppressed=suppressed,
             show_suppressed=show_suppressed,
+            transitive_truncation_reasons=transitive_truncation_reasons,
         )
     elif output_format == "json":
         report_body = _format_json(
@@ -770,6 +852,13 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
+            transitive_targets_scanned=int(transitive_targets_scanned)
+            if isinstance(transitive_targets_scanned, int)
+            else None,
+            transitive_bytes_scanned=int(transitive_bytes_scanned)
+            if isinstance(transitive_bytes_scanned, int)
+            else None,
+            transitive_truncation_reasons=transitive_truncation_reasons,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
@@ -785,6 +874,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             suppressed=suppressed,
             show_suppressed=show_suppressed,
+            transitive_truncation_reasons=transitive_truncation_reasons,
         )
     else:
         report_body = json.dumps(sarif_report, indent=2)
@@ -805,4 +895,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "filtered_findings": filtered_findings,
         "suppressed_findings": suppressed,
     }
+    if isinstance(transitive_targets_scanned, int):
+        out["transitive_targets_scanned"] = transitive_targets_scanned
+    if isinstance(transitive_bytes_scanned, int):
+        out["transitive_bytes_scanned"] = transitive_bytes_scanned
+    if transitive_truncation_reasons:
+        out["transitive_truncated"] = True
+        out["transitive_truncation_reasons"] = transitive_truncation_reasons
     return out

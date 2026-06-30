@@ -97,6 +97,8 @@ def finding_fingerprint(finding: Finding) -> str:
             str(finding.start_line or ""),
             str(finding.end_line or ""),
             (finding.message or "").strip(),
+            finding.source_url or "",
+            str(finding.transitive_depth or 0),
         ]
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from skillspector.models import Finding
 from skillspector.nodes.report import _build_sarif
+from skillspector.sarif_models import validate_sarif_report
 
 
 def _make_finding(rule_id: str = "PE3", message: str = "Credential Access", **kwargs) -> Finding:
@@ -155,3 +156,16 @@ class TestSarifRulesArray:
         sarif = _build_sarif(findings)
         assert "$schema" in sarif
         assert sarif["version"] == "2.1.0"
+
+
+def test_sarif_transitive_properties_validate() -> None:
+    """Transitive provenance lands in SARIF properties and still validates."""
+    finding = _make_finding("TR1", "Transitive Dependency")
+    finding.transitive_depth = 2
+    finding.source_url = "https://github.com/org/dep"
+    sarif = _build_sarif([finding])
+    validate_sarif_report(sarif)
+    result = sarif["runs"][0]["results"][0]
+    properties = result["properties"]
+    assert properties["transitiveDepth"] == 2
+    assert properties["sourceUrl"] == "https://github.com/org/dep"

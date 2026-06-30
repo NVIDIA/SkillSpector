@@ -36,7 +36,7 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -55,11 +55,32 @@ ALLOWED_GIT_HOSTS = frozenset(
 ALLOWED_DOWNLOAD_HOSTS = frozenset(
     {
         "github.com",
+        "codeload.github.com",
         "raw.githubusercontent.com",
         "gitlab.com",
         "bitbucket.org",
         "huggingface.co",
     }
+)
+
+_DIRECT_FILE_URL_SUFFIXES = (
+    ".md",
+    ".py",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".js",
+    ".ts",
+    ".rb",
+    ".go",
+    ".rs",
+    ".pl",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".txt",
+    ".zip",
 )
 
 
@@ -148,7 +169,11 @@ class InputHandler:
         parsed = urlparse(path)
         host = parsed.hostname or ""
         if any(allowed in host for allowed in ALLOWED_GIT_HOSTS):
-            if "/raw/" in path or "/blob/" in path or path.endswith((".md", ".py", ".sh")):
+            if (
+                "/raw/" in path
+                or "/blob/" in path
+                or path.lower().endswith(_DIRECT_FILE_URL_SUFFIXES)
+            ):
                 return False
             return True
         if path.endswith(".git"):
@@ -218,15 +243,12 @@ class InputHandler:
 
     def _download_file(self, url: str) -> Path:
         """Download a file from URL to a temporary directory."""
-        self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)
         temp_dir = self._get_temp_dir()
-        parsed = urlparse(url)
-        filename = Path(parsed.path).name or "SKILL.md"
         try:
-            with httpx.Client(follow_redirects=False, timeout=30) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                content = response.content
+            response, final_url = self._download_with_redirect_validation(url)
+            parsed = urlparse(final_url)
+            filename = Path(parsed.path).name or "SKILL.md"
+            content = response.content
         except httpx.HTTPError as e:
             logger.warning("Download failed for %s: %s", url, e)
             raise ValueError(f"Failed to download file: {e}") from e
@@ -239,6 +261,22 @@ class InputHandler:
         file_path = temp_dir / filename
         file_path.write_bytes(content)
         return temp_dir
+
+    def _download_with_redirect_validation(self, url: str) -> tuple[httpx.Response, str]:
+        current_url = url
+        for _ in range(5):
+            self._validate_url_host(current_url, ALLOWED_DOWNLOAD_HOSTS)
+            with httpx.Client(follow_redirects=False, timeout=30) as client:
+                response = client.get(current_url)
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError(f"Redirect response missing location: {current_url}")
+                current_url = urljoin(current_url, location)
+                continue
+            response.raise_for_status()
+            return response, current_url
+        raise ValueError(f"Too many redirects while downloading: {url}")
 
     def _extract_zip(self, zip_path: Path) -> Path:
         """Extract a zip file to a temporary directory with path traversal protection."""
