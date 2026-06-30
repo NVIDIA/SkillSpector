@@ -72,6 +72,7 @@ def test_build_context_real_directory_with_skill_md(tmp_path: Path) -> None:
         "description": "For tests",
         "triggers": ["a", "b"],
         "permissions": ["read"],
+        "allowed-tools": [],
         "parameters": [],
     }
     assert result["ast_cache"] == {}
@@ -208,3 +209,36 @@ def test_build_context_parses_parameters_from_frontmatter(tmp_path: Path) -> Non
     assert result["manifest"]["parameters"] == [
         {"name": "path", "description": "file path to read"}
     ]
+
+
+def test_build_context_parses_allowed_tools_list(tmp_path: Path) -> None:
+    """`allowed-tools` list form is preserved so LP3 treats it as a declaration."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: [Bash, Read]\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
+
+
+def test_build_context_allowed_tools_malformed_value(tmp_path: Path) -> None:
+    """A non-list, non-string `allowed-tools` value normalizes to an empty list."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: 42\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == []
+
+
+def test_build_context_parses_allowed_tools_comma_string(tmp_path: Path) -> None:
+    """`allowed-tools` comma-separated string form is normalized to a list."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: Bash, Read\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]

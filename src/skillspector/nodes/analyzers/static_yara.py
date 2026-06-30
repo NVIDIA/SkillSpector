@@ -70,11 +70,15 @@ def _collect_rule_files(*dirs: Path) -> list[Path]:
 
 
 def _content_hash(rule_files: list[Path]) -> str:
-    """Fast hash over rule file paths and sizes for cache invalidation."""
+    """Hash over rule file paths and content for cache invalidation.
+
+    Uses actual file content (not just size) so that edits which preserve
+    file length still invalidate the cache.
+    """
     h = hashlib.sha256()
     for p in rule_files:
         h.update(str(p).encode())
-        h.update(str(p.stat().st_size).encode())
+        h.update(p.read_bytes())
     return h.hexdigest()
 
 

@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: tool misuse (TM1–TM3). Node and analyze() in one module.
+"""Static patterns: tool misuse (TM1–TM4). Node and analyze() in one module.
 
 Detects patterns where tool parameters are abused (TM1), tool chaining
-is used to bypass safety (TM2), or tool defaults are unsafe (TM3).
+is used to bypass safety (TM2), tool defaults are unsafe (TM3), or a
+privileged Kubernetes workload is deployed (TM4).
 
 Framework: ASI02.
 """
@@ -31,7 +32,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import get_context, get_line_number, is_code_example
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -149,6 +150,18 @@ TM3_PATTERNS = [
     ),
 ]
 
+# TM4: Privileged Kubernetes Workload — manifest/CLI primitives that grant
+# node/host takeover (the cluster-scale counterpart of a privileged container).
+# Only isolation-breaking signals are matched, so a normal `kubectl apply` or a
+# plain DaemonSet does not fire.
+TM4_PATTERNS = [
+    (r"privileged\s*:\s*true", 0.7),  # privileged container in a manifest
+    (r"hostPath\s*:", 0.55),  # host filesystem mount
+    (r"host(?:PID|Network|IPC)\s*:\s*true", 0.6),  # host namespace sharing
+    (r"kubectl\s+run\b[^\n]*--privileged", 0.7),  # privileged ad-hoc pod
+    (r"--set\b[^\n]*privileged\s*=\s*true", 0.6),  # helm privileged override
+]
+
 
 _SAFE_CONTAINER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"docker\s+run\s+.*--rm", re.IGNORECASE),
@@ -264,6 +277,26 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     confidence=confidence,
                     tags=tag,
                     context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                )
+            )
+    # TM4: privileged K8s workload. Filtered through is_code_example() because
+    # privileged/hostPath fields commonly appear in SKILL.md docs and examples.
+    for pattern, confidence in TM4_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            context_text = ctx(match.start())
+            if is_code_example(context_text):
+                continue
+            line_num = get_line_number(content, match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="TM4",
+                    message="Privileged Kubernetes Workload",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=context_text,
                     matched_text=match.group(0)[:200],
                 )
             )

@@ -101,6 +101,9 @@ class Finding:
             "remediation": self.remediation,
             "code_snippet": self.code_snippet or self.context,
             "intent": self.intent,
+            # Tags surface markers like "llm-unconfirmed" (a high-severity static
+            # finding the LLM filter did not confirm but which is preserved anyway).
+            "tags": list(self.tags),
         }
 
     def __str__(self) -> str:
@@ -108,7 +111,7 @@ class Finding:
 
 
 class AnalyzerPlugin(Protocol):
-    """Analyzer protocol from SADD A.1.1."""
+    """Analyzer plugin protocol: name/stage/availability and an ``analyze`` entry point."""
 
     name: str
     stage: str

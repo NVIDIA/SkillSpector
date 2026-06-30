@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: privilege escalation (PE1–PE3). Node and analyze() in one module."""
+"""Static patterns: privilege escalation (PE1–PE5). Node and analyze() in one module."""
 
 from __future__ import annotations
 
@@ -93,10 +93,28 @@ PE3_PATTERNS = [
     (r"access\s+(?:the\s+)?(?:credentials?|secrets?|tokens?)", 0.7),
     (r"(?:extract|copy|get)\s+(?:api\s+)?keys?\s+from", 0.7),
 ]
+PE4_PATTERNS = [
+    (r"/var/run/docker\.sock", 0.9),
+    (r"docker\.from_env\(\)", 0.85),
+    (r"\bDockerClient\s*\(", 0.85),
+    (r"http\+unix://.*docker\.sock", 0.9),
+]
+PE5_PATTERNS = [
+    (r"--privileged", 0.8),
+    (r"""(?:-v|--volume)['",\s=]+/:""", 0.85),
+    (r"--cap-add[=\s]+(?:SYS_ADMIN|ALL|SYS_PTRACE|NET_ADMIN)", 0.85),
+    (r"--(?:pid|net|network|ipc|uts)[=\s]+host", 0.8),
+    (r"--device[=\s]+/dev/", 0.7),
+    (r"--security-opt[=\s]+\S*unconfined", 0.85),
+    (r"\bnsenter\b", 0.9),
+    (r"/sys/fs/cgroup/.*release_agent", 0.95),
+    (r"/proc/\d+/ns/", 0.85),
+    (r"""\bunshare\b['",\s]+--(?:user|mount|pid)""", 0.85),
+]
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Analyze content for privilege escalation patterns (PE1–PE3)."""
+    """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:
@@ -156,6 +174,50 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
+    # Collect best-confidence PE4 finding per line to avoid double-counting lines
+    # that match multiple patterns (e.g. DockerClient(base_url=".../docker.sock")).
+    pe4_best: dict[int, AnalyzerFinding] = {}
+    for pattern, confidence in PE4_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = get_line_number(content, match.start())
+            context = get_context(content, match.start())
+            if _is_documentation_example(context, file_type):
+                continue
+            if line_num in pe4_best and pe4_best[line_num].confidence >= confidence:
+                continue
+            pe4_best[line_num] = AnalyzerFinding(
+                rule_id="PE4",
+                message="Docker Socket Access",
+                severity=Severity.HIGH,
+                location=loc(line_num),
+                confidence=confidence,
+                tags=tag,
+                context=context,
+                matched_text=match.group(0)[:200],
+            )
+    findings.extend(pe4_best.values())
+    # Collect best-confidence PE5 finding per line — a single `docker run` line
+    # often matches multiple flags (e.g. --privileged + --cap-add=SYS_ADMIN).
+    pe5_best: dict[int, AnalyzerFinding] = {}
+    for pattern, confidence in PE5_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = get_line_number(content, match.start())
+            context = get_context(content, match.start())
+            if _is_documentation_example(context, file_type):
+                continue
+            if line_num in pe5_best and pe5_best[line_num].confidence >= confidence:
+                continue
+            pe5_best[line_num] = AnalyzerFinding(
+                rule_id="PE5",
+                message="Privileged Container / Container Escape",
+                severity=Severity.HIGH,
+                location=loc(line_num),
+                confidence=confidence,
+                tags=tag,
+                context=context,
+                matched_text=match.group(0)[:200],
+            )
+    findings.extend(pe5_best.values())
     return findings
 
 

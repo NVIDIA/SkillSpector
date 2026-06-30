@@ -152,4 +152,3 @@ docker-build:
 # Build and smoke test the Docker image
 docker-smoke: docker-build
 	tests/docker/smoke.sh
-

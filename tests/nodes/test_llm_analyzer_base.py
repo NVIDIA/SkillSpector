@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -298,6 +299,40 @@ class TestBaseParseResponse:
 
 
 # ---------------------------------------------------------------------------
+# MetaAnalyzerResult — tolerate LLMs that stringify the `findings` array
+# ---------------------------------------------------------------------------
+
+
+class TestMetaAnalyzerResultFindingsValidator:
+    _FINDING = {
+        "pattern_id": "E2",
+        "start_line": 12,
+        "is_vulnerability": True,
+        "confidence": 0.9,
+        "intent": "malicious",
+        "impact": "high",
+    }
+
+    def test_findings_as_json_string(self) -> None:
+        """Some LLMs return the findings array as a JSON string, not a list."""
+        result = MetaAnalyzerResult.model_validate({"findings": json.dumps([self._FINDING])})
+        assert len(result.findings) == 1
+        assert result.findings[0].pattern_id == "E2"
+
+    def test_findings_as_native_list(self) -> None:
+        result = MetaAnalyzerResult.model_validate({"findings": [self._FINDING]})
+        assert len(result.findings) == 1
+
+    def test_findings_invalid_string_yields_empty(self) -> None:
+        result = MetaAnalyzerResult.model_validate({"findings": "not json"})
+        assert result.findings == []
+
+    def test_findings_non_list_json_yields_empty(self) -> None:
+        result = MetaAnalyzerResult.model_validate({"findings": json.dumps({"a": 1})})
+        assert result.findings == []
+
+
+# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.collect_findings
 # ---------------------------------------------------------------------------
 
@@ -522,6 +557,42 @@ class TestARunBatches:
 
         assert seen_files == {f"file_{i}.py" for i in range(num_batches)}
 
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_failed_batch_does_not_abort_the_others(self) -> None:
+        """A transient failure costs only its own batch, not the whole fan-out."""
+
+        async def _flaky_ainvoke(prompt: str) -> LLMAnalysisResult:
+            if "b.py" in prompt:
+                raise RuntimeError("429 Too Many Requests")
+            return LLMAnalysisResult(findings=[])
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = _flaky_ainvoke
+
+        batches = [
+            Batch(file_path="a.py", content="code a"),
+            Batch(file_path="b.py", content="code b"),
+            Batch(file_path="c.py", content="code c"),
+        ]
+        results = await analyzer.arun_batches(batches)
+        assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_all_batches_failed_returns_empty(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=RuntimeError("boom"))
+        batches = [Batch(file_path="a.py", content="code")]
+        assert await analyzer.arun_batches(batches) == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_value_error_still_propagates(self) -> None:
+        """ValueError signals misconfiguration, not infra trouble — never swallowed."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=ValueError("no API key"))
+        batches = [Batch(file_path="a.py", content="code")]
+        with pytest.raises(ValueError, match="no API key"):
+            await analyzer.arun_batches(batches)
+
 
 # ---------------------------------------------------------------------------
 # _format_findings_for_prompt (per-file, no truncation)
@@ -566,14 +637,40 @@ class TestLLMAnalysisResult:
         assert len(result.findings) == 1
         assert result.findings[0].confidence == 0.9
 
+    def test_confidence_is_clamped(self) -> None:
+        """Out-of-range confidence is clamped, not rejected, so a slightly off
+        model value does not fail the whole structured-output parse."""
+        hi = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=1.5)
+        lo = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=-0.3)
+        assert hi.confidence == 1.0
+        assert lo.confidence == 0.0
+
+    def test_confidence_100_scale_normalized(self) -> None:
+        """Ollama and some models return confidence on 0-100 scale; must be normalized."""
+        f = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=100)
+        assert f.confidence == pytest.approx(1.0)
+
+    def test_confidence_85_scale_normalized(self) -> None:
+        f = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=85)
+        assert f.confidence == pytest.approx(0.85)
+
+    def test_confidence_negative_clamped_to_zero(self) -> None:
+        f = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=-10)
+        assert f.confidence == pytest.approx(0.0)
+
+    def test_confidence_overlarge_clamped_to_one(self) -> None:
+        """Values > 100 (e.g. 150) are divided then clamped."""
+        f = LLMFinding(rule_id="X", message="x", severity="LOW", start_line=1, confidence=150)
+        assert f.confidence == pytest.approx(1.0)
+
     def test_confidence_validation(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, TypeError)):
             LLMFinding(
                 rule_id="X",
                 message="x",
                 severity="LOW",
                 start_line=1,
-                confidence=1.5,
+                confidence="not-a-number",
             )
 
     def test_severity_validation(self) -> None:
@@ -660,12 +757,55 @@ class TestMetaAnalyzerResult:
         assert len(result.findings) == 1
         assert result.findings[0].confidence == 0.9
 
+    def test_confidence_is_clamped(self) -> None:
+        """Out-of-range confidence is clamped, not rejected, so a slightly off
+        model value does not fail the whole structured-output parse."""
+        high = MetaAnalyzerFinding(
+            pattern_id="E1",
+            is_vulnerability=True,
+            confidence=1.5,
+            intent="malicious",
+            impact="high",
+        )
+        low = MetaAnalyzerFinding(
+            pattern_id="E1",
+            is_vulnerability=True,
+            confidence=-0.2,
+            intent="malicious",
+            impact="high",
+        )
+        assert high.confidence == 1.0
+        assert low.confidence == 0.0
+
+    def test_confidence_100_scale_normalized(self) -> None:
+        """Ollama-style 0-100 scale must be normalized to 0-1."""
+        f = MetaAnalyzerFinding(
+            pattern_id="E1",
+            is_vulnerability=True,
+            confidence=100,
+            intent="malicious",
+            impact="high",
+        )
+        assert f.confidence == pytest.approx(1.0)
+
+    def test_confidence_75_scale_normalized(self) -> None:
+        f = MetaAnalyzerFinding(
+            pattern_id="E1", is_vulnerability=True, confidence=75, intent="malicious", impact="high"
+        )
+        assert f.confidence == pytest.approx(0.75)
+
+    def test_confidence_negative_clamped(self) -> None:
+        f = MetaAnalyzerFinding(
+            pattern_id="E1", is_vulnerability=True, confidence=-5, intent="malicious", impact="high"
+        )
+        assert f.confidence == pytest.approx(0.0)
+
     def test_confidence_validation(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, TypeError)):
             MetaAnalyzerFinding(
                 pattern_id="E1",
                 is_vulnerability=True,
-                confidence=1.5,
+                confidence="bad",
                 intent="malicious",
                 impact="high",
             )
@@ -717,6 +857,54 @@ class TestMetaAnalyzerResult:
         assert d["confidence"] == 0.8
         assert d["explanation"] == ""
         assert d["start_line"] is None
+
+
+class TestStructuredOutputSchema:
+    """The response schemas must stay portable across structured-output backends.
+
+    Pydantic ge/le bounds emit JSON-schema ``minimum`` / ``maximum``, which some
+    OpenAI-compatible structured-output / tool-calling endpoints reject when they
+    validate the response schema. The ranges are enforced by runtime validators
+    instead, so these keywords must not appear in the emitted schema.
+    """
+
+    @staticmethod
+    def _numeric_keywords(schema: dict) -> set[str]:
+        found: set[str] = set()
+
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                found.update(k for k in ("minimum", "maximum") if k in node)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(schema)
+        return found
+
+    def test_llm_finding_schema_has_no_numeric_bounds(self) -> None:
+        assert self._numeric_keywords(LLMFinding.model_json_schema()) == set()
+
+    def test_meta_finding_schema_has_no_numeric_bounds(self) -> None:
+        assert self._numeric_keywords(MetaAnalyzerFinding.model_json_schema()) == set()
+
+    def test_llm_finding_clamps_confidence(self) -> None:
+        hi = LLMFinding(rule_id="R", message="m", severity="LOW", start_line=1, confidence=1.5)
+        lo = LLMFinding(rule_id="R", message="m", severity="LOW", start_line=1, confidence=-0.3)
+        assert hi.confidence == 1.0
+        assert lo.confidence == 0.0
+
+    def test_llm_finding_clamps_start_line(self) -> None:
+        assert LLMFinding(rule_id="R", message="m", severity="LOW", start_line=0).start_line == 1
+        assert LLMFinding(rule_id="R", message="m", severity="LOW", start_line=42).start_line == 42
+
+    def test_llm_finding_start_line_is_required(self) -> None:
+        """start_line stays required: a finding with no location is rejected,
+        not materialised at line 1."""
+        with pytest.raises(ValueError):
+            LLMFinding(rule_id="R", message="m", severity="LOW")
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1309,261 @@ class TestLLMMetaAnalyzerApplyFilter:
         assert len(result) == 1
         assert result[0].end_line == 10
         assert result[0].explanation == "Long block is dangerous"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_static_finding_with_none_end_line_confirmed_by_start(self) -> None:
+        """Issue #67: static finding with end_line=None must not be dropped when
+        the LLM confirms the same start_line with an explicit end_line.
+
+        Static analyzers typically emit end_line=None; the LLM always fills it
+        in.  The confirmed_by_start fallback ensures the finding is kept.
+        """
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        # Construct directly — _make_finding converts None to line via `or`.
+        finding = Finding(
+            rule_id="E2",
+            message="env harvest",
+            file="agent.py",
+            start_line=42,
+            end_line=None,
+        )
+        batch = Batch(file_path="agent.py", content="code", findings=[finding])
+        llm_items = [
+            {
+                "pattern_id": "E2",
+                "start_line": 42,
+                "end_line": 42,
+                "is_vulnerability": True,
+                "confidence": 0.88,
+                "explanation": "Harvests all env vars",
+                "remediation": "Use specific env lookups",
+                "_file": "agent.py",
+            }
+        ]
+        result = analyzer.apply_filter([finding], [(batch, llm_items)])
+        assert len(result) == 1, "Static finding with end_line=None must not be dropped"
+        assert result[0].explanation == "Harvests all env vars"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_static_findings_at_different_lines_only_confirmed_kept(self) -> None:
+        """Two static findings (end_line=None) at different start_lines; LLM
+        confirms only one.  The unconfirmed finding must not survive the filter."""
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        f1 = Finding(
+            rule_id="P1", message="override", file="skill.md", start_line=10, end_line=None
+        )
+        f2 = Finding(
+            rule_id="P1", message="override", file="skill.md", start_line=30, end_line=None
+        )
+        batch = Batch(file_path="skill.md", content="code", findings=[f1, f2])
+        llm_items = [
+            {
+                "pattern_id": "P1",
+                "start_line": 10,
+                "end_line": 10,
+                "is_vulnerability": True,
+                "confidence": 0.9,
+                "explanation": "Instruction override at line 10",
+                "_file": "skill.md",
+            },
+            {
+                "pattern_id": "P1",
+                "start_line": 30,
+                "is_vulnerability": False,
+                "confidence": 0.2,
+                "_file": "skill.md",
+            },
+        ]
+        result = analyzer.apply_filter([f1, f2], [(batch, llm_items)])
+        assert len(result) == 1
+        assert result[0].start_line == 10
+
+
+# ---------------------------------------------------------------------------
+# LLMMetaAnalyzer.apply_filter — severity-gated suppression floor
+#
+# Security invariant: CRITICAL and HIGH static findings must survive LLM
+# filtering even if the LLM (operating on attacker-controlled skill content)
+# omits or denies them.  MEDIUM/LOW findings are still filtered normally.
+# ---------------------------------------------------------------------------
+
+
+class TestApplyFilterSeverityFloor:
+    """Tests for the severity-gated suppression floor in apply_filter.
+
+    Verifies that CRITICAL/HIGH static findings are never silently dropped
+    by the LLM filter (adversarial prompt-injection defence), while MEDIUM/LOW
+    findings continue to be filtered as before.
+    """
+
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    def _make_finding(
+        self,
+        rule_id: str,
+        severity: str,
+        file: str = "skill.md",
+        line: int = 1,
+        tags: list[str] | None = None,
+    ) -> Finding:
+        return Finding(
+            rule_id=rule_id,
+            message=f"original message for {rule_id}",
+            severity=severity,
+            confidence=0.8,
+            file=file,
+            start_line=line,
+            tags=tags or [],
+        )
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_critical_unconfirmed_kept_with_llm_unconfirmed_tag(self) -> None:
+        """A CRITICAL static finding NOT confirmed by the LLM must be kept.
+
+        The finding must appear in the output with its original severity and
+        message, and the tag 'llm-unconfirmed' must be present to let consumers
+        know it was not LLM-validated (and may represent an adversarial suppression).
+        """
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        finding = self._make_finding("CRIT-001", "CRITICAL", line=10)
+        batch = Batch(file_path="skill.md", content="code", findings=[finding])
+        # LLM response: is_vulnerability=False — the LLM denies the finding
+        llm_items = [
+            {
+                "pattern_id": "CRIT-001",
+                "start_line": 10,
+                "is_vulnerability": False,
+                "confidence": 0.2,
+                "_file": "skill.md",
+            }
+        ]
+        result = analyzer.apply_filter([finding], [(batch, llm_items)])
+
+        assert len(result) == 1, "CRITICAL finding must NOT be dropped by LLM filtering"
+        kept = result[0]
+        assert kept.severity == "CRITICAL"
+        assert kept.rule_id == "CRIT-001"
+        assert kept.message == "original message for CRIT-001"
+        assert kept.confidence == 0.8  # original confidence preserved
+        assert "llm-unconfirmed" in kept.tags
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_high_unconfirmed_kept_with_llm_unconfirmed_tag(self) -> None:
+        """A HIGH static finding NOT confirmed by the LLM must be kept.
+
+        Same invariant as CRITICAL: the original finding is preserved and
+        tagged 'llm-unconfirmed'.
+        """
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        finding = self._make_finding("HIGH-001", "HIGH", line=5)
+        batch = Batch(file_path="skill.md", content="code", findings=[finding])
+        # LLM response: finding completely omitted (empty list) — simulates
+        # a prompt-injection payload making the LLM silently drop the finding
+        llm_items: list[dict] = []
+        result = analyzer.apply_filter([finding], [(batch, llm_items)])
+
+        assert len(result) == 1, "HIGH finding must NOT be dropped by LLM filtering"
+        kept = result[0]
+        assert kept.severity == "HIGH"
+        assert kept.rule_id == "HIGH-001"
+        assert kept.message == "original message for HIGH-001"
+        assert kept.confidence == 0.8  # original confidence preserved
+        assert "llm-unconfirmed" in kept.tags
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_medium_unconfirmed_still_dropped(self) -> None:
+        """A MEDIUM static finding NOT confirmed by the LLM must still be dropped.
+
+        The severity floor only applies to CRITICAL/HIGH.  MEDIUM and LOW
+        findings remain subject to normal LLM filtering (false-positive reduction).
+        """
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        finding = self._make_finding("MED-001", "MEDIUM", line=3)
+        batch = Batch(file_path="skill.md", content="code", findings=[finding])
+        llm_items = [
+            {
+                "pattern_id": "MED-001",
+                "start_line": 3,
+                "is_vulnerability": False,
+                "confidence": 0.1,
+                "_file": "skill.md",
+            }
+        ]
+        result = analyzer.apply_filter([finding], [(batch, llm_items)])
+
+        assert len(result) == 0, "MEDIUM finding must be dropped when LLM does not confirm it"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_low_unconfirmed_still_dropped(self) -> None:
+        """A LOW static finding NOT confirmed by the LLM must still be dropped."""
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        finding = self._make_finding("LOW-001", "LOW", line=7)
+        batch = Batch(file_path="skill.md", content="code", findings=[finding])
+        llm_items: list[dict] = []  # LLM omits the finding entirely
+        result = analyzer.apply_filter([finding], [(batch, llm_items)])
+
+        assert len(result) == 0, "LOW finding must be dropped when LLM does not confirm it"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_critical_confirmed_uses_llm_enrichment(self) -> None:
+        """A CRITICAL finding confirmed by the LLM is still enriched as before.
+
+        The floor does not interfere with the normal happy path: when the LLM
+        confirms a CRITICAL/HIGH finding, the enriched version (with LLM
+        explanation/remediation/confidence) is used and 'llm-unconfirmed' is
+        NOT added.
+        """
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        finding = self._make_finding("CRIT-002", "CRITICAL", line=20)
+        batch = Batch(file_path="skill.md", content="code", findings=[finding])
+        llm_items = [
+            {
+                "pattern_id": "CRIT-002",
+                "start_line": 20,
+                "is_vulnerability": True,
+                "confidence": 0.95,
+                "explanation": "LLM-confirmed dangerous pattern",
+                "remediation": "Remove immediately",
+                "_file": "skill.md",
+            }
+        ]
+        result = analyzer.apply_filter([finding], [(batch, llm_items)])
+
+        assert len(result) == 1
+        kept = result[0]
+        assert kept.severity == "CRITICAL"
+        assert kept.rule_id == "CRIT-002"
+        assert kept.explanation == "LLM-confirmed dangerous pattern"
+        assert kept.confidence == 0.95
+        assert "llm-unconfirmed" not in kept.tags
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_llm_unconfirmed_tag_not_duplicated(self) -> None:
+        """If the original finding already has 'llm-unconfirmed' in its tags,
+        apply_filter must not append it again."""
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        finding = self._make_finding(
+            "CRIT-003", "CRITICAL", line=1, tags=["llm-unconfirmed", "existing-tag"]
+        )
+        batch = Batch(file_path="skill.md", content="code", findings=[finding])
+        llm_items: list[dict] = []  # LLM omits finding
+        result = analyzer.apply_filter([finding], [(batch, llm_items)])
+
+        assert len(result) == 1
+        assert result[0].tags.count("llm-unconfirmed") == 1
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_llm_unconfirmed_tag_surfaced_in_to_dict(self) -> None:
+        """The 'llm-unconfirmed' marker must be visible in the JSON output
+        (Finding.to_dict), so consumers can see a high-severity finding the LLM
+        did not confirm."""
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        finding = self._make_finding("CRIT-004", "CRITICAL", line=1)
+        batch = Batch(file_path="skill.md", content="code", findings=[finding])
+        result = analyzer.apply_filter([finding], [(batch, [])])
+
+        assert len(result) == 1
+        assert "llm-unconfirmed" in result[0].to_dict()["tags"]
 
 
 # ---------------------------------------------------------------------------

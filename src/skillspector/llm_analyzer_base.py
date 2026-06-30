@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
@@ -62,11 +62,36 @@ class LLMFinding(BaseModel):
     rule_id: str = Field(description="Identifier for the type of finding")
     message: str = Field(description="Short description of the finding")
     severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(description="Severity level")
-    start_line: int = Field(ge=1, description="Starting line number")
+    # start_line and confidence carry no ge/le Field bounds on purpose. Pydantic
+    # bounds emit JSON-schema minimum/maximum, which some OpenAI-compatible
+    # structured-output / tool-calling endpoints reject when they validate the
+    # response schema, failing the whole call. The ranges are enforced by the
+    # validators below instead, so the guarantee holds without those keywords in
+    # the emitted schema. start_line stays required (no default), so a finding
+    # with no location is still rejected rather than materialised at line 1;
+    # only the numeric bound is removed, not the requiredness.
+    start_line: int = Field(description="Starting line number (>= 1)")
     end_line: int | None = Field(default=None, description="Ending line number (optional)")
-    confidence: float = Field(ge=0.0, le=1.0, default=0.5, description="Confidence score")
+    confidence: float = Field(default=0.5, description="Confidence score between 0.0 and 1.0")
     explanation: str = Field(default="", description="Why this is a finding (2-3 sentences)")
     remediation: str = Field(default="", description="Actionable steps to fix the issue")
+
+    @field_validator("start_line")
+    @classmethod
+    def _clamp_start_line(cls, v: int) -> int:
+        # Clamp rather than raise: an LLM occasionally returns 0 for a
+        # whole-file finding, and normalising to the first line is better than
+        # dropping the finding over an off-by-one.
+        return v if v >= 1 else 1
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: object) -> float:
+        # Accept 0-100 scale values from some models, then clamp into [0, 1].
+        v = float(v)
+        if v > 2.0:
+            v = v / 100.0
+        return min(1.0, max(0.0, v))
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""
@@ -382,6 +407,14 @@ class LLMAnalyzerBase:
         *max_concurrency* LLM requests in parallel.  Both cross-file and
         cross-chunk batches are parallelized in a single gather call.
 
+        Failures are isolated per batch: a transient error (timeout, 429,
+        oversized-chunk 400, ...) costs only its own batch, which is logged
+        and omitted from the result, so one bad call cannot cancel the rest
+        of the fan-out.  Callers can detect partial results by comparing the
+        returned batches against the submitted ones.  ``ValueError`` and
+        ``NotImplementedError`` signal misconfiguration rather than infra
+        trouble and keep propagating.
+
         The return type mirrors :meth:`run_batches`.
         """
         sem = asyncio.Semaphore(max_concurrency)
@@ -402,7 +435,16 @@ class LLMAnalyzerBase:
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 
-        return list(await asyncio.gather(*[_process(b) for b in batches]))
+        results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
+        successful: list[tuple[Batch, list]] = []
+        for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, (ValueError, NotImplementedError)):
+                raise result
+            if isinstance(result, BaseException):
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                continue
+            successful.append(result)
+        return successful
 
     # -- Convenience --------------------------------------------------------
 

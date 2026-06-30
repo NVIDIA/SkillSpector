@@ -65,6 +65,13 @@ class SarifMessage(BaseModel):
     text: str
 
 
+class SarifSuppression(BaseModel):
+    """SARIF suppression object — marks a result as suppressed (e.g. via a baseline)."""
+
+    kind: Literal["inSource", "external"] = "external"
+    justification: str | None = None
+
+
 class SarifResult(BaseModel):
     """A single analysis result (finding)."""
 
@@ -74,13 +81,29 @@ class SarifResult(BaseModel):
     message: SarifMessage
     level: Literal["error", "warning", "note"] = "warning"
     locations: list[SarifLocation]
+    # When present, the result is suppressed; SARIF consumers (e.g. GitHub code
+    # scanning) exclude suppressed results from counts but keep them for audit.
+    suppressions: list[SarifSuppression] | None = None
+
+
+class SarifReportingDescriptor(BaseModel):
+    """Rule metadata (SARIF reportingDescriptor)."""
+
+    model_config = {"populate_by_name": True}
+
+    id: str
+    short_description: SarifMessage | None = Field(default=None, alias="shortDescription")
+    default_configuration: dict[str, object] | None = Field(
+        default=None, alias="defaultConfiguration"
+    )
 
 
 class SarifDriver(BaseModel):
-    """Tool driver (required: name; optional: version)."""
+    """Tool driver (required: name; optional: version, rules)."""
 
     name: str
     version: str | None = None
+    rules: list[SarifReportingDescriptor] | None = None
 
 
 class SarifTool(BaseModel):
@@ -95,12 +118,45 @@ class SarifArtifact(BaseModel):
     location: SarifArtifactLocation
 
 
+class SarifNotification(BaseModel):
+    """A notification about a condition encountered during tool execution.
+
+    Used to surface a degraded LLM stage (requested but every call failed) in
+    the default SARIF output via ``invocation.toolExecutionNotifications``.
+    """
+
+    text: SarifMessage = Field(alias="message")
+    level: Literal["error", "warning", "note"] = "warning"
+
+    model_config = {"populate_by_name": True}
+
+
+class SarifInvocation(BaseModel):
+    """Describes a single tool invocation (SARIF ``run.invocations[]``).
+
+    ``executionSuccessful`` is required by the SARIF spec. SkillSpector keeps it
+    ``True`` even for a degraded LLM stage — the scan completed and produced
+    results — and conveys the degradation through a warning-level entry in
+    ``toolExecutionNotifications``.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    execution_successful: bool = Field(alias="executionSuccessful")
+    tool_execution_notifications: list[SarifNotification] | None = Field(
+        default=None, alias="toolExecutionNotifications"
+    )
+
+
 class SarifRun(BaseModel):
     """A single run (one tool invocation)."""
+
+    model_config = {"populate_by_name": True}
 
     tool: SarifTool
     results: list[SarifResult] = Field(default_factory=list)
     artifacts: list[SarifArtifact] | None = None
+    invocations: list[SarifInvocation] | None = None
 
 
 class SarifLog(BaseModel):

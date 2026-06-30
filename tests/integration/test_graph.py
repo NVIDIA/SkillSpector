@@ -65,3 +65,52 @@ def test_graph_invalid_skill_path_raises() -> None:
                 "use_llm": False,
             }
         )
+
+
+def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end: use_llm requested but every LLM call fails.
+
+    Proves (a) the operator.add reducer accumulates llm_call_log across the
+    parallel analyzer fan-out AND the meta node, (b) the graph completes
+    instead of crashing (regression guard for meta_analyzer constructing its
+    chat model outside the try/except), and (c) the report flags the
+    degraded, static-only scan in every surface.
+    """
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: reads files\n---\n# Demo\n", encoding="utf-8"
+    )
+    # os.system gives a static finding so meta_analyzer also runs (and is exercised).
+    (tmp_path / "run.py").write_text("import os\nos.system('ls')\n", encoding="utf-8")
+
+    def boom(*_a: object, **_k: object) -> object:
+        raise RuntimeError("simulated LLM transport failure")
+
+    # Fail both LLM transports: get_chat_model (semantic analyzers + meta) and
+    # chat_completion (mcp_tool_poisoning TP4).
+    monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", boom)
+    monkeypatch.setattr("skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion", boom)
+
+    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"})
+
+    log = result["llm_call_log"]
+    assert log, "expected LLM telemetry records"
+    assert all(r["ok"] is False for r in log), log
+    nodes = {r["node"] for r in log}
+    # The three semantic analyzers always attempt; meta_analyzer runs because the
+    # static finding above gives it work (and must be caught, not crash).
+    assert {
+        "semantic_security_discovery",
+        "semantic_developer_intent",
+        "semantic_quality_policy",
+        "meta_analyzer",
+    } <= nodes
+
+    meta = json.loads(result["report_body"])["metadata"]
+    assert meta["llm_available"] is False
+    assert meta["llm_degraded"] is True
+    assert meta["llm_calls_succeeded"] == 0
+
+    notification = result["sarif_report"]["runs"][0]["invocations"][0][
+        "toolExecutionNotifications"
+    ][0]
+    assert notification["level"] == "warning"

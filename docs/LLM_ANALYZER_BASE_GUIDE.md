@@ -347,15 +347,15 @@ evaluates *existing* static findings rather than discovering new ones:
 - Overrides `parse_response` to return dicts (not `Finding` objects)
 - Adds `apply_filter` to match LLM results back to originals by `(file, rule_id)`
 
-### Semantic Analyzer Stubs
+### Semantic Analyzers
 
-These are ready to be implemented using `LLMAnalyzerBase`:
+These are implemented on top of `LLMAnalyzerBase` and emit findings only when `use_llm` is enabled:
 
-| Stub | SADD Reference | Purpose |
-|------|---------------|---------|
-| `semantic_security_discovery` | B.4.1 | Intent and attack-phrasing risks |
-| `semantic_developer_intent` | B.4.2 | Description-behavior mismatch |
-| `semantic_quality_policy` | B.4.3 | Quality/safety rubric violations |
+| Analyzer | Purpose |
+|----------|---------|
+| `semantic_security_discovery` | Intent and attack-phrasing risks |
+| `semantic_developer_intent` | Description-behavior mismatch |
+| `semantic_quality_policy` | Quality/safety rubric violations |
 
 ---
 

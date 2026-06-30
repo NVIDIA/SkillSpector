@@ -65,7 +65,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
                 "temp_dir_for_cleanup": None,
             }
         except (OSError, RuntimeError) as e:
-            logger.warning("Could not resolve skill_path %s: %s", skill_path, e)
+            logger.warning("Could not resolve skill_path: %s", e)
             return {"skill_path": None, "temp_dir_for_cleanup": None}
 
     return {"skill_path": None, "temp_dir_for_cleanup": None}
