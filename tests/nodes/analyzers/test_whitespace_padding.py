@@ -38,9 +38,7 @@ def _kinds(runs: list[PaddingRun]) -> set[str]:
 class TestZeroWidthChars:
     def test_exact_membership(self):
         """ZERO_WIDTH_CHARS contains exactly the five P2 code points."""
-        assert ZERO_WIDTH_CHARS == frozenset(
-            ["​", "‌", "‍", "⁠", "﻿"]
-        )
+        assert ZERO_WIDTH_CHARS == frozenset(["​", "‌", "‍", "⁠", "﻿"])
 
 
 class TestIsPaddingChar:
@@ -88,7 +86,7 @@ class TestSummarizeRun:
         # Four distinct code points; _SUMMARY_MAX_SEGMENTS top ones render, the
         # rest collapse into a '+N more' tail. Build with explicit escapes so
         # the exact counts are asserted.
-        text = "\u00A0" * 10 + "\u2003" * 7 + "\u3000" * 4 + "\u2009" * 2
+        text = "\u00a0" * 10 + "\u2003" * 7 + "\u3000" * 4 + "\u2009" * 2
         out = summarize_run(text)
         # Top three by frequency are rendered in full …
         assert "U+00A0 x10" in out
@@ -97,6 +95,7 @@ class TestSummarizeRun:
         # … and the fourth (U+2009 x2) collapses into the tail.
         assert "U+2009" not in out
         assert "+1 more" in out
+
 
 class TestVerticalSignal:
     def test_below_threshold_no_fire(self):
@@ -140,7 +139,6 @@ class TestVerticalSignal:
         content = "header\n" + ((blank + "\n") * VERTICAL_BLANK_LINES) + "tail"
         runs = detect_whitespace_padding(content)
         assert "vertical" in _kinds(runs)
-
 
     def test_u2028_line_separator_counts_as_vertical(self):
         # A >=20-line vertical gap built purely from U+2028 (LINE SEPARATOR)
@@ -376,7 +374,9 @@ class TestIssue20AdversarialEvasionCoverage:
     detector bug per the issue's evasion list.
     """
 
-    @pytest.mark.parametrize("ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS])
+    @pytest.mark.parametrize(
+        "ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS]
+    )
     def test_inline_run_fires(self, ch: str):
         assert 100 >= HORIZONTAL_RUN_CHARS
         content = "x" + ch * 100 + "INJECT"
@@ -390,7 +390,9 @@ class TestIssue20AdversarialEvasionCoverage:
             f"in-line U+{ord(ch):04X} fired no span signal: {_kinds(runs)}"
         )
 
-    @pytest.mark.parametrize("ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS])
+    @pytest.mark.parametrize(
+        "ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS]
+    )
     def test_vertical_run_fires(self, ch: str):
         assert 25 >= VERTICAL_BLANK_LINES
         content = "header\n" + ((ch + "\n") * 25) + "INJECT"
@@ -399,7 +401,9 @@ class TestIssue20AdversarialEvasionCoverage:
         assert vert, f"no vertical P9 run for U+{ord(ch):04X}"
         assert vert[0].followed_by_content is True
 
-    @pytest.mark.parametrize("ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS])
+    @pytest.mark.parametrize(
+        "ch", _ISSUE20_EVASION_CHARS, ids=[f"U+{ord(c):04X}" for c in _ISSUE20_EVASION_CHARS]
+    )
     def test_p9_analyzer_emits_finding(self, ch: str):
         """End-to-end: the prompt-injection analyzer emits a P9 finding."""
         from skillspector.nodes.analyzers import static_patterns_prompt_injection as spi

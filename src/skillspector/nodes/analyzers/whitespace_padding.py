@@ -219,9 +219,7 @@ def _fence_line_flags(lines: list[str]) -> list[bool]:
     return flags
 
 
-def _detect_vertical(
-    content: str, lines: list[str], line_offsets: list[int]
-) -> list[PaddingRun]:
+def _detect_vertical(content: str, lines: list[str], line_offsets: list[int]) -> list[PaddingRun]:
     """Detect runs of >= VERTICAL_BLANK_LINES consecutive blank/whitespace-only lines.
 
     ``line_offsets`` is the offset table from :func:`_split_lines` (one entry per
@@ -354,9 +352,7 @@ def _detect_block_and_ratio(content: str) -> list[PaddingRun]:
     # Whitespace-to-file ratio (bytes) for files over the floor.
     file_bytes = len(content.encode("utf-8"))
     if file_bytes > RATIO_MIN_FILE_BYTES:
-        padding_bytes = sum(
-            len(ch.encode("utf-8")) for ch in content if is_padding_char(ch)
-        )
+        padding_bytes = sum(len(ch.encode("utf-8")) for ch in content if is_padding_char(ch))
         if file_bytes and padding_bytes / file_bytes > RATIO_THRESHOLD:
             runs.append(
                 PaddingRun(
@@ -371,9 +367,7 @@ def _detect_block_and_ratio(content: str) -> list[PaddingRun]:
     return runs
 
 
-def detect_whitespace_padding(
-    content: str, *, file_type: str = "other"
-) -> list[PaddingRun]:
+def detect_whitespace_padding(content: str, *, file_type: str = "other") -> list[PaddingRun]:
     """Scan *content* for whitespace-padding runs and return structured records.
 
     Implements the three P9 signals:
