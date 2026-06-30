@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import re
 from urllib.parse import ParseResult, unquote, urlparse, urlunparse
 
@@ -78,6 +79,11 @@ _EXCLUDED_PATH_MARKERS = frozenset(
     }
 )
 
+_UNRESERVED_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+_PERCENT_ENCODED_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+
 
 def canonicalize_source_identity(url: str) -> str:
     """Return canonical URL identity used for dedupe and visited-state control."""
@@ -94,8 +100,9 @@ def canonicalize_source_identity(url: str) -> str:
     if parsed.port:
         netloc = f"{host}:{parsed.port}"
 
-    path = (parsed.path or "/").rstrip("/")
+    path = _normalize_path(parsed.path or "/")
     path = path.removesuffix(".git")
+    path = path.rstrip("/")
     return urlunparse(("https", netloc, path if path else "/", "", "", ""))
 
 
@@ -185,6 +192,25 @@ def _clean_token(token: str) -> str:
     while cleaned and cleaned[-1] in _TRAILING_PUNCTUATION:
         cleaned = cleaned[:-1]
     return cleaned.strip()
+
+
+def _decode_unreserved(text: str) -> str:
+    def replacer(match: re.Match[str]) -> str:
+        decoded = chr(int(match.group(0)[1:], 16))
+        if decoded in _UNRESERVED_CHARACTERS:
+            return decoded
+        return match.group(0).upper()
+
+    return _PERCENT_ENCODED_RE.sub(replacer, text)
+
+
+def _normalize_path(path: str) -> str:
+    normalized = posixpath.normpath(_decode_unreserved(path) or "/")
+    if normalized == ".":
+        return "/"
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized
 
 
 def _normalize_prefix(prefix: str) -> str:

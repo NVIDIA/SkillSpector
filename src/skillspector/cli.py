@@ -25,9 +25,10 @@ import json
 import os
 import shutil
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from time import monotonic
 from typing import Annotated
 
 import typer
@@ -73,6 +74,10 @@ app = typer.Typer(
 
 console = Console()
 
+_TRANSITIVE_MAX_TARGETS = 32
+_TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
+_TRANSITIVE_MAX_SECONDS = 60.0
+
 
 class FormatChoice(StrEnum):
     """Output format choices for the CLI."""
@@ -88,6 +93,59 @@ class TransportChoice(StrEnum):
 
     stdio = "stdio"
     http = "http"
+
+
+@dataclass(slots=True)
+class _TransitiveBudget:
+    max_targets: int = _TRANSITIVE_MAX_TARGETS
+    max_bytes: int = _TRANSITIVE_MAX_BYTES
+    max_seconds: float = _TRANSITIVE_MAX_SECONDS
+
+
+@dataclass(slots=True)
+class _CachedTransitiveResult:
+    filtered_findings: list[Finding]
+    findings: list[Finding]
+    components: list[str]
+    component_metadata: list[dict[str, object]]
+    file_cache: dict[str, str]
+    has_executable_scripts: bool
+    refs: list[str]
+    bytes_scanned: int
+
+
+@dataclass(slots=True)
+class _TransitiveTraversalState:
+    cache: dict[str, _CachedTransitiveResult] = field(default_factory=dict)
+    budget: _TransitiveBudget = field(default_factory=_TransitiveBudget)
+    started_at: float = field(default_factory=monotonic)
+    scanned_targets: int = 0
+    scanned_bytes: int = 0
+    truncation_reasons: list[str] = field(default_factory=list)
+
+    def note_truncation(self, reason: str) -> None:
+        if reason not in self.truncation_reasons:
+            self.truncation_reasons.append(reason)
+
+    def can_scan_more(self) -> bool:
+        if self.scanned_targets >= self.budget.max_targets:
+            self.note_truncation(f"target budget {self.budget.max_targets} reached")
+            return False
+        if self.scanned_bytes >= self.budget.max_bytes:
+            self.note_truncation(f"byte budget {self.budget.max_bytes} reached")
+            return False
+        if monotonic() - self.started_at >= self.budget.max_seconds:
+            self.note_truncation(f"time budget {self.budget.max_seconds:.0f}s reached")
+            return False
+        return True
+
+    def record_scan(self, bytes_scanned: int) -> None:
+        self.scanned_targets += 1
+        self.scanned_bytes += max(0, bytes_scanned)
+        if self.scanned_bytes >= self.budget.max_bytes:
+            self.note_truncation(f"byte budget {self.budget.max_bytes} reached")
+        if monotonic() - self.started_at >= self.budget.max_seconds:
+            self.note_truncation(f"time budget {self.budget.max_seconds:.0f}s reached")
 
 
 def version_callback(value: bool) -> None:
@@ -410,16 +468,98 @@ def _coerce_findings_list(value: object) -> list[Finding]:
     return [finding for finding in value if isinstance(finding, Finding)]
 
 
-def _merge_unique_by_path(items: list[dict[str, object]]) -> list[dict[str, object]]:
+def _coerce_file_cache(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(path): content
+        for path, content in value.items()
+        if isinstance(path, str) and isinstance(content, str)
+    }
+
+
+def _transitive_component_key(source_url: str | None, path: str) -> str:
+    return f"{source_url}::{path}" if source_url else path
+
+
+def _decorate_component_metadata(
+    metadata: list[dict[str, object]], source_url: str | None
+) -> list[dict[str, object]]:
+    decorated: list[dict[str, object]] = []
+    for item in metadata:
+        path = str(item.get("path", ""))
+        entry = {**item, "coverage_key": _transitive_component_key(source_url, path)}
+        if source_url:
+            entry["source_url"] = source_url
+        decorated.append(entry)
+    return decorated
+
+
+def _source_aware_components(paths: list[str], source_url: str | None) -> list[str]:
+    return [_transitive_component_key(source_url, path) for path in paths]
+
+
+def _source_aware_file_cache(file_cache: dict[str, str], source_url: str | None) -> dict[str, str]:
+    return {
+        _transitive_component_key(source_url, path): content for path, content in file_cache.items()
+    }
+
+
+def _component_identity(item: dict[str, object]) -> str:
+    coverage_key = item.get("coverage_key")
+    if isinstance(coverage_key, str) and coverage_key:
+        return coverage_key
+    path = str(item.get("path", ""))
+    source_url = item.get("source_url")
+    return _transitive_component_key(source_url if isinstance(source_url, str) else None, path)
+
+
+def _merge_unique_component_metadata(items: list[dict[str, object]]) -> list[dict[str, object]]:
     merged: list[dict[str, object]] = []
     seen: set[str] = set()
     for item in items:
-        path = str(item.get("path", ""))
-        if path in seen:
+        identity = _component_identity(item)
+        if identity in seen:
             continue
-        seen.add(path)
+        seen.add(identity)
         merged.append(item)
     return merged
+
+
+def _estimate_scan_bytes(result: dict[str, object]) -> int:
+    size_bytes = 0
+    for entry in _coerce_component_metadata(result.get("component_metadata")):
+        raw_size = entry.get("size_bytes", 0)
+        if isinstance(raw_size, int):
+            size_bytes += max(0, raw_size)
+    if size_bytes > 0:
+        return size_bytes
+    return sum(
+        len(content.encode("utf-8"))
+        for content in _coerce_file_cache(result.get("file_cache")).values()
+    )
+
+
+def _cache_transitive_result(
+    target: str, child_result: dict[str, object]
+) -> _CachedTransitiveResult:
+    child_file_cache = _coerce_file_cache(child_result.get("file_cache"))
+    child_metadata = _decorate_component_metadata(
+        _coerce_component_metadata(child_result.get("component_metadata")), target
+    )
+    return _CachedTransitiveResult(
+        filtered_findings=_coerce_findings_list(child_result.get("filtered_findings")),
+        findings=_coerce_findings_list(child_result.get("findings")),
+        components=_source_aware_components(
+            _coerce_str_path_list(child_result.get("components")), target
+        ),
+        component_metadata=child_metadata,
+        file_cache=_source_aware_file_cache(child_file_cache, target),
+        has_executable_scripts=bool(child_result.get("has_executable_scripts", False))
+        or any(bool(entry.get("executable", False)) for entry in child_metadata),
+        refs=transitive.extract_external_refs(child_file_cache),
+        bytes_scanned=_estimate_scan_bytes(child_result),
+    )
 
 
 def _scan_state_with_baseline(
@@ -482,6 +622,8 @@ def _scan_transitive(
     baseline: Path | None,
     show_suppressed: bool,
     visited: set[str],
+    scan_cache: dict[str, _CachedTransitiveResult] | None = None,
+    budget: _TransitiveBudget | None = None,
     yara_dir: str | None = None,
 ) -> dict[str, object]:
     if max_depth <= 0:
@@ -489,22 +631,36 @@ def _scan_transitive(
         report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
         report_result["transitive_finding_count"] = 0
         report_result["transitive_sources"] = []
+        report_result["transitive_targets_scanned"] = 0
+        report_result["transitive_bytes_scanned"] = 0
+        report_result["transitive_truncated"] = False
+        report_result["transitive_truncation_reasons"] = []
         return report_result
 
+    traversal = _TransitiveTraversalState(
+        cache=scan_cache if scan_cache is not None else {},
+        budget=budget if budget is not None else _TransitiveBudget(),
+    )
     transitive_sources: set[str] = set()
     merged_filtered_findings: list[Finding] = _coerce_findings_list(
         initial_result.get("filtered_findings")
     )
     merged_findings: list[Finding] = _coerce_findings_list(initial_result.get("findings"))
-    merged_components = _coerce_str_path_list(initial_result.get("components"))
-    merged_file_cache = initial_result.get("file_cache") or {}
-    file_cache = merged_file_cache if isinstance(merged_file_cache, dict) else {}
-    component_metadata = _coerce_component_metadata(initial_result.get("component_metadata"))
+    merged_components = _source_aware_components(
+        _coerce_str_path_list(initial_result.get("components")), None
+    )
+    file_cache = _coerce_file_cache(initial_result.get("file_cache"))
+    merged_file_cache = _source_aware_file_cache(file_cache, None)
+    component_metadata = _decorate_component_metadata(
+        _coerce_component_metadata(initial_result.get("component_metadata")), None
+    )
     has_executable_scripts = bool(initial_result.get("has_executable_scripts", False))
 
     frontier: list[tuple[int, list[str]]] = [(1, transitive.extract_external_refs(file_cache))]
 
     while frontier:
+        if not traversal.can_scan_more():
+            break
         current_depth, refs = frontier.pop(0)
         targets = transitive.plan_transitive_targets(
             refs=refs,
@@ -515,43 +671,43 @@ def _scan_transitive(
             deny_prefixes=transitive_deny_prefix,
         )
         for target in targets:
-            child_result: dict[str, object] | None = None
+            if not traversal.can_scan_more():
+                break
             try:
-                child_result = _run_graph_scan(
-                    input_path=target,
-                    format=format,
-                    no_llm=no_llm,
-                    yara_dir=yara_dir,
-                    baseline=baseline,
-                    show_suppressed=show_suppressed,
-                )
+                cached = traversal.cache.get(target)
+                child_result: dict[str, object] | None = None
+                if cached is None:
+                    child_result = _run_graph_scan(
+                        input_path=target,
+                        format=format,
+                        no_llm=no_llm,
+                        yara_dir=yara_dir,
+                        baseline=baseline,
+                        show_suppressed=show_suppressed,
+                    )
+                    cached = _cache_transitive_result(target, child_result)
+                    traversal.cache[target] = cached
+                    traversal.record_scan(cached.bytes_scanned)
                 transitive_sources.add(target)
-                child_filtered_findings = _coerce_findings_list(
-                    child_result.get("filtered_findings")
-                )
-                child_findings = _coerce_findings_list(child_result.get("findings"))
                 merged_filtered_findings.extend(
                     _annotate_transitive_findings(
-                        child_filtered_findings, source_url=target, transitive_depth=current_depth
+                        cached.filtered_findings, source_url=target, transitive_depth=current_depth
                     )
                 )
                 merged_findings.extend(
                     _annotate_transitive_findings(
-                        child_findings, source_url=target, transitive_depth=current_depth
+                        cached.findings, source_url=target, transitive_depth=current_depth
                     )
                 )
 
-                child_metadata = _coerce_component_metadata(child_result.get("component_metadata"))
-                component_metadata.extend(child_metadata)
-                if any(entry.get("executable") for entry in child_metadata):
+                component_metadata.extend(cached.component_metadata)
+                if cached.has_executable_scripts:
                     has_executable_scripts = True
-                merged_components.extend(_coerce_str_path_list(child_result.get("components")))
+                merged_components.extend(cached.components)
+                merged_file_cache.update(cached.file_cache)
 
                 if current_depth < max_depth:
-                    child_file_cache = child_result.get("file_cache") or {}
-                    if isinstance(child_file_cache, dict):
-                        child_refs = transitive.extract_external_refs(child_file_cache)
-                        frontier.append((current_depth + 1, child_refs))
+                    frontier.append((current_depth + 1, cached.refs))
             except Exception as e:
                 if format == FormatChoice.json:
                     logger.warning("Transitive scan failed for %s: %s", target, e)
@@ -568,8 +724,13 @@ def _scan_transitive(
         "filtered_findings": merged_filtered_findings,
         "findings": merged_findings,
         "components": merged_components,
-        "component_metadata": _merge_unique_by_path(component_metadata),
+        "component_metadata": _merge_unique_component_metadata(component_metadata),
+        "file_cache": merged_file_cache,
         "has_executable_scripts": has_executable_scripts,
+        "transitive_targets_scanned": traversal.scanned_targets,
+        "transitive_bytes_scanned": traversal.scanned_bytes,
+        "transitive_truncated": bool(traversal.truncation_reasons),
+        "transitive_truncation_reasons": traversal.truncation_reasons,
     }
     transitive_finding_count = sum(
         1 for finding in merged_filtered_findings if finding.source_url is not None
@@ -578,6 +739,10 @@ def _scan_transitive(
     report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
     report_result["transitive_finding_count"] = transitive_finding_count
     report_result["transitive_sources"] = sorted(transitive_sources)
+    report_result["transitive_targets_scanned"] = traversal.scanned_targets
+    report_result["transitive_bytes_scanned"] = traversal.scanned_bytes
+    report_result["transitive_truncated"] = bool(traversal.truncation_reasons)
+    report_result["transitive_truncation_reasons"] = traversal.truncation_reasons
     return report_result
 
 
@@ -599,10 +764,10 @@ def _scan_skill(
     transitive_depth: int,
     transitive_allow_prefix: tuple[str, ...] | list[str] | None,
     transitive_deny_prefix: tuple[str, ...] | list[str] | None,
-    visited: set[str] | None = None,
+    transitive_cache: dict[str, _CachedTransitiveResult] | None = None,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-    active_visited = visited if visited is not None else set()
+    active_visited: set[str] = set()
     try:
         if verbose:
             console.print("[dim]Running scan...[/dim]")
@@ -639,6 +804,7 @@ def _scan_skill(
             baseline=baseline,
             show_suppressed=show_suppressed,
             visited=active_visited,
+            scan_cache=transitive_cache,
             yara_dir=yara_dir,
         )
     except Exception:
@@ -663,7 +829,7 @@ def _scan_multi_skill(
     skills = detection.skills
     console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
 
-    visited: set[str] = set()
+    shared_transitive_cache: dict[str, _CachedTransitiveResult] = {}
     results: list[dict[str, object]] = []
     max_score = 0
     transitive_finding_count = 0
@@ -686,7 +852,7 @@ def _scan_multi_skill(
                 transitive_depth=transitive_depth,
                 transitive_allow_prefix=transitive_allow_prefix,
                 transitive_deny_prefix=transitive_deny_prefix,
-                visited=visited,
+                transitive_cache=shared_transitive_cache,
             )
             results.append(result)
             score = result.get("risk_score") or 0

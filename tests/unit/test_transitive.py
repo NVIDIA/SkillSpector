@@ -210,6 +210,22 @@ def test_plan_allow_prefix_respects_path_boundaries() -> None:
     assert result == ["https://github.com/trusted/repo"]
 
 
+def test_plan_allow_prefix_normalizes_dot_segment_escapes() -> None:
+    """Allow-prefix checks should run on normalized paths, not raw URL text."""
+    refs = ["https://github.com/trusted/%2e%2e/evil/repo.git"]
+
+    result = transitive.plan_transitive_targets(
+        refs=refs,
+        visited=set(),
+        current_depth=1,
+        max_depth=2,
+        allow_prefixes=("https://github.com/trusted/",),
+        deny_prefixes=(),
+    )
+
+    assert result == []
+
+
 def test_plan_applies_deny_prefix() -> None:
     """Deny prefixes skip matching identities even if they are otherwise valid."""
     refs = [
@@ -249,3 +265,19 @@ def test_plan_deny_prefix_respects_path_boundaries() -> None:
     )
 
     assert result == ["https://github.com/trusted-malicious/repo"]
+
+
+def test_plan_deny_prefix_blocks_normalized_dot_segment_escapes() -> None:
+    """Deny-prefix checks should block refs that normalize into the denied path."""
+    refs = ["https://github.com/trusted/%2e%2e/evil/repo.git"]
+
+    result = transitive.plan_transitive_targets(
+        refs=refs,
+        visited=set(),
+        current_depth=1,
+        max_depth=2,
+        allow_prefixes=(),
+        deny_prefixes=("https://github.com/evil/",),
+    )
+
+    assert result == []

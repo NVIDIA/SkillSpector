@@ -493,6 +493,7 @@ def test_json_output_includes_transitive_provenance() -> None:
     assert data["issues"][0]["transitive_depth"] == 2
     assert data["issues"][0]["source_url"] == "https://github.com/org/transitive"
 
+
 def test_report_output_format_terminal() -> None:
     """output_format terminal produces Rich-formatted output."""
     state: SkillspectorState = {
@@ -544,6 +545,7 @@ def test_markdown_output_labels_transitive_findings() -> None:
     }
     body = report(state)["report_body"]
     assert "**Transitive:** depth=3, source=https://github.com/org/transitive" in body
+
 
 def test_report_default_output_format_is_sarif() -> None:
     """When output_format is missing, report uses sarif."""

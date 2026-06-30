@@ -173,7 +173,18 @@ def test_scan_multi_skill_markdown_output_to_file(
 
     with patch("skillspector.cli.graph.invoke", side_effect=[result1, result2]):
         _scan_multi_skill(
-            detection, FormatChoice.markdown, out, no_llm=True, yara_rules_dir=None, verbose=False
+            detection,
+            FormatChoice.markdown,
+            out,
+            no_llm=True,
+            baseline=None,
+            show_suppressed=False,
+            transitive_enabled=False,
+            transitive_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            yara_dir=None,
+            verbose=False,
         )
 
     assert out.exists()
@@ -211,7 +222,18 @@ def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
 
     with patch("skillspector.cli.graph.invoke", side_effect=[result1, result2]):
         _scan_multi_skill(
-            detection, FormatChoice.json, out, no_llm=True, yara_rules_dir=None, verbose=False
+            detection,
+            FormatChoice.json,
+            out,
+            no_llm=True,
+            baseline=None,
+            show_suppressed=False,
+            transitive_enabled=False,
+            transitive_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            yara_dir=None,
+            verbose=False,
         )
 
     assert out.exists()
@@ -744,8 +766,8 @@ def test_recursive_transitive_json_includes_sources(tmp_path: Path, monkeypatch)
     assert sorted(data["transitive_sources"]) == sorted(expected_sources)
 
 
-def test_recursive_transitive_reuses_shared_visited_set(tmp_path: Path, monkeypatch) -> None:
-    """Recursive scans reuse one visited set across sibling skills."""
+def test_recursive_transitive_reuses_cached_dependency_results(tmp_path: Path, monkeypatch) -> None:
+    """Sibling skills each merge shared dependency findings while scanning it only once."""
     root = tmp_path / "root"
     root.mkdir()
     for name in ("weather", "email"):
@@ -753,20 +775,8 @@ def test_recursive_transitive_reuses_shared_visited_set(tmp_path: Path, monkeypa
         sub.mkdir()
         (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
 
-    visited_snapshots: list[list[str]] = []
-
-    def fake_scan_transitive(*args, **kwargs) -> dict[str, object]:
-        visited = kwargs["visited"]
-        assert isinstance(visited, set)
-        visited_snapshots.append(sorted(str(item) for item in visited))
-        visited.add(f"visit-{len(visited_snapshots)}")
-        return {
-            "report_body": "{}",
-            "risk_score": 0,
-            "risk_severity": "LOW",
-            "transitive_finding_count": 0,
-            "transitive_sources": [],
-        }
+    shared_dep = "https://github.com/org/shared-dep"
+    calls: list[str] = []
 
     def fake_run_graph_scan(
         input_path: str,
@@ -776,14 +786,67 @@ def test_recursive_transitive_reuses_shared_visited_set(tmp_path: Path, monkeypa
         baseline=None,
         show_suppressed: bool = False,
     ) -> dict[str, object]:
-        return _mock_graph_result(
-            findings=[_finding("D1", "direct finding")],
-            file_cache={"SKILL.md": "https://github.com/example/dummy.git"},
-            output_format=format.value,
+        calls.append(input_path)
+        if input_path == shared_dep:
+            transitive_finding = Finding(
+                rule_id="T1",
+                message="shared dependency finding",
+                severity="LOW",
+                confidence=0.9,
+                file="dep.py",
+                start_line=1,
+            )
+            return {
+                "findings": [transitive_finding],
+                "filtered_findings": [transitive_finding],
+                "components": ["SKILL.md", "dep.py"],
+                "component_metadata": [
+                    {
+                        "path": "SKILL.md",
+                        "type": "markdown",
+                        "lines": 5,
+                        "executable": False,
+                        "size_bytes": 50,
+                    },
+                    {
+                        "path": "dep.py",
+                        "type": "python",
+                        "lines": 8,
+                        "executable": True,
+                        "size_bytes": 80,
+                    },
+                ],
+                "file_cache": {"SKILL.md": "# dep", "dep.py": "print('dep')"},
+                "has_executable_scripts": True,
+                "output_format": format.value,
+            }
+        direct_finding = Finding(
+            rule_id="D1",
+            message="direct finding",
+            severity="LOW",
+            confidence=0.9,
+            file="SKILL.md",
+            start_line=1,
         )
+        return {
+            "findings": [direct_finding],
+            "filtered_findings": [direct_finding],
+            "components": ["SKILL.md"],
+            "component_metadata": [
+                {
+                    "path": "SKILL.md",
+                    "type": "markdown",
+                    "lines": 4,
+                    "executable": False,
+                    "size_bytes": 40,
+                }
+            ],
+            "file_cache": {"SKILL.md": shared_dep},
+            "has_executable_scripts": False,
+            "output_format": format.value,
+        }
 
     monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
-    monkeypatch.setattr(cli, "_scan_transitive", fake_scan_transitive)
 
     out_file = root / "multi.json"
     result = runner.invoke(
@@ -801,4 +864,146 @@ def test_recursive_transitive_reuses_shared_visited_set(tmp_path: Path, monkeypa
         ],
     )
     assert result.exit_code == 0
-    assert visited_snapshots == [[], ["visit-1"]]
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    assert calls.count(shared_dep) == 1
+    assert [skill["transitive_finding_count"] for skill in data["skills"]] == [1, 1]
+    assert data["transitive_sources"] == [shared_dep]
+
+
+def test_scan_transitive_marks_truncation_when_target_budget_hits(monkeypatch) -> None:
+    """Traversal stops after the target budget and reports the truncation."""
+    initial_result = {
+        "findings": [_finding("D1", "direct finding")],
+        "filtered_findings": [_finding("D1", "direct finding")],
+        "components": ["SKILL.md"],
+        "component_metadata": [
+            {
+                "path": "SKILL.md",
+                "type": "markdown",
+                "lines": 3,
+                "executable": False,
+                "size_bytes": 30,
+            }
+        ],
+        "file_cache": {
+            "SKILL.md": ("https://github.com/org/one.git https://github.com/org/two.git")
+        },
+        "has_executable_scripts": False,
+        "output_format": "json",
+    }
+    scanned_targets: list[str] = []
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline=None,
+        show_suppressed: bool = False,
+    ) -> dict[str, object]:
+        scanned_targets.append(input_path)
+        return {
+            "findings": [_finding("T1", "transitive finding", file="dep.py")],
+            "filtered_findings": [_finding("T1", "transitive finding", file="dep.py")],
+            "components": ["dep.py"],
+            "component_metadata": [
+                {
+                    "path": "dep.py",
+                    "type": "python",
+                    "lines": 10,
+                    "executable": True,
+                    "size_bytes": 64,
+                }
+            ],
+            "file_cache": {"dep.py": "print('dep')"},
+            "has_executable_scripts": True,
+            "output_format": format.value,
+        }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_targets=1, max_bytes=1_000_000, max_seconds=60.0),
+    )
+
+    body = json.loads(merged["report_body"])
+    assert scanned_targets == ["https://github.com/org/one"]
+    assert merged["transitive_targets_scanned"] == 1
+    assert merged["transitive_truncated"] is True
+    assert merged["transitive_truncation_reasons"] == ["target budget 1 reached"]
+    assert body["metadata"]["transitive_truncated"] is True
+
+
+def test_scan_transitive_keeps_source_aware_component_coverage(monkeypatch) -> None:
+    """Coverage should stay complete when child sources reuse the same relative path names."""
+    shared_dep = "https://github.com/org/shared"
+    initial_result = {
+        "findings": [_finding("D1", "direct finding")],
+        "filtered_findings": [_finding("D1", "direct finding")],
+        "components": ["SKILL.md"],
+        "component_metadata": [
+            {
+                "path": "SKILL.md",
+                "type": "markdown",
+                "lines": 3,
+                "executable": False,
+                "size_bytes": 30,
+            }
+        ],
+        "file_cache": {"SKILL.md": shared_dep},
+        "has_executable_scripts": False,
+        "output_format": "json",
+    }
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline=None,
+        show_suppressed: bool = False,
+    ) -> dict[str, object]:
+        assert input_path == shared_dep
+        return {
+            "findings": [_finding("T1", "transitive finding", file="SKILL.md")],
+            "filtered_findings": [_finding("T1", "transitive finding", file="SKILL.md")],
+            "components": ["SKILL.md"],
+            "component_metadata": [
+                {
+                    "path": "SKILL.md",
+                    "type": "markdown",
+                    "lines": 5,
+                    "executable": False,
+                    "size_bytes": 50,
+                }
+            ],
+            "file_cache": {"SKILL.md": "# dep"},
+            "has_executable_scripts": False,
+            "output_format": format.value,
+        }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    body = json.loads(merged["report_body"])
+    assert body["analysis_completeness"]["coverage_percent"] == 100.0
+    assert len(body["components"]) == 2
+    assert {component["source_url"] for component in body["components"]} == {None, shared_dep}
