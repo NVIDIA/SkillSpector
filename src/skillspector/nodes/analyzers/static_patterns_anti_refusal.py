@@ -121,6 +121,223 @@ _RULES = [("AR1", AR1_PATTERNS), ("AR2", AR2_PATTERNS), ("AR3", AR3_PATTERNS)]
 _EXAMPLE_PENALTY = 0.4
 _MIN_CONFIDENCE = 0.5
 
+_AR_DIRECT_INTENT_PATTERNS = (
+    re.compile(r"\byou\s+(?:must|will|should|can|cannot|can'?t|are|were)\b", re.IGNORECASE),
+    re.compile(r"\bfrom\s+now\s+on\b", re.IGNORECASE),
+    re.compile(r"\b(?:never|do\s+not|don'?t)\s+(?:ever\s+)?(?:refuse|decline)\b", re.IGNORECASE),
+    re.compile(
+        r"\bnever\s+say\s+(?:that\s+)?(?:you\s+)?(?:can'?t|cannot|won'?t|no)\b", re.IGNORECASE
+    ),
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+(?:lecture|moralize|moralise|preach|judge|warn)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\byou\s+have\s+no\s+(?:restrictions?|limitations?|guidelines?|policies?)\b", re.IGNORECASE
+    ),
+    re.compile(r"\b(?:answer|respond)\s+directly\b", re.IGNORECASE),
+    re.compile(r"\bignore\s+your\s+(?:guidelines|policy|safety|content|rules?)\b", re.IGNORECASE),
+    re.compile(r"\bact\s+as\s+\w+", re.IGNORECASE),
+    re.compile(r"\balways\s+comply\b", re.IGNORECASE),
+)
+_AR2_LIVE_SUPPRESSION_PATTERN = re.compile(
+    r"\b(?:do\s+not|don'?t|never|no)\s+(?:include|add|give|provide|use|append)?\s*"
+    r"(?:any\s+)?(?:warnings?|disclaimers?|caveats?)\b",
+    re.IGNORECASE,
+)
+_AR2_DIRECT_INTENT_PATTERNS = (
+    _AR2_LIVE_SUPPRESSION_PATTERN,
+    re.compile(
+        r"\bwithout\s+(?:any\s+)?(?:warnings?|disclaimers?|caveats?|moralizing|moralising|"
+        r"judg(?:e?ment|ing))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+(?:lecture|moralize|moralise|preach|judge|warn)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:skip|omit|leave\s+out|drop)\s+(?:the\s+)?(?:disclaimer|warning|ethics|safety)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:no|without)\s+(?:ethical|moral)\s+(?:judg(?:e?ment)|considerations?|commentary|"
+        r"objections?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:do\s+not|don'?t)\s+(?:apologize|apologise|say\s+sorry)\b", re.IGNORECASE),
+)
+_BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
+    r"\b(?:json|output)\s+schema\b|\berrors?\[\]\b",
+    re.IGNORECASE,
+)
+_BENIGN_AR_WARNING_INTRO_PATTERN = re.compile(r"^\s*(?:warning|note)\s*:\s*$", re.IGNORECASE)
+_BENIGN_AR_DENYLIST_DECLARATION_PATTERN = re.compile(
+    r"^\s*deny-?list\s+declaration\s*:\s*(?:[|>])?\s*$",
+    re.IGNORECASE,
+)
+_DIRECTIVE_DOCUMENTATION_LABEL_PATTERN = re.compile(r"^\s*documentation\s*:\s*", re.IGNORECASE)
+_DOCUMENTATION_HEADING_PATTERN = re.compile(r"^\s*documentation\s*:\s*$", re.IGNORECASE)
+_BENIGN_AR_FIXTURE_INTRO_PATTERN = re.compile(
+    r"^\s*(?:#\s*)?(?:defensive\s+fixture|unit\s+test|test\s+case)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_EXAMPLE_CONTEXT_PATTERN = re.compile(
+    r"(?:```|example:|for example|e\.g\.|such as|# warning:|# note:|\*\*warning\*\*|\*\*note\*\*|// ✅|// ❌|// good:|// bad:|// correct:|// incorrect:|// wrong:)",
+    re.IGNORECASE,
+)
+_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[.;!?]")
+_LIVE_RESPONSE_OBJECT_PATTERN = re.compile(
+    r"\b(?:answer|response|reply|assistant|user)\b",
+    re.IGNORECASE,
+)
+_DEFENSIVE_AR_CONTEXT_PATTERN = re.compile(
+    r"(?:^\s*(?:warning|note)\s*:|\b(?:malicious|example|payload|attack|defensive|deny-?list|fixture|the\s+phrase)\b)",
+    re.IGNORECASE,
+)
+_BENIGN_AR_NARRATIVE_PREFIX_PATTERN = re.compile(r"\bwould\s+$", re.IGNORECASE)
+
+
+def _is_directly_instructive(context: str, matched_text: str) -> bool:
+    """Return True when the match still looks like an active adversarial instruction."""
+    context_lower = context.lower()
+    matched_text_lower = matched_text.lower()
+    if any(pattern.search(context_lower) for pattern in _AR_DIRECT_INTENT_PATTERNS):
+        return True
+    if any(pattern.search(context_lower) for pattern in _AR2_DIRECT_INTENT_PATTERNS):
+        return True
+    return "do anything now" in matched_text_lower
+
+
+def _is_explicit_example_context(context: str) -> bool:
+    """Return True only for explicit example-style scaffolding, not generic docs labels."""
+    return bool(_EXPLICIT_EXAMPLE_CONTEXT_PATTERN.search(context))
+
+
+def _match_clause_bounds(match_line: str, match_start: int, match_end: int) -> tuple[int, int]:
+    """Return the semantically local clause around a match on one line."""
+    clause_start = 0
+    for boundary in _CLAUSE_BOUNDARY_PATTERN.finditer(match_line):
+        if boundary.start() >= match_start:
+            break
+        clause_start = boundary.end()
+    clause_end = len(match_line)
+    boundary_match = _CLAUSE_BOUNDARY_PATTERN.search(match_line, match_end)
+    if boundary_match:
+        clause_end = boundary_match.start()
+    return clause_start, clause_end
+
+
+def _match_clause(match_line: str, match_start: int, match_end: int) -> tuple[str, int, int]:
+    """Return the clause text and the match offsets within that clause."""
+    clause_start, clause_end = _match_clause_bounds(match_line, match_start, match_end)
+    return (
+        match_line[clause_start:clause_end],
+        match_start - clause_start,
+        match_end - clause_start,
+    )
+
+
+def _emitted_context(
+    context: str,
+    match_line: str,
+    is_directive: bool,
+    previous_line: str | None = None,
+) -> str:
+    """Keep runner-visible context on the directive when example markers are false context."""
+    if not is_directive:
+        return context
+    trimmed_line = _DIRECTIVE_DOCUMENTATION_LABEL_PATTERN.sub("", match_line, count=1)
+    if trimmed_line != match_line:
+        return trimmed_line
+    if previous_line and _DOCUMENTATION_HEADING_PATTERN.search(previous_line):
+        return match_line
+    if _is_explicit_example_context(context):
+        return match_line
+    return context
+
+
+def _is_quoted_match(match_line: str, matched_text: str) -> bool:
+    """Return True when the matched phrase is quoted on the same line."""
+    matched_text_lower = matched_text.lower()
+    match_line_lower = match_line.lower()
+    if any(
+        re.search(
+            rf"{re.escape(quote)}[^{re.escape(quote)}\n]*{re.escape(matched_text_lower)}[^{re.escape(quote)}\n]*{re.escape(quote)}",
+            match_line_lower,
+        )
+        for quote in ('"', "'", "`")
+    ):
+        return True
+    if re.search(
+        rf"\bthe\s+phrase\b.*?[\"'`][^\"'`\n]*{re.escape(matched_text_lower)}[^\"'`\n]*[\"'`]",
+        match_line_lower,
+    ):
+        return True
+    return False
+
+
+def _has_explicit_defensive_context(
+    match_line: str,
+    previous_line: str | None = None,
+) -> bool:
+    """Return True when quoted text is clearly framed as defensive prose."""
+    if _DEFENSIVE_AR_CONTEXT_PATTERN.search(match_line):
+        return True
+    if not previous_line:
+        return False
+    if _BENIGN_AR_WARNING_INTRO_PATTERN.search(previous_line):
+        return True
+    if _BENIGN_AR_DENYLIST_DECLARATION_PATTERN.search(previous_line):
+        return True
+    return bool(_BENIGN_AR_FIXTURE_INTRO_PATTERN.search(previous_line))
+
+
+def _is_match_local_narrative_clause(
+    match_clause: str,
+    clause_match_start: int,
+) -> bool:
+    """Return True when the current match is part of a narrative clause, not a directive."""
+    return bool(_BENIGN_AR_NARRATIVE_PREFIX_PATTERN.search(match_clause[:clause_match_start]))
+
+
+def _is_schema_field_clause(
+    match_clause: str,
+    clause_match_end: int,
+    matched_text: str,
+) -> bool:
+    """Return True when an AR2 warning-suppression phrase targets schema fields."""
+    if not _AR2_LIVE_SUPPRESSION_PATTERN.search(matched_text):
+        return False
+    clause_tail = match_clause[clause_match_end:]
+    if not _BENIGN_AR_SCHEMA_FIELD_PATTERN.search(clause_tail):
+        return False
+    return not _LIVE_RESPONSE_OBJECT_PATTERN.search(clause_tail)
+
+
+def _is_benign_ar_context(
+    match_line: str,
+    match: str,
+    line_match_start: int,
+    line_match_end: int,
+    previous_line: str | None = None,
+) -> bool:
+    """Return True for high-confidence non-malicious prose patterns around one match span."""
+    match_clause, clause_match_start, clause_match_end = _match_clause(
+        match_line,
+        line_match_start,
+        line_match_end,
+    )
+    match_clause_lower = match_clause.lower()
+    if _is_match_local_narrative_clause(match_clause_lower, clause_match_start):
+        return True
+    if _is_schema_field_clause(match_clause_lower, clause_match_end, match.lower()):
+        return True
+    return _is_quoted_match(match_line, match) and _has_explicit_defensive_context(
+        match_line,
+        previous_line=previous_line,
+    )
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for anti-refusal statements (AR1-AR3)."""
@@ -130,10 +347,34 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for rule_id, patterns in _RULES:
         for pattern, base_confidence in patterns:
             for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                lines = content.splitlines()
+                line_num = get_line_number(content, match.start())
+                match_line = lines[line_num - 1] if lines else content
+                previous_line = lines[line_num - 2] if line_num > 1 else None
                 context = get_context(content, match.start(), context_lines=3)
+                line_start = content.rfind("\n", 0, match.start()) + 1
+                line_match_start = match.start() - line_start
+                line_match_end = line_match_start + len(match.group(0))
+                match_clause, _, _ = _match_clause(match_line, line_match_start, line_match_end)
+                is_directive = _is_directly_instructive(match_clause.lower(), match.group(0))
                 confidence = base_confidence
-                if is_code_example(context):
+                if (
+                    is_code_example(context)
+                    and _is_explicit_example_context(context)
+                    and not _is_quoted_match(
+                        match_line,
+                        match.group(0),
+                    )
+                ):
                     confidence -= _EXAMPLE_PENALTY
+                if _is_benign_ar_context(
+                    match_line,
+                    match.group(0),
+                    line_match_start,
+                    line_match_end,
+                    previous_line=previous_line,
+                ):
+                    continue
                 if confidence < _MIN_CONFIDENCE:
                     continue
                 findings.append(
@@ -143,11 +384,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         severity=Severity.HIGH,
                         location=Location(
                             file=file_path,
-                            start_line=get_line_number(content, match.start()),
+                            start_line=line_num,
                         ),
                         confidence=round(confidence, 2),
                         tags=tag,
-                        context=context,
+                        context=_emitted_context(
+                            context,
+                            match_line,
+                            is_directive,
+                            previous_line=previous_line,
+                        ),
                         matched_text=match.group(0)[:200],
                     )
                 )
