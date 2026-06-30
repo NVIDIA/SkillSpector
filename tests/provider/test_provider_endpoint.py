@@ -71,11 +71,15 @@ def test_openai_provider_makes_live_structured_request(
     assert result == ProviderResult(ok=True)
 
 
-def test_anthropic_provider_makes_live_structured_request() -> None:
+def test_anthropic_provider_makes_live_structured_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Anthropic provider reaches its default endpoint and returns structured output."""
     from skillspector.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicProvider
 
     _skip_without_env("ANTHROPIC_API_KEY")
+    # This live provider check must hit Anthropic's default base URL, not a proxy.
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
 
     model = _model_from_env("SKILLSPECTOR_ANTHROPIC_TEST_MODEL", AnthropicProvider.DEFAULT_MODEL)
     llm = AnthropicProvider().create_chat_model(model, max_tokens=32, timeout=60)

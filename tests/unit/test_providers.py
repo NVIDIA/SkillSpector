@@ -66,6 +66,7 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
@@ -248,12 +249,32 @@ class TestAnthropicProvider:
         creds = AnthropicProvider().resolve_credentials()
         assert creds == ("sk-ant-x", None)
 
-    def test_creates_native_chat_anthropic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolves_anthropic_base_url_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://anthropic.example/v1")
+        creds = AnthropicProvider().resolve_credentials()
+        assert creds == ("sk-ant-x", "http://anthropic.example/v1")
+
+    def test_creates_native_chat_anthropic_with_default_base_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
         llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
         assert isinstance(llm, ChatAnthropic)
         assert llm.model == "claude-opus-4-6"
         assert llm.max_tokens == 123
+        assert str(llm.anthropic_api_url).rstrip("/") == "https://api.anthropic.com"
+
+    def test_creates_native_chat_anthropic_with_base_url_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://anthropic.example/v1")
+        llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+        assert isinstance(llm, ChatAnthropic)
+        assert llm.model == "claude-opus-4-6"
+        assert llm.max_tokens == 123
+        assert str(llm.anthropic_api_url).rstrip("/") == "http://anthropic.example/v1"
 
     def test_create_chat_model_returns_none_without_key(self) -> None:
         # No ANTHROPIC_API_KEY → no client, signalling the caller to fall back.
