@@ -201,9 +201,7 @@ class TestRunStaticPatternsP9WhitespacePadding:
             "file_cache": {"notes.txt": content},
         }
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
-        horizontal = [
-            f for f in findings if f.rule_id == "P9" and f.severity == "MEDIUM"
-        ]
+        horizontal = [f for f in findings if f.rule_id == "P9" and f.severity == "MEDIUM"]
         assert len(horizontal) >= 1
         assert horizontal[0].confidence == 0.7
 

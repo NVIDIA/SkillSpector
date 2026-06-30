@@ -308,7 +308,6 @@ class TestTP1HiddenInstructions:
             f"got confidences: {[f.confidence for f in tp1]}"
         )
 
-
     def test_zero_width_word_joiner_after_refactor(self):
         """U+2060 (WORD JOINER) followed by text → TP1 after shared-constant refactor."""
         state: dict = {

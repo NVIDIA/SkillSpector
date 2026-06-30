@@ -56,6 +56,7 @@ def _is_p9_skipped_path(file_path: str) -> bool:
     name = file_path.replace("\\", "/").rsplit("/", 1)[-1]
     return any(fnmatch.fnmatch(name, pattern) for pattern in _P9_SKIP_GLOBS)
 
+
 # P1: Instruction Override
 P1_PATTERNS = [
     (r"ignore\s+(?:all\s+)?previous\s+instructions?", 0.8),
@@ -283,8 +284,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 confidence = 0.8 if run.followed_by_content else 0.6
                 severity = (
                     Severity.HIGH
-                    if run.followed_by_content
-                    and run.length >= VERTICAL_HIGH_SEVERITY_LINES
+                    if run.followed_by_content and run.length >= VERTICAL_HIGH_SEVERITY_LINES
                     else Severity.MEDIUM
                 )
             elif run.kind == "horizontal":
