@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Behavioral taint-tracking analyzer (SADD B.2.2): sources -> sinks data-flow analysis.
+"""Behavioral taint-tracking analyzer (TT1–TT5): sources -> sinks data-flow analysis.
 
 Parses Python AST to identify data sources (env vars, file reads, network input)
 and sinks (network output, exec, file writes), then tracks flows between them

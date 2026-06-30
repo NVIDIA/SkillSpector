@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Semantic quality-policy analyzer node (SADD B.4.3).
+"""Semantic quality-policy analyzer node.
 
 Evaluates AI agent skill files against a quality and safety rubric using
 LLM-based discovery.  Flags vague triggers, missing user warnings, and

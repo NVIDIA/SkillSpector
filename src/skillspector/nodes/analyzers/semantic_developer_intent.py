@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Semantic developer-intent analyzer node (SADD B.4.2).
+"""Semantic developer-intent analyzer node.
 
 Detects context-dependent risk and semantic description–behavior mismatches
 by comparing the skill's manifest (name, description, permissions) against

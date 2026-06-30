@@ -160,11 +160,11 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 | `pattern_defaults.py` | Shared pattern metadata (category, explanation, remediation) |
 | `static_yara.py` | YARA-based static analyzer |
 | `osv_client.py` | OSV.dev API client for live vulnerability lookups (SC4); batch queries with caching and fallback |
-| `static_patterns_*.py` | 13 pattern-based analyzers (prompt_injection, data_exfiltration, anti_refusal, etc.) |
+| `static_patterns_*.py` | 14 pattern-based analyzers (prompt_injection, data_exfiltration, anti_refusal, etc.) |
 | `behavioral_ast.py` | AST-based behavioral analyzer (AST1–AST8): detects exec, eval, subprocess, os.system, compile, dynamic import/getattr, and dangerous execution chains |
 | `behavioral_taint_tracking.py` | Taint-tracking behavioral analyzer (TT1–TT5): source→sink data-flow analysis over Python AST |
 | `mcp_least_privilege.py`, `mcp_tool_poisoning.py` | MCP analyzers (LP1–LP4 least-privilege; TP1–TP4 tool poisoning) |
-| `mcp_rug_pull.py` | MCP rug-pull analyzer (stub; RP1–RP3 planned) |
+| `mcp_rug_pull.py` | MCP rug-pull analyzer (RP1–RP3): detects manifest/tool-definition changes between scans |
 | `semantic_security_discovery.py`, `semantic_developer_intent.py`, `semantic_quality_policy.py` | Semantic (LLM) analyzers; emit findings only when `use_llm` is enabled |
 
 ---
@@ -251,9 +251,9 @@ Use [static_runner.run_static_patterns](../src/skillspector/nodes/analyzers/stat
 
 Use [pattern_defaults](../src/skillspector/nodes/analyzers/pattern_defaults.py) for category and remediation. Examples: [static_patterns_prompt_injection.py](../src/skillspector/nodes/analyzers/static_patterns_prompt_injection.py), [static_patterns_data_exfiltration.py](../src/skillspector/nodes/analyzers/static_patterns_data_exfiltration.py).
 
-### Stub analyzers
+### Placeholder analyzers
 
-Return `{"findings": []}`. Most analyzer nodes are implemented; `mcp_rug_pull` remains a stub (returns no findings) pending rug-pull detection (RP1–RP3). Use this pattern for any new placeholder analyzer. The LLM-backed semantic analyzers also return `{"findings": []}` when `use_llm` is False.
+Return `{"findings": []}`. All analyzer nodes are currently implemented; use this pattern for any new placeholder analyzer added before its detection logic lands. The LLM-backed semantic analyzers also return `{"findings": []}` when `use_llm` is False.
 
 ---
 
