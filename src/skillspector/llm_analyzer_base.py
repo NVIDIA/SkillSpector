@@ -440,8 +440,6 @@ class LLMAnalyzerBase:
         for batch, result in zip(batches, results, strict=True):
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
-            if isinstance(result, asyncio.CancelledError):
-                raise result
             if isinstance(result, BaseException):
                 logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
                 continue

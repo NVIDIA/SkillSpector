@@ -13,22 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for LLMMetaAnalyzer filtering and partial batch failure handling."""
+"""Tests for the meta_analyzer node.
+
+Covers ``LLMMetaAnalyzer`` filtering and partial-batch-failure handling, plus
+the LLM-call telemetry and fail-closed construction that drive the report's
+degradation signal.
+"""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from skillspector.llm_analyzer_base import Batch
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, meta_analyzer
+from skillspector.state import SkillspectorState
 
 MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 
 
 def _mock_get_chat_model(*_args, **_kwargs):
-    from unittest.mock import MagicMock
-
     mock_llm = MagicMock()
     mock_llm.with_structured_output.return_value = MagicMock()
     return mock_llm
@@ -39,11 +43,16 @@ def _analyzer() -> LLMMetaAnalyzer:
     return LLMMetaAnalyzer.__new__(LLMMetaAnalyzer)
 
 
-def _finding(rule_id: str, start_line: int, end_line: int | None = None) -> Finding:
+def _finding(
+    rule_id: str,
+    start_line: int,
+    end_line: int | None = None,
+    severity: str = "CRITICAL",
+) -> Finding:
     return Finding(
         rule_id=rule_id,
         message=f"static finding {rule_id}",
-        severity="CRITICAL",
+        severity=severity,
         confidence=0.9,
         file="requirements.txt",
         start_line=start_line,
@@ -63,6 +72,57 @@ def _llm_item(rule_id: str, start_line: int, **kw: object) -> dict[str, object]:
     return item
 
 
+def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
+    """Regression: a static finding with end_line=None must still match a
+    confirmation whose end_line is populated (e.g. end_line == start_line, as
+    some models return). Previously these confirmed findings were silently
+    dropped. See issue #67."""
+    findings = [_finding("SC4", 4), _finding("SC4", 5)]
+    items = [_llm_item("SC4", 4, end_line=4), _llm_item("SC4", 5, end_line=5)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert {f.start_line for f in kept} == {4, 5}
+    assert len(kept) == 2
+
+
+def test_rejected_finding_still_dropped() -> None:
+    """The end_line-agnostic fallback must not resurrect findings the LLM
+    rejected (is_vulnerability=False)."""
+    findings = [_finding("SC4", 4, severity="MEDIUM")]
+    items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert kept == []
+
+
+def test_low_confidence_finding_dropped() -> None:
+    """Confirmations below the confidence threshold are not kept."""
+    findings = [_finding("SC4", 4, severity="MEDIUM")]
+    items = [_llm_item("SC4", 4, end_line=4, confidence=0.3)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert kept == []
+
+
+def test_exact_end_line_match_still_works() -> None:
+    """Existing behaviour: when both sides carry the same concrete end_line,
+    the finding is kept (no regression from the new fallback)."""
+    findings = [_finding("AST1", 21, end_line=21)]
+    items = [_llm_item("AST1", 21, end_line=21)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert len(kept) == 1
+    assert kept[0].rule_id == "AST1"
+
+
 def _confirm(pattern_id: str, file: str, start_line: int) -> dict[str, object]:
     """LLM item confirming a finding, as parse_response would emit it."""
     return {
@@ -75,52 +135,6 @@ def _confirm(pattern_id: str, file: str, start_line: int) -> dict[str, object]:
         "start_line": start_line,
         "end_line": None,
     }
-
-
-def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
-    """A finding with end_line=None matches confirmation with end_line=start_line."""
-    findings = [_finding("SC4", 4), _finding("SC4", 5)]
-    items = [_llm_item("SC4", 4, end_line=4), _llm_item("SC4", 5, end_line=5)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert {f.start_line for f in kept} == {4, 5}
-    assert len(kept) == 2
-
-
-def test_rejected_finding_still_dropped() -> None:
-    """The end_line-agnostic fallback must not resurrect rejected findings."""
-    findings = [_finding("SC4", 4)]
-    items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert kept == []
-
-
-def test_low_confidence_finding_dropped() -> None:
-    """Confirmations below the confidence threshold are not kept."""
-    findings = [_finding("SC4", 4)]
-    items = [_llm_item("SC4", 4, end_line=4, confidence=0.3)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert kept == []
-
-
-def test_exact_end_line_match_still_works() -> None:
-    """Existing behavior: matching concrete end_line keeps the finding."""
-    findings = [_finding("AST1", 21, end_line=21)]
-    items = [_llm_item("AST1", 21, end_line=21)]
-    batch = Batch(file_path="requirements.txt", content="", findings=findings)
-
-    kept = _analyzer().apply_filter(findings, [(batch, items)])
-
-    assert len(kept) == 1
-    assert kept[0].rule_id == "AST1"
 
 
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
@@ -161,8 +175,10 @@ class TestMetaAnalyzerPartialBatchFailure:
         filtered = result["filtered_findings"]
         kept = {(f.file, f.rule_id) for f in filtered}
 
+        # the real filter still applies to the batch that came back
         assert ("a.py", "R1") in kept
         assert ("a.py", "R2") not in kept
+        # the finding the LLM never saw must NOT be silently dropped
         assert ("b.py", "R1") in kept
 
         confirmed = next(f for f in filtered if f.file == "a.py")
@@ -213,3 +229,73 @@ class TestMetaAnalyzerPartialBatchFailure:
 
         kept = {(f.file, f.rule_id) for f in result["filtered_findings"]}
         assert kept == {("a.py", "R1")}
+
+
+# ---------------------------------------------------------------------------
+# LLM-call telemetry + fail-closed construction (drives the report's
+# degradation signal).
+# ---------------------------------------------------------------------------
+
+
+def _degr_finding(rule_id: str = "P1", severity: str = "HIGH") -> Finding:
+    return Finding(
+        rule_id=rule_id,
+        message="test",
+        severity=severity,
+        confidence=0.8,
+        file="SKILL.md",
+        start_line=1,
+    )
+
+
+def _degr_state(**overrides: object) -> SkillspectorState:
+    state: SkillspectorState = {
+        "findings": [_degr_finding()],
+        "use_llm": True,
+        "file_cache": {"SKILL.md": "# Skill"},
+        "manifest": {},
+        "model_config": {},
+    }
+    state.update(overrides)  # type: ignore[typeddict-item]
+    return state
+
+
+def test_records_ok_true_on_success() -> None:
+    with (
+        patch("skillspector.llm_analyzer_base.get_chat_model", return_value=MagicMock()),
+        patch(
+            "skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+    ):
+        result = meta_analyzer(_degr_state())
+    assert result["llm_call_log"] == [{"node": "meta_analyzer", "ok": True, "error": None}]
+
+
+def test_construction_failure_is_caught_not_raised() -> None:
+    """Regression: the chat model is constructed INSIDE the try, so a construction
+    failure degrades (records ok=False, preserves findings) instead of crashing
+    the whole graph."""
+    with patch(
+        "skillspector.llm_analyzer_base.get_chat_model",
+        side_effect=RuntimeError("provider construction failed"),
+    ):
+        result = meta_analyzer(_degr_state())  # must not raise
+    # Findings are preserved via the fallback path...
+    assert len(result["filtered_findings"]) == 1
+    # ...and the failure is recorded so the report can flag degradation.
+    log = result["llm_call_log"]
+    assert log[0]["node"] == "meta_analyzer"
+    assert log[0]["ok"] is False
+    assert "provider construction failed" in log[0]["error"]
+
+
+def test_use_llm_false_records_nothing() -> None:
+    result = meta_analyzer(_degr_state(use_llm=False))
+    assert "llm_call_log" not in result
+
+
+def test_no_findings_records_nothing() -> None:
+    result = meta_analyzer(_degr_state(findings=[]))
+    assert "llm_call_log" not in result

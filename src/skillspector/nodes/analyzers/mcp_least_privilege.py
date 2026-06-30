@@ -125,6 +125,19 @@ def _is_test_file(path: str) -> bool:
     return name.startswith("test_") or stem.endswith("_test")
 
 
+def _normalize_allowed_tools(value: object) -> list[str]:
+    """Coerce a manifest ``allowed-tools`` value into a list of tool names.
+
+    Accepts the list form (``[Bash, Read]``) and the comma-separated string
+    form (``"Bash, Read"``). Anything else yields an empty list.
+    """
+    if isinstance(value, list):
+        return [str(t).strip() for t in value if str(t).strip()]
+    if isinstance(value, str):
+        return [t.strip() for t in value.split(",") if t.strip()]
+    return []
+
+
 def _detect_capabilities(content: str) -> set[str]:
     """Return set of capability categories found in *content*."""
     found: set[str] = set()
@@ -146,6 +159,35 @@ def _map_permissions_to_categories(permissions: list[str]) -> set[str]:
             if re.search(rf"\b{re.escape(keyword)}\b", perm_lower, re.IGNORECASE):
                 categories.add(cat)
                 break
+    return categories
+
+
+# Tool name → capability category (Claude / Agent Skills tool names, case-insensitive exact match)
+_TOOL_TO_CAPABILITY: dict[str, str] = {
+    "bash": "shell",
+    "execute": "shell",
+    "terminal": "shell",
+    "read": "file_read",
+    "glob": "file_read",
+    "ls": "file_read",
+    "write": "file_write",
+    "edit": "file_write",
+    "multiedit": "file_write",
+    "notebookedit": "file_write",
+    "webfetch": "network",
+    "websearch": "network",
+    "fetch": "network",
+    "env": "env",
+}
+
+
+def _map_allowed_tools_to_categories(tools: list[str]) -> set[str]:
+    """Map Agent Skills ``allowed-tools`` tool names to capability category names."""
+    categories: set[str] = set()
+    for tool in tools:
+        cat = _TOOL_TO_CAPABILITY.get(tool.lower().strip())
+        if cat:
+            categories.add(cat)
     return categories
 
 
@@ -188,6 +230,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         permissions: list[str] | None = permissions_raw
     else:
         permissions = None  # treat missing or non-list as None
+
+    # `allowed-tools` (Agent Skills standard) is also a permission declaration.
+    allowed_tools = _normalize_allowed_tools(manifest.get("allowed-tools"))
 
     # --- LP2: Wildcard permission ---
     if isinstance(permissions, list) and _has_wildcard(permissions):
@@ -232,8 +277,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     for caps in file_capabilities.values():
         all_caps.update(caps)
 
-    # LP3: emit when permissions is None or empty list AND capabilities detected
-    permissions_absent = permissions is None or permissions == []
+    # LP3: no declaration via `permissions` or `allowed-tools`, yet caps detected.
+    permissions_absent = (permissions is None or permissions == []) and not allowed_tools
     if permissions_absent and all_caps:
         logger.debug("%s: LP3 no permissions declared but capabilities detected", ANALYZER_ID)
         cap_names = ", ".join(sorted(all_caps))
@@ -259,9 +304,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     wildcard_present = isinstance(permissions, list) and _has_wildcard(permissions)
 
-    # LP1 and LP4 only apply when permissions is a non-empty list
-    if isinstance(permissions, list) and permissions:
-        declared_categories = _map_permissions_to_categories(permissions)
+    # LP1 and LP4 apply when permissions OR allowed-tools is declared
+    has_declaration = (isinstance(permissions, list) and permissions) or bool(allowed_tools)
+    if has_declaration:
+        declared_categories: set[str] = set()
+        if isinstance(permissions, list) and permissions:
+            declared_categories |= _map_permissions_to_categories(permissions)
+        if allowed_tools:
+            declared_categories |= _map_allowed_tools_to_categories(allowed_tools)
 
         # --- LP1: Under-declared capabilities (skip when wildcard present) ---
         if not wildcard_present:
@@ -309,8 +359,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     )
                 )
 
-        # --- LP4: Over-declared permissions ---
-        for perm in permissions:
+        # --- LP4: Over-declared permissions (only when permissions field is set) ---
+        for perm in (permissions or []):
             perm_lower = perm.strip().lower()
             # Skip wildcard entries themselves
             if perm_lower in _WILDCARD_PERMS:

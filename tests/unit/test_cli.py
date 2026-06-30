@@ -17,10 +17,13 @@
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
-from skillspector.cli import app
+from skillspector.cli import FormatChoice, _scan_multi_skill, app
+from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory
 
 runner = CliRunner()
 
@@ -113,3 +116,76 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     data = json.loads(scan.output)
     assert data["issues"] == []
     assert data["risk_assessment"]["score"] == 0
+
+
+def test_scan_multi_skill_markdown_output_to_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Non-JSON recursive scan writes concatenated report to file, not stdout."""
+    s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
+    s2 = SkillDirectory(path=tmp_path / "skill2", name="skill2", relative_path="skill2")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+
+    result1 = {
+        "report_body": "# Report ALPHA for skill1",
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    result2 = {
+        "report_body": "# Report BETA for skill2",
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    out = tmp_path / "report.md"
+
+    with patch("skillspector.cli.graph.invoke", side_effect=[result1, result2]):
+        _scan_multi_skill(
+            detection, FormatChoice.markdown, out, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    assert out.exists()
+    text = out.read_text()
+    assert "ALPHA" in text
+    assert "BETA" in text
+    assert "---" in text
+
+    captured = capsys.readouterr()
+    assert "ALPHA" not in captured.out
+    assert "BETA" not in captured.out
+
+
+def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
+    """JSON recursive scan still produces a valid combined JSON file."""
+    s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
+    s2 = SkillDirectory(path=tmp_path / "skill2", name="skill2", relative_path="skill2")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+
+    result1 = {
+        "report_body": "# Report ALPHA for skill1",
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    result2 = {
+        "report_body": "# Report BETA for skill2",
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    out = tmp_path / "combined.json"
+
+    with patch("skillspector.cli.graph.invoke", side_effect=[result1, result2]):
+        _scan_multi_skill(
+            detection, FormatChoice.json, out, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    assert out.exists()
+    data = json.loads(out.read_text())
+    assert data["multi_skill"] is True
+    assert "skills" in data

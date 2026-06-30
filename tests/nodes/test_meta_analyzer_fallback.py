@@ -98,6 +98,18 @@ class TestSeverityFloor:
         result = _fallback_filtered(findings)
         assert len(result) == 0
 
+    def test_none_severity_treated_as_low(self) -> None:
+        """Finding with None severity does not crash — treated as LOW."""
+        findings = [_finding(confidence=0.8, severity=None)]
+        result = _fallback_filtered(findings)
+        assert len(result) == 1
+
+    def test_none_severity_below_threshold_dropped(self) -> None:
+        """None severity at low confidence is dropped (no severity floor protection)."""
+        findings = [_finding(confidence=0.3, severity=None)]
+        result = _fallback_filtered(findings)
+        assert len(result) == 0
+
 
 class TestCodeExampleFiltering:
     """Findings in code example context are downweighted, not hard-dropped."""

@@ -32,12 +32,17 @@ from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
     create_chat_model,
     get_metadata_provider,
+    has_cli_capability,
     registry,
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
 from skillspector.providers.anthropic import AnthropicProvider
+from skillspector.providers.antigravity_cli import AntigravityCLIProvider
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
+from skillspector.providers.claude_cli import ClaudeCLIProvider
+from skillspector.providers.codex_cli import CodexCLIProvider
+from skillspector.providers.gemini_cli import GeminiCLIProvider
 from skillspector.providers.nv_build import BUILD_BASE_URL, NvBuildProvider
 from skillspector.providers.openai import OpenAIProvider
 
@@ -397,3 +402,120 @@ class TestProviderSelection:
         with pytest.raises(ValueError) as exc_info:
             create_chat_model("gpt-5.4", max_tokens=123)
         assert str(exc_info.value) == NO_LLM_API_KEY_MESSAGE
+
+    def test_select_claude_cli(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+        provider = get_metadata_provider()
+        assert isinstance(provider, ClaudeCLIProvider)
+        # CLI provider returns no HTTP credentials
+        assert resolve_provider_credentials() is None
+
+    def test_select_codex_cli(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "codex_cli")
+        provider = get_metadata_provider()
+        assert isinstance(provider, CodexCLIProvider)
+        assert resolve_provider_credentials() is None
+
+    def test_select_gemini_cli(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "gemini_cli")
+        provider = get_metadata_provider()
+        assert isinstance(provider, GeminiCLIProvider)
+        assert resolve_provider_credentials() is None
+
+    def test_select_antigravity_cli(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "antigravity_cli")
+        provider = get_metadata_provider()
+        assert isinstance(provider, AntigravityCLIProvider)
+        assert resolve_provider_credentials() is None
+
+
+class TestAntigravityCLIProvider:
+    """Antigravity CLI provider — registered but disabled; must fail closed."""
+
+    def test_resolve_credentials_returns_none(self) -> None:
+        assert AntigravityCLIProvider().resolve_credentials() is None
+
+    def test_has_cli_capability(self) -> None:
+        assert has_cli_capability(AntigravityCLIProvider())
+
+    def test_is_available_reports_not_ready(self) -> None:
+        # agy is TTY-only (uncapturable), so the provider must NOT advertise
+        # itself as ready. (Reason is "binary not found" or "disabled" depending
+        # on whether `agy` happens to be on PATH; either way: not ready.)
+        available, reason = AntigravityCLIProvider().is_available()
+        assert available is False
+        assert reason
+
+
+class TestClaudeCLIProvider:
+    """Claude CLI provider — metadata, availability, and capability detection."""
+
+    def test_resolve_model_empty_when_no_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No model is pinned: with SKILLSPECTOR_MODEL unset, resolve_model is ""
+        # so the CLI runs with the user's OWN configured model (we omit --model).
+        monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
+        assert ClaudeCLIProvider().resolve_model() == ""
+        assert ClaudeCLIProvider.DEFAULT_MODEL == ""
+
+    def test_resolve_model_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "claude-opus-4-6")
+        assert ClaudeCLIProvider().resolve_model() == "claude-opus-4-6"
+
+    def test_resolve_model_no_slot_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # CLI providers pin nothing per-slot either — every slot resolves to "".
+        monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
+        assert ClaudeCLIProvider().resolve_model("meta_analyzer") == ""
+
+    def test_metadata_returns_none_without_registry(self) -> None:
+        # No bundled model_registry.yaml -> package-wide default budgets are used.
+        provider = ClaudeCLIProvider()
+        assert provider.get_context_length("claude-sonnet-4-6") is None
+        assert provider.get_max_output_tokens("claude-sonnet-4-6") is None
+
+    def test_has_cli_capability(self) -> None:
+        assert has_cli_capability(ClaudeCLIProvider())
+
+    def test_resolve_credentials_returns_none(self) -> None:
+        assert ClaudeCLIProvider().resolve_credentials() is None
+
+
+class TestCodexCLIProvider:
+    """Codex CLI provider — metadata, availability, and capability detection."""
+
+    def test_resolve_model_empty_when_no_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
+        assert CodexCLIProvider().resolve_model() == ""
+        assert CodexCLIProvider.DEFAULT_MODEL == ""
+
+    def test_resolve_model_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "o3")
+        assert CodexCLIProvider().resolve_model() == "o3"
+
+    def test_metadata_returns_none_without_registry(self) -> None:
+        provider = CodexCLIProvider()
+        assert provider.get_context_length("o4-mini") is None
+        assert provider.get_max_output_tokens("o4-mini") is None
+
+    def test_has_cli_capability(self) -> None:
+        assert has_cli_capability(CodexCLIProvider())
+
+    def test_resolve_credentials_returns_none(self) -> None:
+        assert CodexCLIProvider().resolve_credentials() is None
+
+
+class TestHasCliCapability:
+    """has_cli_capability duck-typing helper."""
+
+    def test_true_for_claude_cli(self) -> None:
+        assert has_cli_capability(ClaudeCLIProvider())
+
+    def test_true_for_codex_cli(self) -> None:
+        assert has_cli_capability(CodexCLIProvider())
+
+    def test_false_for_http_providers(self) -> None:
+        assert not has_cli_capability(AnthropicProvider())
+        assert not has_cli_capability(OpenAIProvider())
+        assert not has_cli_capability(NvBuildProvider())
+
+    def test_false_for_plain_object(self) -> None:
+        assert not has_cli_capability(object())

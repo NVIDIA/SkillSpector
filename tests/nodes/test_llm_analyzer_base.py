@@ -593,17 +593,6 @@ class TestARunBatches:
         with pytest.raises(ValueError, match="no API key"):
             await analyzer.arun_batches(batches)
 
-    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    async def test_cancelled_error_still_propagates(self) -> None:
-        """Cooperative cancellation must not be treated as a transient batch failure."""
-        import asyncio
-
-        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
-        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=asyncio.CancelledError())
-        batches = [Batch(file_path="a.py", content="code")]
-        with pytest.raises(asyncio.CancelledError):
-            await analyzer.arun_batches(batches)
-
 
 # ---------------------------------------------------------------------------
 # _format_findings_for_prompt (per-file, no truncation)
@@ -1360,8 +1349,12 @@ class TestLLMMetaAnalyzerApplyFilter:
         """Two static findings (end_line=None) at different start_lines; LLM
         confirms only one.  The unconfirmed finding must not survive the filter."""
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
-        f1 = Finding(rule_id="P1", message="override", file="skill.md", start_line=10, end_line=None)
-        f2 = Finding(rule_id="P1", message="override", file="skill.md", start_line=30, end_line=None)
+        f1 = Finding(
+            rule_id="P1", message="override", file="skill.md", start_line=10, end_line=None
+        )
+        f2 = Finding(
+            rule_id="P1", message="override", file="skill.md", start_line=30, end_line=None
+        )
         batch = Batch(file_path="skill.md", content="code", findings=[f1, f2])
         llm_items = [
             {

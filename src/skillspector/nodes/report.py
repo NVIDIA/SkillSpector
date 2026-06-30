@@ -22,6 +22,8 @@ based on state["output_format"]. Single place for formatting (CLI and REST API r
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from io import StringIO
 from typing import Literal
@@ -39,9 +41,11 @@ from skillspector.sarif_models import (
     SARIF_SCHEMA_URI,
     SarifArtifactLocation,
     SarifDriver,
+    SarifInvocation,
     SarifLocation,
     SarifLog,
     SarifMessage,
+    SarifNotification,
     SarifPhysicalLocation,
     SarifRegion,
     SarifReportingDescriptor,
@@ -63,6 +67,38 @@ _RISK_RECOMMENDATION: dict[str, str] = {
     "HIGH": "DO_NOT_INSTALL",
     "CRITICAL": "DO_NOT_INSTALL",
 }
+
+
+# Scanned skill content (and LLM output that quotes it) can carry ANSI escape
+# sequences and control bytes (e.g. NUL, ESC) into finding text. Left in, they
+# make a rendered report register as binary — GitLab/editors show "download"
+# instead of the Markdown, and terminals emit garbled output. Strip them from
+# every finding text field so all report formats stay clean UTF-8.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Finding free-text fields that may carry scanned/LLM content.
+_SANITIZED_FIELDS = (
+    "message",
+    "explanation",
+    "remediation",
+    "finding",
+    "context",
+    "matched_text",
+    "code_snippet",
+)
+
+
+def _clean_text(value: str | None) -> str | None:
+    """Strip ANSI escape sequences and disallowed control chars (keep tab/newline)."""
+    if not isinstance(value, str):
+        return value
+    return _CONTROL_RE.sub("", _ANSI_RE.sub("", value))
+
+
+def _sanitize_finding(finding: Finding) -> Finding:
+    """Return a copy of *finding* with control/ANSI bytes stripped from text fields."""
+    return replace(finding, **{f: _clean_text(getattr(finding, f)) for f in _SANITIZED_FIELDS})
 
 
 def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note"]:
@@ -87,7 +123,9 @@ _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 
 
 def _compute_risk_score(
-    findings: list[Finding], has_executable_scripts: bool
+    findings: list[Finding],
+    has_executable_scripts: bool,
+    component_metadata: list[dict[str, object]] | None = None,
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
@@ -97,13 +135,33 @@ def _compute_risk_score(
     a quarter. Occurrences beyond the third are ignored for scoring purposes.
     This prevents repeated pattern matches from inflating the score unboundedly.
 
+    Each finding's contribution is also scaled by its confidence value (clamped
+    to [0, 1]). Findings with confidence <= 0 are skipped entirely — they do not
+    contribute to the score but remain in the reported findings list.
+
+    Within each rule_id bucket, findings are processed in severity-descending
+    order so that the highest-severity occurrence always receives the full weight.
+
     Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
-    Multiplier: 1.3x if has_executable_scripts.
+    1.3x multiplier applied only to findings from executable script files;
+    findings from documentation files (markdown, text, json, yaml, toml)
+    are scored at base weight to avoid punishing security documentation.
     """
+    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    sorted_findings = sorted(
+        findings,
+        key=lambda f: (f.rule_id or "UNKNOWN", severity_rank.get((f.severity or "LOW").upper(), 4)),
+    )
+
+    file_executable: dict[str, bool] = {}
+    if component_metadata:
+        for cm in component_metadata:
+            file_executable[str(cm.get("path", ""))] = bool(cm.get("executable", False))
+
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
 
-    for f in findings:
+    for f in sorted_findings:
         confidence = max(0.0, min(1.0, f.confidence))
         if confidence <= 0.0:
             continue
@@ -119,10 +177,13 @@ def _compute_risk_score(
             continue
 
         weight = _DIMINISHING_WEIGHTS[count]
-        score += base_points * weight * confidence
+        contribution = base_points * weight * confidence
 
-    if has_executable_scripts:
-        score *= 1.3
+        # Apply 1.3x multiplier only to findings from executable files
+        if has_executable_scripts and file_executable.get(f.file, False):
+            contribution *= 1.3
+
+        score += contribution
 
     final_score = min(100, max(0, int(score)))
 
@@ -138,11 +199,19 @@ def _compute_risk_score(
 def _build_sarif(
     findings: list[Finding],
     suppressed: list[SuppressedFinding] | None = None,
+    degraded_notice: str | None = None,
 ) -> dict[str, object]:
     """Build SARIF 2.1.0 log from findings.
 
     Filters out empty/malformed findings (missing rule_id or message) and
     builds the required tool.driver.rules[] array from referenced rule IDs.
+
+    When *degraded_notice* is set (the LLM stage was requested but every call
+    failed), a single ``invocation`` is added carrying the notice as a
+    warning-level ``toolExecutionNotifications`` entry — the standard SARIF
+    place for execution-time conditions — so the default output format also
+    surfaces the degradation. ``executionSuccessful`` stays True: the scan
+    completed and produced results; only the LLM sub-stage was degraded.
     """
     results: list[SarifResult] = []
     seen_rule_ids: dict[str, str] = {}
@@ -206,6 +275,17 @@ def _build_sarif(
         for rule_id, description in sorted(seen_rule_ids.items())
     ]
 
+    invocations: list[SarifInvocation] | None = None
+    if degraded_notice:
+        invocations = [
+            SarifInvocation(
+                execution_successful=True,
+                tool_execution_notifications=[
+                    SarifNotification(text=SarifMessage(text=degraded_notice), level="warning")
+                ],
+            )
+        ]
+
     sarif_log = SarifLog(
         schema_=SARIF_SCHEMA_URI,
         runs=[
@@ -218,6 +298,7 @@ def _build_sarif(
                     )
                 ),
                 results=results,
+                invocations=invocations,
             )
         ],
     )
@@ -233,6 +314,8 @@ def _format_terminal(
     risk_severity: str,
     risk_recommendation: str,
     has_executable_scripts: bool,
+    use_llm: bool = True,
+    llm_call_log: list[dict[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
 ) -> str:
@@ -288,6 +371,17 @@ def _format_terminal(
         comp_table.add_row(f"... and {len(component_metadata) - 15} more", "", "", "")
     console.print(comp_table)
 
+    degraded_notice = _llm_degradation_notice(use_llm, llm_call_log or [])
+    if degraded_notice:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold]Degraded scan[/bold]\n{degraded_notice}",
+                title="[bold red]WARNING[/bold red]",
+                border_style="red",
+            )
+        )
+
     if findings:
         console.print("\n")
         console.print(f"[bold]Issues ({len(findings)})[/bold]\n")
@@ -327,20 +421,70 @@ def _format_terminal(
     return console.export_text()
 
 
-def _build_metadata(has_executable_scripts: bool, use_llm: bool) -> dict[str, object]:
+def _llm_runtime_status(
+    use_llm: bool, llm_call_log: list[dict[str, object]]
+) -> tuple[int, int, bool]:
+    """Return ``(attempted, succeeded, degraded)`` from the LLM call log.
+
+    ``degraded`` is True when the LLM stage was requested and at least one call
+    was attempted, but every call failed at runtime — meaning the report
+    reflects static analysis only despite a deep scan being requested.
+    """
+    attempted = len(llm_call_log)
+    succeeded = sum(1 for r in llm_call_log if r.get("ok"))
+    degraded = bool(use_llm and attempted > 0 and succeeded == 0)
+    return attempted, succeeded, degraded
+
+
+def _llm_degradation_notice(use_llm: bool, llm_call_log: list[dict[str, object]]) -> str | None:
+    """Return a human-readable degraded-scan warning, or None if not degraded."""
+    attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    if not degraded:
+        return None
+    return (
+        f"LLM analysis was requested but all {attempted} LLM call(s) failed - "
+        "results reflect STATIC analysis only."
+    )
+
+
+def _build_metadata(
+    has_executable_scripts: bool,
+    use_llm: bool,
+    llm_call_log: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
+    llm_call_log = llm_call_log or []
     llm_available, llm_error = is_llm_available()
-    meta_analysis_applied = use_llm and llm_available
+    attempted, succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    # meta_analysis_applied reflects whether the LLM meta-analysis effectively
+    # ran: requested, available, and not fully degraded (every call failing).
+    meta_analysis_applied = use_llm and llm_available and not degraded
+
     meta: dict[str, object] = {
         "has_executable_scripts": has_executable_scripts,
         "skillspector_version": skillspector_version,
         "llm_requested": use_llm,
-        "llm_available": llm_available,
+        # llm_available reflects runtime truth: the binary/credentials were
+        # available AND the stage was not fully degraded (every call failing).
+        "llm_available": llm_available and not degraded,
         "meta_analysis_applied": meta_analysis_applied,
     }
     if not meta_analysis_applied:
         meta["filtering_mode"] = "heuristic"
-    if use_llm and not llm_available:
+    if use_llm and attempted:
+        meta["llm_calls_attempted"] = attempted
+        meta["llm_calls_succeeded"] = succeeded
+    if degraded:
+        meta["llm_degraded"] = True
+        reasons = sorted(
+            {str(r.get("error")) for r in llm_call_log if not r.get("ok") and r.get("error")}
+        )
+        detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
+        meta["llm_error"] = (
+            f"LLM analysis was requested but all {attempted} LLM call(s) failed; "
+            f"results reflect static analysis only.{detail}"
+        )
+    elif use_llm and not llm_available:
         meta["llm_error"] = llm_error
     return meta
 
@@ -401,6 +545,7 @@ def _format_json(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
+    llm_call_log: list[dict[str, object]] | None = None,
     analysis_completeness: dict[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
 ) -> str:
@@ -431,7 +576,7 @@ def _format_json(
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
         "suppressed": [sf.to_dict() for sf in suppressed],
-        "metadata": _build_metadata(has_executable_scripts, use_llm),
+        "metadata": _build_metadata(has_executable_scripts, use_llm, llm_call_log),
     }
     if analysis_completeness is not None:
         data["analysis_completeness"] = analysis_completeness
@@ -447,6 +592,8 @@ def _format_markdown(
     risk_severity: str,
     risk_recommendation: str,
     has_executable_scripts: bool,
+    use_llm: bool = True,
+    llm_call_log: list[dict[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
 ) -> str:
@@ -461,6 +608,11 @@ def _format_markdown(
     lines.append(f"**Source:** `{source}`  ")
     lines.append(f"**Scanned:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  ")
     lines.append("")
+
+    degraded_notice = _llm_degradation_notice(use_llm, llm_call_log or [])
+    if degraded_notice:
+        lines.append(f"> ⚠️ **Degraded scan:** {degraded_notice}")
+        lines.append("")
 
     lines.append("## Risk Assessment\n")
     lines.append("| Metric | Value |")
@@ -533,6 +685,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
     """
     raw_findings = state.get("findings", [])
     filtered_findings = state.get("filtered_findings", raw_findings)
+    # Strip ANSI/control bytes once here so every downstream format (terminal,
+    # json, markdown, sarif) and the returned findings stay clean UTF-8. Applied
+    # before partition/dedup so active and suppressed findings are both clean.
+    filtered_findings = [_sanitize_finding(f) for f in filtered_findings]
     component_metadata = state.get("component_metadata") or []
     components = state.get("components") or []
     file_cache = state.get("file_cache") or {}
@@ -541,6 +697,21 @@ def report(state: SkillspectorState) -> dict[str, object]:
     skill_path = state.get("skill_path")
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
+    llm_call_log = state.get("llm_call_log") or []
+
+    # Surface a silent degradation: deep scan requested but every LLM call failed
+    # at runtime, so the report reflects static analysis only. Logged here (once,
+    # operationally) regardless of output format; also embedded in each format's
+    # body / metadata below.
+    _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    degraded_notice = _llm_degradation_notice(use_llm, llm_call_log)
+    if degraded:
+        logger.warning(
+            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static "
+            "analysis only (llm_available reported false)",
+            _attempted - _succeeded,
+            _attempted,
+        )
 
     baseline = state.get("baseline")
     show_suppressed = state.get("show_suppressed", False)
@@ -552,12 +723,23 @@ def report(state: SkillspectorState) -> dict[str, object]:
     # additionally de-duplicates so the same issue is not counted twice.
     findings_for_scoring = deduplicate(active_findings)
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
-        findings_for_scoring, has_executable_scripts
+        findings_for_scoring, has_executable_scripts, component_metadata
     )
-    sarif_report = _build_sarif(active_findings, suppressed)
+    sarif_report = _build_sarif(active_findings, suppressed, degraded_notice=degraded_notice)
     analysis_completeness = _build_analysis_completeness(
         components, file_cache, use_llm, raw_findings, filtered_findings
     )
+
+    # Fail closed on a degraded deep scan: when the LLM stage was requested but
+    # every call failed, the semantic analyzers were effectively skipped, so a
+    # SAFE verdict would rest on static analysis alone. An attacker can trigger
+    # this on purpose (e.g. content that breaks the LLM call) to dodge semantic
+    # scrutiny. Floor the recommendation at CAUTION so an install-gate ASKS
+    # rather than auto-allows; risk_score / severity are left untouched (they
+    # honestly reflect what static analysis found), and llm_degraded / llm_error
+    # explain why the verdict was raised.
+    if degraded and risk_recommendation == "SAFE":
+        risk_recommendation = "CAUTION"
 
     if output_format == "terminal":
         report_body = _format_terminal(
@@ -569,6 +751,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_severity,
             risk_recommendation,
             has_executable_scripts,
+            use_llm=use_llm,
+            llm_call_log=llm_call_log,
             suppressed=suppressed,
             show_suppressed=show_suppressed,
         )
@@ -583,6 +767,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_recommendation,
             has_executable_scripts,
             use_llm=use_llm,
+            llm_call_log=llm_call_log,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
         )
@@ -596,6 +781,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_severity,
             risk_recommendation,
             has_executable_scripts,
+            use_llm=use_llm,
+            llm_call_log=llm_call_log,
             suppressed=suppressed,
             show_suppressed=show_suppressed,
         )

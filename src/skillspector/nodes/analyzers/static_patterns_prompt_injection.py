@@ -116,6 +116,45 @@ P4_PATTERNS = [
     ),
 ]
 
+# P2 (extended): Unicode "Tags" block (U+E0000–U+E007F) — "ASCII smuggling".
+# Tag characters U+E0020–U+E007E map 1:1 to printable ASCII (U+E0041 == tag "A")
+# and render as nothing in virtually every font/editor/terminal, so an entire
+# hidden instruction can be embedded invisibly inside otherwise-benign text:
+# invisible to a human reviewer, but read as literal text by the consuming LLM.
+# This is a distinct codepoint range from the bidi/Trojan-Source class already in
+# P2 (U+202A–U+202E / U+2066–U+2069).
+_TAG_BLOCK = (0xE0000, 0xE007F)
+# The only legitimate use of tag characters is an emoji tag sequence (RGI
+# subdivision flags: an emoji base U+1F3F4 followed by tag chars and terminated
+# by U+E007F CANCEL TAG — e.g. the Scotland/Wales/England flags). Strip
+# well-formed sequences before flagging so those emoji are not false positives.
+#
+# The carve-out is deliberately narrow: the tag payload must be a short
+# ISO-3166-2-style subdivision code, i.e. 2–6 tag characters that each map to a
+# lowercase ASCII letter (U+E0061–U+E007A) or digit (U+E0030–U+E0039). The only
+# RGI-recommended values are "gbeng"/"gbsct"/"gbwls", and Unicode caps
+# subdivision codes at 6 chars, so this admits every real flag. A smuggled ASCII
+# instruction lands in U+E0020–U+E007E and contains spaces, ';', '/', uppercase,
+# or simply runs longer than 6 chars — none of which match here — so wrapping a
+# payload as 🏴 <tags> U+E007F can no longer launder it past detection.
+_EMOJI_TAG_SEQUENCE = re.compile(
+    "\U0001f3f4[\U000e0030-\U000e0039\U000e0061-\U000e007a]{2,6}\U000e007f"
+)
+
+
+def _first_smuggled_tag_offset(content: str) -> int | None:
+    """Return the char offset of the first Unicode Tag character that is *not*
+    part of a well-formed emoji tag sequence, or ``None`` if there is none."""
+    if not any(_TAG_BLOCK[0] <= ord(ch) <= _TAG_BLOCK[1] for ch in content):
+        return None
+    safe_spans = [(m.start(), m.end()) for m in _EMOJI_TAG_SEQUENCE.finditer(content)]
+    for i, ch in enumerate(content):
+        if _TAG_BLOCK[0] <= ord(ch) <= _TAG_BLOCK[1] and not any(
+            start <= i < end for start, end in safe_spans
+        ):
+            return i
+    return None
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for prompt injection patterns (P1–P4)."""
@@ -190,6 +229,27 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
+
+    # P2 (extended): Unicode Tag-block "ASCII smuggling". Runs regardless of
+    # file_type — invisible instructions are dangerous in scripts and config
+    # files too, and the tag range never overlaps the BOM/zero-width codepoints
+    # that the markdown-only block above guards against false positives.
+    tag_offset = _first_smuggled_tag_offset(content)
+    if tag_offset is not None:
+        line_num = get_line_number(content, tag_offset)
+        findings.append(
+            AnalyzerFinding(
+                rule_id="P2",
+                message="Hidden Instructions (Unicode Tag / ASCII smuggling)",
+                severity=Severity.HIGH,
+                location=loc(line_num),
+                confidence=0.9,
+                tags=tag,
+                context=ctx(tag_offset),
+                matched_text=repr(content[tag_offset : tag_offset + 40]),
+            )
+        )
+
     return findings
 
 

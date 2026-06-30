@@ -68,15 +68,48 @@ def _infer_file_type(path: str) -> str:
     return FILE_TYPES.get(suffix, "other")
 
 
-_BINARY_EXTENSIONS = frozenset({
-    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
-    ".woff", ".woff2", ".ttf", ".otf", ".eot",
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a",
-    ".pyc", ".pyo", ".class", ".wasm",
-    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".webm",
-    ".sqlite", ".db",
-})
+_BINARY_EXTENSIONS = frozenset(
+    {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".ico",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".eot",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".7z",
+        ".rar",
+        ".exe",
+        ".dll",
+        ".so",
+        ".dylib",
+        ".bin",
+        ".o",
+        ".a",
+        ".pyc",
+        ".pyo",
+        ".class",
+        ".wasm",
+        ".mp3",
+        ".mp4",
+        ".wav",
+        ".avi",
+        ".mov",
+        ".webm",
+        ".sqlite",
+        ".db",
+    }
+)
 
 _NULL_BYTE_SAMPLE_SIZE = 512
 
@@ -95,7 +128,9 @@ _PE3_ENV_REFERENCE_CONTEXT = re.compile(
 )
 
 
-def _is_env_file_reference_in_docs(finding: AnalyzerFinding, file_type: str, file_path: str = "") -> bool:
+def _is_env_file_reference_in_docs(
+    finding: AnalyzerFinding, file_type: str, file_path: str = ""
+) -> bool:
     """Return True if a PE3 finding is a documentation reference to .env files, not actual access.
 
     SKILL.md is exempt: it is the agent's primary instruction file, so `.env`
@@ -142,7 +177,7 @@ _DOCUMENTATION_DIR_NAMES = (
 _DOCUMENTATION_CONFIDENCE_FACTOR = 0.3
 _CODE_EXAMPLE_CONFIDENCE_FACTOR = 0.5
 
-_NON_EXECUTABLE_FILE_TYPES = frozenset({"markdown", "text", "json", "yaml", "toml", "other"})
+_NON_EXECUTABLE_FILE_TYPES = frozenset({"markdown", "text", "json", "yaml", "toml"})
 
 
 def _is_documentation_markdown(path: str) -> bool:
@@ -230,7 +265,9 @@ def run_static_patterns(
                 if _is_env_file_reference_in_docs(af, file_type, path):
                     logger.debug(
                         "Filtered PE3 .env doc reference: %s in %s:%d",
-                        af.rule_id, path, af.location.start_line,
+                        af.rule_id,
+                        path,
+                        af.location.start_line,
                     )
                     continue
                 if af.context and is_code_example(af.context):

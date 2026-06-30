@@ -28,6 +28,7 @@ from .common import (
     get_context_from_lines,
     get_source_segment,
     resolve_call_name,
+    resolve_dynamic_import_call,
 )
 from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
 
@@ -182,6 +183,10 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
             continue
 
         call_name = resolve_call_name(ast_node, aliases)
+        if call_name is None:
+            # Dynamic-import chain: importlib.import_module('os').system(...) →
+            # 'os.system', so it re-enters the os./subprocess. sink ladders below.
+            call_name = resolve_dynamic_import_call(ast_node, aliases)
         if call_name is None:
             continue
 

@@ -32,11 +32,17 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 
 Create and activate a virtual environment first (all `make` targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv` if available, otherwise `pip`.
 
-**Quick install with uv (no clone required):**
+**Quick install with uv (CLI-only):**
 
 ```bash
 uv tool install git+https://github.com/NVIDIA/skillspector.git
 # Update later: uv tool update skillspector
+```
+
+If you plan to run `skillspector mcp`, install the MCP extra at install time:
+
+```bash
+uv tool install 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
 ```
 
 **From source:**
@@ -180,7 +186,10 @@ inference gateways.
 | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
+| `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
+| `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | `claude-sonnet-4-6` |
+| `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | `o4-mini` |
 
 ```bash
 # Stock OpenAI
@@ -200,6 +209,18 @@ export ANTHROPIC_PROXY_API_KEY=your-bearer-token
 export SKILLSPECTOR_MODEL=claude-sonnet-4-6
 skillspector scan ./my-skill/
 
+# AWS Bedrock (Claude via SigV4)
+export SKILLSPECTOR_PROVIDER=bedrock
+# Optional: select an AWS named profile. When unset, the standard
+# boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves.
+# export AWS_PROFILE=my-profile
+export AWS_REGION=us-west-2  # default if unset
+# Default model: us.anthropic.claude-sonnet-4-6-20250915-v1:0
+# Override with any Bedrock model ID, cross-region inference-profile
+# ID, or your own application-inference-profile ARN:
+# export SKILLSPECTOR_MODEL=us.anthropic.claude-opus-4-6-20250915-v1:0
+skillspector scan ./my-skill/
+
 # NVIDIA build.nvidia.com
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
@@ -210,6 +231,15 @@ export SKILLSPECTOR_PROVIDER=openai
 export OPENAI_API_KEY="YOUR_GEMINI_API_KEY"
 export OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
 export SKILLSPECTOR_MODEL=gemini-3.5-flash
+
+# Local Claude CLI — no API key; uses your existing `claude auth login` session
+# Requires: claude CLI installed and authenticated (claude auth login)
+export SKILLSPECTOR_PROVIDER=claude_cli
+skillspector scan ./my-skill/
+
+# Local Codex CLI — no API key; uses your existing `codex login` session
+# Requires: codex CLI installed and authenticated
+export SKILLSPECTOR_PROVIDER=codex_cli
 skillspector scan ./my-skill/
 
 # Local Ollama or any OpenAI-compatible endpoint
@@ -235,16 +265,21 @@ runtime can call scanning as a tool and **gate skill/MCP installs on the
 result** — turning SkillSpector into a runtime guardrail instead of an
 out-of-band audit step.
 
-```bash
-# Install the optional MCP dependency
-pip install "skillspector[mcp]"
+`skillspector mcp` requires `skillspector[mcp]`.
 
-# stdio transport — for local CLI agents
+```bash
+# Install, or reinstall if you already used the CLI-only path
+uv tool install --force 'skillspector[mcp] @ git+https://github.com/NVIDIA/skillspector.git'
+
+# FastMCP stdio transport for local CLI agents
 skillspector mcp
 
-# streamable HTTP/SSE transport — for remote / A2A callers
+# streamable HTTP/SSE transport for remote / A2A callers
 skillspector mcp --transport http --host 127.0.0.1 --port 8000
 ```
+
+The stdio transport is the current FastMCP path for local CLI agents, and the
+initialize hang reported in issue #199 still applies there.
 
 The server exposes a single tool:
 
@@ -260,6 +295,18 @@ Register it with Claude Code via:
 ```bash
 claude mcp add skillspector -- skillspector mcp
 ```
+
+> **Security — HTTP transport trust model**
+>
+> The HTTP transport ships **without authentication**. Any caller that can
+> reach the port can invoke `scan_skill`. Over stdio or `127.0.0.1` this is
+> the same trust boundary as the CLI. If you bind to a routable interface:
+>
+> - Sit the server behind an authenticating reverse proxy (e.g. nginx + mTLS)
+>   before exposing it externally.
+> - Local paths and `file://` URLs are **automatically rejected** over HTTP to
+>   prevent unauthenticated callers from reading arbitrary host files. Only
+>   remote Git and `.zip` URLs are accepted.
 
 ## Vulnerability Patterns
 
@@ -485,7 +532,7 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, or `nv_build`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
@@ -493,9 +540,13 @@ Issues (2)
 | `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
 | `ANTHROPIC_PROXY_API_KEY` | Bearer token for the Anthropic proxy provider. | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
 | `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
+| `AWS_PROFILE` | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
+| `AWS_REGION` | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
 | `SKILLSPECTOR_MODEL` | Override the active provider's default model. See the LLM Analysis table for each provider's default. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
+
+> **CLI providers** (`claude_cli`, `codex_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session (`claude auth login` / `codex login`). SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run in a hardened sandbox: tools disabled, no MCP, read-only sandbox mode (codex), and untrusted skill content is delivered only via stdin.
 
 ### CLI Options
 

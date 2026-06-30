@@ -39,7 +39,7 @@ from skillspector.nodes.analyzers.pattern_defaults import (
     get_explanation,
     get_remediation,
 )
-from skillspector.state import MetaAnalyzerResponse, SkillspectorState
+from skillspector.state import MetaAnalyzerResponse, SkillspectorState, llm_call_record
 
 logger = get_logger(__name__)
 
@@ -239,7 +239,7 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
 
     result: list[Finding] = []
     for f in findings:
-        severity_upper = f.severity.upper()
+        severity_upper = (f.severity or "LOW").upper()
         confidence = f.confidence
         if f.context and is_code_example(f.context):
             confidence *= _CODE_EXAMPLE_DOWNWEIGHT
@@ -521,9 +521,11 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     metadata_text = _format_metadata(manifest)
     files_with_findings = sorted({f.file for f in findings})
 
-    analyzer = LLMMetaAnalyzer(model=model)
-
     try:
+        # Construct inside the try so a chat-model construction failure is caught
+        # and recorded as a degraded LLM call (consistent with the semantic
+        # analyzers) rather than crashing the whole graph.
+        analyzer = LLMMetaAnalyzer(model=model)
         batches = analyzer.get_batches(files_with_findings, file_cache, findings)
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
@@ -538,9 +540,6 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             # Some batches never returned. A finding the LLM never saw has no
             # verdict — keep it via the fallback path instead of letting
             # apply_filter treat the missing confirmation as a rejection.
-            # get_batches passes through the same Finding objects from
-            # `findings`; if that ever changes, id-based partitioning fails
-            # closed by keeping copied findings as unanalysed.
             analysed_ids = {id(f) for batch, _ in batch_results for f in batch.findings}
             analysed = [f for f in findings if id(f) in analysed_ids]
             unanalysed = [f for f in findings if id(f) not in analysed_ids]
@@ -564,9 +563,15 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(findings),
             len(filtered),
         )
-        return {"filtered_findings": filtered}
+        return {
+            "filtered_findings": filtered,
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+        }
     except ValueError:
         raise
     except Exception as e:
         logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
-        return {"filtered_findings": _passthrough_with_defaults(findings)}
+        return {
+            "filtered_findings": _passthrough_with_defaults(findings),
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],
+        }

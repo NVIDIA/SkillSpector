@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import operator
-from typing import Annotated
+from typing import Annotated, NotRequired
 
 from typing_extensions import TypedDict
 
@@ -46,6 +46,15 @@ class SkillspectorState(TypedDict, total=False):
     # Accumulated findings (reducer: analyzer nodes append to this list)
     findings: Annotated[list[Finding], operator.add]
     filtered_findings: list[Finding]
+
+    # LLM runtime telemetry: each LLM-backed node appends one record (built with
+    # ``llm_call_record``) so the report can detect a *silent degradation* — the
+    # case where use_llm was requested but every LLM call failed at runtime
+    # (transport/parse/auth error). Without this, such a failure would quietly
+    # turn a requested deep scan into a static-only one while still reporting
+    # llm_available=true. Reducer is operator.add so records concatenate across
+    # the parallel analyzer nodes (same pattern as ``findings``).
+    llm_call_log: Annotated[list[LLMCallRecord], operator.add]
 
     # Baseline / false-positive suppression. `baseline` is a loaded
     # skillspector.suppression.Baseline (set by CLI/API); the report node drops
@@ -82,13 +91,36 @@ class SkillspectorState(TypedDict, total=False):
     yara_rules_dir: str | None
 
 
+class LLMCallRecord(TypedDict):
+    """One LLM-stage telemetry record (an entry in ``llm_call_log``)."""
+
+    node: str
+    ok: bool
+    error: str | None
+
+
+def llm_call_record(node_id: str, *, ok: bool, error: str | None = None) -> LLMCallRecord:
+    """Build one telemetry record for ``SkillspectorState['llm_call_log']``.
+
+    LLM-backed nodes append a record on each run so the report can tell whether
+    the LLM stage actually produced results. ``ok=False`` marks a runtime
+    failure where the node fell back to empty/static findings (so the failure is
+    not mistaken for "the LLM ran and found nothing").
+    """
+    return {"node": node_id, "ok": ok, "error": error}
+
+
 class AnalyzerNodeResponse(TypedDict):
     """Strict analyzer update payload for graph state."""
 
     findings: list[Finding]
+    # LLM-backed analyzers also report one telemetry record; static analyzers
+    # omit it (NotRequired keeps the key optional for them).
+    llm_call_log: NotRequired[list[LLMCallRecord]]
 
 
 class MetaAnalyzerResponse(TypedDict):
     """Strict meta-analyzer update payload for graph state."""
 
     filtered_findings: list[Finding]
+    llm_call_log: NotRequired[list[LLMCallRecord]]

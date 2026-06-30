@@ -25,7 +25,12 @@ import unicodedata
 
 from skillspector.llm_utils import chat_completion
 from skillspector.models import Finding
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.state import (
+    AnalyzerNodeResponse,
+    LLMCallRecord,
+    SkillspectorState,
+    llm_call_record,
+)
 
 ANALYZER_ID = "mcp_tool_poisoning"
 logger = logging.getLogger(__name__)
@@ -677,13 +682,20 @@ _TP4_EXECUTABLE_TYPES = frozenset(
 )
 
 
-def _check_tp4(state: SkillspectorState) -> list[Finding]:
-    """TP4: LLM-based description-behavior mismatch detection."""
+def _check_tp4(state: SkillspectorState) -> tuple[list[Finding], LLMCallRecord | None]:
+    """TP4: LLM-based description-behavior mismatch detection.
+
+    Returns ``(findings, record)`` where *record* is the LLM-call telemetry for
+    ``llm_call_log`` — or ``None`` when no LLM call was attempted (no
+    description / no executable code), so an intentional no-op is never counted
+    as a degraded LLM stage. See :func:`skillspector.state.llm_call_record`.
+    """
+    attempted = False
     try:
         manifest: dict = state.get("manifest") or {}
         description = manifest.get("description")
         if not description or not isinstance(description, str) or not description.strip():
-            return []
+            return [], None
 
         triggers = manifest.get("triggers") or []
         permissions = manifest.get("permissions")
@@ -705,7 +717,7 @@ def _check_tp4(state: SkillspectorState) -> list[Finding]:
                 code_parts.append(f"### {path} ({file_type})\n{content}")
 
         if not code_parts:
-            return []
+            return [], None
 
         code_contents = "\n\n".join(code_parts)
 
@@ -749,6 +761,7 @@ Respond in JSON matching this exact schema:
   "explanation": "why this is or is not a mismatch"
 }}"""
 
+        attempted = True
         response = chat_completion(prompt, model=model)
 
         # Parse JSON — handle optional ```json code blocks
@@ -763,13 +776,14 @@ Respond in JSON matching this exact schema:
                 json_text = json_text.rstrip()[:-3].rstrip()
 
         result = json.loads(json_text)
+        ok_record = llm_call_record(ANALYZER_ID, ok=True)
 
         if not result.get("is_mismatch"):
-            return []
+            return [], ok_record
 
         confidence = float(result.get("confidence", 0.0))
         if confidence < 0.5:
-            return []
+            return [], ok_record
 
         severity = "HIGH" if confidence >= 0.7 else "MEDIUM"
 
@@ -797,11 +811,15 @@ Respond in JSON matching this exact schema:
                     "or remove undeclared functionality from the implementation."
                 ),
             )
-        ]
+        ], ok_record
 
-    except Exception:
+    except Exception as exc:
         logger.warning("%s: TP4 LLM check failed, skipping", ANALYZER_ID, exc_info=True)
-        return []
+        # Only record a failure if the LLM call was actually attempted; a failure
+        # before the call (e.g. building the prompt) is not an LLM-stage failure.
+        if attempted:
+            return [], llm_call_record(ANALYZER_ID, ok=False, error=str(exc))
+        return [], None
 
 
 # ---------------------------------------------------------------------------
@@ -839,8 +857,15 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     # match every other LLM-using node (semantic_*, meta_analyzer); the CLI
     # always sets this explicitly, so the default only affects programmatic
     # callers that omit the key.
+    tp4_record: LLMCallRecord | None = None
     if state.get("use_llm", True):
-        findings.extend(_check_tp4(state))
+        tp4_findings, tp4_record = _check_tp4(state)
+        findings.extend(tp4_findings)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    result: AnalyzerNodeResponse = {"findings": findings}
+    # Emit LLM telemetry only when TP4 actually attempted a call, so the report's
+    # degradation detector counts this node consistently with the semantic ones.
+    if tp4_record is not None:
+        result["llm_call_log"] = [tp4_record]
+    return result
