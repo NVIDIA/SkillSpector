@@ -46,6 +46,7 @@ dependencies = [
     "boto3>=1.34.0",
     "langsmith>=0.7.30",
     "yara-python>=4.5.0",
+    "google-auth>=2.53.0",
 ]
 
 [project.optional-dependencies]
