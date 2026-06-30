@@ -189,52 +189,91 @@ def canonical_sibling_sink(name: str | None) -> str | None:
     return _SIBLING_SINKS.get(name)
 
 
-def _receiver_is_importlib_loader(receiver: ast.expr, type_map: dict[str, str] | None) -> bool:
+def _expr_is_importlib_rooted(
+    expr: ast.expr,
+    type_map: dict[str, str] | None,
+    aliases: dict[str, str] | None = None,
+) -> bool:
+    """True when *expr* statically resolves to ``importlib``-rooted machinery.
+
+    A bare name is checked against *type_map* (whose values are already alias-resolved by
+    :func:`build_type_map`), so a ``spec = importlib.util.module_from_spec(...)`` variable
+    is recognized as importlib provenance. Otherwise the expression is resolved to a dotted
+    name and import-alias normalized (``import importlib.util as iu`` → ``iu.x`` reads as
+    ``importlib.util.x``). Anything not rooted in ``importlib`` returns ``False``.
+    """
+    if isinstance(expr, ast.Name) and type_map is not None:
+        inferred = type_map.get(expr.id)
+        if inferred is not None:
+            return inferred.split(".", 1)[0] == "importlib"
+    dotted = resolve_dotted_name(expr)
+    if dotted is not None and aliases:
+        dotted = apply_import_aliases(dotted, aliases)
+    return bool(dotted and dotted.split(".", 1)[0] == "importlib")
+
+
+def _receiver_is_importlib_loader(
+    receiver: ast.expr,
+    type_map: dict[str, str] | None,
+    aliases: dict[str, str] | None = None,
+) -> bool:
     """True when *receiver* statically resolves to an importlib spec loader.
 
-    Recognizes the documented ``importlib`` spec-loader chain: ``<spec>.loader`` (the
-    ``ModuleSpec.loader`` attribute, including ``importlib.util.module_from_spec(...)``
-    results carried through *type_map*), and bare names whose inferred type is rooted in
-    ``importlib``. A user object's ``.exec_module`` (receiver not tied to importlib) does
-    not match.
+    Recognizes the documented ``importlib`` spec-loader chain ``<spec>.loader`` (the
+    ``ModuleSpec.loader`` attribute) **only when the object holding ``.loader`` itself has
+    importlib provenance** — a spec from ``importlib.util.module_from_spec`` /
+    ``spec_from_loader`` carried through *type_map*, or an importlib-rooted dotted name.
+    An unrelated object's ``.loader.exec_module(...)`` (e.g. ``self.widget.loader``) no
+    longer matches, closing the false positive where any ``.loader`` attribute was treated
+    as a dynamic import. Bare names whose inferred type is importlib-rooted also match.
     """
-    if isinstance(receiver, ast.Attribute):
-        # ``<x>.loader`` — the ModuleSpec.loader protocol attribute.
-        if receiver.attr == "loader":
-            return True
-    inferred = None
-    if isinstance(receiver, ast.Name) and type_map is not None:
-        inferred = type_map.get(receiver.id)
-    if inferred is None:
-        inferred = resolve_dotted_name(receiver)
-    return bool(inferred and inferred.split(".", 1)[0] == "importlib")
+    if isinstance(receiver, ast.Attribute) and receiver.attr == "loader":
+        # ``<spec>.loader`` — gated on the base having importlib provenance, not on the
+        # mere presence of a ``.loader`` attribute (which any user object can expose).
+        return _expr_is_importlib_rooted(receiver.value, type_map, aliases)
+    return _expr_is_importlib_rooted(receiver, type_map, aliases)
 
 
-def _receiver_is_code_interpreter(receiver: ast.expr, type_map: dict[str, str] | None) -> bool:
+def _receiver_is_code_interpreter(
+    receiver: ast.expr,
+    type_map: dict[str, str] | None,
+    aliases: dict[str, str] | None = None,
+) -> bool:
     """True when *receiver* resolves to ``code.Interactive{Interpreter,Console}``.
 
     Matches a direct construction (``code.InteractiveInterpreter().runsource(...)``) and a
     variable whose inferred constructor type is one of those classes (carried through
-    *type_map*). A user object defining ``runsource`` / ``runcode`` does not match.
+    *type_map*). The inferred name is import-alias normalized, so ``import code as c;
+    c.InteractiveInterpreter().runsource(...)`` and ``from code import InteractiveInterpreter``
+    are recognized rather than evading detection. A user object defining ``runsource`` /
+    ``runcode`` does not match.
     """
     inferred = None
     if isinstance(receiver, ast.Call):
         inferred = resolve_dotted_name(receiver.func)
     elif isinstance(receiver, ast.Name) and type_map is not None:
         inferred = type_map.get(receiver.id)
+    if inferred is not None and aliases:
+        inferred = apply_import_aliases(inferred, aliases)
     return inferred in _CODE_INTERPRETER_TYPES
 
 
-def canonical_sibling_method(node: ast.Call, type_map: dict[str, str] | None = None) -> str | None:
+def canonical_sibling_method(
+    node: ast.Call,
+    type_map: dict[str, str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
     """Map a gated instance-method call to its canonical code-exec sink id.
 
     Fires only when *node* is ``<recv>.exec_module(...)`` / ``.runsource(...)`` /
     ``.runcode(...)`` **and** *recv* statically resolves to the matching machinery —
     importlib spec loaders for ``exec_module`` (:func:`_receiver_is_importlib_loader`),
     ``code.Interactive{Interpreter,Console}`` for ``runsource`` / ``runcode``
-    (:func:`_receiver_is_code_interpreter`). ``exec_module`` → ``"__import__"``,
-    ``runsource`` / ``runcode`` → ``"exec"``. Returns ``None`` otherwise, so an unrelated
-    user method sharing the name stays unflagged (documented def-use residual).
+    (:func:`_receiver_is_code_interpreter`). Both receiver checks import-alias normalize the
+    inferred name, and the ``exec_module`` gate requires the ``.loader`` base to have
+    importlib provenance. ``exec_module`` → ``"__import__"``, ``runsource`` / ``runcode`` →
+    ``"exec"``. Returns ``None`` otherwise, so an unrelated user method sharing the name
+    stays unflagged (documented def-use residual).
     """
     func = node.func
     if not isinstance(func, ast.Attribute):
@@ -243,8 +282,8 @@ def canonical_sibling_method(node: ast.Call, type_map: dict[str, str] | None = N
     if canonical is None:
         return None
     if func.attr == "exec_module":
-        return canonical if _receiver_is_importlib_loader(func.value, type_map) else None
-    return canonical if _receiver_is_code_interpreter(func.value, type_map) else None
+        return canonical if _receiver_is_importlib_loader(func.value, type_map, aliases) else None
+    return canonical if _receiver_is_code_interpreter(func.value, type_map, aliases) else None
 
 
 def resolve_to_canonical_sink(
@@ -271,7 +310,7 @@ def resolve_to_canonical_sink(
     """
     name = resolve_call_name_typed(node, type_map, aliases)
     if name is not None:
-        sibling = canonical_sibling_sink(name) or canonical_sibling_method(node, type_map)
+        sibling = canonical_sibling_sink(name) or canonical_sibling_method(node, type_map, aliases)
         return sibling or name
     dynamic = resolve_dynamic_import_call(node, aliases)
     if dynamic is not None:
@@ -286,4 +325,4 @@ def resolve_to_canonical_sink(
     # ``code.InteractiveInterpreter().runsource(src)`` — match the gated method (the
     # receiver must resolve to the interpreter/loader machinery) so the sibling is still
     # recognized as a code-exec sink without flagging unrelated same-named user methods.
-    return canonical_sibling_method(node, type_map)
+    return canonical_sibling_method(node, type_map, aliases)
