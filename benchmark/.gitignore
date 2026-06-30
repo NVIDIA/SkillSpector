@@ -1,0 +1,6 @@
+# Benchmark project: local venv, caches, and harness output DBs.
+.venv/
+.ruff_cache/
+__pycache__/
+# DuckDB result files written by the harness (benchmark_<id>.duckdb, -o targets).
+*.duckdb

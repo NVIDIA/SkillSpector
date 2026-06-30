@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "skillspector-benchmark"
+version = "0.1.0"
+description = "Benchmark harness: run SkillSpector over MalSkillBench and score its classifications into DuckDB."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "skillspector",
+    "tqdm>=4.67.3",
+    "duckdb>=1.5.4",
+    "filelock>=3.24.3",
+    "aws-bedrock-token-generator>=1.1.0",
+]
+
+[project.scripts]
+benchmark = "benchmark.main:main"
+
+# skillspector is resolved from the parent repo as an editable install, NOT from
+# PyPI. `editable = true` is load-bearing: drop it and the harness runs against a
+# frozen copy of the source instead of your working tree.
+[tool.uv.sources]
+skillspector = { path = "..", editable = true }
+
+[tool.hatch.build.targets.wheel]
+# The dist name (skillspector-benchmark) differs from the import package
+# (benchmark), so the package dir must be named explicitly.
+packages = ["benchmark"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
