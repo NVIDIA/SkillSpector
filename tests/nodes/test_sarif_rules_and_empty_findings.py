@@ -176,6 +176,7 @@ class TestSarifResultProperties:
         )
         sarif = _build_sarif([finding])
         result = sarif["runs"][0]["results"][0]
+        assert result["properties"]["severity"] == "HIGH"
         assert result["properties"]["category"] == "network_security"
         assert result["properties"]["pattern"] == r"socket\.connect"
         assert result["properties"]["confidence"] == 0.77
@@ -207,6 +208,7 @@ class TestSarifResultProperties:
         result = sarif["runs"][0]["results"][0]
         assert result["suppressions"][0]["kind"] == "external"
         assert result["suppressions"][0]["justification"] == "false positive"
+        assert result["properties"]["severity"] == "HIGH"
         assert result["properties"]["category"] == "authn_security"
         assert result["properties"]["pattern"] == r"api[_-]?key"
         assert result["properties"]["confidence"] == 1.0

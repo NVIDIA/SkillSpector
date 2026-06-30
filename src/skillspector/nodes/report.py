@@ -103,6 +103,7 @@ def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
     """Project selected finding metadata into a SARIF properties dictionary."""
     finding_dict = finding.to_dict()
     metadata: dict[str, object] = {
+        "severity": finding_dict["severity"],
         "category": finding_dict["category"],
         "pattern": finding_dict["pattern"],
         "confidence": finding_dict["confidence"],

@@ -526,6 +526,7 @@ class TestReportNode:
         }
         result = report(state)
         result_row = result["sarif_report"]["runs"][0]["results"][0]
+        assert result_row["properties"]["severity"] == "HIGH"
         assert result_row["properties"]["category"] == "environment"
         assert result_row["properties"]["pattern"] == r"os\.environ"
         assert result_row["properties"]["confidence"] == 0.85
@@ -611,6 +612,7 @@ def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     suppressed_result = sarif_results[0]
     assert suppressed_result["suppressions"][0]["kind"] == "external"
     assert suppressed_result["suppressions"][0]["justification"] == "false positive"
+    assert suppressed_result["properties"]["severity"] == "CRITICAL"
     assert suppressed_result["properties"]["category"] == "critical_path"
     assert suppressed_result["properties"]["pattern"] == r"exec\("
     assert suppressed_result["properties"]["confidence"] == 1.0
@@ -743,3 +745,24 @@ def test_report_doc_findings_no_multiplier() -> None:
     # Without the multiplier: 2 HIGH = 50, not 65
     assert result["risk_score"] == 50
     assert result["risk_severity"] == "MEDIUM"
+
+
+def test_report_sarif_preserves_high_vs_critical_severity() -> None:
+    """HIGH and CRITICAL both map to SARIF error, but properties keep the exact severity."""
+    state: SkillspectorState = {
+        "filtered_findings": [
+            _finding("R1", "HIGH", message="high finding", file="high.py"),
+            _finding("R2", "CRITICAL", message="critical finding", file="critical.py"),
+        ],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "sarif",
+    }
+    results = report(state)["sarif_report"]["runs"][0]["results"]
+    by_rule = {item["ruleId"]: item for item in results}
+    assert by_rule["R1"]["level"] == "error"
+    assert by_rule["R2"]["level"] == "error"
+    assert by_rule["R1"]["properties"]["severity"] == "HIGH"
+    assert by_rule["R2"]["properties"]["severity"] == "CRITICAL"
