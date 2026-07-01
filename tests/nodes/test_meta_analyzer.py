@@ -137,6 +137,18 @@ def _confirm(pattern_id: str, file: str, start_line: int) -> dict[str, object]:
     }
 
 
+def test_critical_finding_kept_when_rejected_by_llm() -> None:
+    """CRITICAL findings survive LLM rejection — security floor prevents false negatives."""
+    findings = [_finding("SC4", 4, severity="CRITICAL")]
+    items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
+    batch = Batch(file_path="requirements.txt", content="", findings=findings)
+
+    kept = _analyzer().apply_filter(findings, [(batch, items)])
+
+    assert len(kept) == 1
+    assert "llm-unconfirmed" in kept[0].tags
+
+
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
 class TestMetaAnalyzerPartialBatchFailure:
     def _state(self, findings: list[Finding]) -> dict[str, object]:
@@ -229,6 +241,237 @@ class TestMetaAnalyzerPartialBatchFailure:
 
         kept = {(f.file, f.rule_id) for f in result["filtered_findings"]}
         assert kept == {("a.py", "R1")}
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_meta_analyzer_batches_large_finding_sets(monkeypatch) -> None:
+    """When findings > META_BATCH_SIZE, meta_analyzer splits into multiple LLM calls."""
+    import importlib
+
+    import skillspector.constants
+
+    monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "3")
+    importlib.reload(skillspector.constants)
+
+    try:
+        # 6 findings across 6 files
+        findings = [
+            Finding(
+                rule_id=f"E{i}",
+                message=f"finding {i}",
+                severity="MEDIUM",
+                confidence=0.8,
+                file=f"file{i}.py",
+                start_line=i,
+            )
+            for i in range(6)
+        ]
+        from skillspector.state import SkillspectorState
+
+        state = SkillspectorState(
+            findings=findings,
+            use_llm=True,
+            file_cache={f"file{i}.py": f"# file {i}" for i in range(6)},
+            manifest={},
+            model_config={},
+        )
+
+        call_count = {"n": 0}
+
+        async def fake_arun_batches(self_or_batches, batches_or_nothing=None, **kwargs):
+            call_count["n"] += 1
+            return []  # return empty so filtered_findings is empty (fine for count test)
+
+        with patch(
+            "skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches
+        ):
+            meta_analyzer(state)
+
+        assert call_count["n"] >= 2, (
+            "Should split into multiple arun_batches calls when findings > batch size"
+        )
+    finally:
+        monkeypatch.delenv("SKILLSPECTOR_META_BATCH_SIZE", raising=False)
+        importlib.reload(skillspector.constants)
+
+
+def test_split_files_into_batches_groups_files_correctly() -> None:
+    """_split_files_into_batches correctly groups files within the max size."""
+    from skillspector.nodes.meta_analyzer import _split_files_into_batches
+
+    # 3 files with 2, 3, 2 findings each; max_findings=4
+    findings = (
+        [
+            Finding(
+                rule_id="R1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="a.py",
+                start_line=i,
+            )
+            for i in range(2)
+        ]
+        + [
+            Finding(
+                rule_id="R1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="b.py",
+                start_line=i,
+            )
+            for i in range(3)
+        ]
+        + [
+            Finding(
+                rule_id="R1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="c.py",
+                start_line=i,
+            )
+            for i in range(2)
+        ]
+    )
+    files = ["a.py", "b.py", "c.py"]
+    groups = _split_files_into_batches(files, findings, max_findings=4)
+    # a.py (2) + b.py (3) = 5 > 4, so a.py alone, then b.py alone (3<=4), then c.py
+    # Actually: a.py (2) fits in first group; adding b.py (3) = 5 > 4, so b.py starts group 2;
+    # adding c.py (2) to group 2 = 5 > 4, so c.py starts group 3
+    assert len(groups) == 3
+    assert groups[0] == ["a.py"]
+    assert groups[1] == ["b.py"]
+    assert groups[2] == ["c.py"]
+
+
+def test_split_files_into_batches_single_group_when_under_limit() -> None:
+    """All files in one group when total findings <= max_findings."""
+    from skillspector.nodes.meta_analyzer import _split_files_into_batches
+
+    findings = [
+        Finding(
+            rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="a.py", start_line=1
+        ),
+        Finding(
+            rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="b.py", start_line=1
+        ),
+    ]
+    groups = _split_files_into_batches(["a.py", "b.py"], findings, max_findings=10)
+    assert len(groups) == 1
+    assert groups[0] == ["a.py", "b.py"]
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_meta_analyzer_reads_batch_size_at_call_time(monkeypatch) -> None:
+    """META_BATCH_SIZE is read from constants at call time, not at import time."""
+    import importlib
+
+    import skillspector.constants
+
+    monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "1")
+    importlib.reload(skillspector.constants)
+
+    try:
+        # 2 findings in 2 files; batch size=1 means each file is its own group
+        findings = [
+            Finding(
+                rule_id="E1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="f1.py",
+                start_line=1,
+            ),
+            Finding(
+                rule_id="E2",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="f2.py",
+                start_line=1,
+            ),
+        ]
+        from skillspector.state import SkillspectorState
+
+        state = SkillspectorState(
+            findings=findings,
+            use_llm=True,
+            file_cache={"f1.py": "# f1", "f2.py": "# f2"},
+            manifest={},
+            model_config={},
+        )
+
+        call_count = {"n": 0}
+
+        async def fake_arun_batches_call_time(_self, _batches, **kwargs):
+            call_count["n"] += 1
+            return []
+
+        with patch(
+            "skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches",
+            fake_arun_batches_call_time,
+        ):
+            meta_analyzer(state)
+
+        assert call_count["n"] == 2, "With batch size=1 and 2 files, expect 2 separate LLM calls"
+    finally:
+        monkeypatch.delenv("SKILLSPECTOR_META_BATCH_SIZE", raising=False)
+        importlib.reload(skillspector.constants)
+
+
+def test_skip_meta_bypasses_llm_entirely() -> None:
+    """skip_meta=True must return all findings without any LLM call."""
+    from skillspector.state import SkillspectorState
+
+    state = SkillspectorState(
+        findings=[_finding("E1", 1), _finding("P1", 2)],
+        use_llm=True,
+        skip_meta=True,
+        file_cache={"SKILL.md": "content"},
+        manifest={},
+        model_config={},
+    )
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
+        result = meta_analyzer(state)
+    mock_cls.assert_not_called()
+    assert len(result["filtered_findings"]) == 2
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_meta_analyzer_llm_failure_prints_stderr_hint(capsys) -> None:
+    """When LLM call fails, a stderr hint about --no-llm must be printed."""
+    finding = Finding(
+        rule_id="E1",
+        message="E1 test finding",
+        severity="HIGH",
+        confidence=0.8,
+        file="SKILL.md",
+        start_line=1,
+    )
+    state: dict[str, object] = {
+        "findings": [finding],
+        "use_llm": True,
+        "file_cache": {"SKILL.md": "# test\nsome content"},
+        "manifest": {"name": "test"},
+        "model_config": {},
+    }
+    batch = Batch(file_path="SKILL.md", content="# test\nsome content", findings=[finding])
+    with (
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]),
+        patch.object(
+            LLMMetaAnalyzer,
+            "arun_batches",
+            new_callable=AsyncMock,
+            side_effect=Exception("provider not available"),
+        ),
+    ):
+        result = meta_analyzer(state)
+
+    captured = capsys.readouterr()
+    assert "--no-llm" in captured.err, "stderr must mention --no-llm when LLM fails"
+    assert result["filtered_findings"], "fail-closed: findings still returned"
 
 
 # ---------------------------------------------------------------------------

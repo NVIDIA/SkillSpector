@@ -28,6 +28,19 @@ from . import static_runner
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
 
+_PE3_TEST_FUNCTION_KEYWORDS = frozenset(
+    {
+        "traversal",
+        "path",
+        "inject",
+        "sanitize",
+        "escape",
+        "neutralize",
+    }
+)
+_kw = "|".join(sorted(_PE3_TEST_FUNCTION_KEYWORDS))
+_PE3_FIXTURE_FUNC_RE = re.compile(rf"\bdef\s+test_\w*(?:{_kw})\w*")
+
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
@@ -113,7 +126,27 @@ PE5_PATTERNS = [
 ]
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+def _is_pe3_test_fixture(content: str, match_start: int, file_path: str) -> bool:
+    """Return True when /etc/passwd appears as a string literal in a test function."""
+    from pathlib import Path as _Path
+
+    name = _Path(file_path).name
+    stem = _Path(file_path).stem
+    if not (name.startswith("test_") or stem.endswith("_test")):
+        return False
+    lines = content.splitlines()
+    line_idx = content[:match_start].count("\n")
+    # Check 15 lines before for a test function definition
+    start = max(0, line_idx - 15)
+    surrounding = "\n".join(lines[start : line_idx + 1]).lower()
+    # Must be a test_ function whose name contains a traversal-related keyword
+    has_test_func = _PE3_FIXTURE_FUNC_RE.search(surrounding) is not None
+    return has_test_func
+
+
+def analyze(
+    content: str, file_path: str, file_type: str, include_test_fixtures: bool = False
+) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
 
@@ -162,14 +195,24 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context = get_context(content, match.start())
             if _is_documentation_example(context, file_type):
                 continue
+            # Test-fixture heuristic for /etc/passwd
+            is_fixture = (
+                "/etc/passwd" in match.group(0).lower()
+                and not include_test_fixtures
+                and _is_pe3_test_fixture(content, match.start(), file_path)
+            )
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
-                    message="Credential Access",
-                    severity=Severity.HIGH,
+                    message=(
+                        "Credential Access (likely test fixture)"
+                        if is_fixture
+                        else "Credential Access"
+                    ),
+                    severity=Severity.LOW if is_fixture else Severity.HIGH,
                     location=loc(line_num),
-                    confidence=confidence,
-                    tags=tag,
+                    confidence=0.15 if is_fixture else confidence,
+                    tags=tag + ["likely_test_fixture"] if is_fixture else tag,
                     context=context,
                     matched_text=match.group(0)[:200],
                 )
@@ -256,6 +299,24 @@ def _is_documentation_example(context: str, file_type: str) -> bool:
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run privilege_escalation patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
+    include_fixtures = bool(state.get("include_test_fixtures", False))
+    if not include_fixtures:
+        # Fast path: include_test_fixtures flag not set; use the shared runner
+        # (fixture heuristic fires inside analyze() with its default False).
+        findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
+    else:
+        # include_test_fixtures=True: call analyze() directly so the flag is forwarded.
+        components: list[str] = state.get("components") or []
+        file_cache: dict[str, str] = state.get("file_cache") or {}
+        raw_findings: list[AnalyzerFinding] = []
+        for path in components:
+            content = file_cache.get(path)
+            if content is None or len(content) > static_runner.MAX_FILE_BYTES:
+                continue
+            if static_runner._is_binary_file(path, content):  # noqa: SLF001
+                continue
+            file_type = static_runner._infer_file_type(path)  # noqa: SLF001
+            raw_findings.extend(analyze(content, path, file_type, include_test_fixtures=True))
+        findings = [static_runner.analyzer_finding_to_finding(af) for af in raw_findings]
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     return {"findings": findings}

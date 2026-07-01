@@ -1,0 +1,6 @@
+# src/skillspector/providers/subprocess/model_registry.yaml
+# Conservative defaults; the actual limits depend on the configured command.
+models:
+  "subprocess":
+    context_length: 200000
+    max_output_tokens: 8192

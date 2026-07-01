@@ -27,6 +27,7 @@ from pathlib import Path
 import yaml
 
 from skillspector.constants import MODEL_CONFIG
+from skillspector.llm_cache import default_cache_dir
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
 
@@ -34,7 +35,16 @@ logger = get_logger(__name__)
 
 # Directories to skip when walking
 _SKIP_DIRS = frozenset(
-    {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"}
+    {
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".tox",
+        ".pytest_cache",
+        ".skillspector-cache",
+    }
 )
 
 # File type by extension
@@ -222,6 +232,8 @@ def _parse_manifest(skill_dir: Path) -> dict[str, object]:
         manifest["parameters"] = (
             [p for p in parameters if isinstance(p, dict)] if isinstance(parameters, list) else []
         )
+        if "classification" in data:
+            manifest["classification"] = str(data["classification"])
         return manifest
     return {}
 
@@ -240,6 +252,21 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)
 
+    # Determine skill classification from manifest or root skillspector.yaml
+    classification = None
+    if isinstance(manifest, dict):
+        classification = manifest.get("classification")
+    if not classification:
+        # Check for root-level skillspector.yaml (library-level scope declaration)
+        lib_config = skill_dir.parent / "skillspector.yaml"
+        if lib_config.is_file():
+            try:
+                lib_data = yaml.safe_load(lib_config.read_text(encoding="utf-8")) or {}
+                if lib_data.get("scope"):
+                    classification = str(lib_data["scope"])
+            except Exception:  # noqa: BLE001
+                pass
+
     return {
         "components": components,
         "file_cache": file_cache,
@@ -249,4 +276,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "model_config": MODEL_CONFIG,
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
+        "skill_classification": classification,
+        "llm_cache_dir": str(default_cache_dir(skill_dir)),
     }

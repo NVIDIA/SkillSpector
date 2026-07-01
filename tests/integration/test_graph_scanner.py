@@ -101,6 +101,42 @@ class TestGraphScanMaliciousSkill:
         # When risk_score is implemented (TODO A.3.2): assert result["risk_score"] >= 50
 
 
+class TestOffensiveSecurityClassification:
+    """Offensive security classification overrides the risk recommendation."""
+
+    def test_offensive_security_classification_overrides_recommendation(
+        self, tmp_path: Path
+    ) -> None:
+        """A skill with classification: offensive_security must get the authorized-tool recommendation."""
+        skill = tmp_path / "my-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: pentest-kit\ndescription: Penetration testing toolkit.\n"
+            "classification: offensive_security\n---\n# Pentest Kit\n"
+            "This skill contains offensive security techniques.\n",
+            encoding="utf-8",
+        )
+        state = {"input_path": str(skill), "output_format": "json", "use_llm": False}
+        result = graph.invoke(state)
+        assert "AUTHORIZED OFFENSIVE TOOL" in (result.get("risk_recommendation") or "")
+
+    def test_library_scope_yaml_cascades_classification(self, tmp_path: Path) -> None:
+        """skillspector.yaml at collection root cascades offensive_security to all skills."""
+        col = tmp_path / "collection"
+        col.mkdir()
+        (col / "skillspector.yaml").write_text(
+            "scope: offensive_security\nauthorized_by: Bug Bounty Program\n", encoding="utf-8"
+        )
+        skill = col / "my-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: Test.\n---\n# skill\n", encoding="utf-8"
+        )
+        state = {"input_path": str(skill), "output_format": "json", "use_llm": False}
+        result = graph.invoke(state)
+        assert "AUTHORIZED OFFENSIVE TOOL" in (result.get("risk_recommendation") or "")
+
+
 class TestGraphRiskScoring:
     """Risk scoring behavior."""
 
