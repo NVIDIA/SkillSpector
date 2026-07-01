@@ -429,4 +429,3 @@ class TestImportlibDynamicChainEvasion:
         """A benign dynamic import (``json.loads``) must not match a sink ladder."""
         findings = _run("import importlib\nimportlib.import_module('json').loads('{}')\n")
         assert findings == []
->>>>>>> origin/main

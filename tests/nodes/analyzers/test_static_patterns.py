@@ -755,7 +755,6 @@ class TestRunStaticPatternsPrivilegeEscalationPE5:
         }
         findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
         assert not any(f.rule_id == "PE5" for f in findings)
->>>>>>> origin/main
 
 
 class TestRunStaticPatternsSSRF:
