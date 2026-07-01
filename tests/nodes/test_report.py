@@ -427,6 +427,90 @@ class TestReportNode:
         assert result["risk_severity"] == "HIGH"
         assert result["risk_recommendation"] == "DO_NOT_INSTALL"
 
+    def test_self_labeled_offensive_security_is_not_trusted_by_default(self) -> None:
+        """A skill's own manifest claiming offensive_security must NOT override
+        the risk verdict unless trust_skill_classification is explicitly opted in.
+
+        skill_classification is read from the scanned skill's own (attacker-
+        controlled) manifest. Without opt-in, a malicious skill must not be able
+        to self-label its way out of a DO_NOT_INSTALL verdict.
+        """
+        state: SkillspectorState = {
+            "filtered_findings": [
+                _finding("P5", "CRITICAL", confidence=1.0),
+                _finding("E2", "MEDIUM", confidence=1.0),
+            ],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "json",
+            "skill_classification": "offensive_security",
+        }
+        result = report(state)
+        assert result["risk_score"] == 60
+        assert result["risk_severity"] == "HIGH"
+        assert result["risk_recommendation"] == "DO_NOT_INSTALL"
+
+    def test_self_labeled_offensive_security_trusted_when_opted_in(self) -> None:
+        """With trust_skill_classification=True, the self-declared classification
+        is honored and overrides the recommendation as before."""
+        state: SkillspectorState = {
+            "filtered_findings": [
+                _finding("P5", "CRITICAL", confidence=1.0),
+                _finding("E2", "MEDIUM", confidence=1.0),
+            ],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "json",
+            "skill_classification": "offensive_security",
+            "trust_skill_classification": True,
+        }
+        result = report(state)
+        assert result["risk_recommendation"] == "AUTHORIZED OFFENSIVE TOOL — review findings in context"
+
+    def test_json_output_always_includes_skill_declared_classification(self) -> None:
+        """skill_declared_classification is a top-level JSON field regardless of
+        whether trust_skill_classification is set, and regardless of its value."""
+        base_state: SkillspectorState = {
+            "filtered_findings": [
+                _finding("P5", "CRITICAL", confidence=1.0),
+                _finding("E2", "MEDIUM", confidence=1.0),
+            ],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "json",
+            "skill_classification": "offensive_security",
+        }
+
+        # Untrusted: field still present, and recommendation is untouched.
+        untrusted = json.loads(report(base_state)["report_body"])
+        assert untrusted["skill_declared_classification"] == "offensive_security"
+        assert untrusted["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+
+        # Trusted: field still present (and equal), recommendation is overridden.
+        trusted_state: SkillspectorState = {**base_state, "trust_skill_classification": True}
+        trusted = json.loads(report(trusted_state)["report_body"])
+        assert trusted["skill_declared_classification"] == "offensive_security"
+        assert trusted["risk_assessment"]["recommendation"] == (
+            "AUTHORIZED OFFENSIVE TOOL — review findings in context"
+        )
+
+        # Non-offensive / absent classification: field present as None, unrelated to trust.
+        general_state: SkillspectorState = {**base_state, "skill_classification": "general"}
+        general = json.loads(report(general_state)["report_body"])
+        assert general["skill_declared_classification"] == "general"
+
+        no_classification_state: SkillspectorState = {
+            k: v for k, v in base_state.items() if k != "skill_classification"
+        }
+        no_classification = json.loads(report(no_classification_state)["report_body"])
+        assert no_classification["skill_declared_classification"] is None
+
     def test_report_output_format_json(self) -> None:
         """output_format json produces valid JSON with expected structure."""
         state: SkillspectorState = {

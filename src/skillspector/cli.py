@@ -139,12 +139,14 @@ def _scan_state(
     show_suppressed: bool = False,
     include_test_fixtures: bool = False,
     skip_meta: bool = False,
+    trust_skill_classification: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
         "input_path": input_path,
         "output_format": format.value,
         "use_llm": not no_llm,
+        "trust_skill_classification": trust_skill_classification,
     }
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
@@ -304,6 +306,18 @@ def scan(
             help="Include full finding details (issues[]) in recursive JSON output.",
         ),
     ] = False,
+    trust_skill_classification: Annotated[
+        bool,
+        typer.Option(
+            "--trust-skill-classification",
+            help="Trust the scanned skill's own self-declared 'offensive_security' "
+            "classification (from its manifest) to override the risk recommendation. "
+            "Off by default: the manifest is attacker-controlled, and a malicious "
+            "skill could label itself this way to suppress a DO_NOT_INSTALL verdict. "
+            "The self-declared classification is always shown in JSON output "
+            "(skill_declared_classification) regardless of this flag.",
+        ),
+    ] = False,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -395,6 +409,7 @@ def scan(
             show_suppressed=show_suppressed,
             include_test_fixtures=include_test_fixtures,
             skip_meta=skip_meta,
+            trust_skill_classification=trust_skill_classification,
         )
         if verbose:
             console.print("[dim]Running scan...[/dim]")
