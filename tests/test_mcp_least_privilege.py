@@ -258,6 +258,73 @@ class TestLP3NoPermissions:
         assert lp3.file == "SKILL.md"
 
 
+class TestLP3AllowedTools:
+    def test_allowed_tools_list_no_lp3(self):
+        """allowed-tools list form ([Bash, Read]) is a declaration → no LP3."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = ["Bash", "Read"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp3_findings = [f for f in findings if f.rule_id == "LP3"]
+        assert lp3_findings == [], (
+            f"allowed-tools should satisfy LP3, got: {[f.rule_id for f in findings]}"
+        )
+
+    def test_allowed_tools_comma_string_no_lp3(self):
+        """allowed-tools comma-string form ('Bash, Read') is also a declaration → no LP3."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = "Bash, Read"
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp3_findings = [f for f in findings if f.rule_id == "LP3"]
+        assert lp3_findings == [], (
+            f"allowed-tools should satisfy LP3, got: {[f.rule_id for f in findings]}"
+        )
+
+    def test_allowed_tools_underdeclared_fires_lp1(self):
+        """allowed-tools: [Read] + Bash code → LP3 suppressed but LP1 fires HIGH for shell."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = ["Read"]
+        # Inject shell capability into a non-test file
+        state["file_cache"]["skill.py"] = "import subprocess\nsubprocess.run(['ls'])\n"
+        state["component_metadata"] = [
+            {"path": "skill.py", "type": "python", "executable": True, "lines": 2, "size_bytes": 50}
+        ]
+        state["components"] = ["skill.py"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp3_findings = [f for f in findings if f.rule_id == "LP3"]
+        lp1_findings = [f for f in findings if f.rule_id == "LP1"]
+        assert lp3_findings == [], (
+            f"allowed-tools should suppress LP3, got: {[f.rule_id for f in findings]}"
+        )
+        assert len(lp1_findings) >= 1, (
+            f"Expected LP1 for undeclared shell capability, got: {[f.rule_id for f in findings]}"
+        )
+        for lp1 in lp1_findings:
+            assert lp1.severity == "HIGH", f"Expected HIGH severity for LP1, got {lp1.severity}"
+
+    def test_allowed_tools_fully_covered_no_lp1(self):
+        """allowed-tools: [Bash] + only shell code → no LP1 (capability is covered)."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = ["Bash"]
+        state["file_cache"]["skill.py"] = "import subprocess\nsubprocess.run(['ls'])\n"
+        state["component_metadata"] = [
+            {"path": "skill.py", "type": "python", "executable": True, "lines": 2, "size_bytes": 50}
+        ]
+        state["components"] = ["skill.py"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_findings = [f for f in findings if f.rule_id == "LP1" and "shell" in f.message]
+        assert lp1_findings == [], (
+            f"Bash covers shell capability — no LP1 expected, got: {[f.rule_id for f in findings]}"
+        )
+
+
 class TestLP4OverDeclared:
     def test_over_declared_detected(self):
         """mcp_overprivileged_skill declares bash/network/write but code only reads → LP4 for network and write."""

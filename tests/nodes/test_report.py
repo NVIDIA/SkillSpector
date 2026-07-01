@@ -29,7 +29,8 @@ from skillspector.nodes.report import (
     _compute_risk_score,
     report,
 )
-from skillspector.state import SkillspectorState
+from skillspector.sarif_models import validate_sarif_report
+from skillspector.state import SkillspectorState, llm_call_record
 from skillspector.suppression import Baseline, SuppressionRule
 
 
@@ -642,6 +643,226 @@ def test_report_no_baseline_unchanged() -> None:
     result = report(state)
     assert result["risk_score"] == 50
     assert result["suppressed_findings"] == []
+
+
+# ---------------------------------------------------------------------------
+# LLM degradation signal (use_llm requested but every LLM call failed)
+# ---------------------------------------------------------------------------
+
+
+def _meta_from_json_report(state: SkillspectorState) -> dict:
+    """Run the report node in JSON mode and return the metadata block."""
+    return json.loads(report(state)["report_body"])["metadata"]
+
+
+def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """use_llm requested + every LLM call failed -> llm_available False, llm_degraded True."""
+    # Pre-flight reports available (binary/creds present); the failure is at runtime.
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_security_discovery", ok=False, error="claude empty stdout"),
+            llm_call_record("semantic_developer_intent", ok=False, error="claude empty stdout"),
+            llm_call_record("semantic_quality_policy", ok=False, error="boom"),
+        ],
+    }
+    meta = _meta_from_json_report(state)
+    assert meta["llm_requested"] is True
+    assert meta["llm_available"] is False  # degraded -> not actually available
+    assert meta["llm_degraded"] is True
+    assert meta["llm_calls_attempted"] == 3
+    assert meta["llm_calls_succeeded"] == 0
+    # Distinct error reasons are surfaced (deduped).
+    assert "claude empty stdout" in meta["llm_error"]
+    assert "static analysis only" in meta["llm_error"]
+
+
+def test_report_not_degraded_when_some_calls_succeeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At least one successful LLM call -> not degraded, llm_available stays True."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_security_discovery", ok=True),
+            llm_call_record("semantic_quality_policy", ok=False, error="boom"),
+        ],
+    }
+    meta = _meta_from_json_report(state)
+    assert meta["llm_available"] is True
+    assert "llm_degraded" not in meta
+    assert meta["llm_calls_attempted"] == 2
+    assert meta["llm_calls_succeeded"] == 1
+
+
+def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """use_llm True but no LLM calls attempted (e.g. empty skill) -> not degraded."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [],
+    }
+    meta = _meta_from_json_report(state)
+    assert meta["llm_available"] is True
+    assert "llm_degraded" not in meta
+    assert "llm_calls_attempted" not in meta
+
+
+def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """use_llm False -> failures (if any) never mark the scan degraded."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": False,
+        "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error="boom")],
+    }
+    meta = _meta_from_json_report(state)
+    assert "llm_degraded" not in meta
+
+
+def test_report_terminal_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Terminal output surfaces a visible degraded-scan warning."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {"name": "t"},
+        "output_format": "terminal",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("semantic_quality_policy", ok=False, error="boom")],
+    }
+    body = report(state)["report_body"]
+    assert "Degraded scan" in body
+    assert "STATIC analysis only" in body
+
+
+def test_report_markdown_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Markdown output surfaces a visible degraded-scan warning."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "markdown",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error="boom")],
+    }
+    body = report(state)["report_body"]
+    assert "Degraded scan" in body
+
+
+def test_report_sarif_carries_degradation_notification() -> None:
+    """The default SARIF output surfaces degradation via a tool-execution notification."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "sarif",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_security_discovery", ok=False, error="claude empty stdout"),
+        ],
+    }
+    result = report(state)
+    run = result["sarif_report"]["runs"][0]
+    assert "invocations" in run
+    invocation = run["invocations"][0]
+    assert invocation["executionSuccessful"] is True  # scan completed; LLM sub-stage degraded
+    notification = invocation["toolExecutionNotifications"][0]
+    assert notification["level"] == "warning"
+    assert "STATIC analysis only" in notification["message"]["text"]
+    # The serialized report_body carries it too, and the doc stays schema-valid.
+    body = json.loads(result["report_body"])
+    assert body["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+    validate_sarif_report(result["sarif_report"])
+
+
+def test_report_sarif_no_invocations_when_not_degraded() -> None:
+    """A healthy scan's SARIF output is unchanged (no invocations block)."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "sarif",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
+    }
+    result = report(state)
+    assert "invocations" not in result["sarif_report"]["runs"][0]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: a degraded deep scan must not be able to report SAFE
+# ---------------------------------------------------------------------------
+
+
+def test_degraded_scan_floors_recommendation_at_caution() -> None:
+    """No findings would normally be SAFE; a degraded LLM stage forces CAUTION."""
+    state: SkillspectorState = {
+        "filtered_findings": [],  # static score 0 -> would be SAFE
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("semantic_security_discovery", ok=False, error="boom")],
+    }
+    result = report(state)
+    assert result["risk_score"] == 0  # score is left honest
+    assert result["risk_recommendation"] == "CAUTION"  # but never SAFE when degraded
+
+
+def test_non_degraded_clean_scan_stays_safe() -> None:
+    """Without degradation, a clean scan still reports SAFE (no over-flooring)."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
+    }
+    result = report(state)
+    assert result["risk_recommendation"] == "SAFE"
+
+
+def test_degraded_scan_does_not_downgrade_a_blocking_verdict() -> None:
+    """A degraded scan that is already DO_NOT_INSTALL stays blocking (floor only lifts SAFE)."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", "CRITICAL"), _finding("P6", "CRITICAL")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error="boom")],
+    }
+    result = report(state)
+    assert result["risk_recommendation"] == "DO_NOT_INSTALL"
 
 
 def test_report_executable_scripts_multiplier() -> None:

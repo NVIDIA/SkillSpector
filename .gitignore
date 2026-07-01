@@ -98,6 +98,7 @@ tmp/
 temp/
 .skillspector/
 .provider-test-missing-keys
+.pr-review-work/
 
 # API Keys (never commit!)
 .env.local

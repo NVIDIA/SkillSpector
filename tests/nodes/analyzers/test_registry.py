@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for analyzer node registry alignment with SADD spec."""
+"""Tests for analyzer node registry alignment with the workflow reference table."""
 
 from __future__ import annotations
 
 from skillspector.nodes.analyzers import ANALYZER_NODE_IDS, ANALYZER_NODES
 
-# Expected analyzer node IDs per SADD spec workflow reference table.
+# Expected analyzer node IDs per the workflow reference table.
 # Order: static (14), behavioral (2), mcp (3), semantic (3).
 EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "static_patterns_prompt_injection",
@@ -49,10 +49,10 @@ EXPECTED_ANALYZER_NODE_IDS: list[str] = [
 
 
 class TestAnalyzerRegistry:
-    """Registry matches SADD spec node set and order."""
+    """Registry matches the expected node set and order."""
 
-    def test_analyzer_node_ids_match_sadd_spec(self):
-        """ANALYZER_NODE_IDS equals expected list from SADD spec."""
+    def test_analyzer_node_ids_match_expected(self):
+        """ANALYZER_NODE_IDS equals the expected list."""
         assert ANALYZER_NODE_IDS == EXPECTED_ANALYZER_NODE_IDS
 
     def test_analyzer_nodes_has_entry_for_every_id(self):

@@ -139,15 +139,20 @@ def _scan_state(
     return state
 
 
+def _result_body(result: dict) -> str:
+    report_body = result.get("report_body") or ""
+    if not report_body and result.get("sarif_report") is not None:
+        report_body = json.dumps(result["sarif_report"], indent=2)
+    return report_body
+
+
 def _write_result(
     result: dict[str, object],
     output: Path | None,
     format: FormatChoice,
 ) -> None:
     """Write report_body to file or stdout. Uses sarif_report if report_body missing."""
-    report_body = result.get("report_body") or ""
-    if not report_body and result.get("sarif_report") is not None:
-        report_body = json.dumps(result["sarif_report"], indent=2)
+    report_body = _result_body(result)
     if output:
         Path(output).write_text(report_body, encoding="utf-8")
         if format == FormatChoice.terminal:
@@ -429,9 +434,13 @@ def _scan_multi_skill(
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
     elif output:
-        for _skill, result in zip(skills, results, strict=True):
+        # concatenated non-JSON output: not merged SARIF
+        sections = []
+        for skill, result in zip(skills, results, strict=True):
             if "error" not in result:
-                _write_result(result, None, format)
+                sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
+        Path(output).write_text("\n\n".join(sections), encoding="utf-8")
+        console.print(f"[green]Combined report saved to:[/green] {output}")
 
     if max_score > 50:
         raise typer.Exit(code=1)

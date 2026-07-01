@@ -668,6 +668,48 @@ class TestTP4Fallbacks:
         assert len(tp4) == 0
 
 
+class TestTP4Telemetry:
+    """TP4 records llm_call_log so the report's degradation detector counts it
+    consistently with the semantic analyzers and the meta-analyzer."""
+
+    def test_successful_call_records_ok_true(self):
+        from unittest.mock import patch
+
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        with patch(
+            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion",
+            return_value='{"is_mismatch": false}',
+        ):
+            result = node(state)
+        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+
+    def test_failed_call_records_ok_false(self):
+        from unittest.mock import patch
+
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        with patch(
+            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion",
+            side_effect=RuntimeError("timeout"),
+        ):
+            result = node(state)
+        log = result["llm_call_log"]
+        assert log[0]["node"] == "mcp_tool_poisoning"
+        assert log[0]["ok"] is False
+        assert "timeout" in log[0]["error"]
+
+    def test_no_llm_call_attempted_records_nothing(self):
+        # No description -> TP4 never reaches the LLM call -> no telemetry record,
+        # so an intentional no-op is not counted as a degraded LLM stage.
+        state = _make_state(manifest={"name": "test"}, use_llm=True)
+        result = node(state)
+        assert "llm_call_log" not in result
+
+    def test_use_llm_false_records_nothing(self):
+        state = _make_state("mcp_mismatched_skill", use_llm=False)
+        result = node(state)
+        assert "llm_call_log" not in result
+
+
 # ---------------------------------------------------------------------------
 # Full-pipeline integration tests
 # ---------------------------------------------------------------------------

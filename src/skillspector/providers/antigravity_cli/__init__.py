@@ -13,3 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Antigravity CLI provider package (registered but disabled — see provider.py)."""
+
+from __future__ import annotations
+
+from .provider import AntigravityCLIProvider
+
+__all__ = ["AntigravityCLIProvider"]

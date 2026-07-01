@@ -82,6 +82,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "TM1": "Tool parameters are crafted to achieve unintended or unsafe behavior. Parameter abuse can bypass intended safety checks (e.g. shell=True, --force, dangerous glob patterns).",
     "TM2": "Tool calls are chained to bypass individual safety checks or escalate capabilities beyond what any single tool call would allow.",
     "TM3": "Tool defaults are unsafe or overly permissive (e.g. disabled TLS verification, no authentication, world-writable permissions). Unsafe defaults widen the attack surface.",
+    "TM4": "Code deploys a privileged Kubernetes workload (privileged container, hostPath mount, or host namespaces). This grants root on the node and is a node/cluster takeover vector.",
     # Rogue Agent (B.1.11)
     "RA1": "Skill modifies its own code, configuration, or behavior at runtime. Self-modification enables an agent to escalate privileges, disable safety constraints, or install persistent backdoors.",
     "RA2": "Skill establishes unauthorized persistence across sessions via cron jobs, startup scripts, or state files. Session persistence allows an attacker to maintain access beyond the current interaction.",
@@ -172,6 +173,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "TM1": PatternCategory.TOOL_MISUSE.value,
     "TM2": PatternCategory.TOOL_MISUSE.value,
     "TM3": PatternCategory.TOOL_MISUSE.value,
+    "TM4": PatternCategory.TOOL_MISUSE.value,
     "RA1": PatternCategory.ROGUE_AGENT.value,
     "RA2": PatternCategory.ROGUE_AGENT.value,
     "SC4": PatternCategory.SUPPLY_CHAIN.value,
@@ -248,6 +250,7 @@ PATTERN_NAMES: dict[str, str] = {
     "TM1": "Tool Parameter Abuse",
     "TM2": "Chaining Abuse",
     "TM3": "Unsafe Defaults",
+    "TM4": "Privileged Kubernetes Workload",
     "RA1": "Self-Modification",
     "RA2": "Session Persistence",
     "SC4": "Known Vulnerable Dependency",
@@ -329,6 +332,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "TM1": "Validate all tool parameters against an allowlist. Reject dangerous parameter values (shell=True, --force, -rf /) and use safe defaults.",
     "TM2": "Limit tool chaining depth and validate the output of each tool before passing it to the next. Require explicit user approval for multi-step chains.",
     "TM3": "Override unsafe defaults with secure settings (verify=True, auth required, restrictive permissions). Review and harden all tool configurations.",
+    "TM4": "Remove privileged, hostPath, and host-namespace settings from workloads. Use a least-privilege securityContext, drop capabilities, and avoid mounting the host filesystem.",
     # Rogue Agent (B.1.11)
     "RA1": "Prevent the skill from modifying its own code, SKILL.md, or configuration files. Treat skill files as read-only at runtime.",
     "RA2": "Remove any persistence mechanisms (cron jobs, startup scripts, state files). Skills should not maintain state across sessions without explicit user consent.",

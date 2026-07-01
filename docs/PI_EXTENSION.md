@@ -5,7 +5,7 @@ SkillSpector can be installed into Pi as a local package. The extension register
 ## Requirements
 
 - Pi installed.
-- Python `>=3.12,<3.14`.
+- Python `>=3.12,<3.15`.
 - `uv` recommended.
 - This repo checked out locally.
 

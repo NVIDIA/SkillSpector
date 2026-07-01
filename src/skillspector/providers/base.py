@@ -13,7 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Protocols for pluggable LLM providers."""
+"""Protocols for pluggable LLM providers.
+
+Two optional capability protocols are also defined here for providers that
+bypass the HTTP API entirely (e.g. CLI-based providers):
+
+- :class:`AgentCLICapable` — providers that implement ``is_available()``
+  and ``complete()`` use these instead of the ``ChatOpenAI`` path.
+
+Callers use :func:`has_cli_capability` to detect these providers at
+runtime without requiring a formal ``isinstance`` check against the
+protocols (which Python structural subtyping does not enforce at runtime
+without an explicit ``runtime_checkable`` decorator).
+"""
 
 from __future__ import annotations
 
@@ -69,5 +81,45 @@ class ChatModelProvider(Protocol):
     ) -> BaseChatModel | None: ...
 
 
+class AgentCLICapable(Protocol):
+    """Optional extension for providers that drive a local agent CLI.
+
+    Providers that implement these two methods opt in to the CLI transport
+    path in :func:`skillspector.llm_utils.chat_completion`.  Existing
+    HTTP-based providers are not required to implement them.
+
+    ``is_available()``
+        Return ``(True, None)`` when the underlying binary is on PATH and
+        the CLI appears to be authenticated.  Return ``(False, reason)``
+        otherwise.  This replaces the credential-based availability check
+        in :func:`skillspector.llm_utils.is_llm_available` for CLI providers.
+
+    ``complete(prompt, *, model, max_output_tokens)``
+        Execute the CLI, pass the prompt via stdin, and return the
+        assistant's text response.  Raises on any failure (fail-closed).
+    """
+
+    def is_available(self) -> tuple[bool, str | None]: ...
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        max_output_tokens: int,
+    ) -> str: ...
+
+
 class LLMProvider(ModelMetadataProvider, CredentialsProvider, ChatModelProvider, Protocol):
     """Complete provider surface used by SkillSpector's LLM stack."""
+
+
+def has_cli_capability(provider: object) -> bool:
+    """Return ``True`` when *provider* implements the :class:`AgentCLICapable` interface.
+
+    Uses duck-typing rather than ``isinstance`` so that providers added
+    externally (outside this package) also qualify.
+    """
+    return callable(getattr(provider, "is_available", None)) and callable(
+        getattr(provider, "complete", None)
+    )

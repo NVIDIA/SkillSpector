@@ -49,7 +49,7 @@ class TestUseLlmGuard:
     def test_returns_empty_when_use_llm_false(self) -> None:
         state = {"use_llm": False, "file_cache": {"main.py": "import os"}}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_use_llm_true_proceeds(self) -> None:
@@ -58,7 +58,7 @@ class TestUseLlmGuard:
 
         with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
             result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +70,12 @@ class TestEmptyFileCache:
     def test_returns_empty_when_no_files(self) -> None:
         state = {"file_cache": {}}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     def test_returns_empty_when_file_cache_missing(self) -> None:
         state = {}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ class TestWorksWithoutManifest:
         with patch.object(LLMAnalyzerBase, "__init__", _patched_init):
             result = node(state)  # must not raise
 
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_empty_manifest_uses_placeholder(self) -> None:
@@ -220,7 +220,7 @@ class TestErrorHandling:
         mock_get_model.side_effect = RuntimeError("LLM service unavailable")
         state = {"file_cache": {"skill.py": "import os"}}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     @patch(MOCK_PATCH_TARGET)
     def test_reraises_value_error(self, mock_get_model: MagicMock) -> None:
@@ -228,6 +228,32 @@ class TestErrorHandling:
         state = {"file_cache": {"skill.py": "import os"}}
         with pytest.raises(ValueError, match="API key"):
             node(state)
+
+
+# ---------------------------------------------------------------------------
+# LLM call telemetry (llm_call_log; drives the report's degradation signal)
+# ---------------------------------------------------------------------------
+
+
+class TestLLMCallTelemetry:
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_success_records_ok_true(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
+            result = node({"file_cache": {"main.py": "import os"}})
+        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+
+    @patch(MOCK_PATCH_TARGET)
+    def test_exception_records_ok_false(self, mock_get_model: MagicMock) -> None:
+        mock_get_model.side_effect = RuntimeError("boom")
+        result = node({"file_cache": {"main.py": "import os"}})
+        assert result["llm_call_log"][0]["node"] == ANALYZER_ID
+        assert result["llm_call_log"][0]["ok"] is False
+
+    def test_use_llm_false_records_nothing(self) -> None:
+        result = node({"use_llm": False, "file_cache": {"main.py": "import os"}})
+        assert "llm_call_log" not in result
 
 
 # ---------------------------------------------------------------------------

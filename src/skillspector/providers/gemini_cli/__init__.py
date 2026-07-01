@@ -13,3 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Gemini CLI provider package (verified against gemini 0.46.0)."""
+
+from __future__ import annotations
+
+from .provider import GeminiCLIProvider
+
+__all__ = ["GeminiCLIProvider"]
