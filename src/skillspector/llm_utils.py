@@ -35,6 +35,9 @@ other OpenAI-compatible endpoint is configured via the standard
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+from collections.abc import Coroutine
+from typing import Any
 import json
 from typing import NoReturn
 
@@ -276,3 +279,29 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     if hasattr(response, "text"):
         return response.text  # type: ignore[union-attr]
     return response.content or ""  # type: ignore[union-attr]
+
+
+def run_async(coroutine: Coroutine) -> Any:
+    """
+    Run an async coroutine in a synchronous context, even if there's already a running event loop.
+
+    This function safely handles nested event loop scenarios (e.g. Jupyter Notebooks, FastAPI,
+    LangGraph Studio) by offloading the coroutine execution to a separate thread with its own
+    event loop when a running loop is detected.
+
+    Args:
+        coroutine: The async coroutine to run
+
+    Returns:
+        The result of the coroutine execution
+
+    Raises:
+        Any exception raised by the coroutine is re-raised as-is
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coroutine).result()
