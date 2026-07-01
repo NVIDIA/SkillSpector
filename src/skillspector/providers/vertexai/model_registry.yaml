@@ -1,6 +1,5 @@
-# Token-budget metadata for the OpenAIProvider (stock api.openai.com or any
-# OpenAI-compatible endpoint via OPENAI_BASE_URL).  Bundled with the
-# package; consulted whenever the active provider is OpenAIProvider.
+# Token-budget metadata for the VertexAIProvider. Bundled with the
+# package; consulted whenever the active provider is VertexAIProvider.
 #
 # Format:
 #   models:
@@ -9,10 +8,7 @@
 #       max_output_tokens: <int>       # model's max output cap (optional)
 
 models:
-  "gpt-5.4":
-    context_length: 1000000
-    max_output_tokens: 128000
-  # Google Gemini models (via VertexAI or AI Studio OpenAI-compatible endpoints)
+  # Google Gemini models (via VertexAI)
   "gemini-2.0-flash":
     context_length: 1048576
     max_output_tokens: 8192
