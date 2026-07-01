@@ -262,6 +262,51 @@ class TestWithStructuredOutput:
 
         assert result.value == "fenced"
 
+    def test_pydantic_schema_path_accepts_plain_string_prompt(self):
+        """A bare string prompt (as LLMAnalyzerBase passes) must still get the
+        JSON-schema instruction appended, not be iterated character-by-character.
+        """
+        from pydantic import BaseModel as PydanticModel
+
+        class MySchema(PydanticModel):
+            value: str
+
+        model = _model()
+        runnable = model.with_structured_output(MySchema)
+        captured: list[str] = []
+
+        def fake_call(prompt: str) -> str:
+            captured.append(prompt)
+            return '{"value": "ok"}'
+
+        with patch.object(model, "_call_subprocess", side_effect=fake_call):
+            result = runnable.invoke("plain string prompt")
+
+        assert isinstance(result, MySchema)
+        assert result.value == "ok"
+        assert len(captured) == 1
+        assert "plain string prompt" in captured[0]
+        assert "JSON Schema" in captured[0]
+
+    def test_dict_schema_path_accepts_plain_string_prompt(self):
+        """A bare string prompt must work for the dict-schema path too."""
+        model = _model()
+        schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+        runnable = model.with_structured_output(schema)
+        captured: list[str] = []
+
+        def fake_call(prompt: str) -> str:
+            captured.append(prompt)
+            return '{"x": 42}'
+
+        with patch.object(model, "_call_subprocess", side_effect=fake_call):
+            result = runnable.invoke("plain string prompt")
+
+        assert result == {"x": 42}
+        assert len(captured) == 1
+        assert "plain string prompt" in captured[0]
+        assert "JSON Schema" in captured[0]
+
 
 class TestExitCode1Diagnostic:
     """exit code 1 diagnostic hint for headless claude sessions."""
@@ -289,3 +334,50 @@ class TestExitCode1Diagnostic:
                 model._call_subprocess("test prompt")
         assert "enterprise session credentials" not in str(exc_info.value)
         assert "exit 1" in str(exc_info.value)
+
+
+class TestLLMAnalyzerBaseIntegration:
+    """End-to-end regression test: LLMAnalyzerBase.run_batches through the
+    subprocess provider's with_structured_output() RunnableLambda.
+
+    This is the exact call path that motivated the fix: LLMAnalyzerBase
+    invokes the structured runnable with a plain string prompt (not a
+    message list), and the runnable must coerce that string before
+    appending the JSON-schema instruction.
+    """
+
+    def test_run_batches_end_to_end_with_subprocess_provider(self, monkeypatch):
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "subprocess")
+        monkeypatch.setenv("SKILLSPECTOR_LLM_COMMAND", "claude -p")
+
+        from skillspector.llm_analyzer_base import Batch, LLMAnalyzerBase
+
+        canned_json = (
+            '{"findings": [{"rule_id": "TEST001", "message": "found it", '
+            '"severity": "HIGH", "start_line": 1}]}'
+        )
+        captured: list[str] = []
+
+        def fake_call(prompt: str) -> str:
+            captured.append(prompt)
+            return canned_json
+
+        with patch.object(SubprocessChatModel, "_call_subprocess", side_effect=fake_call):
+            analyzer = LLMAnalyzerBase(base_prompt="Look for issues.", model="subprocess")
+            batch = Batch(file_path="foo.py", content="print('hi')")
+            results = analyzer.run_batches([batch])
+
+        # The prompt built by LLMAnalyzerBase must reach _call_subprocess intact
+        # (not iterated character-by-character) and carry the JSON-schema
+        # instruction appended by with_structured_output().
+        assert len(captured) == 1
+        assert "foo.py" in captured[0]
+        assert "JSON Schema" in captured[0]
+
+        assert len(results) == 1
+        result_batch, findings = results[0]
+        assert result_batch is batch
+        assert len(findings) == 1
+        assert findings[0].rule_id == "TEST001"
+        assert findings[0].message == "found it"
+        assert findings[0].severity == "HIGH"

@@ -75,6 +75,27 @@ def _augment_messages_with_json_instruction(
     return augmented
 
 
+def _normalize_to_messages(value: Any) -> list[BaseMessage]:
+    """Normalize supported LangChain Runnable inputs to a list of BaseMessage.
+
+    ``RunnableLambda.invoke()`` (unlike ``BaseChatModel.invoke()``) does no
+    str-to-messages coercion, so callers that pass a plain string (as
+    ``LLMAnalyzerBase.run_batches``/``arun_batches`` do) must be normalized
+    here or ``_augment_messages_with_json_instruction`` silently iterates the
+    string character-by-character instead of appending the schema instruction.
+    """
+    if isinstance(value, str):
+        return [HumanMessage(content=value)]
+    if isinstance(value, BaseMessage):
+        return [value]
+    if isinstance(value, list):
+        return value
+    if hasattr(value, "to_messages"):
+        messages: list[BaseMessage] = value.to_messages()
+        return messages
+    raise TypeError(f"Unsupported input to SubprocessChatModel runnable: {type(value)!r}")
+
+
 def _strip_fences(text: str) -> str:
     """Strip markdown code fences from a string."""
     clean = text.strip()
@@ -180,7 +201,8 @@ class SubprocessChatModel(BaseChatModel):
         if isinstance(schema, dict):
             schema_str = json.dumps(schema, indent=2)
 
-            def inject_and_parse_dict(messages: list[BaseMessage]) -> Any:
+            def inject_and_parse_dict(messages: Any) -> Any:
+                messages = _normalize_to_messages(messages)
                 augmented = _augment_messages_with_json_instruction(messages, schema_str)
                 raw_text = str(self.invoke(augmented).content)
                 clean = _strip_fences(raw_text)
@@ -190,7 +212,8 @@ class SubprocessChatModel(BaseChatModel):
         elif isinstance(schema, type) and issubclass(schema, BaseModel):
             schema_str = json.dumps(schema.model_json_schema(), indent=2)
 
-            def inject_and_parse(messages: list[BaseMessage]) -> BaseModel:
+            def inject_and_parse(messages: Any) -> BaseModel:
+                messages = _normalize_to_messages(messages)
                 augmented = _augment_messages_with_json_instruction(messages, schema_str)
                 raw_text = str(self.invoke(augmented).content)
                 clean = _strip_fences(raw_text)
