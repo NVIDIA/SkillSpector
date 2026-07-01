@@ -1,0 +1,4 @@
+[[IgnoredVulns]]
+id = "MAL-2026-6561"
+# ignoreUntil = 2022-11-09 # Optional exception expiry date
+reason = "No actual action can be taken as the pypi has already removed it"
