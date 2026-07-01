@@ -1,4 +1,8 @@
-import sys, os, uuid, time, pathlib
+import os
+import pathlib
+import sys
+import time
+import uuid
 
 MAILBOX = pathlib.Path(os.environ.get("SKILLSPECTOR_MAILBOX", r"C:\temp\skillspector-mailbox"))
 TIMEOUT = int(os.environ.get("SKILLSPECTOR_BRIDGE_TIMEOUT", "90"))
@@ -11,7 +15,7 @@ resp_file = MAILBOX / f"{uid}.resp"
 prompt = sys.stdin.read()
 req_file.write_text(prompt, encoding="utf-8")
 
-for _ in range(TIMEOUT * 2):        # poll every 0.5 s
+for _ in range(TIMEOUT * 2):  # poll every 0.5 s
     time.sleep(0.5)
     if resp_file.exists():
         try:

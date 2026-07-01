@@ -288,7 +288,8 @@ class LLMAnalyzerBase:
             hashlib.sha256(
                 json.dumps(self.response_schema.model_json_schema(), sort_keys=True).encode()
             ).hexdigest()[:12]
-            if self.response_schema else "raw"
+            if self.response_schema
+            else "raw"
         )
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
@@ -297,7 +298,9 @@ class LLMAnalyzerBase:
         )
 
     def _cache_key(self, prompt: str) -> CacheKey:
-        return make_cache_key(content=prompt, prompt_template=self.model, schema_version=self._schema_version)
+        return make_cache_key(
+            content=prompt, prompt_template=self.model, schema_version=self._schema_version
+        )
 
     def _emit_progress(self, file_label: str, stage: str, detail: str = "") -> None:
         """Print a single-line LLM progress indicator to stderr."""
@@ -434,9 +437,7 @@ class LLMAnalyzerBase:
                         results.append((batch, parsed))
                         continue
                     except Exception as exc:  # noqa: BLE001
-                        logger.debug(
-                            "Cache hit but parse failed, calling LLM: %s", exc
-                        )
+                        logger.debug("Cache hit but parse failed, calling LLM: %s", exc)
 
             # --- LLM call ----------------------------------------------------
             self._emit_progress(batch.file_label, "requesting...")
@@ -507,18 +508,14 @@ class LLMAnalyzerBase:
                     self._emit_progress(batch.file_label, "cache hit")
                     try:
                         raw = json.loads(cached)
-                        if self.response_schema and hasattr(
-                            self.response_schema, "model_validate"
-                        ):
+                        if self.response_schema and hasattr(self.response_schema, "model_validate"):
                             response: object = self.response_schema.model_validate(raw)
                         else:
                             response = raw
                         parsed = self.parse_response(response, batch)
                         return (batch, parsed)
                     except Exception as exc:  # noqa: BLE001
-                        logger.debug(
-                            "Cache hit but parse failed, calling LLM: %s", exc
-                        )
+                        logger.debug("Cache hit but parse failed, calling LLM: %s", exc)
 
             async with sem:
                 self._emit_progress(batch.file_label, "requesting...")

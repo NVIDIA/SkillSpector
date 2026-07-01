@@ -340,9 +340,7 @@ def _make_state_with_shell(has_permissions: bool = False) -> dict:
             "permissions": ["network"] if has_permissions else [],
         },
         "file_cache": {"scripts/run.py": "import subprocess\nsubprocess.run(['ls'])"},
-        "component_metadata": [
-            {"path": "scripts/run.py", "executable": True, "type": "python"}
-        ],
+        "component_metadata": [{"path": "scripts/run.py", "executable": True, "type": "python"}],
     }
 
 

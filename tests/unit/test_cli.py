@@ -154,21 +154,15 @@ def test_baseline_warns_on_overwrite(safe_skill_dir: Path) -> None:
 def test_baseline_auto_discovery_is_opt_in(safe_skill_dir: Path) -> None:
     """baseline file in scanned dir is NOT auto-loaded by default (opt-in only)."""
     baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
-    baseline_file.write_text(
-        "version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8"
-    )
-    result = runner.invoke(
-        app, ["scan", str(safe_skill_dir), "--no-llm", "--format", "json"]
-    )
+    baseline_file.write_text("version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8")
+    result = runner.invoke(app, ["scan", str(safe_skill_dir), "--no-llm", "--format", "json"])
     assert "Baseline: applying" not in result.output
 
 
 def test_auto_baseline_flag_enables_auto_discovery(safe_skill_dir: Path) -> None:
     """--auto-baseline must opt in to auto-discovering the baseline file."""
     baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
-    baseline_file.write_text(
-        "version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8"
-    )
+    baseline_file.write_text("version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8")
     result = runner.invoke(
         app, ["scan", str(safe_skill_dir), "--no-llm", "--auto-baseline", "--format", "json"]
     )
@@ -206,9 +200,7 @@ def test_recursive_depth_fallback_warning_message(safe_skill_dir: Path, tmp_path
     deep.mkdir(parents=True)
     (deep / "SKILL.md").write_text("---\nname: deep\n---\n", encoding="utf-8")
 
-    result = runner.invoke(
-        app, ["scan", str(col), "--recursive", "--no-llm", "--format", "json"]
-    )
+    result = runner.invoke(app, ["scan", str(col), "--recursive", "--no-llm", "--format", "json"])
     assert "--depth 2" in result.output or "--depth 2" in result.output.lower()
 
 
@@ -253,7 +245,7 @@ def test_recursive_json_without_detail_no_issues(tmp_path: Path) -> None:
         d.mkdir()
         (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
     out_file = tmp_path / "results.json"
-    result = runner.invoke(
+    runner.invoke(
         app,
         [
             "scan",

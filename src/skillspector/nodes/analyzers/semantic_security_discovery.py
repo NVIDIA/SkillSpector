@@ -90,7 +90,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     try:
         cache_dir = state.get("llm_cache_dir")
         cache = LLMResponseCache(Path(cache_dir)) if cache_dir else None
-        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model, analyzer_id=ANALYZER_ID, cache=cache)
+        analyzer = LLMAnalyzerBase(
+            base_prompt=ANALYZER_PROMPT, model=model, analyzer_id=ANALYZER_ID, cache=cache
+        )
         batches = analyzer.get_batches(components, file_cache)
         results = analyzer.run_batches(batches)
         findings = analyzer.collect_findings(results)

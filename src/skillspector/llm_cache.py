@@ -22,6 +22,7 @@ Cache location: a trusted, per-skill directory under the OS application-cache
 root (see `default_cache_dir`), never inside the scanned skill directory.
 Disable entirely: set SKILLSPECTOR_NO_LLM_CACHE=1.
 """
+
 from __future__ import annotations
 
 import hashlib

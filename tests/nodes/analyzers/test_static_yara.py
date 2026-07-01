@@ -457,8 +457,8 @@ class TestHelpers:
 class TestNegationContextFilter:
     def test_yara_negation_context_reduces_confidence(self):
         """YR4 hitting a phrase that appears in a negating sentence should lower confidence."""
-        from skillspector.nodes.analyzers.static_yara import _apply_negation_context_filter
         from skillspector.models import AnalyzerFinding, Location, Severity
+        from skillspector.nodes.analyzers.static_yara import _apply_negation_context_filter
 
         # Content where the injection phrase is framed as a defense
         finding = AnalyzerFinding(
@@ -476,8 +476,8 @@ class TestNegationContextFilter:
 
     def test_yara_security_education_tag(self):
         """YR1/YR4 hitting inside a ## Safety section should get security_education tag."""
-        from skillspector.nodes.analyzers.static_yara import _apply_negation_context_filter
         from skillspector.models import AnalyzerFinding, Location, Severity
+        from skillspector.nodes.analyzers.static_yara import _apply_negation_context_filter
 
         finding = AnalyzerFinding(
             rule_id="YR1",
@@ -495,8 +495,8 @@ class TestNegationContextFilter:
 
     def test_yara_no_reduction_for_genuine_match(self):
         """A genuine injection phrase without negation should NOT be reduced."""
-        from skillspector.nodes.analyzers.static_yara import _apply_negation_context_filter
         from skillspector.models import AnalyzerFinding, Location, Severity
+        from skillspector.nodes.analyzers.static_yara import _apply_negation_context_filter
 
         finding = AnalyzerFinding(
             rule_id="YR4",

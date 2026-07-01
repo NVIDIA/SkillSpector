@@ -146,7 +146,7 @@ class TestSubprocessProviderSelection:
 class TestHelperFunctions:
     def test_strip_fences_removes_markdown(self):
         """Test that markdown code fences are stripped from response text."""
-        text = "```json\n{\"key\": \"value\"}\n```"
+        text = '```json\n{"key": "value"}\n```'
         assert _strip_fences(text) == '{"key": "value"}'
 
     def test_strip_fences_passthrough_plain(self):

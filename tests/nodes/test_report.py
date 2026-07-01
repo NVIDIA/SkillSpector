@@ -469,7 +469,10 @@ class TestReportNode:
             "trust_skill_classification": True,
         }
         result = report(state)
-        assert result["risk_recommendation"] == "AUTHORIZED OFFENSIVE TOOL — review findings in context"
+        assert (
+            result["risk_recommendation"]
+            == "AUTHORIZED OFFENSIVE TOOL — review findings in context"
+        )
 
     def test_json_output_always_includes_skill_declared_classification(self) -> None:
         """skill_declared_classification is a top-level JSON field regardless of

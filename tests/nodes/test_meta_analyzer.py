@@ -149,7 +149,6 @@ def test_critical_finding_kept_when_rejected_by_llm() -> None:
     assert "llm-unconfirmed" in kept[0].tags
 
 
-
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
 class TestMetaAnalyzerPartialBatchFailure:
     def _state(self, findings: list[Finding]) -> dict[str, object]:
@@ -283,10 +282,14 @@ def test_meta_analyzer_batches_large_finding_sets(monkeypatch) -> None:
             call_count["n"] += 1
             return []  # return empty so filtered_findings is empty (fine for count test)
 
-        with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches):
+        with patch(
+            "skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches
+        ):
             meta_analyzer(state)
 
-        assert call_count["n"] >= 2, "Should split into multiple arun_batches calls when findings > batch size"
+        assert call_count["n"] >= 2, (
+            "Should split into multiple arun_batches calls when findings > batch size"
+        )
     finally:
         monkeypatch.delenv("SKILLSPECTOR_META_BATCH_SIZE", raising=False)
         importlib.reload(skillspector.constants)
@@ -298,9 +301,39 @@ def test_split_files_into_batches_groups_files_correctly() -> None:
 
     # 3 files with 2, 3, 2 findings each; max_findings=4
     findings = (
-        [Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="a.py", start_line=i) for i in range(2)]
-        + [Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="b.py", start_line=i) for i in range(3)]
-        + [Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="c.py", start_line=i) for i in range(2)]
+        [
+            Finding(
+                rule_id="R1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="a.py",
+                start_line=i,
+            )
+            for i in range(2)
+        ]
+        + [
+            Finding(
+                rule_id="R1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="b.py",
+                start_line=i,
+            )
+            for i in range(3)
+        ]
+        + [
+            Finding(
+                rule_id="R1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="c.py",
+                start_line=i,
+            )
+            for i in range(2)
+        ]
     )
     files = ["a.py", "b.py", "c.py"]
     groups = _split_files_into_batches(files, findings, max_findings=4)
@@ -318,8 +351,12 @@ def test_split_files_into_batches_single_group_when_under_limit() -> None:
     from skillspector.nodes.meta_analyzer import _split_files_into_batches
 
     findings = [
-        Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="a.py", start_line=1),
-        Finding(rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="b.py", start_line=1),
+        Finding(
+            rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="a.py", start_line=1
+        ),
+        Finding(
+            rule_id="R1", message="m", severity="MEDIUM", confidence=0.8, file="b.py", start_line=1
+        ),
     ]
     groups = _split_files_into_batches(["a.py", "b.py"], findings, max_findings=10)
     assert len(groups) == 1
@@ -339,8 +376,22 @@ def test_meta_analyzer_reads_batch_size_at_call_time(monkeypatch) -> None:
     try:
         # 2 findings in 2 files; batch size=1 means each file is its own group
         findings = [
-            Finding(rule_id="E1", message="m", severity="MEDIUM", confidence=0.8, file="f1.py", start_line=1),
-            Finding(rule_id="E2", message="m", severity="MEDIUM", confidence=0.8, file="f2.py", start_line=1),
+            Finding(
+                rule_id="E1",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="f1.py",
+                start_line=1,
+            ),
+            Finding(
+                rule_id="E2",
+                message="m",
+                severity="MEDIUM",
+                confidence=0.8,
+                file="f2.py",
+                start_line=1,
+            ),
         ]
         from skillspector.state import SkillspectorState
 
@@ -358,7 +409,10 @@ def test_meta_analyzer_reads_batch_size_at_call_time(monkeypatch) -> None:
             call_count["n"] += 1
             return []
 
-        with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches", fake_arun_batches_call_time):
+        with patch(
+            "skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches",
+            fake_arun_batches_call_time,
+        ):
             meta_analyzer(state)
 
         assert call_count["n"] == 2, "With batch size=1 and 2 files, expect 2 separate LLM calls"

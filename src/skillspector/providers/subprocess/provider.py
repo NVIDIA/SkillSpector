@@ -136,7 +136,9 @@ class SubprocessChatModel(BaseChatModel):
     """
 
     command: str = Field(description="Shell command to invoke (split on whitespace)")
-    timeout: float = Field(default=_DEFAULT_TIMEOUT, description="Seconds before subprocess times out")
+    timeout: float = Field(
+        default=_DEFAULT_TIMEOUT, description="Seconds before subprocess times out"
+    )
 
     @property
     def _llm_type(self) -> str:

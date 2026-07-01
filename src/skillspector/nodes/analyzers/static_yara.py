@@ -55,11 +55,27 @@ _DEFAULT_SEVERITY = Severity.MEDIUM
 _DEFAULT_CONFIDENCE = 0.7
 
 # Negation words that, when near a flagged phrase, suggest defensive framing
-_NEGATION_WORDS = frozenset({
-    "not", "never", "don't", "dont", "avoid", "prevent", "untrusted",
-    "block", "reject", "refuse", "warning", "do not", "must not",
-    "should not", "shouldn't", "prohibited", "forbidden",
-})
+_NEGATION_WORDS = frozenset(
+    {
+        "not",
+        "never",
+        "don't",
+        "dont",
+        "avoid",
+        "prevent",
+        "untrusted",
+        "block",
+        "reject",
+        "refuse",
+        "warning",
+        "do not",
+        "must not",
+        "should not",
+        "shouldn't",
+        "prohibited",
+        "forbidden",
+    }
+)
 
 # Section headers that indicate security-education context
 _EDUCATION_HEADERS = re.compile(

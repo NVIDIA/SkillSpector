@@ -139,9 +139,7 @@ def _is_subprocess_test_fixture(node: ast.Call, aliases: dict[str, str] | None =
     """
     # Must have shell=False keyword
     has_shell_false = any(
-        kw.arg == "shell"
-        and isinstance(kw.value, ast.Constant)
-        and kw.value.value is False
+        kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is False
         for kw in node.keywords
     )
     if not has_shell_false:
@@ -191,7 +189,9 @@ def _contains_dangerous_source(node: ast.AST, aliases: dict[str, str] | None = N
     return None
 
 
-def _analyze_python(content: str, file_path: str, include_test_fixtures: bool = False) -> list[AnalyzerFinding]:
+def _analyze_python(
+    content: str, file_path: str, include_test_fixtures: bool = False
+) -> list[AnalyzerFinding]:
     try:
         tree = ast.parse(content, filename=file_path)
     except SyntaxError:
@@ -269,7 +269,9 @@ def _analyze_python(content: str, file_path: str, include_test_fixtures: bool = 
                             rule_id="AST4",
                             message="subprocess module call (likely test fixture — shell=False + sys.executable pattern)",
                             severity=Severity.LOW,
-                            location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
+                            location=Location(
+                                file=file_path, start_line=lineno, end_line=end_lineno
+                            ),
                             confidence=0.15,
                             tags=[_TAG, "likely_test_fixture"],
                             context=get_context_from_lines(lines, lineno),

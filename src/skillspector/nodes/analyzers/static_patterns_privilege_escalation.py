@@ -28,9 +28,16 @@ from . import static_runner
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
 
-_PE3_TEST_FUNCTION_KEYWORDS = frozenset({
-    "traversal", "path", "inject", "sanitize", "escape", "neutralize",
-})
+_PE3_TEST_FUNCTION_KEYWORDS = frozenset(
+    {
+        "traversal",
+        "path",
+        "inject",
+        "sanitize",
+        "escape",
+        "neutralize",
+    }
+)
 _kw = "|".join(sorted(_PE3_TEST_FUNCTION_KEYWORDS))
 _PE3_FIXTURE_FUNC_RE = re.compile(rf"\bdef\s+test_\w*(?:{_kw})\w*")
 
@@ -137,7 +144,9 @@ def _is_pe3_test_fixture(content: str, match_start: int, file_path: str) -> bool
     return has_test_func
 
 
-def analyze(content: str, file_path: str, file_type: str, include_test_fixtures: bool = False) -> list[AnalyzerFinding]:
+def analyze(
+    content: str, file_path: str, file_type: str, include_test_fixtures: bool = False
+) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
 
@@ -307,9 +316,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             if static_runner._is_binary_file(path, content):  # noqa: SLF001
                 continue
             file_type = static_runner._infer_file_type(path)  # noqa: SLF001
-            raw_findings.extend(
-                analyze(content, path, file_type, include_test_fixtures=True)
-            )
+            raw_findings.extend(analyze(content, path, file_type, include_test_fixtures=True))
         findings = [static_runner.analyzer_finding_to_finding(af) for af in raw_findings]
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     return {"findings": findings}

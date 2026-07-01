@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """Tests for LLM response cache."""
+
 import json
 import sqlite3
 from pathlib import Path
@@ -56,6 +57,7 @@ def test_cache_creates_db_on_first_use(tmp_path):
 
 def test_cache_key_from_content_and_prompt():
     from skillspector.llm_cache import make_cache_key
+
     key = make_cache_key(content="hello world", prompt_template="analyze: {}", schema_version="1")
     assert len(key.content_hash) == 16
     assert len(key.prompt_hash) == 16
@@ -92,7 +94,9 @@ def test_default_cache_dir_never_under_skill_dir(tmp_path):
         "updating this test."
     ),
 )
-def test_default_cache_dir_never_under_skill_dir_when_skill_dir_is_cache_root(tmp_path, monkeypatch):
+def test_default_cache_dir_never_under_skill_dir_when_skill_dir_is_cache_root(
+    tmp_path, monkeypatch
+):
     """Known gap: if skill_dir IS the OS cache root itself (not merely a subdirectory
     of it), the derived cache dir (hashed, under skillspector/llm-cache/<hash>) is
     necessarily nested under skill_dir, so containment is broken for this degenerate

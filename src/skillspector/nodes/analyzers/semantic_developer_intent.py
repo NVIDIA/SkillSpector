@@ -178,7 +178,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         cache_dir = state.get("llm_cache_dir")
         cache = LLMResponseCache(Path(cache_dir)) if cache_dir else None
         prompt = ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest))
-        analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model, analyzer_id=ANALYZER_ID, cache=cache)
+        analyzer = LLMAnalyzerBase(
+            base_prompt=prompt, model=model, analyzer_id=ANALYZER_ID, cache=cache
+        )
         batches = analyzer.get_batches(sorted(file_cache), file_cache)
         results = asyncio.run(analyzer.arun_batches(batches))
         findings = analyzer.collect_findings(results)
