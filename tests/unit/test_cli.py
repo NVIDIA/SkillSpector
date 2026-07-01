@@ -312,6 +312,49 @@ def test_scan_multi_skill_markdown_output_to_file(
     assert "BETA" not in captured.out
 
 
+def test_scan_multi_skill_sarif_output_to_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """SARIF recursive scan writes concatenated per-skill SARIF sections to file, not stdout."""
+    s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
+    s2 = SkillDirectory(path=tmp_path / "skill2", name="skill2", relative_path="skill2")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+
+    result1 = {
+        "report_body": "",
+        "sarif_report": {"runs": [{"tool": "skillspector", "results": ["ALPHA-FINDING"]}]},
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    result2 = {
+        "report_body": "",
+        "sarif_report": {"runs": [{"tool": "skillspector", "results": ["BETA-FINDING"]}]},
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    out = tmp_path / "report.sarif"
+
+    with patch("skillspector.cli.graph.invoke", side_effect=[result1, result2]):
+        _scan_multi_skill(
+            detection, FormatChoice.sarif, out, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    assert out.exists()
+    text = out.read_text()
+    assert "ALPHA-FINDING" in text
+    assert "BETA-FINDING" in text
+    assert "skill1" in text
+    assert "skill2" in text
+
+    captured = capsys.readouterr()
+    assert "ALPHA-FINDING" not in captured.out
+    assert "BETA-FINDING" not in captured.out
+
+
 def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
     """JSON recursive scan still produces a valid combined JSON file."""
     s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
