@@ -27,6 +27,7 @@ from pathlib import Path
 import yaml
 
 from skillspector.constants import MODEL_CONFIG
+from skillspector.llm_cache import default_cache_dir
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
 
@@ -34,7 +35,16 @@ logger = get_logger(__name__)
 
 # Directories to skip when walking
 _SKIP_DIRS = frozenset(
-    {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"}
+    {
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".tox",
+        ".pytest_cache",
+        ".skillspector-cache",
+    }
 )
 
 # File type by extension
@@ -267,5 +277,5 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
         "skill_classification": classification,
-        "llm_cache_dir": str(skill_dir / ".skillspector-cache"),
+        "llm_cache_dir": str(default_cache_dir(skill_dir)),
     }

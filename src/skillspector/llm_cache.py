@@ -18,7 +18,8 @@
 Caches LLM responses keyed by (file_content_hash, prompt_template_hash, schema_version).
 Unchanged files do not make repeated LLM calls across scan runs.
 
-Cache location: <skill_dir>/.skillspector-cache/llm_responses.db
+Cache location: a trusted, per-skill directory under the OS application-cache
+root (see `default_cache_dir`), never inside the scanned skill directory.
 Disable entirely: set SKILLSPECTOR_NO_LLM_CACHE=1.
 """
 from __future__ import annotations
@@ -63,6 +64,16 @@ def make_cache_key(content: str, prompt_template: str, schema_version: str) -> C
     )
 
 
+def default_cache_dir(skill_dir: Path) -> Path:
+    """Trusted application cache dir for *skill_dir*, always outside scanned content."""
+    if os.name == "nt":
+        root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    else:
+        root = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    key = hashlib.sha256(str(skill_dir.resolve()).encode("utf-8")).hexdigest()[:16]
+    return root / "skillspector" / "llm-cache" / key
+
+
 class LLMResponseCache:
     """SQLite-backed cache for LLM responses.
 
@@ -92,6 +103,8 @@ class LLMResponseCache:
     def _connect(self) -> sqlite3.Connection:
         """Open (or reuse) the SQLite connection, creating the schema if needed."""
         if self._conn is None:
+            if self._db_path.parent.is_symlink() or self._db_path.is_symlink():
+                raise RuntimeError(f"Refusing to use symlinked cache path: {self._db_path}")
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self._db_path))
             conn.execute(_SCHEMA_DDL)

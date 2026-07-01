@@ -15,9 +15,12 @@
 
 """Tests for LLM response cache."""
 import json
+import sqlite3
 from pathlib import Path
+
 import pytest
-from skillspector.llm_cache import LLMResponseCache, CacheKey
+
+from skillspector.llm_cache import CacheKey, LLMResponseCache, default_cache_dir
 
 
 def test_cache_miss_returns_none(tmp_path):
@@ -62,3 +65,140 @@ def test_cache_key_from_content_and_prompt():
     # Different content → different key
     key3 = make_cache_key(content="different", prompt_template="analyze: {}", schema_version="1")
     assert key3.content_hash != key.content_hash
+
+
+def test_default_cache_dir_never_under_skill_dir(tmp_path):
+    """The cache dir must always live outside the (untrusted) scanned skill directory."""
+    skill_dir = tmp_path / "some-skill"
+    skill_dir.mkdir()
+    cache_dir = default_cache_dir(skill_dir)
+    resolved_skill_dir = skill_dir.resolve()
+    resolved_cache_dir = cache_dir.resolve()
+    assert resolved_skill_dir not in resolved_cache_dir.parents
+    assert resolved_cache_dir != resolved_skill_dir
+
+
+def test_default_cache_dir_never_under_skill_dir_when_skill_dir_is_cache_root(tmp_path, monkeypatch):
+    """Edge case: even if the skill dir happens to sit inside a typical cache root,
+    the derived cache dir (hashed, under skillspector/llm-cache/<hash>) must not
+    resolve to a path under that skill dir.
+    """
+    fake_cache_root = tmp_path / "AppData" / "Local"
+    fake_cache_root.mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(fake_cache_root))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(fake_cache_root))
+
+    # skill_dir itself lives inside the cache root
+    skill_dir = fake_cache_root / "some-skill"
+    skill_dir.mkdir()
+
+    cache_dir = default_cache_dir(skill_dir)
+    resolved_skill_dir = skill_dir.resolve()
+    resolved_cache_dir = cache_dir.resolve()
+    assert resolved_skill_dir not in resolved_cache_dir.parents
+    assert resolved_cache_dir != resolved_skill_dir
+
+
+def test_default_cache_dir_is_stable_and_differs_per_skill_dir(tmp_path):
+    """Same skill_dir -> same cache dir; different skill_dir -> different cache dir."""
+    skill_dir_a = tmp_path / "skill-a"
+    skill_dir_b = tmp_path / "skill-b"
+    skill_dir_a.mkdir()
+    skill_dir_b.mkdir()
+
+    dir_a1 = default_cache_dir(skill_dir_a)
+    dir_a2 = default_cache_dir(skill_dir_a)
+    dir_b = default_cache_dir(skill_dir_b)
+
+    assert dir_a1 == dir_a2
+    assert dir_a1 != dir_b
+
+
+def test_llm_response_cache_refuses_symlinked_cache_dir(tmp_path, monkeypatch):
+    """LLMResponseCache._connect() must refuse when the cache dir itself is a symlink."""
+    real_target = tmp_path / "real_target"
+    real_target.mkdir()
+    cache_dir = tmp_path / "cache_link"
+
+    # Prefer a real symlink; fall back to mocking Path.is_symlink if unsupported
+    # (e.g. no admin/dev-mode privileges on Windows).
+    try:
+        cache_dir.symlink_to(real_target, target_is_directory=True)
+        used_real_symlink = True
+    except OSError:
+        used_real_symlink = False
+
+    if used_real_symlink:
+        cache = LLMResponseCache(cache_dir)
+        with pytest.raises(RuntimeError, match="symlink"):
+            cache._connect()
+    else:
+        cache_dir.mkdir()
+        cache = LLMResponseCache(cache_dir)
+        original_is_symlink = Path.is_symlink
+
+        def fake_is_symlink(self):
+            if self == cache._db_path.parent:
+                return True
+            return original_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+        with pytest.raises(RuntimeError, match="symlink"):
+            cache._connect()
+
+
+def test_llm_response_cache_refuses_symlinked_db_file(tmp_path, monkeypatch):
+    """get()/put() must not read/write through a symlinked db file."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    # Pre-seed a fake db file elsewhere and symlink llm_responses.db to it.
+    fake_db = tmp_path / "attacker_controlled.db"
+    conn = sqlite3.connect(str(fake_db))
+    conn.execute(
+        "CREATE TABLE llm_responses ("
+        "content_hash TEXT, prompt_hash TEXT, schema_version TEXT, response_json TEXT,"
+        " created_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO llm_responses VALUES ('abc123', 'def456', '1', '{\"evil\": true}', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    db_link = cache_dir / "llm_responses.db"
+
+    try:
+        db_link.symlink_to(fake_db)
+        used_real_symlink = True
+    except OSError:
+        used_real_symlink = False
+
+    key = CacheKey(content_hash="abc123", prompt_hash="def456", schema_version="1")
+
+    if used_real_symlink:
+        cache = LLMResponseCache(cache_dir)
+        assert cache.get(key) is None
+        cache.put(key, '{"trusted": true}')
+        # Verify put() did not write through the symlink into the attacker's db.
+        conn = sqlite3.connect(str(fake_db))
+        rows = conn.execute("SELECT response_json FROM llm_responses").fetchall()
+        conn.close()
+        assert rows == [('{"evil": true}',)]
+    else:
+        cache = LLMResponseCache(cache_dir)
+        original_is_symlink = Path.is_symlink
+
+        def fake_is_symlink(self):
+            if self == cache._db_path:
+                return True
+            return original_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+        assert cache.get(key) is None
+        cache.put(key, '{"trusted": true}')
+        # The fake db file must remain untouched.
+        conn = sqlite3.connect(str(fake_db))
+        rows = conn.execute("SELECT response_json FROM llm_responses").fetchall()
+        conn.close()
+        assert rows == [('{"evil": true}',)]
