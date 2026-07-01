@@ -29,6 +29,7 @@ Ported from legacy implementation.
 from __future__ import annotations
 
 import ipaddress
+import re
 import shutil
 import socket
 import subprocess
@@ -160,6 +161,13 @@ class InputHandler:
             return False
         return not self._is_git_url(path)
 
+    def _extract_scp_host(self, url: str) -> str | None:
+        """Return the host from an scp-style Git URL, or None if not scp form."""
+        if "://" in url:
+            return None
+        m = re.match(r"^[^@/]+@([^:/]+):.+$", url)
+        return m.group(1) if m else None
+
     def _validate_url_host(self, url: str, allowed_hosts: frozenset[str]) -> str:
         """Validate URL host against allowlist and SSRF protections.
 
@@ -167,6 +175,8 @@ class InputHandler:
         """
         parsed = urlparse(url)
         host = parsed.hostname or ""
+        if not host:
+            host = self._extract_scp_host(url) or ""
         if not host:
             raise ValueError(f"URL has no valid hostname: {url}")
         if not any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts):

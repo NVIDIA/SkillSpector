@@ -684,6 +684,58 @@ class TestToolMisuse:
     def test_tm3_detected(self, content: str, filename: str, filetype: str) -> None:
         assert any(f.rule_id == "TM3" for f in tm_mod.analyze(content, filename, filetype))
 
+    @pytest.mark.parametrize(
+        "content,filename,filetype",
+        [
+            pytest.param(
+                "        securityContext:\n          privileged: true",
+                "daemonset.yaml",
+                "yaml",
+                id="privileged_true",
+            ),
+            pytest.param(
+                "      volumes:\n        - hostPath:\n            path: /",
+                "ds.yaml",
+                "yaml",
+                id="hostpath",
+            ),
+            pytest.param("      hostPID: true", "ds.yaml", "yaml", id="hostpid"),
+            pytest.param("      hostNetwork: true", "ds.yaml", "yaml", id="hostnetwork"),
+            pytest.param(
+                "kubectl run probe --image=alpine --privileged",
+                "deploy.sh",
+                "shell",
+                id="kubectl_run_privileged",
+            ),
+            pytest.param(
+                "helm install m ./c --set securityContext.privileged=true",
+                "deploy.sh",
+                "shell",
+                id="helm_privileged",
+            ),
+        ],
+    )
+    def test_tm4_detected(self, content: str, filename: str, filetype: str) -> None:
+        assert any(f.rule_id == "TM4" for f in tm_mod.analyze(content, filename, filetype))
+
+    def test_tm4_severity_high(self) -> None:
+        findings = tm_mod.analyze(
+            "      securityContext:\n        privileged: true", "ds.yaml", "yaml"
+        )
+        tm4 = [f for f in findings if f.rule_id == "TM4"]
+        assert tm4 and tm4[0].severity == Severity.HIGH
+
+    def test_tm4_benign_workload_not_flagged(self) -> None:
+        content = (
+            "kind: DaemonSet\nspec:\n  template:\n    spec:\n      containers:\n"
+            "        - name: app\n          image: nginx"
+        )
+        assert not any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "ds.yaml", "yaml"))
+
+    def test_tm4_documentation_example_excluded(self) -> None:
+        content = "For example, never set privileged: true in your manifests."
+        assert not any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "README.md", "markdown"))
+
     def test_safe_content_produces_no_findings(self) -> None:
         findings = tm_mod.analyze(
             "import json\ndata = json.loads(input_str)", "parser.py", "python"

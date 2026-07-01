@@ -189,6 +189,8 @@ inference gateways.
 | `bedrock`                          | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime                           | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
 | `nv_build`                         | `NVIDIA_INFERENCE_KEY`                                     | build.nvidia.com                              | `deepseek-ai/deepseek-v4-flash`                |
 | `subprocess`                       | `SKILLSPECTOR_LLM_COMMAND` (shell command)                 | User-configured CLI (e.g. `claude -p`)        | N/A — depends on command                       |
+| `claude_cli`                       | _(none — uses local CLI auth)_                             | local `claude` binary                         | `claude-sonnet-4-6`                            |
+| `codex_cli`                        | _(none — uses local CLI auth)_                             | local `codex` binary                          | `o4-mini`                                      |
 
 ```bash
 # Stock OpenAI
@@ -223,6 +225,16 @@ skillspector scan ./my-skill/
 # NVIDIA build.nvidia.com
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
+skillspector scan ./my-skill/
+
+# Local Claude CLI — no API key; uses your existing `claude auth login` session
+# Requires: claude CLI installed and authenticated (claude auth login)
+export SKILLSPECTOR_PROVIDER=claude_cli
+skillspector scan ./my-skill/
+
+# Local Codex CLI — no API key; uses your existing `codex login` session
+# Requires: codex CLI installed and authenticated
+export SKILLSPECTOR_PROVIDER=codex_cli
 skillspector scan ./my-skill/
 
 # Local Ollama or any OpenAI-compatible endpoint
@@ -520,7 +532,7 @@ Issues (2)
 
 | Variable                       | Description                                                                                                                                                                                                                              | Required                                                         |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `SKILLSPECTOR_PROVIDER`        | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, or `subprocess`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional                                                         |
+| `SKILLSPECTOR_PROVIDER`        | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `subprocess`, `claude_cli`, `codex_cli`, or `gemini_cli`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional                                                         |
 | `SKILLSPECTOR_LLM_COMMAND`     | Shell command for `SKILLSPECTOR_PROVIDER=subprocess`. The prompt is written to stdin; the response is read from stdout. No API key required — use the AI session directly (e.g. `claude -p`, `antigravity ask`, `openclaw chat`).        | Required when `SKILLSPECTOR_PROVIDER=subprocess`                 |
 | `NVIDIA_INFERENCE_KEY`         | Credential for the `nv_build` provider (build.nvidia.com).                                                                                                                                                                               | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build`  |
 | `OPENAI_API_KEY`               | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials.                                                     | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai`    |
@@ -534,6 +546,8 @@ Issues (2)
 | `SKILLSPECTOR_MODEL`           | Override the active provider's default model. See the LLM Analysis table for each provider's default.                                                                                                                                   | Optional                                                         |
 | `SKILLSPECTOR_MODEL_REGISTRY`  | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path.                                                                                                       | Optional                                                         |
 | `SKILLSPECTOR_LOG_LEVEL`       | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`).                                                                                                                                                                    | Optional                                                         |
+
+> **CLI providers** (`claude_cli`, `codex_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session (`claude auth login` / `codex login`). SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run in a hardened sandbox: tools disabled, no MCP, read-only sandbox mode (codex), and untrusted skill content is delivered only via stdin.
 
 ### CLI Options
 

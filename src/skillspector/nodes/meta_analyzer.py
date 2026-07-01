@@ -44,7 +44,7 @@ from skillspector.nodes.analyzers.pattern_defaults import (
     get_explanation,
     get_remediation,
 )
-from skillspector.state import MetaAnalyzerResponse, SkillspectorState
+from skillspector.state import MetaAnalyzerResponse, SkillspectorState, llm_call_record
 
 logger = get_logger(__name__)
 
@@ -569,6 +569,9 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     files_with_findings = sorted({f.file for f in findings})
 
     try:
+        # Construct inside the try so a chat-model construction failure is caught
+        # and recorded as a degraded LLM call (consistent with the semantic
+        # analyzers) rather than crashing the whole graph.
         cache_dir = state.get("llm_cache_dir")
         cache = LLMResponseCache(Path(cache_dir)) if cache_dir else None
         analyzer = LLMMetaAnalyzer(model=model, cache=cache)
@@ -631,7 +634,10 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(findings),
             len(filtered),
         )
-        return {"filtered_findings": filtered}
+        return {
+            "filtered_findings": filtered,
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+        }
     except ValueError:
         raise
     except Exception as e:
@@ -646,4 +652,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             file=_sys.stderr,
             flush=True,
         )
-        return {"filtered_findings": _passthrough_with_defaults(findings)}
+        return {
+            "filtered_findings": _passthrough_with_defaults(findings),
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],
+        }

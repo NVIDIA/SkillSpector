@@ -111,7 +111,7 @@ class Finding:
 
 
 class AnalyzerPlugin(Protocol):
-    """Analyzer protocol from SADD A.1.1."""
+    """Analyzer plugin protocol: name/stage/availability and an ``analyze`` entry point."""
 
     name: str
     stage: str

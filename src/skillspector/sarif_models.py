@@ -118,12 +118,45 @@ class SarifArtifact(BaseModel):
     location: SarifArtifactLocation
 
 
+class SarifNotification(BaseModel):
+    """A notification about a condition encountered during tool execution.
+
+    Used to surface a degraded LLM stage (requested but every call failed) in
+    the default SARIF output via ``invocation.toolExecutionNotifications``.
+    """
+
+    text: SarifMessage = Field(alias="message")
+    level: Literal["error", "warning", "note"] = "warning"
+
+    model_config = {"populate_by_name": True}
+
+
+class SarifInvocation(BaseModel):
+    """Describes a single tool invocation (SARIF ``run.invocations[]``).
+
+    ``executionSuccessful`` is required by the SARIF spec. SkillSpector keeps it
+    ``True`` even for a degraded LLM stage — the scan completed and produced
+    results — and conveys the degradation through a warning-level entry in
+    ``toolExecutionNotifications``.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    execution_successful: bool = Field(alias="executionSuccessful")
+    tool_execution_notifications: list[SarifNotification] | None = Field(
+        default=None, alias="toolExecutionNotifications"
+    )
+
+
 class SarifRun(BaseModel):
     """A single run (one tool invocation)."""
+
+    model_config = {"populate_by_name": True}
 
     tool: SarifTool
     results: list[SarifResult] = Field(default_factory=list)
     artifacts: list[SarifArtifact] | None = None
+    invocations: list[SarifInvocation] | None = None
 
 
 class SarifLog(BaseModel):

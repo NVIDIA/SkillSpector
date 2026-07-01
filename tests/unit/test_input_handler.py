@@ -16,10 +16,11 @@
 """Tests for skillspector input_handler (resolve directory, zip, single file)."""
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from skillspector.input_handler import InputHandler
+from skillspector.input_handler import ALLOWED_GIT_HOSTS, InputHandler
 
 
 def test_resolve_directory(tmp_path: Path) -> None:
@@ -94,3 +95,54 @@ def test_cleanup_idempotent(tmp_path: Path) -> None:
     handler.resolve(str(tmp_path / "a.md"))
     handler.cleanup()
     handler.cleanup()
+
+
+def test_scp_url_is_git_url() -> None:
+    """scp-style SSH URL is recognised as a Git URL."""
+    assert InputHandler()._is_git_url("git@github.com:org/repo.git") is True
+
+
+def test_validate_url_host_scp_extracts_github() -> None:
+    """_validate_url_host extracts 'github.com' from an scp-style URL."""
+    host = InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)
+    assert host == "github.com"
+
+
+def test_scp_valid_host_clones() -> None:
+    """resolve() calls git clone with the scp URL when the host is allowed."""
+    handler = InputHandler()
+    try:
+        with patch(
+            "skillspector.input_handler.subprocess.run", return_value=MagicMock()
+        ) as mock_run:
+            handler.resolve("git@github.com:org/repo.git")
+        assert mock_run.called
+        call_args = mock_run.call_args[0][0]
+        assert "git@github.com:org/repo.git" in call_args
+    finally:
+        handler.cleanup()
+
+
+def test_scp_disallowed_host_raises() -> None:
+    """_validate_url_host rejects an scp URL whose host is not in the allowlist."""
+    with pytest.raises(ValueError, match="not in the allowed hosts"):
+        InputHandler()._validate_url_host("git@malicious.internal:org/repo.git", ALLOWED_GIT_HOSTS)
+
+
+def test_scp_private_ip_raises() -> None:
+    """_validate_url_host rejects an scp URL whose extracted host is not in the allowlist."""
+    with pytest.raises(ValueError):
+        InputHandler()._validate_url_host("git@169.254.169.254:org/repo.git", ALLOWED_GIT_HOSTS)
+
+
+def test_https_url_unchanged() -> None:
+    """https URLs continue to extract the host via urlparse without hitting the scp fallback."""
+    host = InputHandler()._validate_url_host("https://github.com/org/repo.git", ALLOWED_GIT_HOSTS)
+    assert host == "github.com"
+
+
+def test_scp_ssrf_gate_fires() -> None:
+    """SSRF gate raises ValueError for an scp URL whose host resolves to a private IP."""
+    with patch("skillspector.input_handler._is_private_ip", return_value=True):
+        with pytest.raises(ValueError, match="private/internal IP"):
+            InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)
