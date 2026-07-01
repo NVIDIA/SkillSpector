@@ -42,6 +42,7 @@ EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "mcp_least_privilege",
     "mcp_tool_poisoning",
     "mcp_rug_pull",
+    "structured_skill_roles",
     "semantic_security_discovery",
     "semantic_developer_intent",
     "semantic_quality_policy",
