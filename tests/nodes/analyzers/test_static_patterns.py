@@ -317,6 +317,72 @@ class TestRunStaticPatternsSupplyChain:
         assert len(sc2) >= 1
         assert sc2[0].severity == "HIGH"
 
+    def test_sc7_disable_content_trust_produces_finding(self):
+        """docker pull --disable-content-trust yields SC7, HIGH severity."""
+        state = {
+            "components": ["setup.sh"],
+            "file_cache": {
+                "setup.sh": "docker pull --disable-content-trust registry.io/base:latest"
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [supply_chain_module])
+        sc7 = [f for f in findings if f.rule_id == "SC7"]
+        assert len(sc7) >= 1
+        assert sc7[0].severity == "HIGH"
+
+    def test_sc7_content_trust_env_produces_finding(self):
+        """DOCKER_CONTENT_TRUST=0 yields SC7."""
+        state = {
+            "components": ["setup.sh"],
+            "file_cache": {"setup.sh": "export DOCKER_CONTENT_TRUST=0"},
+        }
+        findings = static_runner.run_static_patterns(state, [supply_chain_module])
+        assert any(f.rule_id == "SC7" for f in findings)
+
+    def test_sc7_insecure_registry_produces_finding(self):
+        """--insecure-registry yields SC7."""
+        state = {
+            "components": ["setup.sh"],
+            "file_cache": {"setup.sh": "docker pull --insecure-registry 10.0.0.5:5000/tools"},
+        }
+        findings = static_runner.run_static_patterns(state, [supply_chain_module])
+        assert any(f.rule_id == "SC7" for f in findings)
+
+    def test_sc7_documentation_example_excluded(self):
+        """Verification-bypass flags in documentation do not yield SC7."""
+        state = {
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": "For example, never use --disable-content-trust in production."
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [supply_chain_module])
+        assert not any(f.rule_id == "SC7" for f in findings)
+
+    def test_sc7_benign_pull_no_finding(self):
+        """A normal docker pull with verification on does not yield SC7."""
+        state = {
+            "components": ["setup.sh"],
+            "file_cache": {"setup.sh": "docker pull nginx:1.25"},
+        }
+        findings = static_runner.run_static_patterns(state, [supply_chain_module])
+        assert not any(f.rule_id == "SC7" for f in findings)
+
+    def test_sc7_example_marker_in_executable_still_fires(self):
+        """An 'example' marker near a bypass in an executable .sh must NOT suppress SC7.
+
+        Example filtering belongs to the runner, which only downweights (does not
+        skip) executables — so a nearby '# for example' cannot be used to evade SC7.
+        """
+        state = {
+            "components": ["setup.sh"],
+            "file_cache": {
+                "setup.sh": "# for example\ndocker pull --disable-content-trust registry.io/x",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [supply_chain_module])
+        assert any(f.rule_id == "SC7" for f in findings)
+
 
 class TestRunStaticPatternsAgentSnoopingAdditional:
     """run_static_patterns with agent_snooping: AS1, AS2, AS3."""
