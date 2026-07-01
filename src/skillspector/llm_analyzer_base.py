@@ -28,6 +28,7 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -283,20 +284,20 @@ class LLMAnalyzerBase:
         self.model = model
         self.analyzer_id = analyzer_id
         self._cache = cache
-        self._schema_version = self.response_schema.__name__ if self.response_schema else "raw"
+        self._schema_version = (
+            hashlib.sha256(
+                json.dumps(self.response_schema.model_json_schema(), sort_keys=True).encode()
+            ).hexdigest()[:12]
+            if self.response_schema else "raw"
+        )
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
 
-    def _cache_key(self, batch: Batch) -> CacheKey:
-        """Build a cache key for *batch* using content and prompt template hashes."""
-        return make_cache_key(
-            content=batch.content,
-            prompt_template=self.base_prompt,
-            schema_version=self._schema_version,
-        )
+    def _cache_key(self, prompt: str) -> CacheKey:
+        return make_cache_key(content=prompt, prompt_template=self.model, schema_version=self._schema_version)
 
     def _emit_progress(self, file_label: str, stage: str, detail: str = "") -> None:
         """Print a single-line LLM progress indicator to stderr."""
@@ -414,10 +415,12 @@ class LLMAnalyzerBase:
         """
         results: list[tuple[Batch, list]] = []
         for batch in batches:
+            prompt = self.build_prompt(batch, **kwargs)
+
             # --- Cache check -------------------------------------------------
             key: CacheKey | None = None
             if self._cache is not None:
-                key = self._cache_key(batch)
+                key = self._cache_key(prompt)
                 cached = self._cache.get(key)
                 if cached is not None:
                     self._emit_progress(batch.file_label, "cache hit")
@@ -436,7 +439,6 @@ class LLMAnalyzerBase:
                         )
 
             # --- LLM call ----------------------------------------------------
-            prompt = self.build_prompt(batch, **kwargs)
             self._emit_progress(batch.file_label, "requesting...")
             logger.debug(
                 "LLM call for %s (tokens~%d, findings=%d)",
@@ -494,10 +496,12 @@ class LLMAnalyzerBase:
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
+            prompt = self.build_prompt(batch, **kwargs)
+
             # --- Cache check (sync — SQLite is not async) --------------------
             key: CacheKey | None = None
             if self._cache is not None:
-                key = self._cache_key(batch)
+                key = self._cache_key(prompt)
                 cached = self._cache.get(key)
                 if cached is not None:
                     self._emit_progress(batch.file_label, "cache hit")
@@ -517,7 +521,6 @@ class LLMAnalyzerBase:
                         )
 
             async with sem:
-                prompt = self.build_prompt(batch, **kwargs)
                 self._emit_progress(batch.file_label, "requesting...")
                 logger.debug(
                     "LLM call for %s (tokens~%d, findings=%d)",

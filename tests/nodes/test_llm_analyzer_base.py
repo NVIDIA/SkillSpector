@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
+from pydantic import BaseModel, Field
 
 from skillspector.llm_analyzer_base import (
     Batch,
@@ -33,6 +34,7 @@ from skillspector.llm_analyzer_base import (
     findings_in_range,
     number_lines,
 )
+from skillspector.llm_cache import LLMResponseCache
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -1706,3 +1708,117 @@ class TestTokenBudgetFunctions:
         out = get_max_output_tokens("unknown/model")
         assert inp == int(mocked_ctx * 0.75)
         assert out == int(mocked_ctx * 0.25)
+
+
+# ---------------------------------------------------------------------------
+# Cache key invalidation
+#
+# The cache key must be derived from the fully-rendered prompt (not just
+# batch.content), plus the model name and a schema-content hash.  Otherwise a
+# subclass whose build_prompt folds in extra data (e.g. batch.findings), or a
+# switch to a different model / response schema, can silently reuse a stale
+# cached response generated for different inputs.
+# ---------------------------------------------------------------------------
+
+
+class _FindingsAwareAnalyzer(LLMAnalyzerBase):
+    """Test analyzer whose build_prompt folds batch.findings into the prompt.
+
+    Mirrors real subclasses (e.g. the meta-analyzer) that include accumulated
+    findings text in the rendered prompt even though batch.content alone does
+    not change.
+    """
+
+    def build_prompt(self, batch: Batch, **kwargs: object) -> str:
+        findings_text = ",".join(f.rule_id for f in batch.findings)
+        return f"{self.base_prompt}|{batch.content}|findings={findings_text}"
+
+
+class TestCacheKeyInvalidation:
+    MODEL_A = "nvidia/openai/gpt-oss-120b"
+    MODEL_B = "nvidia/openai/gpt-oss-20b"
+
+    @staticmethod
+    def _llm_result(rule_id: str = "T-1") -> LLMAnalysisResult:
+        return LLMAnalysisResult(
+            findings=[LLMFinding(rule_id=rule_id, message="hit", severity="LOW", start_line=1)]
+        )
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_identical_repeated_calls_hit_cache(self, tmp_path) -> None:
+        """Sanity baseline: same batch, same analyzer -> second call is a cache hit."""
+        cache = LLMResponseCache(tmp_path)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL_A, cache=cache)
+        analyzer._structured_llm.invoke = MagicMock(return_value=self._llm_result())
+
+        batch = Batch(file_path="a.py", content="code")
+        analyzer.run_batches([batch])
+        analyzer.run_batches([batch])
+
+        assert analyzer._structured_llm.invoke.call_count == 1
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_different_findings_in_rendered_prompt_miss_cache(self, tmp_path) -> None:
+        """Same batch.content, different batch.findings folded into the rendered
+        prompt by a subclass's build_prompt -> must be a cache miss, not a stale hit."""
+        cache = LLMResponseCache(tmp_path)
+        analyzer = _FindingsAwareAnalyzer(base_prompt="test", model=self.MODEL_A, cache=cache)
+        analyzer._structured_llm.invoke = MagicMock(return_value=self._llm_result())
+
+        finding_a = Finding(rule_id="A", message="a", file="a.py", start_line=1)
+        finding_b = Finding(rule_id="B", message="b", file="a.py", start_line=1)
+        batch1 = Batch(file_path="a.py", content="code", findings=[finding_a])
+        batch2 = Batch(file_path="a.py", content="code", findings=[finding_b])
+
+        analyzer.run_batches([batch1])
+        analyzer.run_batches([batch2])
+
+        assert analyzer._structured_llm.invoke.call_count == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_different_model_misses_cache(self, tmp_path) -> None:
+        """Two analyzer instances differing only in model must not share cache entries."""
+        cache = LLMResponseCache(tmp_path)
+        analyzer_a = LLMAnalyzerBase(base_prompt="test", model=self.MODEL_A, cache=cache)
+        analyzer_b = LLMAnalyzerBase(base_prompt="test", model=self.MODEL_B, cache=cache)
+        analyzer_a._structured_llm.invoke = MagicMock(return_value=self._llm_result())
+        analyzer_b._structured_llm.invoke = MagicMock(return_value=self._llm_result())
+
+        batch = Batch(file_path="a.py", content="code")
+        analyzer_a.run_batches([batch])
+        analyzer_b.run_batches([batch])
+
+        assert analyzer_a._structured_llm.invoke.call_count == 1
+        assert analyzer_b._structured_llm.invoke.call_count == 1
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_different_response_schema_misses_cache(self, tmp_path) -> None:
+        """Two analyzer instances differing only in response_schema must not share
+        cache entries, even with identical model and rendered prompt."""
+
+        class _SchemaA(LLMAnalyzerBase):
+            response_schema = LLMAnalysisResult
+
+        class _SchemaB(LLMAnalyzerBase):
+            class _OtherResult(BaseModel):
+                other_field: list[str] = Field(default_factory=list)
+
+            response_schema = _OtherResult
+
+            def parse_response(self, response: object, batch: Batch) -> list[str]:
+                return list(response.other_field)
+
+        cache = LLMResponseCache(tmp_path)
+        analyzer_a = _SchemaA(base_prompt="test", model=self.MODEL_A, cache=cache)
+        analyzer_b = _SchemaB(base_prompt="test", model=self.MODEL_A, cache=cache)
+        analyzer_a._structured_llm.invoke = MagicMock(return_value=self._llm_result())
+        analyzer_b._structured_llm.invoke = MagicMock(
+            return_value=_SchemaB.response_schema(other_field=["x"])
+        )
+
+        batch = Batch(file_path="a.py", content="code")
+        analyzer_a.run_batches([batch])
+        analyzer_b.run_batches([batch])
+
+        assert analyzer_a._structured_llm.invoke.call_count == 1
+        assert analyzer_b._structured_llm.invoke.call_count == 1
