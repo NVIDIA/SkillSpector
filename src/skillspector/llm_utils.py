@@ -105,12 +105,19 @@ def get_chat_model(model: str | None = None) -> BaseChatModel:
 
 
 def chat_completion(prompt: str, *, model: str | None = None) -> str:
-    """Request a single chat completion and return the assistant text."""
-    llm = get_chat_model(model=model)
-    response = llm.invoke(prompt)
-    if not isinstance(response, BaseMessage):
-        raise TypeError(f"Expected BaseMessage from chat model, got {type(response).__name__}")
-    return str(response.text)
+    """Request a single chat completion and return the assistant content.
+
+    Routes through :func:`get_chat_model`, which dispatches to the CLI adapter
+    for CLI providers and to the provider's native chat model for HTTP providers.
+
+    Uses ``.text`` when available (real LangChain ``BaseMessage`` objects,
+    which normalise content blocks to a single string) and falls back to
+    ``.content`` for the CLI adapter's ``_AgentCLIMessage``.
+    """
+    response = get_chat_model(model=model).invoke(prompt)
+    if hasattr(response, "text"):
+        return response.text  # type: ignore[union-attr]
+    return response.content or ""  # type: ignore[union-attr]
 
 
 def run_async(coroutine: Coroutine) -> Any:
