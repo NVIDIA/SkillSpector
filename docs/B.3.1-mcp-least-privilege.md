@@ -1,6 +1,6 @@
 # B.3.1: MCP Least-Privilege Analysis (LP1 -- LP4)
 
-**Author:** Nir Paz | **Date:** 2026-03-30 | **Status:** Implemented
+**Author:** Nir Paz | **Date:** 2026-03-30 | **Status:** Implemented  
 **Component:** `src/skillspector/nodes/analyzers/mcp_least_privilege.py`
 
 ---
