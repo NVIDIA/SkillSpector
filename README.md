@@ -226,6 +226,12 @@ export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
 skillspector scan ./my-skill/
 
+# Gemini (via OpenAI compatibility layer)
+export SKILLSPECTOR_PROVIDER=openai
+export OPENAI_API_KEY="YOUR_GEMINI_API_KEY"
+export OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+export SKILLSPECTOR_MODEL=gemini-3.5-flash
+
 # Local Claude CLI — no API key; uses your existing `claude auth login` session
 # Requires: claude CLI installed and authenticated (claude auth login)
 export SKILLSPECTOR_PROVIDER=claude_cli
