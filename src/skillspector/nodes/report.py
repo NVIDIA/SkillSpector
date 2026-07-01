@@ -101,6 +101,25 @@ def _sanitize_finding(finding: Finding) -> Finding:
     return replace(finding, **{f: _clean_text(getattr(finding, f)) for f in _SANITIZED_FIELDS})
 
 
+def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
+    """Project selected finding metadata into a SARIF properties dictionary."""
+    finding_dict = finding.to_dict()
+    metadata: dict[str, object] = {
+        "severity": finding_dict["severity"],
+        "category": finding_dict["category"],
+        "pattern": finding_dict["pattern"],
+        "confidence": finding_dict["confidence"],
+        "finding": finding_dict["finding"],
+        "explanation": finding_dict["explanation"],
+        "remediation": finding_dict["remediation"],
+        "code_snippet": finding_dict["code_snippet"],
+        "intent": finding_dict["intent"],
+        "tags": finding_dict["tags"],
+    }
+    cleaned = {key: value for key, value in metadata.items() if value is not None}
+    return cleaned or None
+
+
 def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note"]:
     """Map Finding.severity to SARIF result level."""
     return {
@@ -219,14 +238,13 @@ def _build_sarif(
     for finding in findings:
         if not finding.rule_id or not finding.message:
             continue
-        start_line = finding.start_line
-        end_line = finding.end_line
-        region = SarifRegion(start_line=start_line, end_line=end_line)
+        region = SarifRegion(start_line=finding.start_line, end_line=finding.end_line)
         results.append(
             SarifResult(
                 rule_id=finding.rule_id,
                 message=SarifMessage(text=finding.message),
                 level=_severity_to_sarif_level(finding.severity),
+                properties=_build_sarif_properties(finding),
                 locations=[
                     SarifLocation(
                         physical_location=SarifPhysicalLocation(
@@ -251,6 +269,7 @@ def _build_sarif(
                 rule_id=finding.rule_id,
                 message=SarifMessage(text=finding.message),
                 level=_severity_to_sarif_level(finding.severity),
+                properties=_build_sarif_properties(finding),
                 locations=[
                     SarifLocation(
                         physical_location=SarifPhysicalLocation(

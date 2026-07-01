@@ -84,6 +84,7 @@ class SarifResult(BaseModel):
     # When present, the result is suppressed; SARIF consumers (e.g. GitHub code
     # scanning) exclude suppressed results from counts but keep them for audit.
     suppressions: list[SarifSuppression] | None = None
+    properties: dict[str, object] | None = None
 
 
 class SarifReportingDescriptor(BaseModel):
