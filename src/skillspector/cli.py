@@ -288,11 +288,13 @@ def scan(
             "more false positives. Use for rapid iterative scanning; omit for final/CI runs.",
         ),
     ] = False,
-    no_baseline: Annotated[
+    auto_baseline: Annotated[
         bool,
         typer.Option(
-            "--no-baseline",
-            help="Skip auto-discovery of .skillspector-baseline.yaml in the scanned directory.",
+            "--auto-baseline",
+            help="Auto-discover and apply .skillspector-baseline.yaml in the scanned "
+            "directory. Off by default: the scanned directory may be untrusted, and a "
+            "malicious skill could ship a baseline that suppresses findings about itself.",
         ),
     ] = False,
     detail: Annotated[
@@ -373,7 +375,7 @@ def scan(
 
         # Auto-discover baseline if not explicitly given
         effective_baseline = baseline
-        if effective_baseline is None and not no_baseline:
+        if effective_baseline is None and auto_baseline:
             auto_bl = _auto_discover_baseline(input_path)
             if auto_bl is not None:
                 effective_baseline = auto_bl
