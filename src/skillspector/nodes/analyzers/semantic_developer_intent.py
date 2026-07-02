@@ -41,8 +41,7 @@ capabilities that are unjustified given the skill's stated purpose.
 Skill manifest context:
 {manifest_section}
 
-Use the rule IDs exactly as listed.  Reference the L-prefixed line numbers
-when reporting findings.
+Use the rule IDs exactly as listed.
 
 | Rule ID | Detection |
 |---------|-----------|

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -77,28 +76,14 @@ class MetaAnalyzerFinding(BaseModel):
             v = v / 100.0
         return min(1.0, max(0.0, v))
 
-    intent: Literal["malicious", "negligent", "benign"] = Field(
-        description="Likely intent behind the finding"
-    )
-    impact: Literal["critical", "high", "medium", "low"] = Field(
-        description="Potential impact if exploited"
-    )
     explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
     remediation: str = Field(default="", description="How to fix the issue (actionable steps)")
-
-
-class OverallAssessment(BaseModel):
-    """Overall risk assessment for the analyzed file."""
-
-    risk_level: str = Field(description="Overall risk level: LOW, MEDIUM, HIGH, or CRITICAL")
-    summary: str = Field(description="Brief summary of findings")
 
 
 class MetaAnalyzerResult(BaseModel):
     """Top-level structured response from the meta-analyzer LLM."""
 
     findings: list[MetaAnalyzerFinding] = Field(default_factory=list)
-    overall_assessment: OverallAssessment | None = None
 
     @field_validator("findings", mode="before")
     @classmethod
@@ -110,17 +95,6 @@ class MetaAnalyzerResult(BaseModel):
             except (json.JSONDecodeError, TypeError):
                 return []
             return parsed if isinstance(parsed, list) else []
-        return v
-
-    @field_validator("overall_assessment", mode="before")
-    @classmethod
-    def _parse_stringified_assessment(cls, v: object) -> object:
-        """LLMs sometimes return nested objects as JSON strings."""
-        if isinstance(v, str):
-            try:
-                return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return None
         return v
 
 
@@ -163,9 +137,7 @@ You are a security analyst evaluating an agent skill for vulnerabilities.
 
 For each static analysis finding, evaluate:
 1. Is this a true vulnerability or a false positive?
-2. What is the likely intent (malicious, negligent, or benign)?
-3. What is the potential impact if exploited?
-4. Does the skill context make this more or less dangerous?
+2. Does the skill context make this more or less dangerous?
    (e.g., "cyanide" in a cooking skill = CRITICAL, in a chemistry education skill = maybe OK)
 
 IMPORTANT: Include the start_line from each finding's Location field (the number

@@ -43,8 +43,7 @@ that follows this prompt.  Only report findings from categories whose
 file-type scope matches the current file.  If a category says "markdown and
 manifest files only", do NOT report those findings for .py or .sh files.
 
-Use the rule IDs exactly as listed.  Reference the L-prefixed line numbers
-when reporting findings.
+Use the rule IDs exactly as listed.
 
 | Rule ID | Category | Applies to |
 |---------|----------|------------|

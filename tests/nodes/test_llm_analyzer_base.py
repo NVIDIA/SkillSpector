@@ -712,8 +712,6 @@ class TestLLMAnalysisResult:
             start_line=10,
             end_line=12,
             confidence=0.95,
-            explanation="Contains API key",
-            remediation="Use env vars",
         )
         finding = f.to_finding("config.py")
         assert isinstance(finding, Finding)
@@ -722,8 +720,6 @@ class TestLLMAnalysisResult:
         assert finding.start_line == 10
         assert finding.end_line == 12
         assert finding.confidence == 0.95
-        assert finding.explanation == "Contains API key"
-        assert finding.remediation == "Use env vars"
 
     def test_model_dump(self) -> None:
         f = LLMFinding(
@@ -736,7 +732,7 @@ class TestLLMAnalysisResult:
         d = f.model_dump()
         assert d["rule_id"] == "SEC-002"
         assert d["severity"] == "MEDIUM"
-        assert d["explanation"] == ""
+        assert "explanation" not in d
         assert d["end_line"] is None
 
 
@@ -748,8 +744,6 @@ class TestMetaAnalyzerResult:
             pattern_id="E1",
             is_vulnerability=True,
             confidence=0.9,
-            intent="malicious",
-            impact="high",
             explanation="Dangerous",
             remediation="Fix it",
         )
@@ -764,15 +758,11 @@ class TestMetaAnalyzerResult:
             pattern_id="E1",
             is_vulnerability=True,
             confidence=1.5,
-            intent="malicious",
-            impact="high",
         )
         low = MetaAnalyzerFinding(
             pattern_id="E1",
             is_vulnerability=True,
             confidence=-0.2,
-            intent="malicious",
-            impact="high",
         )
         assert high.confidence == 1.0
         assert low.confidence == 0.0
@@ -783,20 +773,18 @@ class TestMetaAnalyzerResult:
             pattern_id="E1",
             is_vulnerability=True,
             confidence=100,
-            intent="malicious",
-            impact="high",
         )
         assert f.confidence == pytest.approx(1.0)
 
     def test_confidence_75_scale_normalized(self) -> None:
         f = MetaAnalyzerFinding(
-            pattern_id="E1", is_vulnerability=True, confidence=75, intent="malicious", impact="high"
+            pattern_id="E1", is_vulnerability=True, confidence=75
         )
         assert f.confidence == pytest.approx(0.75)
 
     def test_confidence_negative_clamped(self) -> None:
         f = MetaAnalyzerFinding(
-            pattern_id="E1", is_vulnerability=True, confidence=-5, intent="malicious", impact="high"
+            pattern_id="E1", is_vulnerability=True, confidence=-5
         )
         assert f.confidence == pytest.approx(0.0)
 
@@ -806,18 +794,6 @@ class TestMetaAnalyzerResult:
                 pattern_id="E1",
                 is_vulnerability=True,
                 confidence="bad",
-                intent="malicious",
-                impact="high",
-            )
-
-    def test_intent_validation(self) -> None:
-        with pytest.raises(ValueError):
-            MetaAnalyzerFinding(
-                pattern_id="E1",
-                is_vulnerability=True,
-                confidence=0.5,
-                intent="unknown",
-                impact="high",
             )
 
     def test_empty_findings(self) -> None:
@@ -829,8 +805,6 @@ class TestMetaAnalyzerResult:
             pattern_id="E1",
             is_vulnerability=True,
             confidence=0.9,
-            intent="malicious",
-            impact="high",
         )
         assert f_no_line.start_line is None
 
@@ -839,8 +813,6 @@ class TestMetaAnalyzerResult:
             start_line=42,
             is_vulnerability=True,
             confidence=0.9,
-            intent="malicious",
-            impact="high",
         )
         assert f_with_line.start_line == 42
 
@@ -849,8 +821,6 @@ class TestMetaAnalyzerResult:
             pattern_id="E2",
             is_vulnerability=True,
             confidence=0.8,
-            intent="negligent",
-            impact="medium",
         )
         d = f.model_dump()
         assert d["pattern_id"] == "E2"
@@ -1044,8 +1014,6 @@ class TestLLMMetaAnalyzerParseResponse:
                     pattern_id="E1",
                     is_vulnerability=True,
                     confidence=0.9,
-                    intent="malicious",
-                    impact="high",
                     explanation="Bad stuff",
                 ),
             ]
@@ -1586,8 +1554,6 @@ class TestLLMMetaAnalyzerRunBatches:
                     pattern_id="E1",
                     is_vulnerability=True,
                     confidence=0.9,
-                    intent="malicious",
-                    impact="high",
                 )
             ],
         )
@@ -1631,8 +1597,6 @@ class TestLLMMetaAnalyzerARunBatches:
                         pattern_id="E1",
                         is_vulnerability=True,
                         confidence=0.9,
-                        intent="malicious",
-                        impact="high",
                     )
                 ],
             )
@@ -1665,8 +1629,6 @@ class TestLLMMetaAnalyzerARunBatches:
                         pattern_id="E1",
                         is_vulnerability=True,
                         confidence=0.9,
-                        intent="malicious",
-                        impact="high",
                         explanation="Dangerous",
                         remediation="Fix it",
                     )
