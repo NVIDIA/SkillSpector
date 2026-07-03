@@ -25,6 +25,7 @@ import pytest
 import yaml
 
 from skillspector.nodes.analyzers import mcp_tool_poisoning
+from skillspector.state import llm_call_record
 
 # ---------------------------------------------------------------------------
 # Fixture directory path
@@ -681,7 +682,7 @@ class TestTP4Telemetry:
             return_value='{"is_mismatch": false}',
         ):
             result = node(state)
-        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+        assert result["llm_call_log"] == [llm_call_record("mcp_tool_poisoning", ok=True)]
 
     def test_failed_call_records_ok_false(self):
         from unittest.mock import patch

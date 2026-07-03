@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, TypedDict
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field, field_validator
@@ -112,6 +112,38 @@ class LLMAnalysisResult(BaseModel):
     """Structured LLM response containing discovered findings."""
 
     findings: list[LLMFinding] = Field(default_factory=list)
+
+
+class LLMTokenUsage(TypedDict):
+    """Provider-normalized token usage for LLM calls."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+def _empty_token_usage() -> LLMTokenUsage:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _extract_token_usage(raw: object) -> LLMTokenUsage:
+    usage = getattr(raw, "usage_metadata", None) or {}
+    if not isinstance(usage, dict):
+        return _empty_token_usage()
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _add_token_usage(total: LLMTokenUsage, usage: LLMTokenUsage) -> None:
+    total["input_tokens"] += usage["input_tokens"]
+    total["output_tokens"] += usage["output_tokens"]
+    total["total_tokens"] += usage["total_tokens"]
 
 
 def estimate_tokens(text: str) -> int:
@@ -275,8 +307,36 @@ class LLMAnalyzerBase:
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
         self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
+            self._llm.with_structured_output(self.response_schema, include_raw=True)
+            if self.response_schema
+            else None
         )
+        self._llm_usage = _empty_token_usage()
+
+    @property
+    def llm_usage(self) -> LLMTokenUsage:
+        """Cumulative token usage from the most recent batch run."""
+        return dict(self._llm_usage)  # type: ignore[return-value]
+
+    def _reset_llm_usage(self) -> None:
+        self._llm_usage = _empty_token_usage()
+
+    def _record_usage_from_raw(self, raw: object) -> None:
+        _add_token_usage(self._llm_usage, _extract_token_usage(raw))
+
+    def _unwrap_structured_response(self, response: object) -> object:
+        if not isinstance(response, dict) or not {"raw", "parsed", "parsing_error"} <= set(
+            response
+        ):
+            return response
+        raw = response.get("raw")
+        self._record_usage_from_raw(raw)
+        parsing_error = response.get("parsing_error")
+        if parsing_error is not None:
+            if isinstance(parsing_error, BaseException):
+                raise parsing_error
+            raise ValueError(str(parsing_error))
+        return response.get("parsed")
 
     # -- Batching -----------------------------------------------------------
 
@@ -376,6 +436,7 @@ class LLMAnalyzerBase:
         :meth:`parse_response` returns :class:`Finding` objects; subclasses may
         return dicts or other types.
         """
+        self._reset_llm_usage()
         results: list[tuple[Batch, list]] = []
         for batch in batches:
             prompt = self.build_prompt(batch, **kwargs)
@@ -386,9 +447,11 @@ class LLMAnalyzerBase:
                 len(batch.findings),
             )
             if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
+                response = self._unwrap_structured_response(self._structured_llm.invoke(prompt))
             else:
-                response = _message_text(self._llm.invoke(prompt))
+                raw_response = self._llm.invoke(prompt)
+                self._record_usage_from_raw(raw_response)
+                response = _message_text(raw_response)
             logger.debug("LLM response for %s", batch.file_label)
             parsed = self.parse_response(response, batch)
             results.append((batch, parsed))
@@ -417,6 +480,7 @@ class LLMAnalyzerBase:
 
         The return type mirrors :meth:`run_batches`.
         """
+        self._reset_llm_usage()
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
@@ -429,9 +493,13 @@ class LLMAnalyzerBase:
                     len(batch.findings),
                 )
                 if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
+                    response = self._unwrap_structured_response(
+                        await self._structured_llm.ainvoke(prompt)
+                    )
                 else:
-                    response = _message_text(await self._llm.ainvoke(prompt))
+                    raw_response = await self._llm.ainvoke(prompt)
+                    self._record_usage_from_raw(raw_response)
+                    response = _message_text(raw_response)
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 

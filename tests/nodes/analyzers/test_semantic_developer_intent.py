@@ -30,6 +30,7 @@ from skillspector.nodes.analyzers.semantic_developer_intent import (
     _format_manifest,
     node,
 )
+from skillspector.state import llm_call_record
 
 MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 
@@ -242,7 +243,7 @@ class TestLLMCallTelemetry:
 
         with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
             result = node({"file_cache": {"main.py": "import os"}})
-        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+        assert result["llm_call_log"] == [llm_call_record(ANALYZER_ID, ok=True)]
 
     @patch(MOCK_PATCH_TARGET)
     def test_exception_records_ok_false(self, mock_get_model: MagicMock) -> None:

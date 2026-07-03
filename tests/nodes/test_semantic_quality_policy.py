@@ -29,6 +29,7 @@ from skillspector.nodes.analyzers.semantic_quality_policy import (
     ANALYZER_PROMPT,
     node,
 )
+from skillspector.state import llm_call_record
 
 # ---------------------------------------------------------------------------
 # Shared mocks
@@ -271,7 +272,7 @@ class TestLLMCallTelemetry:
 
         with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
-        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+        assert result["llm_call_log"] == [llm_call_record(ANALYZER_ID, ok=True)]
 
     @patch(MOCK_PATCH_TARGET)
     def test_exception_records_ok_false(self, mock_get_model: MagicMock) -> None:

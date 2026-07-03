@@ -26,6 +26,7 @@ from skillspector.nodes.report import (
     _DIMINISHING_WEIGHTS,
     _MAX_OCCURRENCES_PER_RULE,
     _SEVERITY_POINTS,
+    _build_metadata,
     _compute_risk_score,
     report,
 )
@@ -914,3 +915,21 @@ def test_report_doc_findings_no_multiplier() -> None:
     # Without the multiplier: 2 HIGH = 50, not 65
     assert result["risk_score"] == 50
     assert result["risk_severity"] == "MEDIUM"
+
+
+def test_build_metadata_aggregates_llm_usage() -> None:
+    metadata = _build_metadata(
+        has_executable_scripts=False,
+        use_llm=True,
+        llm_call_log=[
+            llm_call_record("a", ok=True, input_tokens=10, output_tokens=5, total_tokens=15),
+            llm_call_record(
+                "b", ok=False, error="boom", input_tokens=2, output_tokens=1, total_tokens=3
+            ),
+        ],
+    )
+    assert metadata["llm_usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 6,
+        "total_tokens": 18,
+    }

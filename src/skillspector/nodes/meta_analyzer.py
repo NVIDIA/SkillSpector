@@ -44,6 +44,10 @@ from skillspector.state import MetaAnalyzerResponse, SkillspectorState, llm_call
 logger = get_logger(__name__)
 
 
+class _NoUsage:
+    llm_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
 # ---------------------------------------------------------------------------
 # Structured output schemas
 # ---------------------------------------------------------------------------
@@ -565,7 +569,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         )
         return {
             "filtered_findings": filtered,
-            "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=True, **analyzer.llm_usage)],
         }
     except ValueError:
         raise
@@ -573,5 +577,12 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
         return {
             "filtered_findings": _passthrough_with_defaults(findings),
-            "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],
+            "llm_call_log": [
+                llm_call_record(
+                    "meta_analyzer",
+                    ok=False,
+                    error=str(e),
+                    **locals().get("analyzer", _NoUsage()).llm_usage,
+                )
+            ],
         }

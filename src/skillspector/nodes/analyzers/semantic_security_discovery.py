@@ -27,6 +27,11 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call
 ANALYZER_ID = "semantic_security_discovery"
 logger = get_logger(__name__)
 
+
+class _NoUsage:
+    llm_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
 ANALYZER_PROMPT = """\
 You are a security analyzer for AI agent skill files. Your task is to identify \
 **intent and attack-phrasing risks** — issues that evade regex/static detection because \
@@ -90,14 +95,22 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         results = analyzer.run_batches(batches)
         findings = analyzer.collect_findings(results)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-        return {"findings": findings, "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True)]}
+        return {
+            "findings": findings,
+            "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True, **analyzer.llm_usage)],
+        }
     except ValidationError as exc:
         # Malformed LLM response — degrade gracefully rather than crashing the graph
         logger.warning("%s: LLM returned malformed response: %s", ANALYZER_ID, exc)
         return {
             "findings": [],
             "llm_call_log": [
-                llm_call_record(ANALYZER_ID, ok=False, error=f"malformed LLM response: {exc}")
+                llm_call_record(
+                    ANALYZER_ID,
+                    ok=False,
+                    error=f"malformed LLM response: {exc}",
+                    **locals().get("analyzer", _NoUsage()).llm_usage,
+                )
             ],
         }
     except ValueError:
@@ -106,5 +119,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         logger.warning("%s failed: %s", ANALYZER_ID, exc)
         return {
             "findings": [],
-            "llm_call_log": [llm_call_record(ANALYZER_ID, ok=False, error=str(exc))],
+            "llm_call_log": [
+                llm_call_record(
+                    ANALYZER_ID,
+                    ok=False,
+                    error=str(exc),
+                    **locals().get("analyzer", _NoUsage()).llm_usage,
+                )
+            ],
         }

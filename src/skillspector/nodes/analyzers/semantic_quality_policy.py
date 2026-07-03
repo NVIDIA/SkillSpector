@@ -32,6 +32,11 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call
 ANALYZER_ID = "semantic_quality_policy"
 logger = get_logger(__name__)
 
+
+class _NoUsage:
+    llm_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
 ANALYZER_PROMPT = """\
 You are a quality and safety auditor for AI agent skills.  Your job is to
 review a single skill file and report findings that fall into the categories
@@ -148,12 +153,22 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         results = asyncio.run(analyzer.arun_batches(batches))
         findings = analyzer.collect_findings(results)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-        return {"findings": findings, "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True)]}
+        return {
+            "findings": findings,
+            "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True, **analyzer.llm_usage)],
+        }
     except ValueError:
         raise
     except Exception as exc:
         logger.warning("%s failed: %s", ANALYZER_ID, exc)
         return {
             "findings": [],
-            "llm_call_log": [llm_call_record(ANALYZER_ID, ok=False, error=str(exc))],
+            "llm_call_log": [
+                llm_call_record(
+                    ANALYZER_ID,
+                    ok=False,
+                    error=str(exc),
+                    **locals().get("analyzer", _NoUsage()).llm_usage,
+                )
+            ],
         }

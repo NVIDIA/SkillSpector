@@ -39,6 +39,7 @@ import json
 from typing import NoReturn
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from pydantic import BaseModel
 
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
@@ -161,11 +162,19 @@ class _StructuredAgentCLIModel:
     ``complete()``, then parses and validates the response into *schema*.
     """
 
-    def __init__(self, provider: object, model: str, max_output_tokens: int, schema: type) -> None:
+    def __init__(
+        self,
+        provider: object,
+        model: str,
+        max_output_tokens: int,
+        schema: type[BaseModel],
+        include_raw: bool = False,
+    ) -> None:
         self._provider = provider
         self._model = model
         self._max_output_tokens = max_output_tokens
         self._schema = schema
+        self._include_raw = include_raw
 
     def _augment(self, prompt: str) -> str:
         schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
@@ -182,7 +191,17 @@ class _StructuredAgentCLIModel:
             model=self._model,
             max_output_tokens=self._max_output_tokens,
         )
-        return self._schema.model_validate(_extract_json_object(raw))
+        try:
+            parsed = self._schema.model_validate(_extract_json_object(raw))
+            parsing_error = None
+        except Exception as exc:
+            parsed = None
+            parsing_error = exc
+            if not self._include_raw:
+                raise
+        if self._include_raw:
+            return {"raw": _AgentCLIMessage(raw), "parsed": parsed, "parsing_error": parsing_error}
+        return parsed
 
     async def ainvoke(self, prompt: str) -> object:
         return await asyncio.to_thread(self.invoke, prompt)
@@ -227,9 +246,11 @@ class AgentCLIChatModel:
     async def ainvoke(self, prompt: str) -> _AgentCLIMessage:
         return await asyncio.to_thread(self.invoke, prompt)
 
-    def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
+    def with_structured_output(
+        self, schema: type[BaseModel], *, include_raw: bool = False
+    ) -> _StructuredAgentCLIModel:
         return _StructuredAgentCLIModel(
-            self._provider, self._model, self._max_output_tokens, schema
+            self._provider, self._model, self._max_output_tokens, schema, include_raw=include_raw
         )
 
 
