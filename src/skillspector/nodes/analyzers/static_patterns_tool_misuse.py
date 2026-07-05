@@ -181,6 +181,11 @@ _SAFE_DOCKERFILE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"rm\s+-rf\s+/root/\.cache", re.IGNORECASE),
 )
 
+_SAFE_CACHE_CLEANUP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\brm\s+-rf\s+['\"]?\$?\{?HOME\}?/\.cache/[^*\s;&|]+", re.IGNORECASE),
+    re.compile(r"\brm\s+-rf\s+['\"]?~/\.cache/[^*\s;&|]+", re.IGNORECASE),
+)
+
 # Dockerfile context indicators (nearby keywords that signal Dockerfile content)
 _DOCKERFILE_CONTEXT_RE = re.compile(
     r"\b(?:FROM|RUN|WORKDIR|COPY|ADD|ENV|EXPOSE|ENTRYPOINT|CMD|USER|HEALTHCHECK|ARG)\s",
@@ -197,6 +202,11 @@ def _is_safe_dockerfile_idiom(context: str, matched_text: str) -> bool:
     if not _DOCKERFILE_CONTEXT_RE.search(context):
         return False
     return any(p.search(matched_text) or p.search(context) for p in _SAFE_DOCKERFILE_PATTERNS)
+
+
+def _is_safe_cache_cleanup(matched_text: str) -> bool:
+    """Return True for scoped cleanup of a tool-owned user cache path."""
+    return any(p.search(matched_text) for p in _SAFE_CACHE_CLEANUP_PATTERNS)
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -217,8 +227,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
 
-            if _is_safe_container_command(context_text) or _is_safe_dockerfile_idiom(
-                context_text, matched
+            if (
+                _is_safe_container_command(context_text)
+                or _is_safe_dockerfile_idiom(context_text, matched)
+                or _is_safe_cache_cleanup(matched)
             ):
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW

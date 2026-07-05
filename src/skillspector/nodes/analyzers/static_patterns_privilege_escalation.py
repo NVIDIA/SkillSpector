@@ -162,6 +162,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context = get_context(content, match.start())
             if _is_documentation_example(context, file_type):
                 continue
+            if _is_negated_safety_constraint(context, match.group(0)):
+                continue
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
@@ -252,6 +254,15 @@ def _is_documentation_example(context: str, file_type: str) -> bool:
         "create ",
     )
     return any(ind in ctx_lower for ind in doc_indicators)
+
+
+def _is_negated_safety_constraint(context: str, matched_text: str) -> bool:
+    """Return True when a privilege-escalation phrase is forbidden in policy prose."""
+    escaped = re.escape(matched_text.strip())
+    if not escaped:
+        return False
+    negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
+    return re.search(negation + r"(?:\w+\s+){0,4}" + escaped, context, re.IGNORECASE) is not None
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
