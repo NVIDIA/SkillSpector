@@ -15,6 +15,7 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
+- **[Agent-led review workflow](docs/AGENT_REVIEW_WORKFLOW.md)** — Use SkillSpector static findings as evidence for source-aware agent review before installing skills.
 
 ## Features
 
