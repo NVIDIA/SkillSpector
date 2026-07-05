@@ -156,6 +156,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for pattern, confidence in RA1_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
+            context = ctx(match.start())
+            if _is_negated_safety_constraint(context, match.group(0)):
+                continue
             findings.append(
                 AnalyzerFinding(
                     rule_id="RA1",
@@ -164,7 +167,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     location=loc(line_num),
                     confidence=confidence,
                     tags=tag,
-                    context=ctx(match.start()),
+                    context=context,
                     matched_text=match.group(0)[:200],
                 )
             )
@@ -184,6 +187,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     return findings
+
+
+def _is_negated_safety_constraint(context: str, matched_text: str) -> bool:
+    """Return True when an RA1 phrase is explicitly forbidden in policy prose."""
+    escaped = re.escape(matched_text.strip())
+    if not escaped:
+        return False
+    negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
+    return re.search(negation + r"(?:\w+\s+){0,4}" + escaped, context, re.IGNORECASE) is not None
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
