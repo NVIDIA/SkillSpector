@@ -1360,8 +1360,12 @@ class TestLLMMetaAnalyzerApplyFilter:
         """Two static findings (end_line=None) at different start_lines; LLM
         confirms only one.  The unconfirmed finding must not survive the filter."""
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
-        f1 = Finding(rule_id="P1", message="override", file="skill.md", start_line=10, end_line=None)
-        f2 = Finding(rule_id="P1", message="override", file="skill.md", start_line=30, end_line=None)
+        f1 = Finding(
+            rule_id="P1", message="override", file="skill.md", start_line=10, end_line=None
+        )
+        f2 = Finding(
+            rule_id="P1", message="override", file="skill.md", start_line=30, end_line=None
+        )
         batch = Batch(file_path="skill.md", content="code", findings=[f1, f2])
         llm_items = [
             {
