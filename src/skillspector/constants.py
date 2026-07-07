@@ -28,6 +28,9 @@ MAX_INPUT_TOKENS_PCT = 0.75
 DEFAULT_CONTEXT_LENGTH = 128_000
 # Risk score threshold above which a scan is treated as unsafe.
 RISK_THRESHOLD = 50
+# Maximum text-file size processed by static analyzers and lightweight
+# format recognizers.
+MAX_FILE_BYTES = 1_000_000
 
 # Default-model selection lives on each provider (see providers/<name>/provider.py
 # for ``DEFAULT_MODEL`` and ``SLOT_DEFAULTS``).  The active provider's

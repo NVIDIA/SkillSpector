@@ -916,7 +916,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings_for_scoring, has_executable_scripts, component_metadata
     )
-
     exceptions = analysis_completeness.get("ledger_exceptions", [])
     fatal_exception = (
         any(

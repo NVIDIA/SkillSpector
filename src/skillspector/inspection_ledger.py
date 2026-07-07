@@ -56,6 +56,7 @@ class LedgerReason(StrEnum):
     RULES_UNAVAILABLE = "rules_unavailable"
     MANIFEST_ABSENT = "manifest_absent"
     NO_APPLICABLE_FILES = "no_applicable_files"
+    OMS_SIGNATURE = "oms_signature"
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
@@ -85,6 +86,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.RULES_UNAVAILABLE: ("Analyzer rules were unavailable before execution."),
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
+    LedgerReason.OMS_SIGNATURE: (
+        "Recognized OMS signature metadata is excluded from content analysis."
+    ),
 }
 
 
