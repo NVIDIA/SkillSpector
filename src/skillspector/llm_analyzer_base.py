@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
@@ -386,11 +386,35 @@ class LLMAnalyzerBase:
                 len(batch.findings),
             )
             if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
+                try:
+                    response = self._structured_llm.invoke(prompt)
+                except ValidationError as exc:
+                    logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                    continue
+                except (ValueError, NotImplementedError):
+                    raise
+                except Exception as exc:
+                    logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                    continue
             else:
-                response = _message_text(self._llm.invoke(prompt))
+                try:
+                    response = _message_text(self._llm.invoke(prompt))
+                except (ValueError, NotImplementedError):
+                    raise
+                except Exception as exc:
+                    logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                    continue
             logger.debug("LLM response for %s", batch.file_label)
-            parsed = self.parse_response(response, batch)
+            try:
+                parsed = self.parse_response(response, batch)
+            except ValidationError as exc:
+                logger.warning("LLM batch parse failed for %s: %s", batch.file_label, exc)
+                continue
+            except (ValueError, NotImplementedError):
+                raise
+            except Exception as exc:
+                logger.warning("LLM batch parse failed for %s: %s", batch.file_label, exc)
+                continue
             results.append((batch, parsed))
         return results
 

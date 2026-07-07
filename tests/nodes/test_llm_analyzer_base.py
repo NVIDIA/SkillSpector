@@ -389,6 +389,50 @@ class TestRawStringMode:
 
 
 # ---------------------------------------------------------------------------
+# LLMAnalyzerBase.run_batches (sync execution)
+# ---------------------------------------------------------------------------
+
+
+class TestRunBatches:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_malformed_structured_batch_does_not_abort_the_others(self) -> None:
+        """A malformed structured response costs only its own batch."""
+
+        def _invoke(prompt: str) -> LLMAnalysisResult:
+            if "b.py" in prompt:
+                return LLMAnalysisResult.model_validate({"findings": 'We{"findings":[]}'})
+            return LLMAnalysisResult(
+                findings=[
+                    LLMFinding(rule_id="T-1", message="hit", severity="LOW", start_line=1),
+                ]
+            )
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke.side_effect = _invoke
+
+        batches = [
+            Batch(file_path="a.py", content="code a"),
+            Batch(file_path="b.py", content="code b"),
+            Batch(file_path="c.py", content="code c"),
+        ]
+        results = analyzer.run_batches(batches)
+
+        assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
+        assert [items[0].rule_id for _, items in results] == ["T-1", "T-1"]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_value_error_still_propagates(self) -> None:
+        """ValueError signals misconfiguration, not a malformed model response."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke.side_effect = ValueError("no API key")
+
+        with pytest.raises(ValueError, match="no API key"):
+            analyzer.run_batches([Batch(file_path="a.py", content="code")])
+
+
+# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.arun_batches (async parallel execution)
 # ---------------------------------------------------------------------------
 
