@@ -42,6 +42,34 @@ def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
     assert "components" in data
 
 
+def test_graph_excludes_valid_oms_signature_from_static_findings(tmp_path: Path) -> None:
+    """A real OMS signature remains inventoried without producing scan findings."""
+    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
+    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
+    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = graph.invoke(
+        {
+            "skill_path": str(tmp_path),
+            "output_format": "json",
+            "use_llm": False,
+        }
+    )
+
+    report = json.loads(result["report_body"])
+    signature_component = next(
+        component for component in report["components"] if component["path"] == "skill.oms.sig"
+    )
+    assert signature_component["type"] == "oms_signature"
+    assert report["analysis_completeness"]["coverage_percent"] == 100.0
+    assert not any(
+        "no content in file_cache" in limitation
+        for limitation in (report["analysis_completeness"]["limitations"] or [])
+    )
+    assert all(finding.file != "skill.oms.sig" for finding in result["findings"])
+    assert all(issue["file"] != "skill.oms.sig" for issue in report["issues"])
+
+
 def test_graph_invoke_returns_findings_and_report(tmp_path: Path) -> None:
     """Graph runs to completion; returns findings, SARIF report, report_body, risk_score."""
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})

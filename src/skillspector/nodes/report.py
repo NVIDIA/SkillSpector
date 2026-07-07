@@ -495,21 +495,26 @@ def _build_analysis_completeness(
     use_llm: bool,
     findings_pre_filter: list[Finding],
     findings_post_filter: list[Finding],
+    excluded_components: list[str] | None = None,
 ) -> dict[str, object]:
     """Build analysis_completeness section indicating scan coverage and limitations.
 
     Helps consumers understand what was NOT analyzed and whether findings
     can be trusted as comprehensive.
     """
+    excluded = frozenset(excluded_components or [])
     total_components = len(components)
-    scanned_components = sum(1 for c in components if c in file_cache)
+    missing_components = [c for c in components if c not in file_cache and c not in excluded]
+    # Intentionally excluded metadata is fully accounted for by the scan even
+    # though analyzers do not inspect its content.
+    scanned_components = total_components - len(missing_components)
 
     llm_available, llm_error = is_llm_available()
     llm_used = use_llm and llm_available
 
     limitations: list[str] = []
-    if scanned_components < total_components:
-        skipped = total_components - scanned_components
+    if missing_components:
+        skipped = len(missing_components)
         limitations.append(f"{skipped} component(s) had no content in file_cache (skipped)")
     if use_llm and not llm_available:
         limitations.append(f"LLM meta-analysis unavailable: {llm_error or 'unknown reason'}")
@@ -727,7 +732,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
     )
     sarif_report = _build_sarif(active_findings, suppressed, degraded_notice=degraded_notice)
     analysis_completeness = _build_analysis_completeness(
-        components, file_cache, use_llm, raw_findings, filtered_findings
+        components,
+        file_cache,
+        use_llm,
+        raw_findings,
+        filtered_findings,
+        state.get("analysis_excluded_components") or [],
     )
 
     # Fail closed on a degraded deep scan: when the LLM stage was requested but

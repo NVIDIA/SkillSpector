@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from skillspector.constants import MAX_FILE_BYTES
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding
 
@@ -48,7 +49,6 @@ FILE_TYPES: dict[str, str] = {
     ".rs": "rust",
 }
 
-MAX_FILE_BYTES = 1_000_000
 _EVAL_DATASET_FILES = {
     "evals/evals.json",
     "evals/evals.jsonl",

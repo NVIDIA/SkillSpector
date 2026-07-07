@@ -169,6 +169,19 @@ class TestSemanticSecurityDiscoveryBatching:
         assert batches_arg[0].file_path == "SKILL.md"
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_component_excluded_from_file_cache_is_not_batched(self, base_state) -> None:
+        """Recognized OMS metadata never becomes an LLM placeholder batch."""
+        base_state["components"] = ["SKILL.md", "skill.oms.sig"]
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]) as mock_run:
+            node(base_state)
+
+        batches_arg = mock_run.call_args[0][0]
+        assert [batch.file_path for batch in batches_arg] == ["SKILL.md"]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_oversized_file_multiple_batches(self, base_state) -> None:
         # A file large enough to exceed the reduced token budget
         long_content = "\n".join(f"Line {i:04d}: " + "x" * 30 for i in range(300))

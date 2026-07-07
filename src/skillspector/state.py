@@ -39,6 +39,9 @@ class SkillspectorState(TypedDict, total=False):
     # build_context node populates these
     components: list[str]
     file_cache: dict[str, str]
+    # Components inventoried for reporting but intentionally omitted from all
+    # analyzer inputs (for example, a recognized root-level OMS signature).
+    analysis_excluded_components: list[str]
     ast_cache: dict[str, str]
     manifest: dict[str, object]
     previous_manifest: dict[str, object] | None

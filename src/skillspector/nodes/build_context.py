@@ -21,12 +21,15 @@ from a local skill directory.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
 from pathlib import Path
 
 import yaml
 
-from skillspector.constants import MODEL_CONFIG
+from skillspector.constants import MAX_FILE_BYTES, MODEL_CONFIG
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
 
@@ -59,6 +62,12 @@ _FILE_TYPES: dict[str, str] = {
 _EXECUTABLE_EXTENSIONS = frozenset(
     {".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".rb", ".go", ".rs", ".pl"}
 )
+
+_OMS_SIGNATURE_PATH = "skill.oms.sig"
+_SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+_IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json"
+_IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+_OMS_PREDICATE_TYPE = "https://model_signing/signature/v1.0"
 
 
 def _resolve_skill_dir(state: SkillspectorState) -> Path:
@@ -108,6 +117,68 @@ def _infer_file_type(path: str) -> str:
     return _FILE_TYPES.get(suffix, "other")
 
 
+def _decode_base64_json(value: object) -> dict[str, object] | None:
+    """Decode a strict base64 JSON object, returning ``None`` on malformed input."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _is_valid_oms_signature(file_path: Path) -> bool:
+    """Recognize the minimal root-level OMS DSSE/in-toto signature structure.
+
+    This intentionally does not parse verification material or verify the
+    cryptographic signature. Its purpose is to distinguish detached OMS
+    metadata from agent-facing content before analyzers inspect the skill.
+    """
+    try:
+        if file_path.stat().st_size > MAX_FILE_BYTES:
+            return False
+        content = file_path.read_text(encoding="utf-8")
+        bundle = json.loads(content)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(bundle, dict):
+        return False
+    if bundle.get("mediaType") != _SIGSTORE_BUNDLE_MEDIA_TYPE:
+        return False
+    if not isinstance(bundle.get("verificationMaterial"), dict):
+        return False
+
+    envelope = bundle.get("dsseEnvelope")
+    if not isinstance(envelope, dict):
+        return False
+    if envelope.get("payloadType") != _IN_TOTO_PAYLOAD_TYPE:
+        return False
+
+    signatures = envelope.get("signatures")
+    if not isinstance(signatures, list) or len(signatures) != 1:
+        return False
+    signature = signatures[0]
+    if not isinstance(signature, dict):
+        return False
+    signature_bytes = signature.get("sig")
+    if not isinstance(signature_bytes, str) or not signature_bytes:
+        return False
+    try:
+        base64.b64decode(signature_bytes, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+
+    statement = _decode_base64_json(envelope.get("payload"))
+    return bool(
+        statement
+        and statement.get("_type") == _IN_TOTO_STATEMENT_TYPE
+        and statement.get("predicateType") == _OMS_PREDICATE_TYPE
+    )
+
+
 def _count_lines(file_path: Path) -> int:
     """Count lines in a file, handling binary and errors gracefully."""
     try:
@@ -119,7 +190,9 @@ def _count_lines(file_path: Path) -> int:
 
 
 def _build_component_metadata(
-    skill_dir: Path, components: list[str]
+    skill_dir: Path,
+    components: list[str],
+    recognized_oms_signatures: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, object]], bool]:
     """Build component_metadata list and has_executable_scripts from paths."""
     metadata: list[dict[str, object]] = []
@@ -129,7 +202,7 @@ def _build_component_metadata(
         if not full.is_file():
             continue
         suffix = full.suffix.lower()
-        file_type = _infer_file_type(path)
+        file_type = "oms_signature" if path in recognized_oms_signatures else _infer_file_type(path)
         lines = _count_lines(full)
         executable = suffix in _EXECUTABLE_EXTENSIONS
         if executable:
@@ -151,10 +224,16 @@ def _build_component_metadata(
     return metadata, has_executable
 
 
-def _read_file_cache(skill_dir: Path, components: list[str]) -> dict[str, str]:
+def _read_file_cache(
+    skill_dir: Path,
+    components: list[str],
+    excluded_paths: frozenset[str] = frozenset(),
+) -> dict[str, str]:
     """Build file_cache: relative path -> file contents. Uses utf-8 with replace for errors."""
     file_cache: dict[str, str] = {}
     for path in components:
+        if path in excluded_paths:
+            continue
         full = skill_dir / path
         if not full.is_file():
             continue
@@ -236,13 +315,22 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     skill_dir = _resolve_skill_dir(state)
 
     components = _walk_skill_files(skill_dir)
-    file_cache = _read_file_cache(skill_dir, components)
+    recognized_oms_signatures = frozenset(
+        {_OMS_SIGNATURE_PATH}
+        if _OMS_SIGNATURE_PATH in components
+        and _is_valid_oms_signature(skill_dir / _OMS_SIGNATURE_PATH)
+        else set()
+    )
+    file_cache = _read_file_cache(skill_dir, components, recognized_oms_signatures)
     manifest = _parse_manifest(skill_dir)
-    component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)
+    component_metadata, has_executable_scripts = _build_component_metadata(
+        skill_dir, components, recognized_oms_signatures
+    )
 
     return {
         "components": components,
         "file_cache": file_cache,
+        "analysis_excluded_components": sorted(recognized_oms_signatures),
         "ast_cache": {},
         "manifest": manifest,
         "previous_manifest": None,

@@ -89,6 +89,23 @@ class TestBuildAnalysisCompleteness:
         assert result["is_complete"] is False
         assert any("2 component(s)" in lim for lim in result["limitations"])
 
+    def test_intentionally_excluded_component_counts_as_covered(self) -> None:
+        """Recognized metadata exclusions do not make an otherwise complete scan partial."""
+        with patch("skillspector.nodes.report.is_llm_available", return_value=(True, None)):
+            result = _build_analysis_completeness(
+                ["SKILL.md", "skill.oms.sig"],
+                {"SKILL.md": "# Skill"},
+                use_llm=True,
+                findings_pre_filter=[],
+                findings_post_filter=[],
+                excluded_components=["skill.oms.sig"],
+            )
+        assert result["total_components"] == 2
+        assert result["scanned_components"] == 2
+        assert result["coverage_percent"] == 100.0
+        assert result["limitations"] is None
+        assert result["is_complete"] is True
+
     def test_llm_unavailable_noted(self) -> None:
         with patch(
             "skillspector.nodes.report.is_llm_available",
