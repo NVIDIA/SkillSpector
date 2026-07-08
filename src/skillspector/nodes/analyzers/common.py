@@ -20,6 +20,8 @@ from __future__ import annotations
 import ast
 from typing import Any
 
+import regex
+
 from skillspector.models import Finding
 
 
@@ -313,3 +315,14 @@ def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) ->
     start = max(0, lineno - 1)
     end = end_lineno or lineno
     return "\n".join(lines[start:end])[:200]
+
+
+def is_emoji_zwj_sequence(content: str, zwj_idx: int):
+
+    left = content[zwj_idx - 1] if zwj_idx > 0 else ""
+    right = content[zwj_idx + 1] if zwj_idx + 1 < len(content) else ""
+
+    left_is_emoji = bool(regex.match(r"\p{Extended_Pictographic}", left))
+    right_is_emoji = bool(regex.match(r"\p{Extended_Pictographic}", right))
+
+    return left_is_emoji and right_is_emoji
