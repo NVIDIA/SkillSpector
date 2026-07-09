@@ -234,7 +234,7 @@ def test_recursive_json_detail_includes_issues(tmp_path: Path) -> None:
     data = json.loads(out_file.read_text())
     assert "summary" in data
     assert "skills" in data
-    for _path, skill_data in data["skills"].items():
+    for skill_data in data["skills"]:
         assert "issues" in skill_data, "each skill entry must have issues[]"
 
 
@@ -260,7 +260,7 @@ def test_recursive_json_without_detail_no_issues(tmp_path: Path) -> None:
     )
     assert out_file.exists()
     data = json.loads(out_file.read_text())
-    for skill_data in data.get("skills", {}).values():
+    for skill_data in data.get("skills", []):
         assert "issues" not in skill_data
 
 
@@ -376,5 +376,10 @@ def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
 
     assert out.exists()
     data = json.loads(out.read_text())
+    assert data["multi_skill"] is True
+    assert data["skill_count"] == 2
+    assert data["max_risk_score"] == 10
     assert data["summary"]["total_skills"] == 2
-    assert "skills" in data
+    assert isinstance(data["skills"], list)
+    assert {s["path"] for s in data["skills"]} == {"skill1", "skill2"}
+    assert all("risk_score" in s and "risk_severity" in s for s in data["skills"])

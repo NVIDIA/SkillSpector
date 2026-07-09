@@ -515,13 +515,12 @@ def _scan_multi_skill(
     if output and format == FormatChoice.json:
         # Count by severity across all skills for the summary.
         sev_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        skills_dict: dict[str, object] = {}
+        skills_list: list[dict[str, object]] = []
         for skill, result in zip(skills, results, strict=True):
             if "error" in result:
-                skills_dict[f"./{skill.relative_path}"] = {
-                    "name": skill.name,
-                    "error": result["error"],
-                }
+                skills_list.append(
+                    {"name": skill.name, "path": skill.relative_path, "error": result["error"]}
+                )
                 continue
             findings_list = result.get("filtered_findings") or result.get("findings") or []
             for f in findings_list:
@@ -529,20 +528,28 @@ def _scan_multi_skill(
                 if sev in sev_counts:
                     sev_counts[sev] += 1
             entry: dict[str, object] = {
-                "score": result.get("risk_score", 0),
-                "severity": result.get("risk_severity", "LOW"),
+                "name": skill.name,
+                "path": skill.relative_path,
+                "risk_score": result.get("risk_score", 0),
+                "risk_severity": result.get("risk_severity", "LOW"),
                 "finding_count": len(findings_list),
             }
             if detail:
                 entry["issues"] = [f.to_dict() for f in findings_list if hasattr(f, "to_dict")]
-            skills_dict[f"./{skill.relative_path}"] = entry
+            skills_list.append(entry)
 
+        # `multi_skill`/`skill_count`/`max_risk_score`/`skills` (list) are the
+        # original contract — preserved as-is. `summary` and per-skill `issues`
+        # are additive so existing consumers keep working unchanged.
         combined: dict[str, object] = {
+            "multi_skill": True,
+            "skill_count": len(skills),
+            "max_risk_score": max_score,
             "summary": {
                 "total_skills": len(skills),
                 **sev_counts,
             },
-            "skills": skills_dict,
+            "skills": skills_list,
         }
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
