@@ -342,6 +342,15 @@ class TestRunStaticPatternsMemoryPoisoning:
         findings = static_runner.run_static_patterns(state, [memory_poisoning_module])
         assert not any(f.rule_id == "MP2" for f in findings)
 
+    def test_mp2_oversized_layout_span_produces_finding(self):
+        """Very large layout-only spans should still yield MP2."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": ("|-" * 5000) + "\nEND\n"},
+        }
+        findings = static_runner.run_static_patterns(state, [memory_poisoning_module])
+        assert any(f.rule_id == "MP2" for f in findings)
+
     def test_mp2_semantic_stuffing_still_fires(self):
         """Semantically meaningful stuffing phrases still yield MP2."""
         state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": "ha" * 80}}

@@ -168,8 +168,16 @@ _AR2_DIRECT_INTENT_PATTERNS = (
     re.compile(r"\b(?:do\s+not|don'?t)\s+(?:apologize|apologise|say\s+sorry)\b", re.IGNORECASE),
 )
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
-    r"\b(?:json|output)\s+schema\b|\berrors?\[\]\b",
-    re.IGNORECASE,
+    r"""
+    \b(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
+    (?:field|key|property|array|list|entry)\b
+    |
+    \b(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
+    (?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
+    |
+    \b(?:warnings?|disclaimers?|caveats?)\b[^.\n]{0,80}\b(?:schema\s+field|schema\s+key|errors?\[\]\s+array)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 _BENIGN_AR_WARNING_INTRO_PATTERN = re.compile(r"^\s*(?:warning|note)\s*:\s*$", re.IGNORECASE)
 _BENIGN_AR_DENYLIST_DECLARATION_PATTERN = re.compile(
@@ -192,10 +200,24 @@ _LIVE_RESPONSE_OBJECT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DEFENSIVE_AR_CONTEXT_PATTERN = re.compile(
-    r"(?:^\s*(?:warning|note)\s*:|\b(?:malicious|example|payload|attack|defensive|deny-?list|fixture|the\s+phrase)\b)",
+    r"(?:^\s*(?:warning|note)\s*:|\b(?:malicious|example|attack|defensive)\s+"
+    r"(?:phrase|payload|string|text|snippet|content|example)\b)",
     re.IGNORECASE,
 )
-_BENIGN_AR_NARRATIVE_PREFIX_PATTERN = re.compile(r"\bwould\s+$", re.IGNORECASE)
+_RETROSPECTIVE_AR_NARRATIVE_PATTERNS = (
+    re.compile(
+        r"\b(?:the|this|that)\s+(?:old|previous|prior)?\s*"
+        r"(?:agent|model|system|implementation|version|behavior)\s+would\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:the|this|that)\s+(?:agent|model|system|implementation|version|behavior)\s+used\s+to\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bpreviously\s+would\b", re.IGNORECASE),
+    re.compile(r"\bpreviously\s+used\s+to\b", re.IGNORECASE),
+)
+_SECOND_PERSON_NARRATIVE_PATTERN = re.compile(r"\byou\s+would\b", re.IGNORECASE)
 
 
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
@@ -298,21 +320,22 @@ def _is_match_local_narrative_clause(
     clause_match_start: int,
 ) -> bool:
     """Return True when the current match is part of a narrative clause, not a directive."""
-    return bool(_BENIGN_AR_NARRATIVE_PREFIX_PATTERN.search(match_clause[:clause_match_start]))
+    prefix = match_clause[:clause_match_start]
+    if _SECOND_PERSON_NARRATIVE_PATTERN.search(prefix):
+        return False
+    return any(pattern.search(prefix) for pattern in _RETROSPECTIVE_AR_NARRATIVE_PATTERNS)
 
 
 def _is_schema_field_clause(
     match_clause: str,
-    clause_match_end: int,
     matched_text: str,
 ) -> bool:
     """Return True when an AR2 warning-suppression phrase targets schema fields."""
     if not _AR2_LIVE_SUPPRESSION_PATTERN.search(matched_text):
         return False
-    clause_tail = match_clause[clause_match_end:]
-    if not _BENIGN_AR_SCHEMA_FIELD_PATTERN.search(clause_tail):
+    if not _BENIGN_AR_SCHEMA_FIELD_PATTERN.search(match_clause):
         return False
-    return not _LIVE_RESPONSE_OBJECT_PATTERN.search(clause_tail)
+    return not _LIVE_RESPONSE_OBJECT_PATTERN.search(match_clause)
 
 
 def _is_benign_ar_context(
@@ -323,15 +346,14 @@ def _is_benign_ar_context(
     previous_line: str | None = None,
 ) -> bool:
     """Return True for high-confidence non-malicious prose patterns around one match span."""
-    match_clause, clause_match_start, clause_match_end = _match_clause(
+    match_clause, clause_match_start, _ = _match_clause(
         match_line,
         line_match_start,
         line_match_end,
     )
-    match_clause_lower = match_clause.lower()
-    if _is_match_local_narrative_clause(match_clause_lower, clause_match_start):
+    if _is_match_local_narrative_clause(match_clause, clause_match_start):
         return True
-    if _is_schema_field_clause(match_clause_lower, clause_match_end, match.lower()):
+    if _is_schema_field_clause(match_clause, match.lower()):
         return True
     return _is_quoted_match(match_line, match) and _has_explicit_defensive_context(
         match_line,
