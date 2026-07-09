@@ -223,7 +223,7 @@ The rules are designed to avoid redundant or contradictory findings:
 | Fixture directory                 | Expected findings | Purpose                          |
 |-----------------------------------|-------------------|----------------------------------|
 | `mcp_clean_skill/`               | None              | Negative test -- all caps declared |
-| `mcp_underdeclared_skill/`        | LP1, LP3          | Missing permissions + undeclared caps |
+| `mcp_underdeclared_skill/`        | LP3               | Missing permissions + detected caps |
 | `mcp_overprivileged_skill/`      | LP2, LP4          | Wildcard + overdeclared permissions |
 
 ---
