@@ -103,6 +103,33 @@ _validate_model_config()
 # Log level: from env or fallback (DEBUG, INFO, WARNING, ERROR).
 SKILLSPECTOR_LOG_LEVEL = os.environ.get("SKILLSPECTOR_LOG_LEVEL", "WARNING")
 
+_META_BATCH_SIZE_DEFAULT = 20
+
+
+def _parse_meta_batch_size() -> int:
+    """Parse ``SKILLSPECTOR_META_BATCH_SIZE`` without letting a bad value crash import.
+
+    Falls back to the default on missing/empty/non-numeric values, and
+    clamps non-positive values to 1.
+    """
+    raw = os.environ.get("SKILLSPECTOR_META_BATCH_SIZE", "").strip()
+    if not raw:
+        return _META_BATCH_SIZE_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SKILLSPECTOR_META_BATCH_SIZE=%r; falling back to default (%d).",
+            raw,
+            _META_BATCH_SIZE_DEFAULT,
+        )
+        return _META_BATCH_SIZE_DEFAULT
+    if value < 1:
+        logger.warning("SKILLSPECTOR_META_BATCH_SIZE=%d is not positive; clamping to 1.", value)
+        return 1
+    return value
+
+
 # Maximum number of findings per meta-analyzer LLM call group.
 # Keeps individual calls within context limits for large skill directories.
-META_BATCH_SIZE: int = int(os.environ.get("SKILLSPECTOR_META_BATCH_SIZE", "20"))
+META_BATCH_SIZE: int = _parse_meta_batch_size()
