@@ -35,3 +35,7 @@ warnings.filterwarnings(
 from skillspector.graph import create_graph, graph  # noqa: E402 (after filter setup)
 
 __all__ = ["create_graph", "graph", "__version__"]
+
+# ExaForce fork: apply runtime schema/prompt patches (kept out of upstream files).
+from skillspector import exaforce as _exaforce  # noqa: E402
+_exaforce.apply_patches()
