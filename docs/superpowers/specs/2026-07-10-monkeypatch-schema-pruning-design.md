@@ -103,12 +103,14 @@ now happens at runtime via `apply_patches()`:
 
 ## Tests
 
-- **Keep** PR #8's edits to `tests/nodes/test_llm_analyzer_base.py` and
-  `tests/nodes/test_semantic_quality_policy.py`. Because `__init__.py` patches
-  globally on import, the test process sees pruned behavior, so these
-  pruned-expecting assertions pass. (Reverting them would make them fail against
-  the patched runtime.) These two test files remain the only forked test
-  artifacts.
+- **Revert** PR #8's edits to `tests/nodes/test_llm_analyzer_base.py` and
+  `tests/nodes/test_semantic_quality_policy.py` back to upstream parity. Because
+  `__init__.py` patches globally on import, these upstream tests assert the
+  **un-pruned** schema (e.g. `d["explanation"] == ""`, `test_intent_validation`
+  expecting a `ValueError`) and will therefore **fail** at runtime. This is an
+  accepted, deliberate trade: keeping every upstream file at parity is worth more
+  than a green upstream test suite, and avoids the maintenance burden of keeping
+  forked test assertions in sync with upstream.
 - **Add** `tests/exaforce/test_patches.py` (fork-only) that:
   - asserts `apply_patches()` removed the expected keys from each model's JSON
     schema and from `model_dump()`;
@@ -119,8 +121,10 @@ now happens at runtime via `apply_patches()`:
 
 ## Verification
 
-- `uv run pytest` green (full suite, incl. kept pruned-expecting tests + new
-  exaforce tests).
+- `uv run pytest` passes **except** for the reverted upstream tests that assert
+  un-pruned behavior (a known, documented set of failures — see Tests). The new
+  `tests/exaforce/` suite and everything else pass. Record the exact expected
+  failures so a reviewer can distinguish them from new regressions.
 - A one-off runtime check: import `skillspector`, then dump
   `LLMAnalysisResult.model_json_schema()` and `MetaAnalyzerResult.model_json_schema()`
   and confirm the pruned keys are absent and the prompts lack the removed
@@ -142,5 +146,8 @@ now happens at runtime via `apply_patches()`:
 2. **Pydantic internal reliance** (`model_fields`, `__pydantic_decorators__`,
    `model_rebuild`) could break on a major Pydantic upgrade — mitigated by the
    exaforce test suite catching it in CI.
-3. **Two test files remain forked** — accepted; their assertions track real
-   (pruned) behavior and conflict far less than the source files did.
+3. **Reverted upstream tests fail at runtime** — accepted. Cost: CI/`pytest`
+   signal is polluted, since a genuinely new regression in those files would be
+   harder to spot among the known failures. Mitigated by documenting the exact
+   expected-failure set. Chosen deliberately over the maintenance burden of
+   forked test assertions.
