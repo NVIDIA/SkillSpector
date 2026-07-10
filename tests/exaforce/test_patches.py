@@ -18,6 +18,8 @@ def test_apply_patches_prunes_model_schemas(run_in_subprocess):
         # Container schema (what the LLM actually receives) is pruned too:
         nested = LLMAnalysisResult.model_json_schema()["$defs"]["LLMFinding"]["properties"]
         assert "explanation" not in nested, nested
+        nested_meta = MetaAnalyzerResult.model_json_schema()["$defs"]["MetaAnalyzerFinding"]["properties"]
+        assert "intent" not in nested_meta and "impact" not in nested_meta, nested_meta
         print("OK")
         """
     )
@@ -36,6 +38,7 @@ def test_apply_patches_prunes_to_finding_and_dump(run_in_subprocess):
         assert "remediation" not in f.model_dump()
         fin = f.to_finding("x.py")
         assert fin.explanation is None
+        assert fin.remediation is None
         assert fin.rule_id == "R" and fin.start_line == 3
         print("OK")
         """
