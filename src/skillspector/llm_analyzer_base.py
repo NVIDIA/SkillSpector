@@ -73,6 +73,8 @@ class LLMFinding(BaseModel):
     start_line: int = Field(description="Starting line number (>= 1)")
     end_line: int | None = Field(default=None, description="Ending line number (optional)")
     confidence: float = Field(default=0.5, description="Confidence score between 0.0 and 1.0")
+    explanation: str = Field(default="", description="Why this is a finding (2-3 sentences)")
+    remediation: str = Field(default="", description="Actionable steps to fix the issue")
 
     @field_validator("start_line")
     @classmethod
@@ -101,6 +103,8 @@ class LLMFinding(BaseModel):
             file=file,
             start_line=self.start_line,
             end_line=self.end_line,
+            explanation=self.explanation,
+            remediation=self.remediation,
         )
 
 

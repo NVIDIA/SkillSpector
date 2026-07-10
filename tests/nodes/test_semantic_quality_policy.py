@@ -494,11 +494,8 @@ class TestFixtureMaliciousSkill:
         assert cred_finding.file == "scripts/helper.py"
         assert cred_finding.start_line == 5
         assert cred_finding.confidence == 0.95
-        # Discovery findings no longer carry explanation/remediation — the
-        # meta-analyzer is the authoritative enrichment stage, so these are
-        # populated downstream (or from pattern_defaults), not here.
-        assert cred_finding.explanation is None
-        assert cred_finding.remediation is None
+        assert cred_finding.explanation is not None
+        assert cred_finding.remediation is not None
 
 
 class TestFixtureSafeSkill:
