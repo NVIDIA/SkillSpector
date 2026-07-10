@@ -155,10 +155,12 @@ def _first_smuggled_tag_offset(content: str) -> int | None:
             return i
     return None
 
+
 def _check_emoji_zwj_sequence(content: str, match: re.Match[str]):
-    if 1 != len(match.group(0)) or '\u200d' != content[match.start():match.end()]:
+    if 1 != len(match.group(0)) or "\u200d" != content[match.start() : match.end()]:
         return False
     return is_emoji_zwj_sequence(content, match.start())
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for prompt injection patterns (P1–P4)."""

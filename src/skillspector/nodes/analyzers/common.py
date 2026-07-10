@@ -319,10 +319,34 @@ def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) ->
 
 def is_emoji_zwj_sequence(content: str, zwj_idx: int):
 
-    left = content[zwj_idx - 1] if zwj_idx > 0 else ""
-    right = content[zwj_idx + 1] if zwj_idx + 1 < len(content) else ""
+    def _read(idx: int):
+        return content[idx] if 0 <= idx < len(content) else ""
 
-    left_is_emoji = bool(regex.match(r"\p{Extended_Pictographic}", left))
-    right_is_emoji = bool(regex.match(r"\p{Extended_Pictographic}", right))
+    def _check_modifier(cp: str):
+        return 0x1F3FB <= ord(cp) <= 0x1F3FF
 
-    return left_is_emoji and right_is_emoji
+    def _check_selector(cp: str):
+        return ord(cp) in {0xFE0E, 0xFE0F}
+
+    def _check_emoji_base(cp: str):
+        return bool(regex.match(r"\p{Extended_Pictographic}", cp))
+
+    #
+    # Variation Selector (U+FE0F): may occur zero or one time
+    # Emoji_Modifier (U+1F3FB–U+1F3FF)：may occur zero or one time
+    #
+    left = _read(zwj_idx - 1)
+    if _check_modifier(left):
+        left = _read(zwj_idx - 2)
+        if _check_selector(left):
+            left = _read(zwj_idx - 3)
+    elif _check_selector(left):
+        left = _read(zwj_idx - 2)
+
+    if not _check_emoji_base(left):
+        return False
+
+    if _check_emoji_base(_read(zwj_idx + 1)):
+        return True
+
+    return False
