@@ -157,7 +157,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = ctx(match.start())
-            if _is_negated_safety_constraint(context, match.group(0)):
+            if _is_negated_safety_constraint(content, match):
                 continue
             findings.append(
                 AnalyzerFinding(
@@ -189,13 +189,25 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
-def _is_negated_safety_constraint(context: str, matched_text: str) -> bool:
+def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
     """Return True when an RA1 phrase is explicitly forbidden in policy prose."""
-    escaped = re.escape(matched_text.strip())
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    phrase = line[local_start : local_start + len(match.group(0))]
+    escaped = re.escape(phrase.strip())
     if not escaped:
         return False
+    clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
+    prefix = line[clause_start + 1 : local_start]
     negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
-    return re.search(negation + r"(?:\w+\s+){0,4}" + escaped, context, re.IGNORECASE) is not None
+    return (
+        re.search(negation + r"(?:\w+\s+){0,4}" + escaped + r"$", prefix + phrase, re.IGNORECASE)
+        is not None
+    )
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
