@@ -251,6 +251,7 @@ Implement the actual pruning patches and the idempotent `apply_patches()` orches
 - Create: `src/skillspector/exaforce/_schema_patches.py`
 - Create: `src/skillspector/exaforce/_prompt_patches.py`
 - Modify: `src/skillspector/exaforce/__init__.py` (currently empty)
+- Create: `tests/exaforce/conftest.py` (shared `run_in_subprocess` fixture, reused by Task 4)
 - Test: `tests/exaforce/test_patches.py`
 
 **Interfaces:**
@@ -259,29 +260,39 @@ Implement the actual pruning patches and the idempotent `apply_patches()` orches
   - `skillspector.exaforce.apply_patches() -> None` — idempotent; runs `_schema_patches.apply()` then `_prompt_patches.apply()`.
   - `_schema_patches.apply() -> None`, `_prompt_patches.apply() -> None`.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the shared fixture and the failing tests**
 
-Create `tests/exaforce/test_patches.py`:
+Create `tests/exaforce/conftest.py` (the subprocess runner both this task and Task 4 use — a fresh interpreter is how we assert the *real* import-time behavior without polluting the in-process patch state):
 
 ```python
 import subprocess
 import sys
 import textwrap
 
+import pytest
 
-def _run(code: str) -> str:
+
+@pytest.fixture
+def run_in_subprocess():
     """Run *code* in a fresh interpreter; return stdout, assert clean exit."""
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(code)],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    return result.stdout
 
+    def _run(code: str) -> str:
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(code)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout
 
-def test_apply_patches_prunes_model_schemas():
-    out = _run(
+    return _run
+```
+
+Then create `tests/exaforce/test_patches.py`:
+
+```python
+def test_apply_patches_prunes_model_schemas(run_in_subprocess):
+    out = run_in_subprocess(
         """
         import skillspector
         from skillspector.exaforce import apply_patches
@@ -306,8 +317,8 @@ def test_apply_patches_prunes_model_schemas():
     assert "OK" in out
 
 
-def test_apply_patches_prunes_to_finding_and_dump():
-    out = _run(
+def test_apply_patches_prunes_to_finding_and_dump(run_in_subprocess):
+    out = run_in_subprocess(
         """
         import skillspector
         from skillspector.exaforce import apply_patches
@@ -325,8 +336,8 @@ def test_apply_patches_prunes_to_finding_and_dump():
     assert "OK" in out
 
 
-def test_apply_patches_trims_prompts():
-    out = _run(
+def test_apply_patches_trims_prompts(run_in_subprocess):
+    out = run_in_subprocess(
         """
         import skillspector
         from skillspector.exaforce import apply_patches
@@ -345,8 +356,8 @@ def test_apply_patches_trims_prompts():
     assert "OK" in out
 
 
-def test_apply_patches_is_idempotent():
-    out = _run(
+def test_apply_patches_is_idempotent(run_in_subprocess):
+    out = run_in_subprocess(
         """
         import skillspector
         from skillspector.exaforce import apply_patches
@@ -506,6 +517,7 @@ Expected: PASS — same count as Task 1 Step 3 plus the new exaforce tests. The 
 git add src/skillspector/exaforce/_schema_patches.py \
         src/skillspector/exaforce/_prompt_patches.py \
         src/skillspector/exaforce/__init__.py \
+        tests/exaforce/conftest.py \
         tests/exaforce/test_patches.py
 git commit -m "feat(exaforce): prune LLM schema keys + prompt text via guarded patch"
 ```
@@ -527,27 +539,12 @@ Wire `apply_patches()` into `skillspector/__init__.py` so the pruning is the def
 
 - [ ] **Step 1: Write the failing activation test**
 
-Create `tests/exaforce/test_activation.py`:
+Create `tests/exaforce/test_activation.py` (reuses the `run_in_subprocess` fixture from `tests/exaforce/conftest.py`, added in Task 3):
 
 ```python
-import subprocess
-import sys
-import textwrap
-
-
-def _run(code: str) -> str:
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(code)],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    return result.stdout
-
-
-def test_bare_import_activates_patches():
+def test_bare_import_activates_patches(run_in_subprocess):
     # No explicit apply_patches() call — importing skillspector must patch.
-    out = _run(
+    out = run_in_subprocess(
         """
         import skillspector
         from skillspector.llm_analyzer_base import LLMFinding
