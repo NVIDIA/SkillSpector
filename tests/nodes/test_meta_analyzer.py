@@ -13,22 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the meta_analyzer node."""
+"""Tests for the meta_analyzer node.
+
+Covers ``LLMMetaAnalyzer`` filtering and partial-batch-failure handling, plus
+the LLM-call telemetry and fail-closed construction that drive the report's
+degradation signal.
+"""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from skillspector.llm_analyzer_base import Batch
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, meta_analyzer
+from skillspector.state import SkillspectorState
 
 MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 
 
 def _mock_get_chat_model(*_args, **_kwargs):
-    from unittest.mock import MagicMock
-
     mock_llm = MagicMock()
     mock_llm.with_structured_output.return_value = MagicMock()
     return mock_llm
@@ -225,3 +229,73 @@ class TestMetaAnalyzerPartialBatchFailure:
 
         kept = {(f.file, f.rule_id) for f in result["filtered_findings"]}
         assert kept == {("a.py", "R1")}
+
+
+# ---------------------------------------------------------------------------
+# LLM-call telemetry + fail-closed construction (drives the report's
+# degradation signal).
+# ---------------------------------------------------------------------------
+
+
+def _degr_finding(rule_id: str = "P1", severity: str = "HIGH") -> Finding:
+    return Finding(
+        rule_id=rule_id,
+        message="test",
+        severity=severity,
+        confidence=0.8,
+        file="SKILL.md",
+        start_line=1,
+    )
+
+
+def _degr_state(**overrides: object) -> SkillspectorState:
+    state: SkillspectorState = {
+        "findings": [_degr_finding()],
+        "use_llm": True,
+        "file_cache": {"SKILL.md": "# Skill"},
+        "manifest": {},
+        "model_config": {},
+    }
+    state.update(overrides)  # type: ignore[typeddict-item]
+    return state
+
+
+def test_records_ok_true_on_success() -> None:
+    with (
+        patch("skillspector.llm_analyzer_base.get_chat_model", return_value=MagicMock()),
+        patch(
+            "skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+    ):
+        result = meta_analyzer(_degr_state())
+    assert result["llm_call_log"] == [{"node": "meta_analyzer", "ok": True, "error": None}]
+
+
+def test_construction_failure_is_caught_not_raised() -> None:
+    """Regression: the chat model is constructed INSIDE the try, so a construction
+    failure degrades (records ok=False, preserves findings) instead of crashing
+    the whole graph."""
+    with patch(
+        "skillspector.llm_analyzer_base.get_chat_model",
+        side_effect=RuntimeError("provider construction failed"),
+    ):
+        result = meta_analyzer(_degr_state())  # must not raise
+    # Findings are preserved via the fallback path...
+    assert len(result["filtered_findings"]) == 1
+    # ...and the failure is recorded so the report can flag degradation.
+    log = result["llm_call_log"]
+    assert log[0]["node"] == "meta_analyzer"
+    assert log[0]["ok"] is False
+    assert "provider construction failed" in log[0]["error"]
+
+
+def test_use_llm_false_records_nothing() -> None:
+    result = meta_analyzer(_degr_state(use_llm=False))
+    assert "llm_call_log" not in result
+
+
+def test_no_findings_records_nothing() -> None:
+    result = meta_analyzer(_degr_state(findings=[]))
+    assert "llm_call_log" not in result

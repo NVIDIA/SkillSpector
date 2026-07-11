@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 from enum import StrEnum
 from pathlib import Path
@@ -34,6 +33,8 @@ from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 
 from skillspector import __version__
+from skillspector.cleanup import cleanup_result
+from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
@@ -139,15 +140,20 @@ def _scan_state(
     return state
 
 
+def _result_body(result: dict) -> str:
+    report_body = result.get("report_body") or ""
+    if not report_body and result.get("sarif_report") is not None:
+        report_body = json.dumps(result["sarif_report"], indent=2)
+    return report_body
+
+
 def _write_result(
     result: dict[str, object],
     output: Path | None,
     format: FormatChoice,
 ) -> None:
     """Write report_body to file or stdout. Uses sarif_report if report_body missing."""
-    report_body = result.get("report_body") or ""
-    if not report_body and result.get("sarif_report") is not None:
-        report_body = json.dumps(result["sarif_report"], indent=2)
+    report_body = _result_body(result)
     if output:
         Path(output).write_text(report_body, encoding="utf-8")
         if format == FormatChoice.terminal:
@@ -159,13 +165,6 @@ def _write_result(
             console.print(report_body)
         else:
             print(report_body)
-
-
-def _cleanup_result(result: dict[str, object]) -> None:
-    """Remove temp dir from graph result if set."""
-    temp_dir = result.get("temp_dir_for_cleanup")
-    if temp_dir and isinstance(temp_dir, str):
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.command()
@@ -317,7 +316,7 @@ def scan(
 
         _write_result(result, output, format)
 
-        if (result.get("risk_score") or 0) > 50:
+        if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
     except typer.Exit:
         raise
@@ -332,7 +331,7 @@ def scan(
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
-            _cleanup_result(result)
+            cleanup_result(result)
 
 
 def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> RunnableConfig:
@@ -429,11 +428,15 @@ def _scan_multi_skill(
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
     elif output:
-        for _skill, result in zip(skills, results, strict=True):
+        # concatenated non-JSON output: not merged SARIF
+        sections = []
+        for skill, result in zip(skills, results, strict=True):
             if "error" not in result:
-                _write_result(result, None, format)
+                sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
+        Path(output).write_text("\n\n".join(sections), encoding="utf-8")
+        console.print(f"[green]Combined report saved to:[/green] {output}")
 
-    if max_score > 50:
+    if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
 
 
@@ -555,7 +558,7 @@ def baseline(
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
-            _cleanup_result(result)
+            cleanup_result(result)
 
 
 if __name__ == "__main__":

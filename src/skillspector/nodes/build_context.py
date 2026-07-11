@@ -170,8 +170,8 @@ def _read_file_cache(skill_dir: Path, components: list[str]) -> dict[str, str]:
 def _parse_manifest(skill_dir: Path) -> dict[str, object]:
     """Parse SKILL.md or skill.md YAML frontmatter into a manifest dict.
 
-    Returns dict with name, description, triggers (list), permissions (list).
-    Returns {} if no file or parse fails.
+    Returns dict with name, description, triggers (list), permissions (list),
+    allowed-tools (list), parameters (list). Returns {} if no file or parse fails.
     """
     for name in ("SKILL.md", "skill.md"):
         path = skill_dir / name
@@ -206,6 +206,14 @@ def _parse_manifest(skill_dir: Path) -> dict[str, object]:
         manifest["permissions"] = (
             [str(p) for p in permissions] if isinstance(permissions, list) else []
         )
+        # `allowed-tools` (Agent Skills standard) — accept list or comma string.
+        allowed_tools = data.get("allowed-tools", [])
+        if isinstance(allowed_tools, list):
+            manifest["allowed-tools"] = [str(t).strip() for t in allowed_tools if str(t).strip()]
+        elif isinstance(allowed_tools, str):
+            manifest["allowed-tools"] = [t.strip() for t in allowed_tools.split(",") if t.strip()]
+        else:
+            manifest["allowed-tools"] = []
         # Preserve parameter definitions as dicts so the MCP tool-poisoning
         # analyzer (TP1/TP2/TP3 parameter checks) can inspect them. Without
         # this, those checks never fire on real scans because the manifest

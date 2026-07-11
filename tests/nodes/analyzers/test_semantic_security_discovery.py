@@ -83,7 +83,7 @@ class TestSemanticSecurityDiscoveryNode:
         base_state["use_llm"] = False
         with patch(MOCK_PATCH_TARGET) as mock_llm:
             result = node(base_state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
         mock_llm.assert_not_called()
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
@@ -111,7 +111,7 @@ class TestSemanticSecurityDiscoveryNode:
         base_state["file_cache"] = {}
         with patch(MOCK_PATCH_TARGET) as mock_llm:
             result = node(base_state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
         mock_llm.assert_not_called()
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
@@ -206,7 +206,7 @@ class TestUseLlmGuard:
 
             with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
                 result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +285,7 @@ class TestErrorHandling:
         mock_get_model.side_effect = RuntimeError("LLM service unavailable")
         state = {"file_cache": {"SKILL.md": "# Skill"}}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_validation_error_returns_empty(self) -> None:
@@ -302,7 +302,54 @@ class TestErrorHandling:
 
         with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
-        assert result == {"findings": []}
+        assert result["findings"] == []
+
+
+# ---------------------------------------------------------------------------
+# TestLLMCallTelemetry — the llm_call_log record the report uses to detect a
+# silent LLM-stage degradation (use_llm requested but every call failed).
+# ---------------------------------------------------------------------------
+
+
+class TestLLMCallTelemetry:
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_success_records_ok_true(self, base_state) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+            result = node(base_state)
+        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+
+    @patch(MOCK_PATCH_TARGET)
+    def test_generic_exception_records_ok_false(self, mock_get_model: MagicMock) -> None:
+        mock_get_model.side_effect = RuntimeError("LLM service unavailable")
+        result = node({"file_cache": {"SKILL.md": "# Skill"}})
+        log = result["llm_call_log"]
+        assert len(log) == 1
+        assert log[0]["node"] == ANALYZER_ID
+        assert log[0]["ok"] is False
+        assert "LLM service unavailable" in log[0]["error"]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_validation_error_records_ok_false(self) -> None:
+        try:
+            LLMAnalysisResult.model_validate({"findings": "not-an-array"})
+        except ValidationError as exc:
+            validation_err = exc
+        else:
+            pytest.fail("Expected ValidationError from bad data")
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+            result = node({"file_cache": {"SKILL.md": "# Skill"}})
+        assert result["llm_call_log"][0]["ok"] is False
+
+    def test_use_llm_false_records_nothing(self) -> None:
+        # An intentional skip is not a failure: no telemetry record is emitted,
+        # so it can never be mistaken for a degraded LLM stage.
+        result = node({"use_llm": False, "file_cache": {"SKILL.md": "# Skill"}})
+        assert "llm_call_log" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +500,7 @@ class TestFixtureConftestSafe:
         ):
             result = node(state)
 
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------

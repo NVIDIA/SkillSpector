@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 MAX_INPUT_TOKENS_PCT = 0.75
 # Fallback context length when no metadata API or registry entry is available.
 DEFAULT_CONTEXT_LENGTH = 128_000
+# Risk score threshold above which a scan is treated as unsafe.
+RISK_THRESHOLD = 50
 
 # Default-model selection lives on each provider (see providers/<name>/provider.py
 # for ``DEFAULT_MODEL`` and ``SLOT_DEFAULTS``).  The active provider's

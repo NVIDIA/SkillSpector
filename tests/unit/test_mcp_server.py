@@ -15,6 +15,9 @@
 
 """Tests for the MCP server wrapper (run_scan core + scan_skill tool)."""
 
+import asyncio
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,3 +93,25 @@ async def test_build_server_registers_scan_skill() -> None:
     server = mcp_server.build_server()
     tools = await server.list_tools()
     assert "scan_skill" in {tool.name for tool in tools}
+
+
+async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
+    """The real stdio CLI must initialize and expose the scan_skill tool."""
+    pytest.importorskip("mcp")
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    repo_root = Path(__file__).resolve().parents[2]
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "skillspector.cli", "mcp"],
+        env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
+    )
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await asyncio.wait_for(session.initialize(), timeout=15)
+            tools = await asyncio.wait_for(session.list_tools(), timeout=15)
+
+    assert "scan_skill" in {tool.name for tool in tools.tools}

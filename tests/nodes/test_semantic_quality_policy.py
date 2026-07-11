@@ -68,7 +68,7 @@ class TestUseLlmGuard:
     def test_use_llm_false_returns_empty(self) -> None:
         state = {"use_llm": False, "file_cache": {"SKILL.md": "# Skill"}}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     def test_use_llm_true_proceeds(self) -> None:
         """When use_llm is True (default), the node should attempt LLM analysis."""
@@ -80,7 +80,7 @@ class TestUseLlmGuard:
                 LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]
             ):
                 result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +92,12 @@ class TestEmptyFileCache:
     def test_empty_file_cache_returns_empty(self) -> None:
         state = {"file_cache": {}}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     def test_missing_file_cache_returns_empty(self) -> None:
         state = {}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +174,7 @@ class TestNodeReturnsFindings:
         with patch.object(LLMAnalyzerBase, "__init__", _patched_init):
             result = node(state)
 
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +256,33 @@ class TestErrorHandling:
         mock_get_model.side_effect = RuntimeError("LLM service unavailable")
         state = {"file_cache": {"SKILL.md": "# Skill"}}
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
+
+
+# ---------------------------------------------------------------------------
+# LLM call telemetry (llm_call_log; drives the report's degradation signal)
+# ---------------------------------------------------------------------------
+
+
+class TestLLMCallTelemetry:
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_success_records_ok_true(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
+            result = node({"file_cache": {"SKILL.md": "# Skill"}})
+        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+
+    @patch(MOCK_PATCH_TARGET)
+    def test_exception_records_ok_false(self, mock_get_model: MagicMock) -> None:
+        mock_get_model.side_effect = RuntimeError("boom")
+        result = node({"file_cache": {"SKILL.md": "# Skill"}})
+        assert result["llm_call_log"][0]["node"] == ANALYZER_ID
+        assert result["llm_call_log"][0]["ok"] is False
+
+    def test_use_llm_false_records_nothing(self) -> None:
+        result = node({"use_llm": False, "file_cache": {"SKILL.md": "# Skill"}})
+        assert "llm_call_log" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +522,7 @@ class TestFixtureSafeSkill:
         with patch.object(LLMAnalyzerBase, "__init__", _patched_init):
             result = node(state)
 
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_safe_skill_processes_all_files(
@@ -586,7 +612,7 @@ class TestFixtureOnDisk:
         with patch.object(LLMAnalyzerBase, "__init__", _patched_init):
             result = node(state)
 
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
 
 # ---------------------------------------------------------------------------

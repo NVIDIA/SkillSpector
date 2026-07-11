@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for behavioral_taint_tracking analyzer (SADD B.2.2): source→sink data-flow."""
+"""Tests for behavioral_taint_tracking analyzer (TT1–TT5): source→sink data-flow."""
 
 from __future__ import annotations
 
