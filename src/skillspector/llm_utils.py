@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 from collections.abc import Coroutine
-from typing import Any
+from typing import Any, NoReturn
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
