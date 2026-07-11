@@ -78,6 +78,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "MP1": "Skill injects content designed to persist in agent memory or context across interactions. Persistent injection can alter agent behavior long after the initial interaction.",
     "MP2": "Skill attempts to fill the context window with filler content, displacing legitimate instructions and safety constraints. This can degrade agent performance or bypass safety boundaries.",
     "MP3": "Skill manipulates agent memory, state, or stored context. Memory corruption can alter personality, override safety rules, or cause unpredictable behavior.",
+    "MP4": "Skill content is padded with a large run of whitespace (blank lines, long in-line runs, or near-entirely-whitespace files). This pushes hidden instructions below or past what a human reviewer sees in an editor, while the agent still reads the entire file as text.",
     # Tool Misuse (B.1.10)
     "TM1": "Tool parameters are crafted to achieve unintended or unsafe behavior. Parameter abuse can bypass intended safety checks (e.g. shell=True, --force, dangerous glob patterns).",
     "TM2": "Tool calls are chained to bypass individual safety checks or escalate capabilities beyond what any single tool call would allow.",
@@ -170,6 +171,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "MP1": PatternCategory.MEMORY_POISONING.value,
     "MP2": PatternCategory.MEMORY_POISONING.value,
     "MP3": PatternCategory.MEMORY_POISONING.value,
+    "MP4": PatternCategory.MEMORY_POISONING.value,
     "TM1": PatternCategory.TOOL_MISUSE.value,
     "TM2": PatternCategory.TOOL_MISUSE.value,
     "TM3": PatternCategory.TOOL_MISUSE.value,
@@ -247,6 +249,7 @@ PATTERN_NAMES: dict[str, str] = {
     "MP1": "Persistent Context Injection",
     "MP2": "Context Window Stuffing",
     "MP3": "Memory Manipulation",
+    "MP4": "Whitespace Padding Evasion",
     "TM1": "Tool Parameter Abuse",
     "TM2": "Chaining Abuse",
     "TM3": "Unsafe Defaults",
@@ -328,6 +331,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "MP1": "Do not allow untrusted input to persist in agent memory or context. Validate all content before storing and implement memory isolation between sessions.",
     "MP2": "Implement context-window management that detects and rejects padding or stuffing attempts. Prioritize system instructions over user-injected content.",
     "MP3": "Protect agent memory and state from modification by untrusted content. Use read-only memory for critical instructions and validate all state changes.",
+    "MP4": "Remove large blank-line runs, long in-line whitespace runs, and near-entirely-whitespace files. Legitimate spacer content should be short and visible to a reviewer scrolling the file normally.",
     # Tool Misuse (B.1.10)
     "TM1": "Validate all tool parameters against an allowlist. Reject dangerous parameter values (shell=True, --force, -rf /) and use safe defaults.",
     "TM2": "Limit tool chaining depth and validate the output of each tool before passing it to the next. Require explicit user approval for multi-step chains.",

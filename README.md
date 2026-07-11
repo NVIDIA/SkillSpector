@@ -404,13 +404,14 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 | P7 | Indirect Extraction | MEDIUM | Extraction via rephrasing, translation, or side-channels |
 | P8 | Tool-Based Exfiltration | HIGH | System prompts exfiltrated via file writes or network requests |
 
-### Memory Poisoning (3 patterns)
+### Memory Poisoning (4 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | MP1 | Persistent Context Injection | HIGH | Content designed to persist across interactions |
 | MP2 | Context Window Stuffing | MEDIUM | Filler content displacing safety constraints |
 | MP3 | Memory Manipulation | HIGH | Tampering with agent memory or stored state |
+| MP4 | Whitespace Padding Evasion | MEDIUM–HIGH | Blank-line runs, long in-line whitespace runs, or near-all-whitespace files hiding instructions from human review |
 
 ### Tool Misuse (3 patterns)
 

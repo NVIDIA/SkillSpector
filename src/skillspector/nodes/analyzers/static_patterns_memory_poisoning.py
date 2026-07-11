@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: memory poisoning (MP1–MP3). Node and analyze() in one module.
+"""Static patterns: memory poisoning (MP1–MP4). Node and analyze() in one module.
 
 Detects patterns where content is injected to persist in agent memory (MP1),
-the context window is stuffed to displace legitimate content (MP2), or
-agent memory/state is directly manipulated (MP3).
+the context window is stuffed to displace legitimate content (MP2), agent
+memory/state is directly manipulated (MP3), or a file is padded with
+whitespace to push instructions below/past what a human reviewer sees (MP4).
 
 Framework: ASI06, AML.T0080.
 """
@@ -152,9 +153,73 @@ MP3_PATTERNS = [
     ),
 ]
 
+# MP4: Whitespace Padding Evasion — a run of whitespace long enough to push
+# hidden instructions below or past what a human reviewer sees in an editor
+# (blank-line runs, long in-line runs, or a file that is mostly padding).
+# "Whitespace" here is not ASCII space/tab: it includes any Unicode
+# whitespace category (`\s` already covers NBSP, line/paragraph separators,
+# ideographic space, etc.) plus the zero-width family that P2
+# (static_patterns_prompt_injection) also treats as hidden-instruction
+# material, since both are read as text by the consuming LLM but rendered
+# as nothing by virtually every editor/terminal font.
+_ZERO_WIDTH_CHARS = "​‌‍⁠﻿"
+_PADDING_CHAR_CLASS = rf"[\s{_ZERO_WIDTH_CHARS}]"
+_PADDING_LINE_RE = re.compile(rf"^{_PADDING_CHAR_CLASS}*$")
+
+MP4_VERTICAL_MIN_LINES = 20
+MP4_HORIZONTAL_MIN_RUN = 80
+MP4_BLOCK_MIN_BYTES = 2048
+MP4_RATIO_MIN_BYTES = 3072
+MP4_RATIO_THRESHOLD = 0.9
+
+_HORIZONTAL_RUN_RE = re.compile(rf"{_PADDING_CHAR_CLASS}{{{MP4_HORIZONTAL_MIN_RUN},}}")
+_BLOCK_RUN_RE = re.compile(rf"{_PADDING_CHAR_CLASS}{{{MP4_BLOCK_MIN_BYTES + 1},}}")
+_PADDING_CHAR_RE = re.compile(_PADDING_CHAR_CLASS)
+
+
+def _fenced_code_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    """Return [start, end) line-index ranges covered by ``` fenced code blocks.
+
+    Large indentation/padding inside a fenced block (ASCII art, table
+    alignment) is legitimate formatting, not evasion — only the horizontal
+    signal skips these ranges (a huge blank-line or file-ratio gap is
+    unusual regardless of fencing).
+    """
+    ranges: list[tuple[int, int]] = []
+    fence_start: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            if fence_start is None:
+                fence_start = i
+            else:
+                ranges.append((fence_start, i + 1))
+                fence_start = None
+    if fence_start is not None:
+        ranges.append((fence_start, len(lines)))
+    return ranges
+
+
+def _find_vertical_padding_runs(lines: list[str]) -> list[tuple[int, int, bool]]:
+    """Return (start_line_idx, run_length, followed_by_content) for each run
+    of consecutive blank/whitespace-only lines at or above the threshold."""
+    runs: list[tuple[int, int, bool]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if _PADDING_LINE_RE.match(lines[i]):
+            start = i
+            while i < n and _PADDING_LINE_RE.match(lines[i]):
+                i += 1
+            run_len = i - start
+            if run_len >= MP4_VERTICAL_MIN_LINES:
+                runs.append((start, run_len, i < n))
+        else:
+            i += 1
+    return runs
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Analyze content for memory poisoning patterns (MP1–MP3)."""
+    """Analyze content for memory poisoning patterns (MP1–MP4)."""
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:
@@ -217,6 +282,75 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
+
+    lines = content.splitlines()
+    fenced_ranges = _fenced_code_line_ranges(lines)
+
+    for start, run_len, followed_by_content in _find_vertical_padding_runs(lines):
+        offset = sum(len(line) + 1 for line in lines[:start])
+        findings.append(
+            AnalyzerFinding(
+                rule_id="MP4",
+                message="Whitespace Padding Evasion",
+                severity=Severity.HIGH if followed_by_content else Severity.MEDIUM,
+                location=loc(start + 1),
+                confidence=0.8 if followed_by_content else 0.4,
+                tags=tag,
+                context=ctx(offset),
+                matched_text=f"<{run_len} consecutive blank/whitespace-only lines>",
+            )
+        )
+
+    for line_idx, line in enumerate(lines):
+        if any(fs <= line_idx < fe for fs, fe in fenced_ranges):
+            continue
+        line_offset = sum(len(prev_line) + 1 for prev_line in lines[:line_idx])
+        for match in _HORIZONTAL_RUN_RE.finditer(line):
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="MP4",
+                    message="Whitespace Padding Evasion",
+                    severity=Severity.MEDIUM,
+                    location=loc(line_idx + 1),
+                    confidence=0.6,
+                    tags=tag,
+                    context=ctx(line_offset + match.start()),
+                    matched_text=f"<{match.end() - match.start()} consecutive whitespace chars>",
+                )
+            )
+
+    block_match = _BLOCK_RUN_RE.search(content)
+    if block_match:
+        findings.append(
+            AnalyzerFinding(
+                rule_id="MP4",
+                message="Whitespace Padding Evasion",
+                severity=Severity.LOW,
+                location=loc(get_line_number(content, block_match.start())),
+                confidence=0.4,
+                tags=tag,
+                context=ctx(block_match.start()),
+                matched_text=f"<{block_match.end() - block_match.start()}-byte whitespace block>",
+            )
+        )
+
+    if len(content) >= MP4_RATIO_MIN_BYTES:
+        ws_count = len(_PADDING_CHAR_RE.findall(content))
+        ratio = ws_count / len(content)
+        if ratio >= MP4_RATIO_THRESHOLD:
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="MP4",
+                    message="Whitespace Padding Evasion",
+                    severity=Severity.LOW,
+                    location=loc(1),
+                    confidence=0.35,
+                    tags=tag,
+                    context=ctx(0),
+                    matched_text=f"<file is {ratio:.0%} whitespace>",
+                )
+            )
+
     return findings
 
 
