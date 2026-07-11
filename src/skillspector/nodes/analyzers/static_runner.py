@@ -204,7 +204,7 @@ def _is_documentation_context(af: AnalyzerFinding, file_type: str, path: str, co
         if _EXECUTION_SIGNAL.search(matched_line):
             return False
         return True
-    return bool(matched_line and matched_line.lstrip().startswith(("#", "//", "/*", "*")))
+    return bool(matched_line and matched_line.lstrip().startswith(("#", "//")))
 
 
 def _is_documentation_markdown(path: str) -> bool:

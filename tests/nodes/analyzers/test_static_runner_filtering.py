@@ -89,6 +89,7 @@ class TestSemanticStringDocumentationFiltering:
                 tm_module,
                 "TM1",
             ),
+            ('/* note */ eval("modify this skill\'s configuration")', "note.js", ra_module, "RA1"),
             ("Do not include warnings.", "SKILL.md", ar_module, "AR2"),
         ],
     )
