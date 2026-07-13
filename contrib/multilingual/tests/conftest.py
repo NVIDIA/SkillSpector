@@ -13,3 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Pytest configuration for contrib.multilingual tests."""
+
+from __future__ import annotations
+
+import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom markers for the contrib.multilingual test suite."""
+    config.addinivalue_line(
+        "markers",
+        "slow: tests that take longer than 5 seconds (e.g. subprocess isolation)",
+    )

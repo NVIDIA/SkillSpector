@@ -360,7 +360,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
 
         # --- LP4: Over-declared permissions (only when permissions field is set) ---
-        for perm in (permissions or []):
+        for perm in permissions or []:
             perm_lower = perm.strip().lower()
             # Skip wildcard entries themselves
             if perm_lower in _WILDCARD_PERMS:

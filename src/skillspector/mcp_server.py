@@ -27,10 +27,11 @@ installed.
 
 from __future__ import annotations
 
-import shutil
 from typing import TYPE_CHECKING, Any
 
 from skillspector import __version__
+from skillspector.cleanup import cleanup_result
+from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger
 from skillspector.providers import resolve_provider_credentials
@@ -41,9 +42,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 VALID_FORMATS = ("json", "markdown", "sarif", "terminal")
-
-# Mirrors the CLI: a scan scoring above this is treated as unsafe (CLI exits 1).
-RISK_THRESHOLD = 50
 
 
 async def run_scan(
@@ -126,9 +124,7 @@ async def run_scan(
         }
     finally:
         if result is not None:
-            temp_dir = result.get("temp_dir_for_cleanup")
-            if temp_dir and isinstance(temp_dir, str):
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            cleanup_result(result)
 
 
 def build_server(name: str = "skillspector") -> FastMCP:
