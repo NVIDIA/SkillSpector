@@ -62,6 +62,7 @@ dev = [
     "build>=1.4.0",
     "twine>=6.2.0",
     "poetry>=2.3.0",
+    "regex>=2026.5.9"
 ]
 
 [project.scripts]
