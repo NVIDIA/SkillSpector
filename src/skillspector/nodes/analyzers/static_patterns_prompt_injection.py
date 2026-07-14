@@ -156,8 +156,8 @@ def _first_smuggled_tag_offset(content: str) -> int | None:
     return None
 
 
-def _check_emoji_zwj_sequence(content: str, match: re.Match[str]):
-    if 1 != len(match.group(0)) or "\u200d" != content[match.start() : match.end()]:
+def _check_emoji_zwj_sequence(content: str, match: re.Match[str]) -> bool:
+    if 1 != len(match.group(0)) or "\u200d" != match.group(0):
         return False
     return is_emoji_zwj_sequence(content, match.start())
 

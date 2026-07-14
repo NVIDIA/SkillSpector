@@ -58,6 +58,7 @@ _CODE_EXAMPLE_INDICATORS: tuple[str, ...] = (
     "// wrong:",
 )
 
+_EMOJI_BASE_PATTERN = regex.compile(r"\p{Extended_Pictographic}")
 
 def is_code_example(context: str) -> bool:
     """Return True when the context appears to be a code example or documentation snippet."""
@@ -317,19 +318,19 @@ def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) ->
     return "\n".join(lines[start:end])[:200]
 
 
-def is_emoji_zwj_sequence(content: str, zwj_idx: int):
+def is_emoji_zwj_sequence(content: str, zwj_idx: int) -> bool:
 
     def _read(idx: int):
         return content[idx] if 0 <= idx < len(content) else ""
 
     def _check_modifier(cp: str):
-        return 0x1F3FB <= ord(cp) <= 0x1F3FF
+        return 1 == len(cp) and 0x1F3FB <= ord(cp) <= 0x1F3FF
 
     def _check_selector(cp: str):
-        return ord(cp) in {0xFE0E, 0xFE0F}
+        return 1 == len(cp) and ord(cp) in {0xFE0E, 0xFE0F}
 
     def _check_emoji_base(cp: str):
-        return bool(regex.match(r"\p{Extended_Pictographic}", cp))
+        return bool(_EMOJI_BASE_PATTERN.match(cp))
 
     #
     # Variation Selector (U+FE0F): may occur zero or one time
