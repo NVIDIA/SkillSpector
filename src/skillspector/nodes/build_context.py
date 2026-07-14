@@ -48,6 +48,7 @@ from skillspector.inspection_ledger import (
 from skillspector.logging_config import get_logger
 from skillspector.python_ast import prewarm_python_ast_cache
 from skillspector.state import SkillspectorState
+from skillspector.structured_skill import extract_structured_skill_context
 
 logger = get_logger(__name__)
 
@@ -579,8 +580,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     component_metadata, has_executable_scripts = _build_component_metadata(
         skill_dir, metadata_components, file_cache, recognized_oms_signatures
     )
+    structured_skill_context = extract_structured_skill_context(skill_dir)
 
-    return {
+    result = {
         "components": components,
         "file_cache": file_cache,
         "inspection_ledger": [
@@ -597,3 +599,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
     }
+
+    if structured_skill_context is not None:
+        result["structured_skill_context"] = structured_skill_context
+
+    return result
