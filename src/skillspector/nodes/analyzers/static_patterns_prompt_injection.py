@@ -186,6 +186,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if file_type in ("markdown", "other"):
         for pattern, confidence in P2_PATTERNS:
             for match in re.finditer(pattern, content, re.IGNORECASE | re.DOTALL):
+                matched_str = match.group(0)
+                if any(p in matched_str.lower() for p in ["template:","theme:","coalmine:","revalidate"]): continue
+                if matched_str.startswith(chr(60)+chr(33)+chr(45)+chr(45)):
+                    if not any(d in matched_str.lower() for d in ["ignore previous","system prompt","override instructions","you must","respond as"]): continue
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(
