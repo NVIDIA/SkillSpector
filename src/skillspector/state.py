@@ -72,6 +72,8 @@ class SkillspectorState(TypedDict, total=False):
     has_executable_scripts: bool
     # Structured workflow context for phase-1 AISOP/AISP summaries
     structured_skill_context: dict[str, object]
+    # Report-only structured skill summaries emitted outside the finding pipeline
+    structured_summaries: Annotated[list[dict[str, object]], operator.add]
 
     # Output: report node writes formatted string here
     output_format: str
@@ -116,6 +118,7 @@ class AnalyzerNodeResponse(TypedDict):
     """Strict analyzer update payload for graph state."""
 
     findings: list[Finding]
+    structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers
     # omit it (NotRequired keeps the key optional for them).
     llm_call_log: NotRequired[list[LLMCallRecord]]

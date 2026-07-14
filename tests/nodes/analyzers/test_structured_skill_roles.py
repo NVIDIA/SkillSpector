@@ -53,27 +53,34 @@ def _write_aisop_bundle(path: Path) -> None:
 
 
 def test_no_structured_context_returns_no_findings() -> None:
-    """A skill without structured-skill context yields no SSR-1 findings."""
+    """A skill without structured-skill context yields no SSR-1 summary."""
     assert module.node({})["findings"] == []
 
 
-def test_structured_bundle_emits_single_low_ssr1(tmp_path: Path) -> None:
-    """Valid structured bundle context produces one LOW SSR-1 finding."""
+def test_structured_bundle_emits_single_report_only_ssr1(tmp_path: Path) -> None:
+    """Valid structured bundle context produces one report-only SSR-1 summary."""
     path = tmp_path / "bundle.aisop.json"
     _write_aisop_bundle(path)
     context = extract_structured_skill_context(tmp_path)
     assert context is not None
 
     result = module.node({"structured_skill_context": context})
-    assert len(result["findings"]) == 1
+    assert result["findings"] == []
+    assert len(result["structured_summaries"]) == 1
 
-    finding = result["findings"][0]
-    assert finding.rule_id == "SSR-1"
-    assert finding.severity == "LOW"
-    assert finding.file == str(path.resolve())
-    assert finding.matched_text is not None
-    assert finding.context is not None
-    assert "declared_tools" in finding.context
+    summary = result["structured_summaries"][0]
+    assert summary["id"] == "SSR-1"
+    assert summary["message"] == f"Structured {summary['layout_kind']} bundle detected (AISOP V1)"
+    assert summary["file"] == str(path.resolve())
+    assert summary["protocol"] == "AISOP V1"
+    assert summary["layout_kind"] == context["layout_kind"]
+    assert summary["declared_tools"] == ["calendar", "search"]
+    assert summary["workflow_nodes"] == context["workflow_nodes"]
+    assert summary["constraints"] == context["constraint_anchors"]
+    assert summary["resources"] == context["resource_anchors"]
+    assert summary["tags"] == ["AISOP", "AISP", "structured-skill"]
+    assert "severity" not in summary
+    assert "confidence" not in summary
 
 
 def test_malformed_context_does_not_raise_no_findings(tmp_path: Path) -> None:
@@ -93,4 +100,5 @@ def test_analyzer_does_not_require_llm_credentials(tmp_path: Path) -> None:
     context = extract_structured_skill_context(tmp_path)
     assert context is not None
     result = module.node({"structured_skill_context": context})
-    assert result["findings"][0].rule_id == "SSR-1"
+    assert result["findings"] == []
+    assert result["structured_summaries"][0]["id"] == "SSR-1"

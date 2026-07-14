@@ -120,6 +120,24 @@ def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
     return cleaned or None
 
 
+def _sanitize_summary_value(value: object) -> object:
+    """Return a recursively sanitized copy of structured-summary content."""
+    if isinstance(value, str):
+        return _clean_text(value)
+    if isinstance(value, list):
+        return [_sanitize_summary_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_summary_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _sanitize_summary_value(item) for key, item in value.items()}
+    return value
+
+
+def _sanitize_structured_summary(summary: dict[str, object]) -> dict[str, object]:
+    """Return a structured summary with control/ANSI bytes stripped from text fields."""
+    return {str(key): _sanitize_summary_value(value) for key, value in summary.items()}
+
+
 def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note"]:
     """Map Finding.severity to SARIF result level."""
     return {
@@ -128,6 +146,36 @@ def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note
         "MEDIUM": "warning",
         "LOW": "note",
     }.get(severity.upper(), "note")  # type: ignore[return-value]
+
+
+def _summary_display_value(value: object) -> str | None:
+    """Format a summary field for terminal / markdown output."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        values = [str(item) for item in value if str(item)]
+        return ", ".join(values) if values else None
+    text = str(value)
+    return text or None
+
+
+def _structured_summary_notification(summary: dict[str, object]) -> str:
+    """Build a note-level SARIF notification message for a structured summary."""
+    summary_id = str(summary.get("id") or "SSR")
+    message = str(summary.get("message") or "Structured skill summary")
+    bits = [f"{summary_id}: {message}"]
+
+    file = _summary_display_value(summary.get("file"))
+    if file:
+        bits.append(f"file={file}")
+    protocol = _summary_display_value(summary.get("protocol"))
+    if protocol:
+        bits.append(f"protocol={protocol}")
+    layout_kind = _summary_display_value(summary.get("layout_kind"))
+    if layout_kind:
+        bits.append(f"layout={layout_kind}")
+
+    return " | ".join(bits)
 
 
 _SEVERITY_POINTS: dict[str, int] = {
@@ -219,6 +267,7 @@ def _build_sarif(
     findings: list[Finding],
     suppressed: list[SuppressedFinding] | None = None,
     degraded_notice: str | None = None,
+    structured_summaries: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Build SARIF 2.1.0 log from findings.
 
@@ -294,14 +343,25 @@ def _build_sarif(
         for rule_id, description in sorted(seen_rule_ids.items())
     ]
 
-    invocations: list[SarifInvocation] | None = None
+    notifications: list[SarifNotification] = []
     if degraded_notice:
+        notifications.append(
+            SarifNotification(text=SarifMessage(text=degraded_notice), level="warning")
+        )
+    for summary in structured_summaries or []:
+        notifications.append(
+            SarifNotification(
+                text=SarifMessage(text=_structured_summary_notification(summary)),
+                level="note",
+            )
+        )
+
+    invocations: list[SarifInvocation] | None = None
+    if notifications:
         invocations = [
             SarifInvocation(
                 execution_successful=True,
-                tool_execution_notifications=[
-                    SarifNotification(text=SarifMessage(text=degraded_notice), level="warning")
-                ],
+                tool_execution_notifications=notifications,
             )
         ]
 
@@ -336,6 +396,7 @@ def _format_terminal(
     use_llm: bool = True,
     llm_call_log: list[dict[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
+    structured_summaries: list[dict[str, object]] | None = None,
     show_suppressed: bool = False,
 ) -> str:
     """Generate Rich terminal output and export as string."""
@@ -421,6 +482,30 @@ def _format_terminal(
             console.print()
     else:
         console.print("\n[green]No security issues detected.[/green]\n")
+
+    if structured_summaries:
+        console.print("\n")
+        console.print(f"[bold]Structured Skill Summary ({len(structured_summaries)})[/bold]\n")
+        for summary in structured_summaries:
+            console.print(
+                f"  [cyan]{summary.get('id', 'SSR-1')}[/cyan]: {summary.get('message', '')}"
+            )
+            file = _summary_display_value(summary.get("file"))
+            if file:
+                console.print(f"    [dim]File:[/dim] {file}")
+            for key, label in (
+                ("protocol", "Protocol"),
+                ("layout_kind", "Layout"),
+                ("declared_tools", "Declared tools"),
+                ("workflow_nodes", "Workflow nodes"),
+                ("constraints", "Constraints"),
+                ("resources", "Resources"),
+                ("tags", "Tags"),
+            ):
+                value = _summary_display_value(summary.get(key))
+                if value:
+                    console.print(f"    [dim]{label}:[/dim] {value}")
+            console.print()
 
     if suppressed:
         console.print(
@@ -567,6 +652,7 @@ def _format_json(
     llm_call_log: list[dict[str, object]] | None = None,
     analysis_completeness: dict[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
+    structured_summaries: list[dict[str, object]] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -592,6 +678,7 @@ def _format_json(
             }
             for c in component_metadata
         ],
+        "structured_summaries": structured_summaries or [],
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
         "suppressed": [sf.to_dict() for sf in suppressed],
@@ -614,6 +701,7 @@ def _format_markdown(
     use_llm: bool = True,
     llm_call_log: list[dict[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
+    structured_summaries: list[dict[str, object]] | None = None,
     show_suppressed: bool = False,
 ) -> str:
     """Generate Markdown report string."""
@@ -652,6 +740,28 @@ def _format_markdown(
         exec_marker = "Yes" if exec_flag else "No"
         lines.append(f"| `{path}` | {typ} | {line_count} | {exec_marker} |")
     lines.append("")
+
+    if structured_summaries:
+        lines.append(f"## Structured Skill Summary ({len(structured_summaries)})\n")
+        for summary in structured_summaries:
+            lines.append(f"### {summary.get('id', 'SSR-1')}\n")
+            lines.append(f"**Message:** {summary.get('message', '')}  ")
+            file = _summary_display_value(summary.get("file"))
+            if file:
+                lines.append(f"**File:** `{file}`  ")
+            for key, label in (
+                ("protocol", "Protocol"),
+                ("layout_kind", "Layout"),
+                ("declared_tools", "Declared tools"),
+                ("workflow_nodes", "Workflow nodes"),
+                ("constraints", "Constraints"),
+                ("resources", "Resources"),
+                ("tags", "Tags"),
+            ):
+                value = _summary_display_value(summary.get(key))
+                if value:
+                    lines.append(f"**{label}:** {value}  ")
+            lines.append("")
 
     lines.append(f"## Issues ({len(findings)})\n")
     if not findings:
@@ -704,10 +814,16 @@ def report(state: SkillspectorState) -> dict[str, object]:
     """
     raw_findings = state.get("findings", [])
     filtered_findings = state.get("filtered_findings", raw_findings)
+    raw_structured_summaries = state.get("structured_summaries") or []
     # Strip ANSI/control bytes once here so every downstream format (terminal,
     # json, markdown, sarif) and the returned findings stay clean UTF-8. Applied
     # before partition/dedup so active and suppressed findings are both clean.
     filtered_findings = [_sanitize_finding(f) for f in filtered_findings]
+    structured_summaries = [
+        _sanitize_structured_summary(summary)
+        for summary in raw_structured_summaries
+        if isinstance(summary, dict)
+    ]
     component_metadata = state.get("component_metadata") or []
     components = state.get("components") or []
     file_cache = state.get("file_cache") or {}
@@ -744,7 +860,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings_for_scoring, has_executable_scripts, component_metadata
     )
-    sarif_report = _build_sarif(active_findings, suppressed, degraded_notice=degraded_notice)
+    sarif_report = _build_sarif(
+        active_findings,
+        suppressed,
+        degraded_notice=degraded_notice,
+        structured_summaries=structured_summaries,
+    )
     analysis_completeness = _build_analysis_completeness(
         components, file_cache, use_llm, raw_findings, filtered_findings
     )
@@ -773,6 +894,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             use_llm=use_llm,
             llm_call_log=llm_call_log,
             suppressed=suppressed,
+            structured_summaries=structured_summaries,
             show_suppressed=show_suppressed,
         )
     elif output_format == "json":
@@ -789,6 +911,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
+            structured_summaries=structured_summaries,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
@@ -803,6 +926,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             use_llm=use_llm,
             llm_call_log=llm_call_log,
             suppressed=suppressed,
+            structured_summaries=structured_summaries,
             show_suppressed=show_suppressed,
         )
     else:
@@ -823,5 +947,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "report_body": report_body,
         "filtered_findings": filtered_findings,
         "suppressed_findings": suppressed,
+        "structured_summaries": structured_summaries,
     }
     return out
