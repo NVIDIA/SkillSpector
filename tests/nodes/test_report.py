@@ -557,7 +557,7 @@ class TestReportNode:
         result = report(state)
         assert result["risk_score"] == 0
         assert result["risk_recommendation"] == "SAFE"
-        assert len(result["structured_summaries"]) == 1
+        assert "structured_summaries" not in result
         data = json.loads(result["report_body"])
         assert data["issues"] == []
         assert data["structured_summaries"][0]["id"] == "SSR-1"

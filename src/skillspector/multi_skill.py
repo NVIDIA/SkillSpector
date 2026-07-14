@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from skillspector.logging_config import get_logger
-from skillspector.structured_skill import extract_structured_skill_context
+from skillspector.structured_skill import _SKIP_DIRS, extract_structured_skill_context
 
 logger = get_logger(__name__)
 
@@ -71,6 +71,8 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
     skills: list[SkillDirectory] = []
     for child in sorted(directory.iterdir()):
         if not child.is_dir():
+            continue
+        if child.name in _SKIP_DIRS:
             continue
         if child.name.startswith("."):
             continue

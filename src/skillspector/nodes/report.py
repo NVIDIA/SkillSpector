@@ -947,6 +947,5 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "report_body": report_body,
         "filtered_findings": filtered_findings,
         "suppressed_findings": suppressed,
-        "structured_summaries": structured_summaries,
     }
     return out

@@ -85,12 +85,12 @@ def _walk_skill_files(skill_dir: Path) -> list[str]:
     for item in skill_dir.rglob("*"):
         if not item.is_file():
             continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
-            continue
-        if item.name.startswith(".") and not item.name.startswith(".claude"):
-            continue
         try:
             rel = item.relative_to(skill_dir)
+            if any(skip in rel.parts for skip in _SKIP_DIRS):
+                continue
+            if item.name.startswith(".") and not item.name.startswith(".claude"):
+                continue
             # Use forward slashes on every OS: these relative paths are dict keys
             # and SARIF/URI locations, so they must be portable (not OS-specific
             # backslashes on Windows).

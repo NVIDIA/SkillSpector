@@ -332,6 +332,19 @@ def test_build_context_populates_structured_skill_context(tmp_path: Path) -> Non
     assert context["declared_tools"] == ["mail", "search"]
 
 
+@pytest.mark.parametrize("ancestor", [".claude", "venv"])
+def test_build_context_structured_bundle_under_ancestor(tmp_path: Path, ancestor: str) -> None:
+    """Scan-root-relative filters keep bundles under external ancestors."""
+    skill_dir = tmp_path / ancestor / "skills" / "foo"
+    skill_dir.mkdir(parents=True)
+    _write_aisop_bundle(skill_dir / "workflow.aisop.json")
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert "workflow.aisop.json" in result["components"]
+    assert "structured_skill_context" in result
+
+
 def test_build_context_manifest_may_be_empty_when_only_structured(tmp_path: Path) -> None:
     """A structured bundle can populate context while manifest stays empty."""
     _write_aisop_bundle(tmp_path / "workflow.aisop.json")
