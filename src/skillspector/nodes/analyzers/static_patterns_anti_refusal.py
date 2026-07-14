@@ -169,13 +169,14 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 )
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
     r"""
-    \b(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
+    ^\s*(?:\[\])?\s+(?:field|key|property|array|list|entry)\b
+    |
+    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
+    |
+    ^\s*(?:\[\])?\s+(?:in|of)\s+(?:the\s+)?(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
     (?:field|key|property|array|list|entry)\b
     |
-    \b(?:warnings?|disclaimers?|caveats?)\b(?:\[\])?\s+
-    (?:in|of)\s+(?:the\s+)?(?:json(?:\s+output)?|output|response)\s+schema\b
-    |
-    \b(?:warnings?|disclaimers?|caveats?)\b[^.\n]{0,80}\b(?:schema\s+field|schema\s+key|errors?\[\]\s+array)\b
+    ^\s*(?:\[\])?\s+in\s+(?:the\s+)?errors\[\]\s+array\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -195,10 +196,6 @@ _EXPLICIT_EXAMPLE_CONTEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _CLAUSE_BOUNDARY_PATTERN = re.compile(r"[.;!?]")
-_LIVE_RESPONSE_OBJECT_PATTERN = re.compile(
-    r"\b(?:answer|response|reply|assistant|user)\b",
-    re.IGNORECASE,
-)
 _DEFENSIVE_AR_CONTEXT_PATTERN = re.compile(
     r"(?:^\s*(?:warning|note)\s*:|\b(?:malicious|example|attack|defensive)\s+"
     r"(?:phrase|payload|string|text|snippet|content|example)\b)",
@@ -206,7 +203,7 @@ _DEFENSIVE_AR_CONTEXT_PATTERN = re.compile(
 )
 _RETROSPECTIVE_AR_NARRATIVE_PATTERNS = (
     re.compile(
-        r"\b(?:the|this|that)\s+(?:old|previous|prior)?\s*"
+        r"\b(?:the|this|that)\s+(?:old|previous|prior)\s+"
         r"(?:agent|model|system|implementation|version|behavior)\s+would\b",
         re.IGNORECASE,
     ),
@@ -216,8 +213,28 @@ _RETROSPECTIVE_AR_NARRATIVE_PATTERNS = (
     ),
     re.compile(r"\bpreviously\s+would\b", re.IGNORECASE),
     re.compile(r"\bpreviously\s+used\s+to\b", re.IGNORECASE),
+    re.compile(
+        r"\bpreviously\s*,?\s+(?:the|this|that)\s+"
+        r"(?:agent|model|system|implementation|version|behavior)\s+would\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:fixed|resolved|addressed|corrected)\s+(?:a|the)\s+"
+        r"(?:bug|issue|problem)\s+where\s+(?:the|this|that)\s+"
+        r"(?:agent|model|system|implementation|version|behavior)\s+would\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:the|this|that)\s+(?:agent|model|system|implementation|version|behavior)\s+"
+        r"no\s+longer\s+(?:would|used\s+to)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:the|this|that)\s+(?:agent|model|system|implementation|version|behavior)\s+"
+        r"would\s+no\s+longer\b",
+        re.IGNORECASE,
+    ),
 )
-_SECOND_PERSON_NARRATIVE_PATTERN = re.compile(r"\byou\s+would\b", re.IGNORECASE)
 
 
 def _is_directly_instructive(context: str, matched_text: str) -> bool:
@@ -321,21 +338,23 @@ def _is_match_local_narrative_clause(
 ) -> bool:
     """Return True when the current match is part of a narrative clause, not a directive."""
     prefix = match_clause[:clause_match_start]
-    if _SECOND_PERSON_NARRATIVE_PATTERN.search(prefix):
-        return False
-    return any(pattern.search(prefix) for pattern in _RETROSPECTIVE_AR_NARRATIVE_PATTERNS)
+    prefix_end = len(prefix.rstrip())
+    return any(
+        (match := pattern.search(prefix)) is not None and match.end() == prefix_end
+        for pattern in _RETROSPECTIVE_AR_NARRATIVE_PATTERNS
+    )
 
 
 def _is_schema_field_clause(
     match_clause: str,
     matched_text: str,
+    clause_match_end: int,
 ) -> bool:
     """Return True when an AR2 warning-suppression phrase targets schema fields."""
     if not _AR2_LIVE_SUPPRESSION_PATTERN.search(matched_text):
         return False
-    if not _BENIGN_AR_SCHEMA_FIELD_PATTERN.search(match_clause):
-        return False
-    return not _LIVE_RESPONSE_OBJECT_PATTERN.search(match_clause)
+    continuation = match_clause[clause_match_end:]
+    return bool(_BENIGN_AR_SCHEMA_FIELD_PATTERN.search(continuation))
 
 
 def _is_benign_ar_context(
@@ -346,14 +365,14 @@ def _is_benign_ar_context(
     previous_line: str | None = None,
 ) -> bool:
     """Return True for high-confidence non-malicious prose patterns around one match span."""
-    match_clause, clause_match_start, _ = _match_clause(
+    match_clause, clause_match_start, clause_match_end = _match_clause(
         match_line,
         line_match_start,
         line_match_end,
     )
     if _is_match_local_narrative_clause(match_clause, clause_match_start):
         return True
-    if _is_schema_field_clause(match_clause, match.lower()):
+    if _is_schema_field_clause(match_clause, match.lower(), clause_match_end):
         return True
     return _is_quoted_match(match_line, match) and _has_explicit_defensive_context(
         match_line,
