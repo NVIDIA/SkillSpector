@@ -22,10 +22,9 @@ natural-language policy violations that static/behavioral tools cannot detect.
 
 from __future__ import annotations
 
-import asyncio
-
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call_record
 
@@ -145,7 +144,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     try:
         analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model)
         batches = analyzer.get_batches(files, file_cache)
-        results = asyncio.run(analyzer.arun_batches(batches))
+        results = run_async(analyzer.arun_batches(batches))
         findings = analyzer.collect_findings(results)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
         return {"findings": findings, "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True)]}

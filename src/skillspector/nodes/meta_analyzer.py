@@ -22,7 +22,6 @@ LangChain structured output for validated, schema-driven LLM responses.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Literal
 
@@ -33,6 +32,7 @@ from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     estimate_tokens,
 )
+from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.pattern_defaults import (
@@ -534,7 +534,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             model,
         )
 
-        batch_results = asyncio.run(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        batch_results = run_async(analyzer.arun_batches(batches, metadata_text=metadata_text))
 
         if len(batch_results) < len(batches):
             # Some batches never returned. A finding the LLM never saw has no
