@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -45,6 +46,7 @@ logger = get_logger(__name__)
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
+TimeoutValue = float | None | Callable[[], float | None]
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +271,30 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
 
-    def __init__(self, base_prompt: str, model: str):
+    def __init__(self, base_prompt: str, model: str, timeout: TimeoutValue = None):
         self.base_prompt = base_prompt
         self.model = model
+        self._timeout = timeout
+        self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model)
+        self._llm = get_chat_model(model=model, timeout=self._remaining_timeout())
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
+
+    def _remaining_timeout(self) -> float | None:
+        if callable(self._timeout):
+            return self._timeout()
+        return self._timeout
+
+    def _model_for_call(self):
+        if not self._dynamic_timeout:
+            return self._llm, self._structured_llm
+        llm = get_chat_model(model=self.model, timeout=self._remaining_timeout())
+        structured = (
+            llm.with_structured_output(self.response_schema) if self.response_schema else None
+        )
+        return llm, structured
 
     # -- Batching -----------------------------------------------------------
 
@@ -385,10 +403,11 @@ class LLMAnalyzerBase:
                 estimate_tokens(prompt),
                 len(batch.findings),
             )
-            if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
+            llm, structured_llm = self._model_for_call()
+            if structured_llm:
+                response = structured_llm.invoke(prompt)
             else:
-                response = _message_text(self._llm.invoke(prompt))
+                response = _message_text(llm.invoke(prompt))
             logger.debug("LLM response for %s", batch.file_label)
             parsed = self.parse_response(response, batch)
             results.append((batch, parsed))
@@ -428,10 +447,11 @@ class LLMAnalyzerBase:
                     estimate_tokens(prompt),
                     len(batch.findings),
                 )
-                if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
+                llm, structured_llm = self._model_for_call()
+                if structured_llm:
+                    response = await structured_llm.ainvoke(prompt)
                 else:
-                    response = _message_text(await self._llm.ainvoke(prompt))
+                    response = _message_text(await llm.ainvoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 

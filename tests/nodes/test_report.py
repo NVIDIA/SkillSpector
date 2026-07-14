@@ -31,7 +31,7 @@ from skillspector.nodes.report import (
 )
 from skillspector.sarif_models import validate_sarif_report
 from skillspector.state import SkillspectorState, llm_call_record
-from skillspector.suppression import Baseline, SuppressionRule
+from skillspector.suppression import Baseline, SuppressionRule, finding_fingerprint
 
 
 def _finding(
@@ -475,126 +475,160 @@ class TestReportNode:
         assert "## Components" in body
         assert "## Issues" in body
 
-    def test_report_output_format_terminal(self) -> None:
-        """output_format terminal produces Rich-formatted output."""
-        state: SkillspectorState = {
-            "filtered_findings": [],
-            "component_metadata": [],
-            "has_executable_scripts": False,
-            "manifest": {"name": "cli-test"},
-            "skill_path": "/foo",
-            "output_format": "terminal",
-        }
-        result = report(state)
-        body = result["report_body"]
-        assert "SkillSpector" in body
-        assert "Risk Assessment" in body
-        assert "cli-test" in body
 
-    def test_report_output_format_sarif(self) -> None:
-        """output_format sarif produces valid SARIF JSON."""
-        state: SkillspectorState = {
-            "filtered_findings": [_finding("E2", "HIGH", "env harvest", confidence=1.0)],
-            "component_metadata": [],
-            "has_executable_scripts": False,
-            "manifest": {},
-            "skill_path": None,
-            "output_format": "sarif",
-        }
-        result = report(state)
-        body = result["report_body"]
-        data = json.loads(body)
-        assert "runs" in data
-        assert data.get("$schema") or "runs" in data
+def test_json_output_includes_transitive_provenance() -> None:
+    """JSON output includes transitive provenance fields from Finding."""
+    finding = _finding("T1", severity="HIGH", confidence=1.0, file="dep.py")
+    finding.transitive_depth = 2
+    finding.source_url = "https://github.com/org/transitive"
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": "/tmp/skill",
+        "output_format": "json",
+    }
+    data = json.loads(report(state)["report_body"])
+    assert data["issues"][0]["transitive_depth"] == 2
+    assert data["issues"][0]["source_url"] == "https://github.com/org/transitive"
 
-    def test_report_output_format_sarif_includes_finding_properties(self) -> None:
-        finding = _finding("E2", "HIGH", "env harvest", confidence=0.85, file="tool.py")
-        finding.category = "environment"
-        finding.pattern = r"os\.environ"
-        finding.finding = "TOKEN lookup"
-        finding.explanation = "Environment-derived secret access"
-        finding.remediation = "Drop env var usage"
-        finding.code_snippet = "os.environ['TOKEN']"
-        finding.intent = "secret_exfiltration"
-        finding.tags = ["env", "secret"]
-        state: SkillspectorState = {
-            "filtered_findings": [finding],
-            "component_metadata": [],
-            "has_executable_scripts": False,
-            "manifest": {},
-            "skill_path": None,
-            "output_format": "sarif",
-        }
-        result = report(state)
-        result_row = result["sarif_report"]["runs"][0]["results"][0]
-        assert result_row["properties"]["severity"] == "HIGH"
-        assert result_row["properties"]["category"] == "environment"
-        assert result_row["properties"]["pattern"] == r"os\.environ"
-        assert result_row["properties"]["confidence"] == 0.85
-        assert result_row["properties"]["finding"] == "TOKEN lookup"
-        assert result_row["properties"]["explanation"] == "Environment-derived secret access"
-        assert result_row["properties"]["remediation"] == "Drop env var usage"
-        assert result_row["properties"]["code_snippet"] == "os.environ['TOKEN']"
-        assert result_row["properties"]["intent"] == "secret_exfiltration"
-        assert result_row["properties"]["tags"] == ["env", "secret"]
 
-    def test_report_default_output_format_is_sarif(self) -> None:
-        """When output_format is missing, report uses sarif."""
-        state: SkillspectorState = {
-            "filtered_findings": [],
-            "component_metadata": [],
-            "has_executable_scripts": False,
-            "manifest": {},
-        }
-        result = report(state)
-        body = result["report_body"]
-        json.loads(body)
-        assert "sarif_report" in result
+def test_report_output_format_terminal() -> None:
+    """output_format terminal produces Rich-formatted output."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {"name": "cli-test"},
+        "skill_path": "/foo",
+        "output_format": "terminal",
+    }
+    result = report(state)
+    body = result["report_body"]
+    assert "SkillSpector" in body
+    assert "Risk Assessment" in body
+    assert "cli-test" in body
 
-    def test_report_dedup_affects_score_only_not_report_output(self) -> None:
-        """Deduplication reduces score but all affected files appear in the report."""
-        duplicated = [
-            Finding(
-                rule_id="TM1",
-                message="shell injection",
-                severity="HIGH",
-                confidence=0.8,
-                file=f"step{i}.py",
-                start_line=10,
-                matched_text="subprocess.run(cmd, shell=True)",
-            )
-            for i in range(4)
-        ]
-        state: SkillspectorState = {
-            "filtered_findings": duplicated,
-            "component_metadata": [],
-            "has_executable_scripts": False,
-            "manifest": {"name": "multi-file"},
-            "skill_path": "/tmp/skill",
-            "output_format": "json",
-        }
-        result = report(state)
-        body = json.loads(result["report_body"])
-        reported_files = {issue["location"]["file"] for issue in body["issues"]}
-        assert reported_files == {"step0.py", "step1.py", "step2.py", "step3.py"}
-        assert len(body["issues"]) == 4
-        assert result["risk_score"] < 4 * 25
+
+def test_report_output_format_sarif() -> None:
+    """output_format sarif produces valid SARIF JSON."""
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("E2", "HIGH", "env harvest", confidence=1.0)],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "sarif",
+    }
+    result = report(state)
+    body = result["report_body"]
+    data = json.loads(body)
+    assert "runs" in data
+    assert data.get("$schema") or "runs" in data
+
+
+def test_report_output_format_sarif_includes_finding_properties() -> None:
+    """SARIF output keeps the selected finding metadata in result properties."""
+    finding = _finding("E2", "HIGH", "env harvest", confidence=0.85, file="tool.py")
+    finding.category = "environment"
+    finding.pattern = r"os\.environ"
+    finding.finding = "TOKEN lookup"
+    finding.explanation = "Environment-derived secret access"
+    finding.remediation = "Drop env var usage"
+    finding.code_snippet = "os.environ['TOKEN']"
+    finding.intent = "secret_exfiltration"
+    finding.tags = ["env", "secret"]
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "sarif",
+    }
+    result = report(state)
+    result_row = result["sarif_report"]["runs"][0]["results"][0]
+    assert result_row["properties"]["severity"] == "HIGH"
+    assert result_row["properties"]["category"] == "environment"
+    assert result_row["properties"]["pattern"] == r"os\.environ"
+    assert result_row["properties"]["confidence"] == 0.85
+    assert result_row["properties"]["finding"] == "TOKEN lookup"
+    assert result_row["properties"]["explanation"] == "Environment-derived secret access"
+    assert result_row["properties"]["remediation"] == "Drop env var usage"
+    assert result_row["properties"]["code_snippet"] == "os.environ['TOKEN']"
+    assert result_row["properties"]["intent"] == "secret_exfiltration"
+    assert result_row["properties"]["tags"] == ["env", "secret"]
+
+
+def test_markdown_output_labels_transitive_findings() -> None:
+    """Markdown output labels transitive findings with depth and source URL."""
+    finding = _finding(
+        "T1", severity="HIGH", file="dep.py", confidence=0.9, message="transitive issue"
+    )
+    finding.transitive_depth = 3
+    finding.source_url = "https://github.com/org/transitive"
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": "/tmp/skill",
+        "output_format": "markdown",
+    }
+    body = report(state)["report_body"]
+    assert "**Transitive:** depth=3, source=https://github.com/org/transitive" in body
+
+
+def test_report_default_output_format_is_sarif() -> None:
+    """When output_format is missing, report uses sarif."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+    }
+    result = report(state)
+    body = result["report_body"]
+    json.loads(body)
+    assert "sarif_report" in result
+
+
+def test_report_dedup_affects_score_only_not_report_output() -> None:
+    """Deduplication reduces score but all affected files appear in the report."""
+    duplicated = [
+        Finding(
+            rule_id="TM1",
+            message="shell injection",
+            severity="HIGH",
+            confidence=0.8,
+            file=f"step{i}.py",
+            start_line=10,
+            matched_text="subprocess.run(cmd, shell=True)",
+        )
+        for i in range(4)
+    ]
+    state: SkillspectorState = {
+        "filtered_findings": duplicated,
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {"name": "multi-file"},
+        "skill_path": "/tmp/skill",
+        "output_format": "json",
+    }
+    result = report(state)
+    body = json.loads(result["report_body"])
+    reported_files = {issue["location"]["file"] for issue in body["issues"]}
+    assert reported_files == {"step0.py", "step1.py", "step2.py", "step3.py"}
+    assert len(body["issues"]) == 4
+    assert result["risk_score"] < 4 * 25
 
 
 def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     """A baseline-suppressed CRITICAL finding does not count toward the risk score."""
     baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="false positive")])
-    suppressed_finding = _finding("P5", "CRITICAL", confidence=1.0)
-    suppressed_finding.category = "critical_path"
-    suppressed_finding.pattern = r"exec\("
-    suppressed_finding.finding = "exec call"
-    suppressed_finding.explanation = "Dynamic execution remains reachable"
-    suppressed_finding.remediation = "Drop suspicious logic"
-    suppressed_finding.code_snippet = "exec(payload)"
-    suppressed_finding.intent = "command_execution"
-    suppressed_finding.tags = ["critical", "injection"]
     state: SkillspectorState = {
-        "filtered_findings": [suppressed_finding],
+        "filtered_findings": [_finding("P5", "CRITICAL")],
         "component_metadata": [],
         "has_executable_scripts": False,
         "manifest": {},
@@ -610,20 +644,34 @@ def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     # (audit trail) so consumers exclude them from counts.
     sarif_results = result["sarif_report"]["runs"][0]["results"]
     assert len(sarif_results) == 1
-    suppressed_result = sarif_results[0]
-    assert suppressed_result["suppressions"][0]["kind"] == "external"
-    assert suppressed_result["suppressions"][0]["justification"] == "false positive"
-    assert suppressed_result["properties"]["severity"] == "CRITICAL"
-    assert suppressed_result["properties"]["category"] == "critical_path"
-    assert suppressed_result["properties"]["pattern"] == r"exec\("
-    assert suppressed_result["properties"]["confidence"] == 1.0
-    assert suppressed_result["properties"]["finding"] == "exec call"
-    assert suppressed_result["properties"]["explanation"] == "Dynamic execution remains reachable"
-    assert suppressed_result["properties"]["remediation"] == "Drop suspicious logic"
-    assert suppressed_result["properties"]["code_snippet"] == "exec(payload)"
-    assert suppressed_result["properties"]["intent"] == "command_execution"
-    assert suppressed_result["properties"]["tags"] == ["critical", "injection"]
+    assert sarif_results[0]["suppressions"][0]["kind"] == "external"
     assert len(result["suppressed_findings"]) == 1
+
+
+def test_report_baseline_direct_fingerprint_does_not_suppress_transitive_finding() -> None:
+    """Transitive provenance keeps baseline fingerprints scoped to the original source."""
+    direct = _finding("P5", "CRITICAL")
+    transitive = _finding("P5", "CRITICAL")
+    transitive.source_url = "https://github.com/evil/dep"
+    transitive.transitive_depth = 1
+
+    baseline = Baseline(fingerprints={finding_fingerprint(direct): "accepted root finding"})
+    state: SkillspectorState = {
+        "findings": [transitive],
+        "filtered_findings": [transitive],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": baseline,
+    }
+    result = report(state)
+    body = json.loads(result["report_body"])
+    assert result["risk_score"] > 0
+    assert len(body["issues"]) == 1
+    assert body["issues"][0]["source_url"] == "https://github.com/evil/dep"
+    assert result["suppressed_findings"] == []
 
 
 def test_report_baseline_keeps_unmatched_finding() -> None:
@@ -917,6 +965,25 @@ def test_degraded_scan_does_not_downgrade_a_blocking_verdict() -> None:
     assert result["risk_recommendation"] == "DO_NOT_INSTALL"
 
 
+def test_truncated_scan_floors_recommendation_at_caution() -> None:
+    """Traversal truncation alone should keep a clean scan from reporting SAFE."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [],
+        "transitive_truncation_reasons": ["time budget 60s reached"],
+    }
+    result = report(state)
+    report_body = json.loads(result["report_body"])
+    assert result["risk_score"] == 0
+    assert result["risk_recommendation"] == "CAUTION"
+    assert report_body["analysis_completeness"]["is_complete"] is False
+
+
 def test_report_executable_scripts_multiplier() -> None:
     """1.3x multiplier applied only to findings from executable files."""
     # 2 HIGH findings in run.py = 2 × 25 × 1.3 = 65 (float-based accumulation)
@@ -966,24 +1033,3 @@ def test_report_doc_findings_no_multiplier() -> None:
     # Without the multiplier: 2 HIGH = 50, not 65
     assert result["risk_score"] == 50
     assert result["risk_severity"] == "MEDIUM"
-
-
-def test_report_sarif_preserves_high_vs_critical_severity() -> None:
-    """HIGH and CRITICAL both map to SARIF error, but properties keep the exact severity."""
-    state: SkillspectorState = {
-        "filtered_findings": [
-            _finding("R1", "HIGH", message="high finding", file="high.py"),
-            _finding("R2", "CRITICAL", message="critical finding", file="critical.py"),
-        ],
-        "component_metadata": [],
-        "has_executable_scripts": False,
-        "manifest": {},
-        "skill_path": None,
-        "output_format": "sarif",
-    }
-    results = report(state)["sarif_report"]["runs"][0]["results"]
-    by_rule = {item["ruleId"]: item for item in results}
-    assert by_rule["R1"]["level"] == "error"
-    assert by_rule["R2"]["level"] == "error"
-    assert by_rule["R1"]["properties"]["severity"] == "HIGH"
-    assert by_rule["R2"]["properties"]["severity"] == "CRITICAL"

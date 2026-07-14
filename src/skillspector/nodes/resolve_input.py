@@ -26,7 +26,7 @@ from pathlib import Path
 
 from skillspector.input_handler import InputHandler
 from skillspector.logging_config import get_logger
-from skillspector.state import SkillspectorState
+from skillspector.state import SkillspectorState, transitive_traversal_state
 
 logger = get_logger(__name__)
 
@@ -42,9 +42,10 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
     """
     input_path = state.get("input_path")
     skill_path = state.get("skill_path")
+    traversal = transitive_traversal_state(state)
 
     if input_path and isinstance(input_path, str) and input_path.strip():
-        handler = InputHandler()
+        handler = InputHandler(transitive_budget=traversal)
         try:
             resolved, source_type = handler.resolve(input_path.strip())
             update: dict[str, object] = {"skill_path": str(resolved)}

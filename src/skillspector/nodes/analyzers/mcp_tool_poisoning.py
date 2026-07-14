@@ -30,6 +30,8 @@ from skillspector.state import (
     LLMCallRecord,
     SkillspectorState,
     llm_call_record,
+    transitive_note_truncation,
+    transitive_remaining_seconds,
 )
 
 ANALYZER_ID = "mcp_tool_poisoning"
@@ -682,7 +684,9 @@ _TP4_EXECUTABLE_TYPES = frozenset(
 )
 
 
-def _check_tp4(state: SkillspectorState) -> tuple[list[Finding], LLMCallRecord | None]:
+def _check_tp4(
+    state: SkillspectorState, timeout: float | None = None
+) -> tuple[list[Finding], LLMCallRecord | None]:
     """TP4: LLM-based description-behavior mismatch detection.
 
     Returns ``(findings, record)`` where *record* is the LLM-call telemetry for
@@ -762,7 +766,7 @@ Respond in JSON matching this exact schema:
 }}"""
 
         attempted = True
-        response = chat_completion(prompt, model=model)
+        response = chat_completion(prompt, model=model, timeout=timeout)
 
         # Parse JSON — handle optional ```json code blocks
         json_text = response.strip()
@@ -858,8 +862,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     # always sets this explicitly, so the default only affects programmatic
     # callers that omit the key.
     tp4_record: LLMCallRecord | None = None
-    if state.get("use_llm", True):
-        tp4_findings, tp4_record = _check_tp4(state)
+    timeout = transitive_remaining_seconds(state)
+    if timeout is not None and timeout <= 0:
+        transitive_note_truncation(state, f"LLM time budget exhausted before {ANALYZER_ID}")
+        logger.info("%s: skipped TP4 (transitive time budget exhausted)", ANALYZER_ID)
+    if state.get("use_llm", True) and not (timeout is not None and timeout <= 0):
+        tp4_findings, tp4_record = _check_tp4(state, timeout=timeout)
         findings.extend(tp4_findings)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
