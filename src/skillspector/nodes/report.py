@@ -1154,5 +1154,4 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "filtered_findings": selected_findings,
         "suppressed_findings": suppressed,
         "execution_successful": execution_successful,
-        "structured_summaries": structured_summaries,
     }

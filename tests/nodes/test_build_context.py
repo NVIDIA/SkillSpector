@@ -667,6 +667,8 @@ def test_build_context_rejects_symlinked_manifest(tmp_path: Path) -> None:
     assert result["manifest"] == {}
     assert "SKILL.md" not in result["components"]
     assert "SKILL.md" not in result["file_cache"]
+
+
 def _write_aisop_bundle(path: Path) -> None:
     """Write a valid minimal AISOP/AISP bundle file."""
     bundle = [
@@ -721,6 +723,19 @@ def test_build_context_populates_structured_skill_context(tmp_path: Path) -> Non
     assert context["constraint_anchors"] == ["Read-only inspection must not modify files."]
     assert context["resource_anchors"] == ["resources/state.json"]
     assert context["declared_tools"] == ["mail", "search"]
+
+
+@pytest.mark.parametrize("ancestor", [".claude", "venv"])
+def test_build_context_structured_bundle_under_ancestor(tmp_path: Path, ancestor: str) -> None:
+    """Scan-root-relative filters keep bundles under external ancestors."""
+    skill_dir = tmp_path / ancestor / "skills" / "foo"
+    skill_dir.mkdir(parents=True)
+    _write_aisop_bundle(skill_dir / "workflow.aisop.json")
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert "workflow.aisop.json" in result["components"]
+    assert "structured_skill_context" in result
 
 
 def test_build_context_manifest_may_be_empty_when_only_structured(tmp_path: Path) -> None:
@@ -797,4 +812,4 @@ def test_build_context_ignores_over_nested_structured_bundle(tmp_path: Path) -> 
 
     result = build_context({"skill_path": str(tmp_path)})
 
-assert "structured_skill_context" not in result
+    assert "structured_skill_context" not in result

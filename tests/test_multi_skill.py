@@ -142,6 +142,36 @@ class TestDetectSkills:
         assert result.is_multi_skill is False
         assert len(result.skills) == 1
 
+    @pytest.mark.parametrize("ancestor", [".claude", "venv"])
+    def test_structured_child_under_ancestor_detected(self, tmp_path: Path, ancestor: str) -> None:
+        """Structured children remain discoverable under external ancestors."""
+        skills_dir = tmp_path / ancestor / "skills"
+        sub = skills_dir / "workflow-bundle"
+        sub.mkdir(parents=True)
+        _write_aisop_bundle(sub / "workflow.aisop.json")
+
+        result = detect_skills(skills_dir)
+
+        assert len(result.skills) == 1
+        assert result.skills[0].path == sub
+
+    @pytest.mark.parametrize("skip_dir", ["venv", "node_modules", "__pycache__"])
+    def test_skip_dir_children_with_bundles_ignored(self, tmp_path: Path, skip_dir: str) -> None:
+        """Skip-dir children do not become phantom skills from vendored bundles."""
+        real_skill = tmp_path / "real-skill"
+        real_skill.mkdir()
+        (real_skill / "SKILL.md").write_text("---\nname: real\n---\n", encoding="utf-8")
+
+        bundled_child = tmp_path / skip_dir / "pkg"
+        bundled_child.mkdir(parents=True)
+        _write_aisop_bundle(bundled_child / "workflow.aisop.json")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 1
+        assert result.skills[0].path == real_skill
+
     def test_structured_bundle_ignored_when_partial(self, tmp_path: Path) -> None:
         """Malformed AISOP/AISP JSON does not count as a structured child skill."""
         malformed = tmp_path / "bad-bundle"

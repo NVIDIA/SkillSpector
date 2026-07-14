@@ -45,9 +45,10 @@ def _iter_aisop_files(skill_dir: Path) -> list[Path]:
     """Yield candidate *.aisop.json files under a directory, skipping noisy paths."""
     files: list[Path] = []
     for path in sorted(skill_dir.rglob("*.aisop.json")):
-        if any(part in _SKIP_DIRS for part in path.parts):
+        relative_parts = path.relative_to(skill_dir).parts
+        if any(part in _SKIP_DIRS for part in relative_parts):
             continue
-        if any(part.startswith(".") and part != ".aisop" for part in path.parts[:-1]):
+        if any(part.startswith(".") and part != ".aisop" for part in relative_parts[:-1]):
             # Keep hidden metadata directories out of structured-skill detection.
             continue
         if path.is_file():
