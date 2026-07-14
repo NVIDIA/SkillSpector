@@ -28,6 +28,9 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
@@ -35,6 +38,7 @@ from typing import Literal
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field, field_validator
 
+from skillspector.llm_cache import CacheKey, LLMResponseCache, make_cache_key
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
@@ -269,13 +273,44 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
 
-    def __init__(self, base_prompt: str, model: str):
+    def __init__(
+        self,
+        base_prompt: str,
+        model: str,
+        analyzer_id: str = "",
+        cache: LLMResponseCache | None = None,
+    ) -> None:
         self.base_prompt = base_prompt
         self.model = model
+        self.analyzer_id = analyzer_id
+        self._cache = cache
+        self._schema_version = (
+            hashlib.sha256(
+                json.dumps(self.response_schema.model_json_schema(), sort_keys=True).encode()
+            ).hexdigest()[:12]
+            if self.response_schema
+            else "raw"
+        )
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
+        )
+
+    def _cache_key(self, prompt: str) -> CacheKey:
+        return make_cache_key(
+            content=prompt, prompt_template=self.model, schema_version=self._schema_version
+        )
+
+    def _emit_progress(self, file_label: str, stage: str, detail: str = "") -> None:
+        """Print a single-line LLM progress indicator to stderr."""
+        if not self.analyzer_id:
+            return
+        suffix = f" ({detail})" if detail else ""
+        print(
+            f"[LLM] {self.analyzer_id}: {file_label} ({stage}){suffix}",
+            file=sys.stderr,
+            flush=True,
         )
 
     # -- Batching -----------------------------------------------------------
@@ -375,10 +410,37 @@ class LLMAnalyzerBase:
         The element type of the inner list depends on the subclass: the default
         :meth:`parse_response` returns :class:`Finding` objects; subclasses may
         return dicts or other types.
+
+        When a cache is configured, each batch is looked up before the LLM call.
+        On a cache hit the stored JSON is re-parsed through the response schema and
+        the LLM call is skipped entirely.  New responses are stored in the cache
+        after a successful LLM call.
         """
         results: list[tuple[Batch, list]] = []
         for batch in batches:
             prompt = self.build_prompt(batch, **kwargs)
+
+            # --- Cache check -------------------------------------------------
+            key: CacheKey | None = None
+            if self._cache is not None:
+                key = self._cache_key(prompt)
+                cached = self._cache.get(key)
+                if cached is not None:
+                    self._emit_progress(batch.file_label, "cache hit")
+                    try:
+                        raw = json.loads(cached)
+                        if self.response_schema and hasattr(self.response_schema, "model_validate"):
+                            response: object = self.response_schema.model_validate(raw)
+                        else:
+                            response = raw
+                        parsed = self.parse_response(response, batch)
+                        results.append((batch, parsed))
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Cache hit but parse failed, calling LLM: %s", exc)
+
+            # --- LLM call ----------------------------------------------------
+            self._emit_progress(batch.file_label, "requesting...")
             logger.debug(
                 "LLM call for %s (tokens~%d, findings=%d)",
                 batch.file_label,
@@ -390,7 +452,19 @@ class LLMAnalyzerBase:
             else:
                 response = _message_text(self._llm.invoke(prompt))
             logger.debug("LLM response for %s", batch.file_label)
+
+            # --- Store in cache ----------------------------------------------
+            if self._cache is not None and key is not None:
+                try:
+                    if hasattr(response, "model_dump"):
+                        self._cache.put(key, json.dumps(response.model_dump()))
+                    else:
+                        self._cache.put(key, json.dumps(response))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Cache write failed: %s", exc)
+
             parsed = self.parse_response(response, batch)
+            self._emit_progress(batch.file_label, "done", f"{len(parsed)} findings")
             results.append((batch, parsed))
         return results
 
@@ -415,13 +489,36 @@ class LLMAnalyzerBase:
         ``NotImplementedError`` signal misconfiguration rather than infra
         trouble and keep propagating.
 
+        When a cache is configured, cache hits are resolved synchronously before
+        the async fan-out so they never consume semaphore slots.
+
         The return type mirrors :meth:`run_batches`.
         """
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
+            prompt = self.build_prompt(batch, **kwargs)
+
+            # --- Cache check (sync — SQLite is not async) --------------------
+            key: CacheKey | None = None
+            if self._cache is not None:
+                key = self._cache_key(prompt)
+                cached = self._cache.get(key)
+                if cached is not None:
+                    self._emit_progress(batch.file_label, "cache hit")
+                    try:
+                        raw = json.loads(cached)
+                        if self.response_schema and hasattr(self.response_schema, "model_validate"):
+                            response: object = self.response_schema.model_validate(raw)
+                        else:
+                            response = raw
+                        parsed = self.parse_response(response, batch)
+                        return (batch, parsed)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Cache hit but parse failed, calling LLM: %s", exc)
+
             async with sem:
-                prompt = self.build_prompt(batch, **kwargs)
+                self._emit_progress(batch.file_label, "requesting...")
                 logger.debug(
                     "LLM call for %s (tokens~%d, findings=%d)",
                     batch.file_label,
@@ -433,7 +530,20 @@ class LLMAnalyzerBase:
                 else:
                     response = _message_text(await self._llm.ainvoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
-                return (batch, self.parse_response(response, batch))
+
+                # --- Store in cache ------------------------------------------
+                if self._cache is not None and key is not None:
+                    try:
+                        if hasattr(response, "model_dump"):
+                            self._cache.put(key, json.dumps(response.model_dump()))
+                        else:
+                            self._cache.put(key, json.dumps(response))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Cache write failed: %s", exc)
+
+                parsed = self.parse_response(response, batch)
+                self._emit_progress(batch.file_label, "done", f"{len(parsed)} findings")
+                return (batch, parsed)
 
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         successful: list[tuple[Batch, list]] = []

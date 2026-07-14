@@ -117,6 +117,20 @@ def main(
     pass
 
 
+def _auto_discover_baseline(input_path: str) -> Path | None:
+    """Return the auto-discovered baseline path, or None if not found.
+
+    Looks for ``.skillspector-baseline.yaml`` in the resolved directory
+    when *input_path* points to a local directory.
+    """
+    candidate = Path(input_path)
+    if candidate.is_dir():
+        bl = candidate.resolve() / ".skillspector-baseline.yaml"
+        if bl.exists():
+            return bl
+    return None
+
+
 def _scan_state(
     input_path: str,
     format: FormatChoice,
@@ -124,12 +138,16 @@ def _scan_state(
     yara_rules_dir: str | None = None,
     baseline: Path | None = None,
     show_suppressed: bool = False,
+    include_test_fixtures: bool = False,
+    skip_meta: bool = False,
+    trust_skill_classification: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
         "input_path": input_path,
         "output_format": format.value,
         "use_llm": not no_llm,
+        "trust_skill_classification": trust_skill_classification,
     }
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
@@ -137,6 +155,10 @@ def _scan_state(
         # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
         state["baseline"] = load_baseline(baseline)
         state["show_suppressed"] = show_suppressed
+    if include_test_fixtures:
+        state["include_test_fixtures"] = True
+    if skip_meta:
+        state["skip_meta"] = True
     return state
 
 
@@ -214,6 +236,13 @@ def scan(
             help="Scan immediate subdirectories that each contain a SKILL.md as independent skills.",
         ),
     ] = False,
+    depth: Annotated[
+        int,
+        typer.Option(
+            "--depth",
+            help="Directory depth to search for sub-skills with --recursive. Default: 1.",
+        ),
+    ] = 1,
     baseline: Annotated[
         Path | None,
         typer.Option(
@@ -239,6 +268,50 @@ def scan(
             help="Show detailed progress.",
         ),
     ] = False,
+    include_test_fixtures: Annotated[
+        bool,
+        typer.Option(
+            "--include-test-fixtures",
+            help="Include AST4/PE3 findings that are likely test-harness patterns (shell=False + "
+            "sys.executable, /etc/passwd in test assertion). Default: downgrade these to INFO.",
+        ),
+    ] = False,
+    skip_meta: Annotated[
+        bool,
+        typer.Option(
+            "--skip-meta",
+            help="Skip the meta-analyzer LLM pass. Reduces token cost (~40-60%) at the cost of "
+            "more false positives. Use for rapid iterative scanning; omit for final/CI runs.",
+        ),
+    ] = False,
+    auto_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--auto-baseline",
+            help="Auto-discover and apply .skillspector-baseline.yaml in the scanned "
+            "directory. Off by default: the scanned directory may be untrusted, and a "
+            "malicious skill could ship a baseline that suppresses findings about itself.",
+        ),
+    ] = False,
+    detail: Annotated[
+        bool,
+        typer.Option(
+            "--detail",
+            help="Include full finding details (issues[]) in recursive JSON output.",
+        ),
+    ] = False,
+    trust_skill_classification: Annotated[
+        bool,
+        typer.Option(
+            "--trust-skill-classification",
+            help="Trust the scanned skill's own self-declared 'offensive_security' "
+            "classification (from its manifest) to override the risk recommendation. "
+            "Off by default: the manifest is attacker-controlled, and a malicious "
+            "skill could label itself this way to suppress a DO_NOT_INSTALL verdict. "
+            "The self-declared classification is always shown in JSON output "
+            "(skill_declared_classification) regardless of this flag.",
+        ),
+    ] = False,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -249,14 +322,22 @@ def scan(
         skillspector scan ./my-skill/ --format json --output report.json
         skillspector scan https://github.com/user/my-skill --no-llm
         skillspector scan ./skill-collection/ --recursive
+        skillspector scan ./skill-collection/ --recursive --depth 2
+        skillspector scan ./my-skill/ --include-test-fixtures
+
+    Flags:
+
+        --include-test-fixtures: Include AST4/PE3 findings that are likely test-harness
+                                 patterns (shell=False + sys.executable, /etc/passwd in
+                                 test assertion). Default: downgrade these to INFO.
 
     Environment variables:
 
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
-                               nv_inference. Defaults to the NVIDIA path
-                               (nv_inference, falling back to nv_build in
-                               OSS builds).
+                               nv_inference | subprocess. Defaults to the
+                               NVIDIA path (nv_inference, falling back to
+                               nv_build in OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
                                model (applies to every analyzer slot).
         SKILLSPECTOR_LOG_LEVEL DEBUG | INFO | WARNING | ERROR (default WARNING).
@@ -269,20 +350,24 @@ def scan(
                                              (AWS_PROFILE: standard boto3 credential
                                              chain when unset; AWS_REGION default: us-west-2)
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
+        SKILLSPECTOR_LLM_COMMAND             for SKILLSPECTOR_PROVIDER=subprocess
+                                             (shell command; prompt via stdin —
+                                             e.g. "claude -p", "antigravity ask")
     """
     if verbose:
         set_level("DEBUG")
 
     resolved_path = Path(input_path).resolve()
     if recursive and resolved_path.is_dir():
-        detection = detect_skills(resolved_path)
+        detection = detect_skills(resolved_path, depth=depth)
         if detection.is_multi_skill:
-            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
+            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose, detail)
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
             console.print(
-                "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
-                "detected. Scanning as single skill."
+                f"[yellow]Warning:[/yellow] no sub-skills found at depth {depth} under {input_path}.\n"
+                f"If skills are nested deeper, try --depth {depth + 1} or --depth {depth + 2}.\n"
+                "Falling back to flat scan of the entire directory."
             )
     elif resolved_path.is_dir():
         detection = detect_skills(resolved_path)
@@ -295,13 +380,30 @@ def scan(
     result = None
     try:
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
+
+        # Auto-discover baseline if not explicitly given
+        effective_baseline = baseline
+        if effective_baseline is None and auto_baseline:
+            auto_bl = _auto_discover_baseline(input_path)
+            if auto_bl is not None:
+                effective_baseline = auto_bl
+                try:
+                    _loaded = load_baseline(auto_bl)
+                    n = len(_loaded.fingerprints or {}) + len(_loaded.rules or [])
+                except Exception:  # noqa: BLE001
+                    n = "?"
+                console.print(f"Baseline: applying {auto_bl.name} ({n} suppression(s))")
+
         state = _scan_state(
             input_path,
             format,
             no_llm,
             yara_rules_dir=yara_dir,
-            baseline=baseline,
+            baseline=effective_baseline,
             show_suppressed=show_suppressed,
+            include_test_fixtures=include_test_fixtures,
+            skip_meta=skip_meta,
+            trust_skill_classification=trust_skill_classification,
         )
         if verbose:
             console.print("[dim]Running scan...[/dim]")
@@ -359,6 +461,7 @@ def _scan_multi_skill(
     no_llm: bool,
     yara_rules_dir: Path | None,
     verbose: bool,
+    detail: bool = False,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     skills = detection.skills
@@ -404,27 +507,44 @@ def _scan_multi_skill(
     console.print("")
 
     if output and format == FormatChoice.json:
-        combined = {
+        # Count by severity across all skills for the summary.
+        sev_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        skills_list: list[dict[str, object]] = []
+        for skill, result in zip(skills, results, strict=True):
+            if "error" in result:
+                skills_list.append(
+                    {"name": skill.name, "path": skill.relative_path, "error": result["error"]}
+                )
+                continue
+            findings_list = result.get("filtered_findings") or result.get("findings") or []
+            for f in findings_list:
+                sev = (f.severity if isinstance(f.severity, str) else str(f.severity)).lower()
+                if sev in sev_counts:
+                    sev_counts[sev] += 1
+            entry: dict[str, object] = {
+                "name": skill.name,
+                "path": skill.relative_path,
+                "risk_score": result.get("risk_score", 0),
+                "risk_severity": result.get("risk_severity", "LOW"),
+                "finding_count": len(findings_list),
+            }
+            if detail:
+                entry["issues"] = [f.to_dict() for f in findings_list if hasattr(f, "to_dict")]
+            skills_list.append(entry)
+
+        # `multi_skill`/`skill_count`/`max_risk_score`/`skills` (list) are the
+        # original contract — preserved as-is. `summary` and per-skill `issues`
+        # are additive so existing consumers keep working unchanged.
+        combined: dict[str, object] = {
             "multi_skill": True,
             "skill_count": len(skills),
             "max_risk_score": max_score,
-            "skills": [],
+            "summary": {
+                "total_skills": len(skills),
+                **sev_counts,
+            },
+            "skills": skills_list,
         }
-        for skill, result in zip(skills, results, strict=True):
-            if "error" in result:
-                combined["skills"].append({"name": skill.name, "error": result["error"]})
-            else:
-                combined["skills"].append(
-                    {
-                        "name": skill.name,
-                        "path": skill.relative_path,
-                        "risk_score": result.get("risk_score", 0),
-                        "risk_severity": result.get("risk_severity", "LOW"),
-                        "finding_count": len(
-                            result.get("filtered_findings") or result.get("findings") or []
-                        ),
-                    }
-                )
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
     elif output:
@@ -484,6 +604,39 @@ def mcp(
         raise typer.Exit(code=2) from e
 
 
+def _resolve_baseline_output(input_path: str, explicit_output: Path | None) -> Path:
+    """Return the path where the baseline file should be written.
+
+    Priority:
+    1. Explicit --output path (always honoured).
+    2. <input_path>/.skillspector-baseline.yaml when input_path is a local directory.
+    3. CWD/.skillspector-baseline.yaml as a last resort (remote / archive inputs).
+    """
+    if explicit_output is not None:
+        return explicit_output
+    candidate = Path(input_path)
+    if candidate.is_dir():
+        return candidate.resolve() / ".skillspector-baseline.yaml"
+    return Path(".skillspector-baseline.yaml")
+
+
+def _warn_if_overwriting(output: Path) -> None:
+    """Print a warning if a baseline file already exists at *output*."""
+    if not output.exists():
+        return
+    try:
+        import yaml as _yaml  # noqa: PLC0415
+
+        data = _yaml.safe_load(output.read_text(encoding="utf-8")) or {}
+        prior = len(data.get("fingerprints") or []) + len(data.get("rules") or [])
+    except Exception:  # noqa: BLE001
+        prior = "unknown"
+    console.print(
+        f"[yellow]Warning:[/yellow] overwriting existing baseline at {output} "
+        f"({prior} prior suppression(s))"
+    )
+
+
 @app.command()
 def baseline(
     input_path: Annotated[
@@ -493,13 +646,16 @@ def baseline(
         ),
     ],
     output: Annotated[
-        Path,
+        Path | None,
         typer.Option(
             "--output",
             "-o",
-            help="Where to write the baseline file (YAML; .json extension writes JSON).",
+            help=(
+                "Where to write the baseline file (YAML; .json extension writes JSON). "
+                "Defaults to <target-dir>/.skillspector-baseline.yaml."
+            ),
         ),
-    ] = Path(".skillspector-baseline.yaml"),
+    ] = None,
     no_llm: Annotated[
         bool,
         typer.Option(
@@ -541,9 +697,11 @@ def baseline(
         result = graph.invoke(state)
         findings = result.get("filtered_findings") or result.get("findings") or []
         data = build_baseline_dict(findings, reason=reason)
-        dump_baseline(data, output)
+        resolved_output = _resolve_baseline_output(input_path, output)
+        _warn_if_overwriting(resolved_output)
+        dump_baseline(data, resolved_output)
         console.print(
-            f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
+            f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {resolved_output}"
         )
     except typer.Exit:
         raise

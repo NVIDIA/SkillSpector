@@ -548,8 +548,17 @@ def _format_json(
     llm_call_log: list[dict[str, object]] | None = None,
     analysis_completeness: dict[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
+    skill_declared_classification: str | None = None,
 ) -> str:
-    """Generate JSON report string."""
+    """Generate JSON report string.
+
+    ``skill_declared_classification`` is the raw, untrusted classification the
+    scanned skill declared about itself (from its own manifest). It is always
+    included as its own top-level field — separate from
+    ``risk_assessment.recommendation`` — so it stays visible in the output even
+    when it was not trusted to influence the verdict (see
+    ``trust_skill_classification`` in state.py / report()).
+    """
     suppressed = suppressed or []
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
     data: dict[str, object] = {
@@ -563,6 +572,7 @@ def _format_json(
             "severity": risk_severity,
             "recommendation": risk_recommendation,
         },
+        "skill_declared_classification": skill_declared_classification,
         "components": [
             {
                 "path": c.get("path"),
@@ -725,6 +735,21 @@ def report(state: SkillspectorState) -> dict[str, object]:
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings_for_scoring, has_executable_scripts, component_metadata
     )
+
+    # Offensive security override: authorized tools get a context-aware recommendation
+    # rather than a blanket DO_NOT_INSTALL, regardless of score-based severity.
+    #
+    # skill_classification is read from the scanned skill's own manifest, i.e. it
+    # is attacker-controlled: a malicious skill could label itself
+    # "offensive_security" purely to suppress a DO_NOT_INSTALL verdict. Trusting
+    # it is therefore opt-in via trust_skill_classification (default False); the
+    # raw self-declared value is still always surfaced separately in JSON output
+    # (see skill_declared_classification below) so it remains visible even when
+    # not trusted.
+    classification = state.get("skill_classification")
+    if classification == "offensive_security" and state.get("trust_skill_classification"):
+        risk_recommendation = "AUTHORIZED OFFENSIVE TOOL — review findings in context"
+
     sarif_report = _build_sarif(active_findings, suppressed, degraded_notice=degraded_notice)
     analysis_completeness = _build_analysis_completeness(
         components, file_cache, use_llm, raw_findings, filtered_findings
@@ -770,6 +795,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
+            skill_declared_classification=classification,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(

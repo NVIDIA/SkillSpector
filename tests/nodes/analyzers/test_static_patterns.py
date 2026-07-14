@@ -571,6 +571,66 @@ class TestRunStaticPatternsPrivilegeEscalationPE4:
         assert any(f.rule_id == "PE4" for f in result["findings"])
 
 
+_PE3_TEST_FIXTURE_CODE = """\
+import os
+
+
+def test_path_traversal_blocked():
+    # Verify that /etc/passwd cannot be accessed via path traversal
+    evil_path = "/etc/passwd"
+    result = sanitize_path(evil_path)
+    assert result is None, "Path traversal to /etc/passwd should be blocked"
+"""
+
+_PE3_PROD_CODE = """\
+import os
+
+
+def get_users():
+    with open("/etc/passwd") as f:
+        return f.read()
+"""
+
+
+class TestPE3TestFixtureHeuristic:
+    """PE3 test-fixture heuristic: downgrade /etc/passwd in test-assertion functions."""
+
+    def test_pe3_test_fixture_downgraded(self):
+        """/etc/passwd in a test_path_traversal function → downgraded confidence."""
+        state = {
+            "components": ["test_sanitizer.py"],
+            "file_cache": {"test_sanitizer.py": _PE3_TEST_FIXTURE_CODE},
+        }
+        result = privilege_escalation_module.node(state)
+        pe3 = [f for f in result["findings"] if f.rule_id == "PE3"]
+        assert pe3, "PE3 should still fire"
+        assert pe3[0].confidence < 0.3, "test-fixture PE3 should be low confidence"
+        assert "likely_test_fixture" in pe3[0].tags
+
+    def test_pe3_production_code_not_downgraded(self):
+        """/etc/passwd in non-test file stays at original confidence."""
+        state = {
+            "components": ["users.py"],
+            "file_cache": {"users.py": _PE3_PROD_CODE},
+        }
+        result = privilege_escalation_module.node(state)
+        pe3 = [f for f in result["findings"] if f.rule_id == "PE3"]
+        assert pe3
+        assert pe3[0].confidence >= 0.5
+
+    def test_pe3_test_fixture_not_downgraded_when_include_flag(self):
+        """include_test_fixtures=True keeps test-file PE3 at full confidence."""
+        state = {
+            "components": ["test_sanitizer.py"],
+            "file_cache": {"test_sanitizer.py": _PE3_TEST_FIXTURE_CODE},
+            "include_test_fixtures": True,
+        }
+        result = privilege_escalation_module.node(state)
+        pe3 = [f for f in result["findings"] if f.rule_id == "PE3"]
+        assert pe3
+        assert pe3[0].confidence >= 0.5, "include_test_fixtures=True means NO downgrade"
+
+
 class TestRunStaticPatternsPrivilegeEscalationPE5:
     """run_static_patterns with privilege_escalation: PE5 (privileged container / container escape)."""
 

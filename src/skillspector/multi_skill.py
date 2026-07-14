@@ -48,12 +48,15 @@ class MultiSkillDetectionResult:
     has_root_skill: bool = False
 
 
-def detect_skills(directory: Path) -> MultiSkillDetectionResult:
+def detect_skills(directory: Path, depth: int = 1) -> MultiSkillDetectionResult:
     """Detect whether a directory contains multiple independent skills.
 
     A directory is considered multi-skill when:
     - It has NO root-level SKILL.md (or skill.md)
-    - At least 2 immediate subdirectories contain SKILL.md (or skill.md)
+    - At least 2 subdirectories (up to *depth* levels deep) contain SKILL.md
+
+    With depth=1 (default): checks immediate subdirectories only.
+    With depth=N: checks up to N directory levels below *directory*.
 
     If a root SKILL.md exists, the directory is treated as a single skill
     (the standard behavior) regardless of nested SKILL.md files.
@@ -68,7 +71,31 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
         return MultiSkillDetectionResult(is_multi_skill=False, has_root_skill=True)
 
     skills: list[SkillDirectory] = []
-    for child in sorted(directory.iterdir()):
+    _find_skills_recursive(directory, directory, depth, skills)
+
+    is_multi = len(skills) >= 2
+    return MultiSkillDetectionResult(
+        is_multi_skill=is_multi,
+        skills=skills,
+        has_root_skill=False,
+    )
+
+
+def _find_skills_recursive(
+    root: Path,
+    current: Path,
+    remaining_depth: int,
+    skills: list[SkillDirectory],
+) -> None:
+    """Recursively collect SkillDirectory objects up to *remaining_depth* levels.
+
+    Directories that start with "." are skipped. When a directory contains a
+    SKILL.md it is recorded as a skill; otherwise its children are searched
+    (consuming one level of depth).
+    """
+    if remaining_depth <= 0:
+        return
+    for child in sorted(current.iterdir()):
         if not child.is_dir():
             continue
         if child.name.startswith("."):
@@ -79,16 +106,11 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
                 SkillDirectory(
                     path=child,
                     name=name,
-                    relative_path=child.name,
+                    relative_path=str(child.relative_to(root)),
                 )
             )
-
-    is_multi = len(skills) >= 2
-    return MultiSkillDetectionResult(
-        is_multi_skill=is_multi,
-        skills=skills,
-        has_root_skill=False,
-    )
+        else:
+            _find_skills_recursive(root, child, remaining_depth - 1, skills)
 
 
 def _has_skill_md(directory: Path) -> bool:

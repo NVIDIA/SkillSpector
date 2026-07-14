@@ -118,6 +118,152 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     assert data["risk_assessment"]["score"] == 0
 
 
+def test_baseline_writes_to_target_directory(safe_skill_dir: Path) -> None:
+    """baseline <path> should write into <path>/, not CWD."""
+    result = runner.invoke(app, ["baseline", str(safe_skill_dir), "--no-llm"])
+    assert result.exit_code in (0, 1)  # 1 is OK (risk score exit), 2 is error
+    baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
+    assert baseline_file.exists(), "baseline file must land in target directory"
+
+
+def test_baseline_explicit_output_still_honoured(safe_skill_dir: Path, tmp_path: Path) -> None:
+    """--output path overrides the default target-dir placement."""
+    custom = tmp_path / "custom.yaml"
+    result = runner.invoke(
+        app, ["baseline", str(safe_skill_dir), "--output", str(custom), "--no-llm"]
+    )
+    assert result.exit_code in (0, 1)
+    assert custom.exists()
+    assert not (safe_skill_dir / ".skillspector-baseline.yaml").exists()
+
+
+def test_baseline_warns_on_overwrite(safe_skill_dir: Path) -> None:
+    """Second baseline call prints 'overwriting existing baseline' with prior count."""
+    existing = safe_skill_dir / ".skillspector-baseline.yaml"
+    existing.write_text(
+        "version: 1\nrules: []\nfingerprints:\n"
+        "  - hash: 'sha256:aabbccdd11223344'\n    rule_id: T1\n    file: f.md\n    reason: test\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["baseline", str(safe_skill_dir), "--no-llm"])
+    assert result.exit_code in (0, 1)
+    assert "overwriting existing baseline" in result.output.lower()
+    assert "1 prior" in result.output.lower()
+
+
+def test_baseline_auto_discovery_is_opt_in(safe_skill_dir: Path) -> None:
+    """baseline file in scanned dir is NOT auto-loaded by default (opt-in only)."""
+    baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
+    baseline_file.write_text("version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8")
+    result = runner.invoke(app, ["scan", str(safe_skill_dir), "--no-llm", "--format", "json"])
+    assert "Baseline: applying" not in result.output
+
+
+def test_auto_baseline_flag_enables_auto_discovery(safe_skill_dir: Path) -> None:
+    """--auto-baseline must opt in to auto-discovering the baseline file."""
+    baseline_file = safe_skill_dir / ".skillspector-baseline.yaml"
+    baseline_file.write_text("version: 1\nrules: []\nfingerprints: []\n", encoding="utf-8")
+    result = runner.invoke(
+        app, ["scan", str(safe_skill_dir), "--no-llm", "--auto-baseline", "--format", "json"]
+    )
+    assert "Baseline: applying" in result.output
+
+
+def test_detect_skills_depth_2(tmp_path: Path) -> None:
+    """detect_skills with depth=2 should find skills nested two levels deep."""
+    from skillspector.multi_skill import detect_skills
+
+    # Create: root/category/skill-a/SKILL.md
+    skill_a = tmp_path / "category" / "skill-a"
+    skill_a.mkdir(parents=True)
+    (skill_a / "SKILL.md").write_text("---\nname: skill-a\n---\n", encoding="utf-8")
+    skill_b = tmp_path / "category" / "skill-b"
+    skill_b.mkdir()
+    (skill_b / "SKILL.md").write_text("---\nname: skill-b\n---\n", encoding="utf-8")
+
+    result_depth1 = detect_skills(tmp_path, depth=1)
+    assert not result_depth1.is_multi_skill, "depth=1 should NOT find nested skills"
+
+    result_depth2 = detect_skills(tmp_path, depth=2)
+    assert result_depth2.is_multi_skill, "depth=2 should find both skills"
+    names = {s.name for s in result_depth2.skills}
+    assert "skill-a" in names
+    assert "skill-b" in names
+
+
+def test_recursive_depth_fallback_warning_message(safe_skill_dir: Path, tmp_path: Path) -> None:
+    """When --recursive finds nothing at depth 1, the warning must suggest --depth 2."""
+    # Create a collection with skills nested 2 levels deep
+    col = tmp_path / "collection"
+    col.mkdir()
+    deep = col / "category" / "my-skill"
+    deep.mkdir(parents=True)
+    (deep / "SKILL.md").write_text("---\nname: deep\n---\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["scan", str(col), "--recursive", "--no-llm", "--format", "json"])
+    assert "--depth 2" in result.output or "--depth 2" in result.output.lower()
+
+
+def test_recursive_json_detail_includes_issues(tmp_path: Path) -> None:
+    """--recursive --format json --detail must include issues[] per skill."""
+    # Create two minimal skills
+    for name in ("skill-a", "skill-b"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\n# {name}\n",
+            encoding="utf-8",
+        )
+    out_file = tmp_path / "results.json"
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--format",
+            "json",
+            "--detail",
+            "--no-llm",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert result.exit_code in (0, 1)
+    assert out_file.exists()
+    data = json.loads(out_file.read_text())
+    assert "summary" in data
+    assert "skills" in data
+    for skill_data in data["skills"]:
+        assert "issues" in skill_data, "each skill entry must have issues[]"
+
+
+def test_recursive_json_without_detail_no_issues(tmp_path: Path) -> None:
+    """Without --detail, recursive JSON must NOT include issues[] (backward compat)."""
+    for name in ("skill-a", "skill-b"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+    out_file = tmp_path / "results.json"
+    runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--recursive",
+            "--format",
+            "json",
+            "--no-llm",
+            "--output",
+            str(out_file),
+        ],
+    )
+    assert out_file.exists()
+    data = json.loads(out_file.read_text())
+    for skill_data in data.get("skills", []):
+        assert "issues" not in skill_data
+
+
 def test_scan_multi_skill_markdown_output_to_file(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -158,6 +304,49 @@ def test_scan_multi_skill_markdown_output_to_file(
     assert "BETA" not in captured.out
 
 
+def test_scan_multi_skill_sarif_output_to_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """SARIF recursive scan writes concatenated per-skill SARIF sections to file, not stdout."""
+    s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
+    s2 = SkillDirectory(path=tmp_path / "skill2", name="skill2", relative_path="skill2")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+
+    result1 = {
+        "report_body": "",
+        "sarif_report": {"runs": [{"tool": "skillspector", "results": ["ALPHA-FINDING"]}]},
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    result2 = {
+        "report_body": "",
+        "sarif_report": {"runs": [{"tool": "skillspector", "results": ["BETA-FINDING"]}]},
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+    out = tmp_path / "report.sarif"
+
+    with patch("skillspector.cli.graph.invoke", side_effect=[result1, result2]):
+        _scan_multi_skill(
+            detection, FormatChoice.sarif, out, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    assert out.exists()
+    text = out.read_text()
+    assert "ALPHA-FINDING" in text
+    assert "BETA-FINDING" in text
+    assert "skill1" in text
+    assert "skill2" in text
+
+    captured = capsys.readouterr()
+    assert "ALPHA-FINDING" not in captured.out
+    assert "BETA-FINDING" not in captured.out
+
+
 def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
     """JSON recursive scan still produces a valid combined JSON file."""
     s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
@@ -188,4 +377,9 @@ def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
     assert out.exists()
     data = json.loads(out.read_text())
     assert data["multi_skill"] is True
-    assert "skills" in data
+    assert data["skill_count"] == 2
+    assert data["max_risk_score"] == 10
+    assert data["summary"]["total_skills"] == 2
+    assert isinstance(data["skills"], list)
+    assert {s["path"] for s in data["skills"]} == {"skill1", "skill2"}
+    assert all("risk_score" in s and "risk_severity" in s for s in data["skills"])

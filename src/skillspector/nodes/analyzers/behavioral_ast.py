@@ -123,6 +123,47 @@ _RULE_CONFIDENCES: dict[str, float] = {
 _TAG = "Dangerous Code Execution"
 
 
+def _is_test_file(file_path: str) -> bool:
+    """Return True when the file path looks like a test file."""
+    from pathlib import Path
+
+    name = Path(file_path).name
+    stem = Path(file_path).stem
+    return name.startswith("test_") or stem.endswith("_test")
+
+
+def _is_subprocess_test_fixture(node: ast.Call, aliases: dict[str, str] | None = None) -> bool:
+    """Return True when this subprocess call matches the safe test-harness pattern.
+
+    Pattern: shell=False explicit, first arg is [sys.executable, ...] or [Path(...), ...].
+    """
+    # Must have shell=False keyword
+    has_shell_false = any(
+        kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is False
+        for kw in node.keywords
+    )
+    if not has_shell_false:
+        return False
+    # Must have at least one positional arg
+    if not node.args:
+        return False
+    first_arg = node.args[0]
+    # First arg must be a non-empty list literal
+    if not isinstance(first_arg, ast.List) or not first_arg.elts:
+        return False
+    first_elt = first_arg.elts[0]
+    # sys.executable
+    if isinstance(first_elt, ast.Attribute):
+        if isinstance(first_elt.value, ast.Name) and first_elt.value.id == "sys":
+            return first_elt.attr == "executable"
+    # str(SCRIPT), Path(...), pathlib.Path(...)
+    if isinstance(first_elt, ast.Call):
+        call_name = resolve_call_name(first_elt, aliases)
+        if call_name and ("Path" in call_name or call_name == "str"):
+            return True
+    return False
+
+
 def _is_chain_sink(node: ast.Call, aliases: dict[str, str] | None = None) -> bool:
     """True if this call is exec(), eval(), or compile() — the outer dangerous call."""
     name = resolve_call_name(node, aliases)
@@ -148,7 +189,9 @@ def _contains_dangerous_source(node: ast.AST, aliases: dict[str, str] | None = N
     return None
 
 
-def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
+def _analyze_python(
+    content: str, file_path: str, include_test_fixtures: bool = False
+) -> list[AnalyzerFinding]:
     try:
         tree = ast.parse(content, filename=file_path)
     except SyntaxError:
@@ -216,7 +259,27 @@ def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                _emit("AST4", lineno, end_lineno)
+                if (
+                    not include_test_fixtures
+                    and _is_test_file(file_path)
+                    and _is_subprocess_test_fixture(ast_node, aliases)
+                ):
+                    findings.append(
+                        AnalyzerFinding(
+                            rule_id="AST4",
+                            message="subprocess module call (likely test fixture — shell=False + sys.executable pattern)",
+                            severity=Severity.LOW,
+                            location=Location(
+                                file=file_path, start_line=lineno, end_line=end_lineno
+                            ),
+                            confidence=0.15,
+                            tags=[_TAG, "likely_test_fixture"],
+                            context=get_context_from_lines(lines, lineno),
+                            matched_text=get_source_segment(lines, lineno, end_lineno),
+                        )
+                    )
+                else:
+                    _emit("AST4", lineno, end_lineno)
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
@@ -237,6 +300,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files via AST and detect dangerous execution patterns."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
+    include_fixtures = bool(state.get("include_test_fixtures", False))
     all_findings: list[Finding] = []
 
     for path in components:
@@ -245,7 +309,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         content = file_cache.get(path)
         if content is None or len(content) > MAX_FILE_BYTES:
             continue
-        raw = _analyze_python(content, path)
+        raw = _analyze_python(content, path, include_test_fixtures=include_fixtures)
         all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(all_findings))

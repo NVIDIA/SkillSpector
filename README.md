@@ -208,15 +208,16 @@ ships its own bundled default model. SkillSpector also works against
 local OpenAI-compatible servers (Ollama, vLLM, llama.cpp) and managed
 inference gateways.
 
-| Provider (`SKILLSPECTOR_PROVIDER`) | Credential env var | Endpoint | Default model |
-| ---------- | ---- | ---- | ---- |
-| `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
-| `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
-| `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
-| `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
-| `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
-| `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | `claude-sonnet-4-6` |
-| `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | `o4-mini` |
+| Provider (`SKILLSPECTOR_PROVIDER`) | Credential env var                                         | Endpoint                                      | Default model                                  |
+| ---------------------------------- | ---------------------------------------------------------- | --------------------------------------------- | ---------------------------------------------- |
+| `openai`                           | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`)            | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4`                                      |
+| `anthropic`                        | `ANTHROPIC_API_KEY`                                        | api.anthropic.com                             | `claude-opus-4-6`                              |
+| `anthropic_proxy`                  | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy            | `claude-sonnet-4-6`                            |
+| `bedrock`                          | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime                           | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
+| `nv_build`                         | `NVIDIA_INFERENCE_KEY`                                     | build.nvidia.com                              | `deepseek-ai/deepseek-v4-flash`                |
+| `subprocess`                       | `SKILLSPECTOR_LLM_COMMAND` (shell command)                 | User-configured CLI (e.g. `claude -p`)        | N/A — depends on command                       |
+| `claude_cli`                       | _(none — uses local CLI auth)_                             | local `claude` binary                         | `claude-sonnet-4-6`                            |
+| `codex_cli`                        | _(none — uses local CLI auth)_                             | local `codex` binary                          | `o4-mini`                                      |
 
 ```bash
 # Stock OpenAI
@@ -272,6 +273,11 @@ skillspector scan ./my-skill/
 
 # Override the provider's default model
 export SKILLSPECTOR_MODEL=gpt-5.2
+skillspector scan ./my-skill/
+
+# Inside Claude Code, OpenClaw, or Antigravity — no API key needed
+export SKILLSPECTOR_PROVIDER=subprocess
+export SKILLSPECTOR_LLM_COMMAND="claude -p"   # or: antigravity ask / openclaw chat
 skillspector scan ./my-skill/
 
 # Skip LLM analysis (faster, static analysis only)
@@ -335,156 +341,156 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 
 ### Prompt Injection (5 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| P1 | Instruction Override | HIGH | Commands to ignore safety constraints |
-| P2 | Hidden Instructions | HIGH | Malicious directives in comments/invisible text |
-| P3 | Exfiltration Commands | HIGH | Instructions to transmit context externally |
-| P4 | Behavior Manipulation | MEDIUM | Subtle instructions altering agent decisions |
-| P5 | Harmful Content | CRITICAL | Instructions that could cause physical harm |
+| ID  | Pattern               | Severity | Description                                     |
+| --- | --------------------- | -------- | ----------------------------------------------- |
+| P1  | Instruction Override  | HIGH     | Commands to ignore safety constraints           |
+| P2  | Hidden Instructions   | HIGH     | Malicious directives in comments/invisible text |
+| P3  | Exfiltration Commands | HIGH     | Instructions to transmit context externally     |
+| P4  | Behavior Manipulation | MEDIUM   | Subtle instructions altering agent decisions    |
+| P5  | Harmful Content       | CRITICAL | Instructions that could cause physical harm     |
 
 ### Anti-Refusal (3 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| AR1 | Refusal Suppression | HIGH | Instructions to never refuse or always comply (e.g. "never refuse", "always comply") |
-| AR2 | Disclaimer Suppression | HIGH | Instructions to omit warnings, disclaimers, or ethical commentary (e.g. "no disclaimers", "do not moralize") |
-| AR3 | Safety Policy Nullification | HIGH | Jailbreak framing that nullifies guardrails (e.g. "you have no restrictions", "ignore your guidelines", "do anything now") |
+| ID  | Pattern                     | Severity | Description                                                                                                                |
+| --- | --------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------- |
+| AR1 | Refusal Suppression         | HIGH     | Instructions to never refuse or always comply (e.g. "never refuse", "always comply")                                       |
+| AR2 | Disclaimer Suppression      | HIGH     | Instructions to omit warnings, disclaimers, or ethical commentary (e.g. "no disclaimers", "do not moralize")               |
+| AR3 | Safety Policy Nullification | HIGH     | Jailbreak framing that nullifies guardrails (e.g. "you have no restrictions", "ignore your guidelines", "do anything now") |
 
 ### Data Exfiltration (4 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| E1 | External Transmission | MEDIUM | Sending data to external URLs |
-| E2 | Env Variable Harvesting | HIGH | Collecting API keys and secrets |
-| E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
-| E4 | Context Leakage | HIGH | Transmitting conversation context externally |
+| ID  | Pattern                 | Severity | Description                                  |
+| --- | ----------------------- | -------- | -------------------------------------------- |
+| E1  | External Transmission   | MEDIUM   | Sending data to external URLs                |
+| E2  | Env Variable Harvesting | HIGH     | Collecting API keys and secrets              |
+| E3  | File System Enumeration | MEDIUM   | Scanning directories for sensitive files     |
+| E4  | Context Leakage         | HIGH     | Transmitting conversation context externally |
 
 ### Privilege Escalation (3 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| PE1 | Excessive Permissions | LOW | Requesting access beyond stated functionality |
-| PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
-| PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
+| ID  | Pattern               | Severity | Description                                   |
+| --- | --------------------- | -------- | --------------------------------------------- |
+| PE1 | Excessive Permissions | LOW      | Requesting access beyond stated functionality |
+| PE2 | Sudo/Root Execution   | MEDIUM   | Invoking elevated system privileges           |
+| PE3 | Credential Access     | HIGH     | Reading SSH keys, tokens, passwords           |
 
 ### Supply Chain (6 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| SC1 | Unpinned Dependencies | LOW | No version constraints on packages |
-| SC2 | External Script Fetching | HIGH | curl \| bash and remote code execution |
-| SC3 | Obfuscated Code | HIGH | Base64/hex encoded execution |
-| SC4 | Known Vulnerable Dependencies | HIGH | Dependencies with known CVEs (live OSV.dev lookup) |
-| SC5 | Abandoned Dependencies | MEDIUM | Unmaintained packages without security updates |
-| SC6 | Typosquatting | HIGH | Package names similar to popular packages |
+| ID  | Pattern                       | Severity | Description                                        |
+| --- | ----------------------------- | -------- | -------------------------------------------------- |
+| SC1 | Unpinned Dependencies         | LOW      | No version constraints on packages                 |
+| SC2 | External Script Fetching      | HIGH     | curl \| bash and remote code execution             |
+| SC3 | Obfuscated Code               | HIGH     | Base64/hex encoded execution                       |
+| SC4 | Known Vulnerable Dependencies | HIGH     | Dependencies with known CVEs (live OSV.dev lookup) |
+| SC5 | Abandoned Dependencies        | MEDIUM   | Unmaintained packages without security updates     |
+| SC6 | Typosquatting                 | HIGH     | Package names similar to popular packages          |
 
 ### Excessive Agency (4 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| EA1 | Unrestricted Tool Access | HIGH | Unfettered tool access without constraints |
-| EA2 | Autonomous Decision Making | HIGH | High-impact decisions without human-in-the-loop |
-| EA3 | Scope Creep | MEDIUM | Capabilities extending beyond stated purpose |
-| EA4 | Unbounded Resource Access | MEDIUM | No rate limits or quotas on resource consumption |
+| ID  | Pattern                    | Severity | Description                                      |
+| --- | -------------------------- | -------- | ------------------------------------------------ |
+| EA1 | Unrestricted Tool Access   | HIGH     | Unfettered tool access without constraints       |
+| EA2 | Autonomous Decision Making | HIGH     | High-impact decisions without human-in-the-loop  |
+| EA3 | Scope Creep                | MEDIUM   | Capabilities extending beyond stated purpose     |
+| EA4 | Unbounded Resource Access  | MEDIUM   | No rate limits or quotas on resource consumption |
 
 ### Output Handling (3 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| OH1 | Unvalidated Output Injection | HIGH | Model output used without sanitization |
-| OH2 | Cross-Context Output | MEDIUM | Output flows across trust boundaries without validation |
-| OH3 | Unbounded Output | MEDIUM | No limits on output size or generation rate |
+| ID  | Pattern                      | Severity | Description                                             |
+| --- | ---------------------------- | -------- | ------------------------------------------------------- |
+| OH1 | Unvalidated Output Injection | HIGH     | Model output used without sanitization                  |
+| OH2 | Cross-Context Output         | MEDIUM   | Output flows across trust boundaries without validation |
+| OH3 | Unbounded Output             | MEDIUM   | No limits on output size or generation rate             |
 
 ### System Prompt Leakage (3 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| P6 | Direct Leakage | HIGH | Instructions that expose system prompts or internal rules |
-| P7 | Indirect Extraction | MEDIUM | Extraction via rephrasing, translation, or side-channels |
-| P8 | Tool-Based Exfiltration | HIGH | System prompts exfiltrated via file writes or network requests |
+| ID  | Pattern                 | Severity | Description                                                    |
+| --- | ----------------------- | -------- | -------------------------------------------------------------- |
+| P6  | Direct Leakage          | HIGH     | Instructions that expose system prompts or internal rules      |
+| P7  | Indirect Extraction     | MEDIUM   | Extraction via rephrasing, translation, or side-channels       |
+| P8  | Tool-Based Exfiltration | HIGH     | System prompts exfiltrated via file writes or network requests |
 
 ### Memory Poisoning (3 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| MP1 | Persistent Context Injection | HIGH | Content designed to persist across interactions |
-| MP2 | Context Window Stuffing | MEDIUM | Filler content displacing safety constraints |
-| MP3 | Memory Manipulation | HIGH | Tampering with agent memory or stored state |
+| ID  | Pattern                      | Severity | Description                                     |
+| --- | ---------------------------- | -------- | ----------------------------------------------- |
+| MP1 | Persistent Context Injection | HIGH     | Content designed to persist across interactions |
+| MP2 | Context Window Stuffing      | MEDIUM   | Filler content displacing safety constraints    |
+| MP3 | Memory Manipulation          | HIGH     | Tampering with agent memory or stored state     |
 
 ### Tool Misuse (3 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| TM1 | Tool Parameter Abuse | HIGH | Crafted parameters for unintended behavior (shell=True, --force) |
-| TM2 | Chaining Abuse | HIGH | Tool chains that bypass individual safety checks |
-| TM3 | Unsafe Defaults | MEDIUM | Overly permissive defaults (disabled TLS, no auth) |
+| ID  | Pattern              | Severity | Description                                                      |
+| --- | -------------------- | -------- | ---------------------------------------------------------------- |
+| TM1 | Tool Parameter Abuse | HIGH     | Crafted parameters for unintended behavior (shell=True, --force) |
+| TM2 | Chaining Abuse       | HIGH     | Tool chains that bypass individual safety checks                 |
+| TM3 | Unsafe Defaults      | MEDIUM   | Overly permissive defaults (disabled TLS, no auth)               |
 
 ### Rogue Agent (2 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| RA1 | Self-Modification | CRITICAL | Modifying own code or configuration at runtime |
-| RA2 | Session Persistence | HIGH | Unauthorized persistence via cron jobs or startup scripts |
+| ID  | Pattern             | Severity | Description                                               |
+| --- | ------------------- | -------- | --------------------------------------------------------- |
+| RA1 | Self-Modification   | CRITICAL | Modifying own code or configuration at runtime            |
+| RA2 | Session Persistence | HIGH     | Unauthorized persistence via cron jobs or startup scripts |
 
 ### Trigger Abuse (3 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| TR1 | Overly Broad Trigger | MEDIUM | Trigger patterns matching common words |
-| TR2 | Shadow Command Trigger | HIGH | Triggers that shadow built-in commands or other skills |
-| TR3 | Keyword Baiting Trigger | MEDIUM | Generic triggers designed to maximize activation |
+| ID  | Pattern                 | Severity | Description                                            |
+| --- | ----------------------- | -------- | ------------------------------------------------------ |
+| TR1 | Overly Broad Trigger    | MEDIUM   | Trigger patterns matching common words                 |
+| TR2 | Shadow Command Trigger  | HIGH     | Triggers that shadow built-in commands or other skills |
+| TR3 | Keyword Baiting Trigger | MEDIUM   | Generic triggers designed to maximize activation       |
 
 ### Behavioral AST (9 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| AST1 | exec() Call | CRITICAL | Direct exec() enabling arbitrary code execution |
-| AST2 | eval() Call | HIGH | Direct eval() evaluating arbitrary expressions |
-| AST3 | Dynamic Import | HIGH | \_\_import\_\_() loading arbitrary modules at runtime |
-| AST4 | subprocess Call | HIGH | External command execution via subprocess |
-| AST5 | os.system / exec-family | HIGH | Shell commands via os module |
-| AST6 | compile() Call | MEDIUM | Code object creation from strings |
-| AST7 | Dynamic getattr() | MEDIUM | Arbitrary attribute access with non-literal names |
-| AST8 | Dangerous Execution Chain | CRITICAL | exec/eval combined with dynamic source (network, encoded data) |
-| AST9 | Reflective getattr() Sink | HIGH | Reflective exec via `getattr(os,'system')` / `getattr(builtins,'exec')` that evades AST1/AST5 |
+| ID   | Pattern                   | Severity | Description                                                                                   |
+| ---- | ------------------------- | -------- | --------------------------------------------------------------------------------------------- |
+| AST1 | exec() Call               | CRITICAL | Direct exec() enabling arbitrary code execution                                               |
+| AST2 | eval() Call               | HIGH     | Direct eval() evaluating arbitrary expressions                                                |
+| AST3 | Dynamic Import            | HIGH     | \_\_import\_\_() loading arbitrary modules at runtime                                         |
+| AST4 | subprocess Call           | HIGH     | External command execution via subprocess                                                     |
+| AST5 | os.system / exec-family   | HIGH     | Shell commands via os module                                                                  |
+| AST6 | compile() Call            | MEDIUM   | Code object creation from strings                                                             |
+| AST7 | Dynamic getattr()         | MEDIUM   | Arbitrary attribute access with non-literal names                                             |
+| AST8 | Dangerous Execution Chain | CRITICAL | exec/eval combined with dynamic source (network, encoded data)                                |
+| AST9 | Reflective getattr() Sink | HIGH     | Reflective exec via `getattr(os,'system')` / `getattr(builtins,'exec')` that evades AST1/AST5 |
 
 ### Taint Tracking (5 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| TT1 | Direct Taint Flow | HIGH | Data flows directly from a source to a sink without sanitization |
-| TT2 | Variable-Mediated Taint Flow | MEDIUM | Data flows from source to sink through intermediate variables |
-| TT3 | Credential Exfiltration Chain | CRITICAL | Credentials (env vars, secrets) flow to network output sinks |
-| TT4 | File Read to Network Exfiltration | HIGH | File contents flow to network output sinks |
-| TT5 | External Input to Code Execution | CRITICAL | Network or user input flows to exec/eval/subprocess sinks |
+| ID  | Pattern                           | Severity | Description                                                      |
+| --- | --------------------------------- | -------- | ---------------------------------------------------------------- |
+| TT1 | Direct Taint Flow                 | HIGH     | Data flows directly from a source to a sink without sanitization |
+| TT2 | Variable-Mediated Taint Flow      | MEDIUM   | Data flows from source to sink through intermediate variables    |
+| TT3 | Credential Exfiltration Chain     | CRITICAL | Credentials (env vars, secrets) flow to network output sinks     |
+| TT4 | File Read to Network Exfiltration | HIGH     | File contents flow to network output sinks                       |
+| TT5 | External Input to Code Execution  | CRITICAL | Network or user input flows to exec/eval/subprocess sinks        |
 
 ### YARA Signatures (4 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| YR1 | Malware Match | CRITICAL | YARA rule match for known malware signatures |
-| YR2 | Webshell Match | CRITICAL | YARA rule match for webshell patterns |
-| YR3 | Cryptominer Match | HIGH | YARA rule match for crypto mining indicators |
-| YR4 | Hack Tool / Exploit Match | HIGH | YARA rule match for hack tools or exploit code |
+| ID  | Pattern                   | Severity | Description                                    |
+| --- | ------------------------- | -------- | ---------------------------------------------- |
+| YR1 | Malware Match             | CRITICAL | YARA rule match for known malware signatures   |
+| YR2 | Webshell Match            | CRITICAL | YARA rule match for webshell patterns          |
+| YR3 | Cryptominer Match         | HIGH     | YARA rule match for crypto mining indicators   |
+| YR4 | Hack Tool / Exploit Match | HIGH     | YARA rule match for hack tools or exploit code |
 
 ### MCP Least Privilege (4 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| LP1 | Underdeclared Capability | HIGH | Code uses capabilities not listed in declared permissions |
-| LP2 | Wildcard Permission | MEDIUM | Permission list contains wildcards (\*, all, full, any) |
-| LP3 | Missing Permission Declaration | MEDIUM | No permissions field but code has detectable capabilities |
-| LP4 | Overdeclared Permission | LOW | Permission declared but no corresponding code capability found |
+| ID  | Pattern                        | Severity | Description                                                    |
+| --- | ------------------------------ | -------- | -------------------------------------------------------------- |
+| LP1 | Underdeclared Capability       | HIGH     | Code uses capabilities not listed in declared permissions      |
+| LP2 | Wildcard Permission            | MEDIUM   | Permission list contains wildcards (\*, all, full, any)        |
+| LP3 | Missing Permission Declaration | MEDIUM   | No permissions field but code has detectable capabilities      |
+| LP4 | Overdeclared Permission        | LOW      | Permission declared but no corresponding code capability found |
 
 ### MCP Tool Poisoning (4 patterns)
 
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| TP1 | Hidden Instructions | HIGH | Hidden directives in metadata (HTML comments, zero-width chars, base64, data URIs) |
-| TP2 | Unicode Deception | HIGH | Homoglyphs, RTL overrides, mixed-script identifiers in tool metadata |
-| TP3 | Parameter Description Injection | MEDIUM | Injection patterns in parameter definitions (overrides, system tokens, malicious defaults) |
-| TP4 | Description-Behavior Mismatch | MEDIUM | Declared tool description does not match actual code behavior (LLM-powered) |
+| ID  | Pattern                         | Severity | Description                                                                                |
+| --- | ------------------------------- | -------- | ------------------------------------------------------------------------------------------ |
+| TP1 | Hidden Instructions             | HIGH     | Hidden directives in metadata (HTML comments, zero-width chars, base64, data URIs)         |
+| TP2 | Unicode Deception               | HIGH     | Homoglyphs, RTL overrides, mixed-script identifiers in tool metadata                       |
+| TP3 | Parameter Description Injection | MEDIUM   | Injection patterns in parameter definitions (overrides, system tokens, malicious defaults) |
+| TP4 | Description-Behavior Mismatch   | MEDIUM   | Declared tool description does not match actual code behavior (LLM-powered)                |
 
 All detected patterns are listed in the tables above.
 
@@ -500,11 +506,11 @@ All detected patterns are listed in the tables above.
 
 ### Severity Levels
 
-| Score | Severity | Recommendation |
-|-------|----------|----------------|
-| 0-20 | LOW | SAFE |
-| 21-50 | MEDIUM | CAUTION |
-| 51-80 | HIGH | DO NOT INSTALL |
+| Score  | Severity | Recommendation |
+| ------ | -------- | -------------- |
+| 0-20   | LOW      | SAFE           |
+| 21-50  | MEDIUM   | CAUTION        |
+| 51-80  | HIGH     | DO NOT INSTALL |
 | 81-100 | CRITICAL | DO NOT INSTALL |
 
 ## Example Output
@@ -551,21 +557,22 @@ Issues (2)
 
 ### Environment Variables
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
-| `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
-| `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
-| `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
-| `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
-| `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
-| `ANTHROPIC_PROXY_API_KEY` | Bearer token for the Anthropic proxy provider. | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
-| `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
-| `AWS_PROFILE` | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
-| `AWS_REGION` | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
-| `SKILLSPECTOR_MODEL` | Override the active provider's default model. See the LLM Analysis table for each provider's default. | Optional |
-| `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
-| `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
+| Variable                       | Description                                                                                                                                                                                                                              | Required                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `SKILLSPECTOR_PROVIDER`        | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `subprocess`, `claude_cli`, `codex_cli`, or `gemini_cli`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional                                                         |
+| `SKILLSPECTOR_LLM_COMMAND`     | Shell command for `SKILLSPECTOR_PROVIDER=subprocess`. The prompt is written to stdin; the response is read from stdout. No API key required — use the AI session directly (e.g. `claude -p`, `antigravity ask`, `openclaw chat`).        | Required when `SKILLSPECTOR_PROVIDER=subprocess`                 |
+| `NVIDIA_INFERENCE_KEY`         | Credential for the `nv_build` provider (build.nvidia.com).                                                                                                                                                                               | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build`  |
+| `OPENAI_API_KEY`               | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials.                                                     | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai`    |
+| `OPENAI_BASE_URL`              | Override the OpenAI endpoint (e.g. point at Ollama).                                                                                                                                                                                     | Optional                                                         |
+| `ANTHROPIC_API_KEY`            | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`).                                                                                                                                                               | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
+| `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict).                                                                                                                                                           | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy`            |
+| `ANTHROPIC_PROXY_API_KEY`      | Bearer token for the Anthropic proxy provider.                                                                                                                                                                                           | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy`            |
+| `ANTHROPIC_PROXY_API_VERSION`  | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`).                                                                                                                                                      | Optional                                                         |
+| `AWS_PROFILE`                  | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves.                                                  | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`)             |
+| `AWS_REGION`                   | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`.                                                                                                                                                                   | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`)             |
+| `SKILLSPECTOR_MODEL`           | Override the active provider's default model. See the LLM Analysis table for each provider's default.                                                                                                                                   | Optional                                                         |
+| `SKILLSPECTOR_MODEL_REGISTRY`  | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path.                                                                                                       | Optional                                                         |
+| `SKILLSPECTOR_LOG_LEVEL`       | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`).                                                                                                                                                                    | Optional                                                         |
 
 > **CLI providers** (`claude_cli`, `codex_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session (`claude auth login` / `codex login`). SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run in a hardened sandbox: tools disabled, no MCP, read-only sandbox mode (codex), and untrusted skill content is delivered only via stdin.
 
@@ -596,11 +603,11 @@ SkillSpector is built to be driven by other tools (CI pipelines, install gates, 
 
 `skillspector scan` exits with:
 
-| Code | Meaning |
-|------|---------|
-| `0` | Scan completed, `risk_score` ≤ 50 (recommendation `SAFE` or `CAUTION`) |
-| `1` | Scan completed, `risk_score` > 50 (recommendation `DO_NOT_INSTALL`) |
-| `2` | Error (bad input, unreadable source, internal failure) |
+| Code | Meaning                                                                |
+| ---- | ---------------------------------------------------------------------- |
+| `0`  | Scan completed, `risk_score` ≤ 50 (recommendation `SAFE` or `CAUTION`) |
+| `1`  | Scan completed, `risk_score` > 50 (recommendation `DO_NOT_INSTALL`)    |
+| `2`  | Error (bad input, unreadable source, internal failure)                 |
 
 > The exit code collapses `SAFE` and `CAUTION` into `0`. To act differently on them (e.g. *warn* on `CAUTION` but *block* on `DO_NOT_INSTALL`), read the `recommendation` field from the JSON output rather than relying on the exit code.
 
@@ -635,11 +642,11 @@ For CI/IDE tooling, `--format sarif` emits SARIF 2.1.0.
 
 When using SkillSpector as an install gate, map the recommendation to an action:
 
-| `recommendation` | Suggested action |
-|------------------|------------------|
-| `SAFE` | allow |
-| `CAUTION` | prompt / warn the user |
-| `DO_NOT_INSTALL` | block |
+| `recommendation` | Suggested action       |
+| ---------------- | ---------------------- |
+| `SAFE`           | allow                  |
+| `CAUTION`        | prompt / warn the user |
+| `DO_NOT_INSTALL` | block                  |
 
 SkillSpector computes the score band and recommendation; how strict the gate is (e.g. whether `CAUTION` blocks in CI) is a policy decision for the integrating tool.
 
@@ -675,6 +682,7 @@ make format
 SkillSpector uses a two-stage detection pipeline:
 
 ### Stage 1: Static Analysis
+
 - Fast regex-based pattern matching across 11 static analyzers
 - AST-based behavioral analysis detecting dangerous calls (exec, eval, subprocess, etc.)
 - Live vulnerability lookups via OSV.dev for known CVEs in dependencies
@@ -683,6 +691,7 @@ SkillSpector uses a two-stage detection pipeline:
 - Moderate precision (some false positives)
 
 ### Stage 2: LLM Semantic Analysis (Optional)
+
 - Evaluates context and intent
 - Filters false positives
 - Provides human-readable explanations

@@ -34,8 +34,8 @@ make install-dev
 
 - **Python**: 3.12+ (see [pyproject.toml](../pyproject.toml)). `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`). You must create and activate the virtual environment yourself before running any make target.
 - **Environment**: Optional `.env` in the project root. The LangGraph dev server loads it (see [langgraph.json](../langgraph.json) `"env": ".env"`). Key variables:
-  - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, or `nv_build`. Defaults to `nv_build` when unset.
-  - **Provider credential**: depends on the active provider — `NVIDIA_INFERENCE_KEY` (NVIDIA), `OPENAI_API_KEY` (OpenAI), or `ANTHROPIC_API_KEY` (Anthropic). See [llm_utils.py](../src/skillspector/llm_utils.py).
+  - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `nv_build`, or `subprocess`. Defaults to `nv_build` when unset.
+  - **Provider credential**: depends on the active provider — `NVIDIA_INFERENCE_KEY` (NVIDIA), `OPENAI_API_KEY` (OpenAI), `ANTHROPIC_API_KEY` (Anthropic), or `SKILLSPECTOR_LLM_COMMAND` (subprocess — no API key required; routes prompts through a shell command). See [llm_utils.py](../src/skillspector/llm_utils.py).
   - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
   - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py).
 
@@ -265,11 +265,12 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai` \| `anthropic` \| `nv_build` \| `claude_cli` \| `codex_cli`. Defaults to `nv_build`. | `claude_cli` |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai` \| `anthropic` \| `anthropic_proxy` \| `nv_build` \| `subprocess` \| `claude_cli` \| `codex_cli`. Defaults to `nv_build`. | `openai` |
 | `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
+| `SKILLSPECTOR_LLM_COMMAND` | Shell command for `SKILLSPECTOR_PROVIDER=subprocess`. Prompt is piped via stdin; response read from stdout. No API key needed — the current AI session handles the call. | `claude -p` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). For `claude_cli`, this is passed as `--model` to the `claude` binary. | `gpt-5.2` |
 
 > **CLI providers** (`claude_cli`, `codex_cli`): no credential env var is needed. Authentication is managed by the agent CLI's own session (`claude auth login` / `codex login`). The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).

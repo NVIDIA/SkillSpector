@@ -90,6 +90,28 @@ class SkillspectorState(TypedDict, total=False):
     # Additional YARA rules directory (user-specified via --yara-rules-dir)
     yara_rules_dir: str | None
 
+    # When True, test-fixture heuristics do not downgrade AST4/PE3 confidence
+    include_test_fixtures: bool
+
+    # Classification of the skill (general | security_research | offensive_security).
+    # This value is read from the scanned skill's own manifest, i.e. it is
+    # attacker-controlled content. It must not be trusted to influence the risk
+    # verdict unless the caller explicitly opts in via trust_skill_classification.
+    skill_classification: str | None
+
+    # Opt-in: when True, report.py honors a self-declared
+    # skill_classification == "offensive_security" to override the risk
+    # recommendation. Defaults to False (untrusted) so a malicious skill cannot
+    # suppress a DO_NOT_INSTALL verdict by simply labeling itself in its own
+    # manifest. Set via --trust-skill-classification.
+    trust_skill_classification: bool
+
+    # When True, meta_analyzer skips LLM calls and returns all findings (fast / cheap mode)
+    skip_meta: bool
+
+    # Directory for LLM response cache (set by build_context from skill_path)
+    llm_cache_dir: str | None
+
 
 class LLMCallRecord(TypedDict):
     """One LLM-stage telemetry record (an entry in ``llm_call_log``)."""

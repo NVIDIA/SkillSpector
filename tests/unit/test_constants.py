@@ -146,3 +146,41 @@ class TestModelValidation:
         monkeypatch.setenv("SKILLSPECTOR_STRICT_MODEL_VALIDATION", "True")
         with pytest.raises(ValueError, match="Strict model validation enabled"):
             _reload_constants()
+
+
+class TestMetaBatchSize:
+    """SKILLSPECTOR_META_BATCH_SIZE must never crash import; bad values degrade gracefully."""
+
+    def test_unset_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_META_BATCH_SIZE", raising=False)
+        mod = _reload_constants()
+        assert mod.META_BATCH_SIZE == 20
+
+    def test_empty_string_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "")
+        mod = _reload_constants()
+        assert mod.META_BATCH_SIZE == 20
+
+    def test_non_numeric_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "not-a-number")
+        with caplog.at_level(logging.WARNING, logger="skillspector.constants"):
+            mod = _reload_constants()
+        assert mod.META_BATCH_SIZE == 20
+        assert any("Invalid SKILLSPECTOR_META_BATCH_SIZE" in r.message for r in caplog.records)
+
+    def test_zero_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "0")
+        mod = _reload_constants()
+        assert mod.META_BATCH_SIZE == 1
+
+    def test_negative_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "-5")
+        mod = _reload_constants()
+        assert mod.META_BATCH_SIZE == 1
+
+    def test_valid_value_is_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_META_BATCH_SIZE", "7")
+        mod = _reload_constants()
+        assert mod.META_BATCH_SIZE == 7
