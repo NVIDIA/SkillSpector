@@ -29,6 +29,7 @@ import yaml
 from skillspector.constants import build_model_config
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
+from skillspector.structured_skill import extract_structured_skill_context
 
 logger = get_logger(__name__)
 
@@ -239,8 +240,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     file_cache = _read_file_cache(skill_dir, components)
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)
+    structured_skill_context = extract_structured_skill_context(skill_dir)
 
-    return {
+    result = {
         "components": components,
         "file_cache": file_cache,
         "ast_cache": {},
@@ -250,3 +252,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
     }
+
+    if structured_skill_context is not None:
+        result["structured_skill_context"] = structured_skill_context
+
+    return result
