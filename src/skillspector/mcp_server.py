@@ -34,7 +34,7 @@ from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger
-from skillspector.providers import resolve_provider_credentials
+from skillspector.providers import resolve_chat_model_credentials
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -72,7 +72,13 @@ async def run_scan(
     if output_format not in VALID_FORMATS:
         raise ValueError(f"output_format must be one of {VALID_FORMATS}, got {output_format!r}")
 
-    llm_available = resolve_provider_credentials() is not None
+    # Use the chat-model credential resolver, not the active-provider-only one,
+    # so availability matches what ``create_chat_model`` actually does: it falls
+    # back to a standard OpenAI client (OPENAI_API_KEY / OPENAI_BASE_URL) when the
+    # active provider is unconfigured. Gating on the active provider alone made the
+    # server report llm_available=false and skip the LLM pass for an OpenAI-only
+    # setup the CLI would have run (see issue #200).
+    llm_available = resolve_chat_model_credentials() is not None
     llm_used = use_llm and llm_available
 
     state: dict[str, Any] = {

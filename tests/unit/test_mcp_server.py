@@ -36,7 +36,7 @@ async def test_run_scan_returns_structured_verdict(
 ) -> None:
     """run_scan returns a JSON-serialisable verdict with the expected shape."""
     # No credentials: the LLM pass cannot run regardless of what is requested.
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: None)
+    monkeypatch.setattr(mcp_server, "resolve_chat_model_credentials", lambda: None)
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
@@ -54,7 +54,7 @@ async def test_run_scan_llm_accounting_is_honest_without_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Requesting the LLM with no credentials must report it as not used."""
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: None)
+    monkeypatch.setattr(mcp_server, "resolve_chat_model_credentials", lambda: None)
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
@@ -69,7 +69,7 @@ async def test_run_scan_reports_llm_available_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Credentials present but use_llm=False: available, but honestly not used."""
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: ("key", None))
+    monkeypatch.setattr(mcp_server, "resolve_chat_model_credentials", lambda: ("key", None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
@@ -78,6 +78,29 @@ async def test_run_scan_reports_llm_available_with_credentials(
     assert result["llm_requested"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
+
+
+async def test_run_scan_reports_llm_available_via_openai_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for #200: availability follows the chat-model resolver.
+
+    When the active provider is unconfigured but the standard OpenAI fallback
+    (OPENAI_API_KEY / OPENAI_BASE_URL) is set, ``create_chat_model`` would run the
+    LLM, so ``resolve_chat_model_credentials`` resolves credentials even though
+    ``resolve_provider_credentials`` (active provider only) returns ``None``. The
+    server must report the LLM as available and must not gate it out. Patching the
+    active-provider-only resolver to ``None`` proves the gate no longer consults it.
+    """
+    monkeypatch.setattr(mcp_server, "resolve_chat_model_credentials", lambda: ("openai-key", None))
+    if hasattr(mcp_server, "resolve_provider_credentials"):
+        monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: None)
+    _write_skill(tmp_path)
+
+    result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert result["llm_available"] is True
+    assert result["scan_mode"] == "static-only"  # use_llm=False, so still not used
 
 
 async def test_run_scan_rejects_invalid_format(tmp_path: Path) -> None:
