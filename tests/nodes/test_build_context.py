@@ -20,6 +20,7 @@ Uses skill spec layout: SKILL.md, references/, scripts/, assets/
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,17 @@ import pytest
 from skillspector.constants import MODEL_CONFIG
 from skillspector.nodes.build_context import build_context
 from skillspector.state import SkillspectorState
+
+_OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
+# Pinned from NVIDIA/skills at commit 1f01acfe1aece58ba95d124eafdfb5bb93523db6:
+# skills/mcore-split-pr/skill.oms.sig
+
+
+def _write_real_oms_signature(root: Path, relative_path: str = "skill.oms.sig") -> Path:
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_OMS_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
 
 
 def _make_skill_spec_dir(root: Path, *, skill_md_name: str = "SKILL.md") -> None:
@@ -129,6 +141,75 @@ def test_build_context_empty_directory_is_valid_empty_scan(tmp_path: Path) -> No
     assert result["file_cache"] == {}
     assert result["manifest"] == {}
     assert result["model_config"] == MODEL_CONFIG
+
+
+def test_build_context_inventories_but_excludes_valid_root_oms_signature(
+    tmp_path: Path,
+) -> None:
+    """A real OMS signature is reported as metadata but withheld from analyzers."""
+    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
+    signature_path = _write_real_oms_signature(tmp_path)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "skill.oms.sig" in result["components"]
+    assert "skill.oms.sig" not in result["file_cache"]
+    assert result["analysis_excluded_components"] == ["skill.oms.sig"]
+    signature_meta = next(
+        item for item in result["component_metadata"] if item["path"] == "skill.oms.sig"
+    )
+    assert signature_meta == {
+        "path": "skill.oms.sig",
+        "type": "oms_signature",
+        "lines": 1,
+        "executable": False,
+        "size_bytes": signature_path.stat().st_size,
+    }
+
+
+@pytest.mark.parametrize(
+    "invalid_case", ["malformed_json", "wrong_media_type", "message_signature"]
+)
+def test_build_context_scans_unrecognized_root_oms_signature(
+    tmp_path: Path,
+    invalid_case: str,
+) -> None:
+    """Malformed and non-OMS Sigstore files retain normal scanner behavior."""
+    content = _OMS_FIXTURE.read_text(encoding="utf-8")
+    if invalid_case == "malformed_json":
+        content = "{not-json"
+    else:
+        bundle = json.loads(content)
+        if invalid_case == "wrong_media_type":
+            bundle["mediaType"] = "application/vnd.dev.sigstore.bundle.v0.2+json"
+        else:
+            bundle["messageSignature"] = {"signature": "YWJj"}
+            del bundle["dsseEnvelope"]
+        content = json.dumps(bundle)
+    (tmp_path / "skill.oms.sig").write_text(content, encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["file_cache"]["skill.oms.sig"] == content
+    assert result["analysis_excluded_components"] == []
+    signature_meta = next(
+        item for item in result["component_metadata"] if item["path"] == "skill.oms.sig"
+    )
+    assert signature_meta["type"] == "other"
+
+
+def test_build_context_scans_nested_oms_signature(tmp_path: Path) -> None:
+    """Only the signature at the skill root is eligible for recognition."""
+    nested = _write_real_oms_signature(tmp_path, "nested/skill.oms.sig")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_text(encoding="utf-8")
+    assert result["analysis_excluded_components"] == []
+    signature_meta = next(
+        item for item in result["component_metadata"] if item["path"] == "nested/skill.oms.sig"
+    )
+    assert signature_meta["type"] == "other"
 
 
 def test_build_context_skips_skip_dirs(tmp_path: Path) -> None:

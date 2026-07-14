@@ -75,7 +75,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         return {"findings": []}
 
     file_cache: dict[str, str] = state.get("file_cache") or {}
-    components: list[str] = state.get("components") or sorted(file_cache.keys())
+    requested_components: list[str] = state.get("components") or sorted(file_cache.keys())
+    # Components intentionally excluded from file_cache (for example a
+    # recognized OMS signature) must not become placeholder LLM batches.
+    components = [path for path in requested_components if path in file_cache]
     if not components:
         return {"findings": []}
 
