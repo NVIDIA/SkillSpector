@@ -507,6 +507,37 @@ class TestReportNode:
         assert "runs" in data
         assert data.get("$schema") or "runs" in data
 
+    def test_report_output_format_sarif_includes_finding_properties(self) -> None:
+        finding = _finding("E2", "HIGH", "env harvest", confidence=0.85, file="tool.py")
+        finding.category = "environment"
+        finding.pattern = r"os\.environ"
+        finding.finding = "TOKEN lookup"
+        finding.explanation = "Environment-derived secret access"
+        finding.remediation = "Drop env var usage"
+        finding.code_snippet = "os.environ['TOKEN']"
+        finding.intent = "secret_exfiltration"
+        finding.tags = ["env", "secret"]
+        state: SkillspectorState = {
+            "filtered_findings": [finding],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "sarif",
+        }
+        result = report(state)
+        result_row = result["sarif_report"]["runs"][0]["results"][0]
+        assert result_row["properties"]["severity"] == "HIGH"
+        assert result_row["properties"]["category"] == "environment"
+        assert result_row["properties"]["pattern"] == r"os\.environ"
+        assert result_row["properties"]["confidence"] == 0.85
+        assert result_row["properties"]["finding"] == "TOKEN lookup"
+        assert result_row["properties"]["explanation"] == "Environment-derived secret access"
+        assert result_row["properties"]["remediation"] == "Drop env var usage"
+        assert result_row["properties"]["code_snippet"] == "os.environ['TOKEN']"
+        assert result_row["properties"]["intent"] == "secret_exfiltration"
+        assert result_row["properties"]["tags"] == ["env", "secret"]
+
     def test_report_default_output_format_is_sarif(self) -> None:
         """When output_format is missing, report uses sarif."""
         state: SkillspectorState = {
@@ -553,8 +584,17 @@ class TestReportNode:
 def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     """A baseline-suppressed CRITICAL finding does not count toward the risk score."""
     baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="false positive")])
+    suppressed_finding = _finding("P5", "CRITICAL", confidence=1.0)
+    suppressed_finding.category = "critical_path"
+    suppressed_finding.pattern = r"exec\("
+    suppressed_finding.finding = "exec call"
+    suppressed_finding.explanation = "Dynamic execution remains reachable"
+    suppressed_finding.remediation = "Drop suspicious logic"
+    suppressed_finding.code_snippet = "exec(payload)"
+    suppressed_finding.intent = "command_execution"
+    suppressed_finding.tags = ["critical", "injection"]
     state: SkillspectorState = {
-        "filtered_findings": [_finding("P5", "CRITICAL")],
+        "filtered_findings": [suppressed_finding],
         "component_metadata": [],
         "has_executable_scripts": False,
         "manifest": {},
@@ -570,7 +610,19 @@ def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     # (audit trail) so consumers exclude them from counts.
     sarif_results = result["sarif_report"]["runs"][0]["results"]
     assert len(sarif_results) == 1
-    assert sarif_results[0]["suppressions"][0]["kind"] == "external"
+    suppressed_result = sarif_results[0]
+    assert suppressed_result["suppressions"][0]["kind"] == "external"
+    assert suppressed_result["suppressions"][0]["justification"] == "false positive"
+    assert suppressed_result["properties"]["severity"] == "CRITICAL"
+    assert suppressed_result["properties"]["category"] == "critical_path"
+    assert suppressed_result["properties"]["pattern"] == r"exec\("
+    assert suppressed_result["properties"]["confidence"] == 1.0
+    assert suppressed_result["properties"]["finding"] == "exec call"
+    assert suppressed_result["properties"]["explanation"] == "Dynamic execution remains reachable"
+    assert suppressed_result["properties"]["remediation"] == "Drop suspicious logic"
+    assert suppressed_result["properties"]["code_snippet"] == "exec(payload)"
+    assert suppressed_result["properties"]["intent"] == "command_execution"
+    assert suppressed_result["properties"]["tags"] == ["critical", "injection"]
     assert len(result["suppressed_findings"]) == 1
 
 
@@ -914,3 +966,24 @@ def test_report_doc_findings_no_multiplier() -> None:
     # Without the multiplier: 2 HIGH = 50, not 65
     assert result["risk_score"] == 50
     assert result["risk_severity"] == "MEDIUM"
+
+
+def test_report_sarif_preserves_high_vs_critical_severity() -> None:
+    """HIGH and CRITICAL both map to SARIF error, but properties keep the exact severity."""
+    state: SkillspectorState = {
+        "filtered_findings": [
+            _finding("R1", "HIGH", message="high finding", file="high.py"),
+            _finding("R2", "CRITICAL", message="critical finding", file="critical.py"),
+        ],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "sarif",
+    }
+    results = report(state)["sarif_report"]["runs"][0]["results"]
+    by_rule = {item["ruleId"]: item for item in results}
+    assert by_rule["R1"]["level"] == "error"
+    assert by_rule["R2"]["level"] == "error"
+    assert by_rule["R1"]["properties"]["severity"] == "HIGH"
+    assert by_rule["R2"]["properties"]["severity"] == "CRITICAL"

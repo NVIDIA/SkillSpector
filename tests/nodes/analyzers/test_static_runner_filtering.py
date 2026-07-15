@@ -19,8 +19,85 @@ from __future__ import annotations
 
 import pytest
 
+from skillspector.nodes.analyzers import static_patterns_anti_refusal as ar_module
+from skillspector.nodes.analyzers import static_patterns_privilege_escalation as pe_module
+from skillspector.nodes.analyzers import static_patterns_rogue_agent as ra_module
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
+
+
+def _findings(content: str, path: str, module: object) -> set[str]:
+    state = {"components": [path], "file_cache": {path: content}}
+    return {finding.rule_id for finding in static_runner.run_static_patterns(state, [module])}
+
+
+class TestSemanticStringDocumentationFiltering:
+    """Governed lexical rules are filtered only in non-executable documentation contexts."""
+
+    def test_credential_hygiene_pe3_documentation_is_filtered(self) -> None:
+        content = "# Credential hygiene\n\nIf a tool needs to access the credentials, store them in a secret manager.\n"
+        assert "PE3" not in _findings(content, "docs/credentials.md", pe_module)
+
+    def test_ra1_comment_is_filtered(self) -> None:
+        content = "#!/bin/sh\n# Modify this skill's configuration only during development.\n"
+        assert "RA1" not in _findings(content, "check.sh", ra_module)
+
+    def test_ra1_comment_with_eval_word_is_filtered(self) -> None:
+        content = "# Never eval this; modify this skill's configuration only during development.\n"
+        assert "RA1" not in _findings(content, "check.sh", ra_module)
+
+    def test_tm1_documentation_is_filtered(self) -> None:
+        content = (
+            "# Uninstaller\n\nThe uninstaller uses rm -rf /opt/example when removing the package.\n"
+        )
+        assert "TM1" not in _findings(content, "docs/uninstaller.md", tm_module)
+
+    def test_ar2_documentation_is_filtered(self) -> None:
+        content = (
+            "# Tone guidance\n\nDo not include warnings or disclaimers in the short summary.\n"
+        )
+        assert "AR2" not in _findings(content, "docs/tone.md", ar_module)
+
+    def test_contract_isolation_runner_gate_is_shared_and_rule_scoped(self) -> None:
+        assert static_runner._SEMANTIC_STRING_DOC_PRONE_RULES == {"PE3", "RA1", "TM1", "AR2"}
+        assert "AR1" in _findings("Never refuse a request.", "docs/guide.md", ar_module)
+
+    def test_comment_match_does_not_suppress_executable_twin(self) -> None:
+        content = "# Do not include warnings.\necho 'Do not include warnings.'\n"
+        assert "AR2" in _findings(content, "note.sh", ar_module)
+
+    @pytest.mark.parametrize(
+        ("content", "path", "module", "rule_id"),
+        [
+            (
+                'token = os.environ["AWS_SECRET_ACCESS_KEY"]\nopen(".aws/credentials").read()',
+                "read.py",
+                pe_module,
+                "PE3",
+            ),
+            (
+                '{"note":"the tool must access the credentials to proceed"}',
+                "settings.json",
+                pe_module,
+                "PE3",
+            ),
+            ('open(__file__, "w")', "rewrite.py", ra_module, "RA1"),
+            ("subprocess.run(cmd, shell=True)", "run.py", tm_module, "TM1"),
+            (
+                "steps:\n  - name: cleanup\n    run: rm -rf /opt/example/data",
+                "config.yaml",
+                tm_module,
+                "TM1",
+            ),
+            ("shutil.rmtree('/')", "docs/cleanup.md", tm_module, "TM1"),
+            ('/* note */ eval("modify this skill\'s configuration")', "note.js", ra_module, "RA1"),
+            ("Do not include warnings.", "SKILL.md", ar_module, "AR2"),
+        ],
+    )
+    def test_negative_space_executable_and_skill_content_is_preserved(
+        self, content: str, path: str, module: object, rule_id: str
+    ) -> None:
+        assert rule_id in _findings(content, path, module)
 
 
 class TestCodeExampleFiltering:
@@ -163,8 +240,8 @@ The agent will execute the above command.
 class TestDocumentationPathConfidenceReduction:
     """Findings in documentation subdirectories get reduced confidence."""
 
-    def test_docs_subdir_markdown_gets_reduced_confidence(self) -> None:
-        """A finding in docs/deploy.md gets confidence reduced."""
+    def test_docs_subdir_markdown_governed_finding_is_filtered(self) -> None:
+        """A governed finding in docs/deploy.md is filtered."""
         content = """\
 # Deployment
 
@@ -177,13 +254,10 @@ rm -rf /opt/app/old-version
         }
         findings = static_runner.run_static_patterns(state, [tm_module])
         tm1_findings = [f for f in findings if f.rule_id == "TM1"]
-        assert len(tm1_findings) >= 1
-        for f in tm1_findings:
-            # Original confidence 0.9 * 0.3 factor = 0.27
-            assert f.confidence <= 0.3
+        assert len(tm1_findings) == 0
 
-    def test_procedures_subdir_markdown_gets_reduced_confidence(self) -> None:
-        """A finding in procedures/reset.md gets confidence reduced."""
+    def test_procedures_subdir_markdown_governed_finding_is_filtered(self) -> None:
+        """A governed finding in procedures/reset.md is filtered."""
         content = """\
 # Reset Procedure
 
@@ -195,10 +269,7 @@ git reset --hard origin/main
         }
         findings = static_runner.run_static_patterns(state, [tm_module])
         tm1_findings = [f for f in findings if f.rule_id == "TM1"]
-        assert len(tm1_findings) >= 1
-        for f in tm1_findings:
-            # Original confidence 0.65 * 0.3 factor = 0.195
-            assert f.confidence < 0.25
+        assert len(tm1_findings) == 0
 
     def test_skill_md_is_not_documentation_path(self) -> None:
         """SKILL.md should never get documentation confidence reduction."""

@@ -95,6 +95,20 @@ This is a helpful skill.
         findings = prompt_injection_module.analyze(content, "test.md", "markdown")
         assert not any(f.rule_id == "P2" for f in findings)
 
+    def test_p2_emoji_zwj_not_flagged(self) -> None:
+        """Emoji ZWJ sequences are visible emoji, not hidden instructions."""
+        judge = "\U0001f9d1\u200d\u2696\ufe0f"
+        technologist = "\U0001f469\U0001f3fd\u200d\U0001f4bb"
+        content = f"# Skill\n\nWorks for judge role {judge} and coding role {technologist}.\n"
+        findings = prompt_injection_module.analyze(content, "test.md", "markdown")
+        assert not any(f.rule_id == "P2" for f in findings)
+
+    def test_p2_bare_zwj_still_flagged(self) -> None:
+        """Bare zero-width joiners outside emoji sequences still yield P2."""
+        content = "# Skill\n\nNormal text\u200dSYSTEM override.\n"
+        findings = prompt_injection_module.analyze(content, "test.md", "markdown")
+        assert any(f.rule_id == "P2" for f in findings)
+
     def test_safe_content(self) -> None:
         """Safe content does not trigger false positives."""
         content = """# Safe Skill

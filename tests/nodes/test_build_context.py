@@ -26,6 +26,7 @@ import pytest
 
 from skillspector.constants import MODEL_CONFIG
 from skillspector.nodes.build_context import build_context
+from skillspector.providers import reset_provider, use_provider
 from skillspector.state import SkillspectorState
 
 
@@ -129,6 +130,36 @@ def test_build_context_empty_directory_is_valid_empty_scan(tmp_path: Path) -> No
     assert result["file_cache"] == {}
     assert result["manifest"] == {}
     assert result["model_config"] == MODEL_CONFIG
+
+
+def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
+    class _BoundProvider:
+        DEFAULT_MODEL = "bound-default"
+        SLOT_DEFAULTS = {"meta_analyzer": "bound-meta"}
+
+        def get_context_length(self, model: str) -> int | None:
+            return 4096
+
+        def get_max_output_tokens(self, model: str) -> int | None:
+            return 128
+
+        def resolve_model(self, slot: str = "default") -> str:
+            return self.SLOT_DEFAULTS.get(slot, self.DEFAULT_MODEL)
+
+        def resolve_credentials(self) -> tuple[str, str | None] | None:
+            return None
+
+        def create_chat_model(self, model: str, *, max_tokens: int, timeout: float | None = 120):
+            return object()
+
+    token = use_provider(_BoundProvider())
+    try:
+        result = build_context({"skill_path": str(tmp_path)})
+    finally:
+        reset_provider(token)
+
+    assert result["model_config"]["default"] == "bound-default"
+    assert result["model_config"]["meta_analyzer"] == "bound-meta"
 
 
 def test_build_context_skips_skip_dirs(tmp_path: Path) -> None:

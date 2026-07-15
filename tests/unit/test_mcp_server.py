@@ -15,12 +15,16 @@
 
 """Tests for the MCP server wrapper (run_scan core + scan_skill tool)."""
 
+import asyncio
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
 from skillspector import mcp_server
 from skillspector.mcp_server import run_scan
+from skillspector.providers import reset_provider, use_provider
 
 
 def _write_skill(tmp_path: Path, body: str = "# Safe skill") -> Path:
@@ -32,8 +36,7 @@ async def test_run_scan_returns_structured_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """run_scan returns a JSON-serialisable verdict with the expected shape."""
-    # No credentials: the LLM pass cannot run regardless of what is requested.
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: None)
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
@@ -51,7 +54,7 @@ async def test_run_scan_llm_accounting_is_honest_without_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Requesting the LLM with no credentials must report it as not used."""
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: None)
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
@@ -66,13 +69,125 @@ async def test_run_scan_reports_llm_available_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Credentials present but use_llm=False: available, but honestly not used."""
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: ("key", None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
 
     assert result["llm_available"] is True
     assert result["llm_requested"] is False
+    assert result["llm_used"] is False
+    assert result["scan_mode"] == "static-only"
+
+
+async def test_run_scan_uses_bound_provider_without_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An injected provider can own the LLM client without exposing raw credentials."""
+
+    class _InjectedProvider:
+        DEFAULT_MODEL = "injected-default"
+        SLOT_DEFAULTS = {"meta_analyzer": "injected-default"}
+
+        def get_context_length(self, model: str) -> int | None:
+            return 4096 if model == "injected-default" else None
+
+        def get_max_output_tokens(self, model: str) -> int | None:
+            return 128 if model == "injected-default" else None
+
+        def resolve_model(self, slot: str = "default") -> str:
+            return "injected-default"
+
+        def resolve_credentials(self) -> tuple[str, str | None] | None:
+            return None
+
+        def create_chat_model(
+            self,
+            model: str,
+            *,
+            max_tokens: int,
+            timeout: float | None = 120,
+        ) -> object:
+            return object()
+
+    class _Graph:
+        async def ainvoke(self, state, config):
+            assert state["use_llm"] is True
+            return {
+                "filtered_findings": [],
+                "risk_score": 0,
+                "risk_severity": "LOW",
+                "risk_recommendation": "OK",
+                "report_body": "report",
+            }
+
+    token = use_provider(_InjectedProvider())
+    monkeypatch.setattr(mcp_server, "graph", _Graph())
+    _write_skill(tmp_path)
+
+    try:
+        result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    finally:
+        reset_provider(token)
+
+    assert result["llm_available"] is True
+    assert result["llm_requested"] is True
+    assert result["llm_used"] is True
+    assert result["scan_mode"] == "static+llm"
+
+
+async def test_run_scan_disables_llm_for_unavailable_bound_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bound provider that cannot build a chat model must stay static-only."""
+
+    class _UnavailableInjectedProvider:
+        DEFAULT_MODEL = "injected-default"
+        SLOT_DEFAULTS = {"meta_analyzer": "injected-default"}
+
+        def get_context_length(self, model: str) -> int | None:
+            return 4096 if model == "injected-default" else None
+
+        def get_max_output_tokens(self, model: str) -> int | None:
+            return 128 if model == "injected-default" else None
+
+        def resolve_model(self, slot: str = "default") -> str:
+            return "injected-default"
+
+        def resolve_credentials(self) -> tuple[str, str | None] | None:
+            return None
+
+        def create_chat_model(
+            self,
+            model: str,
+            *,
+            max_tokens: int,
+            timeout: float | None = 120,
+        ) -> object | None:
+            return None
+
+    class _Graph:
+        async def ainvoke(self, state, config):
+            assert state["use_llm"] is False
+            return {
+                "filtered_findings": [],
+                "risk_score": 0,
+                "risk_severity": "LOW",
+                "risk_recommendation": "OK",
+                "report_body": "report",
+            }
+
+    token = use_provider(_UnavailableInjectedProvider())
+    monkeypatch.setattr(mcp_server, "graph", _Graph())
+    _write_skill(tmp_path)
+
+    try:
+        result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    finally:
+        reset_provider(token)
+
+    assert result["llm_available"] is False
+    assert result["llm_requested"] is True
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
 
@@ -90,3 +205,25 @@ async def test_build_server_registers_scan_skill() -> None:
     server = mcp_server.build_server()
     tools = await server.list_tools()
     assert "scan_skill" in {tool.name for tool in tools}
+
+
+async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
+    """The real stdio CLI must initialize and expose the scan_skill tool."""
+    pytest.importorskip("mcp")
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    repo_root = Path(__file__).resolve().parents[2]
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "skillspector.cli", "mcp"],
+        env={**os.environ, "PYTHONPATH": str(repo_root / "src")},
+    )
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await asyncio.wait_for(session.initialize(), timeout=15)
+            tools = await asyncio.wait_for(session.list_tools(), timeout=15)
+
+    assert "scan_skill" in {tool.name for tool in tools.tools}

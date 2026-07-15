@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 from enum import StrEnum
 from pathlib import Path
@@ -34,6 +33,8 @@ from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 
 from skillspector import __version__
+from skillspector.cleanup import cleanup_result
+from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
@@ -166,11 +167,18 @@ def _write_result(
             print(report_body)
 
 
-def _cleanup_result(result: dict[str, object]) -> None:
-    """Remove temp dir from graph result if set."""
-    temp_dir = result.get("temp_dir_for_cleanup")
-    if temp_dir and isinstance(temp_dir, str):
-        shutil.rmtree(temp_dir, ignore_errors=True)
+def _recursive_json_payload(result: dict[str, object]) -> dict[str, object] | None:
+    """Return parsed report_body when it is valid JSON object text."""
+    raw_report_body = result.get("report_body")
+    if not isinstance(raw_report_body, str):
+        return None
+
+    try:
+        parsed = json.loads(raw_report_body)
+    except json.JSONDecodeError:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
 
 
 @app.command()
@@ -322,7 +330,7 @@ def scan(
 
         _write_result(result, output, format)
 
-        if (result.get("risk_score") or 0) > 50:
+        if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
     except typer.Exit:
         raise
@@ -337,7 +345,7 @@ def scan(
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
-            _cleanup_result(result)
+            cleanup_result(result)
 
 
 def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> RunnableConfig:
@@ -420,17 +428,25 @@ def _scan_multi_skill(
             if "error" in result:
                 combined["skills"].append({"name": skill.name, "error": result["error"]})
             else:
-                combined["skills"].append(
-                    {
-                        "name": skill.name,
-                        "path": skill.relative_path,
-                        "risk_score": result.get("risk_score", 0),
-                        "risk_severity": result.get("risk_severity", "LOW"),
-                        "finding_count": len(
-                            result.get("filtered_findings") or result.get("findings") or []
-                        ),
-                    }
+                payload = _recursive_json_payload(result) or {}
+                entry = {
+                    "name": skill.name,
+                    "path": skill.relative_path,
+                    "risk_score": result.get("risk_score", 0),
+                    "risk_severity": result.get("risk_severity", "LOW"),
+                    "finding_count": len(
+                        result.get("filtered_findings") or result.get("findings") or []
+                    ),
+                }
+                entry.update(payload)
+                entry["name"] = skill.name
+                entry["path"] = skill.relative_path
+                entry["risk_score"] = result.get("risk_score", 0)
+                entry["risk_severity"] = result.get("risk_severity", "LOW")
+                entry["finding_count"] = len(
+                    result.get("filtered_findings") or result.get("findings") or []
                 )
+                combined["skills"].append(entry)
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
     elif output:
@@ -442,7 +458,7 @@ def _scan_multi_skill(
         Path(output).write_text("\n\n".join(sections), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
 
-    if max_score > 50:
+    if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
 
 
@@ -564,7 +580,7 @@ def baseline(
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
-            _cleanup_result(result)
+            cleanup_result(result)
 
 
 if __name__ == "__main__":

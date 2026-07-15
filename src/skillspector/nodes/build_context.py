@@ -26,7 +26,7 @@ from pathlib import Path
 
 import yaml
 
-from skillspector.constants import MODEL_CONFIG
+from skillspector.constants import build_model_config
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
 
@@ -246,7 +246,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "ast_cache": {},
         "manifest": manifest,
         "previous_manifest": None,
-        "model_config": MODEL_CONFIG,
+        "model_config": build_model_config(),
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
     }

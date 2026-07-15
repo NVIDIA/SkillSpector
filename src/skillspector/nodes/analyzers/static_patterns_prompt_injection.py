@@ -71,13 +71,13 @@ P1_PATTERNS = [
     (r"do\s+not\s+follow\s+(?:any|your|the)\s+(?:rules?|guidelines?)", 0.9),
     (r"you\s+must\s+(?:always\s+)?ignore", 0.7),
 ]
-# P2: Hidden Instructions
+_ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
 P2_PATTERNS = [
     (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
     (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
     # Zero-width character class built from the shared ZERO_WIDTH_CHARS constant so
     # P2 and the P9 detector cannot drift (same five code points as before).
-    ("[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]", 0.6),
+    (_ZERO_WIDTH_PATTERN, 0.6),
     (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
@@ -169,6 +169,46 @@ _EMOJI_TAG_SEQUENCE = re.compile(
 )
 
 
+_EMOJI_MODIFIERS = range(0x1F3FB, 0x1F400)
+_VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
+
+
+def _is_emoji_base(ch: str) -> bool:
+    codepoint = ord(ch)
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or codepoint in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D)
+    )
+
+
+def _previous_emoji_base(content: str, offset: int) -> bool:
+    i = offset - 1
+    while i >= 0 and (
+        ord(content[i]) in _VARIATION_SELECTORS or ord(content[i]) in _EMOJI_MODIFIERS
+    ):
+        i -= 1
+    return i >= 0 and _is_emoji_base(content[i])
+
+
+def _next_emoji_base(content: str, offset: int) -> bool:
+    i = offset + 1
+    while i < len(content) and ord(content[i]) in _VARIATION_SELECTORS:
+        i += 1
+    if i < len(content) and ord(content[i]) in _EMOJI_MODIFIERS:
+        i += 1
+    return i < len(content) and _is_emoji_base(content[i])
+
+
+def _zero_width_match_is_safe_emoji_zwj(content: str, offset: int) -> bool:
+    """Allow ZWJ only when it joins two emoji bases in an emoji sequence."""
+    return (
+        content[offset] == "\u200d"
+        and _previous_emoji_base(content, offset)
+        and _next_emoji_base(content, offset)
+    )
+
+
 def _first_smuggled_tag_offset(content: str) -> int | None:
     """Return the char offset of the first Unicode Tag character that is *not*
     part of a well-formed emoji tag sequence, or ``None`` if there is none."""
@@ -213,6 +253,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if file_type in ("markdown", "other"):
         for pattern, confidence in P2_PATTERNS:
             for match in re.finditer(pattern, content, re.IGNORECASE | re.DOTALL):
+                if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
+                    content, match.start()
+                ):
+                    continue
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(

@@ -22,8 +22,6 @@ import from.  Test fixtures patch :func:`_resolve_context_length` here.
 
 from __future__ import annotations
 
-import functools
-
 from skillspector.constants import DEFAULT_CONTEXT_LENGTH, MAX_INPUT_TOKENS_PCT
 from skillspector.logging_config import get_logger
 from skillspector.providers import get_metadata_provider
@@ -31,13 +29,12 @@ from skillspector.providers import get_metadata_provider
 logger = get_logger(__name__)
 
 
-@functools.cache
 def _resolve_context_length(model_label: str) -> int:
     """Return the context window size for *model_label*.
 
     Delegates to the configured provider chain; falls back to
     :data:`DEFAULT_CONTEXT_LENGTH` with a warning when no provider knows
-    about the model.  Cached per model label for the lifetime of the process.
+    about the model.
     """
     ctx = get_metadata_provider().get_context_length(model_label)
     if ctx is not None:

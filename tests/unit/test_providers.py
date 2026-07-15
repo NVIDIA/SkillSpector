@@ -28,14 +28,19 @@ import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
+import skillspector.providers as providers_module
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
     create_chat_model,
+    get_active_provider,
     get_metadata_provider,
     has_cli_capability,
+    has_provider_binding,
     registry,
+    reset_provider,
     resolve_chat_model_credentials,
     resolve_provider_credentials,
+    use_provider,
 )
 from skillspector.providers.anthropic import AnthropicProvider
 from skillspector.providers.antigravity_cli import AntigravityCLIProvider
@@ -62,6 +67,44 @@ nv_inference_required = pytest.mark.skipif(
 )
 
 
+class FakeProvider:
+    DEFAULT_MODEL = "fake-default"
+    SLOT_DEFAULTS = {"meta_analyzer": "fake-meta"}
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        credentials: tuple[str, str | None] | None = None,
+        chat_model: object | None = None,
+    ) -> None:
+        self.name = name
+        self._credentials = credentials
+        self.chat_model = chat_model if chat_model is not None else object()
+
+    def get_context_length(self, model: str) -> int | None:
+        return 111 if model == self.name else None
+
+    def get_max_output_tokens(self, model: str) -> int | None:
+        return 222 if model == self.name else None
+
+    def resolve_model(self, slot: str = "default") -> str:
+        return f"{self.name}:{slot}"
+
+    def resolve_credentials(self) -> tuple[str, str | None] | None:
+        return self._credentials
+
+    def create_chat_model(
+        self,
+        model: str,
+        *,
+        max_tokens: int,
+        timeout: float | None = 120,
+    ) -> object:
+        self.last_chat_model_request = (model, max_tokens, timeout)
+        return self.chat_model
+
+
 @pytest.fixture(autouse=True)
 def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     """Isolate provider-related env vars and the YAML cache for each test."""
@@ -74,8 +117,10 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    providers_module._INJECTED_PROVIDER.set(None)
     registry._load.cache_clear()
     yield
+    providers_module._INJECTED_PROVIDER.set(None)
     registry._load.cache_clear()
 
 
@@ -427,6 +472,74 @@ class TestProviderSelection:
         provider = get_metadata_provider()
         assert isinstance(provider, AntigravityCLIProvider)
         assert resolve_provider_credentials() is None
+
+    def test_injected_provider_routes_metadata_and_active_helpers(self) -> None:
+        provider = FakeProvider("injected")
+        token = use_provider(provider)
+        try:
+            assert has_provider_binding() is True
+            assert get_metadata_provider() is provider
+            assert get_active_provider() is provider
+        finally:
+            reset_provider(token)
+        assert has_provider_binding() is False
+
+    def test_injected_provider_routes_credentials_and_chat_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        chat_model = object()
+        provider = FakeProvider(
+            "injected",
+            credentials=("injected-key", "injected-base-url"),
+            chat_model=chat_model,
+        )
+        token = use_provider(provider)
+        try:
+            assert resolve_provider_credentials() == ("injected-key", "injected-base-url")
+            assert create_chat_model("model-x", max_tokens=42) is chat_model
+        finally:
+            reset_provider(token)
+
+    def test_provider_token_reset_restores_env_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        provider = FakeProvider("injected", credentials=("injected-key", None))
+        token = use_provider(provider)
+        reset_provider(token)
+        assert isinstance(get_metadata_provider(), OpenAIProvider)
+        assert resolve_provider_credentials() == ("sk-x", None)
+
+    def test_provider_token_nested_restores_previous_binding(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        outer_provider = FakeProvider(
+            "outer",
+            credentials=("outer-key", "outer-base-url"),
+        )
+        inner_provider = FakeProvider(
+            "inner",
+            credentials=("inner-key", "inner-base-url"),
+        )
+        outer_token = use_provider(outer_provider)
+        try:
+            inner_token = use_provider(inner_provider)
+            try:
+                assert get_metadata_provider() is inner_provider
+                assert resolve_provider_credentials() == ("inner-key", "inner-base-url")
+            finally:
+                reset_provider(inner_token)
+            assert get_metadata_provider() is outer_provider
+            assert resolve_provider_credentials() == ("outer-key", "outer-base-url")
+        finally:
+            reset_provider(outer_token)
+        assert isinstance(get_metadata_provider(), OpenAIProvider)
+        assert resolve_provider_credentials() == ("sk-x", None)
 
 
 class TestAntigravityCLIProvider:

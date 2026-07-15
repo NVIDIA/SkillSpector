@@ -24,6 +24,7 @@ import pytest
 import yaml
 
 from skillspector.constants import DEFAULT_CONTEXT_LENGTH, MAX_INPUT_TOKENS_PCT
+from skillspector.providers import reset_provider, use_provider
 
 MODULE = "skillspector.model_info"
 NV_PROVIDER_MODULE = "skillspector.providers.nv_inference.provider"
@@ -42,11 +43,9 @@ nv_provider_required = pytest.mark.skipif(
 
 
 def _clear_caches() -> None:
-    """Clear all functools.cache caches across model_info and the providers."""
-    from skillspector import model_info
+    """Clear the provider registry cache used by model-info lookups."""
     from skillspector.providers import registry
 
-    model_info._resolve_context_length.cache_clear()
     registry._load_registry.cache_clear()
 
 
@@ -80,7 +79,6 @@ def _get_real_functions():
     from skillspector.providers import registry
 
     importlib.reload(mod)
-    mod._resolve_context_length.cache_clear()
     registry._load_registry.cache_clear()
     return mod
 
@@ -355,3 +353,44 @@ class TestPublicApi:
             result = mod.get_max_output_tokens("bare/model")
             expected = int(200_000 * (1 - MAX_INPUT_TOKENS_PCT))
             assert result == expected
+
+    def test_token_limits_follow_current_bound_provider_for_same_model_label(self) -> None:
+        """Same labels must resolve against the provider bound in this context."""
+
+        class _BoundProvider:
+            DEFAULT_MODEL = "shared/model"
+            SLOT_DEFAULTS = {"meta_analyzer": "shared/model"}
+
+            def __init__(self, context_length: int, max_output_tokens: int) -> None:
+                self._context_length = context_length
+                self._max_output_tokens = max_output_tokens
+
+            def get_context_length(self, model: str) -> int | None:
+                return self._context_length if model == "shared/model" else None
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return self._max_output_tokens if model == "shared/model" else None
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "shared/model"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+        mod = _get_real_functions()
+        first = _BoundProvider(context_length=100, max_output_tokens=10)
+        second = _BoundProvider(context_length=200, max_output_tokens=20)
+
+        first_token = use_provider(first)
+        try:
+            assert mod.get_max_input_tokens("shared/model") == 75
+            assert mod.get_max_output_tokens("shared/model") == 10
+        finally:
+            reset_provider(first_token)
+
+        second_token = use_provider(second)
+        try:
+            assert mod.get_max_input_tokens("shared/model") == 150
+            assert mod.get_max_output_tokens("shared/model") == 20
+        finally:
+            reset_provider(second_token)
