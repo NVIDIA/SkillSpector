@@ -182,7 +182,7 @@ _SAFE_DOCKERFILE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _SAFE_CACHE_CLEANUP_RE = re.compile(
-    r"\brm\s+-rf\s+(?P<quote>['\"]?)(?P<path>(?:\$?\{?HOME\}?|~)/\.cache/[^\s;&|'\"]+)(?P=quote)",
+    r"\brm\s+-rf\s+(?P<quote>['\"]?)(?P<path>(?:\$?\{?HOME\}?|~)/\.cache/[^\s;&|'\"]+)(?P=quote)(?:\s*(?:$|[;&|]))",
     re.IGNORECASE,
 )
 
@@ -210,9 +210,21 @@ def _is_safe_cache_cleanup(matched_text: str) -> bool:
     if not match:
         return False
     parts = match.group("path").split("/")
-    cache_index = parts.index(".cache")
+    lowered_parts = [part.lower() for part in parts]
+    cache_index = lowered_parts.index(".cache")
     cache_parts = parts[cache_index + 1 :]
-    return bool(cache_parts) and "*" not in cache_parts and ".." not in cache_parts
+    return bool(cache_parts) and not any(
+        part in ("", ".", "..") or "*" in part for part in cache_parts
+    )
+
+
+def _line_containing(content: str, start: int, end: int) -> str:
+    """Return the full line containing a regex match."""
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end == -1:
+        line_end = len(content)
+    return content[line_start:line_end]
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -232,11 +244,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
+            matched_line = _line_containing(content, match.start(), match.end())
 
             if (
                 _is_safe_container_command(context_text)
                 or _is_safe_dockerfile_idiom(context_text, matched)
-                or _is_safe_cache_cleanup(context_text)
+                or _is_safe_cache_cleanup(matched_line)
             ):
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW

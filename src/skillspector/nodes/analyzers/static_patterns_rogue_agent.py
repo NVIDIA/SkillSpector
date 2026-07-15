@@ -203,10 +203,10 @@ def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
         return False
     clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
     prefix = line[clause_start + 1 : local_start]
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
     negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
     return (
-        re.search(negation + r"(?:\w+\s+){0,4}" + escaped + r"$", prefix + phrase, re.IGNORECASE)
-        is not None
+        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
     )
 
 
