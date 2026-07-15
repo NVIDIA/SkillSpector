@@ -140,7 +140,7 @@ def _is_env_file_reference_in_docs(
         return False
     if file_type not in ("markdown", "text"):
         return False
-    if file_path.replace("\\", "/").lower().endswith("skill.md"):
+    if _is_skill_md(file_path):
         return False
     if not finding.context:
         return False
@@ -163,6 +163,17 @@ def _is_env_file_reference_in_docs(
 def _is_eval_dataset(path: str) -> bool:
     """Return True for authored eval datasets that contain test-case prose."""
     return path.replace("\\", "/") in _EVAL_DATASET_FILES
+
+
+def _is_skill_md(path: str) -> bool:
+    """Return True for paths with the existing loose SKILL.md suffix match."""
+    return path.lower().endswith("skill.md")
+
+
+def _is_canonical_skill_md(path: str) -> bool:
+    """Return True for files literally named SKILL.md."""
+    normalized = path.replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1].lower() == "skill.md"
 
 
 _DOCUMENTATION_DIR_NAMES = (
@@ -192,7 +203,7 @@ def _is_documentation_context(af: AnalyzerFinding, file_type: str, path: str, co
     """Return true when a governed finding is prose or a comment without execution signals."""
     if af.rule_id not in _SEMANTIC_STRING_DOC_PRONE_RULES:
         return False
-    if path.replace("\\", "/").lower().endswith("skill.md"):
+    if _is_skill_md(path):
         return False
     lines = content.splitlines()
     matched_line = (
@@ -212,7 +223,7 @@ def _is_documentation_markdown(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
     if not normalized.endswith((".md", ".markdown")):
         return False
-    if normalized.endswith("skill.md"):
+    if _is_skill_md(path):
         return False
     parts = normalized.split("/")
     return any(part in _DOCUMENTATION_DIR_NAMES for part in parts[:-1])
@@ -286,6 +297,7 @@ def run_static_patterns(
         file_type = _infer_file_type(path)
         is_doc_markdown = _is_documentation_markdown(path)
         is_non_executable = file_type in _NON_EXECUTABLE_FILE_TYPES
+        is_canonical_skill_md = _is_canonical_skill_md(path)
         for module in pattern_modules:
             raw = module.analyze(content=content, file_path=path, file_type=file_type)
             for af in raw:
@@ -297,7 +309,7 @@ def run_static_patterns(
                         af.location.start_line,
                     )
                     continue
-                if af.context and is_code_example(af.context):
+                if af.context and is_code_example(af.context) and not is_canonical_skill_md:
                     if is_non_executable:
                         logger.debug(
                             "Filtered code-example finding in non-executable: %s in %s:%d",

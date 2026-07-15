@@ -210,7 +210,7 @@ rm -rf /tmp/build-cache
         )
 
     def test_skill_md_findings_are_not_filtered_by_backticks(self) -> None:
-        """SKILL.md is the primary instruction file — backticks alone shouldn't filter."""
+        """SKILL.md is the primary instruction file, so fenced findings survive."""
         content = """\
 ---
 name: deploy-tool
@@ -229,12 +229,48 @@ The agent will execute the above command.
             "file_cache": {"SKILL.md": content},
         }
         findings = static_runner.run_static_patterns(state, [tm_module])
-        # SKILL.md code blocks do get filtered by is_code_example (same as EA2/MP)
-        # This is correct: the meta-analyzer handles SKILL.md nuance
-        # The key test is that SKILL.md is NOT treated as documentation-path markdown
-        for f in findings:
-            # Confidence should NOT be reduced by _DOCUMENTATION_CONFIDENCE_FACTOR
-            assert f.confidence >= 0.3
+        tm1_findings = [f for f in findings if f.rule_id == "TM1"]
+        assert len(tm1_findings) == 1
+        assert tm1_findings[0].confidence == 0.6
+
+    def test_fenced_guide_md_findings_are_filtered(self) -> None:
+        """Ordinary fenced Markdown remains filtered as a documentation example."""
+        content = """\
+Use this tool to deploy:
+```
+curl -k https://production.example.com/deploy
+```
+"""
+        assert "TM1" not in _findings(content, "guide.md", tm_module)
+
+    def test_fenced_noncanonical_skill_md_suffix_paths_remain_filtered(self) -> None:
+        """Only files literally named SKILL.md bypass the runner's code-example filter."""
+        content = """\
+Use this tool to deploy:
+```
+curl -k https://production.example.com/deploy
+```
+"""
+        for path in ("my_skill.md", "docs/bash_skill.md"):
+            assert "TM1" not in _findings(content, path, tm_module)
+
+    @pytest.mark.parametrize(
+        ("path", "expected_loose", "expected_canonical"),
+        [
+            ("SKILL.md", True, True),
+            ("nested/SKILL.md", True, True),
+            ("nested\\skill.md", True, True),
+            ("my_skill.md", True, False),
+            ("docs/bash_skill.md", True, False),
+            ("skill.md.bak", False, False),
+        ],
+    )
+    def test_skill_md_path_helpers_distinguish_loose_and_canonical_matches(
+        self, path: str, expected_loose: bool, expected_canonical: bool
+    ) -> None:
+        """Legacy suffix checks stay loose, while the new runner gate is exact-basename."""
+        assert static_runner._is_skill_md(path) is expected_loose
+        assert static_runner._is_canonical_skill_md(path) is expected_canonical
 
 
 class TestDocumentationPathConfidenceReduction:
