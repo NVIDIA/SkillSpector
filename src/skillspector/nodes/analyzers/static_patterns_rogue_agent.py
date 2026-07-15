@@ -156,6 +156,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for pattern, confidence in RA1_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
+            context = ctx(match.start())
+            if _is_negated_safety_constraint(content, match):
+                continue
             findings.append(
                 AnalyzerFinding(
                     rule_id="RA1",
@@ -164,7 +167,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     location=loc(line_num),
                     confidence=confidence,
                     tags=tag,
-                    context=ctx(match.start()),
+                    context=context,
                     matched_text=match.group(0)[:200],
                 )
             )
@@ -184,6 +187,27 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     return findings
+
+
+def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+    """Return True when an RA1 phrase is explicitly forbidden in policy prose."""
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    phrase = line[local_start : local_start + len(match.group(0))]
+    escaped = re.escape(phrase.strip())
+    if not escaped:
+        return False
+    clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
+    prefix = line[clause_start + 1 : local_start]
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
+    negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
+    return (
+        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
+    )
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

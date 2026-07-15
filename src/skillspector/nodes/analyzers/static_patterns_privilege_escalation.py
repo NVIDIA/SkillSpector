@@ -162,6 +162,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context = get_context(content, match.start())
             if _is_documentation_example(context, file_type):
                 continue
+            if _is_negated_safety_constraint(content, match):
+                continue
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
@@ -252,6 +254,27 @@ def _is_documentation_example(context: str, file_type: str) -> bool:
         "create ",
     )
     return any(ind in ctx_lower for ind in doc_indicators)
+
+
+def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+    """Return True when a privilege-escalation phrase is forbidden in policy prose."""
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    phrase = line[local_start : local_start + len(match.group(0))]
+    escaped = re.escape(phrase.strip())
+    if not escaped:
+        return False
+    clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
+    prefix = line[clause_start + 1 : local_start]
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
+    negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
+    return (
+        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
+    )
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
