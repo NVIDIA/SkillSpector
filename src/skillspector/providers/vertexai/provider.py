@@ -78,11 +78,16 @@ class VertexAIProvider:
                 "Ensure GOOGLE_APPLICATION_CREDENTIALS points to a valid "
                 "service account key file."
             )
-
-        base_url = (
-            f"https://{location}-aiplatform.googleapis.com/v1beta1/"
-            f"projects/{project_id}/locations/{location}/endpoints/openapi"
-        )
+        if location == "global":
+            base_url = (
+                f"https://aiplatform.googleapis.com/v1beta1/"
+                f"projects/{project_id}/locations/global/endpoints/openapi"
+            )
+        else:
+            base_url = (
+                f"https://{location}-aiplatform.googleapis.com/v1beta1/"
+                f"projects/{project_id}/locations/{location}/endpoints/openapi"
+            )
 
         return access_token, base_url
 

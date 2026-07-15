@@ -359,6 +359,29 @@ class TestVertexAIProvider:
 
     @patch("skillspector.providers.vertexai.provider.google.auth.default")
     @patch("skillspector.providers.vertexai.provider.google.auth.transport.requests.Request")
+    def test_resolves_credentials_with_global_location(
+        self,
+        mock_request: MagicMock,
+        mock_auth_default: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_creds = MagicMock()
+        mock_creds.token = "fake-access-token"
+        mock_auth_default.return_value = (mock_creds, "default-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+
+        creds = VertexAIProvider().resolve_credentials()
+        assert creds is not None
+        token, base_url = creds
+        assert token == "fake-access-token"
+        assert base_url == (
+            "https://aiplatform.googleapis.com/v1beta1/"
+            "projects/my-project/locations/global/endpoints/openapi"
+        )
+
+    @patch("skillspector.providers.vertexai.provider.google.auth.default")
+    @patch("skillspector.providers.vertexai.provider.google.auth.transport.requests.Request")
     def test_create_chat_model_prefixes_model_with_google(
         self,
         mock_request: MagicMock,
