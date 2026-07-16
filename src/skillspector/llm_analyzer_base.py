@@ -642,6 +642,12 @@ class LLMAnalyzerBase:
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         outcome = BatchExecutionResult()
         for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, ValidationError):
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                outcome.failures.append(
+                    BatchFailure(batch=batch, error_class=type(result).__name__)
+                )
+                continue
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
             if isinstance(result, BaseException):
