@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMFinding
+from skillspector.llm_analyzer_base import Batch, LLMAnalysisResult, LLMFinding
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.semantic_quality_policy import (
     ANALYZER_ID,
@@ -269,7 +269,12 @@ class TestLLMCallTelemetry:
     def test_success_records_ok_true(self) -> None:
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
+        with patch.object(
+            LLMAnalyzerBase,
+            "arun_batches",
+            new_callable=AsyncMock,
+            return_value=[(Batch(file_path="SKILL.md", content="# Skill"), [])],
+        ):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
         assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
 
