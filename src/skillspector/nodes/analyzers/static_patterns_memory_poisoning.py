@@ -152,6 +152,33 @@ MP3_PATTERNS = [
     ),
 ]
 
+_LAYOUT_CHAR_RANGES = (
+    (0x2500, 0x257F),
+    (0x2580, 0x259F),
+)
+_LAYOUT_ASCII_CHARS = frozenset("|-_=+")
+_MAX_LAYOUT_ONLY_SPAN = 256
+
+
+def _is_layout_only_span(span: str, max_cosmetic_span: int = _MAX_LAYOUT_ONLY_SPAN) -> bool:
+    """Return True when a captured MP2 span is only layout glyphs and whitespace."""
+    if len(span) > max_cosmetic_span:
+        return False
+    compact = re.sub(r"\s", "", span)
+    if not compact:
+        return True
+    if any(ch.isalnum() for ch in compact):
+        return False
+    if any(ch.isalpha() or ch.isdigit() for ch in compact):
+        return False
+    for ch in compact:
+        if ch in _LAYOUT_ASCII_CHARS:
+            continue
+        codepoint = ord(ch)
+        if not any(start <= codepoint <= end for start, end in _LAYOUT_CHAR_RANGES):
+            return False
+    return True
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for memory poisoning patterns (MP1–MP3)."""
@@ -182,9 +209,11 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in MP2_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            captured = match.group(1) if match.lastindex else match.group(0)
-            non_ws_chars = set(captured) - {" ", "\t", "\n", "\r"}
-            if len(non_ws_chars) <= 1 and not any(c in captured for c in (" ", "\t")):
+            span = match.group(0)
+            if _is_layout_only_span(span):
+                continue
+            non_ws_chars = set(span) - {" ", "\t", "\n", "\r"}
+            if len(non_ws_chars) <= 1 and not any(c in span for c in (" ", "\t")):
                 continue
             line_num = get_line_number(content, match.start())
             findings.append(
