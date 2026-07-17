@@ -53,6 +53,7 @@ from skillspector.providers.openai import OpenAIProvider
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "NVIDIA_INFERENCE_KEY",
@@ -109,10 +110,11 @@ class TestCredentialResolution:
     ) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://anthropic.example/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
         key, base = _resolve_llm_credentials()
         assert key == "sk-ant-x"
-        assert base is None
+        assert base == "http://anthropic.example/v1"
 
     def test_no_credentials_raises_with_helpful_message(self) -> None:
         with pytest.raises(ValueError) as exc_info:
