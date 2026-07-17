@@ -75,6 +75,72 @@ def test_cli_scan_nonexistent_exits_2() -> None:
     assert "Error" in result.output or "error" in result.output.lower()
 
 
+def test_cli_mcp_registry_routes_and_writes_json(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    output = tmp_path / "registry-report.json"
+    result = runner.invoke(
+        app,
+        ["scan", str(payload), "--mcp-registry", "--format", "json", "--output", str(output)],
+    )
+    assert result.exit_code == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["mcp_registry"] is True
+
+
+def test_cli_mcp_registry_exits_1_when_aggregate_risk_crosses_threshold(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "server": {
+                            "name": "risky/example",
+                            "remotes": [
+                                {"type": "streamable-http", "url": "http://one.invalid/mcp"},
+                                {"type": "streamable-http", "url": "http://two.invalid/mcp"},
+                                {"type": "streamable-http", "url": "http://three.invalid/mcp"},
+                            ],
+                        },
+                        "_meta": {
+                            "io.modelcontextprotocol.registry/official": {"status": "deprecated"}
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["scan", str(payload), "--mcp-registry", "--format", "json"])
+    assert result.exit_code == 1
+    assert json.loads(result.output)["risk_score"] == 95
+
+
+@pytest.mark.parametrize(
+    "args", [[], ["--format", "terminal"], ["--format", "markdown"], ["--format", "sarif"]]
+)
+def test_cli_mcp_registry_rejects_non_json_formats(tmp_path: Path, args: list[str]) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    result = runner.invoke(app, ["scan", str(payload), "--mcp-registry", *args])
+    assert result.exit_code == 2
+    assert "supports only --format json" in result.output
+
+
+@pytest.mark.parametrize(
+    "flag", ["--recursive", "--baseline", "--show-suppressed", "--yara-rules-dir"]
+)
+def test_cli_mcp_registry_rejects_skill_only_flags(tmp_path: Path, flag: str) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    args = ["scan", str(payload), "--mcp-registry", flag]
+    if flag in {"--baseline", "--yara-rules-dir"}:
+        args.append(str(tmp_path / "value"))
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
+
+
 def test_cli_scan_missing_baseline_exits_2(tmp_path: Path) -> None:
     """scan with a --baseline pointing at a missing file exits with code 2."""
     (tmp_path / "SKILL.md").write_text("# Hi", encoding="utf-8")
