@@ -27,10 +27,12 @@ import sys
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 import skillspector.providers as providers_module
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
+    chat_models,
     create_chat_model,
     get_active_provider,
     get_metadata_provider,
@@ -113,6 +115,7 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
@@ -343,6 +346,117 @@ class TestOpenAICompatibleConstructor:
         assert llm.model_name == "gpt-5.4"
         assert llm.max_tokens == 123
         assert str(llm.openai_api_base).rstrip("/") == "http://localhost:1234/v1"
+
+    def test_reasoning_effort_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "  high  ")
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["reasoning_effort"] == "high"
+
+    def test_reasoning_effort_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert "reasoning_effort" not in captured
+        assert captured["max_completion_tokens"] == 123
+
+    @pytest.mark.parametrize("blank_value", ["   ", "\t\n"])
+    def test_reasoning_effort_blank(
+        self, monkeypatch: pytest.MonkeyPatch, blank_value: str
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", blank_value)
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert "reasoning_effort" not in captured
+        assert captured["max_completion_tokens"] == 123
+
+    def test_reasoning_effort_provider_matrix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.clear()
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        cases = (
+            (OpenAIProvider(), "OPENAI_API_KEY", "sk-x", "http://localhost:1234/v1"),
+            (NvBuildProvider(), "NVIDIA_INFERENCE_KEY", "nvapi-x", BUILD_BASE_URL),
+        )
+        for provider, key, value, endpoint in cases:
+            monkeypatch.setenv(key, value)
+            if isinstance(provider, OpenAIProvider):
+                monkeypatch.setenv("OPENAI_BASE_URL", endpoint)
+                monkeypatch.setenv("OPENAI_PROJECT_ID", "proj_123")
+            for effort in (None, "   ", " high "):
+                if effort is None:
+                    monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+                else:
+                    monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", effort)
+                provider.create_chat_model("model-x", max_tokens=123)
+                assert captured["base_url"] == endpoint
+                assert captured["max_completion_tokens"] == 123
+                assert isinstance(captured["api_key"], SecretStr)
+                assert captured["api_key"].get_secret_value() == value
+                if isinstance(provider, OpenAIProvider):
+                    assert captured["default_headers"] == {"OpenAI-Project": "proj_123"}
+                if effort is None or not effort.strip():
+                    assert "reasoning_effort" not in captured
+                else:
+                    assert captured["reasoning_effort"] == "high"
+
+    def test_reasoning_effort_passthrough(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "provider-specific-value")
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["reasoning_effort"] == "provider-specific-value"
 
 
 class TestProviderSelection:

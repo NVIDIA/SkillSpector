@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -64,11 +65,15 @@ def create_openai_compatible_chat_model(
 
     api_key, base_url = credentials
     validate_base_url(base_url)
-    return ChatOpenAI(
-        model=model,
-        base_url=base_url,
-        api_key=SecretStr(api_key),
-        max_completion_tokens=max_tokens,
-        timeout=timeout,
-        default_headers=default_headers,
-    )
+    kwargs = {
+        "model": model,
+        "base_url": base_url,
+        "api_key": SecretStr(api_key),
+        "max_completion_tokens": max_tokens,
+        "timeout": timeout,
+        "default_headers": default_headers,
+    }
+    reasoning_effort = os.environ.get("SKILLSPECTOR_REASONING_EFFORT", "").strip()
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    return ChatOpenAI(**kwargs)
