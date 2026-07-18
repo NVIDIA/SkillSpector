@@ -223,6 +223,23 @@ def load_baseline(path: str | Path) -> Baseline:
     return baseline_from_dict(data)
 
 
+SHIPPED_BASELINE_FILENAME = ".skillspector-baseline.yaml"
+
+
+def discover_baseline(skill_dir: str | Path) -> Path | None:
+    """Return the baseline shipped at the top level of *skill_dir*, or None.
+
+    Pure existence check for the single canonical filename
+    (``.skillspector-baseline.yaml``, the name ``skillspector baseline`` writes
+    by default). The file is never read here, so an untrusted shipped baseline
+    is not parsed until the caller decides to load it. Nested files are ignored;
+    per-sub-skill discovery belongs to the recursive path and is out of scope.
+    ``.yml`` / ``.json`` baselines stay usable through explicit ``--baseline``.
+    """
+    candidate = Path(skill_dir) / SHIPPED_BASELINE_FILENAME
+    return candidate if candidate.is_file() else None
+
+
 def partition_findings(
     findings: list[Finding], baseline: Baseline | None
 ) -> tuple[list[Finding], list[SuppressedFinding]]:
