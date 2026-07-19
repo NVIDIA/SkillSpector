@@ -14,6 +14,7 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 ## Documentation
 
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
+- **[OWASP AST10 coverage](docs/OWASP-AST10-COVERAGE.md)** — Revision-pinned crosswalk from SkillSpector's current rule catalog to the OWASP Agentic Skills Top 10, with rationale and gap notes.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 
 ## Features
