@@ -723,7 +723,18 @@ def report(state: SkillspectorState) -> dict[str, object]:
     # operationally) regardless of output format; also embedded in each format's
     # body / metadata below.
     _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    provider_available, provider_error = is_llm_available()
+    has_recorded_failure = any(not r.get("ok") for r in llm_call_log)
+    provider_unavailable = bool(
+        use_llm and not provider_available and has_recorded_failure
+    )
+    degraded = degraded or provider_unavailable
     degraded_notice = _llm_degradation_notice(use_llm, llm_call_log)
+    if provider_unavailable and degraded_notice is None:
+        degraded_notice = (
+            "LLM analysis was requested but the configured provider was unavailable"
+            f" ({provider_error or 'unknown reason'}); results may reflect static analysis only."
+        )
     if degraded:
         logger.warning(
             "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static "
@@ -749,14 +760,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
         components, file_cache, use_llm, raw_findings, filtered_findings
     )
 
-    # Fail closed on a degraded deep scan: when the LLM stage was requested but
-    # every call failed, the semantic analyzers were effectively skipped, so a
-    # SAFE verdict would rest on static analysis alone. An attacker can trigger
-    # this on purpose (e.g. content that breaks the LLM call) to dodge semantic
-    # scrutiny. Floor the recommendation at CAUTION so an install-gate ASKS
-    # rather than auto-allows; risk_score / severity are left untouched (they
-    # honestly reflect what static analysis found), and llm_degraded / llm_error
-    # explain why the verdict was raised.
+    # Fail closed on a degraded deep scan: when the provider is unavailable or
+    # every recorded LLM call failed, a SAFE verdict would rest on static
+    # analysis alone. Floor the recommendation at CAUTION so an install-gate
+    # ASKS rather than auto-allows; risk_score / severity are left untouched.
     if degraded and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
 

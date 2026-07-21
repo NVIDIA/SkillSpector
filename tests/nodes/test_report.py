@@ -887,6 +887,35 @@ def test_degraded_scan_floors_recommendation_at_caution() -> None:
     assert result["risk_recommendation"] == "CAUTION"  # but never SAFE when degraded
 
 
+def test_unavailable_provider_floors_recommendation_even_with_success_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider truth wins when swallowed batch failures produced false success records."""
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda: (False, "codex binary not found"),
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_developer_intent", ok=True),
+            llm_call_record("semantic_quality_policy", ok=True),
+            llm_call_record("semantic_security_discovery", ok=False, error="binary missing"),
+        ],
+    }
+
+    result = report(state)
+    assert result["risk_recommendation"] == "CAUTION"
+    payload = json.loads(result["report_body"])
+    assert payload["risk_assessment"]["recommendation"] == "CAUTION"
+    assert payload["metadata"]["llm_available"] is False
+
+
 def test_non_degraded_clean_scan_stays_safe() -> None:
     """Without degradation, a clean scan still reports SAFE (no over-flooring)."""
     state: SkillspectorState = {
