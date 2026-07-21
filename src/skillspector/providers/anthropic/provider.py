@@ -34,7 +34,7 @@ from pydantic import SecretStr
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_reasoning_effort
 
-# Documented for completeness — ChatAnthropic defaults here when base_url=None.
+# Default endpoint; overridden by the ANTHROPIC_BASE_URL env var when set.
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
@@ -68,10 +68,13 @@ class AnthropicProvider:
             return None
 
         api_key, _ = creds
+        # Honor ANTHROPIC_BASE_URL for self-hosted gateways / Anthropic-compatible
+        # endpoints, mirroring how the openai provider honors OPENAI_BASE_URL.
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or ANTHROPIC_BASE_URL
         kwargs = {
             "model_name": model,
             "api_key": SecretStr(api_key),
-            "base_url": ANTHROPIC_BASE_URL,
+            "base_url": base_url,
             "max_tokens_to_sample": max_tokens,
             "timeout": timeout,
             "stop": None,
