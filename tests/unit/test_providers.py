@@ -23,6 +23,7 @@ NVIDIA catalog API) is covered by the layered tests in
 from __future__ import annotations
 
 import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -53,6 +54,7 @@ from skillspector.providers.codex_cli import CodexCLIProvider
 from skillspector.providers.gemini_cli import GeminiCLIProvider
 from skillspector.providers.nv_build import BUILD_BASE_URL, NvBuildProvider
 from skillspector.providers.openai import OpenAIProvider
+from skillspector.providers.vertexai import VertexAIProvider
 
 try:
     from skillspector.providers.nv_inference import (
@@ -122,6 +124,9 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
     providers_module._INJECTED_PROVIDER.set(None)
     registry._load.cache_clear()
     yield
@@ -379,6 +384,119 @@ class TestAnthropicProvider:
         assert provider.get_context_length("claude-opus-4-6") == 1_000_000
         assert provider.get_max_output_tokens("claude-opus-4-6") == 128_000
         assert provider.get_context_length("claude-sonnet-4-6") == 1_000_000
+
+
+class TestVertexAIProvider:
+    """VertexAI provider — credentials, model prefix, and bundled YAML metadata."""
+
+    def test_returns_none_without_env_vars(self) -> None:
+        assert VertexAIProvider().resolve_credentials() is None
+
+    def test_returns_none_with_partial_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-project")
+        assert VertexAIProvider().resolve_credentials() is None
+
+    @patch("skillspector.providers.vertexai.provider.google.auth.default")
+    @patch("skillspector.providers.vertexai.provider.google.auth.transport.requests.Request")
+    def test_resolves_credentials(
+        self,
+        mock_request: MagicMock,
+        mock_auth_default: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_creds = MagicMock()
+        mock_creds.token = "fake-access-token"
+        mock_auth_default.return_value = (mock_creds, "default-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        creds = VertexAIProvider().resolve_credentials()
+        assert creds is not None
+        token, base_url = creds
+        assert token == "fake-access-token"
+        assert "us-central1" in base_url
+        assert "my-project" in base_url
+        assert base_url.endswith("/endpoints/openapi")
+
+    @patch("skillspector.providers.vertexai.provider.google.auth.default")
+    @patch("skillspector.providers.vertexai.provider.google.auth.transport.requests.Request")
+    def test_resolves_credentials_with_global_location(
+        self,
+        mock_request: MagicMock,
+        mock_auth_default: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_creds = MagicMock()
+        mock_creds.token = "fake-access-token"
+        mock_auth_default.return_value = (mock_creds, "default-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+
+        creds = VertexAIProvider().resolve_credentials()
+        assert creds is not None
+        token, base_url = creds
+        assert token == "fake-access-token"
+        assert base_url == (
+            "https://aiplatform.googleapis.com/v1beta1/"
+            "projects/my-project/locations/global/endpoints/openapi"
+        )
+
+    @patch("skillspector.providers.vertexai.provider.google.auth.default")
+    @patch("skillspector.providers.vertexai.provider.google.auth.transport.requests.Request")
+    def test_create_chat_model_prefixes_model_with_google(
+        self,
+        mock_request: MagicMock,
+        mock_auth_default: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_creds = MagicMock()
+        mock_creds.token = "fake-access-token"
+        mock_auth_default.return_value = (mock_creds, "default-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        llm = VertexAIProvider().create_chat_model("gemini-2.5-flash", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "google/gemini-2.5-flash"
+        assert llm.max_tokens == 123
+
+    @patch("skillspector.providers.vertexai.provider.google.auth.default")
+    @patch("skillspector.providers.vertexai.provider.google.auth.transport.requests.Request")
+    def test_create_chat_model_does_not_double_prefix(
+        self,
+        mock_request: MagicMock,
+        mock_auth_default: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_creds = MagicMock()
+        mock_creds.token = "fake-access-token"
+        mock_auth_default.return_value = (mock_creds, "default-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-project")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        llm = VertexAIProvider().create_chat_model("google/gemini-2.5-flash", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "google/gemini-2.5-flash"
+
+    def test_create_chat_model_returns_none_without_credentials(self) -> None:
+        assert VertexAIProvider().create_chat_model("gemini-2.5-flash", max_tokens=123) is None
+
+    def test_metadata_known_model_from_bundled_yaml(self) -> None:
+        provider = VertexAIProvider()
+        assert provider.get_context_length("gemini-2.5-flash") == 1_048_576
+        assert provider.get_max_output_tokens("gemini-2.5-flash") == 65_535
+
+    def test_metadata_unknown_model_returns_none(self) -> None:
+        provider = VertexAIProvider()
+        assert provider.get_context_length("unknown-model") is None
+        assert provider.get_max_output_tokens("unknown-model") is None
+
+    def test_resolve_model_default_when_no_env(self) -> None:
+        assert VertexAIProvider().resolve_model() == "gemini-2.5-flash"
+
+    def test_resolve_model_env_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "gemini-2.5-pro")
+        assert VertexAIProvider().resolve_model() == "gemini-2.5-pro"
 
 
 class TestOpenAICompatibleConstructor:

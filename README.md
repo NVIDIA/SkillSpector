@@ -213,6 +213,7 @@ inference gateways.
 | `openai` | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | api.openai.com (or any OpenAI-compatible URL) | `gpt-5.4` |
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
+| `vertexai` | `GOOGLE_CLOUD_PROJECT` + `GOOGLE_CLOUD_LOCATION` (+ optional `GOOGLE_APPLICATION_CREDENTIALS`) | VertexAI OpenAI-compat endpoint | `gemini-2.5-flash` |
 | `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | `claude-sonnet-4-6` |
@@ -251,6 +252,14 @@ skillspector scan ./my-skill/
 # NVIDIA build.nvidia.com
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
+skillspector scan ./my-skill/
+
+# VertexAI (Google Cloud)
+export SKILLSPECTOR_PROVIDER=vertexai
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+export GOOGLE_CLOUD_PROJECT=your-project-id
+export GOOGLE_CLOUD_LOCATION=us-central1
+export SKILLSPECTOR_MODEL=gemini-2.5-pro
 skillspector scan ./my-skill/
 
 # Local Claude CLI — no API key; uses your existing `claude auth login` session
@@ -553,7 +562,7 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `vertexai`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
@@ -564,6 +573,9 @@ Issues (2)
 | `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
 | `AWS_PROFILE` | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
 | `AWS_REGION` | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to a GCP service-account JSON key file. When unset, Application Default Credentials (ADC) resolve via the standard `google.auth.default()` chain. | Optional (used when `SKILLSPECTOR_PROVIDER=vertexai`) |
+| `GOOGLE_CLOUD_PROJECT` | GCP project ID for the VertexAI endpoint. | Required when `SKILLSPECTOR_PROVIDER=vertexai` |
+| `GOOGLE_CLOUD_LOCATION` | GCP region for the VertexAI endpoint (e.g. `us-central1`). | Required when `SKILLSPECTOR_PROVIDER=vertexai` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's default model. See the LLM Analysis table for each provider's default. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
