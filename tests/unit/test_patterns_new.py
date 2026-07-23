@@ -1236,6 +1236,26 @@ class TestSupplyChainHelpers:
         assert "numpy" in names
         assert "flask" in names
 
+    def test_extract_packages_requirements_specifier_is_not_a_pin(self) -> None:
+        # Only "==" / "<=" resolve to a concrete version; floors and ranges must not be
+        # reported as pins (regression: ">=" was treated as "==", so "pillow>=10.0.0" was
+        # scanned as the exact release "10.0.0" and flagged with that version's CVEs).
+        content = (
+            "requests==2.31.0\n"      # exact pin -> version kept
+            "pillow>=10.0.0\n"        # floor      -> version None
+            "click<=8.1.0\n"          # upper cap  -> version kept
+            "urllib3~=1.26.0\n"       # compatible -> version None
+            "jinja2!=3.0.0\n"         # exclusion  -> version None
+            "flask\n"                 # unpinned   -> version None
+        )
+        versions = {p[0]: p[1] for p in sc_mod._extract_packages_from_requirements(content)}
+        assert versions["requests"] == "2.31.0"
+        assert versions["click"] == "8.1.0"
+        assert versions["pillow"] is None
+        assert versions["urllib3"] is None
+        assert versions["jinja2"] is None
+        assert versions["flask"] is None
+
     def test_extract_packages_package_json(self) -> None:
         content = (
             '{\n  "dependencies": {\n    "express": "^4.18.0",\n    "lodash": "4.17.21"\n  }\n}'

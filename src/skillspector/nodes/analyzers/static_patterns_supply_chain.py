@@ -426,7 +426,12 @@ def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | N
         m = re.match(r"^([a-zA-Z][a-zA-Z0-9._-]*)(?:\[.*?\])?\s*(?:([=<>!~]=?)\s*([\d.*]+))?", line)
         if m:
             name = m.group(1)
-            version = m.group(3) if m.group(2) else None
+            # Only "==" / "<=" bound the version to a concrete, CVE-checkable release.
+            # ">=", ">", "!=", "~=" are floors/ranges, not pins: treating them as an exact
+            # version makes a floor like "pillow>=10.0.0" report as "pillow==10.0.0" and
+            # attributes that release's CVEs to an unpinned dependency. Mirrors the guard
+            # already used by _extract_packages_from_setup_py.
+            version = m.group(3) if m.group(2) in ("==", "<=") else None
             results.append((name, version, i))
     return results
 
