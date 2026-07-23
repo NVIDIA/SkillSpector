@@ -788,9 +788,13 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
         )
         assert not any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "ds.yaml", "yaml"))
 
-    def test_tm4_documentation_example_excluded(self) -> None:
-        content = "For example, never set privileged: true in your manifests."
-        assert not any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "README.md", "markdown"))
+    def test_tm4_example_marker_not_self_filtered(self) -> None:
+        """analyze() no longer self-filters on example markers — the shared runner
+        handles that (suppressing non-executable docs, only downweighting
+        executables). So a nearby '# for example' marker cannot bypass TM4; the
+        finding is still produced at the analyzer level."""
+        content = "# for example\nprivileged: true"
+        assert any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "ds.yaml", "yaml"))
 
     def test_safe_content_produces_no_findings(self) -> None:
         findings = tm_mod.analyze(

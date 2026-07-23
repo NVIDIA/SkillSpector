@@ -294,6 +294,21 @@ class TestRunStaticPatternsDataExfiltration:
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         assert not any(f.rule_id == "E5" for f in findings)
 
+    def test_e5_example_marker_in_executable_still_fires(self):
+        """An example marker near an upload in an executable .py must NOT suppress E5.
+
+        Example filtering belongs to the runner, which only downweights (does not
+        skip) executables — so a nearby '# for example' cannot be used to evade E5.
+        """
+        state = {
+            "components": ["up.py"],
+            "file_cache": {
+                "up.py": "# for example\ns3.put_object(Bucket='x', Key='k', Body=d)",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        assert any(f.rule_id == "E5" for f in findings)
+
     def test_eval_dataset_prose_is_not_scanned_for_static_patterns(self):
         """Eval datasets are test-case data, not installed skill code."""
         for dataset_path in ("evals/evals.json", "eval/dataset.yaml"):
