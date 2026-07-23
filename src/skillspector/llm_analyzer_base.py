@@ -28,6 +28,7 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
@@ -41,6 +42,36 @@ from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
 
 logger = get_logger(__name__)
+
+DEFAULT_MAX_LLM_CONCURRENCY = 10
+
+
+def resolve_max_concurrency() -> int:
+    """Resolve the LLM fan-out concurrency from ``SKILLSPECTOR_MAX_LLM_CONCURRENCY``.
+
+    Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
+    providers (free tiers with a low RPM) can set it to ``1`` to serialize
+    requests instead of bursting up to 10 in parallel — a burst that otherwise
+    guarantees 429s, and 429'd batches are dropped from the result (see the
+    analyzer fan-out below). Invalid values fall back to the default; values
+    below 1 are clamped to 1.
+    """
+    raw = os.environ.get("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "").strip()
+    if not raw:
+        return DEFAULT_MAX_LLM_CONCURRENCY
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SKILLSPECTOR_MAX_LLM_CONCURRENCY=%r (not an int); using %d",
+            raw,
+            DEFAULT_MAX_LLM_CONCURRENCY,
+        )
+        return DEFAULT_MAX_LLM_CONCURRENCY
+    if value < 1:
+        logger.warning("SKILLSPECTOR_MAX_LLM_CONCURRENCY=%d < 1; clamping to 1", value)
+        return 1
+    return value
 
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
@@ -398,7 +429,7 @@ class LLMAnalyzerBase:
         self,
         batches: list[Batch],
         *,
-        max_concurrency: int = 10,
+        max_concurrency: int | None = None,
         **kwargs: object,
     ) -> list[tuple[Batch, list]]:
         """Execute LLM calls for all *batches* concurrently.
@@ -406,6 +437,11 @@ class LLMAnalyzerBase:
         Uses ``asyncio.gather`` with a semaphore to run up to
         *max_concurrency* LLM requests in parallel.  Both cross-file and
         cross-chunk batches are parallelized in a single gather call.
+
+        When *max_concurrency* is ``None`` (the default) it is resolved from
+        ``SKILLSPECTOR_MAX_LLM_CONCURRENCY`` via :func:`resolve_max_concurrency`,
+        so users on rate-limited providers can serialize the fan-out; an
+        explicit argument still wins.
 
         Failures are isolated per batch: a transient error (timeout, 429,
         oversized-chunk 400, ...) costs only its own batch, which is logged
@@ -417,6 +453,8 @@ class LLMAnalyzerBase:
 
         The return type mirrors :meth:`run_batches`.
         """
+        if max_concurrency is None:
+            max_concurrency = resolve_max_concurrency()
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:

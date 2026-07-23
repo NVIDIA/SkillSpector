@@ -24,6 +24,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from skillspector.llm_analyzer_base import (
+    DEFAULT_MAX_LLM_CONCURRENCY,
     Batch,
     LLMAnalysisResult,
     LLMAnalyzerBase,
@@ -32,6 +33,7 @@ from skillspector.llm_analyzer_base import (
     estimate_tokens,
     findings_in_range,
     number_lines,
+    resolve_max_concurrency,
 )
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
@@ -44,6 +46,28 @@ from skillspector.nodes.meta_analyzer import (
 # ---------------------------------------------------------------------------
 # estimate_tokens
 # ---------------------------------------------------------------------------
+
+
+class TestResolveMaxConcurrency:
+    def test_unset_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
+        assert resolve_max_concurrency() == DEFAULT_MAX_LLM_CONCURRENCY
+
+    def test_valid_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "1")
+        assert resolve_max_concurrency() == 1
+
+    def test_blank_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "  ")
+        assert resolve_max_concurrency() == DEFAULT_MAX_LLM_CONCURRENCY
+
+    def test_invalid_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "abc")
+        assert resolve_max_concurrency() == DEFAULT_MAX_LLM_CONCURRENCY
+
+    def test_below_one_clamps_to_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "0")
+        assert resolve_max_concurrency() == 1
 
 
 class TestEstimateTokens:
