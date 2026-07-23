@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import warnings
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -31,6 +32,8 @@ from typing import Annotated
 import typer
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.tree import Tree
 
 from skillspector import __version__
 from skillspector.cleanup import cleanup_result
@@ -38,6 +41,7 @@ from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
+from skillspector.nodes.analyzers import ANALYZER_NODE_IDS
 from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
 
 logger = get_logger(__name__)
@@ -326,7 +330,80 @@ def scan(
             not no_llm,
         )
         trace_config = _build_trace_config(input_path, format, no_llm)
-        result = graph.invoke(state, config=trace_config)
+        if verbose:
+            result = graph.invoke(state, config=trace_config)
+        else:
+            total_steps = 4 + len(ANALYZER_NODE_IDS)
+            result = dict(state)
+
+            # Use stderr for progress so stdout remains clean for structured outputs
+            err_console = Console(stderr=True)
+
+            # Suppress noisy Pydantic serialization warnings scoped to the graph run
+            with warnings.catch_warnings(), Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                console=err_console,
+                transient=True,
+            ) as progress:
+                warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+                task_id = progress.add_task("Resolving input...", total=total_steps)
+
+                num_files = 0
+                analyzers_done = 0
+                total_analyzers = len(ANALYZER_NODE_IDS)
+
+                for update in graph.stream(state, config=trace_config, stream_mode="updates"):
+                    for node_name, node_output in update.items():
+                        progress.advance(task_id)
+
+                        # Accumulate scalar outputs needed by the CLI (report_body, risk_score, temp_dir, sarif_report)
+                        if "temp_dir_for_cleanup" in node_output:
+                            result["temp_dir_for_cleanup"] = node_output["temp_dir_for_cleanup"]
+                        if "report_body" in node_output:
+                            result["report_body"] = node_output["report_body"]
+                        if "sarif_report" in node_output:
+                            result["sarif_report"] = node_output["sarif_report"]
+                        if "risk_score" in node_output:
+                            result["risk_score"] = node_output["risk_score"]
+
+                        # Update UI text based on graph progression
+                        if node_name == "resolve_input":
+                            progress.update(task_id, description="Building context...")
+                        elif node_name == "build_context":
+                            components = node_output.get("components", [])
+                            num_files = len(components)
+                            progress.update(task_id, description=f"Analyzing {num_files} files (0/{total_analyzers} rules applied)...")
+
+                            # Print a proper report of the files and directories being scanned
+                            tree = Tree("[bold blue]Discovered Files to Scan[/bold blue]")
+                            nodes = {"": tree}
+                            for path in sorted(components):
+                                parts = Path(path).parts
+                                current = ""
+                                for part in parts:
+                                    parent = current
+                                    current = f"{current}/{part}" if current else part
+                                    if current not in nodes:
+                                        is_file = current == path
+                                        icon = "📄 " if is_file else "📁 "
+                                        style = "green" if is_file else "cyan"
+                                        nodes[current] = nodes[parent].add(f"[{style}]{icon}{part}[/{style}]")
+
+                            err_console.print(tree)
+                            err_console.print()
+
+                        elif node_name in ANALYZER_NODE_IDS:
+                            analyzers_done += 1
+                            progress.update(task_id, description=f"Analyzing {num_files} files ({analyzers_done}/{total_analyzers} rules applied)...")
+                            # Print which rule just finished above the progress bar
+                            err_console.print(f"[dim]✔ Rule completed: {node_name}[/dim]")
+                        elif node_name == "meta_analyzer":
+                            progress.update(task_id, description="Generating report...")
+                            err_console.print("[dim]✔ Rule completed: meta_analyzer (filtering findings)[/dim]")
 
         _write_result(result, output, format)
 
