@@ -20,9 +20,11 @@ to drop before scoring and reporting. It supports two complementary mechanisms:
 
 * ``rules`` — human-authored, glob-based suppressions. A finding is suppressed
   when every field a rule specifies (``id``, ``path``, ``message``) glob-matches
-  the finding. Unspecified fields match anything. This covers both global
-  pattern suppression (e.g. ``id: "SQP-1"``) and skill/file-scoped suppression
-  (e.g. ``id: "SSD-2"`` + ``path: "deploy-topology-execute-scripts/SKILL.md"``).
+  the finding. ``message`` covers both the analyzer description and the matched
+  text surfaced as ``finding`` in reports. Unspecified fields match anything.
+  This covers both global pattern suppression (e.g. ``id: "SQP-1"``) and
+  skill/file-scoped suppression (e.g. ``id: "SSD-2"`` +
+  ``path: "deploy-topology-execute-scripts/SKILL.md"``).
 
 * ``fingerprints`` — machine-generated exact suppressions. Each entry is the
   stable hash of one known finding, so re-scans only surface *new* findings.
@@ -120,8 +122,14 @@ class SuppressionRule:
             return False
         if self.path is not None and not _match_glob(finding.file or "", self.path):
             return False
-        if self.message is not None and not _match_glob(finding.message or "", self.message):
-            return False
+        if self.message is not None:
+            message_candidates = (
+                finding.message or "",
+                finding.finding or "",
+                finding.matched_text or "",
+            )
+            if not any(_match_glob(candidate, self.message) for candidate in message_candidates):
+                return False
         return True
 
 

@@ -1,3 +1,12 @@
+### 2.4.3 (Wednesday, July 22, 2026)
+### Features/Bug Fixes
+* Clarify CLI runtime model fallback in provider docs
+* fix(provider): align Claude fallback contract with settings isolation (#295)
+* fix(provider): isolate Claude settings hooks in spawned CLI (#295)
+* fix(suppression): match reported finding text
+* ci: disable optional provider test
+* feat: publish a public-safe changelog
+---
 ### 2.4.2 (Tuesday, July 21, 2026)
 ### Features/Bug Fixes
 * fix(oss): keep internal provider references private

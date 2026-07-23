@@ -101,6 +101,43 @@ def test_rule_message_glob_is_case_insensitive_substring() -> None:
     assert not rule.matches(_finding(message="Reads environment variables"))
 
 
+def test_rule_message_glob_matches_report_finding_text() -> None:
+    rule = SuppressionRule(
+        path="*flow/scripts/cmd.py",
+        message="*shell=True*",
+        reason="Reviewed operator command",
+    )
+    finding = Finding(
+        rule_id="TM1",
+        message="Tool Parameter Abuse",
+        severity="HIGH",
+        file="flow/scripts/cmd.py",
+        start_line=178,
+        finding="subprocess.run(command, shell=True",
+        matched_text="subprocess.run(command, shell=True",
+    )
+
+    assert rule.matches(finding)
+
+
+def test_rule_message_glob_still_requires_other_selectors() -> None:
+    rule = SuppressionRule(
+        path="*flow/scripts/cmd.py",
+        message="*shell=True*",
+        reason="Reviewed operator command",
+    )
+    finding = Finding(
+        rule_id="TM1",
+        message="Tool Parameter Abuse",
+        severity="HIGH",
+        file="other/scripts/cmd.py",
+        start_line=178,
+        finding="subprocess.run(command, shell=True",
+    )
+
+    assert not rule.matches(finding)
+
+
 def test_double_star_is_alias_for_star() -> None:
     rule = SuppressionRule(path="**/SKILL.md", reason="any skill file")
     assert rule.matches(_finding(file="a/b/c/SKILL.md"))

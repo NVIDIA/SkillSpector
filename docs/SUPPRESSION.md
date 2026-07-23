@@ -52,7 +52,7 @@ rules:                       # human-authored, glob-based, drift-tolerant
     reason: "Trigger-phrase breadth is a description nit, not a vuln"
   - id: "SSD-2"
     path: "example-skill/SKILL.md"       # glob over the finding's file
-    message: "*example false-positive phrase*"   # glob over the finding's message
+    message: "*example false-positive phrase*"   # glob over its description or matched text
     reason: "False positive: benign trigger phrase, not an instruction"
 
 fingerprints:                # machine-generated, exact
@@ -78,7 +78,7 @@ Field reference:
 |-------|-----------------|-------|
 | `id` (or `rule_id`) | `Finding.rule_id` | glob |
 | `path` (or `file`) | `Finding.file` | glob; `*` crosses `/`, `**` is an alias for `*` |
-| `message` | `Finding.message` | glob, case-insensitive; wrap a keyword in `*` for substring |
+| `message` | `Finding.message`, plus the matched text shown as `finding` in reports | glob, case-insensitive; wrap a keyword in `*` for substring |
 | `reason` | — | required; recorded in reports and audits |
 
 Glob matching uses Python's [`fnmatch`](https://docs.python.org/3/library/fnmatch.html),
