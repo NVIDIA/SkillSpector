@@ -428,12 +428,39 @@ class LLMAnalyzerBase:
                     estimate_tokens(prompt),
                     len(batch.findings),
                 )
-                if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
-                else:
-                    response = _message_text(await self._llm.ainvoke(prompt))
-                logger.debug("LLM response for %s", batch.file_label)
-                return (batch, self.parse_response(response, batch))
+                try:
+                    if self._structured_llm:
+                        response = await self._structured_llm.ainvoke(prompt)
+                    else:
+                        response = _message_text(await self._llm.ainvoke(prompt))
+                    logger.debug("LLM response for %s", batch.file_label)
+                    parsed = self.parse_response(response, batch)
+                    return (batch, parsed)
+                except NotImplementedError as exc:
+                    # Do not retry on configuration / code errors
+                    raise exc
+                except Exception as exc:
+                    logger.warning(
+                        "LLM call/parse failed for %s: %s (attempting retry)",
+                        batch.file_label,
+                        exc,
+                    )
+                    # Retry once before throwing
+                    try:
+                        if self._structured_llm:
+                            response = await self._structured_llm.ainvoke(prompt)
+                        else:
+                            response = _message_text(await self._llm.ainvoke(prompt))
+                        logger.debug("LLM response for %s on retry", batch.file_label)
+                        parsed = self.parse_response(response, batch)
+                        return (batch, parsed)
+                    except Exception as retry_exc:
+                        logger.warning(
+                            "LLM call/parse retry failed for %s: %s",
+                            batch.file_label,
+                            retry_exc,
+                        )
+                        raise retry_exc
 
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         successful: list[tuple[Batch, list]] = []
