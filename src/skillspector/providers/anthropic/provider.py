@@ -15,11 +15,11 @@
 
 """Anthropic provider — Claude models via api.anthropic.com.
 
-Reads ``ANTHROPIC_API_KEY`` for credentials and constructs
-``langchain_anthropic.ChatAnthropic`` directly. Defaults to Opus 4.6 for
-analyzers and Sonnet 4.6 for ``meta_analyzer`` (cheaper for the
-high-volume filter pass), mirroring the policy used by
-``NvInferenceProvider``.
+Reads ``ANTHROPIC_API_KEY`` for credentials and honors ``ANTHROPIC_BASE_URL``
+as an explicit endpoint override (e.g. a local proxy); when unset, requests
+go to api.anthropic.com. Constructs ``langchain_anthropic.ChatAnthropic``
+directly. It defaults to Opus 4.6 for analyzers and Sonnet 4.6 for
+``meta_analyzer`` (cheaper for the high-volume filter pass).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from pydantic import SecretStr
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_reasoning_effort
 
-# Documented for completeness — ChatAnthropic defaults here when base_url=None.
+# Default endpoint; overridden by ``ANTHROPIC_BASE_URL`` when set.
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
@@ -49,11 +49,12 @@ class AnthropicProvider:
     }
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
-        """Return ``(api_key, base_url)`` from ``ANTHROPIC_API_KEY``."""
+        """Return ``(api_key, base_url)`` from ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_BASE_URL``."""
         api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         if not api_key:
             return None
-        return api_key, None
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or None
+        return api_key, base_url
 
     def create_chat_model(
         self,
@@ -67,11 +68,11 @@ class AnthropicProvider:
         if creds is None:
             return None
 
-        api_key, _ = creds
+        api_key, base_url = creds
         kwargs = {
             "model_name": model,
             "api_key": SecretStr(api_key),
-            "base_url": ANTHROPIC_BASE_URL,
+            "base_url": base_url or ANTHROPIC_BASE_URL,
             "max_tokens_to_sample": max_tokens,
             "timeout": timeout,
             "stop": None,

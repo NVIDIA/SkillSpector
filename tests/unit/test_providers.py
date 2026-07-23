@@ -45,7 +45,7 @@ from skillspector.providers import (
     resolve_provider_credentials,
     use_provider,
 )
-from skillspector.providers.anthropic import AnthropicProvider
+from skillspector.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicProvider
 from skillspector.providers.antigravity_cli import AntigravityCLIProvider
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
 from skillspector.providers.claude_cli import ClaudeCLIProvider
@@ -118,6 +118,7 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
@@ -300,7 +301,13 @@ class TestAnthropicProvider:
     ) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
         creds = AnthropicProvider().resolve_credentials()
-        assert creds == ("sk-ant-x", None)
+        assert creds == ("sk-ant-x", None)  # None → ChatAnthropic uses api.anthropic.com
+
+    def test_honors_anthropic_base_url_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:8787")
+        creds = AnthropicProvider().resolve_credentials()
+        assert creds == ("sk-ant-x", "http://localhost:8787")
 
     def test_creates_native_chat_anthropic(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
@@ -308,6 +315,17 @@ class TestAnthropicProvider:
         assert isinstance(llm, ChatAnthropic)
         assert llm.model == "claude-opus-4-6"
         assert llm.max_tokens == 123
+        # No override → ChatAnthropic points at the default Anthropic endpoint.
+        assert str(llm.anthropic_api_url).rstrip("/") == ANTHROPIC_BASE_URL.rstrip("/")
+
+    def test_create_chat_model_honors_base_url_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:8787")
+        llm = AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+        assert isinstance(llm, ChatAnthropic)
+        assert str(llm.anthropic_api_url).rstrip("/") == "http://localhost:8787"
 
     @pytest.mark.parametrize("effort", ["provider-specific-value"])
     def test_reasoning_effort_passthrough(
