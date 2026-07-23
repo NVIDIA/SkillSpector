@@ -334,7 +334,7 @@ claude mcp add skillspector -- skillspector mcp
 
 SkillSpector detects **68 vulnerability patterns** across 17 categories:
 
-### Prompt Injection (5 patterns)
+### Prompt Injection (6 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -343,6 +343,7 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 | P3 | Exfiltration Commands | HIGH | Instructions to transmit context externally |
 | P4 | Behavior Manipulation | MEDIUM | Subtle instructions altering agent decisions |
 | P5 | Harmful Content | CRITICAL | Instructions that could cause physical harm |
+| P9 | Whitespace Padding | MEDIUM | Large whitespace padding hiding instructions below/beside the visible area |
 
 ### Anti-Refusal (3 patterns)
 
