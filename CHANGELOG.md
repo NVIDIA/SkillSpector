@@ -1,6 +1,6 @@
 ### 2.4.4 (Thursday, July 23, 2026)
 ### Features/Bug Fixes
-* Import GitHub PR 301
+* fix(anthropic): re-apply ANTHROPIC_BASE_URL override reverted by 2.4.3 snapshot (#301)
 ---
 ### 2.4.3 (Wednesday, July 22, 2026)
 ### Features/Bug Fixes
