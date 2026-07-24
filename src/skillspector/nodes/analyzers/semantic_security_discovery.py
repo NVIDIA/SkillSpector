@@ -22,7 +22,13 @@ from pydantic import ValidationError
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.logging_config import get_logger
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call_record
+from skillspector.state import (
+    AnalyzerNodeResponse,
+    SkillspectorState,
+    llm_call_record,
+    transitive_note_truncation,
+    transitive_remaining_seconds,
+)
 
 ANALYZER_ID = "semantic_security_discovery"
 logger = get_logger(__name__)
@@ -74,6 +80,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         logger.info("%s: skipped (use_llm=False)", ANALYZER_ID)
         return {"findings": []}
 
+    timeout = transitive_remaining_seconds(state)
+    if timeout is not None and timeout <= 0:
+        transitive_note_truncation(state, f"LLM time budget exhausted before {ANALYZER_ID}")
+        logger.info("%s: skipped (transitive time budget exhausted)", ANALYZER_ID)
+        return {"findings": []}
+
     file_cache: dict[str, str] = state.get("file_cache") or {}
     components: list[str] = state.get("components") or sorted(file_cache.keys())
     if not components:
@@ -85,7 +97,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
 
     try:
-        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model)
+        analyzer = LLMAnalyzerBase(
+            base_prompt=ANALYZER_PROMPT,
+            model=model,
+            timeout=lambda: transitive_remaining_seconds(state),
+        )
         batches = analyzer.get_batches(components, file_cache)
         results = analyzer.run_batches(batches)
         findings = analyzer.collect_findings(results)

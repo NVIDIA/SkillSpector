@@ -28,7 +28,12 @@ import yaml
 
 from skillspector.constants import build_model_config
 from skillspector.logging_config import get_logger
-from skillspector.state import SkillspectorState
+from skillspector.state import (
+    SkillspectorState,
+    transitive_note_truncation,
+    transitive_remaining_bytes,
+    transitive_traversal_state,
+)
 
 logger = get_logger(__name__)
 
@@ -108,80 +113,90 @@ def _infer_file_type(path: str) -> str:
     return _FILE_TYPES.get(suffix, "other")
 
 
-def _count_lines(file_path: Path) -> int:
-    """Count lines in a file, handling binary and errors gracefully."""
-    try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
-        return len(content.splitlines())
-    except OSError:
-        logger.debug("Could not read file for line count: %s", file_path)
-        return 0
-
-
 def _build_component_metadata(
-    skill_dir: Path, components: list[str]
+    components: list[str], file_cache: dict[str, str]
 ) -> tuple[list[dict[str, object]], bool]:
     """Build component_metadata list and has_executable_scripts from paths."""
     metadata: list[dict[str, object]] = []
     has_executable = False
     for path in components:
-        full = skill_dir / path
-        if not full.is_file():
-            continue
-        suffix = full.suffix.lower()
+        content = file_cache.get(path)
+        suffix = Path(path).suffix.lower()
         file_type = _infer_file_type(path)
-        lines = _count_lines(full)
+        lines = len(content.splitlines()) if content is not None else 0
         executable = suffix in _EXECUTABLE_EXTENSIONS
         if executable:
             has_executable = True
-        try:
-            size_bytes = full.stat().st_size
-        except OSError:
-            logger.debug("Could not stat file: %s", path)
-            size_bytes = 0
         metadata.append(
             {
                 "path": path,
                 "type": file_type,
                 "lines": lines,
                 "executable": executable,
-                "size_bytes": size_bytes,
+                "size_bytes": len(content.encode("utf-8")) if content is not None else 0,
             }
         )
     return metadata, has_executable
 
 
-def _read_file_cache(skill_dir: Path, components: list[str]) -> dict[str, str]:
+def _read_file_cache(
+    skill_dir: Path, components: list[str], state: SkillspectorState
+) -> dict[str, str]:
     """Build file_cache: relative path -> file contents. Uses utf-8 with replace for errors."""
     file_cache: dict[str, str] = {}
+    traversal = transitive_traversal_state(state)
+    remaining_bytes = transitive_remaining_bytes(state)
     for path in components:
         full = skill_dir / path
         if not full.is_file():
             continue
         try:
+            size_bytes = full.stat().st_size
+        except OSError:
+            logger.debug("Could not stat file before read: %s", path)
+            size_bytes = None
+        if remaining_bytes is not None and size_bytes is not None and size_bytes > remaining_bytes:
+            logger.warning(
+                "File read for %s exceeded remaining byte budget: %d > %d",
+                path,
+                size_bytes,
+                remaining_bytes,
+            )
+            transitive_note_truncation(state, f"byte budget exhausted before reading {path}")
+            break
+        try:
             content = full.read_text(encoding="utf-8", errors="replace")
-            file_cache[path] = content
         except OSError:
             logger.debug("Could not read file: %s", path)
-            file_cache[path] = ""
+            content = ""
+        content_bytes = len(content.encode("utf-8"))
+        if remaining_bytes is not None and size_bytes is None and content_bytes > remaining_bytes:
+            logger.warning(
+                "File read for %s exceeded remaining byte budget: %d > %d",
+                path,
+                content_bytes,
+                remaining_bytes,
+            )
+            transitive_note_truncation(state, f"byte budget exhausted while reading {path}")
+            break
+        file_cache[path] = content
+        record_bytes = getattr(traversal, "record_bytes", None)
+        if callable(record_bytes):
+            record_bytes(content_bytes)
+        remaining_bytes = transitive_remaining_bytes(state)
     return file_cache
 
 
-def _parse_manifest(skill_dir: Path) -> dict[str, object]:
+def _parse_manifest(file_cache: dict[str, str]) -> dict[str, object]:
     """Parse SKILL.md or skill.md YAML frontmatter into a manifest dict.
 
     Returns dict with name, description, triggers (list), permissions (list),
     allowed-tools (list), parameters (list). Returns {} if no file or parse fails.
     """
     for name in ("SKILL.md", "skill.md"):
-        path = skill_dir / name
-        if not path.is_file():
+        content = file_cache.get(name)
+        if content is None:
             continue
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            logger.debug("Could not read manifest file: %s", name)
-            return {}
         if not content.startswith("---"):
             return {}
         end_match = re.search(r"\n---\s*\n", content[3:])
@@ -236,9 +251,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     skill_dir = _resolve_skill_dir(state)
 
     components = _walk_skill_files(skill_dir)
-    file_cache = _read_file_cache(skill_dir, components)
-    manifest = _parse_manifest(skill_dir)
-    component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)
+    file_cache = _read_file_cache(skill_dir, components, state)
+    manifest = _parse_manifest(file_cache)
+    component_metadata, has_executable_scripts = _build_component_metadata(components, file_cache)
+    traversal = transitive_traversal_state(state)
+    truncation_reasons = list(getattr(traversal, "truncation_reasons", []) or [])
 
     return {
         "components": components,
@@ -249,4 +266,6 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "model_config": build_model_config(),
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
+        "transitive_truncated": bool(truncation_reasons),
+        "transitive_truncation_reasons": truncation_reasons,
     }

@@ -36,7 +36,7 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -55,12 +55,37 @@ ALLOWED_GIT_HOSTS = frozenset(
 ALLOWED_DOWNLOAD_HOSTS = frozenset(
     {
         "github.com",
+        "codeload.github.com",
         "raw.githubusercontent.com",
         "gitlab.com",
         "bitbucket.org",
         "huggingface.co",
     }
 )
+
+_DIRECT_FILE_URL_SUFFIXES = (
+    ".md",
+    ".py",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".js",
+    ".ts",
+    ".rb",
+    ".go",
+    ".rs",
+    ".pl",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".txt",
+    ".zip",
+)
+
+
+class _TraversalBudgetError(ValueError):
+    """Raised when transitive download work should truncate rather than hard-fail."""
 
 
 def _is_private_ip(host: str) -> bool:
@@ -88,8 +113,9 @@ class InputHandler:
     Normalizes all inputs to a local directory path for scanning.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, transitive_budget: object | None = None) -> None:
         self._temp_dir: Path | None = None
+        self._transitive_budget = transitive_budget
 
     def resolve(self, input_path: str) -> tuple[Path, str]:
         """
@@ -141,6 +167,49 @@ class InputHandler:
             self._temp_dir = Path(tempfile.mkdtemp(prefix="skillspector_"))
         return self._temp_dir
 
+    def _remaining_seconds(self) -> float | None:
+        remaining = getattr(self._transitive_budget, "remaining_seconds", None)
+        if callable(remaining):
+            try:
+                return float(remaining())
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _remaining_bytes(self) -> int | None:
+        remaining = getattr(self._transitive_budget, "remaining_bytes", None)
+        if callable(remaining):
+            try:
+                return int(remaining())
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _note_truncation(self, reason: str) -> None:
+        note = getattr(self._transitive_budget, "note_truncation", None)
+        if callable(note):
+            note(reason)
+
+    def _empty_result_dir(self, reason: str, name: str) -> Path:
+        self._note_truncation(reason)
+        temp_dir = self._get_temp_dir()
+        target = temp_dir / name
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _measure_tree_bytes(self, root: Path) -> int:
+        total = 0
+        for path in root.rglob("*"):
+            if not path.is_file() or ".git" in path.parts:
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                logger.debug("Could not stat cloned file: %s", path)
+        return total
+
     def _is_git_url(self, path: str) -> bool:
         """Check if path is a Git repository URL."""
         if not path.startswith(("http://", "https://", "git@")):
@@ -148,7 +217,11 @@ class InputHandler:
         parsed = urlparse(path)
         host = parsed.hostname or ""
         if any(allowed in host for allowed in ALLOWED_GIT_HOSTS):
-            if "/raw/" in path or "/blob/" in path or path.endswith((".md", ".py", ".sh")):
+            if (
+                "/raw/" in path
+                or "/blob/" in path
+                or path.lower().endswith(_DIRECT_FILE_URL_SUFFIXES)
+            ):
                 return False
             return True
         if path.endswith(".git"):
@@ -195,12 +268,26 @@ class InputHandler:
         self._validate_url_host(url, ALLOWED_GIT_HOSTS)
         temp_dir = self._get_temp_dir()
         clone_dir = temp_dir / "repo"
+        remaining_seconds = self._remaining_seconds()
+        remaining_bytes = self._remaining_bytes()
+        if remaining_seconds is not None and remaining_seconds <= 0:
+            return self._empty_result_dir(
+                "Transitive time budget exhausted before git clone", "repo"
+            )
+        if remaining_bytes is not None and remaining_bytes <= 0:
+            return self._empty_result_dir(
+                "Transitive byte budget exhausted before git clone", "repo"
+            )
+        clone_cmd = ["git", "clone", "--depth", "1"]
+        if remaining_bytes is not None and remaining_bytes > 0:
+            clone_cmd.append(f"--filter=blob:limit={remaining_bytes}")
+        clone_cmd.extend([url, str(clone_dir)])
         try:
             subprocess.run(
-                ["git", "clone", "--depth", "1", url, str(clone_dir)],
+                clone_cmd,
                 check=True,
                 capture_output=True,
-                timeout=60,
+                timeout=remaining_seconds if remaining_seconds is not None else 60,
                 shell=False,
             )
         except subprocess.CalledProcessError as e:
@@ -208,37 +295,94 @@ class InputHandler:
             raise ValueError(f"Failed to clone repository: {e.stderr.decode()}") from e
         except subprocess.TimeoutExpired:
             logger.warning("Git clone timed out for %s", url)
-            raise ValueError("Git clone timed out after 60 seconds") from None
+            raise ValueError(
+                f"Git clone timed out after {remaining_seconds or 60:.0f} seconds"
+            ) from None
         except FileNotFoundError:
             logger.warning("Git not found when cloning %s", url)
             raise ValueError(
                 "Git is not installed. Please install git to scan repositories."
             ) from None
+        if remaining_bytes is not None:
+            cloned_size = self._measure_tree_bytes(clone_dir)
+            if cloned_size > remaining_bytes:
+                logger.warning(
+                    "Git clone for %s exceeded remaining byte budget: %d > %d",
+                    url,
+                    cloned_size,
+                    remaining_bytes,
+                )
+                return self._empty_result_dir(
+                    "Transitive byte budget exceeded by cloned repository", "repo"
+                )
         return clone_dir
 
     def _download_file(self, url: str) -> Path:
         """Download a file from URL to a temporary directory."""
-        self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)
         temp_dir = self._get_temp_dir()
-        parsed = urlparse(url)
-        filename = Path(parsed.path).name or "SKILL.md"
         try:
-            with httpx.Client(follow_redirects=False, timeout=30) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                content = response.content
+            response_headers, final_url, content = self._download_with_redirect_validation(url)
+            parsed = urlparse(final_url)
+            filename = Path(parsed.path).name or "SKILL.md"
+        except _TraversalBudgetError as e:
+            return self._empty_result_dir(str(e), "download")
+        except httpx.TimeoutException as e:
+            if self._remaining_seconds() is not None:
+                logger.warning("Download timed out under transitive budget for %s: %s", url, e)
+                return self._empty_result_dir(
+                    "Transitive time budget exhausted during download", "download"
+                )
+            logger.warning("Download failed for %s: %s", url, e)
+            raise ValueError(f"Failed to download file: {e}") from e
         except httpx.HTTPError as e:
             logger.warning("Download failed for %s: %s", url, e)
             raise ValueError(f"Failed to download file: {e}") from e
-        if filename.endswith(".zip") or (
-            response.headers.get("content-type", "").startswith("application/zip")
-        ):
+        content_type = response_headers.get("content-type", "")
+
+        if filename.endswith(".zip") or content_type.startswith("application/zip"):
             zip_path = temp_dir / "download.zip"
             zip_path.write_bytes(content)
             return self._extract_zip(zip_path)
         file_path = temp_dir / filename
         file_path.write_bytes(content)
         return temp_dir
+
+    def _download_with_redirect_validation(self, url: str) -> tuple[dict[str, str], str, bytes]:
+        current_url = url
+        for _ in range(5):
+            remaining_seconds = self._remaining_seconds()
+            if remaining_seconds is not None and remaining_seconds <= 0:
+                raise _TraversalBudgetError("Transitive time budget exhausted before download")
+            self._validate_url_host(current_url, ALLOWED_DOWNLOAD_HOSTS)
+            with httpx.Client(follow_redirects=False, timeout=remaining_seconds or 30) as client:
+                with client.stream("GET", current_url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError(f"Redirect response missing location: {current_url}")
+                        current_url = urljoin(current_url, location)
+                        continue
+                    response.raise_for_status()
+                    remaining_bytes = self._remaining_bytes()
+                    if remaining_bytes is not None and remaining_bytes <= 0:
+                        raise _TraversalBudgetError(
+                            "Transitive byte budget exhausted before download"
+                        )
+                    content = bytearray()
+                    for chunk in response.iter_bytes():
+                        remaining_seconds = self._remaining_seconds()
+                        if remaining_seconds is not None and remaining_seconds <= 0:
+                            raise _TraversalBudgetError(
+                                "Transitive time budget exhausted during download"
+                            )
+                        if chunk:
+                            content.extend(chunk)
+                            if remaining_bytes is not None and len(content) > remaining_bytes:
+                                raise _TraversalBudgetError(
+                                    "Transitive byte budget exceeded by downloaded file"
+                                )
+                    return dict(response.headers), current_url, bytes(content)
+        raise ValueError(f"Too many redirects while downloading: {url}")
 
     def _extract_zip(self, zip_path: Path) -> Path:
         """Extract a zip file to a temporary directory with path traversal protection."""
@@ -247,6 +391,11 @@ class InputHandler:
         temp_dir = self._get_temp_dir()
         extract_dir = temp_dir / "extracted"
         extract_dir.mkdir(exist_ok=True)
+        remaining_bytes = self._remaining_bytes()
+        if remaining_bytes is not None and remaining_bytes <= 0:
+            return self._empty_result_dir(
+                "Transitive byte budget exhausted before zip extraction", "extracted"
+            )
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 for member in zf.namelist():
@@ -255,6 +404,19 @@ class InputHandler:
                         raise ValueError(
                             f"Zip entry '{member}' would escape extraction directory (zip-slip). "
                             "Archive is potentially malicious."
+                        )
+                if remaining_bytes is not None:
+                    uncompressed_total = sum(info.file_size for info in zf.infolist())
+                    if uncompressed_total > remaining_bytes:
+                        logger.warning(
+                            "Zip extraction for %s exceeded remaining byte budget: %d > %d",
+                            zip_path,
+                            uncompressed_total,
+                            remaining_bytes,
+                        )
+                        return self._empty_result_dir(
+                            "Transitive byte budget exceeded by zip extraction",
+                            "extracted",
                         )
                 zf.extractall(extract_dir)
         except zipfile.BadZipFile:
@@ -269,6 +431,25 @@ class InputHandler:
         """Wrap a single file in a temporary directory for consistent handling."""
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}") from None
+        remaining_bytes = self._remaining_bytes()
+        if remaining_bytes is not None and remaining_bytes <= 0:
+            return self._empty_result_dir(
+                "Transitive byte budget exhausted before file copy", "file"
+            )
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            file_size = 0
+        if remaining_bytes is not None and file_size > remaining_bytes:
+            logger.warning(
+                "Single file copy for %s exceeded remaining byte budget: %d > %d",
+                file_path,
+                file_size,
+                remaining_bytes,
+            )
+            return self._empty_result_dir(
+                "Transitive byte budget exceeded by single-file input", "file"
+            )
         temp_dir = self._get_temp_dir()
         dest = temp_dir / file_path.name
         shutil.copy2(file_path, dest)

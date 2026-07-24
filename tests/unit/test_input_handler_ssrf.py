@@ -121,9 +121,10 @@ class TestDownloadSSRF:
     @patch("skillspector.input_handler.httpx.Client")
     def test_raw_githubusercontent_allowed(self, mock_client_cls) -> None:
         mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_response = mock_client.get.return_value
-        mock_response.content = b"# SKILL.md content"
+        mock_response = mock_client.stream.return_value.__enter__.return_value
+        mock_response.status_code = 200
         mock_response.headers = {}
+        mock_response.iter_bytes.return_value = [b"# SKILL.md content"]
         handler = InputHandler()
         result = handler._download_file(
             "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/SKILL.md"
@@ -135,8 +136,10 @@ class TestDownloadSSRF:
     def test_download_does_not_follow_redirects(self, mock_client_cls) -> None:
         """Redirects are disabled to prevent SSRF via open-redirect on allowed hosts."""
         mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.get.return_value.content = b"# content"
-        mock_client.get.return_value.headers = {}
+        mock_response = mock_client.stream.return_value.__enter__.return_value
+        mock_response.status_code = 200
+        mock_response.headers = {}
+        mock_response.iter_bytes.return_value = [b"# content"]
         handler = InputHandler()
         try:
             handler._download_file(

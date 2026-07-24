@@ -26,7 +26,13 @@ from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call_record
+from skillspector.state import (
+    AnalyzerNodeResponse,
+    SkillspectorState,
+    llm_call_record,
+    transitive_note_truncation,
+    transitive_remaining_seconds,
+)
 
 ANALYZER_ID = "semantic_quality_policy"
 logger = get_logger(__name__)
@@ -131,6 +137,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     if not state.get("use_llm", True):
         return {"findings": []}
 
+    timeout = transitive_remaining_seconds(state)
+    if timeout is not None and timeout <= 0:
+        transitive_note_truncation(state, f"LLM time budget exhausted before {ANALYZER_ID}")
+        logger.info("%s: skipped (transitive time budget exhausted)", ANALYZER_ID)
+        return {"findings": []}
+
     file_cache: dict[str, str] = state.get("file_cache") or {}
     files = sorted(file_cache.keys())
     if not files:
@@ -142,7 +154,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
 
     try:
-        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model)
+        analyzer = LLMAnalyzerBase(
+            base_prompt=ANALYZER_PROMPT,
+            model=model,
+            timeout=lambda: transitive_remaining_seconds(state),
+        )
         batches = analyzer.get_batches(files, file_cache)
         results = run_async(analyzer.arun_batches(batches))
         findings = analyzer.collect_findings(results)

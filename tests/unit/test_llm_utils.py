@@ -227,7 +227,9 @@ class TestChatCompletion:
                 assert prompt == "ping"
                 return AIMessage(content="hello world")
 
-        monkeypatch.setattr(llm_utils, "get_chat_model", lambda model=None: _FakeLLM())
+        monkeypatch.setattr(
+            llm_utils, "get_chat_model", lambda model=None, timeout=None: _FakeLLM()
+        )
         assert chat_completion("ping") == "hello world"
 
     def test_returns_text_from_langchain_content_blocks(
@@ -239,7 +241,9 @@ class TestChatCompletion:
 
         captured: dict[str, str | None] = {}
 
-        def _fake_get_chat_model(model: str | None = None) -> _FakeLLM:
+        def _fake_get_chat_model(
+            model: str | None = None, timeout: float | None = None
+        ) -> _FakeLLM:
             captured["model"] = model
             return _FakeLLM()
 
@@ -253,7 +257,9 @@ class TestChatCompletion:
             def invoke(self, prompt: str) -> AIMessage:
                 return AIMessage(content="")
 
-        monkeypatch.setattr(llm_utils, "get_chat_model", lambda model=None: _FakeLLM())
+        monkeypatch.setattr(
+            llm_utils, "get_chat_model", lambda model=None, timeout=None: _FakeLLM()
+        )
         assert chat_completion("prompt") == ""
 
 
@@ -350,6 +356,21 @@ class TestChatCompletionCLIDispatch:
         call_kwargs = fake_complete.call_args[1]
         assert call_kwargs["model"] == "claude-haiku-3-5"
 
+    def test_dispatches_timeout_to_cli_provider_complete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
+
+        fake_complete = MagicMock(return_value="mocked CLI response")
+        with patch(
+            "skillspector.providers.claude_cli.provider.ClaudeCLIProvider.complete",
+            fake_complete,
+        ):
+            result = chat_completion("test prompt", model="claude-haiku-3-5", timeout=17.5)
+
+        assert result == "mocked CLI response"
+        assert fake_complete.call_args[1]["timeout"] == 17.5
+
     def test_does_not_call_complete_for_http_provider(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -388,9 +409,10 @@ class TestGetChatModelCLIAdapter:
         with patch(
             "skillspector.providers.claude_cli.provider.ClaudeCLIProvider.complete",
             MagicMock(return_value="hello"),
-        ):
+        ) as fake_complete:
             msg = get_chat_model(model="claude-sonnet-4-6").invoke("hi")
         assert msg.content == "hello"
+        assert fake_complete.call_args[1]["timeout"] is None
 
     def test_structured_output_parses_and_validates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")
@@ -403,15 +425,16 @@ class TestGetChatModelCLIAdapter:
         with patch(
             "skillspector.providers.claude_cli.provider.ClaudeCLIProvider.complete",
             MagicMock(return_value=raw),
-        ):
+        ) as fake_complete:
             out = (
-                get_chat_model(model="claude-sonnet-4-6")
+                get_chat_model(model="claude-sonnet-4-6", timeout=12.0)
                 .with_structured_output(_Schema)
                 .invoke("x")
             )
         assert isinstance(out, _Schema)
         assert out.verdict == "unsafe"
         assert out.score == 7
+        assert fake_complete.call_args[1]["timeout"] == 12.0
 
     def test_structured_output_fail_closed_on_garbage(
         self, monkeypatch: pytest.MonkeyPatch

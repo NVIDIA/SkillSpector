@@ -92,15 +92,16 @@ def finding_fingerprint(finding: Finding) -> str:
     LLM message will change the fingerprint — regenerate the baseline when a skill
     changes materially. Use ``rules`` for drift-tolerant suppression.
     """
-    raw = "|".join(
-        [
-            finding.rule_id or "",
-            finding.file or "",
-            str(finding.start_line or ""),
-            str(finding.end_line or ""),
-            (finding.message or "").strip(),
-        ]
-    )
+    fields = [
+        finding.rule_id or "",
+        finding.file or "",
+        str(finding.start_line or ""),
+        str(finding.end_line or ""),
+        (finding.message or "").strip(),
+    ]
+    if finding.source_url or finding.transitive_depth:
+        fields.extend([finding.source_url or "", str(finding.transitive_depth or 0)])
+    raw = "|".join(fields)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"sha256:{digest}"
 

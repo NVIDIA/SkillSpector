@@ -87,6 +87,15 @@ class SkillspectorState(TypedDict, total=False):
     sarif_report: dict[str, object]
     risk_score: int
 
+    # Transitive traversal metadata for report output and CLI summaries.
+    transitive_finding_count: int
+    transitive_sources: list[str]
+    transitive_targets_scanned: int
+    transitive_bytes_scanned: int
+    transitive_truncated: bool
+    transitive_truncation_reasons: list[str]
+    transitive_traversal_state: object
+
     # Additional YARA rules directory (user-specified via --yara-rules-dir)
     yara_rules_dir: str | None
 
@@ -108,6 +117,44 @@ def llm_call_record(node_id: str, *, ok: bool, error: str | None = None) -> LLMC
     not mistaken for "the LLM ran and found nothing").
     """
     return {"node": node_id, "ok": ok, "error": error}
+
+
+def transitive_traversal_state(state: SkillspectorState) -> object | None:
+    """Return the shared transitive traversal object, when one is present."""
+    traversal = state.get("transitive_traversal_state")
+    return traversal if traversal is not None else None
+
+
+def transitive_remaining_seconds(state: SkillspectorState) -> float | None:
+    """Return the remaining transitive deadline in seconds, when available."""
+    traversal = transitive_traversal_state(state)
+    remaining = getattr(traversal, "remaining_seconds", None)
+    if callable(remaining):
+        try:
+            return float(remaining())
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def transitive_remaining_bytes(state: SkillspectorState) -> int | None:
+    """Return the remaining transitive byte allowance, when available."""
+    traversal = transitive_traversal_state(state)
+    remaining = getattr(traversal, "remaining_bytes", None)
+    if callable(remaining):
+        try:
+            return int(remaining())
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def transitive_note_truncation(state: SkillspectorState, reason: str) -> None:
+    """Record a transitive truncation reason on the shared traversal object."""
+    traversal = transitive_traversal_state(state)
+    note = getattr(traversal, "note_truncation", None)
+    if callable(note):
+        note(reason)
 
 
 class AnalyzerNodeResponse(TypedDict):

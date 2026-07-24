@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from skillspector.models import Finding
 from skillspector.nodes.report import _build_sarif
+from skillspector.sarif_models import validate_sarif_report
 from skillspector.suppression import SuppressedFinding
 
 
@@ -215,3 +216,16 @@ class TestSarifResultProperties:
         assert result["properties"]["finding"] == "credential leak"
         assert result["properties"]["explanation"] == "Credential material is exposed in output"
         assert result["properties"]["intent"] == "exposed_secret"
+
+
+def test_sarif_transitive_properties_validate() -> None:
+    """Transitive provenance lands in SARIF properties and still validates."""
+    finding = _make_finding("TR1", "Transitive Dependency")
+    finding.transitive_depth = 2
+    finding.source_url = "https://github.com/org/dep"
+    sarif = _build_sarif([finding])
+    validate_sarif_report(sarif)
+    result = sarif["runs"][0]["results"][0]
+    properties = result["properties"]
+    assert properties["transitiveDepth"] == 2
+    assert properties["sourceUrl"] == "https://github.com/org/dep"
