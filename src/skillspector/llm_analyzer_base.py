@@ -46,6 +46,38 @@ logger = get_logger(__name__)
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
 
+_MEDIA_FILE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".webp",
+    ".avif",
+    ".heic",
+    ".heif",
+    ".tif",
+    ".tiff",
+    ".mp3",
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".mp4",
+    ".m4v",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".mkv",
+    ".mpeg",
+    ".mpg",
+    ".ogv",
+    ".3gp",
+)
+
 
 # ---------------------------------------------------------------------------
 # Default structured-output schemas (discovery mode)
@@ -303,6 +335,9 @@ class LLMAnalyzerBase:
 
         batches: list[Batch] = []
         for path in file_paths:
+            if path.lower().endswith(_MEDIA_FILE_EXTENSIONS):
+                logger.info("Skipping media file from LLM analysis: %s", path)
+                continue
             content = file_cache.get(path) or "No content available for this file."
             file_findings = findings_by_file.get(path, [])
 

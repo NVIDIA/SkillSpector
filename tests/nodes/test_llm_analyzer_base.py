@@ -204,6 +204,44 @@ class TestNumberLines:
 
 
 # ---------------------------------------------------------------------------
+# LLMAnalyzerBase.get_batches
+# ---------------------------------------------------------------------------
+
+
+class TestLLMAnalyzerBaseGetBatches:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "assets/demo.gif",
+            "assets/screenshot.PNG",
+            "assets/tutorial.mp4",
+            "assets/voice.mp3",
+            "assets/photo.webp",
+            "assets/movie.mkv",
+        ],
+    )
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_media_files_are_skipped(self, path: str) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+
+        assert analyzer.get_batches([path], {path: "decoded media data"}) == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_text_files_and_svg_are_preserved(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        file_cache = {
+            "src/main.py": "print('hello')\n",
+            "assets/icon.svg": '<svg><script>alert("x")</script></svg>',
+        }
+
+        batches = analyzer.get_batches(list(file_cache), file_cache)
+
+        assert {batch.file_path for batch in batches} == set(file_cache)
+
+
+# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.build_prompt (default implementation)
 # ---------------------------------------------------------------------------
 
