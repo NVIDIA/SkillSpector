@@ -25,6 +25,7 @@ import pytest
 import yaml
 
 from skillspector.nodes.analyzers import mcp_tool_poisoning
+from skillspector.state import llm_call_record
 
 # ---------------------------------------------------------------------------
 # Fixture directory path
@@ -648,7 +649,7 @@ class TestTP4Fallbacks:
 
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         with patch(
-            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion",
+            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion_with_usage",
             side_effect=RuntimeError("timeout"),
         ):
             result = node(state)
@@ -660,8 +661,11 @@ class TestTP4Fallbacks:
 
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         with patch(
-            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion",
-            return_value="this is not json at all {{{",
+            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion_with_usage",
+            return_value=(
+                "this is not json at all {{{",
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            ),
         ):
             result = node(state)
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
@@ -672,23 +676,42 @@ class TestTP4Telemetry:
     """TP4 records llm_call_log so the report's degradation detector counts it
     consistently with the semantic analyzers and the meta-analyzer."""
 
-    def test_successful_call_records_ok_true(self):
+    def test_successful_call_records_provider_usage(self):
         from unittest.mock import patch
+
+        from skillspector.nodes.report import _build_metadata
 
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         with patch(
-            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion",
-            return_value='{"is_mismatch": false}',
+            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion_with_usage",
+            return_value=(
+                '{"is_mismatch": false}',
+                {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+            ),
         ):
             result = node(state)
-        assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+        assert result["llm_call_log"] == [
+            llm_call_record(
+                "mcp_tool_poisoning",
+                ok=True,
+                input_tokens=12,
+                output_tokens=3,
+                total_tokens=15,
+            )
+        ]
+        metadata = _build_metadata(False, True, result["llm_call_log"])
+        assert metadata["llm_usage"] == {
+            "input_tokens": 12,
+            "output_tokens": 3,
+            "total_tokens": 15,
+        }
 
     def test_failed_call_records_ok_false(self):
         from unittest.mock import patch
 
         state = _make_state("mcp_mismatched_skill", use_llm=True)
         with patch(
-            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion",
+            "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion_with_usage",
             side_effect=RuntimeError("timeout"),
         ):
             result = node(state)

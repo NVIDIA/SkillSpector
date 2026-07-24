@@ -30,6 +30,7 @@ from skillspector.nodes.analyzers.semantic_security_discovery import (
     ANALYZER_PROMPT,
     node,
 )
+from skillspector.state import llm_call_record
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -318,7 +319,7 @@ class TestLLMCallTelemetry:
 
         with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
             result = node(base_state)
-        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+        assert result["llm_call_log"] == [llm_call_record(ANALYZER_ID, ok=True)]
 
     @patch(MOCK_PATCH_TARGET)
     def test_generic_exception_records_ok_false(self, mock_get_model: MagicMock) -> None:

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from io import StringIO
@@ -144,7 +145,7 @@ _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 def _compute_risk_score(
     findings: list[Finding],
     has_executable_scripts: bool,
-    component_metadata: list[dict[str, object]] | None = None,
+    component_metadata: Sequence[Mapping[str, object]] | None = None,
 ) -> tuple[int, str, str]:
     """
     Compute risk score (0-100), severity band, and recommendation.
@@ -326,7 +327,7 @@ def _build_sarif(
 
 def _format_terminal(
     findings: list[Finding],
-    component_metadata: list[dict[str, object]],
+    component_metadata: Sequence[Mapping[str, object]],
     manifest: dict[str, object],
     skill_path: str | None,
     risk_score: int,
@@ -334,7 +335,7 @@ def _format_terminal(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
-    llm_call_log: list[dict[str, object]] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
 ) -> str:
@@ -441,7 +442,7 @@ def _format_terminal(
 
 
 def _llm_runtime_status(
-    use_llm: bool, llm_call_log: list[dict[str, object]]
+    use_llm: bool, llm_call_log: Sequence[Mapping[str, object]]
 ) -> tuple[int, int, bool]:
     """Return ``(attempted, succeeded, degraded)`` from the LLM call log.
 
@@ -455,7 +456,9 @@ def _llm_runtime_status(
     return attempted, succeeded, degraded
 
 
-def _llm_degradation_notice(use_llm: bool, llm_call_log: list[dict[str, object]]) -> str | None:
+def _llm_degradation_notice(
+    use_llm: bool, llm_call_log: Sequence[Mapping[str, object]]
+) -> str | None:
     """Return a human-readable degraded-scan warning, or None if not degraded."""
     attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     if not degraded:
@@ -466,10 +469,27 @@ def _llm_degradation_notice(use_llm: bool, llm_call_log: list[dict[str, object]]
     )
 
 
+def _usage_int(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return 0
+
+
+def _aggregate_llm_usage(llm_call_log: Sequence[Mapping[str, object]]) -> dict[str, int]:
+    """Aggregate provider-reported token usage across LLM call records."""
+    return {
+        "input_tokens": sum(_usage_int(r.get("input_tokens")) for r in llm_call_log),
+        "output_tokens": sum(_usage_int(r.get("output_tokens")) for r in llm_call_log),
+        "total_tokens": sum(_usage_int(r.get("total_tokens")) for r in llm_call_log),
+    }
+
+
 def _build_metadata(
     has_executable_scripts: bool,
     use_llm: bool,
-    llm_call_log: list[dict[str, object]] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
@@ -487,6 +507,7 @@ def _build_metadata(
         # available AND the stage was not fully degraded (every call failing).
         "llm_available": llm_available and not degraded,
         "meta_analysis_applied": meta_analysis_applied,
+        "llm_usage": _aggregate_llm_usage(llm_call_log),
     }
     if not meta_analysis_applied:
         meta["filtering_mode"] = "heuristic"
@@ -556,7 +577,7 @@ def _build_analysis_completeness(
 
 def _format_json(
     findings: list[Finding],
-    component_metadata: list[dict[str, object]],
+    component_metadata: Sequence[Mapping[str, object]],
     manifest: dict[str, object],
     skill_path: str | None,
     risk_score: int,
@@ -564,7 +585,7 @@ def _format_json(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
-    llm_call_log: list[dict[str, object]] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
     analysis_completeness: dict[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
 ) -> str:
@@ -604,7 +625,7 @@ def _format_json(
 
 def _format_markdown(
     findings: list[Finding],
-    component_metadata: list[dict[str, object]],
+    component_metadata: Sequence[Mapping[str, object]],
     manifest: dict[str, object],
     skill_path: str | None,
     risk_score: int,
@@ -612,7 +633,7 @@ def _format_markdown(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
-    llm_call_log: list[dict[str, object]] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
 ) -> str:

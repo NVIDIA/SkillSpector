@@ -38,9 +38,10 @@ import asyncio
 import concurrent.futures
 import json
 from collections.abc import Coroutine
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from pydantic import BaseModel
 
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
@@ -54,6 +55,32 @@ from skillspector.providers import (
     resolve_provider_credentials,
 )
 from skillspector.providers.openai import OpenAIProvider
+
+
+class LLMTokenUsage(TypedDict):
+    """Provider-normalized token usage for LLM calls."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+def empty_token_usage() -> LLMTokenUsage:
+    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def extract_token_usage(raw: object) -> LLMTokenUsage:
+    usage = getattr(raw, "usage_metadata", None) or {}
+    if not isinstance(usage, dict):
+        return empty_token_usage()
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 def _resolve_llm_credentials() -> tuple[str, str | None]:
@@ -180,11 +207,19 @@ class _StructuredAgentCLIModel:
     ``complete()``, then parses and validates the response into *schema*.
     """
 
-    def __init__(self, provider: object, model: str, max_output_tokens: int, schema: type) -> None:
+    def __init__(
+        self,
+        provider: object,
+        model: str,
+        max_output_tokens: int,
+        schema: type[BaseModel],
+        include_raw: bool = False,
+    ) -> None:
         self._provider = provider
         self._model = model
         self._max_output_tokens = max_output_tokens
         self._schema = schema
+        self._include_raw = include_raw
 
     def _augment(self, prompt: str) -> str:
         schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
@@ -201,7 +236,17 @@ class _StructuredAgentCLIModel:
             model=self._model,
             max_output_tokens=self._max_output_tokens,
         )
-        return self._schema.model_validate(_extract_json_object(raw))
+        try:
+            parsed = self._schema.model_validate(_extract_json_object(raw))
+            parsing_error = None
+        except Exception as exc:
+            parsed = None
+            parsing_error = exc
+            if not self._include_raw:
+                raise
+        if self._include_raw:
+            return {"raw": _AgentCLIMessage(raw), "parsed": parsed, "parsing_error": parsing_error}
+        return parsed
 
     async def ainvoke(self, prompt: str) -> object:
         return await asyncio.to_thread(self.invoke, prompt)
@@ -246,9 +291,11 @@ class AgentCLIChatModel:
     async def ainvoke(self, prompt: str) -> _AgentCLIMessage:
         return await asyncio.to_thread(self.invoke, prompt)
 
-    def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
+    def with_structured_output(
+        self, schema: type[BaseModel], *, include_raw: bool = False
+    ) -> _StructuredAgentCLIModel:
         return _StructuredAgentCLIModel(
-            self._provider, self._model, self._max_output_tokens, schema
+            self._provider, self._model, self._max_output_tokens, schema, include_raw=include_raw
         )
 
 
@@ -291,10 +338,20 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     which normalise content blocks to a single string) and falls back to
     ``.content`` for the CLI adapter's ``_AgentCLIMessage``.
     """
+    content, _usage = chat_completion_with_usage(prompt, model=model)
+    return content
+
+
+def chat_completion_with_usage(
+    prompt: str, *, model: str | None = None
+) -> tuple[str, LLMTokenUsage]:
+    """Request a chat completion and return its content and token usage."""
     response = get_chat_model(model=model).invoke(prompt)
     if hasattr(response, "text"):
-        return response.text  # type: ignore[union-attr]
-    return response.content or ""  # type: ignore[union-attr]
+        content = response.text  # type: ignore[union-attr]
+    else:
+        content = response.content or ""  # type: ignore[union-attr]
+    return content, extract_token_usage(response)
 
 
 def run_async(coroutine: Coroutine) -> Any:

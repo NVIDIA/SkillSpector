@@ -88,7 +88,9 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
     # Fail both LLM transports: get_chat_model (semantic analyzers + meta) and
     # chat_completion (mcp_tool_poisoning TP4).
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", boom)
-    monkeypatch.setattr("skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion", boom)
+    monkeypatch.setattr(
+        "skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion_with_usage", boom
+    )
 
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"})
 

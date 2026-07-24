@@ -256,6 +256,20 @@ class TestChatCompletion:
         monkeypatch.setattr(llm_utils, "get_chat_model", lambda model=None: _FakeLLM())
         assert chat_completion("prompt") == ""
 
+    def test_returns_provider_usage_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _FakeLLM:
+            def invoke(self, prompt: str) -> AIMessage:
+                assert prompt == "ping"
+                return AIMessage(
+                    content="hello world",
+                    usage_metadata={"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+                )
+
+        monkeypatch.setattr(llm_utils, "get_chat_model", lambda model=None: _FakeLLM())
+        content, usage = llm_utils.chat_completion_with_usage("ping")
+        assert content == "hello world"
+        assert usage == {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15}
+
 
 class TestIsLlmAvailable:
     def test_returns_true_when_credentials_present(self, monkeypatch: pytest.MonkeyPatch) -> None:

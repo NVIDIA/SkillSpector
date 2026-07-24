@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from skillspector.llm_analyzer_base import Batch
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, meta_analyzer
-from skillspector.state import SkillspectorState
+from skillspector.state import SkillspectorState, llm_call_record
 
 MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
 
@@ -270,7 +270,7 @@ def test_records_ok_true_on_success() -> None:
         ),
     ):
         result = meta_analyzer(_degr_state())
-    assert result["llm_call_log"] == [{"node": "meta_analyzer", "ok": True, "error": None}]
+    assert result["llm_call_log"] == [llm_call_record("meta_analyzer", ok=True)]
 
 
 def test_construction_failure_is_caught_not_raised() -> None:

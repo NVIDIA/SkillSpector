@@ -97,9 +97,20 @@ class LLMCallRecord(TypedDict):
     node: str
     ok: bool
     error: str | None
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
 
 
-def llm_call_record(node_id: str, *, ok: bool, error: str | None = None) -> LLMCallRecord:
+def llm_call_record(
+    node_id: str,
+    *,
+    ok: bool,
+    error: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+) -> LLMCallRecord:
     """Build one telemetry record for ``SkillspectorState['llm_call_log']``.
 
     LLM-backed nodes append a record on each run so the report can tell whether
@@ -107,7 +118,14 @@ def llm_call_record(node_id: str, *, ok: bool, error: str | None = None) -> LLMC
     failure where the node fell back to empty/static findings (so the failure is
     not mistaken for "the LLM ran and found nothing").
     """
-    return {"node": node_id, "ok": ok, "error": error}
+    return {
+        "node": node_id,
+        "ok": ok,
+        "error": error,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 class AnalyzerNodeResponse(TypedDict):

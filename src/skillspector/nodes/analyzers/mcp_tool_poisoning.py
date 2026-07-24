@@ -23,7 +23,7 @@ import logging
 import re
 import unicodedata
 
-from skillspector.llm_utils import chat_completion
+from skillspector.llm_utils import chat_completion_with_usage, empty_token_usage
 from skillspector.models import Finding
 from skillspector.state import (
     AnalyzerNodeResponse,
@@ -691,6 +691,7 @@ def _check_tp4(state: SkillspectorState) -> tuple[list[Finding], LLMCallRecord |
     as a degraded LLM stage. See :func:`skillspector.state.llm_call_record`.
     """
     attempted = False
+    usage = empty_token_usage()
     try:
         manifest: dict = state.get("manifest") or {}
         description = manifest.get("description")
@@ -762,7 +763,7 @@ Respond in JSON matching this exact schema:
 }}"""
 
         attempted = True
-        response = chat_completion(prompt, model=model)
+        response, usage = chat_completion_with_usage(prompt, model=model)
 
         # Parse JSON — handle optional ```json code blocks
         json_text = response.strip()
@@ -776,7 +777,7 @@ Respond in JSON matching this exact schema:
                 json_text = json_text.rstrip()[:-3].rstrip()
 
         result = json.loads(json_text)
-        ok_record = llm_call_record(ANALYZER_ID, ok=True)
+        ok_record = llm_call_record(ANALYZER_ID, ok=True, **usage)
 
         if not result.get("is_mismatch"):
             return [], ok_record
@@ -818,7 +819,7 @@ Respond in JSON matching this exact schema:
         # Only record a failure if the LLM call was actually attempted; a failure
         # before the call (e.g. building the prompt) is not an LLM-stage failure.
         if attempted:
-            return [], llm_call_record(ANALYZER_ID, ok=False, error=str(exc))
+            return [], llm_call_record(ANALYZER_ID, ok=False, error=str(exc), **usage)
         return [], None
 
 

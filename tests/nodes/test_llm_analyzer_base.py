@@ -1567,6 +1567,66 @@ class TestApplyFilterSeverityFloor:
 
 
 # ---------------------------------------------------------------------------
+
+
+class _RawWithUsage:
+    def __init__(self, usage_metadata: dict[str, int] | None = None) -> None:
+        self.usage_metadata = usage_metadata
+
+
+@patch("skillspector.llm_analyzer_base.get_chat_model")
+def test_run_batches_records_token_usage_with_include_raw(mock_get_model: MagicMock) -> None:
+    mock_llm = MagicMock()
+    mock_structured = MagicMock()
+    mock_llm.with_structured_output.return_value = mock_structured
+    mock_get_model.return_value = mock_llm
+    response = LLMAnalysisResult(findings=[])
+    mock_structured.invoke.return_value = {
+        "raw": _RawWithUsage({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}),
+        "parsed": response,
+        "parsing_error": None,
+    }
+    analyzer = LLMAnalyzerBase(base_prompt="Analyze", model="test-model")
+    results = analyzer.run_batches([Batch(file_path="a.py", content="code")])
+    assert results == [(results[0][0], [])]
+    mock_llm.with_structured_output.assert_called_once_with(LLMAnalysisResult, include_raw=True)
+    assert analyzer.llm_usage == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+
+@patch("skillspector.llm_analyzer_base.get_chat_model")
+async def test_arun_batches_records_token_usage_with_include_raw(mock_get_model: MagicMock) -> None:
+    mock_llm = MagicMock()
+    mock_structured = MagicMock()
+    mock_structured.ainvoke = AsyncMock(
+        return_value={
+            "raw": _RawWithUsage({"prompt_tokens": 7, "completion_tokens": 3}),
+            "parsed": LLMAnalysisResult(findings=[]),
+            "parsing_error": None,
+        }
+    )
+    mock_llm.with_structured_output.return_value = mock_structured
+    mock_get_model.return_value = mock_llm
+    analyzer = LLMAnalyzerBase(base_prompt="Analyze", model="test-model")
+    await analyzer.arun_batches([Batch(file_path="a.py", content="code")])
+    assert analyzer.llm_usage == {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+
+
+@patch("skillspector.llm_analyzer_base.get_chat_model")
+def test_run_batches_missing_usage_metadata_defaults_to_zero(mock_get_model: MagicMock) -> None:
+    mock_llm = MagicMock()
+    mock_structured = MagicMock()
+    mock_structured.invoke.return_value = {
+        "raw": object(),
+        "parsed": LLMAnalysisResult(findings=[]),
+        "parsing_error": None,
+    }
+    mock_llm.with_structured_output.return_value = mock_structured
+    mock_get_model.return_value = mock_llm
+    analyzer = LLMAnalyzerBase(base_prompt="Analyze", model="test-model")
+    analyzer.run_batches([Batch(file_path="a.py", content="code")])
+    assert analyzer.llm_usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
 # LLMMetaAnalyzer.run_batches (mocked LLM)
 # ---------------------------------------------------------------------------
 
