@@ -76,6 +76,9 @@ from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
     node as static_patterns_tool_misuse_node,
 )
 from skillspector.nodes.analyzers.static_yara import node as static_yara_node
+from skillspector.nodes.analyzers.structured_skill_roles import (
+    node as structured_skill_roles_node,
+)
 
 ANALYZER_NODE_IDS: list[str] = [
     "static_patterns_prompt_injection",
@@ -98,6 +101,7 @@ ANALYZER_NODE_IDS: list[str] = [
     "mcp_least_privilege",
     "mcp_tool_poisoning",
     "mcp_rug_pull",
+    "structured_skill_roles",
     "semantic_security_discovery",
     "semantic_developer_intent",
     "semantic_quality_policy",
@@ -124,6 +128,7 @@ ANALYZER_NODES = {
     "mcp_least_privilege": mcp_least_privilege_node,
     "mcp_tool_poisoning": mcp_tool_poisoning_node,
     "mcp_rug_pull": mcp_rug_pull_node,
+    "structured_skill_roles": structured_skill_roles_node,
     "semantic_security_discovery": semantic_security_discovery_node,
     "semantic_developer_intent": semantic_developer_intent_node,
     "semantic_quality_policy": semantic_quality_policy_node,

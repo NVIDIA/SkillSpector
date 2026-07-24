@@ -51,6 +51,25 @@ def _finding(
     )
 
 
+def _structured_summary(
+    *,
+    message: str = "Structured structured bundle detected (AISOP V1)",
+    file: str = "bundle.aisop.json",
+) -> dict[str, object]:
+    return {
+        "id": "SSR-1",
+        "message": message,
+        "file": file,
+        "protocol": "AISOP V1",
+        "layout_kind": "structured",
+        "declared_tools": ["calendar", "search"],
+        "workflow_nodes": ["system", "user"],
+        "constraints": ["query"],
+        "resources": ["docs"],
+        "tags": ["AISOP", "AISP", "structured-skill"],
+    }
+
+
 # --- Risk score computation tests ---
 
 
@@ -431,6 +450,7 @@ class TestReportNode:
         """output_format json produces valid JSON with expected structure."""
         state: SkillspectorState = {
             "filtered_findings": [_finding("P1", "HIGH", confidence=1.0)],
+            "structured_summaries": [_structured_summary()],
             "component_metadata": [
                 {
                     "path": "a.md",
@@ -454,6 +474,9 @@ class TestReportNode:
         assert "severity" in data["risk_assessment"]
         assert "recommendation" in data["risk_assessment"]
         assert "components" in data
+        assert "structured_summaries" in data
+        assert len(data["structured_summaries"]) == 1
+        assert data["structured_summaries"][0]["id"] == "SSR-1"
         assert "issues" in data
         assert len(data["issues"]) == 1
         assert data["issues"][0]["id"] == "P1"
@@ -462,6 +485,7 @@ class TestReportNode:
         """output_format markdown produces expected headings."""
         state: SkillspectorState = {
             "filtered_findings": [],
+            "structured_summaries": [_structured_summary()],
             "component_metadata": [],
             "has_executable_scripts": False,
             "manifest": {},
@@ -473,12 +497,14 @@ class TestReportNode:
         assert "# SkillSpector Security Report" in body
         assert "## Risk Assessment" in body
         assert "## Components" in body
+        assert "## Structured Skill Summary (1)" in body
         assert "## Issues" in body
 
     def test_report_output_format_terminal(self) -> None:
         """output_format terminal produces Rich-formatted output."""
         state: SkillspectorState = {
             "filtered_findings": [],
+            "structured_summaries": [_structured_summary()],
             "component_metadata": [],
             "has_executable_scripts": False,
             "manifest": {"name": "cli-test"},
@@ -490,11 +516,13 @@ class TestReportNode:
         assert "SkillSpector" in body
         assert "Risk Assessment" in body
         assert "cli-test" in body
+        assert "Structured Skill Summary" in body
 
     def test_report_output_format_sarif(self) -> None:
         """output_format sarif produces valid SARIF JSON."""
         state: SkillspectorState = {
-            "filtered_findings": [_finding("E2", "HIGH", "env harvest", confidence=1.0)],
+            "structured_summaries": [_structured_summary()],
+            "filtered_findings": [],
             "component_metadata": [],
             "has_executable_scripts": False,
             "manifest": {},
@@ -506,6 +534,33 @@ class TestReportNode:
         data = json.loads(body)
         assert "runs" in data
         assert data.get("$schema") or "runs" in data
+        run = data["runs"][0]
+        assert run["results"] == []
+        assert "invocations" in run
+        notifications = run["invocations"][0]["toolExecutionNotifications"]
+        assert notifications[0]["level"] == "note"
+        assert "SSR-1" in notifications[0]["message"]["text"]
+
+    def test_report_json_structured_summary_survives_llm_mode(self) -> None:
+        """A structured-only scan keeps SSR-1 visible when use_llm is true."""
+        state: SkillspectorState = {
+            "filtered_findings": [],
+            "structured_summaries": [_structured_summary()],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "json",
+            "use_llm": True,
+            "llm_call_log": [],
+        }
+        result = report(state)
+        assert result["risk_score"] == 0
+        assert result["risk_recommendation"] == "SAFE"
+        assert "structured_summaries" not in result
+        data = json.loads(result["report_body"])
+        assert data["issues"] == []
+        assert data["structured_summaries"][0]["id"] == "SSR-1"
 
     def test_report_output_format_sarif_includes_finding_properties(self) -> None:
         finding = _finding("E2", "HIGH", "env harvest", confidence=0.85, file="tool.py")

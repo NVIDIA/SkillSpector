@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from skillspector.logging_config import get_logger
+from skillspector.structured_skill import _SKIP_DIRS, extract_structured_skill_context
 
 logger = get_logger(__name__)
 
@@ -71,9 +72,11 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
     for child in sorted(directory.iterdir()):
         if not child.is_dir():
             continue
+        if child.name in _SKIP_DIRS:
+            continue
         if child.name.startswith("."):
             continue
-        if _has_skill_md(child):
+        if _has_skill_md(child) or _is_structured_skill_bundle(child):
             name = _extract_skill_name(child)
             skills.append(
                 SkillDirectory(
@@ -89,6 +92,11 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
         skills=skills,
         has_root_skill=False,
     )
+
+
+def _is_structured_skill_bundle(child_dir: Path) -> bool:
+    """Return true when a child directory contains a valid AISOP/AISP bundle."""
+    return extract_structured_skill_context(child_dir) is not None
 
 
 def _has_skill_md(directory: Path) -> bool:

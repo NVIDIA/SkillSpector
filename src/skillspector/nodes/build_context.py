@@ -29,6 +29,7 @@ import yaml
 from skillspector.constants import build_model_config
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
+from skillspector.structured_skill import extract_structured_skill_context
 
 logger = get_logger(__name__)
 
@@ -84,12 +85,12 @@ def _walk_skill_files(skill_dir: Path) -> list[str]:
     for item in skill_dir.rglob("*"):
         if not item.is_file():
             continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
-            continue
-        if item.name.startswith(".") and not item.name.startswith(".claude"):
-            continue
         try:
             rel = item.relative_to(skill_dir)
+            if any(skip in rel.parts for skip in _SKIP_DIRS):
+                continue
+            if item.name.startswith(".") and not item.name.startswith(".claude"):
+                continue
             # Use forward slashes on every OS: these relative paths are dict keys
             # and SARIF/URI locations, so they must be portable (not OS-specific
             # backslashes on Windows).
@@ -239,8 +240,9 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     file_cache = _read_file_cache(skill_dir, components)
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)
+    structured_skill_context = extract_structured_skill_context(skill_dir)
 
-    return {
+    result = {
         "components": components,
         "file_cache": file_cache,
         "ast_cache": {},
@@ -250,3 +252,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
     }
+
+    if structured_skill_context is not None:
+        result["structured_skill_context"] = structured_skill_context
+
+    return result

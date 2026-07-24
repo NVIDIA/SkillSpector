@@ -494,3 +494,38 @@ def test_cli_scan_json_preserves_single_skill_contract(
     assert payload["issues"] == [{"id": "X-1", "severity": "low"}]
     assert payload["suppressed_count"] == 0
     assert payload["suppressed"] == []
+
+
+def test_cli_scan_structured_skill_aisop_no_llm_reports_summary(tmp_path: Path) -> None:
+    """--no-llm JSON scan reports SSR-1 through the structured summary channel."""
+    (tmp_path / "workflow.aisop.json").write_text(
+        """
+[
+  {
+    "role": "system",
+    "content": {
+      "protocol": "AISOP V1",
+      "format": "workflow"
+    }
+  },
+  {
+    "role": "user",
+    "content": {
+      "aisop": {
+        "main": "graph TD"
+      },
+      "functions": {
+        "lookup": {"constraints": ["query"]}
+      }
+    }
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["issues"] == []
+    assert data["risk_assessment"]["score"] == 0
+    assert data["structured_summaries"][0]["id"] == "SSR-1"
