@@ -90,6 +90,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         results = analyzer.run_batches(batches)
         findings = analyzer.collect_findings(results)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
+        if len(results) < len(batches):
+            error = f"{len(batches) - len(results)}/{len(batches)} LLM batches failed"
+            return {
+                "findings": findings,
+                "llm_call_log": [llm_call_record(ANALYZER_ID, ok=False, error=error)],
+            }
         return {"findings": findings, "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True)]}
     except ValidationError as exc:
         # Malformed LLM response — degrade gracefully rather than crashing the graph

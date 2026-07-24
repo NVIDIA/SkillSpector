@@ -377,6 +377,27 @@ class TestRawStringMode:
         assert results[0][1] == ["chunk"]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_run_batches_isolates_raw_invoke_validation_error(self) -> None:
+        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
+
+        def _invoke(prompt: str) -> AIMessage:
+            if "b.py" in prompt:
+                LLMAnalysisResult.model_validate({"findings": 'We{"findings":[]}'})
+            return AIMessage(content="ok")
+
+        analyzer._llm.invoke.side_effect = _invoke
+        batches = [
+            Batch(file_path="a.py", content="code a"),
+            Batch(file_path="b.py", content="code b"),
+            Batch(file_path="c.py", content="code c"),
+        ]
+
+        results = analyzer.run_batches(batches)
+
+        assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
+        assert [items for _, items in results] == [["ok"], ["ok"]]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     async def test_arun_batches_uses_message_text_for_content_blocks(self) -> None:
         analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
         analyzer._llm.ainvoke = AsyncMock(
@@ -386,6 +407,72 @@ class TestRawStringMode:
         results = await analyzer.arun_batches([Batch(file_path="a.py", content="code")])
 
         assert results[0][1] == ["async chunk"]
+
+
+# ---------------------------------------------------------------------------
+# LLMAnalyzerBase.run_batches (sync execution)
+# ---------------------------------------------------------------------------
+
+
+class TestRunBatches:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_malformed_structured_batch_does_not_abort_the_others(self) -> None:
+        """A malformed structured response costs only its own batch."""
+
+        def _invoke(prompt: str) -> LLMAnalysisResult:
+            if "b.py" in prompt:
+                return LLMAnalysisResult.model_validate({"findings": 'We{"findings":[]}'})
+            return LLMAnalysisResult(
+                findings=[
+                    LLMFinding(rule_id="T-1", message="hit", severity="LOW", start_line=1),
+                ]
+            )
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke.side_effect = _invoke
+
+        batches = [
+            Batch(file_path="a.py", content="code a"),
+            Batch(file_path="b.py", content="code b"),
+            Batch(file_path="c.py", content="code c"),
+        ]
+        results = analyzer.run_batches(batches)
+
+        assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
+        assert [items[0].rule_id for _, items in results] == ["T-1", "T-1"]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_value_error_still_propagates(self) -> None:
+        """ValueError signals misconfiguration, not a malformed model response."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke.side_effect = ValueError("no API key")
+
+        with pytest.raises(ValueError, match="no API key"):
+            analyzer.run_batches([Batch(file_path="a.py", content="code")])
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_parse_validation_error_does_not_abort_the_others(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke.return_value = LLMAnalysisResult(findings=[])
+        original_parse = analyzer.parse_response
+
+        def _parse(response: object, batch: Batch) -> list[Finding]:
+            if batch.file_path == "b.py":
+                LLMAnalysisResult.model_validate({"findings": 'We{"findings":[]}'})
+            return original_parse(response, batch)
+
+        analyzer.parse_response = _parse
+        batches = [
+            Batch(file_path="a.py", content="code a"),
+            Batch(file_path="b.py", content="code b"),
+            Batch(file_path="c.py", content="code c"),
+        ]
+
+        results = analyzer.run_batches(batches)
+
+        assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +663,32 @@ class TestARunBatches:
         ]
         results = await analyzer.arun_batches(batches)
         assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_malformed_structured_batch_does_not_abort_the_others(self) -> None:
+        """A malformed structured response is isolated even though it is a ValueError."""
+
+        async def _ainvoke(prompt: str) -> LLMAnalysisResult:
+            if "b.py" in prompt:
+                return LLMAnalysisResult.model_validate({"findings": 'We{"findings":[]}'})
+            return LLMAnalysisResult(
+                findings=[
+                    LLMFinding(rule_id="T-1", message="hit", severity="LOW", start_line=1),
+                ]
+            )
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = _ainvoke
+
+        batches = [
+            Batch(file_path="a.py", content="code a"),
+            Batch(file_path="b.py", content="code b"),
+            Batch(file_path="c.py", content="code c"),
+        ]
+        results = await analyzer.arun_batches(batches)
+
+        assert {batch.file_path for batch, _ in results} == {"a.py", "c.py"}
+        assert [items[0].rule_id for _, items in results] == ["T-1", "T-1"]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     async def test_all_batches_failed_returns_empty(self) -> None:

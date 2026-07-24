@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMFinding
+from skillspector.llm_analyzer_base import Batch, LLMAnalysisResult, LLMFinding
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.semantic_security_discovery import (
     ANALYZER_ID,
@@ -316,7 +316,11 @@ class TestLLMCallTelemetry:
     def test_success_records_ok_true(self, base_state) -> None:
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
-        with patch.object(LLMAnalyzerBase, "run_batches", return_value=[]):
+        with patch.object(
+            LLMAnalyzerBase,
+            "run_batches",
+            return_value=[(Batch(file_path="SKILL.md", content="# Skill"), [])],
+        ):
             result = node(base_state)
         assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
 
@@ -374,7 +378,6 @@ def _build_file_cache(skill_dir: Path) -> dict[str, str]:
 
 def _make_file_aware_run_batches(responses: dict[str, LLMAnalysisResult]):
     """Return a mock run_batches that dispatches based on file_path in each batch."""
-    from skillspector.llm_analyzer_base import Batch
 
     def _run_batches(self_inner, batches: list[Batch], **_kwargs):
         results = []

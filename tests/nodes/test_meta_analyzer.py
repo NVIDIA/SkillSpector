@@ -261,15 +261,18 @@ def _degr_state(**overrides: object) -> SkillspectorState:
 
 
 def test_records_ok_true_on_success() -> None:
+    state = _degr_state()
     with (
         patch("skillspector.llm_analyzer_base.get_chat_model", return_value=MagicMock()),
         patch(
             "skillspector.nodes.meta_analyzer.LLMMetaAnalyzer.arun_batches",
             new_callable=AsyncMock,
-            return_value=[],
+            return_value=[
+                (Batch(file_path="SKILL.md", content="# Skill", findings=state["findings"]), [])
+            ],
         ),
     ):
-        result = meta_analyzer(_degr_state())
+        result = meta_analyzer(state)
     assert result["llm_call_log"] == [{"node": "meta_analyzer", "ok": True, "error": None}]
 
 

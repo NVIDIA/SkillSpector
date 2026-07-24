@@ -563,6 +563,12 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(findings),
             len(filtered),
         )
+        if unanalysed:
+            error = f"{len(batches) - len(batch_results)}/{len(batches)} LLM batches failed"
+            return {
+                "filtered_findings": filtered,
+                "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=error)],
+            }
         return {
             "filtered_findings": filtered,
             "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
@@ -374,7 +374,9 @@ class LLMAnalyzerBase:
 
         The element type of the inner list depends on the subclass: the default
         :meth:`parse_response` returns :class:`Finding` objects; subclasses may
-        return dicts or other types.
+        return dicts or other types. Malformed structured responses are isolated
+        per batch and omitted from the result so callers can detect partial
+        analysis by comparing submitted and returned batches.
         """
         results: list[tuple[Batch, list]] = []
         for batch in batches:
@@ -386,11 +388,38 @@ class LLMAnalyzerBase:
                 len(batch.findings),
             )
             if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
+                try:
+                    response = self._structured_llm.invoke(prompt)
+                except ValidationError as exc:
+                    logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                    continue
+                except (ValueError, NotImplementedError):
+                    raise
+                except Exception as exc:
+                    logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                    continue
             else:
-                response = _message_text(self._llm.invoke(prompt))
+                try:
+                    response = _message_text(self._llm.invoke(prompt))
+                except ValidationError as exc:
+                    logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                    continue
+                except (ValueError, NotImplementedError):
+                    raise
+                except Exception as exc:
+                    logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                    continue
             logger.debug("LLM response for %s", batch.file_label)
-            parsed = self.parse_response(response, batch)
+            try:
+                parsed = self.parse_response(response, batch)
+            except ValidationError as exc:
+                logger.warning("LLM batch parse failed for %s: %s", batch.file_label, exc)
+                continue
+            except (ValueError, NotImplementedError):
+                raise
+            except Exception as exc:
+                logger.warning("LLM batch parse failed for %s: %s", batch.file_label, exc)
+                continue
             results.append((batch, parsed))
         return results
 
@@ -408,12 +437,12 @@ class LLMAnalyzerBase:
         cross-chunk batches are parallelized in a single gather call.
 
         Failures are isolated per batch: a transient error (timeout, 429,
-        oversized-chunk 400, ...) costs only its own batch, which is logged
-        and omitted from the result, so one bad call cannot cancel the rest
-        of the fan-out.  Callers can detect partial results by comparing the
-        returned batches against the submitted ones.  ``ValueError`` and
-        ``NotImplementedError`` signal misconfiguration rather than infra
-        trouble and keep propagating.
+        oversized-chunk 400, malformed structured response, ...) costs only
+        its own batch, which is logged and omitted from the result, so one bad
+        call cannot cancel the rest of the fan-out.  Callers can detect partial
+        results by comparing the returned batches against the submitted ones.
+        ``ValueError`` and ``NotImplementedError`` signal misconfiguration
+        rather than infra trouble and keep propagating.
 
         The return type mirrors :meth:`run_batches`.
         """
@@ -438,6 +467,9 @@ class LLMAnalyzerBase:
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         successful: list[tuple[Batch, list]] = []
         for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, ValidationError):
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                continue
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
             if isinstance(result, BaseException):
