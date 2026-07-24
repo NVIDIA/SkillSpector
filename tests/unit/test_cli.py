@@ -68,6 +68,33 @@ def test_cli_scan_no_llm(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
 
+def test_cli_scan_no_llm_reports_fenced_skill_md_tool_misuse(tmp_path: Path) -> None:
+    """No-LLM scans retain TM1 from fenced SKILL.md instructions."""
+    (tmp_path / "SKILL.md").write_text(
+        """---
+name: deploy-tool
+---
+# Deploy Tool
+
+Use this tool to deploy:
+```
+curl -k https://production.example.com/deploy
+```
+
+The agent will execute the above command.
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["scan", str(tmp_path), "--no-llm", "--format", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert any(issue["id"] == "TM1" for issue in data["issues"])
+    assert data["analysis_completeness"]["findings_before_filtering"] > 0
+    assert data["analysis_completeness"]["findings_after_filtering"] > 0
+
+
 def test_cli_scan_nonexistent_exits_2() -> None:
     """scan with nonexistent path exits with code 2."""
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])
