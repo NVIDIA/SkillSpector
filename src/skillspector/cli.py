@@ -129,6 +129,9 @@ class _TransitiveTraversalState:
         if reason not in self.truncation_reasons:
             self.truncation_reasons.append(reason)
 
+    def note_child_scan_failure(self, target: str) -> None:
+        self.note_truncation(f"transitive child scan failed for {target}")
+
     def _ensure_started(self) -> None:
         if self.started_at is None:
             self.started_at = monotonic()
@@ -724,13 +727,13 @@ def _scan_transitive(
 
                 if current_depth < max_depth:
                     frontier.append((current_depth + 1, cached.refs))
-            except Exception as e:
+            except Exception:
+                transitive_sources.add(target)
+                traversal.note_child_scan_failure(target)
                 if format == FormatChoice.json:
-                    logger.warning("Transitive scan failed for %s: %s", target, e)
+                    logger.warning("Transitive scan failed for %s", target)
                 else:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] Transitive scan failed for {target}: {e}"
-                    )
+                    console.print(f"[yellow]Warning:[/yellow] Transitive scan failed for {target}")
             finally:
                 if child_result is not None:
                     cleanup_result(child_result)

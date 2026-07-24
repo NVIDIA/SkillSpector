@@ -1509,6 +1509,72 @@ def test_scan_transitive_marks_truncation_when_target_budget_hits(monkeypatch) -
     assert body["metadata"]["transitive_truncated"] is True
 
 
+def test_scan_transitive_child_failure_stays_visible_and_fail_closed(monkeypatch) -> None:
+    """Child scan exceptions should degrade the report without leaking raw error text."""
+    failed_target = "https://github.com/org/broken"
+    initial_result = {
+        "findings": [_finding("D1", "direct finding")],
+        "filtered_findings": [_finding("D1", "direct finding")],
+        "components": ["SKILL.md"],
+        "component_metadata": [
+            {
+                "path": "SKILL.md",
+                "type": "markdown",
+                "lines": 3,
+                "executable": False,
+                "size_bytes": 30,
+            }
+        ],
+        "file_cache": {"SKILL.md": failed_target},
+        "has_executable_scripts": False,
+        "output_format": "json",
+        "temp_dir_for_cleanup": "root-temp",
+    }
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline=None,
+        show_suppressed: bool = False,
+        transitive_traversal=None,
+    ) -> dict[str, object]:
+        assert input_path == failed_target
+        raise RuntimeError("secret token should stay private")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    body = json.loads(merged["report_body"])
+    assert merged["temp_dir_for_cleanup"] == "root-temp"
+    assert merged["transitive_sources"] == [failed_target]
+    assert merged["transitive_targets_scanned"] == 0
+    assert merged["transitive_truncated"] is True
+    assert merged["transitive_truncation_reasons"] == [
+        f"transitive child scan failed for {failed_target}"
+    ]
+    assert merged["risk_recommendation"] == "CAUTION"
+    assert body["analysis_completeness"]["is_complete"] is False
+    assert body["metadata"]["transitive_truncated"] is True
+    assert any(
+        "transitive child scan failed for https://github.com/org/broken" in limitation
+        for limitation in body["analysis_completeness"]["limitations"]
+    )
+    assert "secret token should stay private" not in merged["transitive_truncation_reasons"][0]
+    assert "secret token should stay private" not in merged["report_body"]
+
+
 def test_scan_transitive_keeps_source_aware_component_coverage(monkeypatch) -> None:
     """Coverage should stay complete when child sources reuse the same relative path names."""
     shared_dep = "https://github.com/org/shared"
