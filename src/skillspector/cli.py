@@ -38,7 +38,12 @@ from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
-from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
+from skillspector.suppression import (
+    build_baseline_dict,
+    discover_baseline,
+    dump_baseline,
+    load_baseline,
+)
 
 logger = get_logger(__name__)
 
@@ -70,6 +75,7 @@ app = typer.Typer(
 )
 
 console = Console()
+err_console = Console(stderr=True)
 
 
 class FormatChoice(StrEnum):
@@ -245,6 +251,17 @@ def scan(
             "do not count toward the risk score).",
         ),
     ] = False,
+    use_shipped_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--use-shipped-baseline",
+            help="Apply a baseline shipped at the top level of the scanned skill "
+            "directory (.skillspector-baseline.yaml). Off by default: a skill "
+            "author's baseline can suppress findings in your scan, so a discovered "
+            "baseline is only reported until you opt in. Ignored when --baseline "
+            "is given.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -305,6 +322,31 @@ def scan(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
+
+    shipped: Path | None = None
+    if baseline is None and resolved_path.is_dir():
+        shipped = discover_baseline(resolved_path)
+    if shipped is not None:
+        if use_shipped_baseline:
+            baseline = shipped
+            err_console.print(f"[yellow]Applying author-shipped baseline:[/yellow] {shipped}")
+            err_console.print(
+                "[dim]Suppressed findings do not count toward the risk score; "
+                "use --show-suppressed to list them.[/dim]"
+            )
+        else:
+            err_console.print(
+                f"[yellow]Shipped baseline detected (not applied):[/yellow] {shipped}"
+            )
+            err_console.print(
+                "[dim]Review it, then re-run with --use-shipped-baseline to apply its "
+                "suppressions. Findings and risk score are unaffected until you opt in.[/dim]"
+            )
+    elif use_shipped_baseline and baseline is None:
+        err_console.print(
+            f"[dim]--use-shipped-baseline: no shipped baseline found in {resolved_path}; "
+            "scanning without a baseline.[/dim]"
+        )
 
     result = None
     try:
