@@ -56,7 +56,14 @@ class AgentCLIProviderBase:
 
     # -- Transport -----------------------------------------------------------
 
-    def complete(self, prompt: str, *, model: str, max_output_tokens: int = 8192) -> str:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        max_output_tokens: int = 8192,
+        timeout: float | None = None,
+    ) -> str:
         """Invoke the CLI via the hardened runner and return the assistant text.
 
         The prompt is passed through unchanged (parity with the HTTP path).
@@ -64,7 +71,11 @@ class AgentCLIProviderBase:
         :func:`skillspector.providers._agent_cli.run_agent_cli`.
         """
         return _agent_cli.run_agent_cli(
-            self.BINARY_NAME, prompt, model=model, max_output_tokens=max_output_tokens
+            self.BINARY_NAME,
+            prompt,
+            model=model,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout if timeout is not None else _agent_cli.CLI_TIMEOUT_SECONDS,
         )
 
     # -- Metadata ------------------------------------------------------------

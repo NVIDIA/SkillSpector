@@ -388,6 +388,41 @@ class TestRawStringMode:
         assert results[0][1] == ["async chunk"]
 
 
+class TestDynamicTimeout:
+    def test_run_batches_resolves_timeout_per_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Dynamic timeout providers are called again before every LLM call."""
+        captured_timeouts: list[float | None] = []
+        timeout_values = iter([30.0, 20.0, 10.0])
+
+        class _Structured:
+            def invoke(self, prompt: str) -> LLMAnalysisResult:
+                return LLMAnalysisResult(findings=[])
+
+        class _LLM:
+            def with_structured_output(self, schema: type) -> _Structured:
+                return _Structured()
+
+        def fake_get_chat_model(*, model: str, timeout: float | None = None) -> _LLM:
+            captured_timeouts.append(timeout)
+            return _LLM()
+
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", fake_get_chat_model)
+
+        analyzer = LLMAnalyzerBase(
+            base_prompt="test",
+            model="nvidia/openai/gpt-oss-120b",
+            timeout=lambda: next(timeout_values),
+        )
+        analyzer.run_batches(
+            [
+                Batch(file_path="a.py", content="a"),
+                Batch(file_path="b.py", content="b"),
+            ]
+        )
+
+        assert captured_timeouts == [30.0, 20.0, 10.0]
+
+
 # ---------------------------------------------------------------------------
 # LLMAnalyzerBase.arun_batches (async parallel execution)
 # ---------------------------------------------------------------------------

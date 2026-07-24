@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 from skillspector.llm_analyzer_base import (
     Batch,
     LLMAnalyzerBase,
+    TimeoutValue,
     estimate_tokens,
 )
 from skillspector.llm_utils import run_async
@@ -39,7 +40,13 @@ from skillspector.nodes.analyzers.pattern_defaults import (
     get_explanation,
     get_remediation,
 )
-from skillspector.state import MetaAnalyzerResponse, SkillspectorState, llm_call_record
+from skillspector.state import (
+    MetaAnalyzerResponse,
+    SkillspectorState,
+    llm_call_record,
+    transitive_note_truncation,
+    transitive_remaining_seconds,
+)
 
 logger = get_logger(__name__)
 
@@ -320,8 +327,8 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
     response_schema = MetaAnalyzerResult
 
-    def __init__(self, model: str):
-        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model)
+    def __init__(self, model: str, timeout: TimeoutValue = None):
+        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model, timeout=timeout)
 
     def _estimate_extra_overhead(self, findings: list[Finding]) -> int:
         if not findings:
@@ -517,6 +524,12 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     manifest: dict[str, object] = state.get("manifest") or {}
     model_config: dict[str, str] = state.get("model_config") or {}
     model = model_config.get("meta_analyzer")
+    timeout = transitive_remaining_seconds(state)
+
+    if timeout is not None and timeout <= 0:
+        transitive_note_truncation(state, "LLM time budget exhausted before meta_analyzer")
+        logger.info("Meta-analyzer: skipped (transitive time budget exhausted)")
+        return {"filtered_findings": _fallback_filtered(findings)}
 
     metadata_text = _format_metadata(manifest)
     files_with_findings = sorted({f.file for f in findings})
@@ -525,7 +538,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         # Construct inside the try so a chat-model construction failure is caught
         # and recorded as a degraded LLM call (consistent with the semantic
         # analyzers) rather than crashing the whole graph.
-        analyzer = LLMMetaAnalyzer(model=model)
+        analyzer = LLMMetaAnalyzer(model=model, timeout=lambda: transitive_remaining_seconds(state))
         batches = analyzer.get_batches(files_with_findings, file_cache, findings)
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
