@@ -38,7 +38,12 @@ from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
-from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
+from skillspector.suppression import (
+    Baseline,
+    build_baseline_dict,
+    dump_baseline,
+    load_baseline,
+)
 
 logger = get_logger(__name__)
 
@@ -122,10 +127,16 @@ def _scan_state(
     format: FormatChoice,
     no_llm: bool,
     yara_rules_dir: str | None = None,
-    baseline: Path | None = None,
+    baseline: Baseline | None = None,
     show_suppressed: bool = False,
 ) -> dict[str, object]:
-    """Build initial graph state from scan CLI args."""
+    """Build initial graph state from scan CLI args.
+
+    *baseline* is an already-loaded :class:`Baseline`, not a path. Loading is done
+    once in ``scan()`` inside its ``try`` so a missing or malformed baseline is
+    reported as a clean error with exit code 2 on every path (single and
+    recursive), and so the file is not re-read and re-parsed per sub-skill.
+    """
     state: dict[str, object] = {
         "input_path": input_path,
         "output_format": format.value,
@@ -134,8 +145,7 @@ def _scan_state(
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
     if baseline is not None:
-        # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
-        state["baseline"] = load_baseline(baseline)
+        state["baseline"] = baseline
         state["show_suppressed"] = show_suppressed
     return state
 
@@ -288,42 +298,50 @@ def scan(
         set_level("DEBUG")
 
     resolved_path = Path(input_path).resolve()
-    if recursive and resolved_path.is_dir():
-        detection = detect_skills(resolved_path)
-        if detection.is_multi_skill:
-            _scan_multi_skill(
-                detection,
-                format,
-                output,
-                no_llm,
-                yara_rules_dir,
-                verbose,
-                baseline=baseline,
-                show_suppressed=show_suppressed,
-            )
-            return
-        if not detection.has_root_skill and len(detection.skills) == 0:
-            console.print(
-                "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
-                "detected. Scanning as single skill."
-            )
-    elif resolved_path.is_dir():
-        detection = detect_skills(resolved_path)
-        if detection.is_multi_skill:
-            console.print(
-                f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
-                f"this directory. Use --recursive to scan each independently."
-            )
 
     result = None
     try:
+        # Load once, here, inside the try: load_baseline() raises
+        # FileNotFoundError/ValueError, which the handlers below map to exit code 2.
+        # The recursive dispatch is inside this try for the same reason -- when it sat
+        # outside, a bad --baseline escaped as an uncaught traceback and exited 1 (the
+        # "risk found" code), contradicting docs/SUPPRESSION.md and the single-skill path.
+        loaded_baseline = load_baseline(baseline) if baseline is not None else None
+
+        if recursive and resolved_path.is_dir():
+            detection = detect_skills(resolved_path)
+            if detection.is_multi_skill:
+                _scan_multi_skill(
+                    detection,
+                    format,
+                    output,
+                    no_llm,
+                    yara_rules_dir,
+                    verbose,
+                    baseline=loaded_baseline,
+                    show_suppressed=show_suppressed,
+                )
+                return
+            if not detection.has_root_skill and len(detection.skills) == 0:
+                console.print(
+                    "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
+                    "detected. Scanning as single skill."
+                )
+        elif resolved_path.is_dir():
+            detection = detect_skills(resolved_path)
+            if detection.is_multi_skill:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
+                    f"this directory. Use --recursive to scan each independently."
+                )
+
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
         state = _scan_state(
             input_path,
             format,
             no_llm,
             yara_rules_dir=yara_dir,
-            baseline=baseline,
+            baseline=loaded_baseline,
             show_suppressed=show_suppressed,
         )
         if verbose:
@@ -406,10 +424,14 @@ def _scan_multi_skill(
     no_llm: bool,
     yara_rules_dir: Path | None,
     verbose: bool,
-    baseline: Path | None = None,
+    baseline: Baseline | None = None,
     show_suppressed: bool = False,
 ) -> None:
-    """Scan each detected sub-skill independently and produce a combined report."""
+    """Scan each detected sub-skill independently and produce a combined report.
+
+    *baseline* is already loaded by ``scan()``; it is reused across sub-skills rather
+    than re-read and re-parsed once per skill.
+    """
     skills = detection.skills
     console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
 

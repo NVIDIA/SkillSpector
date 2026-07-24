@@ -659,3 +659,116 @@ def test_result_finding_count_branches() -> None:
     # Nothing usable -> 0. Malformed (suppressed longer than filtered) floors at 0.
     assert _result_finding_count({}) == 0
     assert _result_finding_count({"filtered_findings": [1], "suppressed_findings": [1, 2, 3]}) == 0
+
+
+def test_cli_recursive_missing_baseline_exits_2(tmp_path: Path) -> None:
+    """Recursive counterpart of test_cli_scan_missing_baseline_exits_2.
+
+    Regression for the error-contract break found reviewing PR #205: once --baseline
+    was threaded into the recursive path, load_baseline() ran outside scan()'s
+    try/except, so a bad path escaped as an uncaught FileNotFoundError and exited 1,
+    the "risk found" code. docs/SUPPRESSION.md and README's exit-code table both
+    require 2 for a missing or malformed baseline.
+    """
+    collection = tmp_path / "collection"
+    for name in ("alpha", "beta"):
+        sub = collection / name
+        sub.mkdir(parents=True)
+        (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(collection),
+            "--recursive",
+            "--no-llm",
+            "--baseline",
+            str(tmp_path / "missing.yaml"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "baseline" in result.output.lower()
+    assert "Traceback" not in result.output
+
+
+def test_cli_recursive_malformed_baseline_exits_2(tmp_path: Path) -> None:
+    """A malformed (unparseable) baseline exits 2 recursively, same as single-skill."""
+    collection = tmp_path / "collection"
+    sub = collection / "alpha"
+    sub.mkdir(parents=True)
+    (sub / "SKILL.md").write_text("---\nname: alpha\n---\n# alpha\n", encoding="utf-8")
+    (collection / "beta").mkdir()
+    (collection / "beta" / "SKILL.md").write_text(
+        "---\nname: beta\n---\n# beta\n", encoding="utf-8"
+    )
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("not: [valid\n  yaml: :::\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["scan", str(collection), "--recursive", "--no-llm", "--baseline", str(bad)],
+    )
+
+    assert result.exit_code == 2
+    assert "baseline" in result.output.lower()
+    assert "Traceback" not in result.output
+
+
+def test_cli_recursive_terminal_summary_finding_count_excludes_suppressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminal summary's Findings column must also exclude suppressed findings.
+
+    The combined-JSON count is pinned by
+    test_cli_recursive_json_finding_count_excludes_suppressed, but the terminal
+    summary at cli.py's _scan_multi_skill uses the same helper on a separate line and
+    was previously unpinned: reverting it to the pre-suppression form passed the whole
+    suite. This pins the user-visible column.
+    """
+    import skillspector.cli as cli_mod
+
+    collection = tmp_path / "collection"
+    for name in ("alpha", "beta"):
+        sub = collection / name
+        sub.mkdir(parents=True)
+        (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n", encoding="utf-8")
+
+    # alpha fully suppressed (active 0); beta suppresses 2 of 3 (active 1).
+    per_skill = {
+        "alpha": {
+            "findings": ["raw1", "raw2", "raw3"],
+            "filtered_findings": ["raw1", "raw2", "raw3"],
+            "suppressed_findings": ["raw1", "raw2", "raw3"],
+        },
+        "beta": {
+            "findings": ["raw1", "raw2", "raw3"],
+            "filtered_findings": ["raw1", "raw2", "raw3"],
+            "suppressed_findings": ["raw1", "raw2"],
+        },
+    }
+
+    def fake_invoke(state: dict[str, object], config: object = None) -> dict[str, object]:
+        name = Path(str(state["input_path"])).name
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "report_body": "{}",
+            **per_skill[name],
+        }
+
+    monkeypatch.setattr(cli_mod.graph, "invoke", fake_invoke)
+
+    result = runner.invoke(app, ["scan", str(collection), "--recursive", "--no-llm"])
+
+    assert result.exit_code == 0
+    # Summary rows are "<name> <score> <severity> <finding_count>"; assert the count
+    # column, not a bare substring, so a pre-suppression 3 cannot pass.
+    rows = {
+        parts[0]: parts[-1]
+        for line in result.output.splitlines()
+        if len(parts := line.split()) == 4 and parts[0] in ("alpha", "beta")
+    }
+    assert rows == {"alpha": "0", "beta": "1"}
