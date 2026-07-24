@@ -501,6 +501,79 @@ def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None
     return results
 
 
+_LOCKFILE_PACKAGE_BLOCK_RE = re.compile(
+    r"(?ms)^\s*\[\[package\]\]\s*$.*?(?=^\s*\[\[package\]\]\s*$|\Z)"
+)
+
+
+def _normalize_package_name(name: str) -> str:
+    """Normalize package names the same way OSV/fallback coverage does."""
+    return name.lower().replace("_", "-")
+
+
+def _is_python_lockfile(file_path: str) -> bool:
+    lower_path = file_path.lower()
+    return "uv.lock" in lower_path or "poetry.lock" in lower_path
+
+
+def _extract_packages_from_toml_lock(content: str) -> list[tuple[str, str | None, int]]:
+    """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
+    try:
+        data = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return []
+    packages = data.get("package")
+    if not isinstance(packages, list):
+        return []
+    blocks = list(_LOCKFILE_PACKAGE_BLOCK_RE.finditer(content))
+    results: list[tuple[str, str | None, int]] = []
+    for package, block in zip(packages, blocks, strict=False):
+        if not isinstance(package, dict):
+            continue
+        name = package.get("name")
+        version = package.get("version")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        version_value = version.strip() if isinstance(version, str) and version.strip() else None
+        name_match = re.search(r"(?m)^\s*name\s*=", block.group(0))
+        idx = block.start() + name_match.start() if name_match else block.start()
+        line_num = get_line_number(content, idx)
+        results.append((name, version_value, line_num))
+    return results
+
+
+def _apply_locked_versions(
+    packages: list[tuple[str, str | None, int]],
+    locked_versions: dict[str, str] | None,
+) -> list[tuple[str, str | None, int]]:
+    """Prefer lockfile versions for manifest dependencies without exact versions."""
+    if not locked_versions:
+        return packages
+    resolved: list[tuple[str, str | None, int]] = []
+    for name, version, line_num in packages:
+        locked_version = locked_versions.get(_normalize_package_name(name))
+        resolved.append((name, version or locked_version, line_num))
+    return resolved
+
+
+def _collect_locked_versions(
+    file_cache: dict[str, str],
+    components: list[str],
+) -> dict[str, str]:
+    """Build package -> exact version map from Python lockfiles in the project."""
+    locked_versions: dict[str, str] = {}
+    for path in components:
+        if not _is_python_lockfile(path):
+            continue
+        content = file_cache.get(path)
+        if not content:
+            continue
+        for name, version, _line_num in _extract_packages_from_toml_lock(content):
+            if version:
+                locked_versions[_normalize_package_name(name)] = version
+    return locked_versions
+
+
 def _version_lt(v1: str, v2: str) -> bool:
     """Simple version comparison: True if v1 < v2 (numeric tuple comparison)."""
 
@@ -785,14 +858,17 @@ def _sc4_from_fallback(
 def _analyze_dependencies(
     content: str,
     file_path: str,
+    locked_versions: dict[str, str] | None = None,
 ) -> list[AnalyzerFinding]:
     """Run SC4/SC5/SC6 checks on dependency files."""
     findings: list[AnalyzerFinding] = []
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
     lower_path = file_path.lower()
-    is_python_dep = any(
-        n in lower_path for n in ["requirements", "pyproject.toml", "setup.py", "pipfile"]
+    is_lockfile = _is_python_lockfile(lower_path)
+    is_python_dep = (
+        any(n in lower_path for n in ["requirements", "pyproject.toml", "setup.py", "pipfile"])
+        or is_lockfile
     )
     is_npm_dep = "package.json" in lower_path
 
@@ -802,8 +878,12 @@ def _analyze_dependencies(
     if is_python_dep:
         if "pyproject.toml" in lower_path:
             packages = _extract_packages_from_pyproject(content)
+        elif is_lockfile:
+            packages = _extract_packages_from_toml_lock(content)
         else:
             packages = _extract_packages_from_requirements(content)
+        if not is_lockfile:
+            packages = _apply_locked_versions(packages, locked_versions)
         ecosystem = ECOSYSTEM_PYPI
         fallback_db = _FALLBACK_VULNERABLE_PYPI
         popular = _POPULAR_PYPI
@@ -990,18 +1070,27 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     # SC4–SC6: dependency-level analysis on dependency files
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
+    locked_versions = _collect_locked_versions(file_cache, components)
     for path in components:
         lower_path = path.lower()
         is_dep_file = any(
             n in lower_path
-            for n in ["requirements", "package.json", "pyproject.toml", "setup.py", "pipfile"]
+            for n in [
+                "requirements",
+                "package.json",
+                "pyproject.toml",
+                "setup.py",
+                "pipfile",
+                "uv.lock",
+                "poetry.lock",
+            ]
         )
         if not is_dep_file:
             continue
         content = file_cache.get(path)
         if not content:
             continue
-        dep_findings = _analyze_dependencies(content, path)
+        dep_findings = _analyze_dependencies(content, path, locked_versions)
         findings.extend(analyzer_finding_to_finding(af) for af in dep_findings)
 
     # TR1–TR3: trigger analysis from manifest
