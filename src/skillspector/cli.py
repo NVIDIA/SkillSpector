@@ -38,7 +38,12 @@ from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
-from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
+from skillspector.suppression import (
+    Baseline,
+    build_baseline_dict,
+    dump_baseline,
+    load_baseline,
+)
 
 logger = get_logger(__name__)
 
@@ -122,10 +127,16 @@ def _scan_state(
     format: FormatChoice,
     no_llm: bool,
     yara_rules_dir: str | None = None,
-    baseline: Path | None = None,
+    baseline: Baseline | None = None,
     show_suppressed: bool = False,
 ) -> dict[str, object]:
-    """Build initial graph state from scan CLI args."""
+    """Build initial graph state from scan CLI args.
+
+    *baseline* is an already-loaded :class:`Baseline`, not a path. Loading is done
+    once in ``scan()`` inside its ``try`` so a missing or malformed baseline is
+    reported as a clean error with exit code 2 on every path (single and
+    recursive), and so the file is not re-read and re-parsed per sub-skill.
+    """
     state: dict[str, object] = {
         "input_path": input_path,
         "output_format": format.value,
@@ -134,8 +145,7 @@ def _scan_state(
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
     if baseline is not None:
-        # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
-        state["baseline"] = load_baseline(baseline)
+        state["baseline"] = baseline
         state["show_suppressed"] = show_suppressed
     return state
 
@@ -288,33 +298,50 @@ def scan(
         set_level("DEBUG")
 
     resolved_path = Path(input_path).resolve()
-    if recursive and resolved_path.is_dir():
-        detection = detect_skills(resolved_path)
-        if detection.is_multi_skill:
-            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
-            return
-        if not detection.has_root_skill and len(detection.skills) == 0:
-            console.print(
-                "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
-                "detected. Scanning as single skill."
-            )
-    elif resolved_path.is_dir():
-        detection = detect_skills(resolved_path)
-        if detection.is_multi_skill:
-            console.print(
-                f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
-                f"this directory. Use --recursive to scan each independently."
-            )
 
     result = None
     try:
+        # Load once, here, inside the try: load_baseline() raises
+        # FileNotFoundError/ValueError, which the handlers below map to exit code 2.
+        # The recursive dispatch is inside this try for the same reason -- when it sat
+        # outside, a bad --baseline escaped as an uncaught traceback and exited 1 (the
+        # "risk found" code), contradicting docs/SUPPRESSION.md and the single-skill path.
+        loaded_baseline = load_baseline(baseline) if baseline is not None else None
+
+        if recursive and resolved_path.is_dir():
+            detection = detect_skills(resolved_path)
+            if detection.is_multi_skill:
+                _scan_multi_skill(
+                    detection,
+                    format,
+                    output,
+                    no_llm,
+                    yara_rules_dir,
+                    verbose,
+                    baseline=loaded_baseline,
+                    show_suppressed=show_suppressed,
+                )
+                return
+            if not detection.has_root_skill and len(detection.skills) == 0:
+                console.print(
+                    "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
+                    "detected. Scanning as single skill."
+                )
+        elif resolved_path.is_dir():
+            detection = detect_skills(resolved_path)
+            if detection.is_multi_skill:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
+                    f"this directory. Use --recursive to scan each independently."
+                )
+
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
         state = _scan_state(
             input_path,
             format,
             no_llm,
             yara_rules_dir=yara_dir,
-            baseline=baseline,
+            baseline=loaded_baseline,
             show_suppressed=show_suppressed,
         )
         if verbose:
@@ -366,6 +393,30 @@ def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> 
     }
 
 
+def _result_finding_count(result: dict[str, object]) -> int:
+    """Count active (post-suppression) findings for the multi-skill summary.
+
+    The report node returns ``filtered_findings`` as the full LLM-filtered set
+    (kept plus baseline-suppressed) and the suppressed subset separately under
+    ``suppressed_findings`` (see ``nodes/report.py``). ``partition_findings``
+    guarantees ``kept + suppressed == filtered_findings``, so the active count is
+    ``len(filtered_findings) - len(suppressed_findings)`` and is never negative for
+    real report output; the ``max(..., 0)`` is only a display-safety floor against
+    a malformed result. Subtracting is done solely on this branch: the raw
+    ``findings`` fallback (reached only when ``filtered_findings`` is absent or not
+    a list, e.g. a malformed or error result, never real report output) must not
+    subtract, since raw findings are not the population that produced
+    ``suppressed_findings``.
+    """
+    filtered = result.get("filtered_findings")
+    if isinstance(filtered, list):
+        suppressed = result.get("suppressed_findings")
+        suppressed_count = len(suppressed) if isinstance(suppressed, list) else 0
+        return max(len(filtered) - suppressed_count, 0)
+    findings = result.get("findings")
+    return len(findings) if isinstance(findings, list) else 0
+
+
 def _scan_multi_skill(
     detection: MultiSkillDetectionResult,
     format: FormatChoice,
@@ -373,8 +424,14 @@ def _scan_multi_skill(
     no_llm: bool,
     yara_rules_dir: Path | None,
     verbose: bool,
+    baseline: Baseline | None = None,
+    show_suppressed: bool = False,
 ) -> None:
-    """Scan each detected sub-skill independently and produce a combined report."""
+    """Scan each detected sub-skill independently and produce a combined report.
+
+    *baseline* is already loaded by ``scan()``; it is reused across sub-skills rather
+    than re-read and re-parsed once per skill.
+    """
     skills = detection.skills
     console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
 
@@ -386,7 +443,14 @@ def _scan_multi_skill(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(str(skill.path), format, no_llm, yara_rules_dir=yara_dir)
+        state = _scan_state(
+            str(skill.path),
+            format,
+            no_llm,
+            yara_rules_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+        )
         trace_config = _build_trace_config(str(skill.path), format, no_llm)
 
         try:
@@ -411,8 +475,7 @@ def _scan_multi_skill(
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        finding_count = _result_finding_count(result)
         console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
 
     console.print("")
@@ -434,18 +497,14 @@ def _scan_multi_skill(
                     "path": skill.relative_path,
                     "risk_score": result.get("risk_score", 0),
                     "risk_severity": result.get("risk_severity", "LOW"),
-                    "finding_count": len(
-                        result.get("filtered_findings") or result.get("findings") or []
-                    ),
+                    "finding_count": _result_finding_count(result),
                 }
                 entry.update(payload)
                 entry["name"] = skill.name
                 entry["path"] = skill.relative_path
                 entry["risk_score"] = result.get("risk_score", 0)
                 entry["risk_severity"] = result.get("risk_severity", "LOW")
-                entry["finding_count"] = len(
-                    result.get("filtered_findings") or result.get("findings") or []
-                )
+                entry["finding_count"] = _result_finding_count(result)
                 combined["skills"].append(entry)
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
