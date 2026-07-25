@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable
 
 from skillspector.llm_analyzer_base import (
     Batch,
@@ -157,10 +158,8 @@ class TestBatch:
 
 
 def _mock_get_chat_model(*_args, **_kwargs):
-    """Return a mock ChatOpenAI that supports with_structured_output."""
-    mock_llm = MagicMock()
-    mock_llm.with_structured_output.return_value = MagicMock()
-    return mock_llm
+    """Return a mock chat model for tests that override ``_structured_llm``."""
+    return MagicMock()
 
 
 MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
@@ -174,6 +173,70 @@ class _RawTextAnalyzer(LLMAnalyzerBase):
     def parse_response(self, response: object, batch: Batch) -> list[str]:
         assert isinstance(response, str)
         return [response]
+
+
+class _FakeChatModel(Runnable):
+    """Minimal Runnable that returns a fixed ``AIMessage`` content.
+
+    Stands in for an OpenAI-compatible endpoint that ignores
+    ``response_format`` so the real ``PydanticOutputParser`` in the
+    structured-output chain is exercised end-to-end.
+    """
+
+    def __init__(self, content: str):
+        self._content = content
+
+    def invoke(self, _input, _config=None, **_kwargs):
+        return AIMessage(content=self._content)
+
+    async def ainvoke(self, _input, _config=None, **_kwargs):
+        return AIMessage(content=self._content)
+
+
+class TestStructuredOutputParsing:
+    """Regression tests: structured chain tolerates non-strict endpoints.
+
+    OpenAI-compatible endpoints may ignore ``response_format`` and wrap the
+    JSON in markdown fences or surround it with prose. The chain must still
+    parse into the response schema rather than crashing the scan.
+    """
+
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"findings": [{"rule_id": "R-1", "message": "m", "severity": "LOW", "start_line": 1}]}',
+            '```json\n{"findings": [{"rule_id": "R-1", "message": "m", "severity": "LOW", "start_line": 1}]}\n```',
+            'Here is the analysis:\n```json\n{"findings": [{"rule_id": "R-1", "message": "m", "severity": "LOW", "start_line": 1}]}\n```\nDone.',
+        ],
+    )
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_parses_fenced_and_prose_wrapped_json(self, content: str) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm = _FakeChatModel(content) | analyzer._parser
+        results = analyzer.run_batches([Batch(file_path="x.py", content="code")])
+        _, findings = results[0]
+        assert len(findings) == 1
+        assert findings[0].rule_id == "R-1"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_empty_findings_object_parses(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm = (
+            _FakeChatModel('```json\n{"findings": []}\n```') | analyzer._parser
+        )
+        results = analyzer.run_batches([Batch(file_path="x.py", content="code")])
+        _, findings = results[0]
+        assert findings == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_format_instructions_appended_to_prompt(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        assert analyzer._format_instructions
+        augmented = analyzer._with_format("PROMPT BODY")
+        assert augmented.startswith("PROMPT BODY")
+        assert analyzer._format_instructions in augmented
 
 
 # ---------------------------------------------------------------------------
@@ -1577,22 +1640,22 @@ class TestLLMMetaAnalyzerRunBatches:
     @patch(MOCK_PATCH_TARGET)
     def test_run_batches_calls_structured_llm_per_batch(self, mock_get_model: MagicMock) -> None:
         mock_llm = MagicMock()
-        mock_structured = MagicMock()
         mock_get_model.return_value = mock_llm
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.invoke.return_value = MetaAnalyzerResult(
-            findings=[
-                MetaAnalyzerFinding(
-                    pattern_id="E1",
-                    is_vulnerability=True,
-                    confidence=0.9,
-                    intent="malicious",
-                    impact="high",
-                )
-            ],
-        )
 
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            return_value=MetaAnalyzerResult(
+                findings=[
+                    MetaAnalyzerFinding(
+                        pattern_id="E1",
+                        is_vulnerability=True,
+                        confidence=0.9,
+                        intent="malicious",
+                        impact="high",
+                    )
+                ],
+            )
+        )
         f1 = Finding(rule_id="E1", message="test", file="a.py", start_line=1)
         f2 = Finding(rule_id="E2", message="test", file="b.py", start_line=1)
         batches = [
@@ -1600,7 +1663,7 @@ class TestLLMMetaAnalyzerRunBatches:
             Batch(file_path="b.py", content="code b", findings=[f2]),
         ]
         results = analyzer.run_batches(batches, metadata_text="Name: skill")
-        assert mock_structured.invoke.call_count == 2
+        assert analyzer._structured_llm.invoke.call_count == 2
         assert len(results) == 2
 
     @patch(MOCK_PATCH_TARGET)
@@ -1621,10 +1684,10 @@ class TestLLMMetaAnalyzerARunBatches:
     @patch(MOCK_PATCH_TARGET)
     async def test_arun_batches_calls_ainvoke_per_batch(self, mock_get_model: MagicMock) -> None:
         mock_llm = MagicMock()
-        mock_structured = MagicMock()
         mock_get_model.return_value = mock_llm
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.ainvoke = AsyncMock(
+
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
             return_value=MetaAnalyzerResult(
                 findings=[
                     MetaAnalyzerFinding(
@@ -1637,8 +1700,6 @@ class TestLLMMetaAnalyzerARunBatches:
                 ],
             )
         )
-
-        analyzer = LLMMetaAnalyzer(model=self.MODEL)
         f1 = Finding(rule_id="E1", message="test", file="a.py", start_line=1)
         f2 = Finding(rule_id="E2", message="test", file="b.py", start_line=1)
         batches = [
@@ -1646,7 +1707,7 @@ class TestLLMMetaAnalyzerARunBatches:
             Batch(file_path="b.py", content="code b", findings=[f2]),
         ]
         results = await analyzer.arun_batches(batches, metadata_text="Name: skill")
-        assert mock_structured.ainvoke.call_count == 2
+        assert analyzer._structured_llm.ainvoke.call_count == 2
         assert len(results) == 2
 
     @patch(MOCK_PATCH_TARGET)
@@ -1655,10 +1716,10 @@ class TestLLMMetaAnalyzerARunBatches:
         mock_get_model: MagicMock,
     ) -> None:
         mock_llm = MagicMock()
-        mock_structured = MagicMock()
         mock_get_model.return_value = mock_llm
-        mock_llm.with_structured_output.return_value = mock_structured
-        mock_structured.ainvoke = AsyncMock(
+
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
             return_value=MetaAnalyzerResult(
                 findings=[
                     MetaAnalyzerFinding(
@@ -1673,8 +1734,6 @@ class TestLLMMetaAnalyzerARunBatches:
                 ],
             )
         )
-
-        analyzer = LLMMetaAnalyzer(model=self.MODEL)
         finding = Finding(rule_id="E1", message="test", file="a.py", start_line=1)
         batches = [Batch(file_path="a.py", content="code", findings=[finding])]
         batch_results = await analyzer.arun_batches(batches, metadata_text="")
