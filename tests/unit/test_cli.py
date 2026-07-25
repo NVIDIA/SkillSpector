@@ -16,6 +16,7 @@
 """Tests for skillspector CLI (skillspector scan, --version)."""
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -764,11 +765,15 @@ def test_cli_recursive_terminal_summary_finding_count_excludes_suppressed(
     result = runner.invoke(app, ["scan", str(collection), "--recursive", "--no-llm"])
 
     assert result.exit_code == 0
+    # Strip ANSI first: Rich highlights numbers, so under FORCE_COLOR=1 the count
+    # column arrives as "\x1b[1;36m0\x1b[0m" and a raw split comparison fails even
+    # though the count is right. Keep this test hermetic across colour settings.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
     # Summary rows are "<name> <score> <severity> <finding_count>"; assert the count
     # column, not a bare substring, so a pre-suppression 3 cannot pass.
     rows = {
         parts[0]: parts[-1]
-        for line in result.output.splitlines()
+        for line in plain.splitlines()
         if len(parts := line.split()) == 4 and parts[0] in ("alpha", "beta")
     }
     assert rows == {"alpha": "0", "beta": "1"}
