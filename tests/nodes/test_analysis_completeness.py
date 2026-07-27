@@ -89,6 +89,44 @@ class TestBuildAnalysisCompleteness:
         assert result["is_complete"] is False
         assert any("2 component(s)" in lim for lim in result["limitations"])
 
+    def test_content_exclusions_report_media_and_binary_reasons(self) -> None:
+        components = ["SKILL.md", "image.png", "payload.bin"]
+        component_metadata = [
+            {
+                "path": "SKILL.md",
+                "content_kind": "text",
+                "llm_analysis_status": "included",
+            },
+            {
+                "path": "image.png",
+                "content_kind": "media",
+                "llm_analysis_status": "excluded",
+                "llm_skip_reason": "media_content",
+            },
+            {
+                "path": "payload.bin",
+                "content_kind": "binary",
+                "llm_analysis_status": "excluded",
+                "llm_skip_reason": "binary_content",
+            },
+        ]
+        with patch("skillspector.nodes.report.is_llm_available", return_value=(True, None)):
+            result = _build_analysis_completeness(
+                components,
+                {"SKILL.md": "# Skill", "image.png": "binary", "payload.bin": "binary"},
+                use_llm=True,
+                findings_pre_filter=[],
+                findings_post_filter=[],
+                component_metadata=component_metadata,
+            )
+
+        assert result["coverage_percent"] == 100.0
+        assert result["llm_eligible_components"] == 1
+        assert result["llm_excluded_components"] == 2
+        assert result["is_complete"] is False
+        assert "1 media component(s) excluded from LLM analysis" in result["limitations"]
+        assert "1 binary component(s) excluded from LLM analysis" in result["limitations"]
+
     def test_llm_unavailable_noted(self) -> None:
         with patch(
             "skillspector.nodes.report.is_llm_available",
@@ -169,6 +207,40 @@ class TestCompletenessInJsonReport:
         assert body["analysis_completeness"]["total_components"] == 1
         assert body["analysis_completeness"]["scanned_components"] == 1
         assert body["analysis_completeness"]["coverage_percent"] == 100.0
+
+    @patch("skillspector.nodes.report.is_llm_available", return_value=(True, None))
+    def test_json_report_explains_media_exclusion(self, _mock_llm) -> None:
+        state = {
+            "findings": [],
+            "filtered_findings": [],
+            "components": ["SKILL.md", "image.png"],
+            "file_cache": {"SKILL.md": "# Skill", "image.png": "binary"},
+            "component_metadata": [
+                {
+                    "path": "SKILL.md",
+                    "content_kind": "text",
+                    "llm_analysis_status": "included",
+                },
+                {
+                    "path": "image.png",
+                    "content_kind": "media",
+                    "llm_analysis_status": "excluded",
+                    "llm_skip_reason": "media_content",
+                },
+            ],
+            "has_executable_scripts": False,
+            "manifest": {"name": "test-skill"},
+            "output_format": "json",
+            "use_llm": True,
+        }
+
+        body = json.loads(report(state)["report_body"])
+
+        completeness = body["analysis_completeness"]
+        assert completeness["is_complete"] is False
+        assert completeness["coverage_percent"] == 100.0
+        assert completeness["llm_excluded_components"] == 1
+        assert "1 media component(s) excluded from LLM analysis" in completeness["limitations"]
 
     @patch("skillspector.nodes.report.is_llm_available", return_value=(True, None))
     def test_sarif_format_does_not_include_completeness(self, _mock_llm) -> None:

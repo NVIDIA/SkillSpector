@@ -22,6 +22,7 @@ from a local skill directory.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -59,6 +60,111 @@ _FILE_TYPES: dict[str, str] = {
 _EXECUTABLE_EXTENSIONS = frozenset(
     {".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".rb", ".go", ".rs", ".pl"}
 )
+
+
+@dataclass(frozen=True)
+class _FileInspection:
+    """Content classification used to decide whether LLM analyzers can read a file."""
+
+    content: str
+    content_kind: str
+    llm_analysis_status: str
+    llm_skip_reason: str | None = None
+
+
+def _has_media_signature(data: bytes) -> bool:
+    """Return whether bytes have a recognized image, audio, or video signature."""
+    if data.startswith(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff",
+            b"GIF87a",
+            b"GIF89a",
+            b"BM",
+            b"\x00\x00\x01\x00",
+            b"II*\x00",
+            b"MM\x00*",
+            b"fLaC",
+            b"OggS",
+            b"\x1aE\xdf\xa3",
+            b"\x00\x00\x01\xba",
+            b"\x00\x00\x01\xb3",
+        )
+    ):
+        return True
+    if data.startswith(b"RIFF") and data[8:12] in {b"WEBP", b"WAVE", b"AVI "}:
+        return True
+    if data.startswith(b"ID3") or (
+        len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE6 in {0xE0, 0xE2, 0xE4, 0xE6}
+    ):
+        return True
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return data[8:12].lower() in {
+            b"3gp4",
+            b"3gp5",
+            b"avif",
+            b"avis",
+            b"heic",
+            b"heix",
+            b"hevc",
+            b"hevx",
+            b"isom",
+            b"m4a ",
+            b"m4v ",
+            b"mif1",
+            b"mp41",
+            b"mp42",
+            b"msf1",
+            b"qt  ",
+        }
+    return False
+
+
+def _has_abnormal_controls(content: str) -> bool:
+    """Return whether decoded text contains controls not used for normal layout."""
+    return any(
+        (ord(char) < 32 and char not in "\t\n\r\f") or 127 <= ord(char) <= 159 for char in content
+    )
+
+
+def _is_strong_binary(data: bytes) -> bool:
+    """Detect strong binary evidence while leaving uncertain encodings analyzable."""
+    if b"\x00" in data:
+        return True
+    if not data:
+        return False
+    abnormal_controls = sum(
+        (byte < 32 and byte not in {9, 10, 12, 13}) or byte == 127 for byte in data
+    )
+    return abnormal_controls / len(data) >= 0.3
+
+
+def _inspect_bytes(data: bytes) -> _FileInspection:
+    """Classify bytes, preferring analyzable text and failing open when uncertain."""
+    try:
+        strict_content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        strict_content = None
+
+    if strict_content is not None and not _has_abnormal_controls(strict_content):
+        return _FileInspection(strict_content, "text", "included")
+    if _has_media_signature(data):
+        return _FileInspection(
+            data.decode("utf-8", errors="replace"),
+            "media",
+            "excluded",
+            "media_content",
+        )
+    if _is_strong_binary(data):
+        return _FileInspection(
+            data.decode("utf-8", errors="replace"),
+            "binary",
+            "excluded",
+            "binary_content",
+        )
+
+    # Invalid or unusual text that is not confidently binary remains in scope.
+    return _FileInspection(data.decode("utf-8", errors="replace"), "text", "included")
 
 
 def _resolve_skill_dir(state: SkillspectorState) -> Path:
@@ -108,18 +214,10 @@ def _infer_file_type(path: str) -> str:
     return _FILE_TYPES.get(suffix, "other")
 
 
-def _count_lines(file_path: Path) -> int:
-    """Count lines in a file, handling binary and errors gracefully."""
-    try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
-        return len(content.splitlines())
-    except OSError:
-        logger.debug("Could not read file for line count: %s", file_path)
-        return 0
-
-
 def _build_component_metadata(
-    skill_dir: Path, components: list[str]
+    skill_dir: Path,
+    components: list[str],
+    inspections: dict[str, _FileInspection],
 ) -> tuple[list[dict[str, object]], bool]:
     """Build component_metadata list and has_executable_scripts from paths."""
     metadata: list[dict[str, object]] = []
@@ -130,7 +228,8 @@ def _build_component_metadata(
             continue
         suffix = full.suffix.lower()
         file_type = _infer_file_type(path)
-        lines = _count_lines(full)
+        inspection = inspections[path]
+        lines = len(inspection.content.splitlines())
         executable = suffix in _EXECUTABLE_EXTENSIONS
         if executable:
             has_executable = True
@@ -146,25 +245,37 @@ def _build_component_metadata(
                 "lines": lines,
                 "executable": executable,
                 "size_bytes": size_bytes,
+                "content_kind": inspection.content_kind,
+                "llm_analysis_status": inspection.llm_analysis_status,
+                "llm_skip_reason": inspection.llm_skip_reason,
             }
         )
     return metadata, has_executable
 
 
-def _read_file_cache(skill_dir: Path, components: list[str]) -> dict[str, str]:
-    """Build file_cache: relative path -> file contents. Uses utf-8 with replace for errors."""
+def _read_file_cache(
+    skill_dir: Path, components: list[str]
+) -> tuple[dict[str, str], dict[str, str], dict[str, _FileInspection]]:
+    """Build the shared and LLM-eligible caches and classify every component."""
     file_cache: dict[str, str] = {}
+    llm_file_cache: dict[str, str] = {}
+    inspections: dict[str, _FileInspection] = {}
     for path in components:
         full = skill_dir / path
         if not full.is_file():
             continue
         try:
-            content = full.read_text(encoding="utf-8", errors="replace")
-            file_cache[path] = content
+            inspection = _inspect_bytes(full.read_bytes())
         except OSError:
             logger.debug("Could not read file: %s", path)
-            file_cache[path] = ""
-    return file_cache
+            inspection = _FileInspection("", "unknown", "excluded", "read_error")
+        inspections[path] = inspection
+        file_cache[path] = inspection.content
+        if inspection.llm_analysis_status == "included":
+            llm_file_cache[path] = inspection.content
+        else:
+            logger.info("Excluding %s from LLM analysis: %s", path, inspection.llm_skip_reason)
+    return file_cache, llm_file_cache, inspections
 
 
 def _parse_manifest(skill_dir: Path) -> dict[str, object]:
@@ -236,13 +347,16 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     skill_dir = _resolve_skill_dir(state)
 
     components = _walk_skill_files(skill_dir)
-    file_cache = _read_file_cache(skill_dir, components)
+    file_cache, llm_file_cache, inspections = _read_file_cache(skill_dir, components)
     manifest = _parse_manifest(skill_dir)
-    component_metadata, has_executable_scripts = _build_component_metadata(skill_dir, components)
+    component_metadata, has_executable_scripts = _build_component_metadata(
+        skill_dir, components, inspections
+    )
 
     return {
         "components": components,
         "file_cache": file_cache,
+        "llm_file_cache": llm_file_cache,
         "ast_cache": {},
         "manifest": manifest,
         "previous_manifest": None,

@@ -39,6 +39,9 @@ class SkillspectorState(TypedDict, total=False):
     # build_context node populates these
     components: list[str]
     file_cache: dict[str, str]
+    # Text files eligible for LLM analysis. Missing on legacy/test states, where
+    # LLM nodes fall back to file_cache for compatibility.
+    llm_file_cache: dict[str, str]
     ast_cache: dict[str, str]
     manifest: dict[str, object]
     previous_manifest: dict[str, object] | None
@@ -117,6 +120,14 @@ class AnalyzerNodeResponse(TypedDict):
     # LLM-backed analyzers also report one telemetry record; static analyzers
     # omit it (NotRequired keeps the key optional for them).
     llm_call_log: NotRequired[list[LLMCallRecord]]
+
+
+def get_llm_file_cache(state: SkillspectorState) -> dict[str, str]:
+    """Return the LLM-eligible cache, preserving compatibility with legacy states."""
+    cache = state.get("llm_file_cache")
+    if cache is not None:
+        return cache
+    return state.get("file_cache") or {}
 
 
 class MetaAnalyzerResponse(TypedDict):

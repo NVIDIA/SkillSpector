@@ -514,6 +514,7 @@ def _build_analysis_completeness(
     use_llm: bool,
     findings_pre_filter: list[Finding],
     findings_post_filter: list[Finding],
+    component_metadata: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Build analysis_completeness section indicating scan coverage and limitations.
 
@@ -522,14 +523,34 @@ def _build_analysis_completeness(
     """
     total_components = len(components)
     scanned_components = sum(1 for c in components if c in file_cache)
+    component_set = set(components)
+    llm_skip_reasons = {
+        str(metadata.get("path")): metadata.get("llm_skip_reason")
+        for metadata in (component_metadata or [])
+        if metadata.get("path") in component_set
+        and metadata.get("llm_analysis_status") == "excluded"
+    }
+    llm_excluded_components = len(llm_skip_reasons)
+    llm_eligible_components = total_components - llm_excluded_components
 
     llm_available, llm_error = is_llm_available()
     llm_used = use_llm and llm_available
 
     limitations: list[str] = []
+    media_count = sum(reason == "media_content" for reason in llm_skip_reasons.values())
+    binary_count = sum(reason == "binary_content" for reason in llm_skip_reasons.values())
+    read_error_count = sum(reason == "read_error" for reason in llm_skip_reasons.values())
+    if media_count:
+        limitations.append(f"{media_count} media component(s) excluded from LLM analysis")
+    if binary_count:
+        limitations.append(f"{binary_count} binary component(s) excluded from LLM analysis")
+    if read_error_count:
+        limitations.append(f"{read_error_count} component(s) could not be read for LLM analysis")
     if scanned_components < total_components:
-        skipped = total_components - scanned_components
-        limitations.append(f"{skipped} component(s) had no content in file_cache (skipped)")
+        missing_components = {component for component in components if component not in file_cache}
+        other_count = len(missing_components - llm_skip_reasons.keys())
+        if other_count:
+            limitations.append(f"{other_count} component(s) had no content in file_cache (skipped)")
     if use_llm and not llm_available:
         limitations.append(f"LLM meta-analysis unavailable: {llm_error or 'unknown reason'}")
     if not use_llm:
@@ -546,6 +567,8 @@ def _build_analysis_completeness(
         if total_components > 0
         else 100.0,
         "llm_analysis": "applied" if llm_used else "skipped",
+        "llm_eligible_components": llm_eligible_components,
+        "llm_excluded_components": llm_excluded_components,
         "findings_before_filtering": len(findings_pre_filter),
         "findings_after_filtering": len(findings_post_filter),
         "limitations": limitations if limitations else None,
@@ -746,7 +769,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
     )
     sarif_report = _build_sarif(active_findings, suppressed, degraded_notice=degraded_notice)
     analysis_completeness = _build_analysis_completeness(
-        components, file_cache, use_llm, raw_findings, filtered_findings
+        components,
+        file_cache,
+        use_llm,
+        raw_findings,
+        filtered_findings,
+        component_metadata,
     )
 
     # Fail closed on a degraded deep scan: when the LLM stage was requested but

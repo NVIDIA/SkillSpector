@@ -26,7 +26,12 @@ from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL, MODEL_CONFIG
 from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call_record
+from skillspector.state import (
+    AnalyzerNodeResponse,
+    SkillspectorState,
+    get_llm_file_cache,
+    llm_call_record,
+)
 
 ANALYZER_ID = "semantic_developer_intent"
 logger = get_logger(__name__)
@@ -158,7 +163,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     if not state.get("use_llm", True):
         return {"findings": []}
 
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache = get_llm_file_cache(state)
     if not file_cache:
         return {"findings": []}
 
