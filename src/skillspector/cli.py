@@ -274,7 +274,16 @@ def scan(
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
-            _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
+            _scan_multi_skill(
+                detection,
+                format,
+                output,
+                no_llm,
+                yara_rules_dir,
+                verbose,
+                baseline=baseline,
+                show_suppressed=show_suppressed,
+            )
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
             console.print(
@@ -349,6 +358,23 @@ def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> 
     }
 
 
+def _active_finding_count(result: dict[str, object]) -> int:
+    """Number of findings a scan actually reports, excluding baseline suppressions.
+
+    `filtered_findings` is pre-suppression: the report node partitions it into
+    active and suppressed sets but only returns the latter separately. Counting
+    the raw list therefore overstates a scan whose findings were all baselined.
+    """
+    findings = result.get("filtered_findings")
+    if findings is None:
+        findings = result.get("findings")
+    total = len(findings) if isinstance(findings, list) else 0
+    suppressed = result.get("suppressed_findings")
+    if isinstance(suppressed, list):
+        total -= len(suppressed)
+    return max(total, 0)
+
+
 def _scan_multi_skill(
     detection: MultiSkillDetectionResult,
     format: FormatChoice,
@@ -356,10 +382,21 @@ def _scan_multi_skill(
     no_llm: bool,
     yara_rules_dir: Path | None,
     verbose: bool,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     skills = detection.skills
     console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
+
+    if baseline is not None:
+        # Validate up front so a bad baseline fails fast with exit code 2, matching
+        # single-skill behaviour, instead of surfacing as a per-skill scan error.
+        try:
+            load_baseline(baseline)
+        except (FileNotFoundError, ValueError) as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=2) from e
 
     results: list[dict[str, object]] = []
     max_score = 0
@@ -369,7 +406,14 @@ def _scan_multi_skill(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
         yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
-        state = _scan_state(str(skill.path), format, no_llm, yara_rules_dir=yara_dir)
+        state = _scan_state(
+            str(skill.path),
+            format,
+            no_llm,
+            yara_rules_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+        )
         trace_config = _build_trace_config(str(skill.path), format, no_llm)
 
         try:
@@ -394,8 +438,7 @@ def _scan_multi_skill(
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        finding_count = _active_finding_count(result)
         console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
 
     console.print("")
@@ -417,9 +460,7 @@ def _scan_multi_skill(
                         "path": skill.relative_path,
                         "risk_score": result.get("risk_score", 0),
                         "risk_severity": result.get("risk_severity", "LOW"),
-                        "finding_count": len(
-                            result.get("filtered_findings") or result.get("findings") or []
-                        ),
+                        "finding_count": _active_finding_count(result),
                     }
                 )
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
