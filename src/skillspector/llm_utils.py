@@ -35,8 +35,10 @@ other OpenAI-compatible endpoint is configured via the standard
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
-from typing import NoReturn
+from collections.abc import Coroutine
+from typing import Any, NoReturn
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -46,6 +48,7 @@ from skillspector.providers import (
     get_active_provider,
     get_metadata_provider,
     has_cli_capability,
+    has_provider_binding,
     raise_no_llm_api_key_configured,
     resolve_chat_model_credentials,
     resolve_provider_credentials,
@@ -71,6 +74,9 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
 
 def _resolve_default_chat_model() -> str:
     """Return the default chat model for the endpoint that will be used."""
+    if has_provider_binding():
+        return get_metadata_provider().resolve_model()
+
     if resolve_provider_credentials() is not None:
         return get_metadata_provider().resolve_model()
 
@@ -84,13 +90,26 @@ def _resolve_default_chat_model() -> str:
 def is_llm_available() -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
-    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) the check
-    delegates to the provider's ``is_available()`` method (binary on PATH +
-    auth).  For HTTP providers, it falls back to credential resolution.
+    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) are checked
+    through their ``is_available()`` method first.  Other providers probe the
+    same native chat-model path used by :func:`get_chat_model`; unbound HTTP
+    providers keep the credential-resolution and OpenAI fallback path.
     """
     provider = get_active_provider()
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
+
+    if has_provider_binding():
+        try:
+            model = provider.resolve_model()
+            create_chat_model(
+                model=model,
+                max_tokens=get_max_output_tokens(model),
+                timeout=120,
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        return True, None
     try:
         _resolve_llm_credentials()
     except ValueError as exc:
@@ -276,3 +295,29 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     if hasattr(response, "text"):
         return response.text  # type: ignore[union-attr]
     return response.content or ""  # type: ignore[union-attr]
+
+
+def run_async(coroutine: Coroutine) -> Any:
+    """
+    Run an async coroutine in a synchronous context, even if there's already a running event loop.
+
+    This function safely handles nested event loop scenarios (e.g. Jupyter Notebooks, FastAPI,
+    LangGraph Studio) by offloading the coroutine execution to a separate thread with its own
+    event loop when a running loop is detected.
+
+    Args:
+        coroutine: The async coroutine to run
+
+    Returns:
+        The result of the coroutine execution
+
+    Raises:
+        Any exception raised by the coroutine is re-raised as-is
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coroutine).result()

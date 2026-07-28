@@ -30,38 +30,84 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  lint-and-test:
-    name: Lint & Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    # Windows is excluded: the test suite has known path-separator failures
-    # in build_context that are out of scope for this workflow.
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+env:
+  UV_VERSION: "0.10.x"
+  PYTHON_VERSION: "3.12"
+  UV_CACHE_DIR: .uv-cache
+  UV_LINK_MODE: copy
 
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            .dockerignore .github/workflows/ci.yml .gitlab-ci.yml Dockerfile \
+            Makefile pyproject.toml uv.lock src tests/docker tests/fixtures/safe_skill; then
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          fi
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Set up uv
         # Pinned to a full commit SHA (third-party action); comment tracks the tag.
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
-          python-version: ${{ matrix.python-version }}
+          cache-dependency-glob: uv.lock
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: make install-dev
+      - run: uv run make lint
+      - run: uv run make format-check
 
-      - name: Install dependencies
-        run: uv sync --all-extras
+  test-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        # Pinned to a full commit SHA (third-party action); comment tracks the tag.
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: make install-dev
+      - run: uv run skillspector --version
+      - run: uv run make test-ci
 
-      - name: Lint with ruff
-        run: uv run ruff check src/ tests/
-
-      - name: Check formatting with ruff
-        run: uv run ruff format --check src/ tests/
-
-      - name: Run unit tests with coverage
-        run: uv run pytest -m "not integration" --cov=src/skillspector --cov-report=term-missing
+  docker-smoke:
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker version
+      - run: docker info
+      - run: docker build -t skillspector .
+      - run: tests/docker/smoke.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-smoke-reports
+          path: |
+            .skillspector-docker-smoke.json
+            .skillspector-docker-github-smoke.json
+          if-no-files-found: ignore
 
   dco:
     name: DCO Check

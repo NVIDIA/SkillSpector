@@ -168,8 +168,7 @@ class TestBuildClaudeArgv:
         assert argv[idx + 1] == MODEL
 
     def test_model_flag_omitted_when_empty(self) -> None:
-        # No SKILLSPECTOR_MODEL -> resolve_model() is "" -> --model is omitted so
-        # claude runs with the user's OWN configured model (no pinned version).
+        # No SKILLSPECTOR_MODEL -> resolve_model() is "" -> --model is omitted.
         argv = _build_claude_argv(CLAUDE_BINARY, "", 4096)
         assert "--model" not in argv
 
@@ -194,6 +193,12 @@ class TestBuildClaudeArgv:
         assert "--strict-mcp-config" in argv
         # --no-mcp-config is not a real claude flag and must not be used.
         assert "--no-mcp-config" not in argv
+
+    def test_setting_sources_is_empty_single_token_after_strict_mcp_config(self) -> None:
+        argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
+        assert "--setting-sources=" in argv
+        assert argv[argv.index("--strict-mcp-config") + 1] == "--setting-sources="
+        assert argv.count("--setting-sources=") == 1
 
     def test_bare_flag_absent(self) -> None:
         argv = _build_claude_argv(CLAUDE_BINARY, MODEL, 4096)
@@ -253,6 +258,10 @@ class TestBuildCodexArgv:
         argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
         full_cmd = " ".join(argv)
         assert "dangerously" not in full_cmd.lower()
+
+    def test_setting_sources_flag_absent(self) -> None:
+        argv = _build_codex_argv(CODEX_BINARY, "o4-mini")
+        assert "--setting-sources=" not in argv
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +699,10 @@ class TestGeminiArgv:
         # No SKILLSPECTOR_MODEL -> gemini runs with the user's own model.
         argv = _agent_cli._build_gemini_argv("gemini", "", 4096)
         assert "-m" not in argv
+
+    def test_setting_sources_flag_absent(self) -> None:
+        argv = _agent_cli._build_gemini_argv("gemini", "gemini-2.5-pro", 4096)
+        assert "--setting-sources=" not in argv
 
     def test_parse_handles_json_and_plaintext(self) -> None:
         assert _agent_cli._parse_gemini_output('{"response": "hi"}') == "hi"

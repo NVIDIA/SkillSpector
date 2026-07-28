@@ -44,7 +44,9 @@ OH1_PATTERNS = [
     # Python: output piped into exec/eval/subprocess
     (r"exec\s*\(\s*(?:response|output|result|answer|completion|reply|generated)", 0.9),
     (r"eval\s*\(\s*(?:response|output|result|answer|completion|reply|generated)", 0.9),
-    (r"subprocess\.\w+\s*\([^)]*(?:response|output|result|answer|completion)", 0.85),
+    # Identifier boundaries keep benign keyword names such as capture_output
+    # from being mistaken for model-output variables.
+    (r"subprocess\.\w+\s*\([^)]*\b(?:response|output|result|answer|completion)\b", 0.85),
     (r"os\.system\s*\(\s*(?:response|output|result|answer|completion)", 0.85),
     (r"os\.popen\s*\(\s*(?:response|output|result|answer|completion)", 0.85),
     # Web: output injected into HTML without sanitization
@@ -195,6 +197,6 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run output_handling patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

@@ -50,7 +50,14 @@ AR1_PATTERNS = [
     (r"\byou\s+(?:must|will|should|can)\s*(?:not|never)\s+(?:refuse|decline|say\s+no)\b", 0.9),
     (r"\byou\s+(?:cannot|can'?t|can\s+not)\s+(?:refuse|decline|say\s+no)\b", 0.85),
     (r"\bnever\s+say\s+(?:that\s+)?(?:you\s+)?(?:can'?t|cannot|won'?t|no)\b", 0.85),
-    (r"\balways\s+(?:comply|obey|answer|respond|agree)\b", 0.7),
+    (r"\balways\s+(?:comply|obey|answer|respond)\b", 0.7),
+    (
+        r"\b(?:(?:you|the\s+(?:agent|assistant|model))\s+(?:must|should|will)\s+"
+        r"always\s+agree|always\s+agree\s+(?:with|to)\s+"
+        r"(?:(?:the|every|all|any|each)\s+)?"
+        r"(?:user|requests?|questions?|prompts?|queries|commands?))\b",
+        0.7,
+    ),
     (
         r"\b(?:you\s+)?must\s+(?:always\s+)?(?:answer|comply\s+with|respond\s+to|fulfill)\s+"
         r"(?:every|all|any|each)\b",
@@ -120,6 +127,16 @@ _RULES = [("AR1", AR1_PATTERNS), ("AR2", AR2_PATTERNS), ("AR3", AR3_PATTERNS)]
 # minimum confidence required to emit a finding after the penalty.
 _EXAMPLE_PENALTY = 0.4
 _MIN_CONFIDENCE = 0.5
+_MODE_ENABLED_RE = re.compile(
+    r"\b(?:developer|debug|god|sudo|jailbreak)\s+mode\s+(?:enabled|on|activated|engaged)\b",
+    re.IGNORECASE,
+)
+_SECURITY_REVIEW_CONTEXT_RE = re.compile(
+    r"\b(?:unsafe\s+defaults?|security\s+(?:review|audit|checklist)|review\s+checklist)\b|"
+    r"\b(?:detect|flag|check(?:s|ed|ing)?\s+for|look\s+for|avoid|must\s+not|never\s+enable)\b"
+    r"[^.\n]{0,100}\b(?:developer|debug|god|sudo|jailbreak)\s+mode\b",
+    re.IGNORECASE,
+)
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -131,6 +148,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for pattern, base_confidence in patterns:
             for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
                 context = get_context(content, match.start(), context_lines=3)
+                if _MODE_ENABLED_RE.fullmatch(match.group(0)) and (
+                    _SECURITY_REVIEW_CONTEXT_RE.search(context)
+                ):
+                    continue
                 confidence = base_confidence
                 if is_code_example(context):
                     confidence -= _EXAMPLE_PENALTY
@@ -167,6 +188,6 @@ def _deduplicate_findings(findings: list[AnalyzerFinding]) -> list[AnalyzerFindi
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run anti_refusal patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

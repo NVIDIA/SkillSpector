@@ -23,14 +23,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 
+from skillspector.inspection_ledger import LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
     Batch,
+    BatchExecutionResult,
+    BatchFailure,
     LLMAnalysisResult,
     LLMAnalyzerBase,
     LLMFinding,
     chunk_file_by_lines,
     estimate_tokens,
     findings_in_range,
+    ledger_events_for_batches,
     number_lines,
 )
 from skillspector.models import Finding
@@ -418,6 +422,23 @@ class TestARunBatches:
         assert files == {"a.py", "b.py", "c.py"}
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_detailed_outcome_preserves_failed_batch(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[LLMAnalysisResult(findings=[]), TimeoutError("provider detail")]
+        )
+        batches = [
+            Batch(file_path="a.py", content="ok"),
+            Batch(file_path="b.py", content="times out"),
+        ]
+
+        outcome = await analyzer.arun_batches_detailed(batches)
+
+        assert [batch.file_path for batch, _ in outcome.successful] == ["a.py"]
+        assert outcome.failures[0].batch.file_path == "b.py"
+        assert outcome.failures[0].error_class == "TimeoutError"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     async def test_returns_parsed_findings(self) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.ainvoke = AsyncMock(
@@ -592,6 +613,113 @@ class TestARunBatches:
         batches = [Batch(file_path="a.py", content="code")]
         with pytest.raises(ValueError, match="no API key"):
             await analyzer.arun_batches(batches)
+
+
+class TestLedgerEventsForBatches:
+    def test_successful_overlap_is_excluded_from_failed_range(self) -> None:
+        outcome = BatchExecutionResult(
+            successful=[
+                (
+                    Batch(file_path="large.py", content="", start_line=1, end_line=100),
+                    [],
+                )
+            ],
+            failures=[
+                BatchFailure(
+                    Batch(file_path="large.py", content="", start_line=51, end_line=150),
+                    "TimeoutError",
+                )
+            ],
+        )
+
+        events, status = ledger_events_for_batches("semantic_test", outcome)
+
+        assert [(event["outcome"], event["start_line"], event["end_line"]) for event in events] == [
+            ("completed", 1, 100),
+            ("failed", 101, 150),
+        ]
+        assert [work["work_id"] for work in status["planned_work"]] == [
+            event["work_id"] for event in events
+        ]
+
+    def test_unchunked_batch_keeps_its_work_id_after_failure(self) -> None:
+        batch = Batch(file_path="single.py", content="first line\nsecond line")
+        successful_events, _ = ledger_events_for_batches(
+            "semantic_test", BatchExecutionResult(successful=[(batch, [])])
+        )
+        failed_events, _ = ledger_events_for_batches(
+            "semantic_test",
+            BatchExecutionResult(failures=[BatchFailure(batch, "TimeoutError")]),
+        )
+
+        assert successful_events[0]["start_line"] is None
+        assert failed_events[0]["start_line"] is None
+        assert successful_events[0]["work_id"] == failed_events[0]["work_id"]
+
+    def test_successful_unchunked_retry_has_one_terminal_outcome(self) -> None:
+        """A retry does not create duplicate work IDs or fatal unaccounted work."""
+        batch = Batch(file_path="single.py", content="first line\nsecond line")
+        events, status = ledger_events_for_batches(
+            "semantic_test",
+            BatchExecutionResult(
+                successful=[(batch, [])],
+                failures=[BatchFailure(batch, "TimeoutError")],
+            ),
+        )
+
+        assert [event["outcome"] for event in events] == ["completed"]
+        assert status["status"] == "completed"
+
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["single.py"],
+                "findings": [],
+                "inspection_ledger": events,
+                "analyzer_status_events": [status],
+            }
+        )
+
+        assert completeness["execution_successful"] is True
+        assert not any(
+            exception["reason_code"] is LedgerReason.UNACCOUNTED_WORK
+            for exception in completeness["ledger_exceptions"]
+        )
+
+    def test_overlapping_failed_chunks_keep_their_full_submitted_ranges(self) -> None:
+        outcome = BatchExecutionResult(
+            failures=[
+                BatchFailure(
+                    Batch(file_path="large.py", content="", start_line=1, end_line=100),
+                    "TimeoutError",
+                ),
+                BatchFailure(
+                    Batch(file_path="large.py", content="", start_line=51, end_line=150),
+                    "RateLimitError",
+                ),
+            ]
+        )
+
+        events, status = ledger_events_for_batches("semantic_test", outcome)
+
+        assert [
+            (event["start_line"], event["end_line"], event["error_class"]) for event in events
+        ] == [(1, 100, "TimeoutError"), (51, 150, "RateLimitError")]
+        assert [work["work_id"] for work in status["planned_work"]] == [
+            event["work_id"] for event in events
+        ]
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["large.py"],
+                "findings": [],
+                "inspection_ledger": events,
+                "analyzer_status_events": [status],
+            }
+        )
+
+        assert not any(
+            exception["reason_code"] is LedgerReason.UNACCOUNTED_WORK
+            for exception in completeness["ledger_exceptions"]
+        )
 
 
 # ---------------------------------------------------------------------------

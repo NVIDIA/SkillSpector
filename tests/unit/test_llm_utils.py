@@ -22,6 +22,7 @@ in the active provider — see ``tests/unit/test_providers.py``.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,16 +39,25 @@ from skillspector.llm_utils import (
     fetch_model_token_limits,
     get_chat_model,
     is_llm_available,
+    run_async,
 )
-from skillspector.providers import NO_LLM_API_KEY_MESSAGE, resolve_provider_credentials
+from skillspector.providers import (
+    NO_LLM_API_KEY_MESSAGE,
+    reset_provider,
+    resolve_chat_model_credentials,
+    resolve_provider_credentials,
+    use_provider,
+)
 from skillspector.providers.nv_build import NvBuildProvider
 from skillspector.providers.openai import OpenAIProvider
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "NVIDIA_INFERENCE_KEY",
+    "SKILLSPECTOR_REASONING_EFFORT",
     "SKILLSPECTOR_MODEL",
     "SKILLSPECTOR_PROVIDER",
 )
@@ -119,6 +129,84 @@ class TestCredentialResolution:
         llm = get_chat_model(model="claude-opus-4-6")
         assert isinstance(llm, ChatAnthropic)
         assert llm.model == "claude-opus-4-6"
+
+    def test_injected_provider_without_credentials_builds_native_chat_model(self) -> None:
+        chat_model = object()
+
+        class _InjectedProvider:
+            DEFAULT_MODEL = "injected-default"
+            SLOT_DEFAULTS = {"meta_analyzer": "injected-default"}
+
+            def get_context_length(self, model: str) -> int | None:
+                return 4096 if model == "injected-default" else None
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return 128 if model == "injected-default" else None
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "injected-default"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+            def create_chat_model(
+                self,
+                model: str,
+                *,
+                max_tokens: int,
+                timeout: float | None = 120,
+            ) -> object:
+                assert model == "injected-default"
+                assert max_tokens == 128
+                assert timeout == 120
+                return chat_model
+
+        token = use_provider(_InjectedProvider())
+        try:
+            assert is_llm_available() == (True, None)
+            assert get_chat_model() is chat_model
+        finally:
+            reset_provider(token)
+
+    def test_injected_provider_without_native_model_does_not_fall_back_to_openai(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fallback")
+
+        class _InjectedProvider:
+            DEFAULT_MODEL = "injected-default"
+            SLOT_DEFAULTS = {}
+
+            def get_context_length(self, model: str) -> int | None:
+                return 4096
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return 128
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "injected-default"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+            def create_chat_model(
+                self,
+                model: str,
+                *,
+                max_tokens: int,
+                timeout: float | None = 120,
+            ) -> object | None:
+                return None
+
+        token = use_provider(_InjectedProvider())
+        try:
+            assert resolve_chat_model_credentials() is None
+            assert is_llm_available() == (False, NO_LLM_API_KEY_MESSAGE)
+            with pytest.raises(ValueError) as exc_info:
+                get_chat_model()
+            assert str(exc_info.value) == NO_LLM_API_KEY_MESSAGE
+        finally:
+            reset_provider(token)
 
 
 class TestFetchModelTokenLimits:
@@ -198,6 +286,50 @@ class TestIsLlmAvailable:
             ok, err = is_llm_available()
         assert ok is False
         assert "not found" in (err or "").lower()
+
+    def test_bound_cli_provider_uses_cli_availability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bound CLI providers should use is_available, not the HTTP probe path."""
+
+        class _InjectedCLIProvider:
+            DEFAULT_MODEL = "cli-default"
+            SLOT_DEFAULTS = {"meta_analyzer": "cli-default"}
+
+            def get_context_length(self, model: str) -> int | None:
+                return 4096
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return 128
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "cli-default"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+            def complete(
+                self,
+                prompt: str,
+                *,
+                model: str,
+                max_output_tokens: int,
+            ) -> str:
+                return "ok"
+
+        provider = _InjectedCLIProvider()
+        provider.is_available = MagicMock(return_value=(False, "binary not found on PATH"))
+        token = use_provider(provider)
+        try:
+            with patch("skillspector.llm_utils.create_chat_model") as mock_create_chat_model:
+                ok, err = is_llm_available()
+        finally:
+            reset_provider(token)
+
+        assert ok is False
+        assert err == "binary not found on PATH"
+        provider.is_available.assert_called_once_with()
+        mock_create_chat_model.assert_not_called()
 
 
 class TestChatCompletionCLIDispatch:
@@ -347,3 +479,48 @@ class TestGetChatModel:
 
 def _chat_model_name(llm: object) -> str:
     return str(getattr(llm, "model_name", None) or getattr(llm, "model", None))
+
+
+class TestRunAsync:
+    """Tests for run_async helper function that handles nested event loops."""
+
+    async def _test_async_function(self, value: int, delay: float = 0) -> int:
+        """Simple async function for testing."""
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return value * 2
+
+    async def _test_async_function_raises(self) -> None:
+        """Async function that raises an exception for testing."""
+        raise ValueError("Test exception")
+
+    def test_run_async_without_running_loop(self) -> None:
+        """Test run_async works correctly when there is no running event loop."""
+        result = run_async(self._test_async_function(42))
+        assert result == 84
+
+    def test_run_async_with_running_loop(self) -> None:
+        """Test run_async works correctly even when there is already a running event loop.
+
+        This regression test covers the scenario where SkillSpector is invoked from
+        environments like Jupyter Notebooks, FastAPI, or LangGraph Studio that already
+        have an active event loop.
+        """
+
+        async def _test_in_running_loop() -> int:
+            # Call run_async from within an already running event loop
+            return run_async(self._test_async_function(100))
+
+        # Use asyncio.run to create a running loop context
+        result = asyncio.run(_test_in_running_loop())
+        assert result == 200
+
+    def test_run_async_propagates_exceptions(self) -> None:
+        """Test exceptions from async functions are properly propagated."""
+        with pytest.raises(ValueError, match="Test exception"):
+            run_async(self._test_async_function_raises())
+
+    def test_run_async_with_delay(self) -> None:
+        """Test run_async correctly handles async functions with await calls."""
+        result = run_async(self._test_async_function(5, delay=0.01))
+        assert result == 10

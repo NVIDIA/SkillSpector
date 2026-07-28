@@ -30,11 +30,19 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal, cast
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field, field_validator
 
+from skillspector.inspection_ledger import (
+    AnalyzerStatusEvent,
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.llm_utils import get_chat_model
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
@@ -88,10 +96,10 @@ class LLMFinding(BaseModel):
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        v = float(v)
-        if v > 2.0:
-            v = v / 100.0
-        return min(1.0, max(0.0, v))
+        value = float(cast(Any, v))
+        if value > 2.0:
+            value = value / 100.0
+        return min(1.0, max(0.0, value))
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""
@@ -144,6 +152,131 @@ class Batch:
         if self.is_chunk:
             label += f" (lines {self.start_line}\u2013{self.end_line})"
         return label
+
+
+@dataclass(frozen=True)
+class BatchFailure:
+    """Sanitized failure outcome for one submitted LLM batch."""
+
+    batch: Batch
+    error_class: str
+
+
+@dataclass
+class BatchExecutionResult:
+    """Detailed LLM batch outcome while preserving successful parsed values."""
+
+    successful: list[tuple[Batch, list]] = field(default_factory=list)
+    failures: list[BatchFailure] = field(default_factory=list)
+
+
+def _batch_interval(batch: Batch) -> tuple[int | None, int | None]:
+    """Return the canonical ledger range for a submitted batch."""
+    if batch.end_line is not None:
+        return batch.start_line, batch.end_line
+    return None, None
+
+
+def _uncovered_intervals(
+    failed_interval: tuple[int | None, int | None],
+    successful_intervals: list[tuple[int | None, int | None]],
+) -> list[tuple[int | None, int | None]]:
+    """Subtract successful chunk coverage from one failed batch interval."""
+    failed_start, failed_end = failed_interval
+    if failed_start is None:
+        return [] if failed_interval in successful_intervals else [failed_interval]
+
+    assert failed_end is not None
+    covered_intervals: list[tuple[int, int]] = []
+    for start_line, end_line in successful_intervals:
+        if start_line is not None and end_line is not None:
+            covered_intervals.append((start_line, end_line))
+
+    uncovered: list[tuple[int | None, int | None]] = []
+    next_uncovered_line = failed_start
+    for covered_start, covered_end in sorted(covered_intervals):
+        if covered_end < next_uncovered_line:
+            continue
+        if covered_start > failed_end:
+            break
+        if covered_start > next_uncovered_line:
+            uncovered.append((next_uncovered_line, min(failed_end, covered_start - 1)))
+        next_uncovered_line = max(next_uncovered_line, covered_end + 1)
+        if next_uncovered_line > failed_end:
+            break
+    if next_uncovered_line <= failed_end:
+        uncovered.append((next_uncovered_line, failed_end))
+    return uncovered
+
+
+def ledger_events_for_batches(
+    analyzer_id: str,
+    outcome: BatchExecutionResult,
+) -> tuple[list[InspectionLedgerEvent], AnalyzerStatusEvent]:
+    """Project detailed LLM batch execution into terminal ledger evidence."""
+    events: list[InspectionLedgerEvent] = []
+    successful_ranges: dict[str, list[tuple[int | None, int | None]]] = defaultdict(list)
+    for batch, findings in outcome.successful:
+        if not isinstance(batch, Batch):
+            logger.debug("Skipping ledger projection for malformed successful batch: %r", batch)
+            continue
+        start_line, end_line = _batch_interval(batch)
+        successful_ranges[batch.file_path].append((start_line, end_line))
+        events.append(
+            ledger_event(
+                analyzer_id=analyzer_id,
+                outcome=LedgerOutcome.COMPLETED,
+                phase="semantic",
+                path=batch.file_path,
+                start_line=start_line,
+                end_line=end_line,
+                emitted_finding_ids=[finding.finding_id for finding in findings],
+            )
+        )
+
+    failed_ranges: dict[str, list[tuple[BatchFailure, tuple[int | None, int | None]]]] = (
+        defaultdict(list)
+    )
+    for failure in outcome.failures:
+        if not isinstance(failure.batch, Batch):
+            logger.debug("Skipping ledger projection for malformed failed batch: %r", failure.batch)
+            continue
+        failed_ranges[failure.batch.file_path].append((failure, _batch_interval(failure.batch)))
+
+    for path, failures in failed_ranges.items():
+        for failure, failed_range in failures:
+            for start_line, end_line in _uncovered_intervals(failed_range, successful_ranges[path]):
+                events.append(
+                    ledger_event(
+                        analyzer_id=analyzer_id,
+                        outcome=LedgerOutcome.FAILED,
+                        phase="semantic",
+                        path=path,
+                        start_line=start_line,
+                        end_line=end_line,
+                        reason=LedgerReason.LLM_BATCH_FAILED,
+                        error_class=failure.error_class,
+                    )
+                )
+
+    status = analyzer_status_event(
+        analyzer_id=analyzer_id,
+        status=(
+            "failed"
+            if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
+            else "completed"
+        ),
+        planned_work=[
+            {
+                "work_id": event["work_id"],
+                "path": event["path"],
+                "start_line": event["start_line"],
+                "end_line": event["end_line"],
+            }
+            for event in events
+        ],
+    )
+    return events, status
 
 
 # ---------------------------------------------------------------------------
@@ -376,23 +509,38 @@ class LLMAnalyzerBase:
         :meth:`parse_response` returns :class:`Finding` objects; subclasses may
         return dicts or other types.
         """
-        results: list[tuple[Batch, list]] = []
+        outcome = self.run_batches_detailed(batches, **kwargs)
+        self._last_batch_outcome = outcome
+        return outcome.successful
+
+    def run_batches_detailed(
+        self,
+        batches: list[Batch],
+        **kwargs: object,
+    ) -> BatchExecutionResult:
+        """Execute batches and retain each sanitized failure alongside successes."""
+        outcome = BatchExecutionResult()
         for batch in batches:
-            prompt = self.build_prompt(batch, **kwargs)
-            logger.debug(
-                "LLM call for %s (tokens~%d, findings=%d)",
-                batch.file_label,
-                estimate_tokens(prompt),
-                len(batch.findings),
-            )
-            if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
-            else:
-                response = _message_text(self._llm.invoke(prompt))
-            logger.debug("LLM response for %s", batch.file_label)
-            parsed = self.parse_response(response, batch)
-            results.append((batch, parsed))
-        return results
+            try:
+                prompt = self.build_prompt(batch, **kwargs)
+                logger.debug(
+                    "LLM call for %s (tokens~%d, findings=%d)",
+                    batch.file_label,
+                    estimate_tokens(prompt),
+                    len(batch.findings),
+                )
+                if self._structured_llm:
+                    response = self._structured_llm.invoke(prompt)
+                else:
+                    response = _message_text(self._llm.invoke(prompt))
+                logger.debug("LLM response for %s", batch.file_label)
+                outcome.successful.append((batch, self.parse_response(response, batch)))
+            except (ValueError, NotImplementedError):
+                raise
+            except Exception as exc:
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                outcome.failures.append(BatchFailure(batch=batch, error_class=type(exc).__name__))
+        return outcome
 
     async def arun_batches(
         self,
@@ -417,6 +565,20 @@ class LLMAnalyzerBase:
 
         The return type mirrors :meth:`run_batches`.
         """
+        outcome = await self.arun_batches_detailed(
+            batches, max_concurrency=max_concurrency, **kwargs
+        )
+        self._last_batch_outcome = outcome
+        return outcome.successful
+
+    async def arun_batches_detailed(
+        self,
+        batches: list[Batch],
+        *,
+        max_concurrency: int = 10,
+        **kwargs: object,
+    ) -> BatchExecutionResult:
+        """Execute batches concurrently and retain sanitized per-batch failures."""
         sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
@@ -436,15 +598,18 @@ class LLMAnalyzerBase:
                 return (batch, self.parse_response(response, batch))
 
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
-        successful: list[tuple[Batch, list]] = []
+        outcome = BatchExecutionResult()
         for batch, result in zip(batches, results, strict=True):
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
             if isinstance(result, BaseException):
                 logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                outcome.failures.append(
+                    BatchFailure(batch=batch, error_class=type(result).__name__)
+                )
                 continue
-            successful.append(result)
-        return successful
+            outcome.successful.append(result)
+        return outcome
 
     # -- Convenience --------------------------------------------------------
 

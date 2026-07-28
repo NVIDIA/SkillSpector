@@ -257,6 +257,9 @@ class TestErrorHandling:
         state = {"file_cache": {"SKILL.md": "# Skill"}}
         result = node(state)
         assert result["findings"] == []
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "unavailable"
+        assert "reason_code" not in status
 
 
 # ---------------------------------------------------------------------------

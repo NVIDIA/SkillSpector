@@ -696,6 +696,11 @@ class TestTP4Telemetry:
         assert log[0]["node"] == "mcp_tool_poisoning"
         assert log[0]["ok"] is False
         assert "timeout" in log[0]["error"]
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "failed"
+        assert [work["work_id"] for work in status["planned_work"]] == [
+            event["work_id"] for event in result["inspection_ledger"]
+        ]
 
     def test_no_llm_call_attempted_records_nothing(self):
         # No description -> TP4 never reaches the LLM call -> no telemetry record,
@@ -708,6 +713,41 @@ class TestTP4Telemetry:
         state = _make_state("mcp_mismatched_skill", use_llm=False)
         result = node(state)
         assert "llm_call_log" not in result
+
+
+class TestInspectionLedgerStatus:
+    def test_static_work_is_completed_when_tp4_is_disabled(self):
+        result = mcp_tool_poisoning.node(_make_state(manifest={"name": "test"}, use_llm=False))
+
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "completed"
+        assert [work["work_id"] for work in status["planned_work"]] == [
+            event["work_id"] for event in result["inspection_ledger"]
+        ]
+
+    def test_static_work_is_completed_when_tp4_is_not_applicable(self):
+        result = mcp_tool_poisoning.node(_make_state(manifest={"name": "test"}, use_llm=True))
+
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "completed"
+        assert [work["work_id"] for work in status["planned_work"]] == [
+            event["work_id"] for event in result["inspection_ledger"]
+        ]
+
+    def test_successful_tp4_plans_static_and_semantic_work(self, monkeypatch):
+        monkeypatch.setattr(
+            mcp_tool_poisoning,
+            "chat_completion",
+            lambda *_args, **_kwargs: '{"is_mismatch": false}',
+        )
+
+        result = mcp_tool_poisoning.node(_make_state("mcp_mismatched_skill", use_llm=True))
+
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "completed"
+        assert [work["work_id"] for work in status["planned_work"]] == [
+            event["work_id"] for event in result["inspection_ledger"]
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -22,25 +22,35 @@ hack tools) based on industry open-source patterns. Users can supply additional 
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 from pathlib import Path
 
-import yara
+import yara  # type: ignore[import-not-found]
 
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import MAX_FILE_CHARS, analyzer_finding_to_finding
 
 ANALYZER_ID = "static_yara"
 logger = get_logger(__name__)
 
 _BUILTIN_RULES_DIR = Path(__file__).resolve().parent.parent.parent / "yara_rules"
 
-_RULE_EXTENSIONS = ("*.yar", "*.yara")
+_RULE_EXTENSIONS = ("*.yar", "*.yara", "*.yar.b64", "*.yara.b64")
+_ENCODED_RULE_SUFFIXES = (".yar.b64", ".yara.b64")
 
 _CATEGORY_MAP: dict[str, tuple[str, Severity]] = {
     "malware": ("YR1", Severity.CRITICAL),
@@ -82,39 +92,64 @@ def _content_hash(rule_files: list[Path]) -> str:
     return h.hexdigest()
 
 
-def _build_namespace_map(rule_files: list[Path]) -> dict[str, str]:
-    """Build a {namespace: filepath} dict from rule files, deduplicating namespace names."""
-    filepaths: dict[str, str] = {}
+def _rule_namespace(rule_file: Path) -> str:
+    """Derive a stable namespace from a rule file name."""
+    for suffix in _ENCODED_RULE_SUFFIXES:
+        if rule_file.name.endswith(suffix):
+            return rule_file.name[: -len(suffix)]
+    return rule_file.stem
+
+
+def _read_rule_source(rule_file: Path) -> str:
+    """Read a YARA rule source, decoding embedded packaged rules when needed."""
+    if not rule_file.name.endswith(_ENCODED_RULE_SUFFIXES):
+        return rule_file.read_text(encoding="utf-8")
+
+    encoded_source = rule_file.read_text(encoding="utf-8")
+    return base64.b64decode("".join(encoded_source.split())).decode("utf-8")
+
+
+def _build_namespace_map(
+    rule_files: list[Path], temp_dir: Path | None = None
+) -> tuple[dict[str, str], int]:
+    """Build a {namespace: source} dict and count malformed rule files."""
+    del temp_dir
+    sources: dict[str, str] = {}
+    skipped = 0
     for rf in rule_files:
-        ns = rf.stem
-        if ns in filepaths:
-            ns = f"{rf.parent.name}/{rf.stem}"
-        filepaths[ns] = str(rf)
-    return filepaths
+        ns = _rule_namespace(rf)
+        if ns in sources:
+            ns = f"{rf.parent.name}/{ns}"
+        try:
+            sources[ns] = _read_rule_source(rf)
+        except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+            skipped += 1
+            logger.debug("%s: skipping malformed encoded rule %s: %s", ANALYZER_ID, rf, exc)
+    return sources, skipped
 
 
-def _compile_rules(filepaths: dict[str, str]) -> tuple[yara.Rules | None, int]:
-    """Compile YARA rules from a namespace map. Falls back to per-file compilation on error.
+def _compile_rules(sources: dict[str, str]) -> tuple[yara.Rules | None, int]:
+    """Compile YARA rules from a namespace map. Falls back to per-source compilation on error.
 
     Returns (compiled_rules, skipped_count).
     """
     try:
-        return yara.compile(filepaths=filepaths), 0
+        return yara.compile(sources=sources), 0
     except yara.SyntaxError:
         pass
 
-    logger.debug("%s: bulk compile failed, falling back to per-file compilation", ANALYZER_ID)
+    logger.debug("%s: bulk compile failed, falling back to per-source compilation", ANALYZER_ID)
     good: dict[str, str] = {}
     skipped = 0
-    for ns, fp in filepaths.items():
+    for ns, source in sources.items():
         try:
-            yara.compile(filepath=fp)
-            good[ns] = fp
+            yara.compile(source=source)
+            good[ns] = source
         except (yara.SyntaxError, yara.Error) as exc:
             skipped += 1
-            logger.debug("%s: skipping %s: %s", ANALYZER_ID, fp, exc)
+            logger.debug("%s: skipping %s: %s", ANALYZER_ID, ns, exc)
 
-    compiled = yara.compile(filepaths=good) if good else None
+    compiled = yara.compile(sources=good) if good else None
     return compiled, skipped
 
 
@@ -140,8 +175,9 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     if _compiled_rules is not None and _rules_hash == current_hash:
         return _compiled_rules
 
-    filepaths = _build_namespace_map(rule_files)
-    compiled, skipped = _compile_rules(filepaths)
+    sources, materialize_skipped = _build_namespace_map(rule_files)
+    compiled, compile_skipped = _compile_rules(sources)
+    skipped = materialize_skipped + compile_skipped
 
     if compiled is None:
         logger.warning("%s: failed to compile any YARA rules", ANALYZER_ID)
@@ -149,7 +185,7 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
 
     _compiled_rules = compiled
     _rules_hash = current_hash
-    loaded = len(filepaths) - skipped
+    loaded = len(sources) - compile_skipped
     logger.info("%s: compiled %d YARA rule file(s) (%d skipped)", ANALYZER_ID, loaded, skipped)
     return compiled
 
@@ -201,11 +237,7 @@ def _build_message(rule_name: str, namespace: str, description: str | None) -> s
 def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[AnalyzerFinding]:
     """Run compiled YARA rules against *content* and return AnalyzerFindings."""
     data = content.encode("utf-8", errors="replace")
-    try:
-        matches = rules.match(data=data)
-    except Exception as exc:
-        logger.debug("%s: match error on %s: %s", ANALYZER_ID, file_path, exc)
-        return []
+    matches = rules.match(data=data)
 
     findings: list[AnalyzerFinding] = []
     for match in matches:
@@ -237,21 +269,113 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     rules = _load_rules(extra_dir)
     if rules is None:
         logger.info("%s: 0 findings (no rules available)", ANALYZER_ID)
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="unavailable",
+                    reason=LedgerReason.RULES_UNAVAILABLE,
+                )
+            ],
+        }
 
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
     findings = []
+    events: list[InspectionLedgerEvent] = []
 
     for path in components:
         content = file_cache.get(path)
         if content is None:
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.MISSING_FILE_CACHE,
+                )
+            )
             continue
-        if len(content) > MAX_FILE_BYTES:
-            logger.debug("%s: skipping %s (exceeds size limit)", ANALYZER_ID, path)
+        if len(content) > MAX_FILE_CHARS:
+            logger.debug(
+                "%s: skipping %s (exceeds %d-character limit)",
+                ANALYZER_ID,
+                path,
+                MAX_FILE_CHARS,
+            )
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.SKIPPED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.SIZE_LIMIT,
+                    observed_characters=len(content),
+                    limit_characters=MAX_FILE_CHARS,
+                    observed_bytes=len(content.encode("utf-8")),
+                )
+            )
             continue
-        for af in _match_file(rules, content, path):
-            findings.append(analyzer_finding_to_finding(af))
+        try:
+            path_findings = [
+                analyzer_finding_to_finding(af) for af in _match_file(rules, content, path)
+            ]
+        except Exception as exc:
+            logger.warning("%s: match error on %s: %s", ANALYZER_ID, path, exc)
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        findings.extend(path_findings)
+        events.append(
+            ledger_event(
+                analyzer_id=ANALYZER_ID,
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                path=path,
+                emitted_finding_ids=[finding.finding_id for finding in path_findings],
+            )
+        )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    if not events:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status="not_applicable",
+            reason=LedgerReason.NO_APPLICABLE_FILES,
+        )
+    else:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status=(
+                "failed"
+                if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
+                else "degraded"
+                if any(event["outcome"] is LedgerOutcome.SKIPPED for event in events)
+                else "completed"
+            ),
+            planned_work=[
+                {
+                    "work_id": event["work_id"],
+                    "path": event["path"],
+                    "start_line": event["start_line"],
+                    "end_line": event["end_line"],
+                }
+                for event in events
+            ],
+        )
+    return {
+        "findings": findings,
+        "inspection_ledger": events,
+        "analyzer_status_events": [status],
+    }

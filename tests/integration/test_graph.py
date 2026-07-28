@@ -109,8 +109,9 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
     assert meta["llm_available"] is False
     assert meta["llm_degraded"] is True
     assert meta["llm_calls_succeeded"] == 0
+    assert result["execution_successful"] is False
 
     notification = result["sarif_report"]["runs"][0]["invocations"][0][
         "toolExecutionNotifications"
     ][0]
-    assert notification["level"] == "warning"
+    assert notification["level"] == "error"

@@ -22,7 +22,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMFinding
+from skillspector.llm_analyzer_base import (
+    BatchExecutionResult,
+    BatchFailure,
+    LLMAnalysisResult,
+    LLMFinding,
+)
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.semantic_developer_intent import (
     ANALYZER_ID,
@@ -221,6 +226,9 @@ class TestErrorHandling:
         state = {"file_cache": {"skill.py": "import os"}}
         result = node(state)
         assert result["findings"] == []
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "unavailable"
+        assert "reason_code" not in status
 
     @patch(MOCK_PATCH_TARGET)
     def test_reraises_value_error(self, mock_get_model: MagicMock) -> None:
@@ -242,6 +250,23 @@ class TestLLMCallTelemetry:
 
         with patch.object(LLMAnalyzerBase, "arun_batches", new_callable=AsyncMock, return_value=[]):
             result = node({"file_cache": {"main.py": "import os"}})
+        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_partial_batch_failure_records_llm_success(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        async def partially_succeeds(self, batches, **_kwargs):
+            successful = [(batches[0], [])]
+            self._last_batch_outcome = BatchExecutionResult(
+                successful=successful,
+                failures=[BatchFailure(batches[1], "TimeoutError")],
+            )
+            return successful
+
+        with patch.object(LLMAnalyzerBase, "arun_batches", partially_succeeds):
+            result = node({"file_cache": {"first.py": "print(1)", "second.py": "print(2)"}})
+
         assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
 
     @patch(MOCK_PATCH_TARGET)

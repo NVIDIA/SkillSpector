@@ -33,8 +33,9 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
-from skillspector.providers import resolve_chat_model_credentials
+
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -56,8 +57,9 @@ async def run_scan(
     Args:
         target: Git URL, file URL, ``.zip``, ``.md`` file, or local directory.
         use_llm: Whether to request the optional LLM semantic pass on top of
-            static analysis. Honoured only when provider credentials resolve;
-            the returned payload reports what actually happened.
+            static analysis. Honoured only when the active provider can
+            actually build or run the LLM pass; the returned payload reports
+            what actually happened.
         output_format: Format of the embedded ``report`` string. One of
             :data:`VALID_FORMATS`.
         yara_rules_dir: Optional directory of additional YARA rules.
@@ -72,13 +74,7 @@ async def run_scan(
     if output_format not in VALID_FORMATS:
         raise ValueError(f"output_format must be one of {VALID_FORMATS}, got {output_format!r}")
 
-    # Use the chat-model credential resolver, not the active-provider-only one,
-    # so availability matches what ``create_chat_model`` actually does: it falls
-    # back to a standard OpenAI client (OPENAI_API_KEY / OPENAI_BASE_URL) when the
-    # active provider is unconfigured. Gating on the active provider alone made the
-    # server report llm_available=false and skip the LLM pass for an OpenAI-only
-    # setup the CLI would have run (see issue #200).
-    llm_available = resolve_chat_model_credentials() is not None
+    llm_available, _ = is_llm_available()
     llm_used = use_llm and llm_available
 
     state: dict[str, Any] = {
@@ -113,12 +109,20 @@ async def run_scan(
         )
         findings = result.get("filtered_findings") or result.get("findings") or []
         risk_score = int(result.get("risk_score") or 0)
+        execution_successful = bool(result.get("execution_successful", True))
+        analysis_completeness = result.get("analysis_completeness") or {}
+        entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
+        safe_to_install = (
+            risk_score <= RISK_THRESHOLD and execution_successful and entirely_uninspected == 0
+        )
         return {
             "target": target,
             "risk_score": risk_score,
             "severity": result.get("risk_severity"),
             "recommendation": result.get("risk_recommendation"),
-            "safe_to_install": risk_score <= RISK_THRESHOLD,
+            "safe_to_install": safe_to_install,
+            "execution_successful": execution_successful,
+            "analysis_completeness": analysis_completeness,
             "findings": [f.to_dict() for f in findings],
             "report": result.get("report_body") or "",
             # Honest LLM accounting — never silently imply a full semantic scan.
