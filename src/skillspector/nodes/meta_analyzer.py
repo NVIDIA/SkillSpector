@@ -23,12 +23,24 @@ LangChain structured output for validated, schema-driven LLM responses.
 from __future__ import annotations
 
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
+from skillspector.inspection_ledger import (
+    AnalyzerStatusEvent,
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_event,
+    inspection_work_id,
+    ledger_event,
+)
 from skillspector.llm_analyzer_base import (
     Batch,
+    BatchExecutionResult,
+    BatchFailure,
     LLMAnalyzerBase,
     estimate_tokens,
 )
@@ -77,10 +89,10 @@ class MetaAnalyzerFinding(BaseModel):
     @classmethod
     def _normalize_confidence(cls, v: object) -> float:
         # Accept 0-100 scale values from some models, then clamp into [0, 1].
-        v = float(v)
-        if v > 2.0:
-            v = v / 100.0
-        return min(1.0, max(0.0, v))
+        value = float(v)  # type: ignore[arg-type]
+        if value > 2.0:
+            value = value / 100.0
+        return min(1.0, max(0.0, value))
 
     intent: Literal["malicious", "negligent", "benign"] = Field(
         description="Likely intent behind the finding"
@@ -196,10 +208,10 @@ def _format_metadata(manifest: dict[str, object]) -> str:
     if manifest.get("description"):
         parts.append(f"Description: {manifest['description']}")
     triggers = manifest.get("triggers")
-    if triggers:
+    if isinstance(triggers, list) and triggers:
         parts.append(f"Triggers: {', '.join(str(t) for t in triggers)}")
     permissions = manifest.get("permissions")
-    if permissions:
+    if isinstance(permissions, list) and permissions:
         parts.append(f"Permissions: {', '.join(str(p) for p in permissions)}")
     return "\n".join(parts) if parts else "No metadata available"
 
@@ -255,6 +267,7 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
             Finding(
                 rule_id=f.rule_id,
                 message=f.message,
+                finding_id=f.finding_id,
                 severity=f.severity,
                 confidence=confidence,
                 file=f.file,
@@ -291,6 +304,7 @@ def _passthrough_with_defaults(findings: list[Finding]) -> list[Finding]:
         Finding(
             rule_id=f.rule_id,
             message=f.message,
+            finding_id=f.finding_id,
             severity=f.severity,
             confidence=f.confidence,
             file=f.file,
@@ -343,13 +357,13 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             static_findings=findings_text,
         )
 
-    def parse_response(
+    def parse_response(  # type: ignore[override]  # Base class permits custom parsed values.
         self,
         response: MetaAnalyzerResult,
         batch: Batch,
-    ) -> list[dict[str, object]]:
+    ) -> list[dict[str, Any]]:
         """Convert the validated Pydantic response to dicts for ``apply_filter``."""
-        items: list[dict[str, object]] = []
+        items: list[dict[str, Any]] = []
         for f in response.findings:
             d = f.model_dump()
             d["_file"] = batch.file_path
@@ -369,7 +383,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
     def apply_filter(
         self,
         findings: list[Finding],
-        batch_results: list[tuple[Batch, list[dict[str, object]]]],
+        batch_results: list[tuple[Batch, list[dict[str, Any]]]],
     ) -> list[Finding]:
         """Keep only LLM-confirmed findings, enriched with explanation / remediation.
 
@@ -451,6 +465,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                         Finding(
                             rule_id=f.rule_id,
                             message=f.message,
+                            finding_id=f.finding_id,
                             severity=f.severity,
                             confidence=f.confidence,
                             file=f.file,
@@ -474,6 +489,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                 Finding(
                     rule_id=f.rule_id,
                     message=expl,
+                    finding_id=f.finding_id,
                     severity=f.severity,
                     confidence=conf,
                     file=f.file,
@@ -499,6 +515,86 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 # ---------------------------------------------------------------------------
 
 
+def _meta_batch_work_id(batch: Batch) -> str:
+    """Return the ledger identity for one submitted meta-analysis batch."""
+    return inspection_work_id(
+        "meta_analyzer",
+        batch.file_path,
+        batch.start_line if batch.end_line is not None else None,
+        batch.end_line,
+    )
+
+
+def _meta_ledger_response(
+    batches: list[Batch],
+    outcome: BatchExecutionResult,
+    filtered: list[Finding],
+) -> tuple[list[InspectionLedgerEvent], AnalyzerStatusEvent]:
+    """Account for each meta batch while preserving fail-closed finding identity."""
+    retained_ids = {finding.finding_id for finding in filtered}
+    completed_ids = {
+        finding.finding_id for batch, _ in outcome.successful for finding in batch.findings
+    }
+    events: list[InspectionLedgerEvent] = []
+    for batch, _ in outcome.successful:
+        input_ids = [finding.finding_id for finding in batch.findings]
+        events.append(
+            ledger_event(
+                analyzer_id="meta_analyzer",
+                outcome=LedgerOutcome.COMPLETED,
+                phase="meta",
+                path=batch.file_path,
+                start_line=batch.start_line if batch.end_line is not None else None,
+                end_line=batch.end_line,
+                input_finding_ids=input_ids,
+                emitted_finding_ids=[
+                    finding_id for finding_id in input_ids if finding_id in retained_ids
+                ],
+            )
+        )
+    for failure in outcome.failures:
+        batch = failure.batch
+        input_ids = [
+            finding.finding_id
+            for finding in batch.findings
+            if finding.finding_id not in completed_ids
+        ]
+        if not input_ids:
+            continue
+        events.append(
+            ledger_event(
+                analyzer_id="meta_analyzer",
+                outcome=LedgerOutcome.FAILED,
+                phase="meta",
+                path=batch.file_path,
+                start_line=batch.start_line if batch.end_line is not None else None,
+                end_line=batch.end_line,
+                reason=LedgerReason.LLM_BATCH_FAILED,
+                input_finding_ids=input_ids,
+                emitted_finding_ids=input_ids,
+                error_class=failure.error_class,
+            )
+        )
+    status = analyzer_status_event(
+        analyzer_id="meta_analyzer",
+        status=(
+            "failed"
+            if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
+            else "completed"
+        ),
+        planned_work=[
+            {
+                "work_id": event["work_id"],
+                "path": event["path"],
+                "start_line": event["start_line"],
+                "end_line": event["end_line"],
+            }
+            for event in events
+        ],
+    )
+    return events, status
+
+
 def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     """Filter and enrich findings via per-file LLM calls.
 
@@ -513,15 +609,42 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     """
     findings: list[Finding] = state.get("findings", [])
     if not findings:
-        return {"filtered_findings": []}
+        return {
+            "findings": [],
+            "effective_finding_ids": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id="meta_analyzer",
+                    status="not_applicable",
+                    reason=LedgerReason.NO_APPLICABLE_FILES,
+                )
+            ],
+        }
 
     if state.get("use_llm", True) is False:
-        return {"filtered_findings": _fallback_filtered(findings)}
+        filtered = _fallback_filtered(findings)
+        return {
+            "findings": filtered,
+            "effective_finding_ids": [finding.finding_id for finding in filtered],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id="meta_analyzer",
+                    status="disabled",
+                    reason=LedgerReason.DISABLED_BY_CONFIGURATION,
+                )
+            ],
+        }
 
     file_cache = get_llm_file_cache(state)
     manifest: dict[str, object] = state.get("manifest") or {}
     model_config: dict[str, str] = state.get("model_config") or {}
-    model = model_config.get("meta_analyzer")
+    model = (
+        model_config.get("meta_analyzer")
+        or model_config.get("default")
+        or _SKILLSPECTOR_DEFAULT_MODEL
+    )
 
     metadata_text = _format_metadata(manifest)
     files_with_findings = sorted({f.file for f in findings})
@@ -532,6 +655,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         # analyzers) rather than crashing the whole graph.
         analyzer = LLMMetaAnalyzer(model=model)
         batches = analyzer.get_batches(files_with_findings, file_cache, findings)
+        batches = [batch for batch in batches if batch.findings]
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
             len(files_with_findings),
@@ -539,15 +663,42 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             model,
         )
 
-        batch_results = run_async(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        returned_results = run_async(analyzer.arun_batches(batches, metadata_text=metadata_text))
+        submitted_batches = {_meta_batch_work_id(batch): batch for batch in batches}
+        returned_by_work_id: dict[str, tuple[Batch, list]] = {}
+        for returned_batch, response_findings in returned_results:
+            work_id = _meta_batch_work_id(returned_batch)
+            if work_id in submitted_batches and work_id not in returned_by_work_id:
+                # Match reconstructed returns to their submitted batch so
+                # finding identity is stable, and ignore duplicate/unknown
+                # work instead of mistaking it for another completed batch.
+                returned_by_work_id[work_id] = (submitted_batches[work_id], response_findings)
+        batch_results = [
+            returned_by_work_id[work_id]
+            for batch in batches
+            if (work_id := _meta_batch_work_id(batch)) in returned_by_work_id
+        ]
+        detailed = getattr(analyzer, "_last_batch_outcome", None)
+        if not isinstance(detailed, BatchExecutionResult):
+            successful_work_ids = set(returned_by_work_id)
+            detailed = BatchExecutionResult(
+                successful=batch_results,
+                failures=[
+                    BatchFailure(batch=batch, error_class="MissingBatchResult")
+                    for batch in batches
+                    if _meta_batch_work_id(batch) not in successful_work_ids
+                ],
+            )
 
         if len(batch_results) < len(batches):
             # Some batches never returned. A finding the LLM never saw has no
             # verdict — keep it via the fallback path instead of letting
             # apply_filter treat the missing confirmation as a rejection.
-            analysed_ids = {id(f) for batch, _ in batch_results for f in batch.findings}
-            analysed = [f for f in findings if id(f) in analysed_ids]
-            unanalysed = [f for f in findings if id(f) not in analysed_ids]
+            analysed_ids = {
+                finding.finding_id for batch, _ in batch_results for finding in batch.findings
+            }
+            analysed = [finding for finding in findings if finding.finding_id in analysed_ids]
+            unanalysed = [finding for finding in findings if finding.finding_id not in analysed_ids]
         else:
             analysed, unanalysed = findings, []
 
@@ -568,15 +719,39 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(findings),
             len(filtered),
         )
+        ledger_events, status = _meta_ledger_response(batches, detailed, filtered)
         return {
-            "filtered_findings": filtered,
-            "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+            "findings": filtered,
+            "effective_finding_ids": list(
+                dict.fromkeys(
+                    finding_id
+                    for event in ledger_events
+                    for finding_id in event["emitted_finding_ids"]
+                )
+            ),
+            "inspection_ledger": ledger_events,
+            "analyzer_status_events": [status],
+            "llm_call_log": [
+                llm_call_record(
+                    "meta_analyzer",
+                    ok=bool(detailed.successful) or not detailed.failures,
+                )
+            ],
         }
     except ValueError:
         raise
     except Exception as e:
         logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
+        filtered = _passthrough_with_defaults(findings)
         return {
-            "filtered_findings": _passthrough_with_defaults(findings),
+            "findings": filtered,
+            "effective_finding_ids": [finding.finding_id for finding in filtered],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id="meta_analyzer",
+                    status="unavailable",
+                )
+            ],
             "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],
         }

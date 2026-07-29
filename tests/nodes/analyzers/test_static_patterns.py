@@ -947,3 +947,18 @@ class TestRunStaticPatternsSSRF:
         }
         result = ssrf_module.node(state)
         assert any(f.rule_id == "SSRF1" for f in result["findings"])
+
+
+class TestSupplyChainLedger:
+    def test_trigger_analysis_uses_distinct_work_after_static_skip(self):
+        result = supply_chain_module.node(
+            {
+                "components": ["SKILL.md"],
+                "file_cache": {"SKILL.md": "x" * (static_runner.MAX_FILE_CHARS + 1)},
+                "manifest": {"triggers": ["anything"]},
+            }
+        )
+
+        events = result["inspection_ledger"]
+        assert [event["outcome"] for event in events] == ["skipped", "completed"]
+        assert len({event["work_id"] for event in events}) == 2

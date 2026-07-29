@@ -246,4 +246,5 @@ class TestLLMFailurePassthrough:
         with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
             mock_cls.return_value.get_batches.side_effect = RuntimeError("API timeout")
             result = meta_analyzer(state)
-        assert len(result["filtered_findings"]) == 2
+        assert len(result["findings"]) == 2
+        assert "filtered_findings" not in result

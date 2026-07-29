@@ -23,7 +23,12 @@ natural-language policy violations that static/behavioral tools cannot detect.
 from __future__ import annotations
 
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
-from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.inspection_ledger import LedgerReason, analyzer_status_event
+from skillspector.llm_analyzer_base import (
+    BatchExecutionResult,
+    LLMAnalyzerBase,
+    ledger_events_for_batches,
+)
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.state import (
@@ -134,12 +139,32 @@ Use rule ID **SQP-3** for all policy-violation findings.
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Discover quality/policy findings via LLM analysis."""
     if not state.get("use_llm", True):
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="disabled",
+                    reason=LedgerReason.DISABLED_BY_CONFIGURATION,
+                )
+            ],
+        }
 
     file_cache = get_llm_file_cache(state)
     files = sorted(file_cache.keys())
     if not files:
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="not_applicable",
+                    reason=LedgerReason.NO_APPLICABLE_FILES,
+                )
+            ],
+        }
 
     model_config: dict[str, str] = state.get("model_config") or {}
     model = (
@@ -150,14 +175,30 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model)
         batches = analyzer.get_batches(files, file_cache)
         results = run_async(analyzer.arun_batches(batches))
-        findings = analyzer.collect_findings(results)
+        outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
+        findings = analyzer.collect_findings(outcome.successful)
+        events, status = ledger_events_for_batches(ANALYZER_ID, outcome)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-        return {"findings": findings, "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True)]}
+        return {
+            "findings": findings,
+            "inspection_ledger": events,
+            "analyzer_status_events": [status],
+            "llm_call_log": [
+                llm_call_record(ANALYZER_ID, ok=bool(outcome.successful) or not outcome.failures)
+            ],
+        }
     except ValueError:
         raise
     except Exception as exc:
         logger.warning("%s failed: %s", ANALYZER_ID, exc)
         return {
             "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="unavailable",
+                )
+            ],
             "llm_call_log": [llm_call_record(ANALYZER_ID, ok=False, error=str(exc))],
         }

@@ -114,6 +114,46 @@ class TestSemanticSecurityDiscoveryNode:
         assert result["findings"] == []
         mock_llm.assert_not_called()
 
+    def test_missing_cached_component_is_failed_without_an_llm_call(self) -> None:
+        state = {
+            "components": ["unreadable.py"],
+            "file_cache": {},
+        }
+
+        with patch(MOCK_PATCH_TARGET) as mock_llm:
+            result = node(state)
+
+        mock_llm.assert_not_called()
+        assert result["inspection_ledger"][0]["outcome"] == "failed"
+        assert result["inspection_ledger"][0]["reason_code"] == "missing_file_cache"
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_mixed_cache_only_batches_available_files_and_marks_status_failed(self) -> None:
+        from skillspector.llm_analyzer_base import BatchExecutionResult, LLMAnalyzerBase
+
+        submitted_batches = []
+
+        def fake_run_batches(self, batches):
+            submitted_batches.extend(batches)
+            results = [(batch, []) for batch in batches]
+            self._last_batch_outcome = BatchExecutionResult(successful=results)
+            return results
+
+        state = {
+            "components": ["cached.py", "unreadable.py"],
+            "file_cache": {"cached.py": "print('ready')\n"},
+        }
+        with patch.object(LLMAnalyzerBase, "run_batches", fake_run_batches):
+            result = node(state)
+
+        assert [batch.file_path for batch in submitted_batches] == ["cached.py"]
+        assert [(event["path"], event["outcome"]) for event in result["inspection_ledger"]] == [
+            ("unreadable.py", "failed"),
+            ("cached.py", "completed"),
+        ]
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_all_ssd_rule_ids_pass_through(self, base_state) -> None:
         findings = [_make_finding(rid) for rid in ("SSD-1", "SSD-2", "SSD-3", "SSD-4")]
@@ -286,6 +326,9 @@ class TestErrorHandling:
         state = {"file_cache": {"SKILL.md": "# Skill"}}
         result = node(state)
         assert result["findings"] == []
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "unavailable"
+        assert "reason_code" not in status
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_validation_error_returns_empty(self) -> None:
@@ -303,6 +346,35 @@ class TestErrorHandling:
         with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
         assert result["findings"] == []
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_validation_error_preserves_failed_work_evidence(self) -> None:
+        """Malformed responses retain both cache and submitted-batch failures."""
+        try:
+            LLMAnalysisResult.model_validate({"findings": "not-an-array"})
+        except ValidationError as exc:
+            validation_err = exc
+        else:
+            pytest.fail("Expected ValidationError from bad data")
+
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        with patch.object(LLMAnalyzerBase, "run_batches", side_effect=validation_err):
+            result = node(
+                {
+                    "components": ["cached.py", "missing.py"],
+                    "file_cache": {"cached.py": "print('ready')\n"},
+                }
+            )
+
+        events_by_path = {event["path"]: event for event in result["inspection_ledger"]}
+        assert events_by_path["cached.py"]["reason_code"] == "llm_batch_failed"
+        assert events_by_path["missing.py"]["reason_code"] == "missing_file_cache"
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "failed"
+        assert {work["work_id"] for work in status["planned_work"]} == {
+            event["work_id"] for event in result["inspection_ledger"]
+        }
 
 
 # ---------------------------------------------------------------------------

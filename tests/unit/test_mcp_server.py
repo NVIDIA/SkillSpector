@@ -198,6 +198,30 @@ async def test_run_scan_rejects_invalid_format(tmp_path: Path) -> None:
         await run_scan(str(tmp_path), output_format="xml")
 
 
+async def test_mcp_blocks_install_when_execution_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A low risk score cannot override failed inspection execution."""
+
+    async def failed_execution_result(state: dict, config: dict) -> dict:
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "risk_recommendation": "CAUTION",
+            "execution_successful": False,
+            "analysis_completeness": {
+                "entirely_uninspected_files": 1,
+                "ledger_exceptions": [],
+            },
+            "filtered_findings": [],
+            "report_body": "{}",
+        }
+
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", failed_execution_result)
+    verdict = await mcp_server.run_scan("fixture", use_llm=False)
+
+    assert verdict["safe_to_install"] is False
+    assert verdict["execution_successful"] is False
+
+
 async def test_build_server_registers_scan_skill() -> None:
     """build_server wires up the scan_skill tool (requires the mcp extra)."""
     pytest.importorskip("mcp")

@@ -27,8 +27,15 @@ import binascii
 import hashlib
 from pathlib import Path
 
-import yara
+import yara  # type: ignore[import-not-found]
 
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -230,11 +237,7 @@ def _build_message(rule_name: str, namespace: str, description: str | None) -> s
 def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[AnalyzerFinding]:
     """Run compiled YARA rules against *content* and return AnalyzerFindings."""
     data = content.encode("utf-8", errors="replace")
-    try:
-        matches = rules.match(data=data)
-    except Exception as exc:
-        logger.debug("%s: match error on %s: %s", ANALYZER_ID, file_path, exc)
-        return []
+    matches = rules.match(data=data)
 
     findings: list[AnalyzerFinding] = []
     for match in matches:
@@ -266,15 +269,35 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     rules = _load_rules(extra_dir)
     if rules is None:
         logger.info("%s: 0 findings (no rules available)", ANALYZER_ID)
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="unavailable",
+                    reason=LedgerReason.RULES_UNAVAILABLE,
+                )
+            ],
+        }
 
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
     findings = []
+    events: list[InspectionLedgerEvent] = []
 
     for path in components:
         content = file_cache.get(path)
         if content is None:
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.MISSING_FILE_CACHE,
+                )
+            )
             continue
         if len(content) > MAX_FILE_CHARS:
             logger.debug(
@@ -283,9 +306,76 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 path,
                 MAX_FILE_CHARS,
             )
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.SKIPPED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.SIZE_LIMIT,
+                    observed_characters=len(content),
+                    limit_characters=MAX_FILE_CHARS,
+                    observed_bytes=len(content.encode("utf-8")),
+                )
+            )
             continue
-        for af in _match_file(rules, content, path):
-            findings.append(analyzer_finding_to_finding(af))
+        try:
+            path_findings = [
+                analyzer_finding_to_finding(af) for af in _match_file(rules, content, path)
+            ]
+        except Exception as exc:
+            logger.warning("%s: match error on %s: %s", ANALYZER_ID, path, exc)
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        findings.extend(path_findings)
+        events.append(
+            ledger_event(
+                analyzer_id=ANALYZER_ID,
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                path=path,
+                emitted_finding_ids=[finding.finding_id for finding in path_findings],
+            )
+        )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    if not events:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status="not_applicable",
+            reason=LedgerReason.NO_APPLICABLE_FILES,
+        )
+    else:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status=(
+                "failed"
+                if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
+                else "degraded"
+                if any(event["outcome"] is LedgerOutcome.SKIPPED for event in events)
+                else "completed"
+            ),
+            planned_work=[
+                {
+                    "work_id": event["work_id"],
+                    "path": event["path"],
+                    "start_line": event["start_line"],
+                    "end_line": event["end_line"],
+                }
+                for event in events
+            ],
+        )
+    return {
+        "findings": findings,
+        "inspection_ledger": events,
+        "analyzer_status_events": [status],
+    }

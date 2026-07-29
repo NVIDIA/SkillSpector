@@ -45,6 +45,26 @@ def test_rp1_npx_unpinned():
     assert "npx @scope/mcp-server" in rp1[0].matched_text
 
 
+def test_rp1_scans_cached_files_without_a_manifest():
+    """Cache-based RP1 checks remain applicable when manifest parsing failed."""
+    result = node(_state(file_cache={"setup.sh": "npx @scope/mcp-server\n"}))
+
+    assert [finding.rule_id for finding in result["findings"]] == ["RP1"]
+
+
+def test_cache_only_scan_skips_manifest_comparison_checks():
+    """A prior manifest cannot be diffed against an absent current manifest."""
+    state = _state(file_cache={"setup.sh": "npx @scope/mcp-server\n"})
+    state["previous_manifest"] = {
+        "triggers": ["legacy"],
+        "parameters": [{"name": "token", "type": "string"}],
+    }
+
+    result = node(state)
+
+    assert [finding.rule_id for finding in result["findings"]] == ["RP1"]
+
+
 def test_rp1_npx_pinned_no_finding():
     """RP1 does not fire when npx has @version."""
     result = node(

@@ -7,7 +7,8 @@
 # See docs/SUPPRESSION.md for the full reference. All identifiers below are
 # placeholders — replace them with your own rule ids, paths, and reasons.
 
-version: 1
+version: 2
+scanner_version: "X.Y.Z" # generated automatically; do not edit
 
 # Glob rules — human-authored, drift-tolerant (survive line/wording changes).
 # A finding is suppressed when EVERY field a rule sets glob-matches it.
@@ -31,7 +32,7 @@ rules:
 # Fingerprints — exact, machine-generated suppressions (one per accepted
 # finding). Regenerate with `skillspector baseline` when a skill changes.
 fingerprints:
-  - hash: "sha256:0123456789abcdef"
+  - hash: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     rule_id: "SDI-2"
     file: "example-skill/SKILL.md"
     reason: "Accepted: reads its own environment ($EXAMPLE_TOKEN) for context"

@@ -108,12 +108,20 @@ async def run_scan(
         )
         findings = result.get("filtered_findings") or result.get("findings") or []
         risk_score = int(result.get("risk_score") or 0)
+        execution_successful = bool(result.get("execution_successful", True))
+        analysis_completeness = result.get("analysis_completeness") or {}
+        entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
+        safe_to_install = (
+            risk_score <= RISK_THRESHOLD and execution_successful and entirely_uninspected == 0
+        )
         return {
             "target": target,
             "risk_score": risk_score,
             "severity": result.get("risk_severity"),
             "recommendation": result.get("risk_recommendation"),
-            "safe_to_install": risk_score <= RISK_THRESHOLD,
+            "safe_to_install": safe_to_install,
+            "execution_successful": execution_successful,
+            "analysis_completeness": analysis_completeness,
             "findings": [f.to_dict() for f in findings],
             "report": result.get("report_body") or "",
             # Honest LLM accounting — never silently imply a full semantic scan.

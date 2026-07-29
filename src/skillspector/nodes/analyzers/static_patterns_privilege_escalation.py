@@ -148,6 +148,56 @@ def _is_read_only_passwd_volume_match(content: str, match: re.Match[str]) -> boo
     return False
 
 
+_BENIGN_ACCESS_REQUIREMENT_ROWS = frozenset(
+    {
+        "| GTL access credential | Runner-gated job start |",
+        "| GTL access credential | Runner-gated job create/start/monitor/collect |",
+    }
+)
+_PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
+    r"(?:^|>|\b(?:navigate|go)\s+to\s+)\s*settings\s*>\s*(?:ci/cd\s*>\s*)?"
+    r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _source_line(content: str, match: re.Match[str]) -> str:
+    """Return only the source line containing *match*."""
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(content)
+    return content[line_start:line_end]
+
+
+def _is_qualified_benign_access_requirement(
+    content: str, match: re.Match[str], file_type: str
+) -> bool:
+    """Suppress only the reviewed GTL requirement row in its exact table."""
+    if file_type != "markdown" or match.group(0) != "access credential":
+        return False
+
+    lines = content.splitlines()
+    row_index = get_line_number(content, match.start()) - 1
+    if row_index >= len(lines) or lines[row_index].strip() not in _BENIGN_ACCESS_REQUIREMENT_ROWS:
+        return False
+
+    table_start = row_index
+    while table_start > 0 and lines[table_start - 1].strip().startswith("|"):
+        table_start -= 1
+    if table_start + 1 >= len(lines):
+        return False
+    if lines[table_start].strip() != "| Requirement | Purpose |":
+        return False
+    if lines[table_start + 1].strip() != "| --- | --- |":
+        return False
+
+    heading_index = table_start - 1
+    while heading_index >= 0 and not lines[heading_index].strip():
+        heading_index -= 1
+    return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
@@ -195,7 +245,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
-            if _is_documentation_example(context, file_type):
+            if _is_pe3_documentation_example(content, match, file_type):
+                continue
+            if _is_qualified_benign_access_requirement(content, match, file_type):
                 continue
             if _is_read_only_passwd_volume_match(content, match):
                 continue
@@ -258,41 +310,55 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
-def _is_documentation_example(context: str, file_type: str) -> bool:
+_DOCUMENTATION_EXAMPLE_INDICATORS = (
+    "example:",
+    "for example",
+    "e.g.",
+    "such as",
+    "documentation",
+    "# warning:",
+    "# note:",
+    "**warning**",
+    "**note**",
+    "```",
+)
+
+
+def _has_documentation_indicator(context: str, indicators: tuple[str, ...]) -> bool:
     ctx_lower = context.lower()
-    doc_indicators = (
-        "example:",
-        "for example",
-        "e.g.",
-        "such as",
-        "documentation",
-        "# warning:",
-        "# note:",
-        "**warning**",
-        "**note**",
-        "```",
-        # CI/CD setup instructions (GitLab/GitHub settings navigation)
-        "settings >",
-        "navigate to",
-        "go to ",
-        "> ci/cd",
-        "> runners",
-        "> merge request",
-        "> access token",
-        # Environment variable documentation tables
-        "| yes |",
-        "| no |",
-        "| required |",
-        "| optional |",
-        "env variable",
-        "environment variable",
-        "create ",
-    )
-    return any(ind in ctx_lower for ind in doc_indicators)
+    return any(indicator in ctx_lower for indicator in indicators)
+
+
+def _is_documentation_example(context: str, file_type: str) -> bool:
+    if file_type not in {"markdown", "text"}:
+        return False
+    return _has_documentation_indicator(context, _DOCUMENTATION_EXAMPLE_INDICATORS)
+
+
+def _is_pe3_documentation_example(content: str, match: re.Match[str], file_type: str) -> bool:
+    """Filter only the reviewed, position-bound access-token UI path.
+
+    Generic words such as ``example``, ``documentation``, ``Required``, and
+    ``environment variable`` are attacker-controllable prose and must never
+    suppress an otherwise actionable credential-access match. Even negated
+    references remain findings because another malicious clause can share the
+    same line.
+    """
+    if file_type not in {"markdown", "text"}:
+        return False
+    line = _source_line(content, match)
+    if match.group(0).lower() not in {"access token", "access tokens"}:
+        return False
+    navigation = _PE3_SAFE_ACCESS_TOKEN_NAVIGATION.search(line)
+    if navigation is None:
+        return False
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    match_span = (match.start() - line_start, match.end() - line_start)
+    return navigation.span("target") == match_span
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run privilege_escalation patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

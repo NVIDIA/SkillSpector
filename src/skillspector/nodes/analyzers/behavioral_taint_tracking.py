@@ -25,6 +25,14 @@ from __future__ import annotations
 import ast
 from typing import NamedTuple
 
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    PlannedWorkTarget,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -318,11 +326,7 @@ def _find_tainted_in_expr(node: ast.expr, tainted: dict[str, _TaintedVar]) -> _T
 
 
 def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
-    try:
-        tree = ast.parse(content, filename=file_path)
-    except SyntaxError:
-        logger.debug("SyntaxError parsing %s, skipping", file_path)
-        return []
+    tree = ast.parse(content, filename=file_path)
 
     type_map = build_type_map(tree)
     aliases = build_import_aliases(tree)
@@ -425,15 +429,85 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
     all_findings: list[Finding] = []
+    ledger_events: list[InspectionLedgerEvent] = []
 
     for path in components:
         if not path.endswith(".py"):
             continue
         content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_CHARS:
-            continue
-        raw = _analyze_python(content, path)
-        all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
+        if content is None:
+            event = ledger_event(
+                outcome=LedgerOutcome.FAILED,
+                phase="behavioral",
+                analyzer_id=ANALYZER_ID,
+                path=path,
+                reason=LedgerReason.MISSING_FILE_CACHE,
+            )
+        elif len(content) > MAX_FILE_CHARS:
+            event = ledger_event(
+                outcome=LedgerOutcome.SKIPPED,
+                phase="behavioral",
+                analyzer_id=ANALYZER_ID,
+                path=path,
+                reason=LedgerReason.SIZE_LIMIT,
+                observed_characters=len(content),
+                limit_characters=MAX_FILE_CHARS,
+                observed_bytes=len(content.encode("utf-8")),
+            )
+        else:
+            try:
+                raw = _analyze_python(content, path)
+            except SyntaxError:
+                event = ledger_event(
+                    outcome=LedgerOutcome.SKIPPED,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.SYNTAX_ERROR,
+                )
+            else:
+                path_findings = [analyzer_finding_to_finding(af) for af in raw]
+                all_findings.extend(path_findings)
+                event = ledger_event(
+                    outcome=LedgerOutcome.COMPLETED,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    emitted_finding_ids=[finding.finding_id for finding in path_findings],
+                )
+        ledger_events.append(event)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(all_findings))
-    return {"findings": all_findings}
+    planned_work: list[PlannedWorkTarget] = [
+        {
+            "work_id": event["work_id"],
+            "path": event["path"],
+            "start_line": event["start_line"],
+            "end_line": event["end_line"],
+        }
+        for event in ledger_events
+    ]
+    if not ledger_events:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status="not_applicable",
+            reason=LedgerReason.NO_APPLICABLE_FILES,
+        )
+    else:
+        outcomes = {event["outcome"] for event in ledger_events}
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status=(
+                "failed"
+                if LedgerOutcome.FAILED in outcomes
+                else "degraded"
+                if LedgerOutcome.SKIPPED in outcomes
+                else "completed"
+            ),
+            planned_work=planned_work,
+        )
+    return {
+        "findings": all_findings,
+        "inspection_ledger": ledger_events,
+        "analyzer_status_events": [status],
+    }

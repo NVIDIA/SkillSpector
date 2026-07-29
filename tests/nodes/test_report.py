@@ -851,8 +851,8 @@ def test_report_sarif_carries_degradation_notification() -> None:
     validate_sarif_report(result["sarif_report"])
 
 
-def test_report_sarif_no_invocations_when_not_degraded() -> None:
-    """A healthy scan's SARIF output is unchanged (no invocations block)."""
+def test_report_sarif_has_successful_invocation_when_not_degraded() -> None:
+    """SARIF always records the single canonical inspection invocation."""
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -863,7 +863,9 @@ def test_report_sarif_no_invocations_when_not_degraded() -> None:
         "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
     }
     result = report(state)
-    assert "invocations" not in result["sarif_report"]["runs"][0]
+    invocations = result["sarif_report"]["runs"][0]["invocations"]
+    assert len(invocations) == 1
+    assert invocations[0]["executionSuccessful"] is True
 
 
 # ---------------------------------------------------------------------------

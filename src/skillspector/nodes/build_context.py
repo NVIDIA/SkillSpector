@@ -21,13 +21,22 @@ from a local skill directory.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 
 import yaml
 
 from skillspector.constants import build_model_config
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    LedgerRecordType,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
 
@@ -181,30 +190,57 @@ def _resolve_skill_dir(state: SkillspectorState) -> Path:
     return resolved
 
 
-def _walk_skill_files(skill_dir: Path) -> list[str]:
-    """Walk skill directory and return sorted relative path strings.
+def _walk_skill_files(
+    skill_dir: Path,
+) -> tuple[list[str], list[InspectionLedgerEvent]]:
+    """Walk skill files and record scan-scope exclusions.
 
     Skips _SKIP_DIRS and hidden files except those starting with .claude.
     """
     paths: list[str] = []
-    for item in skill_dir.rglob("*"):
-        if not item.is_file():
-            continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
-            continue
-        if item.name.startswith(".") and not item.name.startswith(".claude"):
-            continue
-        try:
-            rel = item.relative_to(skill_dir)
+    exclusions: list[InspectionLedgerEvent] = []
+    for root, dirnames, filenames in os.walk(skill_dir):
+        root_path = Path(root)
+        dirnames.sort()
+        filenames.sort()
+        relative_root = root_path.relative_to(skill_dir)
+
+        skipped_dirnames = [name for name in dirnames if name in _SKIP_DIRS]
+        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
+        for dirname in skipped_dirnames:
+            boundary = (relative_root / dirname).as_posix()
+            exclusions.append(
+                ledger_event(
+                    outcome=LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                    phase="discovery",
+                    path=f"{boundary}/",
+                    reason=LedgerReason.EXCLUDED_DIRECTORY,
+                )
+            )
+
+        for filename in filenames:
+            relative_path = (relative_root / filename).as_posix()
+            if filename.startswith(".") and not filename.startswith(".claude"):
+                exclusions.append(
+                    ledger_event(
+                        outcome=LedgerOutcome.OUT_OF_SCOPE,
+                        record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                        phase="discovery",
+                        path=relative_path,
+                        reason=LedgerReason.HIDDEN_FILE,
+                    )
+                )
+                continue
+
             # Use forward slashes on every OS: these relative paths are dict keys
-            # and SARIF/URI locations, so they must be portable (not OS-specific
-            # backslashes on Windows).
-            paths.append(rel.as_posix())
-        except ValueError:
-            logger.debug("Skipping path (not under skill_dir): %s", item)
-            continue
+            # and SARIF/URI locations, so they must be portable.  Do not filter
+            # on ``is_file()`` here: it follows symlinks and silently discards
+            # dangling or non-regular entries before the cache phase can record
+            # their terminal ledger evidence.
+            paths.append(relative_path)
     paths.sort()
-    return paths
+    return paths, exclusions
 
 
 def _infer_file_type(path: str) -> str:
@@ -218,18 +254,18 @@ def _build_component_metadata(
     skill_dir: Path,
     components: list[str],
     inspections: dict[str, _FileInspection],
+    file_cache: dict[str, str],
 ) -> tuple[list[dict[str, object]], bool]:
     """Build component_metadata list and has_executable_scripts from paths."""
     metadata: list[dict[str, object]] = []
     has_executable = False
     for path in components:
         full = skill_dir / path
-        if not full.is_file():
-            continue
         suffix = full.suffix.lower()
         file_type = _infer_file_type(path)
-        inspection = inspections[path]
-        lines = len(inspection.content.splitlines())
+        content = file_cache.get(path)
+        lines = len(content.splitlines()) if content is not None else 0
+        inspection = inspections.get(path)
         executable = suffix in _EXECUTABLE_EXTENSIONS
         if executable:
             has_executable = True
@@ -245,9 +281,11 @@ def _build_component_metadata(
                 "lines": lines,
                 "executable": executable,
                 "size_bytes": size_bytes,
-                "content_kind": inspection.content_kind,
-                "llm_analysis_status": inspection.llm_analysis_status,
-                "llm_skip_reason": inspection.llm_skip_reason,
+                "content_kind": inspection.content_kind if inspection else "unknown",
+                "llm_analysis_status": (
+                    inspection.llm_analysis_status if inspection else "excluded"
+                ),
+                "llm_skip_reason": inspection.llm_skip_reason if inspection else None,
             }
         )
     return metadata, has_executable
@@ -255,27 +293,103 @@ def _build_component_metadata(
 
 def _read_file_cache(
     skill_dir: Path, components: list[str]
-) -> tuple[dict[str, str], dict[str, str], dict[str, _FileInspection]]:
-    """Build the shared and LLM-eligible caches and classify every component."""
+) -> tuple[
+    dict[str, str],
+    dict[str, str],
+    dict[str, _FileInspection],
+    list[InspectionLedgerEvent],
+]:
+    """Build shared/LLM caches, classifications, and terminal cache evidence."""
     file_cache: dict[str, str] = {}
     llm_file_cache: dict[str, str] = {}
     inspections: dict[str, _FileInspection] = {}
+    ledger_events: list[InspectionLedgerEvent] = []
     for path in components:
         full = skill_dir / path
-        if not full.is_file():
+        try:
+            file_stat = full.stat()
+        except FileNotFoundError as exc:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.FILE_DISAPPEARED,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        except OSError as exc:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.STAT_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        if not S_ISREG(file_stat.st_mode):
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.NOT_REGULAR_FILE,
+                )
+            )
             continue
         try:
             inspection = _inspect_bytes(full.read_bytes())
-        except OSError:
+        except FileNotFoundError as exc:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.FILE_DISAPPEARED,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        except OSError as exc:
             logger.debug("Could not read file: %s", path)
-            inspection = _FileInspection("", "unknown", "excluded", "read_error")
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.READ_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+
         inspections[path] = inspection
         file_cache[path] = inspection.content
         if inspection.llm_analysis_status == "included":
             llm_file_cache[path] = inspection.content
-        else:
-            logger.info("Excluding %s from LLM analysis: %s", path, inspection.llm_skip_reason)
-    return file_cache, llm_file_cache, inspections
+            continue
+
+        logger.info("Excluding %s from LLM analysis: %s", path, inspection.llm_skip_reason)
+        ledger_events.append(
+            ledger_event(
+                outcome=LedgerOutcome.SKIPPED,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="llm_eligibility",
+                path=path,
+                reason=LedgerReason.BINARY_CONTENT,
+                observed_bytes=file_stat.st_size,
+            )
+        )
+
+    return file_cache, llm_file_cache, inspections, ledger_events
 
 
 def _parse_manifest(skill_dir: Path) -> dict[str, object]:
@@ -346,17 +460,18 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     """
     skill_dir = _resolve_skill_dir(state)
 
-    components = _walk_skill_files(skill_dir)
-    file_cache, llm_file_cache, inspections = _read_file_cache(skill_dir, components)
+    components, discovery_events = _walk_skill_files(skill_dir)
+    file_cache, llm_file_cache, inspections, cache_events = _read_file_cache(skill_dir, components)
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(
-        skill_dir, components, inspections
+        skill_dir, components, inspections, file_cache
     )
 
     return {
         "components": components,
         "file_cache": file_cache,
         "llm_file_cache": llm_file_cache,
+        "inspection_ledger": [*discovery_events, *cache_events],
         "ast_cache": {},
         "manifest": manifest,
         "previous_manifest": None,

@@ -24,6 +24,12 @@ from __future__ import annotations
 
 import re
 
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -366,6 +372,20 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     file_cache: dict[str, str] = state.get("file_cache") or {}
     previous_manifest: dict | None = state.get("previous_manifest")
 
+    if not manifest and not file_cache:
+        logger.info("%s: no manifest or files, skipping", ANALYZER_ID)
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="not_applicable",
+                    reason=LedgerReason.MANIFEST_ABSENT,
+                )
+            ],
+        }
+
     findings: list[Finding] = []
 
     # 1. Static unpinned / pre-staging checks (always run if manifest/cache exists)
@@ -383,7 +403,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         logger.debug("%s: RP3 produced %d static findings", ANALYZER_ID, len(rp3_findings))
 
     # 2. Manifest comparison checks (if previous_manifest is available)
-    if previous_manifest:
+    if manifest and previous_manifest:
         curr_perms = _normalize_string_list(manifest.get("permissions"))
         prev_perms = _normalize_string_list(previous_manifest.get("permissions"))
 
@@ -479,10 +499,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         if added_params or removed_params or changed_params:
             changes = []
             if added_params:
-                changes.append(f"added: {', '.join(curr_params[p]['name'] for p in added_params)}")
+                changes.append(
+                    f"added: {', '.join(str(curr_params[p]['name']) for p in added_params)}"
+                )
             if removed_params:
                 changes.append(
-                    f"removed: {', '.join(prev_params[p]['name'] for p in removed_params)}"
+                    f"removed: {', '.join(str(prev_params[p]['name']) for p in removed_params)}"
                 )
             if changed_params:
                 changes.append(f"modified: {', '.join(changed_params)}")
@@ -513,4 +535,28 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             )
 
     logger.info("%s: %d findings in total", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    event = ledger_event(
+        analyzer_id=ANALYZER_ID,
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path="SKILL.md",
+        emitted_finding_ids=[finding.finding_id for finding in findings],
+    )
+    return {
+        "findings": findings,
+        "inspection_ledger": [event],
+        "analyzer_status_events": [
+            analyzer_status_event(
+                analyzer_id=ANALYZER_ID,
+                status="completed",
+                planned_work=[
+                    {
+                        "work_id": event["work_id"],
+                        "path": event["path"],
+                        "start_line": event["start_line"],
+                        "end_line": event["end_line"],
+                    }
+                ],
+            )
+        ],
+    }

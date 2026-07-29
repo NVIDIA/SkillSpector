@@ -1,3 +1,9 @@
+### 2.5.0 (Friday, July 24, 2026)
+### Features/Bug Fixes
+* feat(report): add canonical inspection-ledger reporting, including JSON and SARIF execution-completeness status
+* fix(cli): make recursive child-scan failures fail the combined command and JSON report
+* fix(oss): exclude internal inspection-ledger plans and design documents from public snapshots
+
 ### 2.4.4 (Thursday, July 23, 2026)
 ### Features/Bug Fixes
 * fix(anthropic): re-apply ANTHROPIC_BASE_URL override reverted by 2.4.3 snapshot (#301)

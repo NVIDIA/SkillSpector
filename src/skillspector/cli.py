@@ -26,7 +26,7 @@ import os
 import sys
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
 from langchain_core.runnables import RunnableConfig
@@ -291,6 +291,12 @@ def scan(
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
+            if baseline is not None:
+                console.print(
+                    "[red]Error:[/red] --baseline is not supported for recursive "
+                    "multi-skill scans; scan each sub-skill with its own baseline"
+                )
+                raise typer.Exit(code=2)
             _scan_multi_skill(detection, format, output, no_llm, yara_rules_dir, verbose)
             return
         if not detection.has_root_skill and len(detection.skills) == 0:
@@ -330,6 +336,8 @@ def scan(
 
         _write_result(result, output, format)
 
+        if result.get("execution_successful") is False:
+            raise typer.Exit(code=2)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
     except typer.Exit:
@@ -380,6 +388,7 @@ def _scan_multi_skill(
 
     results: list[dict[str, object]] = []
     max_score = 0
+    execution_failed = False
 
     for i, skill in enumerate(skills, 1):
         console.print(
@@ -392,6 +401,8 @@ def _scan_multi_skill(
         try:
             result = graph.invoke(state, config=trace_config)
             results.append(result)
+            if result.get("execution_successful") is False:
+                execution_failed = True
             score = result.get("risk_score") or 0
             if isinstance(score, int) and score > max_score:
                 max_score = score
@@ -399,54 +410,62 @@ def _scan_multi_skill(
             console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
             console.print(f"         [red]Error:[/red] {e}\n")
+            execution_failed = True
             results.append({"skill_name": skill.name, "error": str(e)})
 
     console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
-    console.print(f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10}")
-    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10}")
+    console.print(
+        f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10} {'Execution':<10}"
+    )
+    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
 
     for skill, result in zip(skills, results, strict=True):
         if "error" in result:
-            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10}")
+            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}")
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
         filtered = result.get("filtered_findings") or result.get("findings")
         finding_count = len(filtered) if isinstance(filtered, list) else 0
-        console.print(f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10}")
+        execution = "failed" if result.get("execution_successful") is False else "successful"
+        console.print(
+            f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
+        )
 
     console.print("")
 
     if output and format == FormatChoice.json:
-        combined = {
+        combined: dict[str, object] = {
             "multi_skill": True,
             "skill_count": len(skills),
             "max_risk_score": max_score,
+            "execution_successful": not execution_failed,
             "skills": [],
         }
+        combined_skills = cast(list[dict[str, object]], combined["skills"])
         for skill, result in zip(skills, results, strict=True):
             if "error" in result:
-                combined["skills"].append({"name": skill.name, "error": result["error"]})
+                combined_skills.append({"name": skill.name, "error": result["error"]})
             else:
                 payload = _recursive_json_payload(result) or {}
+                selected_findings = result.get("filtered_findings") or result.get("findings") or []
+                finding_count = len(selected_findings) if isinstance(selected_findings, list) else 0
                 entry = {
                     "name": skill.name,
                     "path": skill.relative_path,
                     "risk_score": result.get("risk_score", 0),
                     "risk_severity": result.get("risk_severity", "LOW"),
-                    "finding_count": len(
-                        result.get("filtered_findings") or result.get("findings") or []
-                    ),
+                    "finding_count": finding_count,
+                    "execution_successful": result.get("execution_successful", True),
                 }
                 entry.update(payload)
                 entry["name"] = skill.name
                 entry["path"] = skill.relative_path
                 entry["risk_score"] = result.get("risk_score", 0)
                 entry["risk_severity"] = result.get("risk_severity", "LOW")
-                entry["finding_count"] = len(
-                    result.get("filtered_findings") or result.get("findings") or []
-                )
-                combined["skills"].append(entry)
+                entry["finding_count"] = finding_count
+                entry["execution_successful"] = result.get("execution_successful", True)
+                combined_skills.append(entry)
         Path(output).write_text(json.dumps(combined, indent=2), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
     elif output:
@@ -458,6 +477,8 @@ def _scan_multi_skill(
         Path(output).write_text("\n\n".join(sections), encoding="utf-8")
         console.print(f"[green]Combined report saved to:[/green] {output}")
 
+    if execution_failed:
+        raise typer.Exit(code=2)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
 
@@ -562,7 +583,12 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         result = graph.invoke(state)
         findings = result.get("filtered_findings") or result.get("findings") or []
-        data = build_baseline_dict(findings, reason=reason)
+        data = build_baseline_dict(
+            findings,
+            reason=reason,
+            file_cache=result.get("file_cache") or {},
+            scanner_version=__version__,
+        )
         dump_baseline(data, output)
         console.print(
             f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"

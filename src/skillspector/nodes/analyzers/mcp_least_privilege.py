@@ -20,6 +20,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -214,13 +220,33 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     # Skip: no manifest
     if not manifest:
         logger.info("%s: no manifest, skipping", ANALYZER_ID)
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="not_applicable",
+                    reason=LedgerReason.MANIFEST_ABSENT,
+                )
+            ],
+        }
 
     # Skip: docs-only skill (no executable files)
     has_executable = any(m.get("executable", False) for m in component_metadata)
     if not has_executable:
         logger.info("%s: no executable files, skipping", ANALYZER_ID)
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="not_applicable",
+                    reason=LedgerReason.NO_APPLICABLE_FILES,
+                )
+            ],
+        }
 
     findings: list[Finding] = []
 
@@ -400,4 +426,28 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    event = ledger_event(
+        analyzer_id=ANALYZER_ID,
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path="SKILL.md",
+        emitted_finding_ids=[finding.finding_id for finding in findings],
+    )
+    return {
+        "findings": findings,
+        "inspection_ledger": [event],
+        "analyzer_status_events": [
+            analyzer_status_event(
+                analyzer_id=ANALYZER_ID,
+                status="completed",
+                planned_work=[
+                    {
+                        "work_id": event["work_id"],
+                        "path": event["path"],
+                        "start_line": event["start_line"],
+                        "end_line": event["end_line"],
+                    }
+                ],
+            )
+        ],
+    }

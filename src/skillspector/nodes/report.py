@@ -23,16 +23,19 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from io import StringIO
 from typing import Literal
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
 from skillspector import __version__ as skillspector_version
+from skillspector.inspection_ledger import AnalysisCompleteness
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -53,6 +56,7 @@ from skillspector.sarif_models import (
     SarifRun,
     SarifSuppression,
     SarifTool,
+    validate_sarif_report,
 )
 from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
@@ -98,13 +102,23 @@ def _clean_text(value: str | None) -> str | None:
 
 def _sanitize_finding(finding: Finding) -> Finding:
     """Return a copy of *finding* with control/ANSI bytes stripped from text fields."""
-    return replace(finding, **{f: _clean_text(getattr(finding, f)) for f in _SANITIZED_FIELDS})
+    return replace(
+        finding,
+        message=_clean_text(finding.message) or "",
+        explanation=_clean_text(finding.explanation),
+        remediation=_clean_text(finding.remediation),
+        finding=_clean_text(finding.finding),
+        context=_clean_text(finding.context),
+        matched_text=_clean_text(finding.matched_text),
+        code_snippet=_clean_text(finding.code_snippet),
+    )
 
 
 def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
     """Project selected finding metadata into a SARIF properties dictionary."""
     finding_dict = finding.to_dict()
     metadata: dict[str, object] = {
+        "findingId": finding.finding_id,
         "severity": finding_dict["severity"],
         "category": finding_dict["category"],
         "pattern": finding_dict["pattern"],
@@ -219,36 +233,27 @@ def _build_sarif(
     findings: list[Finding],
     suppressed: list[SuppressedFinding] | None = None,
     degraded_notice: str | None = None,
+    analysis_completeness: Mapping[str, object] | None = None,
+    execution_successful: bool = True,
 ) -> dict[str, object]:
-    """Build SARIF 2.1.0 log from findings.
-
-    Filters out empty/malformed findings (missing rule_id or message) and
-    builds the required tool.driver.rules[] array from referenced rule IDs.
-
-    When *degraded_notice* is set (the LLM stage was requested but every call
-    failed), a single ``invocation`` is added carrying the notice as a
-    warning-level ``toolExecutionNotifications`` entry — the standard SARIF
-    place for execution-time conditions — so the default output format also
-    surfaces the degradation. ``executionSuccessful`` stays True: the scan
-    completed and produced results; only the LLM sub-stage was degraded.
-    """
+    """Build one SARIF invocation with canonical inspection notifications."""
     results: list[SarifResult] = []
     seen_rule_ids: dict[str, str] = {}
 
     for finding in findings:
         if not finding.rule_id or not finding.message:
             continue
-        region = SarifRegion(start_line=finding.start_line, end_line=finding.end_line)
+        region = SarifRegion(startLine=finding.start_line, endLine=finding.end_line)
         results.append(
             SarifResult(
-                rule_id=finding.rule_id,
+                ruleId=finding.rule_id,
                 message=SarifMessage(text=finding.message),
                 level=_severity_to_sarif_level(finding.severity),
                 properties=_build_sarif_properties(finding),
                 locations=[
                     SarifLocation(
-                        physical_location=SarifPhysicalLocation(
-                            artifact_location=SarifArtifactLocation(uri=finding.file),
+                        physicalLocation=SarifPhysicalLocation(
+                            artifactLocation=SarifArtifactLocation(uri=finding.file),
                             region=region,
                         )
                     )
@@ -266,16 +271,16 @@ def _build_sarif(
             continue
         results.append(
             SarifResult(
-                rule_id=finding.rule_id,
+                ruleId=finding.rule_id,
                 message=SarifMessage(text=finding.message),
                 level=_severity_to_sarif_level(finding.severity),
                 properties=_build_sarif_properties(finding),
                 locations=[
                     SarifLocation(
-                        physical_location=SarifPhysicalLocation(
-                            artifact_location=SarifArtifactLocation(uri=finding.file),
+                        physicalLocation=SarifPhysicalLocation(
+                            artifactLocation=SarifArtifactLocation(uri=finding.file),
                             region=SarifRegion(
-                                start_line=finding.start_line, end_line=finding.end_line
+                                startLine=finding.start_line, endLine=finding.end_line
                             ),
                         )
                     )
@@ -289,39 +294,157 @@ def _build_sarif(
     rules = [
         SarifReportingDescriptor(
             id=rule_id,
-            short_description=SarifMessage(text=description),
+            shortDescription=SarifMessage(text=description),
         )
         for rule_id, description in sorted(seen_rule_ids.items())
     ]
 
-    invocations: list[SarifInvocation] | None = None
-    if degraded_notice:
-        invocations = [
-            SarifInvocation(
-                execution_successful=True,
-                tool_execution_notifications=[
-                    SarifNotification(text=SarifMessage(text=degraded_notice), level="warning")
-                ],
-            )
-        ]
+    notifications: list[SarifNotification] = []
+    completeness = analysis_completeness or {}
 
-    sarif_log = SarifLog(
-        schema_=SARIF_SCHEMA_URI,
-        runs=[
-            SarifRun(
-                tool=SarifTool(
-                    driver=SarifDriver(
-                        name="skillspector",
-                        version=skillspector_version,
-                        rules=rules if rules else None,
-                    )
-                ),
-                results=results,
-                invocations=invocations,
+    def notification_from_exception(
+        exception: Mapping[str, object], level: Literal["error", "warning", "note"]
+    ) -> SarifNotification:
+        path = str(exception.get("path", ""))
+        start_line = exception.get("start_line")
+        end_line = exception.get("end_line")
+        locations = None
+        if path:
+            region = (
+                SarifRegion(
+                    startLine=int(start_line),
+                    endLine=int(end_line) if isinstance(end_line, int) else None,
+                )
+                if isinstance(start_line, int)
+                else None
             )
-        ],
+            locations = [
+                SarifLocation(
+                    physicalLocation=SarifPhysicalLocation(
+                        artifactLocation=SarifArtifactLocation(uri=path),
+                        region=region,
+                    )
+                )
+            ]
+        properties: dict[str, object] = {
+            "outcome": str(exception.get("outcome", "")),
+            "phase": str(exception.get("phase", "")),
+            "reasonCode": str(exception.get("reason_code", "")),
+        }
+        if exception.get("fatal") is not None:
+            properties["fatal"] = bool(exception["fatal"])
+        analyzers = exception.get("analyzers")
+        if isinstance(analyzers, list):
+            properties["analyzers"] = list(analyzers)
+        return SarifNotification(
+            message=SarifMessage(text=str(exception.get("message", "Inspection exception."))),
+            level=level,
+            locations=locations,
+            properties=properties,
+        )
+
+    scope_exclusions = completeness.get("scope_exclusions", [])
+    if isinstance(scope_exclusions, list):
+        for exception in scope_exclusions:
+            if isinstance(exception, Mapping):
+                notifications.append(notification_from_exception(exception, "note"))
+    ledger_exceptions = completeness.get("ledger_exceptions", [])
+    if isinstance(ledger_exceptions, list):
+        for exception in ledger_exceptions:
+            if isinstance(exception, Mapping):
+                level: Literal["error", "warning", "note"] = (
+                    "error" if exception.get("fatal") else "warning"
+                )
+                notifications.append(notification_from_exception(exception, level))
+    limitations = completeness.get("limitations", [])
+    if isinstance(limitations, list):
+        for limitation in limitations:
+            notifications.append(
+                SarifNotification(
+                    message=SarifMessage(text=str(limitation)),
+                    level="warning",
+                    properties={"kind": "inspection_limitation"},
+                )
+            )
+    if degraded_notice:
+        notifications.append(
+            SarifNotification(
+                message=SarifMessage(text=degraded_notice),
+                level="warning",
+                properties={"kind": "llm_degradation"},
+            )
+        )
+    invocations = [
+        SarifInvocation(
+            executionSuccessful=execution_successful,
+            toolExecutionNotifications=notifications or None,
+        )
+    ]
+
+    sarif_log = SarifLog.model_validate(
+        {
+            "$schema": SARIF_SCHEMA_URI,
+            "runs": [
+                SarifRun(
+                    tool=SarifTool(
+                        driver=SarifDriver(
+                            name="skillspector",
+                            version=skillspector_version,
+                            rules=rules if rules else None,
+                        )
+                    ),
+                    results=results,
+                    invocations=invocations,
+                )
+            ],
+        }
     )
-    return sarif_log.model_dump(mode="json", by_alias=True, exclude_none=True)
+    rendered = sarif_log.model_dump(mode="json", by_alias=True, exclude_none=True)
+    validate_sarif_report(rendered)
+    return rendered
+
+
+def _render_terminal_completeness(
+    console: Console,
+    completeness: Mapping[str, object],
+    execution_successful: bool,
+) -> None:
+    """Render every public completeness record without leaking internal work IDs."""
+    console.print()
+    table = Table(title="Inspection Completeness", show_header=False, box=None)
+    table.add_column("Metric", style="bold")
+    table.add_column("Value")
+    table.add_row("Execution", "successful" if execution_successful else "failed")
+    table.add_row("Coverage", f"{completeness.get('coverage_percent', 100.0)}%")
+    table.add_row("Fully inspected", str(completeness.get("fully_inspected_files", 0)))
+    table.add_row("Partially inspected", str(completeness.get("partially_inspected_files", 0)))
+    table.add_row("Entirely uninspected", str(completeness.get("entirely_uninspected_files", 0)))
+    console.print(table)
+
+    def render_rows(title: str, rows: object) -> None:
+        if not isinstance(rows, list) or not rows:
+            return
+        console.print(f"[bold]{escape(title)}[/bold]")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            location = str(row.get("path", ""))
+            start_line = row.get("start_line")
+            end_line = row.get("end_line")
+            if isinstance(start_line, int):
+                location += f":{start_line}" + (f"-{end_line}" if end_line else "")
+            reason = str(row.get("reason_code", row.get("status", "status")))
+            message = str(row.get("message", ""))
+            console.print(f"  - {escape(reason)} {escape(location)}: {escape(message)}")
+
+    render_rows("Scope exclusions", completeness.get("scope_exclusions"))
+    render_rows("Ledger exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Analyzer statuses", completeness.get("analyzer_statuses"))
+    limitations = completeness.get("limitations")
+    if isinstance(limitations, list) and limitations:
+        console.print("[bold]Limitations[/bold]")
+        for limitation in limitations:
+            console.print(f"  - {escape(str(limitation))}")
 
 
 def _format_terminal(
@@ -334,9 +457,11 @@ def _format_terminal(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
-    llm_call_log: list[dict[str, object]] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
+    analysis_completeness: Mapping[str, object] | None = None,
+    execution_successful: bool = True,
 ) -> str:
     """Generate Rich terminal output and export as string."""
     suppressed = suppressed or []
@@ -380,8 +505,8 @@ def _format_terminal(
     comp_table.add_column("Lines", justify="right")
     comp_table.add_column("Executable")
     for comp in component_metadata[:15]:
-        path = comp.get("path", "")
-        typ = comp.get("type", "")
+        path = str(comp.get("path", ""))
+        typ = str(comp.get("type", ""))
         lines = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
         exec_marker = "[yellow]Yes[/yellow]" if exec_flag else "No"
@@ -436,12 +561,17 @@ def _format_terminal(
             console.print("[dim]Use --show-suppressed to list them.[/dim]")
         console.print()
 
+    _render_terminal_completeness(
+        console,
+        analysis_completeness or {},
+        execution_successful,
+    )
     console.print(f"[dim]Executable scripts: {'Yes' if has_executable_scripts else 'No'}[/dim]")
     return console.export_text()
 
 
 def _llm_runtime_status(
-    use_llm: bool, llm_call_log: list[dict[str, object]]
+    use_llm: bool, llm_call_log: Sequence[Mapping[str, object]]
 ) -> tuple[int, int, bool]:
     """Return ``(attempted, succeeded, degraded)`` from the LLM call log.
 
@@ -455,7 +585,9 @@ def _llm_runtime_status(
     return attempted, succeeded, degraded
 
 
-def _llm_degradation_notice(use_llm: bool, llm_call_log: list[dict[str, object]]) -> str | None:
+def _llm_degradation_notice(
+    use_llm: bool, llm_call_log: Sequence[Mapping[str, object]]
+) -> str | None:
     """Return a human-readable degraded-scan warning, or None if not degraded."""
     attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     if not degraded:
@@ -469,7 +601,7 @@ def _llm_degradation_notice(use_llm: bool, llm_call_log: list[dict[str, object]]
 def _build_metadata(
     has_executable_scripts: bool,
     use_llm: bool,
-    llm_call_log: list[dict[str, object]] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
@@ -508,75 +640,6 @@ def _build_metadata(
     return meta
 
 
-def _build_analysis_completeness(
-    components: list[str],
-    file_cache: dict[str, str],
-    use_llm: bool,
-    findings_pre_filter: list[Finding],
-    findings_post_filter: list[Finding],
-    component_metadata: list[dict[str, object]] | None = None,
-) -> dict[str, object]:
-    """Build analysis_completeness section indicating scan coverage and limitations.
-
-    Helps consumers understand what was NOT analyzed and whether findings
-    can be trusted as comprehensive.
-    """
-    total_components = len(components)
-    scanned_components = sum(1 for c in components if c in file_cache)
-    component_set = set(components)
-    llm_skip_reasons = {
-        str(metadata.get("path")): metadata.get("llm_skip_reason")
-        for metadata in (component_metadata or [])
-        if metadata.get("path") in component_set
-        and metadata.get("llm_analysis_status") == "excluded"
-    }
-    llm_excluded_components = len(llm_skip_reasons)
-    llm_eligible_components = total_components - llm_excluded_components
-
-    llm_available, llm_error = is_llm_available()
-    llm_used = use_llm and llm_available
-
-    limitations: list[str] = []
-    media_count = sum(reason == "media_content" for reason in llm_skip_reasons.values())
-    binary_count = sum(reason == "binary_content" for reason in llm_skip_reasons.values())
-    read_error_count = sum(reason == "read_error" for reason in llm_skip_reasons.values())
-    if media_count:
-        limitations.append(f"{media_count} media component(s) excluded from LLM analysis")
-    if binary_count:
-        limitations.append(f"{binary_count} binary component(s) excluded from LLM analysis")
-    if read_error_count:
-        limitations.append(f"{read_error_count} component(s) could not be read for LLM analysis")
-    if scanned_components < total_components:
-        missing_components = {component for component in components if component not in file_cache}
-        other_count = len(missing_components - llm_skip_reasons.keys())
-        if other_count:
-            limitations.append(f"{other_count} component(s) had no content in file_cache (skipped)")
-    if use_llm and not llm_available:
-        limitations.append(f"LLM meta-analysis unavailable: {llm_error or 'unknown reason'}")
-    if not use_llm:
-        limitations.append("LLM meta-analysis was disabled (--no-llm)")
-
-    findings_dropped = len(findings_pre_filter) - len(findings_post_filter)
-    if findings_dropped > 0:
-        limitations.append(f"{findings_dropped} finding(s) filtered by meta-analyzer or heuristics")
-
-    completeness: dict[str, object] = {
-        "total_components": total_components,
-        "scanned_components": scanned_components,
-        "coverage_percent": round(scanned_components / total_components * 100, 1)
-        if total_components > 0
-        else 100.0,
-        "llm_analysis": "applied" if llm_used else "skipped",
-        "llm_eligible_components": llm_eligible_components,
-        "llm_excluded_components": llm_excluded_components,
-        "findings_before_filtering": len(findings_pre_filter),
-        "findings_after_filtering": len(findings_post_filter),
-        "limitations": limitations if limitations else None,
-        "is_complete": len(limitations) == 0,
-    }
-    return completeness
-
-
 def _format_json(
     findings: list[Finding],
     component_metadata: list[dict[str, object]],
@@ -587,9 +650,10 @@ def _format_json(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
-    llm_call_log: list[dict[str, object]] | None = None,
-    analysis_completeness: dict[str, object] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
+    analysis_completeness: Mapping[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
+    execution_successful: bool = True,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -619,10 +683,69 @@ def _format_json(
         "suppressed_count": len(suppressed),
         "suppressed": [sf.to_dict() for sf in suppressed],
         "metadata": _build_metadata(has_executable_scripts, use_llm, llm_call_log),
+        "execution_successful": execution_successful,
     }
-    if analysis_completeness is not None:
-        data["analysis_completeness"] = analysis_completeness
+    data["analysis_completeness"] = dict(analysis_completeness or {})
     return json.dumps(data, indent=2)
+
+
+def _markdown_cell(value: object) -> str:
+    """Render dynamic report text safely inside a Markdown table cell."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _render_markdown_completeness(
+    lines: list[str],
+    completeness: Mapping[str, object],
+    execution_successful: bool,
+) -> None:
+    """Append the full public completeness projection to a Markdown report."""
+    lines.append("## Inspection Completeness\n")
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    lines.append(f"| Execution | {'successful' if execution_successful else 'failed'} |")
+    lines.append(f"| Coverage | {_markdown_cell(completeness.get('coverage_percent', 100.0))}% |")
+    lines.append(
+        f"| Fully inspected | {_markdown_cell(completeness.get('fully_inspected_files', 0))} |"
+    )
+    lines.append(
+        f"| Partially inspected | {_markdown_cell(completeness.get('partially_inspected_files', 0))} |"
+    )
+    lines.append(
+        f"| Entirely uninspected | {_markdown_cell(completeness.get('entirely_uninspected_files', 0))} |"
+    )
+    lines.append("")
+
+    def render_rows(title: str, rows: object) -> None:
+        if not isinstance(rows, list) or not rows:
+            return
+        lines.append(f"### {title}\n")
+        lines.append("| Reason / Status | Location | Details |")
+        lines.append("|-----------------|----------|---------|")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            location = str(row.get("path", ""))
+            start_line = row.get("start_line")
+            end_line = row.get("end_line")
+            if isinstance(start_line, int):
+                location += f":{start_line}" + (f"-{end_line}" if end_line else "")
+            reason = row.get("reason_code", row.get("status", "status"))
+            lines.append(
+                f"| {_markdown_cell(reason)} | `{_markdown_cell(location)}` | "
+                f"{_markdown_cell(row.get('message', ''))} |"
+            )
+        lines.append("")
+
+    render_rows("Scope Exclusions", completeness.get("scope_exclusions"))
+    render_rows("Ledger Exceptions", completeness.get("ledger_exceptions"))
+    render_rows("Analyzer Statuses", completeness.get("analyzer_statuses"))
+    limitations = completeness.get("limitations")
+    if isinstance(limitations, list) and limitations:
+        lines.append("### Limitations\n")
+        for limitation in limitations:
+            lines.append(f"- {_markdown_cell(limitation)}")
+        lines.append("")
 
 
 def _format_markdown(
@@ -635,9 +758,11 @@ def _format_markdown(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
-    llm_call_log: list[dict[str, object]] | None = None,
+    llm_call_log: Sequence[Mapping[str, object]] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     show_suppressed: bool = False,
+    analysis_completeness: Mapping[str, object] | None = None,
+    execution_successful: bool = True,
 ) -> str:
     """Generate Markdown report string."""
     suppressed = suppressed or []
@@ -712,6 +837,7 @@ def _format_markdown(
         else:
             lines.append("_Run with `--show-suppressed` to list them._\n")
 
+    _render_markdown_completeness(lines, analysis_completeness or {}, execution_successful)
     lines.append("## Metadata\n")
     lines.append(f"- **Executable Scripts:** {'Yes' if has_executable_scripts else 'No'}")
     lines.append(f"\n*Generated by SkillSpector v{skillspector_version}*")
@@ -719,20 +845,48 @@ def _format_markdown(
 
 
 def report(state: SkillspectorState) -> dict[str, object]:
-    """Generate SARIF, compute risk score, and set report_body from output_format.
+    """Render canonical findings and the exceptional ledger projection.
 
-    A baseline (state["baseline"]) suppresses matching findings: they never count
-    toward the risk score and are excluded from SARIF. They are shown in the
-    human-readable report only when state["show_suppressed"] is True.
+    Finalization owns completeness derivation. The report node only selects the
+    validated finding IDs, applies baseline suppression, and renders all surfaces.
     """
     raw_findings = state.get("findings", [])
-    filtered_findings = state.get("filtered_findings", raw_findings)
-    # Strip ANSI/control bytes once here so every downstream format (terminal,
-    # json, markdown, sarif) and the returned findings stay clean UTF-8. Applied
-    # before partition/dedup so active and suppressed findings are both clean.
-    filtered_findings = [_sanitize_finding(f) for f in filtered_findings]
+    findings_by_id = {finding.finding_id: finding for finding in raw_findings}
+    effective_ids = state.get("effective_finding_ids")
+    if isinstance(effective_ids, list):
+        selected_findings = [
+            findings_by_id[finding_id]
+            for finding_id in effective_ids
+            if isinstance(finding_id, str) and finding_id in findings_by_id
+        ]
+    else:
+        # Transitional direct-node compatibility. Graph execution always receives
+        # `effective_finding_ids` from finalize_inspection_ledger.
+        selected_findings = state.get("filtered_findings", raw_findings)
+    selected_findings = [_sanitize_finding(finding) for finding in selected_findings]
+
+    empty_completeness: AnalysisCompleteness = {
+        "total_components": 0,
+        "scanned_components": 0,
+        "coverage_percent": 100.0,
+        "is_complete": True,
+        "execution_successful": True,
+        "fully_inspected_files": 0,
+        "partially_inspected_files": 0,
+        "entirely_uninspected_files": 0,
+        "ledger_exceptions": [],
+        "scope_exclusions": [],
+        "analyzer_statuses": [],
+        "limitations": [],
+    }
+    supplied_completeness = state.get("analysis_completeness")
+    analysis_completeness: Mapping[str, object] = (
+        supplied_completeness if isinstance(supplied_completeness, Mapping) else empty_completeness
+    )
+    execution_successful = bool(
+        state.get("execution_successful", analysis_completeness.get("execution_successful", True))
+    )
     component_metadata = state.get("component_metadata") or []
-    components = state.get("components") or []
     file_cache = state.get("file_cache") or {}
     has_executable_scripts = state.get("has_executable_scripts", False)
     manifest = state.get("manifest") or {}
@@ -741,16 +895,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
     use_llm = state.get("use_llm", True)
     llm_call_log = state.get("llm_call_log") or []
 
-    # Surface a silent degradation: deep scan requested but every LLM call failed
-    # at runtime, so the report reflects static analysis only. Logged here (once,
-    # operationally) regardless of output format; also embedded in each format's
-    # body / metadata below.
     _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     degraded_notice = _llm_degradation_notice(use_llm, llm_call_log)
     if degraded:
         logger.warning(
-            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static "
-            "analysis only (llm_available reported false)",
+            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static analysis only",
             _attempted - _succeeded,
             _attempted,
         )
@@ -758,36 +907,39 @@ def report(state: SkillspectorState) -> dict[str, object]:
     baseline = state.get("baseline")
     show_suppressed = state.get("show_suppressed", False)
     active_findings, suppressed = partition_findings(
-        filtered_findings, baseline if isinstance(baseline, Baseline) else None
+        selected_findings,
+        baseline if isinstance(baseline, Baseline) else None,
+        file_cache=file_cache,
+        scanner_version=skillspector_version,
     )
-
-    # Risk and SARIF reflect only the active (non-suppressed) findings; scoring
-    # additionally de-duplicates so the same issue is not counted twice.
     findings_for_scoring = deduplicate(active_findings)
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings_for_scoring, has_executable_scripts, component_metadata
     )
-    sarif_report = _build_sarif(active_findings, suppressed, degraded_notice=degraded_notice)
-    analysis_completeness = _build_analysis_completeness(
-        components,
-        file_cache,
-        use_llm,
-        raw_findings,
-        filtered_findings,
-        component_metadata,
-    )
 
-    # Fail closed on a degraded deep scan: when the LLM stage was requested but
-    # every call failed, the semantic analyzers were effectively skipped, so a
-    # SAFE verdict would rest on static analysis alone. An attacker can trigger
-    # this on purpose (e.g. content that breaks the LLM call) to dodge semantic
-    # scrutiny. Floor the recommendation at CAUTION so an install-gate ASKS
-    # rather than auto-allows; risk_score / severity are left untouched (they
-    # honestly reflect what static analysis found), and llm_degraded / llm_error
-    # explain why the verdict was raised.
-    if degraded and risk_recommendation == "SAFE":
+    exceptions = analysis_completeness.get("ledger_exceptions", [])
+    fatal_exception = (
+        any(
+            isinstance(exception, Mapping) and bool(exception.get("fatal"))
+            for exception in exceptions
+        )
+        if isinstance(exceptions, list)
+        else False
+    )
+    entirely_uninspected_value = analysis_completeness.get("entirely_uninspected_files", 0)
+    entirely_uninspected = (
+        entirely_uninspected_value if isinstance(entirely_uninspected_value, int) else 0
+    )
+    if (degraded or fatal_exception or entirely_uninspected > 0) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
 
+    sarif_report = _build_sarif(
+        active_findings,
+        suppressed,
+        degraded_notice=degraded_notice,
+        analysis_completeness=analysis_completeness,
+        execution_successful=execution_successful,
+    )
     if output_format == "terminal":
         report_body = _format_terminal(
             active_findings,
@@ -802,6 +954,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             suppressed=suppressed,
             show_suppressed=show_suppressed,
+            analysis_completeness=analysis_completeness,
+            execution_successful=execution_successful,
         )
     elif output_format == "json":
         report_body = _format_json(
@@ -817,6 +971,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
+            execution_successful=execution_successful,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
@@ -832,6 +987,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_call_log=llm_call_log,
             suppressed=suppressed,
             show_suppressed=show_suppressed,
+            analysis_completeness=analysis_completeness,
+            execution_successful=execution_successful,
         )
     else:
         report_body = json.dumps(sarif_report, indent=2)
@@ -842,14 +999,13 @@ def report(state: SkillspectorState) -> dict[str, object]:
         len(active_findings),
         len(suppressed),
     )
-
-    out: dict[str, object] = {
+    return {
         "sarif_report": sarif_report,
         "risk_score": risk_score,
         "risk_severity": risk_severity,
         "risk_recommendation": risk_recommendation,
         "report_body": report_body,
-        "filtered_findings": filtered_findings,
+        "filtered_findings": selected_findings,
         "suppressed_findings": suppressed,
+        "execution_successful": execution_successful,
     }
-    return out

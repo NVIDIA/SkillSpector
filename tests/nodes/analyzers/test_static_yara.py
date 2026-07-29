@@ -619,3 +619,42 @@ class TestContentHashInvalidation:
         matches_b = rules_v2.match(data=content_with_b.encode())
         assert len(matches_a) == 0, "v2 rules should not match AAAA"
         assert len(matches_b) >= 1, "v2 rules should match BBBB"
+
+
+class TestInspectionLedgerResponse:
+    def test_unavailable_rules_emit_an_analyzer_level_status(self, monkeypatch) -> None:
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: None)
+
+        result = static_yara.node({"components": ["skill.py"], "file_cache": {"skill.py": "x"}})
+
+        assert result["inspection_ledger"] == []
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "unavailable"
+        assert status["reason_code"] == "rules_unavailable"
+
+    def test_match_error_is_recorded_as_failed_work(self, monkeypatch) -> None:
+        class BrokenRules:
+            def match(self, **_kwargs):
+                raise RuntimeError("match failed")
+
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: BrokenRules())
+
+        result = static_yara.node({"components": ["skill.py"], "file_cache": {"skill.py": "x"}})
+
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] == "failed"
+        assert event["reason_code"] == "analyzer_runtime_error"
+        assert event["error_class"] == "RuntimeError"
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+
+    def test_character_size_limit_does_not_claim_a_byte_limit(self, monkeypatch) -> None:
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: object())
+        content = "😀" * (static_yara.MAX_FILE_CHARS + 1)
+
+        result = static_yara.node({"components": ["large.md"], "file_cache": {"large.md": content}})
+
+        event = result["inspection_ledger"][0]
+        assert event["reason_code"] == "size_limit"
+        assert event["observed_characters"] == len(content)
+        assert event["observed_bytes"] == len(content.encode("utf-8"))
+        assert "limit_bytes" not in event
