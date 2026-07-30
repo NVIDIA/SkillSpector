@@ -417,6 +417,32 @@ _OVERLY_BROAD_SINGLE_WORDS: set[str] = {
 }
 
 
+def _pinned_version(operator: str | None, version: str | None) -> str | None:
+    """Return *version* only when the specifier pins one concrete release.
+
+    A vulnerability lookup answers "is THIS release affected?". That question is only
+    meaningful when the manifest admits exactly one release. Under PEP 440 that is ``==``
+    with a fully concrete version: floors (``>=``, ``>``), caps (``<=``, ``<``), exclusions
+    (``!=``), compatible releases (``~=``) and wildcard equality (``==1.*``) all admit more
+    than one, so the installed version is unknown and must not be passed off as a pin.
+    """
+    if operator != "==" or not version or "*" in version:
+        return None
+    return version
+
+
+def _pinned_npm_version(spec: str) -> str | None:
+    """Return the pinned version of an npm dependency spec, or None for any range.
+
+    npm defaults to caret ranges, so ``"^1.8.3"`` is *not* a pin: stripping the operator
+    turns a range into a concrete release that the project may never install.
+    """
+    candidate = spec.strip()
+    if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", candidate):
+        return candidate
+    return None
+
+
 def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from requirements.txt format."""
     results: list[tuple[str, str | None, int]] = []
@@ -427,7 +453,7 @@ def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | N
         m = re.match(r"^([a-zA-Z][a-zA-Z0-9._-]*)(?:\[.*?\])?\s*(?:([=<>!~]=?)\s*([\d.*]+))?", line)
         if m:
             name = m.group(1)
-            version = m.group(3) if m.group(2) else None
+            version = _pinned_version(m.group(2), m.group(3))
             results.append((name, version, i))
     return results
 
@@ -448,8 +474,7 @@ def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | N
             m = re.match(r'"([^"]+)"\s*:\s*"([^"]*)"', stripped)
             if m:
                 name = m.group(1)
-                ver_str = m.group(2).lstrip("^~>=<")
-                version = ver_str if re.match(r"^\d", ver_str) else None
+                version = _pinned_npm_version(m.group(2))
                 results.append((name, version, i))
     return results
 
@@ -495,7 +520,7 @@ def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None
         if not m:
             continue
         name = m.group(1)
-        version = m.group(3) if m.group(2) in ("==", "<=") else None
+        version = _pinned_version(m.group(2), m.group(3))
         idx = content.find(spec)
         line_num = get_line_number(content, idx) if idx >= 0 else 1
         results.append((name, version, line_num))
