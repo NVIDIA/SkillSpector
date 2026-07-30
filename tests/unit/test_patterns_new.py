@@ -1475,3 +1475,54 @@ class TestSupplyChainHelpers:
         names = [p[0] for p in sc_mod._extract_packages_from_package_json(content)]
         assert "express" in names
         assert "lodash" in names
+
+
+class TestSC4UnresolvedVersion:
+    """A name-only OSV query answers a different question than a version match."""
+
+    @staticmethod
+    def _vuln(severity: str = "CRITICAL"):
+        from skillspector.nodes.analyzers.osv_client import VulnResult
+
+        return VulnResult(
+            vuln_id="GHSA-xxxx-yyyy-zzzz",
+            summary="historical advisory",
+            severity=severity,
+            aliases=("CVE-2020-0001",),
+        )
+
+    def test_pinned_version_keeps_osv_severity(self) -> None:
+        from skillspector.models import Severity
+
+        with patch.object(sc_mod, "query_batch", return_value=[[self._vuln("CRITICAL")]]):
+            findings, covered = sc_mod._sc4_from_osv(
+                [("lodash", "4.17.20", 3)], "npm", "package.json", ["supply-chain"]
+            )
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.CRITICAL
+        assert "lodash==4.17.20" in findings[0].message
+        assert covered == {"lodash"}
+
+    def test_unresolved_version_is_capped_and_reworded(self) -> None:
+        # "setuptools>=61" resolves to no version, so OSV is queried by name and returns the
+        # package's history. Reporting the worst of those as the finding's severity claims a
+        # vulnerability that the installed release may not have.
+        from skillspector.models import Severity
+
+        with patch.object(sc_mod, "query_batch", return_value=[[self._vuln("CRITICAL")]]):
+            findings, _ = sc_mod._sc4_from_osv(
+                [("setuptools", None, 2)], "PyPI", "pyproject.toml", ["supply-chain"]
+            )
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.LOW
+        assert findings[0].confidence < 0.5
+        assert "does not pin a version" in findings[0].message
+        assert "==" not in findings[0].matched_text
+
+    def test_no_vulns_emits_nothing(self) -> None:
+        with patch.object(sc_mod, "query_batch", return_value=[[]]):
+            findings, covered = sc_mod._sc4_from_osv(
+                [("safe-pkg", None, 1)], "PyPI", "requirements.txt", ["supply-chain"]
+            )
+        assert findings == []
+        assert covered == set()

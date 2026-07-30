@@ -819,20 +819,37 @@ def _sc4_from_osv(
                 worst_severity = v.severity
         severity = _osv_severity_to_app(worst_severity)
         confidence = _SEVERITY_CONFIDENCE.get(worst_severity.upper(), 0.75)
-        version_str = f"=={pkg_version}" if pkg_version else ""
         vuln_desc = _format_vuln_ids(vulns)
+        if pkg_version:
+            message = (
+                f"Known Vulnerable Dependency: {pkg_name}=={pkg_version}"
+                f" — {len(vulns)} advisory(ies): {vuln_desc}"
+            )
+            matched_text = f"{pkg_name}=={pkg_version}"
+        else:
+            # No resolvable version: OSV was queried by name only, so these advisories are
+            # NOT matched against the release that will actually be installed — they are the
+            # package's history, and the worst of them may predate every version the range
+            # admits. Reporting that as the finding's severity turns "setuptools>=61" into a
+            # CRITICAL. The unpinned dependency itself is already reported by SC1, so what is
+            # left to say here is "could not verify", and it must not outrank a real match.
+            severity = Severity.LOW
+            confidence = 0.4
+            message = (
+                f"Unverifiable Dependency: {pkg_name} has {len(vulns)} known advisory(ies)"
+                f" ({vuln_desc}), but the manifest does not pin a version, so it is unknown"
+                " whether the installed release is affected"
+            )
+            matched_text = pkg_name
         findings.append(
             AnalyzerFinding(
                 rule_id="SC4",
-                message=(
-                    f"Known Vulnerable Dependency: {pkg_name}{version_str}"
-                    f" — {len(vulns)} advisory(ies): {vuln_desc}"
-                ),
+                message=message,
                 severity=severity,
                 location=Location(file=file_path, start_line=line_num),
                 confidence=confidence,
                 tags=tag,
-                matched_text=f"{pkg_name}{version_str}" if version_str else pkg_name,
+                matched_text=matched_text,
             )
         )
     return findings, covered
