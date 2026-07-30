@@ -312,7 +312,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             Finding(
                 rule_id="LP3",
                 message=(
-                    f"Skill has no declared permissions but code capabilities were detected: {cap_names}."
+                    f"Skill declares no tool scope ('permissions' or 'allowed-tools') "
+                    f"but code capabilities were detected: {cap_names}."
                 ),
                 severity="MEDIUM",
                 confidence=_clamp(0.70),
@@ -323,7 +324,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     "Without declared permissions the skill's intent is opaque and cannot be validated."
                 ),
                 remediation=(
-                    "Add a 'permissions' field to SKILL.md listing the capabilities this skill requires."
+                    "Declare the skill's tool scope: for Claude Code / Agent Skills "
+                    "SKILL.md, list the tools the skill may invoke in the "
+                    "'allowed-tools' frontmatter field; for MCP server manifests, "
+                    "add a 'permissions' list naming the required capabilities."
                 ),
             )
         )
