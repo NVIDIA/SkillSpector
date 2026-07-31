@@ -76,7 +76,7 @@ _OMS_SIGNATURE_PATH = "skill.oms.sig"
 _SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
 _IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json"
 _IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
-_OMS_PREDICATE_TYPE = "https://model_signing/signature/v1.0"
+_OMS_PREDICATE_TYPE_PREFIX = "https://model_signing/signature/"
 
 
 def _resolve_skill_dir(state: SkillspectorState) -> Path:
@@ -211,7 +211,8 @@ def _is_valid_oms_signature(file_path: Path) -> bool:
     return bool(
         statement
         and statement.get("_type") == _IN_TOTO_STATEMENT_TYPE
-        and statement.get("predicateType") == _OMS_PREDICATE_TYPE
+        and isinstance(statement.get("predicateType"), str)
+        and statement["predicateType"].startswith(_OMS_PREDICATE_TYPE_PREFIX)
     )
 
 

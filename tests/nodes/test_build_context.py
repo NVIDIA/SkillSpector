@@ -20,6 +20,7 @@ Uses skill spec layout: SKILL.md, references/, scripts/, assets/
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -200,6 +201,25 @@ def test_build_context_inventories_but_excludes_valid_root_oms_signature(
         "executable": False,
         "size_bytes": signature_path.stat().st_size,
     }
+
+
+def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> None:
+    """OMS predicate revisions remain excluded without relaxing the namespace check."""
+    bundle = json.loads(_OMS_FIXTURE.read_text(encoding="utf-8"))
+    payload = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
+    payload["predicateType"] = "https://model_signing/signature/v1.1"
+    bundle["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(payload).encode("utf-8")
+    ).decode("ascii")
+    (tmp_path / "skill.oms.sig").write_text(json.dumps(bundle), encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "skill.oms.sig" not in result["components"]
+    assert any(
+        event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
+        for event in result["inspection_ledger"]
+    )
 
 
 @pytest.mark.parametrize(
