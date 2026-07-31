@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: supply chain (SC1–SC6) and trigger analysis (TR1–TR3).
+"""Static patterns: supply chain (SC1–SC7) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
 SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
 SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
+SC7: Untrusted container image — flags image signature / registry-verification bypass.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
 
 Node and analyze() in one module.
@@ -31,6 +32,7 @@ import sys
 import tomllib
 from urllib.parse import urlparse
 
+from skillspector.inspection_ledger import LedgerOutcome, analyzer_status_for_events, ledger_event
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -94,6 +96,20 @@ SC3_PATTERNS = [
     (r"\(lambda\s+_:\s*exec\s*\(", 0.9),
     (r"__import__\s*\(['\"]os['\"]\s*\)\.system", 0.85),
     (r"decode\s+(?:this|the)\s+(?:base64|hex)\s+(?:and\s+)?(?:run|execute)", 0.8),
+]
+
+# SC7: Untrusted Container Image — pulling images with signature/registry
+# verification turned off. These flags disable image trust regardless of the
+# registry, so they are a strong supply-chain signal with near-zero FP.
+# (`--tls-verify=false` is intentionally omitted: TM3's `verify=False` already
+# covers it; SC7 targets the image-specific bypasses TM3 does not see.)
+SC7_PATTERNS = [
+    (
+        r"--disable-content-trust\b(?!=false)",
+        0.85,
+    ),  # Content Trust off (exclude =false, which keeps it on)
+    (r"DOCKER_CONTENT_TRUST\s*=\s*0", 0.85),  # signature verification disabled via env
+    (r"--insecure-registry", 0.8),  # registry TLS verification off
 ]
 
 # ---------------------------------------------------------------------------
@@ -504,7 +520,7 @@ def _version_lt(v1: str, v2: str) -> bool:
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Analyze content for supply chain patterns (SC1–SC3)."""
+    """Analyze content for supply chain patterns (SC1–SC3, SC7)."""
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:
@@ -573,6 +589,22 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         matched_text=match.group(0)[:200],
                     )
                 )
+    # SC7: untrusted container image. Example filtering is delegated to the runner.
+    for pattern, confidence in SC7_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = get_line_number(content, match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="SC7",
+                    message="Untrusted Container Image",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                )
+            )
     return findings
 
 
@@ -954,7 +986,31 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run supply_chain patterns (SC1–SC6) and trigger analysis (TR1–TR3)."""
     # SC1–SC3 via static_runner
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    findings = response["findings"]
+
+    def record_extra_findings(
+        path: str,
+        extra_findings: list[Finding],
+        fallback_analyzer_id: str,
+    ) -> None:
+        """Attach dependency/manifest findings to the matching completed work item."""
+        if not extra_findings:
+            return
+        finding_ids = [finding.finding_id for finding in extra_findings]
+        for event in response["inspection_ledger"]:
+            if event["path"] == path and event["outcome"] is LedgerOutcome.COMPLETED:
+                event["emitted_finding_ids"].extend(finding_ids)
+                return
+        response["inspection_ledger"].append(
+            ledger_event(
+                analyzer_id=fallback_analyzer_id,
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                path=path,
+                emitted_finding_ids=finding_ids,
+            )
+        )
 
     # SC4–SC6: dependency-level analysis on dependency files
     components: list[str] = state.get("components") or []
@@ -970,8 +1026,15 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         content = file_cache.get(path)
         if not content:
             continue
-        dep_findings = _analyze_dependencies(content, path)
-        findings.extend(analyzer_finding_to_finding(af) for af in dep_findings)
+        dependency_findings = [
+            analyzer_finding_to_finding(af) for af in _analyze_dependencies(content, path)
+        ]
+        findings.extend(dependency_findings)
+        record_extra_findings(
+            path,
+            dependency_findings,
+            f"{ANALYZER_ID}_dependencies",
+        )
 
     # TR1–TR3: trigger analysis from manifest
     manifest: dict[str, object] = state.get("manifest") or {}
@@ -979,6 +1042,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         skill_path = state.get("skill_path") or ""
         trigger_findings = _analyze_triggers(manifest, skill_path)
         findings.extend(trigger_findings)
+        record_extra_findings(
+            "SKILL.md",
+            trigger_findings,
+            f"{ANALYZER_ID}_triggers",
+        )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response["analyzer_status_events"] = [
+        analyzer_status_for_events(ANALYZER_ID, response["inspection_ledger"])
+    ]
+    return response

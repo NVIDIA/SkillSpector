@@ -696,6 +696,8 @@ def entry_from_result(
             for c in component_metadata  # type: ignore[union-attr]
         ],
         "issues": issues,
+        "analysis_completeness": result.get("analysis_completeness") or {},
+        "execution_successful": bool(result.get("execution_successful", True)),
         "scan_mode": "multilingual-enhanced",
         "enhancements": {
             "gap_fill_applied": gap_fill_applied,

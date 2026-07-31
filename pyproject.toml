@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skillspector"
-version = "2.3.12"
+version = "2.5.1"
 description = "SkillSpector: Security scanner for AI agent skills (Claude Code, Cursor, and similar). Scans skills for vulnerabilities, malicious patterns, and security risks before installation. Supports Git repos, URLs, zips, and local directories; runs static pattern checks and optional LLM semantic analysis; outputs terminal, JSON, and Markdown reports with risk scoring."
 readme = "README.md"
 license = "Apache-2.0"
@@ -60,6 +60,7 @@ dev = [
     "ruff>=0.15.0",
     "mypy>=1.19.0",
     "build>=1.4.0",
+    "hatchling>=1.31.0",
     "twine>=6.2.0",
     "poetry>=2.3.0",
 ]
@@ -81,11 +82,6 @@ exclude = [".claude/", ".cursor/", ".agents/"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/skillspector"]
-artifacts = [
-    "src/skillspector/yara_rules/*.yar",
-    "src/skillspector/yara_rules/*.yara",
-    "src/skillspector/providers/*/model_registry.yaml",
-]
 
 [tool.ruff]
 line-length = 100

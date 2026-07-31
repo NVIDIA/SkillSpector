@@ -20,12 +20,14 @@ Uses skill spec layout: SKILL.md, references/, scripts/, assets/
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from skillspector.constants import MODEL_CONFIG
 from skillspector.nodes.build_context import build_context
+from skillspector.providers import reset_provider, use_provider
 from skillspector.state import SkillspectorState
 
 
@@ -129,6 +131,36 @@ def test_build_context_empty_directory_is_valid_empty_scan(tmp_path: Path) -> No
     assert result["file_cache"] == {}
     assert result["manifest"] == {}
     assert result["model_config"] == MODEL_CONFIG
+
+
+def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
+    class _BoundProvider:
+        DEFAULT_MODEL = "bound-default"
+        SLOT_DEFAULTS = {"meta_analyzer": "bound-meta"}
+
+        def get_context_length(self, model: str) -> int | None:
+            return 4096
+
+        def get_max_output_tokens(self, model: str) -> int | None:
+            return 128
+
+        def resolve_model(self, slot: str = "default") -> str:
+            return self.SLOT_DEFAULTS.get(slot, self.DEFAULT_MODEL)
+
+        def resolve_credentials(self) -> tuple[str, str | None] | None:
+            return None
+
+        def create_chat_model(self, model: str, *, max_tokens: int, timeout: float | None = 120):
+            return object()
+
+    token = use_provider(_BoundProvider())
+    try:
+        result = build_context({"skill_path": str(tmp_path)})
+    finally:
+        reset_provider(token)
+
+    assert result["model_config"]["default"] == "bound-default"
+    assert result["model_config"]["meta_analyzer"] == "bound-meta"
 
 
 def test_build_context_skips_skip_dirs(tmp_path: Path) -> None:
@@ -242,3 +274,126 @@ def test_build_context_parses_allowed_tools_comma_string(tmp_path: Path) -> None
     state: SkillspectorState = {"skill_path": str(tmp_path)}
     result = build_context(state)
     assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
+
+
+def test_build_context_reports_exclusion_boundary_without_descendants(tmp_path: Path) -> None:
+    """Excluded directory trees produce one boundary record, not child records."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    excluded = tmp_path / "node_modules" / "pkg"
+    excluded.mkdir(parents=True)
+    (excluded / "index.js").write_text("alert(1)\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+    exclusions = [
+        event for event in result["inspection_ledger"] if event["outcome"] == "out_of_scope"
+    ]
+
+    assert [event["path"] for event in exclusions] == ["node_modules/"]
+    assert "node_modules/pkg/index.js" not in result["components"]
+
+
+def test_build_context_reports_hidden_file_as_a_scope_exclusion(tmp_path: Path) -> None:
+    """Hidden files are excluded individually without a directory marker."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=not-reported\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+    exclusions = [
+        event for event in result["inspection_ledger"] if event["outcome"] == "out_of_scope"
+    ]
+
+    assert [event["path"] for event in exclusions] == [".env"]
+    assert ".env" not in result["components"]
+
+
+def test_build_context_reports_read_error_without_fake_empty_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable files remain inventoried but are absent from the content cache."""
+    target = tmp_path / "broken.py"
+    target.write_text("print(1)\n", encoding="utf-8")
+    original = Path.read_text
+
+    def fail_target(path: Path, *args: object, **kwargs: object) -> str:
+        if path == target:
+            raise PermissionError("sensitive operating-system detail")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_target)
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "broken.py" in result["components"]
+    assert "broken.py" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "broken.py")
+    assert event["reason_code"] == "read_error"
+    assert event["error_class"] == "PermissionError"
+    assert "sensitive" not in event["message"]
+
+
+def test_build_context_records_non_regular_files_in_the_ledger(tmp_path: Path) -> None:
+    """Named pipes are inventoried so the cache phase can report their failure."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes are unavailable on this platform")
+    pipe = tmp_path / "events.pipe"
+    os.mkfifo(pipe)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "events.pipe" in result["components"]
+    assert "events.pipe" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "events.pipe")
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_records_dangling_symlink_in_the_ledger(tmp_path: Path) -> None:
+    """Dangling entries are not silently omitted during discovery."""
+    dangling = tmp_path / "missing.py"
+    try:
+        dangling.symlink_to("no-longer-present.py")
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "missing.py" in result["components"]
+    assert "missing.py" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "missing.py")
+    assert event["reason_code"] == "file_disappeared"
+
+
+def test_build_context_records_stat_errors_in_the_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unstatable discovered entry produces structured STAT_ERROR evidence."""
+    target = tmp_path / "protected.py"
+    target.write_text("print(1)\n", encoding="utf-8")
+    original = Path.stat
+
+    def fail_target(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if path == target:
+            raise PermissionError("sensitive operating-system detail")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_target)
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "protected.py" in result["components"]
+    assert "protected.py" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "protected.py")
+    assert event["reason_code"] == "stat_error"
+    assert event["error_class"] == "PermissionError"
+
+
+def test_build_context_records_non_regular_entries_in_the_ledger(tmp_path: Path) -> None:
+    """A discovered FIFO is retained as failed ledger evidence, never silently skipped."""
+    fifo = tmp_path / "inspection.pipe"
+    os.mkfifo(fifo)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "inspection.pipe" in result["components"]
+    assert "inspection.pipe" not in result["file_cache"]
+    event = next(
+        entry for entry in result["inspection_ledger"] if entry["path"] == "inspection.pipe"
+    )
+    assert event["reason_code"] == "not_regular_file"

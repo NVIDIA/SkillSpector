@@ -24,6 +24,7 @@ import pytest
 
 from skillspector import mcp_server
 from skillspector.mcp_server import run_scan
+from skillspector.providers import reset_provider, use_provider
 
 
 def _write_skill(tmp_path: Path, body: str = "# Safe skill") -> Path:
@@ -35,8 +36,7 @@ async def test_run_scan_returns_structured_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """run_scan returns a JSON-serialisable verdict with the expected shape."""
-    # No credentials: the LLM pass cannot run regardless of what is requested.
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: None)
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
@@ -54,7 +54,7 @@ async def test_run_scan_llm_accounting_is_honest_without_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Requesting the LLM with no credentials must report it as not used."""
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: None)
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
@@ -69,7 +69,7 @@ async def test_run_scan_reports_llm_available_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Credentials present but use_llm=False: available, but honestly not used."""
-    monkeypatch.setattr(mcp_server, "resolve_provider_credentials", lambda: ("key", None))
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     _write_skill(tmp_path)
 
     result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
@@ -80,10 +80,146 @@ async def test_run_scan_reports_llm_available_with_credentials(
     assert result["scan_mode"] == "static-only"
 
 
+async def test_run_scan_uses_bound_provider_without_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An injected provider can own the LLM client without exposing raw credentials."""
+
+    class _InjectedProvider:
+        DEFAULT_MODEL = "injected-default"
+        SLOT_DEFAULTS = {"meta_analyzer": "injected-default"}
+
+        def get_context_length(self, model: str) -> int | None:
+            return 4096 if model == "injected-default" else None
+
+        def get_max_output_tokens(self, model: str) -> int | None:
+            return 128 if model == "injected-default" else None
+
+        def resolve_model(self, slot: str = "default") -> str:
+            return "injected-default"
+
+        def resolve_credentials(self) -> tuple[str, str | None] | None:
+            return None
+
+        def create_chat_model(
+            self,
+            model: str,
+            *,
+            max_tokens: int,
+            timeout: float | None = 120,
+        ) -> object:
+            return object()
+
+    class _Graph:
+        async def ainvoke(self, state, config):
+            assert state["use_llm"] is True
+            return {
+                "filtered_findings": [],
+                "risk_score": 0,
+                "risk_severity": "LOW",
+                "risk_recommendation": "OK",
+                "report_body": "report",
+            }
+
+    token = use_provider(_InjectedProvider())
+    monkeypatch.setattr(mcp_server, "graph", _Graph())
+    _write_skill(tmp_path)
+
+    try:
+        result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    finally:
+        reset_provider(token)
+
+    assert result["llm_available"] is True
+    assert result["llm_requested"] is True
+    assert result["llm_used"] is True
+    assert result["scan_mode"] == "static+llm"
+
+
+async def test_run_scan_disables_llm_for_unavailable_bound_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bound provider that cannot build a chat model must stay static-only."""
+
+    class _UnavailableInjectedProvider:
+        DEFAULT_MODEL = "injected-default"
+        SLOT_DEFAULTS = {"meta_analyzer": "injected-default"}
+
+        def get_context_length(self, model: str) -> int | None:
+            return 4096 if model == "injected-default" else None
+
+        def get_max_output_tokens(self, model: str) -> int | None:
+            return 128 if model == "injected-default" else None
+
+        def resolve_model(self, slot: str = "default") -> str:
+            return "injected-default"
+
+        def resolve_credentials(self) -> tuple[str, str | None] | None:
+            return None
+
+        def create_chat_model(
+            self,
+            model: str,
+            *,
+            max_tokens: int,
+            timeout: float | None = 120,
+        ) -> object | None:
+            return None
+
+    class _Graph:
+        async def ainvoke(self, state, config):
+            assert state["use_llm"] is False
+            return {
+                "filtered_findings": [],
+                "risk_score": 0,
+                "risk_severity": "LOW",
+                "risk_recommendation": "OK",
+                "report_body": "report",
+            }
+
+    token = use_provider(_UnavailableInjectedProvider())
+    monkeypatch.setattr(mcp_server, "graph", _Graph())
+    _write_skill(tmp_path)
+
+    try:
+        result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    finally:
+        reset_provider(token)
+
+    assert result["llm_available"] is False
+    assert result["llm_requested"] is True
+    assert result["llm_used"] is False
+    assert result["scan_mode"] == "static-only"
+
+
 async def test_run_scan_rejects_invalid_format(tmp_path: Path) -> None:
     """An unsupported output_format is rejected before any scan runs."""
     with pytest.raises(ValueError):
         await run_scan(str(tmp_path), output_format="xml")
+
+
+async def test_mcp_blocks_install_when_execution_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A low risk score cannot override failed inspection execution."""
+
+    async def failed_execution_result(state: dict, config: dict) -> dict:
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "risk_recommendation": "CAUTION",
+            "execution_successful": False,
+            "analysis_completeness": {
+                "entirely_uninspected_files": 1,
+                "ledger_exceptions": [],
+            },
+            "filtered_findings": [],
+            "report_body": "{}",
+        }
+
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", failed_execution_result)
+    verdict = await mcp_server.run_scan("fixture", use_llm=False)
+
+    assert verdict["safe_to_install"] is False
+    assert verdict["execution_successful"] is False
 
 
 async def test_build_server_registers_scan_skill() -> None:

@@ -30,6 +30,8 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 
 ### Installation
 
+> **Open-source software notice:** This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.
+
 Create and activate a virtual environment first (all `make` targets assume the venv is active). Use **uv** or **pip**; the Makefile uses `uv` if available, otherwise `pip`.
 
 **Quick install with uv (CLI-only):**
@@ -199,12 +201,13 @@ skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml --show-supp
 
 A baseline can also use drift-tolerant glob rules (by rule id, file path, or
 message) — see [`.skillspector-baseline.example.yaml`](.skillspector-baseline.example.yaml).
+Exact fingerprint baselines are evidence-bound: changing the scanned source or
+SkillSpector version keeps the finding active until it is reviewed again.
 
 ### LLM Analysis
 
 For the best results, configure an OpenAI-compatible LLM endpoint for
-semantic analysis. Pick a provider with `SKILLSPECTOR_PROVIDER`; each
-ships its own bundled default model. SkillSpector also works against
+semantic analysis. Pick a provider with `SKILLSPECTOR_PROVIDER`; hosted providers ship bundled default models, while CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. SkillSpector also works against
 local OpenAI-compatible servers (Ollama, vLLM, llama.cpp) and managed
 inference gateways.
 
@@ -215,8 +218,8 @@ inference gateways.
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
 | `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
-| `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | `claude-sonnet-4-6` |
-| `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | `o4-mini` |
+| `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 
 ```bash
 # Stock OpenAI
@@ -256,6 +259,8 @@ skillspector scan ./my-skill/
 # Local Claude CLI — no API key; uses your existing `claude auth login` session
 # Requires: claude CLI installed and authenticated (claude auth login)
 export SKILLSPECTOR_PROVIDER=claude_cli
+# Uses the local Claude CLI runtime fallback unless SKILLSPECTOR_MODEL is set.
+# export SKILLSPECTOR_MODEL=claude-sonnet-4-6
 skillspector scan ./my-skill/
 
 # Local Codex CLI — no API key; uses your existing `codex login` session
@@ -553,17 +558,19 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Each provider has its own bundled `model_registry.yaml` and default model (see the LLM Analysis table above). Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Hosted providers use bundled `model_registry.yaml` defaults; `claude_cli` and `codex_cli` fall back to the local CLI runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged; unset or blank preserves provider-default behavior. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
+| `ANTHROPIC_BASE_URL` | Override the native Anthropic endpoint (default: `https://api.anthropic.com`). | Optional |
 | `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
 | `ANTHROPIC_PROXY_API_KEY` | Bearer token for the Anthropic proxy provider. | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
 | `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
 | `AWS_PROFILE` | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
 | `AWS_REGION` | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
-| `SKILLSPECTOR_MODEL` | Override the active provider's default model. See the LLM Analysis table for each provider's default. | Optional |
+| `SKILLSPECTOR_MODEL` | Override the active provider model. For hosted providers, this replaces the bundled default from the LLM Analysis table. For `claude_cli` and `codex_cli`, this is forwarded as `--model` instead of using the local CLI runtime fallback. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 

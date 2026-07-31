@@ -37,7 +37,7 @@ from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import get_context, get_line_number
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import MAX_FILE_CHARS, analyzer_finding_to_finding
 
 ANALYZER_ID = "prompt_injection_resilience"
 logger = get_logger(__name__)
@@ -196,7 +196,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     for path in components:
         content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_BYTES:
+        if content is None or len(content) > MAX_FILE_CHARS:
             continue
         idx = path.rfind(".")
         suffix = path[idx:].lower() if idx >= 0 else ""

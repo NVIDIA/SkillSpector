@@ -40,7 +40,7 @@ from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import build_import_aliases, resolve_call_name
-from .static_runner import FILE_TYPES, MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import FILE_TYPES, MAX_FILE_CHARS, analyzer_finding_to_finding
 
 ANALYZER_ID = "behavioral_fingerprint"
 logger = get_logger(__name__)
@@ -337,7 +337,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     for path in components:
         content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_BYTES:
+        if content is None or len(content) > MAX_FILE_CHARS:
             continue
         file_type = _infer_file_type(path)
         if file_type == "other":

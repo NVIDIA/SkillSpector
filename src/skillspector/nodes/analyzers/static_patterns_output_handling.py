@@ -24,6 +24,7 @@ Framework: LLM05.
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
 
@@ -32,19 +33,49 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    build_import_aliases,
+    get_context,
+    get_context_from_lines,
+    get_line_number,
+    get_source_segment,
+    resolve_call_name,
+    resolve_dynamic_import_call,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_output_handling"
 
+_SUBPROCESS_OUTPUT_NAMES = frozenset(
+    {"response", "output", "result", "answer", "completion", "reply", "generated"}
+)
+_SUBPROCESS_EXECUTION_KEYWORDS = {
+    "call": frozenset({"args", "executable"}),
+    "run": frozenset({"args", "input", "executable"}),
+    "Popen": frozenset({"args", "executable"}),
+    "check_output": frozenset({"args", "input", "executable"}),
+    "check_call": frozenset({"args", "executable"}),
+    "getoutput": frozenset({"cmd"}),
+    "getstatusoutput": frozenset({"cmd"}),
+}
+_SUBPROCESS_CALLS = frozenset(_SUBPROCESS_EXECUTION_KEYWORDS)
+_SUBPROCESS_FALLBACK_MAX_CHARS = 1_000
+_SUBPROCESS_FALLBACK_PATTERN = re.compile(
+    rf"""
+    \bsubprocess\s*\.\s*(?:{"|".join(sorted(_SUBPROCESS_CALLS))})\s*\(
+    [^)]{{0,{_SUBPROCESS_FALLBACK_MAX_CHARS}}}?
+    (?<![-\w'"])(?:{"|".join(sorted(_SUBPROCESS_OUTPUT_NAMES))})(?!\w)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 # OH1: Unvalidated Output Injection — model output used directly in dangerous sinks
 OH1_PATTERNS = [
-    # Python: output piped into exec/eval/subprocess
+    # Python: output piped into exec/eval. Subprocess calls are inspected via AST below.
     (r"exec\s*\(\s*(?:response|output|result|answer|completion|reply|generated)", 0.9),
     (r"eval\s*\(\s*(?:response|output|result|answer|completion|reply|generated)", 0.9),
-    (r"subprocess\.\w+\s*\([^)]*(?:response|output|result|answer|completion)", 0.85),
     (r"os\.system\s*\(\s*(?:response|output|result|answer|completion)", 0.85),
     (r"os\.popen\s*\(\s*(?:response|output|result|answer|completion)", 0.85),
     # Web: output injected into HTML without sanitization
@@ -128,6 +159,108 @@ OH3_PATTERNS = [
 ]
 
 
+def _contains_output_name(node: ast.AST) -> bool:
+    """Return whether *node* references a model-output-like identifier.
+
+    Constants and keyword names are deliberately excluded. In particular, a
+    subprocess command containing the literal CLI flag ``"--output"`` or the
+    keyword ``capture_output=True`` must not be treated as model-generated data.
+    """
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id.casefold() in _SUBPROCESS_OUTPUT_NAMES:
+            return True
+        if isinstance(child, ast.Attribute) and child.attr.casefold() in _SUBPROCESS_OUTPUT_NAMES:
+            return True
+    return False
+
+
+def _subprocess_execution_arguments(node: ast.Call, method_name: str) -> list[ast.expr]:
+    """Return subprocess arguments that can supply executed content."""
+    execution_keywords = _SUBPROCESS_EXECUTION_KEYWORDS.get(method_name)
+    if execution_keywords is None:
+        return []
+
+    arguments = [node.args[0]] if node.args else []
+    arguments.extend(
+        keyword.value for keyword in node.keywords if keyword.arg in execution_keywords
+    )
+    return arguments
+
+
+def _analyze_subprocess_fallback(
+    content: str, file_path: str, tag: list[str]
+) -> list[AnalyzerFinding]:
+    """Conservatively detect subprocess sinks when Python AST analysis is unavailable."""
+    return [
+        AnalyzerFinding(
+            rule_id="OH1",
+            message="Unvalidated Output Injection",
+            severity=Severity.HIGH,
+            location=Location(
+                file=file_path,
+                start_line=get_line_number(content, match.start()),
+            ),
+            confidence=0.85,
+            tags=tag,
+            context=get_context(content, match.start()),
+            matched_text=match.group(0)[:200],
+        )
+        for match in _SUBPROCESS_FALLBACK_PATTERN.finditer(content)
+    ]
+
+
+def _analyze_python_subprocess_calls(
+    content: str, file_path: str, tag: list[str]
+) -> list[AnalyzerFinding]:
+    """Detect output-like values used as Python subprocess command arguments."""
+    try:
+        tree = ast.parse(content, filename=file_path)
+    except SyntaxError:
+        # Static pattern analysis also runs over partial/generated Python files.
+        # Retain best-effort subprocess coverage without failing the analyzer.
+        return _analyze_subprocess_fallback(content, file_path, tag)
+
+    aliases = build_import_aliases(tree)
+    lines = content.splitlines()
+    findings: list[AnalyzerFinding] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        call_name = resolve_call_name(node, aliases)
+        if call_name is None:
+            call_name = resolve_dynamic_import_call(node, aliases)
+        if call_name is None or not call_name.startswith("subprocess."):
+            continue
+
+        _, _, method_name = call_name.partition(".")
+        execution_arguments = _subprocess_execution_arguments(node, method_name)
+        if (
+            method_name not in _SUBPROCESS_CALLS
+            or not execution_arguments
+            or not any(_contains_output_name(argument) for argument in execution_arguments)
+        ):
+            continue
+
+        lineno = getattr(node, "lineno", 1)
+        end_lineno = getattr(node, "end_lineno", None)
+        findings.append(
+            AnalyzerFinding(
+                rule_id="OH1",
+                message="Unvalidated Output Injection",
+                severity=Severity.HIGH,
+                location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
+                confidence=0.95,
+                tags=tag,
+                context=get_context_from_lines(lines, lineno),
+                matched_text=get_source_segment(lines, lineno, end_lineno),
+            )
+        )
+
+    return findings
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for output handling patterns (OH1–OH3)."""
     findings: list[AnalyzerFinding] = []
@@ -160,6 +293,14 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
+    if file_type == "python":
+        subprocess_findings = _analyze_python_subprocess_calls(content, file_path, tag)
+    else:
+        # Other file types can contain embedded Python snippets, so preserve the
+        # analyzer's previous best-effort subprocess coverage for those files.
+        subprocess_findings = _analyze_subprocess_fallback(content, file_path, tag)
+    findings.extend(subprocess_findings)
+
     for pattern, confidence in OH2_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -195,6 +336,6 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run output_handling patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

@@ -33,7 +33,7 @@ from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import MAX_FILE_CHARS, analyzer_finding_to_finding
 
 ANALYZER_ID = "cross_skill_dependency"
 logger = get_logger(__name__)
@@ -218,7 +218,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     for path in components:
         content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_BYTES:
+        if content is None or len(content) > MAX_FILE_CHARS:
             continue
         raw = analyze(content, path, "other", all_skill_names=skill_names)
         all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
