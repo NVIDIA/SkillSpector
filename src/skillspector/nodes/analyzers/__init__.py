@@ -18,12 +18,21 @@
 from __future__ import annotations
 
 from skillspector.nodes.analyzers.behavioral_ast import node as behavioral_ast_node
+from skillspector.nodes.analyzers.behavioral_fingerprint import (
+    node as behavioral_fingerprint_node,
+)
 from skillspector.nodes.analyzers.behavioral_taint_tracking import (
     node as behavioral_taint_tracking_node,
+)
+from skillspector.nodes.analyzers.cross_skill_dependency import (
+    node as cross_skill_dependency_node,
 )
 from skillspector.nodes.analyzers.mcp_least_privilege import node as mcp_least_privilege_node
 from skillspector.nodes.analyzers.mcp_rug_pull import node as mcp_rug_pull_node
 from skillspector.nodes.analyzers.mcp_tool_poisoning import node as mcp_tool_poisoning_node
+from skillspector.nodes.analyzers.prompt_injection_resilience import (
+    node as prompt_injection_resilience_node,
+)
 from skillspector.nodes.analyzers.semantic_developer_intent import (
     node as semantic_developer_intent_node,
 )
@@ -95,6 +104,9 @@ ANALYZER_NODE_IDS: list[str] = [
     "static_yara",
     "behavioral_ast",
     "behavioral_taint_tracking",
+    "behavioral_fingerprint",
+    "cross_skill_dependency",
+    "prompt_injection_resilience",
     "mcp_least_privilege",
     "mcp_tool_poisoning",
     "mcp_rug_pull",
@@ -121,6 +133,9 @@ ANALYZER_NODES = {
     "static_yara": static_yara_node,
     "behavioral_ast": behavioral_ast_node,
     "behavioral_taint_tracking": behavioral_taint_tracking_node,
+    "behavioral_fingerprint": behavioral_fingerprint_node,
+    "cross_skill_dependency": cross_skill_dependency_node,
+    "prompt_injection_resilience": prompt_injection_resilience_node,
     "mcp_least_privilege": mcp_least_privilege_node,
     "mcp_tool_poisoning": mcp_tool_poisoning_node,
     "mcp_rug_pull": mcp_rug_pull_node,

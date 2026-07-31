@@ -50,10 +50,12 @@ _MISSING_VALIDATION_PATTERNS = [
     (re.compile(r"(?:accept|receive|process|handle)\s+(?:user|input|message)", re.IGNORECASE), 0.4),
 ]
 
-# Patterns indicating trust in user content
+# Patterns indicating trust in user content. "never trust user input" is a
+# defensive instruction and must not fire, so the trust verb is rejected when
+# negated with "never"/"don't"/"do not".
 _TRUSTING_PATTERNS = [
-    (re.compile(r"(?:trust|believe|assume)\s+(?:the\s+)?(?:user|input|message)", re.IGNORECASE), 0.7),
-    (re.compile(r"(?:always|never)\s+(?:validate|verify|sanitize|check)\s+(?:the\s+)?(?:input|user)", re.IGNORECASE), 0.8),
+    (re.compile(r"(?<!never\s)(?<!don't\s)(?<!do not\s)(?:trust|believe|assume)\s+(?:the\s+)?(?:user|input|message)", re.IGNORECASE), 0.7),
+    (re.compile(r"never\s+(?:validate|verify|sanitize|check)\s+(?:the\s+)?(?:input|user)", re.IGNORECASE), 0.8),
     (re.compile(r"(?:do\s+not|don't)\s+(?:validate|verify|sanitize|filter)\s+(?:the\s+)?(?:input|user)", re.IGNORECASE), 0.8),
     (re.compile(r"(?:process|execute|run)\s+(?:the\s+)?(?:user|input)\s+(?:directly|immediately|without)", re.IGNORECASE), 0.7),
 ]
@@ -62,7 +64,7 @@ _TRUSTING_PATTERNS = [
 _OUTPUT_GUARD_PATTERNS = [
     re.compile(r"(?:never|do\s+not|don't)\s+(?:reveal|expose|output|show|print|display)\s+(?:the\s+)?(?:system|internal|hidden|secret)", re.IGNORECASE),
     re.compile(r"(?:filter|sanitize|validate|escape)\s+(?:the\s+)?(?:output|response|result)", re.IGNORECASE),
-    re.compile(r"(?:never|do\s+not|don't)\s+(?:include|include|contain)\s+(?:the\s+)?(?:following|above|system|instruction)", re.IGNORECASE),
+    re.compile(r"(?:never|do\s+not|don't)\s+(?:include|contain)\s+(?:the\s+)?(?:following|above|system|instruction)", re.IGNORECASE),
 ]
 
 # Patterns indicating adversarial awareness
@@ -94,7 +96,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [_TAG]
 
     # Only analyze markdown and text files (skill instruction files)
-    if file_type not in ("markdown", "text", "other"):
+    if file_type not in ("markdown", "text"):
         return findings
 
     # IR1: Missing instruction boundaries
@@ -187,6 +189,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     file_cache: dict[str, str] = state.get("file_cache") or {}
     all_findings: list[Finding] = []
 
+    # Resilience checks are absence-based and per-file, so they only make sense
+    # on the skill's instruction file. When a SKILL.md exists, evaluate it only;
+    # otherwise fall back to all markdown/text files (bare .md skills).
+    has_skill_md = any(path.replace("\\", "/").split("/")[-1].lower() == "skill.md" for path in components)
+
     for path in components:
         content = file_cache.get(path)
         if content is None or len(content) > MAX_FILE_BYTES:
@@ -196,6 +203,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         file_type = {
             ".md": "markdown", ".txt": "text",
         }.get(suffix, "other")
+        if file_type not in ("markdown", "text"):
+            continue
+        if has_skill_md and path.replace("\\", "/").split("/")[-1].lower() != "skill.md":
+            continue
         raw = analyze(content, path, file_type)
         all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
 

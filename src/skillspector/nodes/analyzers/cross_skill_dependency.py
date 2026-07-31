@@ -55,11 +55,11 @@ _PRIVILEGE_ESCALATION_PATTERNS = [
     re.compile(r"(?:pipe|chain|pass)\s+(?:output|results?)\s+(?:to|into)\s+['\"]([a-zA-Z0-9_-]+)['\"]", re.IGNORECASE),
 ]
 
-# Patterns for shared state access
+# Patterns for shared state access (only reported when the file also contains
+# an actual cross-skill reference, to avoid flagging every mention of "mutex").
 _SHARED_STATE_PATTERNS = [
     re.compile(r"(?:shared|common|global)\s+(?:state|config|store|cache|registry)", re.IGNORECASE),
     re.compile(r"(?:/tmp/|/var/|~/.cache/).*(?:skill|agent)", re.IGNORECASE),
-    re.compile(r"(?:lockfile|mutex|semaphore|barrier)", re.IGNORECASE),
 ]
 
 
@@ -71,15 +71,16 @@ def analyze(
 ) -> list[AnalyzerFinding]:
     """Analyze content for cross-skill dependency patterns."""
     findings: list[AnalyzerFinding] = []
-    skill_names = [s.lower() for s in (all_skill_names or [])]
+    skill_names = {s.lower() for s in (all_skill_names or [])}
     if not skill_names:
         return findings
+    self_names = _ancestor_skill_names(file_path, skill_names)
 
     # CS1: Direct skill references
     for pattern in _SKILL_REFERENCE_PATTERNS:
         for match in pattern.finditer(content):
             ref_name = match.group(1).lower() if match.lastindex else ""
-            if ref_name in skill_names and ref_name != _skill_name_from_path(file_path).lower():
+            if ref_name in skill_names and ref_name not in self_names:
                 line_num = content[:match.start()].count("\n") + 1
                 findings.append(
                     AnalyzerFinding(
@@ -98,7 +99,7 @@ def analyze(
     for pattern in _PRIVILEGE_ESCALATION_PATTERNS:
         for match in pattern.finditer(content):
             ref_name = match.group(1).lower() if match.lastindex else ""
-            if ref_name in skill_names:
+            if ref_name in skill_names and ref_name not in self_names:
                 line_num = content[:match.start()].count("\n") + 1
                 findings.append(
                     AnalyzerFinding(
@@ -113,32 +114,55 @@ def analyze(
                     )
                 )
 
-    # CS3: Shared state access
-    for pattern in _SHARED_STATE_PATTERNS:
+    # CS3: Shared state access (only meaningful when this file actually
+    # references another skill; otherwise "mutex"/"shared cache" is benign prose).
+    has_cross_skill_ref = False
+    for pattern in _SKILL_REFERENCE_PATTERNS:
         for match in pattern.finditer(content):
-            line_num = content[:match.start()].count("\n") + 1
-            findings.append(
-                AnalyzerFinding(
-                    rule_id="CS3",
-                    message="Shared state mechanism detected between skills",
-                    severity=Severity.LOW,
-                    location=Location(file=file_path, start_line=line_num),
-                    confidence=0.5,
-                    tags=[_TAG],
-                    context=content[max(0, match.start() - 50) : match.end() + 50],
-                    matched_text=match.group(0)[:200],
+            ref_name = match.group(1).lower() if match.lastindex else ""
+            if ref_name in skill_names and ref_name not in self_names:
+                has_cross_skill_ref = True
+                break
+        if has_cross_skill_ref:
+            break
+
+    if has_cross_skill_ref:
+        for pattern in _SHARED_STATE_PATTERNS:
+            for match in pattern.finditer(content):
+                line_num = content[:match.start()].count("\n") + 1
+                findings.append(
+                    AnalyzerFinding(
+                        rule_id="CS3",
+                        message="Shared state mechanism detected between skills",
+                        severity=Severity.LOW,
+                        location=Location(file=file_path, start_line=line_num),
+                        confidence=0.5,
+                        tags=[_TAG],
+                        context=content[max(0, match.start() - 50) : match.end() + 50],
+                        matched_text=match.group(0)[:200],
+                    )
                 )
-            )
 
     return findings
 
 
-def _skill_name_from_path(file_path: str) -> str:
-    """Extract skill directory name from a file path."""
+def _ancestor_skill_names(file_path: str, skill_names: set[str]) -> set[str]:
+    """Return the skill names the file lives under (its own skill directory)."""
     parts = file_path.replace("\\", "/").split("/")
-    for part in reversed(parts):
-        if part and not part.startswith(".") and part not in ("src", "lib", "code", "scripts"):
-            return part.rsplit(".", 1)[0] if "." in part else part
+    return {part.lower() for part in parts[:-1] if part.lower() in skill_names}
+
+
+def _skill_name_from_path(file_path: str) -> str:
+    """Extract the owning skill directory name from a file path.
+
+    Returns the nearest ancestor directory, so "skill-a/SKILL.md" -> "skill-a"
+    (previously this returned the file stem "SKILL", which broke the CS1
+    self-reference exclusion).
+    """
+    parts = file_path.replace("\\", "/").split("/")
+    for part in reversed(parts[:-1]):
+        if part and not part.startswith("."):
+            return part
     return ""
 
 
@@ -177,14 +201,16 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     file_cache: dict[str, str] = state.get("file_cache") or {}
     all_findings: list[Finding] = []
 
-    # Extract skill names from directory structure
+    # Extract skill names from directory structure: only directories that
+    # actually contain a SKILL.md are skills. (Collecting every intermediate
+    # directory previously made a single skill with a scripts/ subdir pass the
+    # >=2 gate and matched prose like "tool scripts".)
     skill_names: list[str] = []
     for path in components:
         parts = path.replace("\\", "/").split("/")
-        for part in parts[:-1]:
-            if part and not part.startswith("."):
-                skill_names.append(part)
-    skill_names = list(set(skill_names))
+        if parts[-1].lower() == "skill.md" and len(parts) >= 2:
+            skill_names.append(parts[-2])
+    skill_names = sorted(set(skill_names))
 
     if len(skill_names) < 2:
         logger.info("%s: fewer than 2 skill dirs detected, skipping", ANALYZER_ID)

@@ -41,6 +41,9 @@ class PatternCategory(StrEnum):
     AGENT_SNOOPING = "Agent Snooping"
     ANTI_REFUSAL = "Anti-Refusal"
     SERVER_SIDE_REQUEST_FORGERY = "Server-Side Request Forgery"
+    BEHAVIORAL_FINGERPRINT = "Behavioral Fingerprint"
+    CROSS_SKILL_DEPENDENCY = "Cross-Skill Dependency"
+    PROMPT_INJECTION_RESILIENCE = "Prompt Injection Resilience"
 
 
 # Pattern-specific explanations (why the finding is dangerous)
@@ -137,6 +140,21 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SSRF1": "Code accesses a cloud instance metadata endpoint (e.g. 169.254.169.254). A single request can return temporary IAM credentials, making this a high-value SSRF target for credential theft.",
     "SSRF2": "Code issues a request to a loopback, link-local, or private-range host. This can reach internal services not meant to be exposed and is a common SSRF pivot.",
     "SSRF3": "Request target host is built from a dynamic or untrusted value. If the host is attacker-influenced, this enables SSRF to arbitrary internal or metadata endpoints.",
+    # Behavioral Fingerprint (FP1–FP4)
+    "FP1": "Skill code references sensitive credential paths (SSH keys, AWS credentials, .env files). This may be legitimate secret handling or credential theft.",
+    "FP2": "Skill code reads credential-related environment variables (API keys, tokens, passwords). These values should never be logged or transmitted.",
+    "FP3": "Skill references external network endpoints. This could be legitimate telemetry or data exfiltration.",
+    "FP4": "Skill combines modules that enable dangerous behavior chains (code execution combined with deserialization or network access). Review whether these capabilities are necessary.",
+    # Cross-Skill Dependency (CS1–CS3)
+    "CS1": "Skill references another skill by name, creating an invocation or data dependency between skills.",
+    "CS2": "Skill grants privileges to, or shares credentials with, another skill. This can form a privilege escalation chain.",
+    "CS3": "Skill uses shared state mechanisms with other skills. Shared state can be a vector for coordinated supply-chain attacks.",
+    # Prompt Injection Resilience (IR1–IR5)
+    "IR1": "No clear instruction boundaries found in the skill instructions, making it harder for the agent to separate user content from skill rules.",
+    "IR2": "Skill instructions trust user input without requiring validation or sanitization.",
+    "IR3": "No output guards found; the skill does not restrict disclosure of internal state.",
+    "IR4": "No adversarial awareness; the skill does not address prompt injection threats.",
+    "IR5": "Skill processes user input but does not include explicit input validation requirements.",
 }
 
 # Rule ID -> category (for report output)
@@ -214,6 +232,21 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SSRF1": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
     "SSRF2": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
     "SSRF3": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
+    # Behavioral Fingerprint (FP1–FP4)
+    "FP1": PatternCategory.BEHAVIORAL_FINGERPRINT.value,
+    "FP2": PatternCategory.BEHAVIORAL_FINGERPRINT.value,
+    "FP3": PatternCategory.BEHAVIORAL_FINGERPRINT.value,
+    "FP4": PatternCategory.BEHAVIORAL_FINGERPRINT.value,
+    # Cross-Skill Dependency (CS1–CS3)
+    "CS1": PatternCategory.CROSS_SKILL_DEPENDENCY.value,
+    "CS2": PatternCategory.CROSS_SKILL_DEPENDENCY.value,
+    "CS3": PatternCategory.CROSS_SKILL_DEPENDENCY.value,
+    # Prompt Injection Resilience (IR1–IR5)
+    "IR1": PatternCategory.PROMPT_INJECTION_RESILIENCE.value,
+    "IR2": PatternCategory.PROMPT_INJECTION_RESILIENCE.value,
+    "IR3": PatternCategory.PROMPT_INJECTION_RESILIENCE.value,
+    "IR4": PatternCategory.PROMPT_INJECTION_RESILIENCE.value,
+    "IR5": PatternCategory.PROMPT_INJECTION_RESILIENCE.value,
 }
 
 # Rule ID -> pattern display name (for report output)
@@ -291,6 +324,21 @@ PATTERN_NAMES: dict[str, str] = {
     "SSRF1": "Cloud Metadata Access",
     "SSRF2": "Internal Network Request",
     "SSRF3": "Dynamic Request Target",
+    # Behavioral Fingerprint (FP1–FP4)
+    "FP1": "Sensitive File Path Access",
+    "FP2": "Credential Env Var Access",
+    "FP3": "External Network Endpoints",
+    "FP4": "Dangerous Import Combination",
+    # Cross-Skill Dependency (CS1–CS3)
+    "CS1": "Cross-Skill Reference",
+    "CS2": "Privilege Escalation Chain",
+    "CS3": "Shared State Mechanism",
+    # Prompt Injection Resilience (IR1–IR5)
+    "IR1": "Missing Instruction Boundaries",
+    "IR2": "Unvalidated User Input",
+    "IR3": "Missing Output Guards",
+    "IR4": "Missing Adversarial Awareness",
+    "IR5": "Missing Input Validation",
 }
 
 # Pattern-specific remediations (how to fix the issue)
@@ -387,6 +435,21 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SSRF1": "Remove access to cloud metadata endpoints unless strictly required. If metadata is needed, restrict it (e.g. IMDSv2 with hop limit) and never expose returned credentials.",
     "SSRF2": "Avoid requests to loopback/link-local/private hosts from skill code. If internal access is intended, document it and validate the target against an allowlist.",
     "SSRF3": "Do not build request URLs from untrusted input. Validate the host against an allowlist and reject internal/metadata addresses before issuing the request.",
+    # Behavioral Fingerprint (FP1–FP4)
+    "FP1": "Remove references to credential file paths, or use environment variables and a secrets manager instead of hardcoded credential locations.",
+    "FP2": "Use a secrets manager for credential values and never log, print, or transmit environment variables.",
+    "FP3": "Remove unused external endpoints and ensure any network calls target documented, trusted destinations.",
+    "FP4": "Remove unused dangerous imports or isolate risky capabilities (execution, deserialization, networking) behind explicit, reviewed code paths.",
+    # Cross-Skill Dependency (CS1–CS3)
+    "CS1": "Replace cross-skill references with explicit, documented integration contracts, or restructure so skills do not depend on each other.",
+    "CS2": "Remove privilege grants between skills. Skills should never share credentials or grant each other elevated access.",
+    "CS3": "Avoid shared mutable state between skills. If coordination is required, use an explicit, reviewed interface.",
+    # Prompt Injection Resilience (IR1–IR5)
+    "IR1": "Add clear instruction boundaries (e.g. an 'Instructions' / 'Rules' section) separating skill rules from user content.",
+    "IR2": "Add explicit validation and sanitization requirements before trusting user-provided input.",
+    "IR3": "Add output-guard instructions that prevent the agent from revealing internal or system state.",
+    "IR4": "Document adversarial-input handling and mention prompt-injection protections in the skill instructions.",
+    "IR5": "Add explicit input validation requirements wherever the skill processes user-provided data.",
 }
 
 

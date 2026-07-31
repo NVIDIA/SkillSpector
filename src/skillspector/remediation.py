@@ -26,25 +26,39 @@ from __future__ import annotations
 
 import difflib
 import re
-import textwrap
-from pathlib import Path
+from collections.abc import Callable
 
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
 logger = get_logger(__name__)
 
+# Comments that may carry hidden/override instructions. Only these are stripped
+# by the P2 remediation; legitimate comments are left untouched.
+_SUSPICIOUS_COMMENT = re.compile(
+    r"(?:ignore|override|never|always|secret|jailbreak|restriction|safety|"
+    r"system\s*prompt|instructions?)\b",
+    re.IGNORECASE,
+)
 
-# Rule ID -> (pattern, replacement) for automated regex fixes
-_REGEX_FIXES: dict[str, list[tuple[re.Pattern[str], str]]] = {
+_P2_COMMENT_PATTERN = re.compile(r"<!--.*?-->|\[//\]:\s*#\(.*?\)", re.DOTALL)
+
+
+def _strip_suspicious_comment(match: re.Match[str]) -> str:
+    """Replace a comment with '' only when it contains suspicious content."""
+    return "" if _SUSPICIOUS_COMMENT.search(match.group(0)) else match.group(0)
+
+
+# Rule ID -> (pattern, replacement) for automated regex fixes. Replacement may
+# be a callable (re.sub supports it) for conditional rewrites.
+_REGEX_FIXES: dict[str, list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]]] = {
     "P1": [
         (re.compile(r"ignore\s+(?:all\s+)?previous\s+instructions?", re.IGNORECASE), "[REMOVED: instruction override]"),
         (re.compile(r"ignore\s+(?:all\s+)?(?:safety|security)\s+(?:rules?|constraints?|guidelines?)", re.IGNORECASE), "[REMOVED: safety override]"),
         (re.compile(r"you\s+are\s+now\s+(?:in\s+)?(?:jailbreak|unrestricted|unfiltered)\s+mode", re.IGNORECASE), "[REMOVED: jailbreak mode]"),
     ],
     "P2": [
-        (re.compile(r"<!--.*?-->", re.DOTALL), ""),
-        (re.compile(r"\[//\]:\s*#\(.*?\)", re.DOTALL), ""),
+        (_P2_COMMENT_PATTERN, _strip_suspicious_comment),
     ],
     "P6": [
         (re.compile(r"(?:print|output|reveal|expose|show)\s+(?:the\s+)?(?:system\s+)?(?:prompt|instructions?|rules?)", re.IGNORECASE), "[REMOVED: system prompt leakage]"),
@@ -101,7 +115,11 @@ class RemediationResult:
 
 
 def apply_regex_fix(content: str, rule_id: str) -> tuple[str, int]:
-    """Apply regex-based fixes for a given rule ID. Returns (new_content, fix_count)."""
+    """Apply regex-based fixes for a given rule ID to the whole file.
+
+    Returns (new_content, fix_count). Prefer :func:`_apply_fixes_scoped` when
+    the finding location is known so the fix is anchored near the finding.
+    """
     fixes = _REGEX_FIXES.get(rule_id, [])
     fix_count = 0
     for pattern, replacement in fixes:
@@ -110,6 +128,33 @@ def apply_regex_fix(content: str, rule_id: str) -> tuple[str, int]:
             fix_count += 1
             content = new_content
     return content, fix_count
+
+
+def _apply_fixes_scoped(content: str, finding: Finding) -> tuple[str, int]:
+    """Apply a finding's regex fixes only around its reported location.
+
+    Anchors the fix to the lines surrounding the finding (instead of rewriting
+    the whole file) so legitimate content elsewhere — e.g. unrelated HTML
+    comments when remediating a P2 finding — is not modified.
+    """
+    patterns = _REGEX_FIXES.get(finding.rule_id, [])
+    if not patterns:
+        return content, 0
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return content, 0
+    window = 5
+    start_idx = max(0, (finding.start_line or 1) - 1 - window)
+    end_idx = min(len(lines), (finding.start_line or 1) - 1 + window + 1)
+    region = "".join(lines[start_idx:end_idx])
+    new_region = region
+    fix_count = 0
+    for pattern, replacement in patterns:
+        new_region, n = pattern.subn(replacement, new_region)
+        fix_count += n
+    if fix_count and new_region != region:
+        return "".join(lines[:start_idx]) + new_region + "".join(lines[end_idx:]), fix_count
+    return content, 0
 
 
 def generate_skill_md_patch(findings: list[Finding]) -> str | None:
@@ -163,13 +208,13 @@ def remediate_files(
         total_fixes = 0
         for finding in file_findings:
             if finding.rule_id in _REGEX_FIXES:
-                new_content, fix_count = apply_regex_fix(content, finding.rule_id)
+                new_content, fix_count = _apply_fixes_scoped(content, finding)
                 if fix_count > 0:
                     content = new_content
                     total_fixes += fix_count
                     result.add_fix(file_path, finding.rule_id, f"Regex fix applied ({fix_count} occurrence(s))")
                 else:
-                    result.add_skip(file_path, finding.rule_id, "Pattern not found in current content")
+                    result.add_skip(file_path, finding.rule_id, "Pattern not found at the finding location")
             elif finding.rule_id in _SKILL_MD_TEMPLATES:
                 result.add_skip(file_path, finding.rule_id, "Requires manual SKILL.md edit")
             else:

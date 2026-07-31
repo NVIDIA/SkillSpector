@@ -39,30 +39,34 @@ from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
-from .common import build_import_aliases, get_context_from_lines, get_source_segment, resolve_call_name
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .common import build_import_aliases, resolve_call_name
+from .static_runner import FILE_TYPES, MAX_FILE_BYTES, analyzer_finding_to_finding
 
 ANALYZER_ID = "behavioral_fingerprint"
 logger = get_logger(__name__)
 
 _TAG = "Behavioral Fingerprint"
 
-# Known dangerous module groups
-_DANGEROUS_MODULE_GROUPS = {
-    "network": {"requests", "urllib", "httpx", "aiohttp", "socket", "websocket"},
-    "execution": {"subprocess", "os", "shlex", "popen", "pty"},
-    "file_io": {"pathlib", "shutil", "glob", "fnmatch", "tempfile"},
-    "crypto": {"hashlib", "hmac", "cryptography", "bcrypt"},
-    "serialization": {"pickle", "marshal", "shelve", "json", "yaml"},
-    "env": {"os", "dotenv"},
-}
+# Patterns for detecting network URLs in code/strings. The HTTP-verb form is
+# matched case-sensitively and only when followed by a URL or a path, so prose
+# like "get started" or "put the file" is not reported as a network endpoint.
+_URL_PATTERN = re.compile(r"https?://[^\s\"']+|wss?://[^\s\"']+")
+_HTTP_VERB_PATTERN = re.compile(
+    r"(?:POST|GET|PUT|DELETE|PATCH)\s+(?:https?://[^\s\"']+|/[^\s\"']+)"
+)
 
-# Patterns for detecting network URLs in code/strings
-_URL_PATTERN = re.compile(
-    r"https?://[^\s\"']+|"
-    r"wss?://[^\s\"']+|"
-    r"(?:POST|GET|PUT|DELETE|PATCH)\s+[^\s\"']+",
-    re.IGNORECASE,
+# Ubiquitous standard-library modules that are not risky on their own; they are
+# deliberately excluded from the FP4 "dangerous combination" check so that a
+# plain `import os, json` in nearly every Python file does not fire.
+_EXECUTION_MODULES = frozenset({"subprocess", "pty", "popen", "shlex"})
+_SERIALIZATION_MODULES = frozenset({"pickle", "marshal", "shelve"})
+_NETWORK_MODULES = frozenset({"requests", "urllib", "httpx", "aiohttp", "socket", "websocket"})
+_FILE_MODULES = frozenset({"shutil", "tempfile"})
+
+_DANGEROUS_COMBOS: tuple[tuple[frozenset[str], frozenset[str], str], ...] = (
+    (_EXECUTION_MODULES, _NETWORK_MODULES, "execution + network"),
+    (_FILE_MODULES, _NETWORK_MODULES, "file_io + network"),
+    (_SERIALIZATION_MODULES, _EXECUTION_MODULES, "serialization + execution"),
 )
 
 # Patterns for detecting file path access
@@ -73,9 +77,11 @@ _PATH_ACCESS_PATTERNS = [
     re.compile(r"~/(?:\.ssh|\.aws|\.config|\.env|\.git|Library)"),
 ]
 
-# Patterns for detecting env var access
+# Patterns for detecting env var access (both .get()/.pop() calls and []
+# subscript reads such as os.environ["API_KEY"]).
 _ENV_VAR_PATTERNS = [
-    re.compile(r"os\.environ(?:\.get|\.pop|\[)\s*\(\s*['\"]([A-Z_]+)['\"]"),
+    re.compile(r"os\.environ\s*\[\s*['\"]([A-Z_]+)['\"]"),
+    re.compile(r"os\.environ(?:\.get|\.pop)\s*\(\s*['\"]([A-Z_]+)['\"]"),
     re.compile(r"os\.getenv\s*\(\s*['\"]([A-Z_]+)['\"]"),
     re.compile(r"ENV\s+([A-Z_]+)="),
 ]
@@ -123,12 +129,21 @@ def _extract_string_literals(tree: ast.Module) -> list[str]:
     return strings
 
 
+def _extract_urls(text: str) -> list[str]:
+    """Find URLs and HTTP endpoint references in *text*."""
+    urls = set()
+    for match in _URL_PATTERN.finditer(text):
+        urls.add(match.group(0).strip())
+    for match in _HTTP_VERB_PATTERN.finditer(text):
+        urls.add(match.group(0).strip())
+    return sorted(urls)
+
+
 def _detect_urls_in_strings(strings: list[str]) -> list[str]:
     """Find URLs in string literals."""
     urls = set()
     for s in strings:
-        for match in _URL_PATTERN.finditer(s):
-            urls.add(match.group(0).strip())
+        urls.update(_extract_urls(s))
     return sorted(urls)
 
 
@@ -154,15 +169,14 @@ def _detect_env_vars(content: str) -> list[str]:
     return sorted(env_vars)
 
 
-def _classify_imports(imports: list[str]) -> dict[str, list[str]]:
-    """Classify imports into behavioral categories."""
-    classified: dict[str, list[str]] = {}
-    for imp in imports:
-        root = imp.split(".")[0]
-        for category, modules in _DANGEROUS_MODULE_GROUPS.items():
-            if root in modules:
-                classified.setdefault(category, []).append(imp)
-    return classified
+def _detect_dangerous_combos(imports: list[str]) -> list[str]:
+    """Return the dangerous import combinations present in *imports*."""
+    roots = {imp.split(".")[0] for imp in imports}
+    combos = []
+    for exec_mods, other_mods, label in _DANGEROUS_COMBOS:
+        if roots & exec_mods and roots & other_mods:
+            combos.append(label)
+    return combos
 
 
 def _compute_fingerprint(
@@ -205,7 +219,7 @@ def _analyze_python_fingerprint(
 
 def _analyze_markdown_fingerprint(content: str) -> tuple[list[str], list[str], list[str]]:
     """Extract behavioral features from markdown/config files."""
-    urls = sorted(set(m.group(0).strip() for m in _URL_PATTERN.finditer(content)))
+    urls = _extract_urls(content)
     env_vars = set()
     for pattern in _ENV_VAR_PATTERNS:
         for match in pattern.finditer(content):
@@ -284,14 +298,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     # FP4: Dangerous import combination
     if imports:
-        classified = _classify_imports(imports)
-        dangerous_combos = []
-        if "execution" in classified and "network" in classified:
-            dangerous_combos.append("execution + network")
-        if "file_io" in classified and "network" in classified:
-            dangerous_combos.append("file_io + network")
-        if "serialization" in classified and "execution" in classified:
-            dangerous_combos.append("serialization + execution")
+        dangerous_combos = _detect_dangerous_combos(imports)
         if dangerous_combos:
             findings.append(
                 AnalyzerFinding(
@@ -309,47 +316,46 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
+def _infer_file_type(path: str) -> str:
+    """Infer file type from path (extension)."""
+    idx = path.rfind(".")
+    suffix = path[idx:].lower() if idx >= 0 else ""
+    return FILE_TYPES.get(suffix, "other")
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Compute behavioral fingerprints and detect risky behavioral patterns."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
     all_findings: list[Finding] = []
 
+    all_imports: list[str] = []
+    all_calls: list[str] = []
+    all_urls: list[str] = []
+    all_paths: list[str] = []
+    all_envs: list[str] = []
+
     for path in components:
         content = file_cache.get(path)
         if content is None or len(content) > MAX_FILE_BYTES:
             continue
-        idx = path.rfind(".")
-        suffix = path[idx:].lower() if idx >= 0 else ""
-        file_type = {
-            ".py": "python", ".md": "markdown", ".yaml": "yaml", ".yml": "yaml",
-            ".json": "json", ".toml": "toml",
-        }.get(suffix, "other")
+        file_type = _infer_file_type(path)
         if file_type == "other":
             continue
         raw = analyze(content, path, file_type)
         all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
 
-    # Compute the aggregate fingerprint across all files
-    all_imports, all_calls, all_urls, all_paths, all_envs = [], [], [], [], []
-    for path in components:
-        content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_BYTES:
-            continue
-        idx = path.rfind(".")
-        suffix = path[idx:].lower() if idx >= 0 else ""
-        if suffix == ".py":
+        # Aggregate fingerprint features in the same pass (single parse per file).
+        if file_type == "python":
             i, c, u, p, e = _analyze_python_fingerprint(content, path)
-            all_imports.extend(i)
-            all_calls.extend(c)
-            all_urls.extend(u)
-            all_paths.extend(p)
-            all_envs.extend(e)
-        elif suffix in (".md", ".yaml", ".yml", ".json", ".toml"):
+        else:
             u, p, e = _analyze_markdown_fingerprint(content)
-            all_urls.extend(u)
-            all_paths.extend(p)
-            all_envs.extend(e)
+            i, c = [], []
+        all_imports.extend(i)
+        all_calls.extend(c)
+        all_urls.extend(u)
+        all_paths.extend(p)
+        all_envs.extend(e)
 
     fingerprint = _compute_fingerprint(
         sorted(set(all_imports)),

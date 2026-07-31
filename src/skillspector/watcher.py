@@ -79,7 +79,8 @@ def watch_directory(
         directory: Directory to watch.
         callback: Function to call when changes are detected. Receives directory path.
         poll_interval: Seconds between polls.
-        debounce: Seconds to wait after a change before triggering a scan (to batch rapid edits).
+        debounce: Seconds to wait after the *last* observed change before
+            triggering a scan (to batch rapid edits into a single scan).
         **callback_kwargs: Extra kwargs passed to callback.
     """
     logger.info("Watching %s (poll=%ss, debounce=%ss)", directory, poll_interval, debounce)
@@ -90,19 +91,19 @@ def watch_directory(
     while True:
         time.sleep(poll_interval)
         current_hash = _compute_directory_hash(directory)
+        now = time.time()
 
         if current_hash != last_hash:
-            now = time.time()
-            if last_change_time is None:
-                last_change_time = now
-
-            if now - last_change_time >= debounce:
-                logger.info("Changes detected in %s, triggering scan...", directory)
-                try:
-                    callback(str(directory), **callback_kwargs)
-                except Exception:
-                    logger.exception("Error during watch scan callback")
-                last_hash = _compute_directory_hash(directory)
-                last_change_time = None
-        else:
+            # A change was observed. Restart the debounce window from *now* so
+            # that ongoing edits (a file still being saved, or a burst of file
+            # changes) keep postponing the scan until the tree settles.
+            last_change_time = now
+            last_hash = current_hash
+        elif last_change_time is not None and now - last_change_time >= debounce:
+            logger.info("Changes detected in %s, triggering scan...", directory)
+            try:
+                callback(str(directory), **callback_kwargs)
+            except Exception:
+                logger.exception("Error during watch scan callback")
             last_change_time = None
+            last_hash = _compute_directory_hash(directory)
