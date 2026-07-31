@@ -71,6 +71,10 @@ app = typer.Typer(
 )
 
 console = Console()
+# Fatal errors go to stderr. Anything driving the CLI from a script separates the two streams,
+# and with the message on stdout the only diagnosis available was thrown away: a failed scan
+# left an empty error log and the caller had nothing to act on.
+err_console = Console(stderr=True)
 
 
 class FormatChoice(StrEnum):
@@ -378,13 +382,13 @@ def scan(
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
             console.print_exception()
         else:
-            console.print(f"[red]Error:[/red] {e}")
+            err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
@@ -444,7 +448,7 @@ def _scan_multi_skill(
             severity = result.get("risk_severity") or "LOW"
             console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
-            console.print(f"         [red]Error:[/red] {e}\n")
+            err_console.print(f"         [red]Error:[/red] {e}\n")
             execution_failed = True
             results.append({"skill_name": skill.name, "error": str(e)})
 
@@ -558,7 +562,7 @@ def mcp(
 
         run_mcp(transport=transport.value, host=host, port=port)
     except ModuleNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
 
 
@@ -631,13 +635,13 @@ def baseline(
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
             console.print_exception()
         else:
-            console.print(f"[red]Error:[/red] {e}")
+            err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:

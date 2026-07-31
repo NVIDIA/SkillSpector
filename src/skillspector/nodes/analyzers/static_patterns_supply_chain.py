@@ -27,6 +27,7 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tomllib
@@ -544,8 +545,23 @@ def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | N
     return results
 
 
-def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | None, int]]:
-    """Extract (package_name, version_or_None, line_number) from package.json content."""
+_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+
+
+def _package_json_line(content: str, section: str, name: str) -> int:
+    """Best-effort line for a dependency entry, so findings keep pointing somewhere useful.
+
+    Parsing JSON loses positions, and the search starts at the section header so a name that
+    also appears in ``scripts`` does not win.
+    """
+    header = re.search(rf'"{re.escape(section)}"\s*:', content)
+    start = header.end() if header else 0
+    entry = re.compile(rf'"{re.escape(name)}"\s*:').search(content, start)
+    return get_line_number(content, entry.start()) if entry else 1
+
+
+def _extract_packages_from_package_json_scan(content: str) -> list[tuple[str, str | None, int]]:
+    """Line-oriented fallback, used only when the manifest is not valid JSON."""
     results: list[tuple[str, str | None, int]] = []
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
@@ -559,9 +575,34 @@ def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | N
         if in_deps:
             m = re.match(r'"([^"]+)"\s*:\s*"([^"]*)"', stripped)
             if m:
-                name = m.group(1)
-                version = _pinned_npm_version(m.group(2))
-                results.append((name, version, i))
+                results.append((m.group(1), _pinned_npm_version(m.group(2)), i))
+    return results
+
+
+def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | None, int]]:
+    """Extract (package_name, version_or_None, line_number) from package.json content.
+
+    package.json is JSON, so it is parsed as JSON. Scanning it line by line made the result
+    depend on formatting: a manifest written on a single line — which is valid, and what many
+    generators emit — never entered the dependency section at all and yielded *no* dependencies,
+    silently. The line-oriented scan remains as a fallback for manifests that do not parse.
+    """
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return _extract_packages_from_package_json_scan(content)
+    if not isinstance(data, dict):
+        return []
+    results: list[tuple[str, str | None, int]] = []
+    for section in _NPM_DEPENDENCY_SECTIONS:
+        deps = data.get(section)
+        if not isinstance(deps, dict):
+            continue
+        for name, spec in deps.items():
+            if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            line = _package_json_line(content, section, name)
+            results.append((name, _pinned_npm_version(spec), line))
     return results
 
 

@@ -1532,6 +1532,60 @@ idna==3.7\\
         assert versions["shell-quote"] is None
         assert versions["semver"] is None
         assert versions["glob"] is None
+    def test_package_json_on_a_single_line_is_not_invisible(self) -> None:
+        # Regression: the line-oriented scan never entered the dependency section, so a valid
+        # one-line manifest yielded no dependencies at all — silently.
+        content = '{"name":"x","dependencies":{"express":"^4.18.0","lodash":"4.17.21"}}'
+        names = {p[0] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert names == {"express", "lodash"}
+
+    def test_package_json_compact_keeps_versions(self) -> None:
+        # Version resolution is not this PR's subject: it stays whatever the shared predicate
+        # decides (#319). Only the parsing of the manifest changes, and a compact manifest must
+        # resolve exactly like the indented one.
+        content = '{"dependencies":{"lodash":"4.17.21","semver":"^7.5.0"}}'
+        versions = {p[0]: p[1] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert versions["lodash"] == "4.17.21"
+        assert versions["semver"] is None
+
+    def test_package_json_line_numbers_survive_parsing(self) -> None:
+        content = (
+            "{\n"
+            '  "name": "x",\n'
+            '  "dependencies": {\n'
+            '    "express": "4.18.0"\n'
+            "  }\n"
+            "}\n"
+        )
+        lines = {p[0]: p[2] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert lines["express"] == 4
+
+    def test_package_json_line_prefers_the_dependency_over_a_script(self) -> None:
+        # A name that also appears in "scripts" must not steal the line number.
+        content = (
+            "{\n"
+            '  "scripts": { "express": "node server.js" },\n'
+            '  "dependencies": {\n'
+            '    "express": "4.18.0"\n'
+            "  }\n"
+            "}\n"
+        )
+        lines = {p[0]: p[2] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert lines["express"] == 4
+
+    def test_package_json_invalid_falls_back_to_the_scan(self) -> None:
+        # A manifest that does not parse keeps the previous behaviour instead of going blind.
+        content = '{\n  "dependencies": {\n    "express": "4.18.0",\n'  # truncated
+        names = {p[0] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert "express" in names
+
+    def test_package_json_non_object_is_empty(self) -> None:
+        assert sc_mod._extract_packages_from_package_json("[1, 2, 3]") == []
+
+    def test_package_json_ignores_non_string_specs(self) -> None:
+        content = '{"dependencies":{"ok":"1.0.0","broken":{"version":"1.0.0"},"n":42}}'
+        names = {p[0] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert names == {"ok"}
 
     def test_extract_packages_package_json(self) -> None:
         content = (
