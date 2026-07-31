@@ -51,7 +51,12 @@ from skillspector.nodes.analyzers.pattern_defaults import (
     get_explanation,
     get_remediation,
 )
-from skillspector.state import MetaAnalyzerResponse, SkillspectorState, llm_call_record
+from skillspector.state import (
+    MetaAnalyzerResponse,
+    SkillspectorState,
+    get_llm_file_cache,
+    llm_call_record,
+)
 
 logger = get_logger(__name__)
 
@@ -632,7 +637,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             ],
         }
 
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache = get_llm_file_cache(state)
     manifest: dict[str, object] = state.get("manifest") or {}
     model_config: dict[str, str] = state.get("model_config") or {}
     model = (

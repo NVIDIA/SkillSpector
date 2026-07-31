@@ -468,7 +468,10 @@ class LLMAnalyzerBase:
 
         batches: list[Batch] = []
         for path in file_paths:
-            content = file_cache.get(path) or "No content available for this file."
+            if path not in file_cache:
+                logger.info("Skipping file absent from LLM file cache: %s", path)
+                continue
+            content = file_cache[path] or "No content available for this file."
             file_findings = findings_by_file.get(path, [])
 
             extra = self._estimate_extra_overhead(file_findings)

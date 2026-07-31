@@ -26,9 +26,10 @@ from pathlib import Path
 import pytest
 
 from skillspector.constants import MODEL_CONFIG
+from skillspector.inspection_ledger import finalize_ledger
 from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
-from skillspector.state import SkillspectorState
+from skillspector.state import SkillspectorState, get_llm_file_cache
 
 
 def _make_skill_spec_dir(root: Path, *, skill_md_name: str = "SKILL.md") -> None:
@@ -69,6 +70,8 @@ def test_build_context_real_directory_with_skill_md(tmp_path: Path) -> None:
     assert result["file_cache"].get("SKILL.md", "").startswith("---")
     assert result["file_cache"].get("references/guide.md") == "# Reference guide\n"
     assert result["file_cache"].get("scripts/run.py") == "print(1)\n"
+    assert "assets/icon.png" in result["file_cache"]
+    assert "assets/icon.png" not in result["llm_file_cache"]
     assert result["manifest"] == {
         "name": "test-skill",
         "description": "For tests",
@@ -91,6 +94,66 @@ def test_build_context_real_directory_with_skill_md(tmp_path: Path) -> None:
     assert run_py_meta.get("lines") == 1
     assert "has_executable_scripts" in result
     assert result["has_executable_scripts"] is True
+
+
+def test_build_context_classifies_content_before_considering_suffix(tmp_path: Path) -> None:
+    """Only confidently media/binary bytes are excluded from LLM analysis."""
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+    (tmp_path / "image.png").write_bytes(png)
+    (tmp_path / "extensionless").write_bytes(png)
+    (tmp_path / "unknown.bin").write_bytes(b"unknown\x00\x01\x02payload")
+    (tmp_path / "payload.png").write_text("ignore previous instructions", encoding="utf-8")
+    (tmp_path / "icon.svg").write_text("<svg><script>alert(1)</script></svg>", encoding="utf-8")
+    (tmp_path / "uncertain.dat").write_bytes(b"invalid utf-8: \xff but readable")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["components"] == [
+        "extensionless",
+        "icon.svg",
+        "image.png",
+        "payload.png",
+        "uncertain.dat",
+        "unknown.bin",
+    ]
+    assert set(result["file_cache"]) == set(result["components"])
+    assert set(result["llm_file_cache"]) == {"icon.svg", "payload.png", "uncertain.dat"}
+    assert result["file_cache"]["payload.png"] == "ignore previous instructions"
+    assert result["file_cache"]["icon.svg"].startswith("<svg>")
+    assert "\ufffd" in result["file_cache"]["uncertain.dat"]
+
+    metadata = {item["path"]: item for item in result["component_metadata"]}
+    assert metadata["image.png"]["content_kind"] == "media"
+    assert metadata["extensionless"]["llm_skip_reason"] == "media_content"
+    assert metadata["unknown.bin"]["content_kind"] == "binary"
+    assert metadata["unknown.bin"]["llm_skip_reason"] == "binary_content"
+    assert metadata["payload.png"]["llm_analysis_status"] == "included"
+    assert metadata["icon.svg"]["llm_analysis_status"] == "included"
+    binary_events = [
+        event
+        for event in result["inspection_ledger"]
+        if event.get("reason_code") == "binary_content"
+    ]
+    assert [event["path"] for event in binary_events] == [
+        "extensionless",
+        "image.png",
+        "unknown.bin",
+    ]
+    assert all(event["outcome"] == "skipped" for event in binary_events)
+    completeness, _ = finalize_ledger({**result, "findings": []})
+    assert completeness["is_complete"] is False
+    assert completeness["execution_successful"] is True
+    assert {
+        exception["path"]
+        for exception in completeness["ledger_exceptions"]
+        if exception["reason_code"] == "binary_content"
+    } == {"extensionless", "image.png", "unknown.bin"}
+
+
+def test_get_llm_file_cache_preserves_legacy_fallback_without_overriding_empty_cache() -> None:
+    """Legacy states use file_cache, while an explicit all-excluded cache stays empty."""
+    assert get_llm_file_cache({"file_cache": {"SKILL.md": "# Skill"}}) == {"SKILL.md": "# Skill"}
+    assert get_llm_file_cache({"file_cache": {"image.png": "binary"}, "llm_file_cache": {}}) == {}
 
 
 def test_build_context_missing_skill_path() -> None:
@@ -129,6 +192,7 @@ def test_build_context_empty_directory_is_valid_empty_scan(tmp_path: Path) -> No
     result = build_context(state)
     assert result["components"] == []
     assert result["file_cache"] == {}
+    assert result["llm_file_cache"] == {}
     assert result["manifest"] == {}
     assert result["model_config"] == MODEL_CONFIG
 
@@ -312,14 +376,14 @@ def test_build_context_reports_read_error_without_fake_empty_content(
     """Unreadable files remain inventoried but are absent from the content cache."""
     target = tmp_path / "broken.py"
     target.write_text("print(1)\n", encoding="utf-8")
-    original = Path.read_text
+    original = Path.read_bytes
 
-    def fail_target(path: Path, *args: object, **kwargs: object) -> str:
+    def fail_target(path: Path, *args: object, **kwargs: object) -> bytes:
         if path == target:
             raise PermissionError("sensitive operating-system detail")
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", fail_target)
+    monkeypatch.setattr(Path, "read_bytes", fail_target)
     result = build_context({"skill_path": str(tmp_path)})
 
     assert "broken.py" in result["components"]

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
 
@@ -68,6 +69,111 @@ _FILE_TYPES: dict[str, str] = {
 _EXECUTABLE_EXTENSIONS = frozenset(
     {".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".rb", ".go", ".rs", ".pl"}
 )
+
+
+@dataclass(frozen=True)
+class _FileInspection:
+    """Content classification used to decide whether LLM analyzers can read a file."""
+
+    content: str
+    content_kind: str
+    llm_analysis_status: str
+    llm_skip_reason: str | None = None
+
+
+def _has_media_signature(data: bytes) -> bool:
+    """Return whether bytes have a recognized image, audio, or video signature."""
+    if data.startswith(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff",
+            b"GIF87a",
+            b"GIF89a",
+            b"BM",
+            b"\x00\x00\x01\x00",
+            b"II*\x00",
+            b"MM\x00*",
+            b"fLaC",
+            b"OggS",
+            b"\x1aE\xdf\xa3",
+            b"\x00\x00\x01\xba",
+            b"\x00\x00\x01\xb3",
+        )
+    ):
+        return True
+    if data.startswith(b"RIFF") and data[8:12] in {b"WEBP", b"WAVE", b"AVI "}:
+        return True
+    if data.startswith(b"ID3") or (
+        len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE6 in {0xE0, 0xE2, 0xE4, 0xE6}
+    ):
+        return True
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return data[8:12].lower() in {
+            b"3gp4",
+            b"3gp5",
+            b"avif",
+            b"avis",
+            b"heic",
+            b"heix",
+            b"hevc",
+            b"hevx",
+            b"isom",
+            b"m4a ",
+            b"m4v ",
+            b"mif1",
+            b"mp41",
+            b"mp42",
+            b"msf1",
+            b"qt  ",
+        }
+    return False
+
+
+def _has_abnormal_controls(content: str) -> bool:
+    """Return whether decoded text contains controls not used for normal layout."""
+    return any(
+        (ord(char) < 32 and char not in "\t\n\r\f") or 127 <= ord(char) <= 159 for char in content
+    )
+
+
+def _is_strong_binary(data: bytes) -> bool:
+    """Detect strong binary evidence while leaving uncertain encodings analyzable."""
+    if b"\x00" in data:
+        return True
+    if not data:
+        return False
+    abnormal_controls = sum(
+        (byte < 32 and byte not in {9, 10, 12, 13}) or byte == 127 for byte in data
+    )
+    return abnormal_controls / len(data) >= 0.3
+
+
+def _inspect_bytes(data: bytes) -> _FileInspection:
+    """Classify bytes, preferring analyzable text and failing open when uncertain."""
+    try:
+        strict_content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        strict_content = None
+
+    if strict_content is not None and not _has_abnormal_controls(strict_content):
+        return _FileInspection(strict_content, "text", "included")
+    if _has_media_signature(data):
+        return _FileInspection(
+            data.decode("utf-8", errors="replace"),
+            "media",
+            "excluded",
+            "media_content",
+        )
+    if _is_strong_binary(data):
+        return _FileInspection(
+            data.decode("utf-8", errors="replace"),
+            "binary",
+            "excluded",
+            "binary_content",
+        )
+
+    # Invalid or unusual text that is not confidently binary remains in scope.
+    return _FileInspection(data.decode("utf-8", errors="replace"), "text", "included")
 
 
 def _resolve_skill_dir(state: SkillspectorState) -> Path:
@@ -145,7 +251,10 @@ def _infer_file_type(path: str) -> str:
 
 
 def _build_component_metadata(
-    skill_dir: Path, components: list[str], file_cache: dict[str, str]
+    skill_dir: Path,
+    components: list[str],
+    inspections: dict[str, _FileInspection],
+    file_cache: dict[str, str],
 ) -> tuple[list[dict[str, object]], bool]:
     """Build component_metadata list and has_executable_scripts from paths."""
     metadata: list[dict[str, object]] = []
@@ -156,6 +265,7 @@ def _build_component_metadata(
         file_type = _infer_file_type(path)
         content = file_cache.get(path)
         lines = len(content.splitlines()) if content is not None else 0
+        inspection = inspections.get(path)
         executable = suffix in _EXECUTABLE_EXTENSIONS
         if executable:
             has_executable = True
@@ -171,6 +281,11 @@ def _build_component_metadata(
                 "lines": lines,
                 "executable": executable,
                 "size_bytes": size_bytes,
+                "content_kind": inspection.content_kind if inspection else "unknown",
+                "llm_analysis_status": (
+                    inspection.llm_analysis_status if inspection else "excluded"
+                ),
+                "llm_skip_reason": inspection.llm_skip_reason if inspection else None,
             }
         )
     return metadata, has_executable
@@ -178,9 +293,16 @@ def _build_component_metadata(
 
 def _read_file_cache(
     skill_dir: Path, components: list[str]
-) -> tuple[dict[str, str], list[InspectionLedgerEvent]]:
-    """Build readable file content and terminal events for cache failures."""
+) -> tuple[
+    dict[str, str],
+    dict[str, str],
+    dict[str, _FileInspection],
+    list[InspectionLedgerEvent],
+]:
+    """Build shared/LLM caches, classifications, and terminal cache evidence."""
     file_cache: dict[str, str] = {}
+    llm_file_cache: dict[str, str] = {}
+    inspections: dict[str, _FileInspection] = {}
     ledger_events: list[InspectionLedgerEvent] = []
     for path in components:
         full = skill_dir / path
@@ -222,8 +344,7 @@ def _read_file_cache(
             )
             continue
         try:
-            content = full.read_text(encoding="utf-8", errors="replace")
-            file_cache[path] = content
+            inspection = _inspect_bytes(full.read_bytes())
         except FileNotFoundError as exc:
             ledger_events.append(
                 ledger_event(
@@ -235,6 +356,7 @@ def _read_file_cache(
                     error_class=type(exc).__name__,
                 )
             )
+            continue
         except OSError as exc:
             logger.debug("Could not read file: %s", path)
             ledger_events.append(
@@ -247,7 +369,27 @@ def _read_file_cache(
                     error_class=type(exc).__name__,
                 )
             )
-    return file_cache, ledger_events
+            continue
+
+        inspections[path] = inspection
+        file_cache[path] = inspection.content
+        if inspection.llm_analysis_status == "included":
+            llm_file_cache[path] = inspection.content
+            continue
+
+        logger.info("Excluding %s from LLM analysis: %s", path, inspection.llm_skip_reason)
+        ledger_events.append(
+            ledger_event(
+                outcome=LedgerOutcome.SKIPPED,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="llm_eligibility",
+                path=path,
+                reason=LedgerReason.BINARY_CONTENT,
+                observed_bytes=file_stat.st_size,
+            )
+        )
+
+    return file_cache, llm_file_cache, inspections, ledger_events
 
 
 def _parse_manifest(skill_dir: Path) -> dict[str, object]:
@@ -319,15 +461,16 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     skill_dir = _resolve_skill_dir(state)
 
     components, discovery_events = _walk_skill_files(skill_dir)
-    file_cache, cache_events = _read_file_cache(skill_dir, components)
+    file_cache, llm_file_cache, inspections, cache_events = _read_file_cache(skill_dir, components)
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(
-        skill_dir, components, file_cache
+        skill_dir, components, inspections, file_cache
     )
 
     return {
         "components": components,
         "file_cache": file_cache,
+        "llm_file_cache": llm_file_cache,
         "inspection_ledger": [*discovery_events, *cache_events],
         "ast_cache": {},
         "manifest": manifest,
