@@ -55,7 +55,10 @@ def _is_local_target(target: str) -> bool:
     if stripped.startswith(("\\\\", "//")):
         return True
 
-    candidate = Path(stripped).expanduser()
+    try:
+        candidate = Path(stripped).expanduser()
+    except RuntimeError:
+        return True
     if candidate.is_absolute() or candidate.drive:
         return True
     if "://" in stripped:
@@ -95,8 +98,11 @@ async def run_scan(
     """
     if output_format not in VALID_FORMATS:
         raise ValueError(f"output_format must be one of {VALID_FORMATS}, got {output_format!r}")
-    if not allow_local_targets and _is_local_target(target):
-        raise ValueError("local targets are disabled for this MCP transport")
+    if not allow_local_targets:
+        local_target = _is_local_target(target)
+        local_yara_rules = yara_rules_dir is not None and _is_local_target(yara_rules_dir)
+        if local_target or local_yara_rules:
+            raise ValueError("local targets are disabled for this MCP transport")
 
     llm_available, _ = is_llm_available()
     llm_used = use_llm and llm_available
@@ -207,7 +213,7 @@ def build_server(name: str = "skillspector", *, allow_local_targets: bool = Fals
 
 def run(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
     """Run the MCP server over ``stdio`` (local agents) or ``http`` (remote/A2A)."""
-    server = build_server(allow_local_targets=transport != "http")
+    server = build_server(allow_local_targets=transport == "stdio")
     if transport == "stdio":
         server.run(transport="stdio")
     elif transport == "http":

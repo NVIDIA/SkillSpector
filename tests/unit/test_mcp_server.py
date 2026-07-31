@@ -252,6 +252,24 @@ async def test_run_scan_rejects_file_url_when_local_targets_disallowed(
     assert graph_ainvoke.await_count == 0
 
 
+async def test_run_scan_rejects_local_yara_rules_when_targets_are_disallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The HTTP policy covers local YARA configuration as well as scan targets."""
+    graph_ainvoke = AsyncMock()
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+
+    with pytest.raises(ValueError, match="local targets are disabled"):
+        await run_scan(
+            "https://example.com/skills/safe.git",
+            allow_local_targets=False,
+            yara_rules_dir=str(tmp_path),
+        )
+
+    assert graph_ainvoke.await_count == 0
+
+
 @pytest.mark.parametrize(
     ("target", "expected"),
     [
@@ -277,6 +295,19 @@ def test_is_local_target_checks_relative_paths_from_cwd(
 
     assert mcp_server._is_local_target("skill") is True
     assert mcp_server._is_local_target("missing-skill") is False
+
+
+def test_is_local_target_fails_closed_when_home_cannot_be_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolvable tilde paths remain local instead of leaking a runtime error."""
+
+    def fail_to_expanduser(self: Path) -> Path:
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(Path, "expanduser", fail_to_expanduser)
+
+    assert mcp_server._is_local_target("~nosuchuser/skill") is True
 
 
 async def test_run_scan_allows_remote_target_when_local_targets_disallowed(
@@ -357,6 +388,29 @@ def test_run_passes_transport_local_target_policy(
         server.run.assert_called_once_with(transport="streamable-http")
     else:
         server.run.assert_called_once_with(transport="stdio")
+
+
+def test_run_rejects_unknown_transport_without_allowing_local_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown transports fail closed before a server can start."""
+    captured: dict[str, bool] = {}
+    server = SimpleNamespace(
+        settings=SimpleNamespace(host=None, port=None),
+        run=MagicMock(),
+    )
+
+    def fake_build_server(*, allow_local_targets: bool = False):
+        captured["allow_local_targets"] = allow_local_targets
+        return server
+
+    monkeypatch.setattr(mcp_server, "build_server", fake_build_server)
+
+    with pytest.raises(ValueError, match="transport must be"):
+        mcp_server.run(transport="sse")
+
+    assert captured["allow_local_targets"] is False
+    server.run.assert_not_called()
 
 
 async def test_build_server_registers_scan_skill() -> None:
