@@ -86,6 +86,45 @@ def test_graph_excludes_valid_oms_signature_from_static_findings(tmp_path: Path)
     assert all(issue["file"] != "skill.oms.sig" for issue in report["issues"])
 
 
+@pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
+def test_graph_reports_oms_scope_exclusion_in_every_non_json_format(
+    tmp_path: Path, output_format: str
+) -> None:
+    """OMS scope exclusions remain visible in every user-facing report format."""
+    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
+    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
+    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = graph.invoke(
+        {
+            "skill_path": str(tmp_path),
+            "output_format": output_format,
+            "use_llm": False,
+        }
+    )
+
+    scope_exclusion = result["analysis_completeness"]["scope_exclusions"]
+    assert scope_exclusion[0]["path"] == "skill.oms.sig"
+    assert scope_exclusion[0]["reason_code"] == "oms_signature"
+
+    if output_format == "sarif":
+        notifications = result["sarif_report"]["runs"][0]["invocations"][0][
+            "toolExecutionNotifications"
+        ]
+        notification = next(
+            item for item in notifications if item["properties"]["reasonCode"] == "oms_signature"
+        )
+        assert notification["level"] == "note"
+        assert notification["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == (
+            "skill.oms.sig"
+        )
+    else:
+        expected_heading = "Scope exclusions" if output_format == "terminal" else "Scope Exclusions"
+        assert expected_heading in result["report_body"]
+        assert "oms_signature" in result["report_body"]
+        assert "skill.oms.sig" in result["report_body"]
+
+
 def test_graph_invoke_returns_findings_and_report(tmp_path: Path) -> None:
     """Graph runs to completion; returns findings, SARIF report, report_body, risk_score."""
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
