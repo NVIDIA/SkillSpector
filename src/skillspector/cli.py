@@ -386,7 +386,7 @@ def scan(
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
-            console.print_exception()
+            err_console.print_exception()
         else:
             err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
@@ -639,7 +639,7 @@ def baseline(
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
-            console.print_exception()
+            err_console.print_exception()
         else:
             err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e

@@ -756,3 +756,30 @@ def test_cli_scan_json_preserves_single_skill_contract(
     assert payload["issues"] == [{"id": "X-1", "severity": "low"}]
     assert payload["suppressed_count"] == 0
     assert payload["suppressed"] == []
+
+
+def test_scan_verbose_traceback_goes_to_stderr(tmp_path: Path) -> None:
+    """A fatal --verbose traceback belongs on stderr, so stdout stays parseable."""
+    (tmp_path / "SKILL.md").write_text("# Boom", encoding="utf-8")
+
+    with patch("skillspector.cli.graph.invoke", side_effect=RuntimeError("scan crashed")):
+        result = runner.invoke(app, ["scan", str(tmp_path), "--no-llm", "--verbose"])
+
+    assert result.exit_code == 2
+    assert "RuntimeError" in result.stderr
+    assert "RuntimeError" not in result.stdout
+
+
+def test_baseline_verbose_traceback_goes_to_stderr(tmp_path: Path) -> None:
+    """Same separation for `baseline`, which shares the generic --verbose handler."""
+    (tmp_path / "SKILL.md").write_text("# Boom", encoding="utf-8")
+
+    with patch("skillspector.cli.graph.invoke", side_effect=RuntimeError("baseline crashed")):
+        result = runner.invoke(
+            app,
+            ["baseline", str(tmp_path), "--no-llm", "--verbose", "-o", str(tmp_path / "b.yaml")],
+        )
+
+    assert result.exit_code == 2
+    assert "RuntimeError" in result.stderr
+    assert "RuntimeError" not in result.stdout
