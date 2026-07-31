@@ -168,6 +168,15 @@ class TestExcessiveAgency:
     def test_ea3_detected(self, content: str) -> None:
         assert any(f.rule_id == "EA3" for f in ea_mod.analyze(content, "SKILL.md", "markdown"))
 
+    def test_ea3_direct_analyzer_accepts_license_path(self) -> None:
+        findings = ea_mod.analyze(
+            "Responsibilities are not limited to the items described above.",
+            "LICENSE",
+            "other",
+        )
+
+        assert any(f.rule_id == "EA3" for f in findings)
+
     @pytest.mark.parametrize(
         "content,filename,filetype",
         [

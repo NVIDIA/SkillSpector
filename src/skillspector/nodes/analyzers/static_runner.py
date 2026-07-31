@@ -69,12 +69,28 @@ _EVAL_DATASET_FILES = {
     "eval/dataset.yml",
 }
 
+_LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
+_LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+_LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
+
 
 def _infer_file_type(path: str) -> str:
     """Infer file type from path (extension)."""
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
+
+
+def _is_license_basename(path: str, file_type: str) -> bool:
+    """Return whether a text-like path has a conventional legal-file basename."""
+    if file_type not in _LICENSE_FILE_TYPES:
+        return False
+    basename = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if file_type == "other" and "." in basename:
+        suffix = "." + basename.rsplit(".", 1)[-1].casefold()
+        if suffix not in _LICENSE_OTHER_SUFFIXES:
+            return False
+    return _LICENSE_BASENAME.fullmatch(basename.casefold()) is not None
 
 
 _BINARY_EXTENSIONS = frozenset(
@@ -289,6 +305,9 @@ def _scan_path(path: str, content: str, pattern_modules: list) -> list[Finding]:
     for module in pattern_modules:
         raw = module.analyze(content=content, file_path=path, file_type=file_type)
         for af in raw:
+            if af.rule_id == "EA3" and _is_license_basename(path, file_type):
+                logger.debug("Filtered EA3 license boilerplate finding: %s", path)
+                continue
             if _is_env_file_reference_in_docs(af, file_type, path, content):
                 logger.debug(
                     "Filtered PE3 .env doc reference: %s in %s:%d",
