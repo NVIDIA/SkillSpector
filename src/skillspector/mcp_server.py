@@ -161,10 +161,11 @@ async def run_scan(
             cleanup_result(result)
 
 
-def build_server(name: str = "skillspector", *, allow_local_targets: bool = True) -> FastMCP:
+def build_server(name: str = "skillspector", *, allow_local_targets: bool = False) -> FastMCP:
     """Construct the FastMCP server exposing the ``scan_skill`` tool.
 
     Requires the optional ``mcp`` dependency (``pip install 'skillspector[mcp]'``).
+    Local targets stay disabled unless the caller selects a trusted transport.
     """
     try:
         from mcp.server.fastmcp import FastMCP

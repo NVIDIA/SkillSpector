@@ -342,7 +342,7 @@ def test_run_passes_transport_local_target_policy(
         run=MagicMock(),
     )
 
-    def fake_build_server(*, allow_local_targets: bool = True):
+    def fake_build_server(*, allow_local_targets: bool = False):
         captured["allow_local_targets"] = allow_local_targets
         return server
 
@@ -366,6 +366,25 @@ async def test_build_server_registers_scan_skill() -> None:
     server = mcp_server.build_server()
     tools = await server.list_tools()
     assert "scan_skill" in {tool.name for tool in tools}
+
+
+async def test_build_server_disables_local_targets_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct server construction remains fail-closed before transport selection."""
+    pytest.importorskip("mcp")
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    graph_ainvoke = AsyncMock()
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", graph_ainvoke)
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+
+    server = mcp_server.build_server()
+
+    with pytest.raises(ToolError, match="local targets are disabled"):
+        await server.call_tool("scan_skill", {"target": str(tmp_path)})
+
+    assert graph_ainvoke.await_count == 0
 
 
 async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
