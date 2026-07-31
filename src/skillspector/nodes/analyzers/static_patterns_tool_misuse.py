@@ -32,7 +32,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number, is_code_example
+from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -291,13 +291,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
-    # TM4: privileged K8s workload. Filtered through is_code_example() because
-    # privileged/hostPath fields commonly appear in SKILL.md docs and examples.
+    # TM4: privileged K8s workload. Example filtering is delegated to the runner.
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            context_text = ctx(match.start())
-            if is_code_example(context_text):
-                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -307,7 +303,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     location=loc(line_num),
                     confidence=confidence,
                     tags=tag,
-                    context=context_text,
+                    context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                 )
             )
