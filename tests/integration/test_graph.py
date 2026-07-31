@@ -75,7 +75,7 @@ def test_graph_excludes_valid_oms_signature_from_static_findings(tmp_path: Path)
         }
     ]
     assert report["analysis_completeness"]["ledger_exceptions"] == []
-    assert report["analysis_completeness"]["is_complete"] is True
+    assert report["analysis_completeness"]["execution_successful"] is True
     assert "skill.oms.sig" not in result["components"]
     assert "skill.oms.sig" not in result["file_cache"]
     assert not any(
