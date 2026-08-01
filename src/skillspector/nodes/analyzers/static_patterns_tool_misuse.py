@@ -206,7 +206,7 @@ def _is_safe_dockerfile_idiom(context: str, matched_text: str) -> bool:
 
 def _is_safe_cache_cleanup(matched_text: str) -> bool:
     """Return True for scoped cleanup of a tool-owned user cache path."""
-    match = _SAFE_CACHE_CLEANUP_RE.search(matched_text)
+    match = _SAFE_CACHE_CLEANUP_RE.fullmatch(matched_text)
     if not match:
         return False
     parts = match.group("path").split("/")

@@ -121,6 +121,30 @@ def test_cache_cleanup_multi_argument_stays_high_risk() -> None:
     assert tm1[0].severity == "HIGH"
 
 
+def test_cache_cleanup_does_not_hide_earlier_same_line_deletion() -> None:
+    findings = _scan(
+        "scripts/uninstall.sh",
+        "rm -rf ~/.ssh; rm -rf ~/.cache/tool",
+        tool_misuse_module,
+    )
+
+    tm1 = [f for f in findings if f.rule_id == "TM1"]
+    assert tm1
+    assert all(f.severity == "HIGH" for f in tm1)
+
+
+def test_cache_cleanup_does_not_hide_later_same_line_deletion() -> None:
+    findings = _scan(
+        "scripts/uninstall.sh",
+        "rm -rf ~/.cache/tool; rm -rf ~/.ssh",
+        tool_misuse_module,
+    )
+
+    tm1 = [f for f in findings if f.rule_id == "TM1"]
+    assert tm1
+    assert all(f.severity == "HIGH" for f in tm1)
+
+
 def test_negation_word_gap_does_not_hide_live_credential_instruction() -> None:
     findings = _scan(
         "SKILL.md",
