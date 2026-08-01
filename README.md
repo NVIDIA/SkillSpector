@@ -14,6 +14,7 @@ SkillSpector helps you answer: **"Is this skill safe to install?"**
 ## Documentation
 
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
+- **[OWASP AST10 coverage](docs/OWASP-AST10-COVERAGE.md)** — Revision-pinned crosswalk from SkillSpector's current rule catalog to the OWASP Agentic Skills Top 10, with rationale and gap notes.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 
 ## Features
@@ -138,6 +139,15 @@ skillspector scan https://github.com/user/my-skill
 # Scan a zip file
 skillspector scan ./my-skill.zip
 ```
+
+#### Size limits
+
+SkillSpector enforces two independent caps on remote and archive inputs to bound the impact of oversized downloads and zip bombs:
+
+- **Per-ingest cap**: `INGEST_MAX_BYTES` (100 MiB) — applied to streamed URL downloads, total uncompressed size of zip archives, and post-clone disk usage of Git repos.
+- **Zip member cap**: `INGEST_MAX_ZIP_MEMBERS` (10,000) — caps the number of entries in a single zip.
+
+Note that the per-file 1 MB analysis cap (`MAX_FILE_BYTES`) is a separate, downstream limit: it bounds what individual analyzers will read out of an already-ingested directory. The ingest caps above bound how much content can land on disk in the first place. A breach of either ingest cap fails closed with an `IngestLimitExceededError`.
 
 ### Output Formats
 
