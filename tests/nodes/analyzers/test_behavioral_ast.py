@@ -187,6 +187,97 @@ class TestDangerousChains:
         assert len(ast8) >= 1
 
 
+class TestInsecureDeserialization:
+    """AST10: deserializers that reconstruct arbitrary objects / execute code."""
+
+    def test_pickle_loads_produces_ast10(self):
+        findings = _run("import pickle\nobj = pickle.loads(data)")
+        ast10 = [f for f in findings if f.rule_id == "AST10"]
+        assert len(ast10) == 1
+        assert ast10[0].severity == "MEDIUM"
+        assert "pickle.loads" in ast10[0].message
+
+    def test_pickle_load_produces_ast10(self):
+        findings = _run('import pickle\nobj = pickle.load(open("f.pkl", "rb"))')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_marshal_loads_produces_ast10(self):
+        findings = _run("import marshal\nmarshal.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_dill_loads_produces_ast10(self):
+        findings = _run("import dill\ndill.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_jsonpickle_decode_produces_ast10(self):
+        findings = _run("import jsonpickle\njsonpickle.decode(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_pandas_read_pickle_produces_ast10(self):
+        findings = _run('import pandas as pd\ndf = pd.read_pickle("data.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_joblib_load_produces_ast10(self):
+        findings = _run('import joblib\nm = joblib.load("model.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_unsafe_load_produces_ast10(self):
+        findings = _run("import yaml\nyaml.unsafe_load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_from_import_alias_evasion(self):
+        findings = _run("from pickle import loads\nloads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    # ── yaml.load: argument-aware ─────────────────────────────────────
+
+    def test_yaml_load_without_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_kwarg_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_positional_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_unsafe_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.FullLoader)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_safe_load_no_finding(self):
+        findings = _run("import yaml\nyaml.safe_load(s)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── torch.load: argument-aware ────────────────────────────────────
+
+    def test_torch_load_without_weights_only_produces_ast10(self):
+        findings = _run('import torch\ntorch.load("model.pt")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_torch_load_with_weights_only_no_finding(self):
+        findings = _run('import torch\ntorch.load("model.pt", weights_only=True)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── numpy.load: argument-aware ────────────────────────────────────
+
+    def test_numpy_load_default_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", allow_pickle=True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    # ── no false positives on safe data parsing ───────────────────────
+
+    def test_json_loads_no_finding(self):
+        findings = _run("import json\njson.loads('{}')")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+
 class TestEdgeCases:
     def test_non_python_files_skipped(self):
         state = {
