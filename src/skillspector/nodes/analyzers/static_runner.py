@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping
 from typing import cast
@@ -121,6 +122,43 @@ _BINARY_EXTENSIONS = frozenset(
 )
 
 _NULL_BYTE_SAMPLE_SIZE = 512
+
+_SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+_SIGSTORE_CERTIFICATE_VALUE_RE = re.compile(r'("rawBytes"\s*:\s*")(?P<value>[^"\\]*)(")')
+
+
+def _mask_sigstore_certificate_bytes(path: str, content: str) -> str:
+    """Mask certificate payloads in a valid ``skill.oms.sig`` bundle.
+
+    Sigstore v0.3 stores DER certificates as base64 in ``rawBytes``. Those
+    payloads are cryptographic metadata, not executable skill content, and
+    otherwise trigger the generic long-base64 and repetition rules. Keep the
+    original offsets intact so findings in every other bundle field retain
+    correct locations.
+    """
+    if path.replace("\\", "/").rsplit("/", 1)[-1].lower() != "skill.oms.sig":
+        return content
+    try:
+        bundle = json.loads(content)
+        if bundle.get("mediaType") != _SIGSTORE_BUNDLE_MEDIA_TYPE:
+            return content
+        certificates = bundle["verificationMaterial"]["x509CertificateChain"]["certificates"]
+        certificate_values = {
+            certificate["rawBytes"]
+            for certificate in certificates
+            if isinstance(certificate, dict) and isinstance(certificate.get("rawBytes"), str)
+        }
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+        return content
+
+    def mask(match: re.Match[str]) -> str:
+        value = match.group("value")
+        if value not in certificate_values:
+            return match.group(0)
+        masked = "".join(chr(0xE000 + (index % 4096)) for index in range(len(value)))
+        return f"{match.group(1)}{masked}{match.group(3)}"
+
+    return _SIGSTORE_CERTIFICATE_VALUE_RE.sub(mask, content)
 
 
 def _is_binary_file(path: str, content: str) -> bool:
@@ -283,6 +321,7 @@ def analyzer_finding_to_finding(
 def _scan_path(path: str, content: str, pattern_modules: list) -> list[Finding]:
     """Run pattern modules for one already-applicable file path."""
     findings: list[Finding] = []
+    content = _mask_sigstore_certificate_bytes(path, content)
     file_type = _infer_file_type(path)
     is_doc_markdown = _is_documentation_markdown(path)
     is_non_executable = file_type in _NON_EXECUTABLE_FILE_TYPES

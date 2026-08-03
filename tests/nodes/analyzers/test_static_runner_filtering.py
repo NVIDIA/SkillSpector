@@ -17,11 +17,16 @@
 
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 
 from skillspector.nodes.analyzers import static_patterns_anti_refusal as ar_module
+from skillspector.nodes.analyzers import static_patterns_memory_poisoning as mp_module
 from skillspector.nodes.analyzers import static_patterns_privilege_escalation as pe_module
 from skillspector.nodes.analyzers import static_patterns_rogue_agent as ra_module
+from skillspector.nodes.analyzers import static_patterns_supply_chain as sc_module
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
 
@@ -38,6 +43,57 @@ class _RecordingModule:
     def analyze(self, *, content: str, file_path: str, file_type: str) -> list:
         self.calls.append(content)
         return []
+
+
+def _sigstore_bundle(*, extra: dict[str, str] | None = None) -> str:
+    certificates = [
+        {"rawBytes": base64.b64encode(bytes([index]) * 14_000).decode()} for index in range(1, 6)
+    ]
+    bundle = {
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {"x509CertificateChain": {"certificates": certificates}},
+        **(extra or {}),
+    }
+    return json.dumps(bundle)
+
+
+class TestSigstoreCertificateFiltering:
+    def test_valid_bundle_certificate_bytes_do_not_trigger_sc3_or_mp2(self) -> None:
+        content = _sigstore_bundle()
+        state = {"components": ["skill.oms.sig"], "file_cache": {"skill.oms.sig": content}}
+
+        findings = static_runner.run_static_patterns(state, [sc_module, mp_module])
+
+        assert not {finding.rule_id for finding in findings} & {"SC3", "MP2"}
+
+    def test_other_bundle_fields_remain_visible(self) -> None:
+        payload = base64.b64encode(b"payload" * 200).decode()
+        content = _sigstore_bundle(extra={"untrustedPayload": payload})
+        state = {"components": ["skill.oms.sig"], "file_cache": {"skill.oms.sig": content}}
+
+        findings = static_runner.run_static_patterns(state, [sc_module])
+
+        assert any(finding.rule_id == "SC3" for finding in findings)
+
+    @pytest.mark.parametrize("path", ["other.sig", "nested/signature.sig"])
+    def test_non_skill_signature_paths_are_not_exempt(self, path: str) -> None:
+        content = _sigstore_bundle()
+        state = {"components": [path], "file_cache": {path: content}}
+
+        findings = static_runner.run_static_patterns(state, [sc_module])
+
+        assert any(finding.rule_id == "SC3" for finding in findings)
+
+    def test_malformed_bundle_is_not_exempt(self) -> None:
+        payload = base64.b64encode(b"certificate" * 200).decode()
+        content = (
+            f'{{"mediaType":"{static_runner._SIGSTORE_BUNDLE_MEDIA_TYPE}","rawBytes":"{payload}"'
+        )
+        state = {"components": ["skill.oms.sig"], "file_cache": {"skill.oms.sig": content}}
+
+        findings = static_runner.run_static_patterns(state, [sc_module])
+
+        assert any(finding.rule_id == "SC3" for finding in findings)
 
 
 class TestCharacterLimit:
