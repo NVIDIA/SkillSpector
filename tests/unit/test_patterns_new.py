@@ -300,6 +300,18 @@ class TestOutputHandling:
                 "/prefix/.test(output);\n/error/i.exec(output);",
                 id="regexp_statement_before_literal_line_break",
             ),
+            pytest.param(
+                'const marker = "<!-- return";\n/error/i.exec(output);',
+                id="quoted_html_open_comment_lookalike",
+            ),
+            pytest.param(
+                'const marker = "--> return";\n/error/i.exec(output);',
+                id="quoted_html_close_comment_lookalike",
+            ),
+            pytest.param(
+                "const compared = left-- > right;\n/error/i.exec(output);",
+                id="postfix_decrement_comparison_before_literal",
+            ),
             pytest.param("return (/error/i).exec(output);", id="grouped_return"),
             pytest.param("throw (/error/i).exec(output);", id="grouped_throw"),
             pytest.param("typeof (/error/i).exec(output);", id="grouped_unary_keyword"),
@@ -433,6 +445,38 @@ class TestOutputHandling:
     )
     def test_line_comment_before_regexp_shaped_division_fails_closed(self, content: str) -> None:
         findings = oh_mod.analyze(content, "runner.ts", "typescript")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "terminator",
+        [
+            pytest.param("\n", id="lf"),
+            pytest.param("\r", id="cr"),
+            pytest.param("\r\n", id="crlf"),
+            pytest.param("\u2028", id="ls"),
+            pytest.param("\u2029", id="ps"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "content_template",
+        [
+            pytest.param(
+                "left <!-- return{terminator}/right/g.exec(output)",
+                id="html_open_comment",
+            ),
+            pytest.param(
+                "let result=left{terminator}--> return{terminator}/right/g.exec(output)",
+                id="html_close_comment",
+            ),
+        ],
+    )
+    def test_legacy_html_comment_before_regexp_shaped_division_fails_closed(
+        self, content_template: str, terminator: str
+    ) -> None:
+        content = content_template.format(terminator=terminator)
+
+        findings = oh_mod.analyze(content, "runner.js", "javascript")
 
         assert any(f.rule_id == "OH1" for f in findings)
 

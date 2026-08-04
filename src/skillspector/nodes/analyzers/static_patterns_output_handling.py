@@ -220,13 +220,14 @@ def _skip_javascript_whitespace_backward(content: str, index: int, floor: int) -
 def _javascript_whitespace_crosses_possible_line_comment(
     content: str, whitespace_start: int, whitespace_end: int, floor: int
 ) -> bool:
-    """Return whether a backward whitespace walk may have entered ``//`` text.
+    """Return whether a backward whitespace walk may have entered a line comment.
 
     A line comment ends at a JavaScript line terminator. After walking backward
     across that terminator, an accepted expression-prefix character or keyword
     at the end of the comment must not validate the following slash as a regexp
-    literal. Ordinary quoted strings are tracked so a URL on the preceding line
-    does not look like a comment. Definite comment openers fail closed. A prior
+    literal. This includes Annex B's legacy ``<!--`` opener and line-start
+    ``-->`` closer. Ordinary quoted strings are tracked so comment lookalikes on
+    the preceding line do not fail closed. Definite comment openers do. A prior
     unquoted slash only becomes ambiguous if later quoting prevents this small
     scanner from proving that a subsequent ``//`` is outside a regexp. Lines
     that inherit a multiline string, template, or block-comment state and
@@ -249,6 +250,8 @@ def _javascript_whitespace_crosses_possible_line_comment(
 
     line_prefix = content[line_start:whitespace_start]
     if "`" in line_prefix or "*/" in line_prefix:
+        return True
+    if line_prefix.lstrip().startswith("-->"):
         return True
     if last_line_break >= floor:
         terminator_start = last_line_break
@@ -278,6 +281,8 @@ def _javascript_whitespace_crosses_possible_line_comment(
                 return True
             quote = character
         elif character == "`":
+            return True
+        elif content.startswith("<!--", cursor, whitespace_start):
             return True
         elif character == "/":
             if cursor + 1 < whitespace_start and content[cursor + 1] in {"/", "*"}:
