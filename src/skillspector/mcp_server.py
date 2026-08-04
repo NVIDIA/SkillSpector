@@ -176,6 +176,11 @@ def build_server(name: str = "skillspector", *, allow_local_targets: bool = Fals
     try:
         from mcp.server.fastmcp import FastMCP
     except ModuleNotFoundError as exc:
+        if exc.name != "mcp":
+            raise ModuleNotFoundError(
+                "The installed 'mcp' package is incompatible with the SkillSpector "
+                "MCP server. Reinstall with: pip install 'skillspector[mcp]'"
+            ) from exc
         raise ModuleNotFoundError(
             "The MCP server requires the optional 'mcp' dependency. "
             "Install it with: pip install 'skillspector[mcp]'"

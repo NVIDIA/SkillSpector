@@ -441,6 +441,23 @@ async def test_build_server_disables_local_targets_by_default(
     assert graph_ainvoke.await_count == 0
 
 
+def test_build_server_reports_incompatible_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed package without FastMCP must not be reported as missing."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def import_without_fastmcp(name: str, *args: object, **kwargs: object) -> object:
+        if name == "mcp.server.fastmcp":
+            raise ModuleNotFoundError("No module named 'mcp.server.fastmcp'", name=name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_fastmcp)
+
+    with pytest.raises(ModuleNotFoundError, match="installed 'mcp' package is incompatible"):
+        mcp_server.build_server()
+
+
 async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
     """The real stdio CLI must initialize and expose the scan_skill tool."""
     pytest.importorskip("mcp")
