@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -90,47 +91,6 @@ _JAVASCRIPT_EXPRESSION_PREFIX_KEYWORDS = frozenset(
         "typeof",
         "void",
     }
-)
-_JAVASCRIPT_MUTATION_TRIVIA = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|//[^\r\n]*(?:\r\n?|\n|$))*"
-_JAVASCRIPT_ASSIGNMENT_OPERATOR = r"(?:\?\?=|&&=|\|\|=|\*\*=|>>>=|>>=|<<=|[+\-*/%&|^]?=(?!=|>))"
-_JAVASCRIPT_IDENTIFIER = r"(?:[$_]|[^\W\d])[\w$]*"
-_JAVASCRIPT_REGEXP_LITERAL = r"/(?:\\[^\r\n]|[^/\\\r\n]){1,4096}/[dgimsuvy]*"
-_JAVASCRIPT_REGEXP_CONSTRUCTOR = r"(?:new\s+)?\bRegExp\s*\([^\r\n)]{0,4096}\)"
-_JAVASCRIPT_REGEXP_INSTANCE = rf"(?:{_JAVASCRIPT_REGEXP_LITERAL}|{_JAVASCRIPT_REGEXP_CONSTRUCTOR})"
-_JAVASCRIPT_REGEXP_PROTOTYPE = r"\bRegExp\s*(?:\.\s*prototype\b|\[\s*['\"`]prototype['\"`]\s*\])"
-_JAVASCRIPT_REGEXP_PROTOTYPE_FROM_INSTANCE = (
-    rf"(?:\b(?:Object|Reflect)\s*\.\s*getPrototypeOf\s*\(\s*"
-    rf"(?:\(\s*)*{_JAVASCRIPT_REGEXP_INSTANCE}(?:\s*\))*\s*\)|"
-    rf"(?:\(\s*)*{_JAVASCRIPT_REGEXP_INSTANCE}(?:\s*\))*\s*\.\s*"
-    r"(?:__proto__\b|constructor\s*\.\s*prototype\b))"
-)
-_JAVASCRIPT_REGEXP_PROTOTYPE_EXPRESSION = (
-    rf"(?:{_JAVASCRIPT_REGEXP_PROTOTYPE}|"
-    rf"{_JAVASCRIPT_REGEXP_PROTOTYPE_FROM_INSTANCE})"
-)
-_JAVASCRIPT_UNICODE_ESCAPE_PATTERN = re.compile(
-    r"\\(?:u(?:\{(?P<braced>[0-9a-fA-F]+)\}|(?P<fixed>[0-9a-fA-F]{4}))|"
-    r"x(?P<hex>[0-9a-fA-F]{2}))"
-)
-_JAVASCRIPT_SIMPLE_STRING_CONCAT_PATTERN = re.compile(
-    r"(?P<left_quote>['\"])(?P<left>[A-Za-z_$]+)(?P=left_quote)\s*\+\s*"
-    r"(?P<right_quote>['\"])(?P<right>[A-Za-z_$]+)(?P=right_quote)"
-)
-_JAVASCRIPT_COMMENT_PATTERN = re.compile(r"/\*[\s\S]*?\*/|//[^\r\n]*")
-_JAVASCRIPT_EXEC_PROPERTY_ALIAS_PATTERN = re.compile(
-    rf"\b(?:const|let|var)\s+(?P<name>{_JAVASCRIPT_IDENTIFIER})\s*=\s*['\"`]exec['\"`]"
-)
-_JAVASCRIPT_REGEXP_INSTANCE_ALIAS_PATTERN = re.compile(
-    rf"\b(?:const|let|var)\s+(?P<target>{_JAVASCRIPT_IDENTIFIER})\s*=\s*"
-    rf"{_JAVASCRIPT_REGEXP_INSTANCE}(?=\s*(?:[;,\r\n]|$))"
-)
-_JAVASCRIPT_IDENTIFIER_ALIAS_PATTERN = re.compile(
-    rf"\b(?:const|let|var)\s+(?P<target>{_JAVASCRIPT_IDENTIFIER})\s*=\s*"
-    rf"(?P<source>{_JAVASCRIPT_IDENTIFIER})\b(?=\s*(?:[;,\r\n]|$))"
-)
-_JAVASCRIPT_IMPORT_ALIAS_PATTERN = re.compile(
-    rf"\b(?P<source>{_JAVASCRIPT_IDENTIFIER})\s+as\s+"
-    rf"(?P<target>{_JAVASCRIPT_IDENTIFIER})\b"
 )
 
 # OH1: Unvalidated Output Injection — model output used directly in dangerous sinks
@@ -241,238 +201,6 @@ def _is_javascript_source(file_path: str, file_type: str) -> bool:
     suffix_start = file_path.rfind(".")
     suffix = file_path[suffix_start:].casefold() if suffix_start >= 0 else ""
     return file_type in _JAVASCRIPT_FILE_TYPES or suffix in _JAVASCRIPT_EXTENSIONS
-
-
-def _javascript_unicode_escape_value(match: re.Match[str]) -> str:
-    """Decode a bounded JavaScript Unicode or hexadecimal escape for scanning."""
-    digits = match.group("braced") or match.group("fixed") or match.group("hex")
-    significant = digits.lstrip("0") or "0"
-    if len(significant) > 6:
-        return match.group(0)
-    value = int(significant, 16)
-    if value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
-        return match.group(0)
-    return chr(value)
-
-
-def _javascript_mutation_scan_variants(content: str) -> tuple[str, ...]:
-    """Return conservative source variants for mutation signal matching.
-
-    The raw variant prevents comment-like text inside regexp literals from
-    hiding later code. The comment-collapsed variant recognizes mutations with
-    comments inserted between JavaScript tokens. Identifier and string escapes
-    plus simple constant string concatenations are normalized in both.
-    """
-    normalized = _JAVASCRIPT_UNICODE_ESCAPE_PATTERN.sub(_javascript_unicode_escape_value, content)
-    for _ in range(4):
-        folded = _JAVASCRIPT_SIMPLE_STRING_CONCAT_PATTERN.sub(
-            lambda match: f'"{match.group("left")}{match.group("right")}"',
-            normalized,
-        )
-        if folded == normalized:
-            break
-        normalized = folded
-    without_comments = _JAVASCRIPT_COMMENT_PATTERN.sub(" ", normalized)
-    return (normalized,) if without_comments == normalized else (normalized, without_comments)
-
-
-def _javascript_expand_aliases(
-    seeds: set[str],
-    contents: tuple[str, ...],
-    *,
-    include_imports: bool = True,
-) -> frozenset[str]:
-    """Propagate simple identifier and import aliases from known seed names."""
-    aliases = set(seeds)
-    aliases_by_source: dict[str, set[str]] = {}
-    for content in contents:
-        patterns = [_JAVASCRIPT_IDENTIFIER_ALIAS_PATTERN]
-        if include_imports:
-            patterns.append(_JAVASCRIPT_IMPORT_ALIAS_PATTERN)
-        for pattern in patterns:
-            for match in pattern.finditer(content):
-                aliases_by_source.setdefault(match.group("source"), set()).add(
-                    match.group("target")
-                )
-
-    pending = list(aliases)
-    while pending:
-        source = pending.pop()
-        for target in aliases_by_source.get(source, ()):
-            if target not in aliases:
-                aliases.add(target)
-                pending.append(target)
-    return frozenset(aliases)
-
-
-def _javascript_exec_property_aliases(contents: tuple[str, ...]) -> frozenset[str]:
-    """Collect simple local or imported aliases whose constant value is ``exec``."""
-    seeds = {
-        match.group("name")
-        for content in contents
-        for match in _JAVASCRIPT_EXEC_PROPERTY_ALIAS_PATTERN.finditer(content)
-    }
-    return _javascript_expand_aliases(seeds, contents)
-
-
-def _javascript_regexp_prototype_receiver(
-    contents: tuple[str, ...],
-) -> str:
-    """Build a pattern for direct and simply aliased RegExp prototype receivers."""
-    constructor_aliases = _javascript_expand_aliases(
-        {"RegExp"}, contents, include_imports=False
-    ) - {"RegExp"}
-    needs_instance_aliases = any(
-        any(hint in content for hint in ("getPrototypeOf", "__proto__", "constructor"))
-        for content in contents
-    )
-    instance_seeds = (
-        {
-            match.group("target")
-            for content in contents
-            for match in _JAVASCRIPT_REGEXP_INSTANCE_ALIAS_PATTERN.finditer(content)
-        }
-        if needs_instance_aliases
-        else set()
-    )
-    instance_aliases = _javascript_expand_aliases(instance_seeds, contents)
-
-    prototype_expressions = [_JAVASCRIPT_REGEXP_PROTOTYPE_EXPRESSION]
-    if constructor_aliases:
-        constructors = "|".join(re.escape(alias) for alias in sorted(constructor_aliases))
-        prototype_expressions.append(
-            rf"\b(?:{constructors})\b\s*(?:\.\s*prototype\b|"
-            r"\[\s*['\"`]prototype['\"`]\s*\])"
-        )
-    if instance_aliases:
-        instances = "|".join(re.escape(alias) for alias in sorted(instance_aliases))
-        instance = rf"\b(?:{instances})\b"
-        prototype_expressions.extend(
-            (
-                rf"\b(?:Object|Reflect)\s*\.\s*getPrototypeOf\s*\(\s*{instance}\s*\)",
-                rf"{instance}\s*\.\s*(?:__proto__\b|constructor\s*\.\s*prototype\b)",
-            )
-        )
-    prototype_expression = rf"(?:{'|'.join(prototype_expressions)})"
-
-    prototype_alias_pattern = re.compile(
-        rf"\b(?:const|let|var)\s+(?P<target>{_JAVASCRIPT_IDENTIFIER})\s*=\s*"
-        rf"{prototype_expression}(?=\s*(?:[;,\r\n]|$))"
-    )
-    prototype_seeds = {
-        match.group("target")
-        for content in contents
-        for match in prototype_alias_pattern.finditer(content)
-    }
-    prototype_aliases = _javascript_expand_aliases(prototype_seeds, contents)
-    receivers = [prototype_expression]
-    if prototype_aliases:
-        aliases = "|".join(re.escape(alias) for alias in sorted(prototype_aliases))
-        receivers.append(rf"\b(?:{aliases})\b")
-    return rf"(?:{'|'.join(receivers)})"
-
-
-def _javascript_mutates_regexp_exec(
-    content: str,
-    receiver: str,
-    property_aliases: frozenset[str],
-) -> bool:
-    """Return whether *content* mutates ``exec`` on a known RegExp prototype."""
-    property_keys = [r"['\"`]exec['\"`]"]
-    computed_properties: list[str] = []
-    if property_aliases:
-        aliases = "|".join(re.escape(alias) for alias in sorted(property_aliases))
-        property_keys.append(rf"\b(?:{aliases})\b")
-        computed_properties.append(rf"\[\s*(?:{aliases})\s*\]")
-    property_key = rf"(?:{'|'.join(property_keys)})"
-    member = r"(?:\.\s*exec\b|\[\s*['\"`]exec['\"`]\s*\]"
-    if computed_properties:
-        member += rf"|{'|'.join(computed_properties)}"
-    member += ")"
-    wrapped_receiver = rf"(?:\(\s*)*{receiver}(?:\s*\))*"
-
-    patterns = (
-        rf"{wrapped_receiver}{_JAVASCRIPT_MUTATION_TRIVIA}{member}"
-        rf"{_JAVASCRIPT_MUTATION_TRIVIA}{_JAVASCRIPT_ASSIGNMENT_OPERATOR}",
-        rf"\bdelete{_JAVASCRIPT_MUTATION_TRIVIA}{wrapped_receiver}"
-        rf"{_JAVASCRIPT_MUTATION_TRIVIA}{member}",
-        rf"\b(?:Object|Reflect)\s*\.\s*(?:defineProperty|set)\s*\(\s*"
-        rf"{wrapped_receiver}\s*,\s*{property_key}\s*,",
-        rf"\bObject\s*\.\s*(?:assign|defineProperties)\s*\(\s*"
-        rf"{wrapped_receiver}\s*,\s*\{{[^}}\r\n]{{0,4096}}"
-        rf"(?:\bexec\s*:|['\"`]exec['\"`]\s*:"
-        rf"|\[\s*{property_key}\s*\]\s*:)",
-        rf"{wrapped_receiver}{_JAVASCRIPT_MUTATION_TRIVIA}\.\s*"
-        rf"__define(?:Getter|Setter)__\s*\(\s*{property_key}\s*,",
-    )
-    return any(re.search(pattern, content, re.MULTILINE) for pattern in patterns)
-
-
-def _javascript_regexp_exec_mutation_possible(contents: tuple[str, ...]) -> bool:
-    """Return whether visible code may replace the method used by regexp literals.
-
-    Prototype acquisition and mutation may occur in different components, so
-    the graph node evaluates these signals across the complete scanned skill.
-    The public ``analyze`` helper applies the same rule within a single source.
-    """
-    if not contents:
-        return False
-    if not any(
-        any(
-            hint in content
-            for hint in ("RegExp", "getPrototypeOf", "__proto__", "constructor", "\\u", "\\x")
-        )
-        for content in contents
-    ):
-        return False
-    if not any(
-        any(
-            hint in content
-            for hint in (
-                "=",
-                "delete",
-                "defineProperty",
-                "defineProperties",
-                "assign",
-                "set",
-                "__define",
-            )
-        )
-        for content in contents
-    ):
-        return False
-
-    scan_contents = tuple(
-        dict.fromkeys(
-            variant
-            for content in contents
-            for variant in _javascript_mutation_scan_variants(content)
-        )
-    )
-    property_aliases = _javascript_exec_property_aliases(scan_contents)
-    receiver = _javascript_regexp_prototype_receiver(scan_contents)
-    return any(
-        _javascript_mutates_regexp_exec(content, receiver, property_aliases)
-        for content in scan_contents
-    )
-
-
-class _OutputHandlingPatternAdapter:
-    """Bind whole-skill mutation context to the generic static runner contract."""
-
-    ANALYZER_ID = "static_patterns_output_handling"
-
-    def __init__(self, regexp_exec_mutation_possible: bool) -> None:
-        self._regexp_exec_mutation_possible = regexp_exec_mutation_possible
-
-    def analyze(self, *, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-        """Analyze one component with whole-skill RegExp mutation context."""
-        return analyze(
-            content,
-            file_path,
-            file_type,
-            regexp_exec_mutation_possible=self._regexp_exec_mutation_possible,
-        )
 
 
 def _skip_javascript_whitespace_backward(content: str, index: int, floor: int) -> int:
@@ -649,6 +377,12 @@ def _is_javascript_regexp_literal_exec(
     and parentheses around the literal. It deliberately rejects comments and
     a parenthesized function argument such as ``makeRunner(/x/).exec(output)``.
     Contexts that require matching an earlier control header remain findings.
+
+    This is a syntactic classification of the ordinary built-in method. Raw
+    cross-file source cannot establish whether, or when, another component
+    mutates JavaScript intrinsics; correlating those strings here would turn
+    uncertainty into an unverified HIGH finding at this call site. Prototype
+    mutation belongs in a separate parser-backed rule with data-flow context.
     """
     if not _is_javascript_source(file_path, file_type):
         return False
@@ -786,20 +520,9 @@ def _analyze_python_subprocess_calls(
     return findings
 
 
-def analyze(
-    content: str,
-    file_path: str,
-    file_type: str,
-    *,
-    regexp_exec_mutation_possible: bool | None = None,
-) -> list[AnalyzerFinding]:
+def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for output handling patterns (OH1–OH3)."""
     findings: list[AnalyzerFinding] = []
-
-    if regexp_exec_mutation_possible is None:
-        regexp_exec_mutation_possible = _is_javascript_source(
-            file_path, file_type
-        ) and _javascript_regexp_exec_mutation_possible((content,))
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -811,10 +534,8 @@ def analyze(
 
     for pattern, confidence in OH1_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            if (
-                pattern == _EXEC_OUTPUT_PATTERN
-                and not regexp_exec_mutation_possible
-                and _is_javascript_regexp_literal_exec(content, match, file_path, file_type)
+            if pattern == _EXEC_OUTPUT_PATTERN and _is_javascript_regexp_literal_exec(
+                content, match, file_path, file_type
             ):
                 continue
             line_num = get_line_number(content, match.start())
@@ -878,26 +599,6 @@ def analyze(
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run output_handling patterns and return findings."""
-    components: list[str] = state.get("components") or []
-    file_cache: dict[str, str] = state.get("file_cache") or {}
-    javascript_contents: list[str] = []
-    has_uninspected_javascript = False
-    for path in components:
-        if not _is_javascript_source(path, ""):
-            continue
-        content = file_cache.get(path)
-        if (
-            content is None
-            or len(content) > static_runner.MAX_FILE_CHARS
-            or "\x00" in content[:512]
-        ):
-            has_uninspected_javascript = True
-        else:
-            javascript_contents.append(content)
-    adapter = _OutputHandlingPatternAdapter(
-        has_uninspected_javascript
-        or _javascript_regexp_exec_mutation_possible(tuple(javascript_contents))
-    )
-    response = static_runner.run_static_patterns_with_ledger(state, [adapter])
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response

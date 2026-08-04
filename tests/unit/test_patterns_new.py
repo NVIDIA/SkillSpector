@@ -391,176 +391,6 @@ class TestOutputHandling:
         assert any(f.rule_id == "OH1" for f in findings)
 
     @pytest.mark.parametrize(
-        "mutation",
-        [
-            pytest.param("RegExp.prototype.exec = eval;", id="direct_assignment"),
-            pytest.param('RegExp.prototype["exec"] = eval;', id="bracket_assignment"),
-            pytest.param("RegExp.prototype[`exec`] = eval;", id="template_key_assignment"),
-            pytest.param(
-                'Object.defineProperty(RegExp.prototype, "exec", { value: eval });',
-                id="define_property",
-            ),
-            pytest.param(
-                'Reflect.defineProperty(RegExp.prototype, "exec", { value: eval });',
-                id="reflect_define_property",
-            ),
-            pytest.param(
-                "Object.defineProperties(RegExp.prototype, { exec: { value: eval } });",
-                id="define_properties",
-            ),
-            pytest.param(
-                'Reflect.set(RegExp.prototype, "exec", eval);',
-                id="reflect_set",
-            ),
-            pytest.param(
-                "Object.assign(RegExp.prototype, { exec: eval });",
-                id="object_assign",
-            ),
-            pytest.param(
-                "const regexPrototype = RegExp.prototype; regexPrototype.exec = eval;",
-                id="prototype_alias",
-            ),
-            pytest.param(
-                "const π = RegExp.prototype; π.exec = eval;",
-                id="unicode_prototype_alias",
-            ),
-            pytest.param(
-                "const NativeRegExp = RegExp; NativeRegExp.prototype.exec = eval;",
-                id="constructor_alias",
-            ),
-            pytest.param(
-                "const regexPrototype = Object.getPrototypeOf(/x/); regexPrototype.exec = eval;",
-                id="get_prototype_alias",
-            ),
-            pytest.param(
-                "const regexPrototype = /x/.__proto__; regexPrototype.exec = eval;",
-                id="legacy_proto_alias",
-            ),
-            pytest.param(
-                "const regex = /x/; regex.__proto__.exec = eval;",
-                id="regexp_instance_alias",
-            ),
-            pytest.param(
-                "const regexPrototype = Object.getPrototypeOf(new RegExp()); "
-                "regexPrototype.exec = eval;",
-                id="constructor_instance_alias",
-            ),
-            pytest.param(
-                "Object.getPrototypeOf(/x/).exec = eval;",
-                id="direct_get_prototype",
-            ),
-            pytest.param(
-                "(/x/).constructor.prototype.exec = eval;",
-                id="literal_constructor_prototype",
-            ),
-            pytest.param(
-                "Object.prototype.exec = eval; delete RegExp.prototype.exec;",
-                id="delete_to_inherited_exec",
-            ),
-            pytest.param(
-                "RegExp /* gap */ . /* gap */ prototype . /* gap */ exec /* gap */ = eval;",
-                id="comment_separated_assignment",
-            ),
-            pytest.param(
-                r"RegExp.prot\u006ftype.ex\u0065c = eval;",
-                id="identifier_unicode_escapes",
-            ),
-            pytest.param(
-                r'RegExp["prot\u006ftype"]["ex\u0065c"] = eval;',
-                id="string_unicode_escapes",
-            ),
-            pytest.param(
-                'const property = "exec"; RegExp.prototype[property] = eval;',
-                id="computed_property_alias",
-            ),
-            pytest.param(
-                'const property = "ex" + "ec"; RegExp.prototype[property] = eval;',
-                id="concatenated_property_alias",
-            ),
-            pytest.param(
-                'Object.defineProperty(RegExp.prototype, "ex" + "ec", { value: eval });',
-                id="computed_define_property",
-            ),
-            pytest.param(
-                'RegExp.prototype.__defineGetter__("exec", () => eval);',
-                id="legacy_define_getter",
-            ),
-        ],
-    )
-    def test_regexp_literal_exec_fails_closed_when_prototype_may_be_mutated(
-        self, mutation: str
-    ) -> None:
-        content = f'{mutation}\nconst output = "globalThis.compromised = true";\n/x/.exec(output);'
-
-        findings = oh_mod.analyze(content, "attack.js", "javascript")
-
-        assert any(f.rule_id == "OH1" for f in findings)
-
-    def test_regexp_exec_prototype_mutation_fails_closed_across_files(self) -> None:
-        response = oh_mod.node(
-            {
-                "components": ["prototype.js", "mutation.js", "parser.js"],
-                "file_cache": {
-                    "prototype.js": "export const regexPrototype = RegExp.prototype;",
-                    "mutation.js": (
-                        'import { regexPrototype } from "./prototype.js";\n'
-                        "regexPrototype.exec = eval;"
-                    ),
-                    "parser.js": (
-                        'const output = "globalThis.compromised = true";\n/x/.exec(output);'
-                    ),
-                },
-            }
-        )
-
-        assert any(
-            finding.rule_id == "OH1" and finding.file == "parser.js"
-            for finding in response["findings"]
-        )
-
-    def test_unrelated_exec_assignment_does_not_disable_regexp_literal_exemption(
-        self,
-    ) -> None:
-        response = oh_mod.node(
-            {
-                "components": ["runner.js", "parser.js"],
-                "file_cache": {
-                    "runner.js": "runner.exec = handler;",
-                    "parser.js": "const match = /x/.exec(output);",
-                },
-            }
-        )
-
-        assert not any(finding.rule_id == "OH1" for finding in response["findings"])
-
-    def test_reading_regexp_prototype_does_not_disable_literal_exemption(self) -> None:
-        response = oh_mod.node(
-            {
-                "components": ["introspection.js", "parser.js"],
-                "file_cache": {
-                    "introspection.js": "const descriptor = RegExp.prototype.exec;",
-                    "parser.js": "const match = /x/.exec(output);",
-                },
-            }
-        )
-
-        assert not any(finding.rule_id == "OH1" for finding in response["findings"])
-
-    def test_unrelated_prototype_read_and_exec_write_do_not_combine(self) -> None:
-        response = oh_mod.node(
-            {
-                "components": ["introspection.js", "runner.js", "parser.js"],
-                "file_cache": {
-                    "introspection.js": "const descriptor = RegExp.prototype.exec;",
-                    "runner.js": "runner.exec = handler;",
-                    "parser.js": "const match = /x/.exec(output);",
-                },
-            }
-        )
-
-        assert not any(finding.rule_id == "OH1" for finding in response["findings"])
-
-    @pytest.mark.parametrize(
         "uninspected_content",
         [
             pytest.param(None, id="missing_cache_entry"),
@@ -571,7 +401,7 @@ class TestOutputHandling:
             ),
         ],
     )
-    def test_uninspected_javascript_sibling_fails_closed(
+    def test_uninspected_sibling_does_not_invent_oh1_at_regexp_call(
         self, uninspected_content: str | None
     ) -> None:
         file_cache = {"parser.js": "const match = /x/.exec(output);"}
@@ -585,10 +415,27 @@ class TestOutputHandling:
             }
         )
 
-        assert any(
+        assert not any(
             finding.rule_id == "OH1" and finding.file == "parser.js"
             for finding in response["findings"]
         )
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            pytest.param(
+                'const note = "RegExp.prototype.exec = eval;";',
+                id="string_literal",
+            ),
+            pytest.param("// RegExp.prototype.exec = eval;", id="line_comment"),
+        ],
+    )
+    def test_mutation_shaped_text_does_not_invent_oh1_at_regexp_call(self, context: str) -> None:
+        content = f"{context}\nconst match = /x/.exec(output);"
+
+        findings = oh_mod.analyze(content, "parser.js", "javascript")
+
+        assert not any(f.rule_id == "OH1" for f in findings)
 
     def test_python_exec_remains_output_injection(self) -> None:
         findings = oh_mod.analyze("exec(output)", "runner.py", "python")
