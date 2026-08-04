@@ -263,6 +263,14 @@ class TestOutputHandling:
             pytest.param("const match = ((/error/i)).exec(output);", id="parenthesized"),
             pytest.param("const match = /error/i\n  .exec(output);", id="line_broken"),
             pytest.param(r"const match = /[\/]/u.exec(output);", id="character_class_slash"),
+            pytest.param(
+                r"const match = /[/]/u.exec(output);",
+                id="character_class_unescaped_slash",
+            ),
+            pytest.param(
+                r"const match = /[[A-z]--_]/v.exec(output);",
+                id="unicode_sets_nested_class",
+            ),
             pytest.param("const match = (/error/i)?.exec(output);", id="optional_chain"),
             pytest.param(
                 'const url = "https://example.test"; const match = /error/i.exec(output);',
