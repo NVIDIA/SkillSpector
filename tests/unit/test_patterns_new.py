@@ -244,6 +244,197 @@ class TestOutputHandling:
     def test_oh1_detected(self, content: str, filename: str, filetype: str) -> None:
         assert any(f.rule_id == "OH1" for f in oh_mod.analyze(content, filename, filetype))
 
+    def test_reported_regexp_literal_exec_is_not_output_injection(self) -> None:
+        content = r"const match = /Process exited with code\s+(-?\d+)/u.exec(output);"
+
+        findings = oh_mod.analyze(content, "scripts/importers/codex.ts", "typescript")
+
+        assert not any(f.rule_id == "OH1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param("return /error/i.exec(output);", id="return_expression"),
+            pytest.param("const parse = () => /error/i.exec(output);", id="arrow_expression"),
+            pytest.param(
+                "const match = condition ? /yes/.exec(output) : null;",
+                id="conditional_expression",
+            ),
+            pytest.param("const match = ((/error/i)).exec(output);", id="parenthesized"),
+            pytest.param("const match = /error/i\n  .exec(output);", id="line_broken"),
+            pytest.param(r"const match = /[\/]/u.exec(output);", id="character_class_slash"),
+            pytest.param("const match = (/error/i)?.exec(output);", id="optional_chain"),
+            pytest.param(
+                'const url = "https://example.test"; const match = /error/i.exec(output);',
+                id="url_string_before_literal",
+            ),
+            pytest.param(
+                'const url = "https://example.test"; const match = /error/i\n  .exec(output);',
+                id="url_string_before_line_break",
+            ),
+            pytest.param("return (/error/i).exec(output);", id="grouped_return"),
+            pytest.param("throw (/error/i).exec(output);", id="grouped_throw"),
+            pytest.param("typeof (/error/i).exec(output);", id="grouped_unary_keyword"),
+            pytest.param("return !/error/i.exec(output);", id="unary_not"),
+            pytest.param("return\u00a0/error/i.exec(output);", id="unicode_whitespace"),
+        ],
+    )
+    def test_regexp_literal_exec_is_not_output_injection(self, content: str) -> None:
+        findings = oh_mod.analyze(content, "parser.ts", "typescript")
+
+        assert not any(f.rule_id == "OH1" for f in findings)
+
+    @pytest.mark.parametrize("filename", ["parser.mjs", "parser.tsx"])
+    def test_regexp_literal_exec_recognizes_javascript_family_extensions(
+        self, filename: str
+    ) -> None:
+        findings = oh_mod.analyze("const match = /error/i.exec(output);", filename, "other")
+
+        assert not any(f.rule_id == "OH1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param("child_process.exec(output)", id="child_process"),
+            pytest.param("child_process .\n exec ( output )", id="child_process_spaced"),
+            pytest.param("exec(output)", id="imported_exec_alias"),
+            pytest.param("runner.exec(output)", id="unknown_exec_method"),
+            pytest.param(
+                "const ratio = left / right; child_process.exec(output)", id="nearby_division"
+            ),
+            pytest.param("left/right/g.exec(output)", id="division_short_receiver"),
+            pytest.param("left/right/g?.exec(output)", id="division_optional_receiver"),
+            pytest.param("left++/right/g.exec(output)", id="postfix_increment"),
+            pytest.param("left--/right/g.exec(output)", id="postfix_decrement"),
+            pytest.param("left!/right/g.exec(output)", id="non_null_identifier"),
+            pytest.param('"left"!/right/g.exec(output)', id="non_null_string"),
+            pytest.param("`left`!/right/g.exec(output)", id="non_null_template"),
+            pytest.param("/left/!/right/g.exec(output)", id="non_null_regexp"),
+            pytest.param("left!!!/right/g.exec(output)", id="chained_non_null"),
+            pytest.param("const z = <div/>/right/g.exec(output)", id="jsx_element"),
+            pytest.param("fn<T>/right/g.exec(output)", id="typescript_instantiation"),
+            pytest.param("obj.return/right/g.exec(output)", id="keyword_property"),
+            pytest.param("obj?.await/right/g.exec(output)", id="optional_keyword_property"),
+            pytest.param(
+                "class C { #return = 8; run(right, g, output) { "
+                "return this.#return/right/g.exec(output); } }",
+                id="private_keyword_field",
+            ),
+            pytest.param("of/right/g.exec(output)", id="contextual_of_identifier"),
+            pytest.param("await/right/g.exec(output)", id="contextual_await_identifier"),
+            pytest.param("yield/right/g.exec(output)", id="contextual_yield_identifier"),
+            pytest.param("x\u200creturn/right/g.exec(output)", id="zwnj_identifier"),
+            pytest.param("x\u0301return/right/g.exec(output)", id="combining_mark_identifier"),
+            pytest.param(
+                "x\u037areturn/right/g.exec(output)",
+                id="javascript_id_continue_not_python_xid",
+            ),
+            pytest.param(
+                r"x\u{37A}return/right/g.exec(output)",
+                id="braced_unicode_escape_identifier",
+            ),
+            pytest.param(
+                r"x\u{00000037A}return/right/g.exec(output)",
+                id="long_braced_unicode_escape_identifier",
+            ),
+            pytest.param("makeRunner(/x/).exec(output)", id="call_result_exec"),
+            pytest.param('"/x/".exec(output)', id="slash_shaped_string"),
+            pytest.param("/x/.EXEC(output)", id="uppercase_custom_method"),
+            pytest.param("/x/.Exec(output)", id="mixed_case_custom_method"),
+            pytest.param(
+                "return left / /x=/ /g.exec(output);",
+                id="nested_regexp_closing_slash_before_division",
+            ),
+            pytest.param(
+                "const t = `${left / /x=/ /g.exec(output)}`;",
+                id="nested_regexp_closing_slash_in_template_expression",
+            ),
+            pytest.param(
+                "return /[/*]*/ /right/g.exec(output);",
+                id="regexp_block_comment_lookalike_before_division",
+            ),
+            pytest.param(
+                "return /[ //]+/\n/right/g.exec(output);",
+                id="regexp_line_comment_lookalike_before_division",
+            ),
+            pytest.param(
+                "const r = /[/x/. //]+/;\nexec(output);",
+                id="regexp_line_comment_lookalike_before_standalone_exec",
+            ),
+            pytest.param(
+                "const r = /[/x/. /*]*/\nexec(output);",
+                id="regexp_block_comment_lookalike_before_standalone_exec",
+            ),
+        ],
+    )
+    def test_dangerous_exec_sinks_remain_output_injection(self, content: str) -> None:
+        findings = oh_mod.analyze(content, "runner.ts", "typescript")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                "const match = /error/i /* parsing only */ .exec(output);",
+                id="block_comment",
+            ),
+            pytest.param(
+                "const match = /error/i // parsing only\n  .exec(output);",
+                id="line_comment",
+            ),
+        ],
+    )
+    def test_comment_separated_regexp_exec_fails_closed(self, content: str) -> None:
+        findings = oh_mod.analyze(content, "parser.ts", "typescript")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    def test_python_exec_remains_output_injection(self) -> None:
+        findings = oh_mod.analyze("exec(output)", "runner.py", "python")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    def test_regexp_literal_detection_remains_bounded_on_large_files(self) -> None:
+        suffix = "\nreturn /error/i.exec(output);"
+        content = ("x" * (1_000_000 - len(suffix))) + suffix
+
+        findings = oh_mod.analyze(content, "parser.ts", "typescript")
+
+        assert not any(f.rule_id == "OH1" for f in findings)
+
+    def test_regexp_literal_detection_fails_closed_at_lookback_boundary(self) -> None:
+        middle = "a" * (oh_mod._JAVASCRIPT_REGEXP_LOOKBACK_CHARS - 11)
+        content = f"xreturn /{middle}/g.exec(output);"
+
+        findings = oh_mod.analyze(content, "runner.ts", "typescript")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    def test_braced_unicode_identifier_escape_fails_closed_at_lookback_boundary(
+        self,
+    ) -> None:
+        zeros = "0" * (oh_mod._JAVASCRIPT_REGEXP_LOOKBACK_CHARS + 1)
+        content = rf"x\u{{{zeros}37A}}return/right/g.exec(output)"
+
+        findings = oh_mod.analyze(content, "runner.ts", "typescript")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    def test_regexp_literal_detection_scans_escape_runs_linearly(self) -> None:
+        regexp = "/" + ("\\" * 3_500) + "x/"
+        content = "\n".join(f"const match{index} = {regexp}.exec(output);" for index in range(10))
+
+        with patch.object(
+            oh_mod,
+            "_is_javascript_character_escaped",
+            wraps=oh_mod._is_javascript_character_escaped,
+        ) as escape_check:
+            findings = oh_mod.analyze(content, "parser.ts", "typescript")
+
+        assert not any(f.rule_id == "OH1" for f in findings)
+        assert escape_check.call_count <= 30
+
     def test_oh1_confidence_boost_for_python(self) -> None:
         findings = oh_mod.analyze('exec(response["code"])', "runner.py", "python")
         oh1 = [f for f in findings if f.rule_id == "OH1"]
