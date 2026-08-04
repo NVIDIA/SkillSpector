@@ -1,3 +1,20 @@
+### 2.5.2 (Tuesday, August 04, 2026)
+### Features/Bug Fixes
+* test(mp2): lock the layout-span guard against regressions (#342)
+* fix(nv_build): cover reported model metadata (#279)
+* (chore) pin dependencies for workflows and Docker base images (#238)
+* fix(analyzer): reduce instructional-prose false positives in static scans (#103) (#232)
+* fix(input-handler): bound URL, zip, and git ingest paths (#164)
+* fix: read exact versions from Python lockfiles for OSV (#263)
+* feat(mcp): add registry posture scanning (#280)
+* fix: exclude valid OMS signatures from content analysis (#261)
+* fix(static): markdown table and quote syntax is not an execution signal (#321)
+* fix(agent-cli): Windows temp-cwd cleanup must not fail a successful batch (#317)
+* fix(supply-chain): SC4 must not claim a vulnerability it did not verify (#319)
+* docs: link to the Verified Skills pipeline and hosted docs (#347)
+* test(release): make changelog assertions version-aware
+* fix(release): harden patch publishing and changelog baseline
+---
 ### 2.5.1 (Thursday, July 30, 2026)
 ### Features/Bug Fixes
 * feat(llm): configurable analyzer fan-out concurrency via SKILLSPECTOR_MAX_LLM_CONCURRENCY (part of #303) (#305)
