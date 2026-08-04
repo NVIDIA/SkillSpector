@@ -30,6 +30,7 @@ import pytest
 from skillspector.constants import MODEL_CONFIG
 from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
+from skillspector.providers.openai import OpenAIProvider
 from skillspector.state import SkillspectorState
 
 _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
@@ -174,6 +175,23 @@ def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
 
     assert result["model_config"]["default"] == "bound-default"
     assert result["model_config"]["meta_analyzer"] == "bound-meta"
+
+
+def test_build_context_model_config_matches_openai_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in (
+        "SKILLSPECTOR_PROVIDER",
+        "SKILLSPECTOR_MODEL",
+        "NVIDIA_INFERENCE_KEY",
+        "NVIDIA_INFERENCE_METADATA_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
 def test_build_context_inventories_but_excludes_valid_root_oms_signature(
