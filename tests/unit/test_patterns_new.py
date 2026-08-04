@@ -262,6 +262,10 @@ class TestOutputHandling:
             ),
             pytest.param("const match = ((/error/i)).exec(output);", id="parenthesized"),
             pytest.param("const match = /error/i\n  .exec(output);", id="line_broken"),
+            pytest.param(
+                "const match =\n  /error/i.exec(output);",
+                id="literal_after_assignment_line_break",
+            ),
             pytest.param(r"const match = /[\/]/u.exec(output);", id="character_class_slash"),
             pytest.param(
                 r"const match = /[/]/u.exec(output);",
@@ -279,6 +283,22 @@ class TestOutputHandling:
             pytest.param(
                 'const url = "https://example.test"; const match = /error/i\n  .exec(output);',
                 id="url_string_before_line_break",
+            ),
+            pytest.param(
+                'const url = "https://example.test";\n/error/i.exec(output);',
+                id="url_string_statement_before_literal_line_break",
+            ),
+            pytest.param(
+                "const prior = 8 / 2;\n/error/i.exec(output);",
+                id="division_statement_before_literal_line_break",
+            ),
+            pytest.param(
+                "const match = 8 / 2 +\n/error/i.exec(output);",
+                id="division_before_multiline_literal_operand",
+            ),
+            pytest.param(
+                "/prefix/.test(output);\n/error/i.exec(output);",
+                id="regexp_statement_before_literal_line_break",
             ),
             pytest.param("return (/error/i).exec(output);", id="grouped_return"),
             pytest.param("throw (/error/i).exec(output);", id="grouped_throw"),
@@ -376,6 +396,50 @@ class TestOutputHandling:
         ],
     )
     def test_dangerous_exec_sinks_remain_output_injection(self, content: str) -> None:
+        findings = oh_mod.analyze(content, "runner.ts", "typescript")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param("left // TODO:\n/right/g.exec(output)", id="punctuation_lf"),
+            pytest.param("left // return\n/right/g.exec(output)", id="keyword_lf"),
+            pytest.param("left // TODO:\r/right/g.exec(output)", id="punctuation_cr"),
+            pytest.param("left // TODO:\r\n/right/g.exec(output)", id="punctuation_crlf"),
+            pytest.param("left // TODO:\u2028/right/g.exec(output)", id="punctuation_ls"),
+            pytest.param("left // TODO:\u2029/right/g.exec(output)", id="punctuation_ps"),
+            pytest.param(
+                "left / /'/.source // ':\n/right/g.exec(output)",
+                id="comment_after_regexp_quote",
+            ),
+            pytest.param(
+                "/* open\n' */ left // ':\n/right/g.exec(output)",
+                id="comment_after_multiline_block_comment_quote",
+            ),
+            pytest.param(
+                "const value = 'continued\\\n'; left // ':\n/right/g.exec(output)",
+                id="comment_after_continued_string_quote",
+            ),
+            pytest.param(
+                "const value = 'continued\\\r\n'; left // ':\r\n/right/g.exec(output)",
+                id="comment_after_crlf_continued_string_quote",
+            ),
+            pytest.param(
+                "const value = `continued\n'`; left // ':\n/right/g.exec(output)",
+                id="comment_after_multiline_template_quote",
+            ),
+        ],
+    )
+    def test_line_comment_before_regexp_shaped_division_fails_closed(self, content: str) -> None:
+        findings = oh_mod.analyze(content, "runner.ts", "typescript")
+
+        assert any(f.rule_id == "OH1" for f in findings)
+
+    def test_line_comment_detection_fails_closed_at_lookback_boundary(self) -> None:
+        prefix = "x" * (oh_mod._JAVASCRIPT_REGEXP_LOOKBACK_CHARS + 32)
+        content = f"{prefix} // return\n/right/g.exec(output)"
+
         findings = oh_mod.analyze(content, "runner.ts", "typescript")
 
         assert any(f.rule_id == "OH1" for f in findings)

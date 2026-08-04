@@ -217,6 +217,77 @@ def _skip_javascript_whitespace_backward(content: str, index: int, floor: int) -
     return index
 
 
+def _javascript_whitespace_crosses_possible_line_comment(
+    content: str, whitespace_start: int, whitespace_end: int, floor: int
+) -> bool:
+    """Return whether a backward whitespace walk may have entered ``//`` text.
+
+    A line comment ends at a JavaScript line terminator. After walking backward
+    across that terminator, an accepted expression-prefix character or keyword
+    at the end of the comment must not validate the following slash as a regexp
+    literal. Ordinary quoted strings are tracked so a URL on the preceding line
+    does not look like a comment. Definite comment openers fail closed. A prior
+    unquoted slash only becomes ambiguous if later quoting prevents this small
+    scanner from proving that a subsequent ``//`` is outside a regexp. Lines
+    that inherit a multiline string, template, or block-comment state and
+    truncated lines also fail closed.
+    """
+    whitespace = content[whitespace_start:whitespace_end]
+    if not any(terminator in whitespace for terminator in _JAVASCRIPT_LINE_TERMINATORS):
+        return False
+
+    last_line_break = max(
+        content.rfind(terminator, floor, whitespace_start)
+        for terminator in _JAVASCRIPT_LINE_TERMINATORS
+    )
+    if last_line_break >= floor:
+        line_start = last_line_break + 1
+    elif floor == 0 or content[floor - 1] in _JAVASCRIPT_LINE_TERMINATORS:
+        line_start = floor
+    else:
+        return True
+
+    line_prefix = content[line_start:whitespace_start]
+    if "`" in line_prefix or "*/" in line_prefix:
+        return True
+    if last_line_break >= floor:
+        terminator_start = last_line_break
+        while (
+            terminator_start > floor
+            and content[terminator_start - 1] in _JAVASCRIPT_LINE_TERMINATORS
+        ):
+            terminator_start -= 1
+        if _is_javascript_character_escaped(content, terminator_start, floor):
+            return True
+
+    quote: str | None = None
+    escaped = False
+    saw_unquoted_slash = False
+    cursor = line_start
+    while cursor < whitespace_start:
+        character = content[cursor]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif character in {'"', "'"}:
+            if saw_unquoted_slash:
+                return True
+            quote = character
+        elif character == "`":
+            return True
+        elif character == "/":
+            if cursor + 1 < whitespace_start and content[cursor + 1] in {"/", "*"}:
+                return True
+            saw_unquoted_slash = True
+        cursor += 1
+
+    return quote is not None
+
+
 def _is_javascript_character_escaped(content: str, index: int, floor: int) -> bool:
     """Return whether the character at *index* has an odd backslash prefix."""
     backslashes = 0
@@ -327,6 +398,8 @@ def _find_javascript_regexp_opening_slash(
 def _javascript_expression_can_start_at(content: str, index: int, floor: int) -> bool:
     """Conservatively validate that a JavaScript expression may start at *index*."""
     cursor = _skip_javascript_whitespace_backward(content, index, floor)
+    if _javascript_whitespace_crosses_possible_line_comment(content, cursor, index, floor):
+        return False
     if cursor == floor:
         return floor == 0
 
