@@ -32,6 +32,8 @@ import sys
 import tomllib
 from urllib.parse import urlparse
 
+from packaging.requirements import InvalidRequirement, Requirement
+
 from skillspector.inspection_ledger import LedgerOutcome, analyzer_status_for_events, ledger_event
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
@@ -443,6 +445,23 @@ def _pinned_npm_version(spec: str) -> str | None:
     return None
 
 
+def _parse_python_requirement(spec: str) -> tuple[str, str | None] | None:
+    """Return a Python requirement's name and exact pinned version, if any."""
+    try:
+        requirement = Requirement(spec)
+    except InvalidRequirement:
+        # Preserve the existing analyzer coverage for malformed requirement
+        # lines, but never manufacture a version from a partial match.
+        name_match = re.match(r"^([a-zA-Z][a-zA-Z0-9._-]*)", spec)
+        return (name_match.group(1), None) if name_match else None
+
+    specifiers = list(requirement.specifier)
+    if len(specifiers) != 1:
+        return requirement.name, None
+    specifier = specifiers[0]
+    return requirement.name, _pinned_version(specifier.operator, specifier.version)
+
+
 def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from requirements.txt format."""
     results: list[tuple[str, str | None, int]] = []
@@ -450,10 +469,9 @@ def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | N
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
             continue
-        m = re.match(r"^([a-zA-Z][a-zA-Z0-9._-]*)(?:\[.*?\])?\s*(?:([=<>!~]=?)\s*([\d.*]+))?", line)
-        if m:
-            name = m.group(1)
-            version = _pinned_version(m.group(2), m.group(3))
+        parsed = _parse_python_requirement(line)
+        if parsed:
+            name, version = parsed
             results.append((name, version, i))
     return results
 
@@ -516,11 +534,10 @@ def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None
 
     results: list[tuple[str, str | None, int]] = []
     for spec in specs:
-        m = re.match(r"^([a-zA-Z][a-zA-Z0-9._-]*)(?:\[.*?\])?\s*(?:([=<>!~]=?)\s*([\d.*]+))?", spec)
-        if not m:
+        parsed = _parse_python_requirement(spec)
+        if not parsed:
             continue
-        name = m.group(1)
-        version = _pinned_version(m.group(2), m.group(3))
+        name, version = parsed
         idx = content.find(spec)
         line_num = get_line_number(content, idx) if idx >= 0 else 1
         results.append((name, version, line_num))
