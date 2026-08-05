@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
@@ -567,6 +567,9 @@ class LLMAnalyzerBase:
                     response = _message_text(self._llm.invoke(prompt))
                 logger.debug("LLM response for %s", batch.file_label)
                 outcome.successful.append((batch, self.parse_response(response, batch)))
+            except ValidationError as exc:
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                outcome.failures.append(BatchFailure(batch=batch, error_class=type(exc).__name__))
             except (ValueError, NotImplementedError):
                 raise
             except Exception as exc:
@@ -639,6 +642,12 @@ class LLMAnalyzerBase:
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         outcome = BatchExecutionResult()
         for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, ValidationError):
+                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                outcome.failures.append(
+                    BatchFailure(batch=batch, error_class=type(result).__name__)
+                )
+                continue
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
             if isinstance(result, BaseException):
