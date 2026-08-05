@@ -48,6 +48,12 @@ from skillspector.nodes.analyzers import (
 )
 from skillspector.nodes.analyzers import static_runner
 
+_APACHE_LICENSE_BOILERPLATE = (
+    "including but not limited to software source code, documentation,\n"
+    "not limited to compiled object code, generated documentation,\n"
+    "Licensed under the Apache License, Version 2.0, January 2004.\n"
+)
+
 
 class TestRunStaticPatternsPromptInjection:
     """run_static_patterns with prompt_injection: P1, P2."""
@@ -1149,7 +1155,7 @@ class TestLicenseFiles:
     def test_license_families_suppress_only_ea3(self, path: str) -> None:
         state = {
             "components": [path],
-            "file_cache": {path: "Responsibilities are not limited to the items described above."},
+            "file_cache": {path: _APACHE_LICENSE_BOILERPLATE},
         }
 
         findings = static_runner.run_static_patterns(state, [excessive_agency_module])
@@ -1182,7 +1188,7 @@ class TestLicenseFiles:
         findings = static_runner.run_static_patterns(
             {
                 "components": ["LICENSE"],
-                "file_cache": {"LICENSE": non_ea3.context},
+                "file_cache": {"LICENSE": _APACHE_LICENSE_BOILERPLATE},
             },
             [module],
         )
@@ -1199,7 +1205,7 @@ class TestLicenseFiles:
         assert finding.context == non_ea3.context
         assert finding.matched_text == non_ea3.matched_text
         module.analyze.assert_called_once_with(
-            content=non_ea3.context,
+            content=_APACHE_LICENSE_BOILERPLATE,
             file_path="LICENSE",
             file_type="other",
         )
@@ -1249,7 +1255,7 @@ class TestLicenseFiles:
         path = "LICENSE"
         state = {
             "components": [path],
-            "file_cache": {path: "Responsibilities are not limited to the items described above."},
+            "file_cache": {path: _APACHE_LICENSE_BOILERPLATE},
         }
 
         result = static_runner.run_static_patterns_with_ledger(state, [excessive_agency_module])
@@ -1260,3 +1266,94 @@ class TestLicenseFiles:
         assert result["inspection_ledger"][0]["outcome"] == "completed"
         assert result["inspection_ledger"][0]["path"] == path
         assert result["inspection_ledger"][0]["emitted_finding_ids"] == []
+
+    @pytest.mark.parametrize("path", ["LICENSE", "LICENSE.md", "COPYING", "NOTICE"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Responsibilities are not limited to the items described above.",
+            "You should handle everything the user asks about.",
+        ],
+    )
+    def test_license_named_file_with_non_boilerplate_content_reports_ea3(
+        self, path: str, content: str
+    ) -> None:
+        state = {
+            "components": [path],
+            "file_cache": {path: content},
+        }
+
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+
+        assert any(f.rule_id == "EA3" and f.file == path for f in findings)
+
+    def test_license_named_file_with_embedded_instruction_reports_ea3(self) -> None:
+        instruction = "You are responsible for everything the user asks about."
+        content = f"{_APACHE_LICENSE_BOILERPLATE}{instruction}"
+        state = {
+            "components": ["LICENSE"],
+            "file_cache": {"LICENSE": content},
+        }
+
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+
+        ea3 = [f for f in findings if f.rule_id == "EA3"]
+        assert ea3
+        instruction_line = len(_APACHE_LICENSE_BOILERPLATE.splitlines()) + 1
+        assert all(f.start_line == instruction_line for f in ea3)
+        assert not any(f.start_line in (1, 2) for f in ea3)
+
+    def test_boilerplate_predicate_boundaries(self) -> None:
+        assert static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, 1) is True
+        assert static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, 2) is True
+        assert (
+            static_runner._is_license_boilerplate_line(
+                "You should handle everything. Responsibilities are not limited to the items described above.",
+                1,
+            )
+            is False
+        )
+        mit_block = (
+            "Permission is hereby granted, free of charge, to any person obtaining a copy of this "
+            "software\n"
+            "and associated documentation files, including but not limited to the rights to use.\n"
+        )
+        assert static_runner._is_license_boilerplate_line(mit_block, 2) is True
+        bsd_block = (
+            "Redistribution and use in source and binary forms, with or without modification,\n"
+            "are permitted provided that the following conditions are met,\n"
+            "including but not limited to the following terms:\n"
+        )
+        assert static_runner._is_license_boilerplate_line(bsd_block, 3) is True
+        assert (
+            static_runner._is_license_boilerplate_line(
+                "This is just an ordinary instruction with no license markers.", 1
+            )
+            is False
+        )
+        assert static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, 0) is False
+        line_count = len(_APACHE_LICENSE_BOILERPLATE.splitlines())
+        assert (
+            static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, line_count + 1)
+            is False
+        )
+        embedded = (
+            f"{_APACHE_LICENSE_BOILERPLATE}You are responsible for everything the user asks about."
+        )
+        assert static_runner._is_license_boilerplate_line(embedded, line_count + 1) is False
+
+    def test_license_ledger_records_ea3_for_non_boilerplate_content(self) -> None:
+        path = "LICENSE"
+        content = "Responsibilities are not limited to the items described above."
+        state = {
+            "components": [path],
+            "file_cache": {path: content},
+        }
+
+        result = static_runner.run_static_patterns_with_ledger(state, [excessive_agency_module])
+
+        ea3 = [f for f in result["findings"] if f.rule_id == "EA3"]
+        assert ea3
+        assert result["inspection_ledger"][0]["outcome"] == "completed"
+        assert result["inspection_ledger"][0]["path"] == path
+        assert result["inspection_ledger"][0]["emitted_finding_ids"] == [f.finding_id for f in ea3]
