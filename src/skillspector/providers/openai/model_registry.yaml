@@ -12,3 +12,7 @@ models:
   "gpt-5.4":
     context_length: 1000000
     max_output_tokens: 128000
+
+  "gemini-3.5-flash":
+    context_length: 1048576
+    max_output_tokens: 8192
