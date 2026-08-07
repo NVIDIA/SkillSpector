@@ -2726,7 +2726,7 @@ requires-dist = [
     { name = "langgraph", specifier = ">=1.0.10" },
     { name = "langgraph-cli", extras = ["inmem"], specifier = ">=0.4.14" },
     { name = "langsmith", specifier = ">=0.7.30" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2.0" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2.0,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.19.0" },
     { name = "openai", specifier = ">=2.25.0" },
     { name = "packaging", specifier = ">=24.0" },
