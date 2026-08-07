@@ -58,23 +58,36 @@ E1_PATTERNS = [
     ),
 ]
 E2_PYTHON_FALLBACK_PATTERNS = [
+    # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
+    # Python: os.environ["KEY"] / os.environ['SECRET']
     (
         r"os\s*\.\s*environ\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[^'\"]*['\"]\s*\]",
         0.8,
     ),
+    # Python: os.environ.get("KEY")
     (r"os\s*\.\s*environ\s*\.\s*get\s*\([^)]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", 0.7),
+    # Python: os.environ.copy() — full environ read
     (r"os\s*\.\s*environ\s*\.\s*copy\s*\(\s*\)", 0.6),
+    # Python: dict(os.environ) — full environ read via dict()
     (r"dict\s*\(\s*os\s*\.\s*environ\s*\)", 0.6),
-    (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
+    # Python: {**os.environ} — full environ read via spread
+    (r"\*\*\s*os\s*\.\s*environ", 0.6),
+    # Generic keyword-in-var check
 ]
 E2_OTHER_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
+    # Node.js: process.env["KEY"]
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
+    # Node.js: Object.keys(process.env)
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
+    # Shell: env | grep key
     (r"env\s*\|\s*grep\s+(?:-i\s+)?(?:key|secret|token|password)", 0.8),
+    # Shell: printenv KEY
     (r"printenv\s+(?:\w*(?:KEY|SECRET|TOKEN|PASSWORD)\w*)", 0.7),
+    # Natural language: "collect all environment variables"
     (r"collect\s+(?:all\s+)?(?:environment\s+variables?|env\s+vars?)", 0.7),
+    # Natural language: "extract/harvest/gather API keys from environment"
     (r"(?:extract|harvest|gather)\s+(?:api\s+)?keys?\s+from\s+environment", 0.8),
 ]
 E2_PATTERNS = E2_PYTHON_FALLBACK_PATTERNS + E2_OTHER_PATTERNS
