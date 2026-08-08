@@ -53,7 +53,9 @@ install-dev:
 	@if [ -n "$(UV)" ]; then uv sync --all-extras; else pip install -e ".[dev]"; fi
 
 # Run LangGraph dev server, opening Studio at LANGGRAPH_STUDIO_URL.
+# Requires the optional langgraph-dev extra: pip install 'skillspector[langgraph-dev]'
 langgraph-dev:
+	@command -v langgraph >/dev/null 2>&1 || { echo "Error: 'langgraph' command not found. Install the optional dependency:"; echo "  pip install 'skillspector[langgraph-dev]'"; exit 1; }
 	langgraph dev --studio-url $(LANGGRAPH_STUDIO_URL)
 
 # Run unit + integration tests
