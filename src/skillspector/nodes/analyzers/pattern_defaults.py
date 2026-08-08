@@ -119,7 +119,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     # MCP Least Privilege (B.3.1)
     "LP1": "Code uses capabilities (network, shell, file write, etc.) not covered by declared permissions. The skill does more than it claims, which may indicate deceptive intent.",
     "LP2": "Permission list contains a wildcard ('*' or 'all'), granting blanket access with no least-privilege boundary. This disables permission-based security controls entirely.",
-    "LP3": "Skill has no permissions field in its manifest but code uses detectable capabilities. Without declared permissions, the skill's intent is opaque and cannot be validated.",
+    "LP3": "Skill declares no tool scope ('permissions' or 'allowed-tools') in its manifest but code uses detectable capabilities. Without a declaration, the skill's intent is opaque and cannot be validated.",
     "LP4": "Permission is declared but no corresponding code capability was detected. This may indicate removed functionality or pre-staging for future abuse.",
     # MCP Tool Poisoning (B.3.2)
     "TP1": "Hidden instructions detected in skill metadata (description, triggers, or parameters). These concealed directives can steer LLM behavior without the user's knowledge.",
@@ -372,7 +372,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     # MCP Least Privilege (B.3.1)
     "LP1": "Add the missing permission to SKILL.md, or remove the code that requires it.",
     "LP2": "Replace wildcard permissions ('*', 'all', 'full', 'any') with an explicit list of required permissions.",
-    "LP3": "Add a 'permissions' field to SKILL.md listing the capabilities this skill requires.",
+    "LP3": "Declare the skill's tool scope: for Claude Code / Agent Skills SKILL.md, list the tools the skill may invoke in the 'allowed-tools' frontmatter field; for MCP server manifests, add a 'permissions' list naming the required capabilities.",
     "LP4": "Remove the declared permission if the corresponding capability is no longer used.",
     # MCP Tool Poisoning (B.3.2)
     "TP1": "Remove hidden content (HTML comments, markdown comments, zero-width characters, base64 blobs) from metadata fields. Metadata should contain plain, visible text only.",
