@@ -74,12 +74,73 @@ _EVAL_DATASET_FILES = {
     "eval/dataset.yml",
 }
 
+_LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
+_LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+_LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
+
+# Whole-content marker sets that identify a file as a recognized license family.
+# Every marker must be present (case-insensitively) in the full content.
+_LICENSE_BOILERPLATE_FAMILY_MARKERS: dict[str, tuple[str, ...]] = {
+    "apache-2.0": ("apache license", "version 2.0, january 2004"),
+    "mit": (
+        "permission is hereby granted, free of charge, to any person obtaining a copy of this software",
+    ),
+    "bsd": ("redistribution and use in source and binary forms", "with or without modification"),
+}
+
+# Per-family canonical EA3-triggering line regexes. A matched EA3 line is only
+# suppressible when it also matches a canonical pattern for the recognized family.
+_LICENSE_EA3_CANONICAL_LINES: dict[str, tuple[re.Pattern, ...]] = {
+    "apache-2.0": (
+        re.compile(r"including\s+but\s+not\s+limited\s+to", re.IGNORECASE),
+        re.compile(r"not\s+limited\s+to\s+compiled\s+object\s+code", re.IGNORECASE),
+    ),
+    "mit": (re.compile(r"but\s+not\s+limited\s+to", re.IGNORECASE),),
+    "bsd": (re.compile(r"but\s+not\s+limited\s+to", re.IGNORECASE),),
+}
+
 
 def _infer_file_type(path: str) -> str:
     """Infer file type from path (extension)."""
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
+
+
+def _is_license_basename(path: str, file_type: str) -> bool:
+    """Return whether a text-like path has a conventional legal-file basename."""
+    if file_type not in _LICENSE_FILE_TYPES:
+        return False
+    basename = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if file_type == "other" and "." in basename:
+        suffix = "." + basename.rsplit(".", 1)[-1].casefold()
+        if suffix not in _LICENSE_OTHER_SUFFIXES:
+            return False
+    return _LICENSE_BASENAME.fullmatch(basename.casefold()) is not None
+
+
+def _detect_license_family(content: str) -> str | None:
+    """Return the recognized license family key for content, or None."""
+    casefolded = content.casefold()
+    for family, markers in _LICENSE_BOILERPLATE_FAMILY_MARKERS.items():
+        if all(marker in casefolded for marker in markers):
+            return family
+    return None
+
+
+def _is_license_boilerplate_line(content: str, start_line: int) -> bool:
+    """Return whether start_line in content is a canonical EA3 license line."""
+    family = _detect_license_family(content)
+    if family is None:
+        return False
+    patterns = _LICENSE_EA3_CANONICAL_LINES.get(family, ())
+    if not patterns:
+        return False
+    lines = content.splitlines()
+    if start_line < 1 or start_line > len(lines):
+        return False
+    matched_line = lines[start_line - 1].strip()
+    return any(pattern.search(matched_line) for pattern in patterns)
 
 
 _BINARY_EXTENSIONS = frozenset(
@@ -344,6 +405,13 @@ def _scan_path(
         else:
             raw = module.analyze(content=content, file_path=path, file_type=file_type)
         for af in raw:
+            if (
+                af.rule_id == "EA3"
+                and _is_license_basename(path, file_type)
+                and _is_license_boilerplate_line(content, af.location.start_line)
+            ):
+                logger.debug("Filtered EA3 license boilerplate finding: %s", path)
+                continue
             if _is_env_file_reference_in_docs(af, file_type, path, content):
                 logger.debug(
                     "Filtered PE3 .env doc reference: %s in %s:%d",

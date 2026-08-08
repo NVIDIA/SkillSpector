@@ -17,13 +17,19 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
+from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.nodes.analyzers import (
     static_patterns_agent_snooping as agent_snooping_module,
 )
 from skillspector.nodes.analyzers import (
     static_patterns_data_exfiltration as data_exfiltration_module,
+)
+from skillspector.nodes.analyzers import (
+    static_patterns_excessive_agency as excessive_agency_module,
 )
 from skillspector.nodes.analyzers import (
     static_patterns_memory_poisoning as memory_poisoning_module,
@@ -41,6 +47,12 @@ from skillspector.nodes.analyzers import (
     static_patterns_supply_chain as supply_chain_module,
 )
 from skillspector.nodes.analyzers import static_runner
+
+_APACHE_LICENSE_BOILERPLATE = (
+    "including but not limited to software source code, documentation,\n"
+    "not limited to compiled object code, generated documentation,\n"
+    "Licensed under the Apache License, Version 2.0, January 2004.\n"
+)
 
 
 class TestRunStaticPatternsPromptInjection:
@@ -1002,3 +1014,226 @@ class TestSupplyChainLedger:
         events = result["inspection_ledger"]
         assert [event["outcome"] for event in events] == ["skipped", "completed"]
         assert len({event["work_id"] for event in events}) == 2
+
+
+class TestLicenseFiles:
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "LICENSE",
+            "licenses",
+            "licenses/LICENSE",
+            "COPYING",
+            "NOTICE",
+            "NOTICES",
+            "LICENSE.txt",
+            "license-MIT",
+            "COPYING.LESSER",
+            "NOTICE.md",
+        ],
+    )
+    def test_license_families_suppress_only_ea3(self, path: str) -> None:
+        state = {
+            "components": [path],
+            "file_cache": {path: _APACHE_LICENSE_BOILERPLATE},
+        }
+
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+
+        assert not any(f.rule_id == "EA3" for f in findings)
+
+    def test_non_ea3_finding_is_preserved_on_license(self) -> None:
+        non_ea3 = AnalyzerFinding(
+            rule_id="TM1",
+            message="Tool misuse",
+            severity=Severity.MEDIUM,
+            location=Location(file="LICENSE", start_line=1),
+            confidence=0.8,
+            tags=["tool_misuse"],
+            context="Responsibilities are not limited to the items described above.",
+            matched_text="not limited to",
+        )
+        ea3 = AnalyzerFinding(
+            rule_id="EA3",
+            message="Scope creep",
+            severity=Severity.LOW,
+            location=Location(file="LICENSE", start_line=1),
+            confidence=0.7,
+            context=non_ea3.context,
+            matched_text=non_ea3.matched_text,
+        )
+        module = MagicMock()
+        module.analyze.return_value = [ea3, non_ea3]
+
+        findings = static_runner.run_static_patterns(
+            {
+                "components": ["LICENSE"],
+                "file_cache": {"LICENSE": _APACHE_LICENSE_BOILERPLATE},
+            },
+            [module],
+        )
+
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.rule_id == non_ea3.rule_id
+        assert finding.message == non_ea3.message
+        assert finding.severity == non_ea3.severity.value
+        assert finding.confidence == non_ea3.confidence
+        assert finding.file == non_ea3.location.file
+        assert finding.start_line == non_ea3.location.start_line
+        assert finding.tags == non_ea3.tags
+        assert finding.context == non_ea3.context
+        assert finding.matched_text == non_ea3.matched_text
+        module.analyze.assert_called_once_with(
+            content=_APACHE_LICENSE_BOILERPLATE,
+            file_path="LICENSE",
+            file_type="other",
+        )
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "SKILL.md",
+            "README.md",
+            "README.txt",
+            "docs/guide.md",
+            "LICENSES/guide.md",
+            "license_terms.py",
+        ],
+    )
+    def test_non_license_paths_preserve_ea3(self, path: str) -> None:
+        state = {
+            "components": [path],
+            "file_cache": {path: "Responsibilities are not limited to the items described above."},
+        }
+
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+
+        assert any(f.rule_id == "EA3" and f.file == path for f in findings)
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("LICENSE", True),
+            ("docs\\license-mit", True),
+            ("NOTICE.md", True),
+            ("licensing.md", False),
+            ("LICENSES/guide.md", False),
+            ("THIRD_PARTY_NOTICES.md", False),
+            ("licence-check.sh", False),
+            ("license_terms.py", False),
+            ("license.php", False),
+            ("notice.c", False),
+        ],
+    )
+    def test_helper_boundaries(self, path: str, expected: bool) -> None:
+        file_type = static_runner._infer_file_type(path)
+
+        assert static_runner._is_license_basename(path, file_type) is expected
+
+    def test_license_is_completed_in_ledger_without_emitted_ids(self) -> None:
+        path = "LICENSE"
+        state = {
+            "components": [path],
+            "file_cache": {path: _APACHE_LICENSE_BOILERPLATE},
+        }
+
+        result = static_runner.run_static_patterns_with_ledger(state, [excessive_agency_module])
+
+        assert state["components"] == [path]
+        assert path in state["file_cache"]
+        assert result["findings"] == []
+        assert result["inspection_ledger"][0]["outcome"] == "completed"
+        assert result["inspection_ledger"][0]["path"] == path
+        assert result["inspection_ledger"][0]["emitted_finding_ids"] == []
+
+    @pytest.mark.parametrize("path", ["LICENSE", "LICENSE.md", "COPYING", "NOTICE"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Responsibilities are not limited to the items described above.",
+            "You should handle everything the user asks about.",
+        ],
+    )
+    def test_license_named_file_with_non_boilerplate_content_reports_ea3(
+        self, path: str, content: str
+    ) -> None:
+        state = {
+            "components": [path],
+            "file_cache": {path: content},
+        }
+
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+
+        assert any(f.rule_id == "EA3" and f.file == path for f in findings)
+
+    def test_license_named_file_with_embedded_instruction_reports_ea3(self) -> None:
+        instruction = "You are responsible for everything the user asks about."
+        content = f"{_APACHE_LICENSE_BOILERPLATE}{instruction}"
+        state = {
+            "components": ["LICENSE"],
+            "file_cache": {"LICENSE": content},
+        }
+
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+
+        ea3 = [f for f in findings if f.rule_id == "EA3"]
+        assert ea3
+        instruction_line = len(_APACHE_LICENSE_BOILERPLATE.splitlines()) + 1
+        assert all(f.start_line == instruction_line for f in ea3)
+        assert not any(f.start_line in (1, 2) for f in ea3)
+
+    def test_boilerplate_predicate_boundaries(self) -> None:
+        assert static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, 1) is True
+        assert static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, 2) is True
+        assert (
+            static_runner._is_license_boilerplate_line(
+                "You should handle everything. Responsibilities are not limited to the items described above.",
+                1,
+            )
+            is False
+        )
+        mit_block = (
+            "Permission is hereby granted, free of charge, to any person obtaining a copy of this "
+            "software\n"
+            "and associated documentation files, including but not limited to the rights to use.\n"
+        )
+        assert static_runner._is_license_boilerplate_line(mit_block, 2) is True
+        bsd_block = (
+            "Redistribution and use in source and binary forms, with or without modification,\n"
+            "are permitted provided that the following conditions are met,\n"
+            "including but not limited to the following terms:\n"
+        )
+        assert static_runner._is_license_boilerplate_line(bsd_block, 3) is True
+        assert (
+            static_runner._is_license_boilerplate_line(
+                "This is just an ordinary instruction with no license markers.", 1
+            )
+            is False
+        )
+        assert static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, 0) is False
+        line_count = len(_APACHE_LICENSE_BOILERPLATE.splitlines())
+        assert (
+            static_runner._is_license_boilerplate_line(_APACHE_LICENSE_BOILERPLATE, line_count + 1)
+            is False
+        )
+        embedded = (
+            f"{_APACHE_LICENSE_BOILERPLATE}You are responsible for everything the user asks about."
+        )
+        assert static_runner._is_license_boilerplate_line(embedded, line_count + 1) is False
+
+    def test_license_ledger_records_ea3_for_non_boilerplate_content(self) -> None:
+        path = "LICENSE"
+        content = "Responsibilities are not limited to the items described above."
+        state = {
+            "components": [path],
+            "file_cache": {path: content},
+        }
+
+        result = static_runner.run_static_patterns_with_ledger(state, [excessive_agency_module])
+
+        ea3 = [f for f in result["findings"] if f.rule_id == "EA3"]
+        assert ea3
+        assert result["inspection_ledger"][0]["outcome"] == "completed"
+        assert result["inspection_ledger"][0]["path"] == path
+        assert result["inspection_ledger"][0]["emitted_finding_ids"] == [f.finding_id for f in ea3]
