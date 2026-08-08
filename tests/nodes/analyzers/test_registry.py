@@ -20,7 +20,7 @@ from __future__ import annotations
 from skillspector.nodes.analyzers import ANALYZER_NODE_IDS, ANALYZER_NODES
 
 # Expected analyzer node IDs per the workflow reference table.
-# Order: static (14), behavioral (2), mcp (3), semantic (3).
+# Order: static (14), behavioral (5), mcp (3), semantic (3).
 EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "static_patterns_prompt_injection",
     "static_patterns_data_exfiltration",
@@ -39,6 +39,9 @@ EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "static_yara",
     "behavioral_ast",
     "behavioral_taint_tracking",
+    "behavioral_fingerprint",
+    "cross_skill_dependency",
+    "prompt_injection_resilience",
     "mcp_least_privilege",
     "mcp_tool_poisoning",
     "mcp_rug_pull",
@@ -64,3 +67,14 @@ class TestAnalyzerRegistry:
         """ANALYZER_NODES has no entries beyond ANALYZER_NODE_IDS."""
         for node_id in ANALYZER_NODES:
             assert node_id in ANALYZER_NODE_IDS, f"Extra ANALYZER_NODES entry: {node_id}"
+
+    def test_new_rule_ids_have_pattern_defaults(self):
+        """FP/CS/IR rule IDs resolve in pattern_defaults (reports, risk scoring)."""
+        from skillspector.nodes.analyzers import pattern_defaults
+
+        for rule_id in ("FP1", "FP2", "FP3", "FP4", "CS1", "CS2", "CS3", "IR1", "IR2", "IR3", "IR4", "IR5"):
+            assert pattern_defaults.get_explanation(
+                rule_id
+            ) != "Potential security issue detected. Manual review is recommended."
+            assert pattern_defaults.get_category(rule_id) != "Security"
+            assert pattern_defaults.get_pattern_name(rule_id) != "Unknown"

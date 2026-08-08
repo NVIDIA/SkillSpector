@@ -39,7 +39,9 @@ from skillspector.graph import graph
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
+from skillspector.remediation import remediate_files
 from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
+from skillspector.watcher import watch_directory
 
 logger = get_logger(__name__)
 
@@ -644,6 +646,189 @@ def baseline(
     finally:
         if result is not None:
             cleanup_result(result)
+
+
+@app.command()
+def fix(
+    input_path: Annotated[
+        str,
+        typer.Argument(
+            help="Path or URL to scan. Supports: Git URL, file URL, zip file, .md file, or directory.",
+        ),
+    ],
+    write: Annotated[
+        bool,
+        typer.Option(
+            "--write",
+            "-w",
+            help="Write patched files to disk. Default is a dry run that prints the proposed diff.",
+        ),
+    ] = False,
+    no_llm: Annotated[
+        bool,
+        typer.Option(
+            "--no-llm",
+            help="Skip LLM analysis when scanning (static analysis only).",
+        ),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-V",
+            help="Show detailed progress.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Scan a skill and apply automated remediations for auto-fixable findings.
+
+    Remediation is best-effort: only a subset of rule IDs have automated fixes,
+    and a fixed skill must be re-scanned to confirm the findings are resolved.
+    The default is a dry run; pass --write to write patched files to disk.
+
+    Examples:
+
+        skillspector fix ./my-skill/             # dry run, prints proposed diff
+        skillspector fix ./my-skill/ --write     # write patched files
+    """
+    if verbose:
+        set_level("DEBUG")
+    result = None
+    try:
+        state = _scan_state(input_path, FormatChoice.json, no_llm)
+        result = graph.invoke(state)
+        findings = result.get("filtered_findings") or result.get("findings") or []
+        file_cache = result.get("file_cache") or {}
+        rem_result, patched = remediate_files(findings, file_cache, dry_run=not write)
+        console.print(rem_result.summary())
+        if rem_result.skipped:
+            console.print(
+                f"[yellow]{len(rem_result.skipped)} finding(s) skipped[/yellow] "
+                "require manual review."
+            )
+        if rem_result.diff:
+            console.print(rem_result.diff)
+        if write:
+            if result.get("temp_dir_for_cleanup"):
+                console.print(
+                    "[yellow]Input was resolved to a temporary directory; patched "
+                    "files are not written for ephemeral inputs.[/yellow]"
+                )
+            else:
+                base = Path(result["skill_path"]) if result.get("skill_path") else Path(input_path).resolve()
+                for rel_path, content in patched.items():
+                    target = base / rel_path
+                    target.write_text(content, encoding="utf-8")
+                    console.print(f"[green]Patched:[/green] {target}")
+            console.print(
+                "[dim]Re-run 'skillspector scan' to confirm the findings are resolved.[/dim]"
+            )
+    except typer.Exit:
+        raise
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    except Exception as e:
+        if verbose:
+            console.print_exception()
+        else:
+            console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    finally:
+        if result is not None:
+            cleanup_result(result)
+
+
+@app.command()
+def watch(
+    input_path: Annotated[
+        str,
+        typer.Argument(
+            help="Directory to watch for changes.",
+        ),
+    ],
+    format: Annotated[
+        FormatChoice,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format for each scan.",
+            case_sensitive=False,
+        ),
+    ] = FormatChoice.terminal,
+    poll_interval: Annotated[
+        float,
+        typer.Option(
+            "--poll-interval",
+            help="Seconds between directory polls.",
+        ),
+    ] = 2.0,
+    debounce: Annotated[
+        float,
+        typer.Option(
+            "--debounce",
+            help="Seconds to wait after the last change before re-scanning.",
+        ),
+    ] = 5.0,
+    no_llm: Annotated[
+        bool,
+        typer.Option(
+            "--no-llm",
+            help="Skip LLM analysis (static analysis only).",
+        ),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-V",
+            help="Show detailed progress.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Watch a directory and re-scan whenever skill files change.
+
+    Polls the directory for changes and re-runs a scan after edits settle
+    (debounce). Press Ctrl-C to stop watching.
+
+    Examples:
+
+        skillspector watch ./my-skill/
+        skillspector watch ./my-skill/ --no-llm --format json
+    """
+    if verbose:
+        set_level("DEBUG")
+    directory = Path(input_path).resolve()
+    if not directory.is_dir():
+        console.print(f"[red]Error:[/red] {directory} is not a directory")
+        raise typer.Exit(code=2)
+
+    def _scan_and_report(directory_str: str) -> None:
+        scan_result = None
+        try:
+            state = _scan_state(directory_str, format, no_llm)
+            scan_result = graph.invoke(state)
+            _write_result(scan_result, None, format)
+            score = scan_result.get("risk_score") or 0
+            severity = scan_result.get("risk_severity") or "LOW"
+            console.print(f"Score: {score}/100 ({severity})")
+        except Exception as e:
+            if verbose:
+                console.print_exception()
+            else:
+                console.print(f"[red]Scan error:[/red] {e}")
+        finally:
+            if scan_result is not None:
+                cleanup_result(scan_result)
+
+    try:
+        watch_directory(
+            directory, _scan_and_report, poll_interval=poll_interval, debounce=debounce
+        )
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped watching.[/dim]")
 
 
 if __name__ == "__main__":
