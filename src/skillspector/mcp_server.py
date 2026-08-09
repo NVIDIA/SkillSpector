@@ -144,10 +144,24 @@ def build_server(name: str = "skillspector") -> FastMCP:
     try:
         from mcp.server.fastmcp import FastMCP
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "The MCP server requires the optional 'mcp' dependency. "
-            "Install it with: pip install 'skillspector[mcp]'"
-        ) from exc
+        if exc.name == "mcp":
+            raise ModuleNotFoundError(
+                "The MCP server requires the optional 'mcp' dependency. "
+                "Install it with: pip install 'skillspector[mcp]'"
+            ) from exc
+        if exc.name == "mcp.server.fastmcp":
+            # mcp>=2.0.0 removed mcp.server.fastmcp, so an install that
+            # resolved mcp 2.x fails here even though mcp is present.
+            # Point at the real cause instead of the misleading
+            # "extra not installed" error.
+            raise ModuleNotFoundError(
+                "The installed 'mcp' package is incompatible with the "
+                "SkillSpector MCP server: 'mcp.server.fastmcp' is "
+                "unavailable. Reinstall with: pip install 'skillspector[mcp]'"
+            ) from exc
+        # Some other module was missing (e.g. a transitive dependency of
+        # the installed mcp package); keep the original error.
+        raise exc
 
     server = FastMCP(name)
 

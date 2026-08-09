@@ -231,6 +231,65 @@ async def test_build_server_registers_scan_skill() -> None:
     assert "scan_skill" in {tool.name for tool in tools}
 
 
+def test_build_server_reports_missing_mcp_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An absent mcp package must still report the missing optional extra."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def import_without_mcp(name: str, *args: object, **kwargs: object) -> object:
+        if name == "mcp.server.fastmcp":
+            raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_mcp)
+
+    with pytest.raises(ModuleNotFoundError, match="requires the optional 'mcp' dependency"):
+        mcp_server.build_server()
+
+
+def test_build_server_reports_incompatible_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed package without FastMCP must not be reported as missing."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def import_without_fastmcp(name: str, *args: object, **kwargs: object) -> object:
+        if name == "mcp.server.fastmcp":
+            raise ModuleNotFoundError(
+                "No module named 'mcp.server.fastmcp'", name="mcp.server.fastmcp"
+            )
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_fastmcp)
+
+    with pytest.raises(ModuleNotFoundError, match="installed 'mcp' package is incompatible"):
+        mcp_server.build_server()
+
+
+def test_build_server_preserves_transitive_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing transitive dependency must keep the original error."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def import_with_missing_transitive(name: str, *args: object, **kwargs: object) -> object:
+        if name == "mcp.server.fastmcp":
+            raise ModuleNotFoundError(
+                "No module named 'mcp.server.fastmcp.uvicorn'",
+                name="mcp.server.fastmcp.uvicorn",
+            )
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_missing_transitive)
+
+    with pytest.raises(ModuleNotFoundError, match="mcp.server.fastmcp.uvicorn") as excinfo:
+        mcp_server.build_server()
+    assert excinfo.value.name == "mcp.server.fastmcp.uvicorn"
+
+
 async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
     """The real stdio CLI must initialize and expose the scan_skill tool."""
     pytest.importorskip("mcp")
