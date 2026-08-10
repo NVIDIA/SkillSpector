@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: supply chain (SC1–SC7) and trigger analysis (TR1–TR3).
+"""Static patterns: supply chain (SC1–SC8) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
 SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
 SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
+SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
 
 Node and analyze() in one module.
@@ -27,9 +28,11 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tomllib
+from pathlib import Path
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -1185,13 +1188,86 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
     return findings
 
 
+
+# ---------------------------------------------------------------------------
+# SC8: Shipped Python bytecode (closes silent __pycache__ / .pyc skip)
+# ---------------------------------------------------------------------------
+
+# Still skip heavy/vendor trees for SC8, but *do* descend into __pycache__.
+_SC8_SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"})
+_SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
+
+
+def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
+    """Emit SC8 when a skill ships __pycache__ dirs or .pyc/.pyo files.
+
+    ``build_context`` excludes ``__pycache__`` from inventory and
+    ``static_runner`` treats ``.pyc`` as binary, so malicious bytecode can
+    otherwise score SAFE. Presence alone is a HIGH supply-chain signal;
+    full disassembly can come later.
+    """
+    findings: list[Finding] = []
+    if not skill_path or not isinstance(skill_path, str):
+        return findings
+    root = Path(skill_path)
+    if not root.is_dir():
+        return findings
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in _SC8_SKIP_DIRS)
+        rel_dir = Path(dirpath).relative_to(root).as_posix()
+        if rel_dir == ".":
+            rel_dir = ""
+
+        for dirname in list(dirnames):
+            if dirname != "__pycache__":
+                continue
+            rel = f"{rel_dir}/{dirname}/" if rel_dir else f"{dirname}/"
+            af = AnalyzerFinding(
+                rule_id="SC8",
+                message="Skill ships a __pycache__ directory that normal discovery skips",
+                severity=Severity.HIGH,
+                location=Location(file=rel, start_line=1),
+                confidence=0.95,
+                tags=[PatternCategory.SUPPLY_CHAIN.value],
+                matched_text=rel,
+                context=(
+                    "Python may load .pyc from this directory even when decoy "
+                    ".py sources look clean (PEP 552 UNCHECKED_HASH)."
+                ),
+            )
+            findings.append(analyzer_finding_to_finding(af))
+
+        for filename in sorted(filenames):
+            lower = filename.lower()
+            if not lower.endswith(_SC8_BYTECODE_SUFFIXES):
+                continue
+            rel = f"{rel_dir}/{filename}" if rel_dir else filename
+            af = AnalyzerFinding(
+                rule_id="SC8",
+                message="Skill ships Python bytecode (.pyc/.pyo) that normal analysis skips",
+                severity=Severity.HIGH,
+                location=Location(file=rel, start_line=1),
+                confidence=0.95,
+                tags=[PatternCategory.SUPPLY_CHAIN.value],
+                matched_text=filename,
+                context=(
+                    "Bytecode is excluded from content analysis; a malicious "
+                    ".pyc can execute while source decoys remain clean."
+                ),
+            )
+            findings.append(analyzer_finding_to_finding(af))
+
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Graph node
 # ---------------------------------------------------------------------------
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Run supply_chain patterns (SC1–SC6) and trigger analysis (TR1–TR3)."""
+    """Run supply_chain patterns (SC1–SC8) and trigger analysis (TR1–TR3)."""
     # SC1–SC3 via static_runner
     response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
     findings = response["findings"]
@@ -1262,6 +1338,18 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             trigger_findings,
             f"{ANALYZER_ID}_triggers",
         )
+
+    # SC8: shipped bytecode / __pycache__ (discovery otherwise skips these)
+    skill_path = state.get("skill_path") or ""
+    if isinstance(skill_path, str) and skill_path.strip():
+        bytecode_findings = _analyze_shipped_bytecode(skill_path)
+        findings.extend(bytecode_findings)
+        if bytecode_findings:
+            record_extra_findings(
+                skill_path,
+                bytecode_findings,
+                f"{ANALYZER_ID}_bytecode",
+            )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     response["analyzer_status_events"] = [
