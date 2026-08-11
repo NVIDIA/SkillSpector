@@ -78,26 +78,62 @@ _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 
-# Whole-content marker sets that identify a file as a recognized license family.
-# Every marker must be present (case-insensitively) in the full content.
-_LICENSE_BOILERPLATE_FAMILY_MARKERS: dict[str, tuple[str, ...]] = {
-    "apache-2.0": ("apache license", "version 2.0, january 2004"),
-    "mit": (
-        "permission is hereby granted, free of charge, to any person obtaining a copy of this software",
-    ),
-    "bsd": ("redistribution and use in source and binary forms", "with or without modification"),
-}
 
-# Per-family canonical EA3-triggering line regexes. A matched EA3 line is only
-# suppressible when it also matches a canonical pattern for the recognized family.
-_LICENSE_EA3_CANONICAL_LINES: dict[str, tuple[re.Pattern, ...]] = {
-    "apache-2.0": (
-        re.compile(r"including\s+but\s+not\s+limited\s+to", re.IGNORECASE),
-        re.compile(r"not\s+limited\s+to\s+compiled\s+object\s+code", re.IGNORECASE),
+def _normalize_license_line(line: str) -> str:
+    return " ".join(line.casefold().split())
+
+
+# Each range contains the complete adjacent text and the only suppressible line offset.
+_LICENSE_CANONICAL_RANGES: tuple[tuple[tuple[str, ...], int], ...] = (
+    (
+        (
+            '"source" form shall mean the preferred form for making modifications,',
+            "including but not limited to software source code, documentation",
+            "source, and configuration files.",
+        ),
+        1,
     ),
-    "mit": (re.compile(r"but\s+not\s+limited\s+to", re.IGNORECASE),),
-    "bsd": (re.compile(r"but\s+not\s+limited\s+to", re.IGNORECASE),),
-}
+    (
+        (
+            "transformation or translation of a source form, including but",
+            "not limited to compiled object code, generated documentation,",
+            "and conversions to other media types.",
+        ),
+        1,
+    ),
+    (
+        (
+            'the copyright owner. For the purposes of this definition, "submitted"',
+            "means any form of electronic, verbal, or written communication sent",
+            "to the Licensor or its representatives, including but not limited to",
+        ),
+        2,
+    ),
+    (
+        (
+            "result of this License or out of the use or inability to use the",
+            "Work (including but not limited to damages for loss of goodwill,",
+            "work stoppage, computer failure or malfunction, or any and all",
+        ),
+        1,
+    ),
+    (
+        (
+            'the software is provided "as is", without warranty of any kind, express or',
+            "implied, including but not limited to the warranties of merchantability,",
+            "fitness for a particular purpose and NONINFRINGEMENT. in no event shall the",
+        ),
+        1,
+    ),
+    (
+        (
+            'this software is provided by the copyright holders and contributors "as is" and',
+            "any express or implied warranties, including, but not limited to, the implied",
+            "warranties of merchantability and fitness for a particular purpose are",
+        ),
+        1,
+    ),
+)
 
 
 def _infer_file_type(path: str) -> str:
@@ -119,28 +155,24 @@ def _is_license_basename(path: str, file_type: str) -> bool:
     return _LICENSE_BASENAME.fullmatch(basename.casefold()) is not None
 
 
-def _detect_license_family(content: str) -> str | None:
-    """Return the recognized license family key for content, or None."""
-    casefolded = content.casefold()
-    for family, markers in _LICENSE_BOILERPLATE_FAMILY_MARKERS.items():
-        if all(marker in casefolded for marker in markers):
-            return family
-    return None
-
-
 def _is_license_boilerplate_line(content: str, start_line: int) -> bool:
-    """Return whether start_line in content is a canonical EA3 license line."""
-    family = _detect_license_family(content)
-    if family is None:
-        return False
-    patterns = _LICENSE_EA3_CANONICAL_LINES.get(family, ())
-    if not patterns:
-        return False
+    """Return whether start_line occupies a registered canonical license range."""
     lines = content.splitlines()
     if start_line < 1 or start_line > len(lines):
         return False
-    matched_line = lines[start_line - 1].strip()
-    return any(pattern.search(matched_line) for pattern in patterns)
+    normalized_lines = tuple(_normalize_license_line(line) for line in lines)
+    for canonical_lines, match_offset in _LICENSE_CANONICAL_RANGES:
+        range_start = start_line - match_offset - 1
+        range_end = range_start + len(canonical_lines)
+        normalized_canonical_lines = tuple(
+            _normalize_license_line(line) for line in canonical_lines
+        )
+        if (
+            range_start >= 0
+            and normalized_lines[range_start:range_end] == normalized_canonical_lines
+        ):
+            return True
+    return False
 
 
 _BINARY_EXTENSIONS = frozenset(
