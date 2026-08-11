@@ -127,9 +127,9 @@ _LICENSE_CANONICAL_RANGES: tuple[tuple[tuple[str, ...], int], ...] = (
     ),
     (
         (
-            'this software is provided by the copyright holders and contributors "as is" and',
-            "any express or implied warranties, including, but not limited to, the implied",
-            "warranties of merchantability and fitness for a particular purpose are",
+            'this software is provided by the copyright holders and contributors "as is"',
+            "and any express or implied warranties, including, but not limited to, the",
+            "implied warranties of merchantability and fitness for a particular purpose are",
         ),
         1,
     ),

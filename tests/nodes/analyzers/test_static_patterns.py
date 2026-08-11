@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -1132,6 +1133,12 @@ class TestSupplyChainLedger:
 
 class TestLicenseFiles:
     @staticmethod
+    def _third_party_notice_range(start_line: int, end_line: int) -> str:
+        notice_path = Path(__file__).resolve().parents[3] / "THIRD_PARTY_NOTICES.md"
+        lines = notice_path.read_text(encoding="utf-8").splitlines()
+        return "\n".join(lines[start_line - 1 : end_line]) + "\n"
+
+    @staticmethod
     def _range_content(range_index: int) -> tuple[str, int]:
         canonical_lines, match_offset = static_runner._LICENSE_CANONICAL_RANGES[range_index]
         return "\n".join(canonical_lines) + "\n", match_offset + 1
@@ -1144,6 +1151,23 @@ class TestLicenseFiles:
             [excessive_agency_module],
         )
 
+        assert not any(f.rule_id == "EA3" and f.start_line == match_line for f in findings)
+
+    @pytest.mark.parametrize(
+        "start_line,match_line",
+        [(92, 2), (118, 2)],
+        ids=["mit_notice", "bsd_notice"],
+    )
+    def test_independent_third_party_ranges_suppress_ea3(
+        self, start_line: int, match_line: int
+    ) -> None:
+        content = self._third_party_notice_range(start_line, start_line + 2)
+        findings = static_runner.run_static_patterns(
+            {"components": ["LICENSE"], "file_cache": {"LICENSE": content}},
+            [excessive_agency_module],
+        )
+
+        assert static_runner._is_license_boilerplate_line(content, match_line)
         assert not any(f.rule_id == "EA3" and f.start_line == match_line for f in findings)
 
     def test_review_payload_reports_ea3(self) -> None:
