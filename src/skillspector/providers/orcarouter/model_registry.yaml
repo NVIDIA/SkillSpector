@@ -1,0 +1,18 @@
+# Token-budget metadata for the OrcaRouter provider (api.orcarouter.ai).
+#
+# ``orcarouter/auto`` routes each request to the best available frontier
+# model for the task, so the exact backend context window varies.  The
+# budgets below mirror the conservative Claude-class defaults already
+# shipped in this package; tune with SKILLSPECTOR_MODEL_REGISTRY if your
+# routing target needs more headroom.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+
+models:
+  "orcarouter/auto":
+    context_length: 200000
+    max_output_tokens: 64000

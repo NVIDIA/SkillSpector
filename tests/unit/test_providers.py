@@ -53,6 +53,7 @@ from skillspector.providers.codex_cli import CodexCLIProvider
 from skillspector.providers.gemini_cli import GeminiCLIProvider
 from skillspector.providers.nv_build import BUILD_BASE_URL, NvBuildProvider
 from skillspector.providers.openai import OpenAIProvider
+from skillspector.providers.orcarouter import ORCAROUTER_BASE_URL, OrcaRouterProvider
 
 try:
     from skillspector.providers.nv_inference import (
@@ -116,6 +117,8 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
+    monkeypatch.delenv("ORCAROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ORCAROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
@@ -307,6 +310,41 @@ class TestOpenAIProvider:
         provider = OpenAIProvider()
         assert provider.get_context_length("gpt-5.4") == 1_000_000
         assert provider.get_max_output_tokens("gpt-5.4") == 128_000
+
+
+class TestOrcaRouterProvider:
+    """OrcaRouter provider — model-routing gateway credentials + YAML metadata."""
+
+    def test_returns_none_without_env_var(self) -> None:
+        assert OrcaRouterProvider().resolve_credentials() is None
+
+    def test_resolves_to_orcarouter_default_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ORCAROUTER_API_KEY", "sk-orca-test")
+        creds = OrcaRouterProvider().resolve_credentials()
+        assert creds == ("sk-orca-test", ORCAROUTER_BASE_URL)
+
+    def test_honors_orcarouter_base_url_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ORCAROUTER_API_KEY", "sk-orca-test")
+        monkeypatch.setenv("ORCAROUTER_BASE_URL", "https://router.example.com/v1")
+        creds = OrcaRouterProvider().resolve_credentials()
+        assert creds == ("sk-orca-test", "https://router.example.com/v1")
+
+    def test_creates_chat_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ORCAROUTER_API_KEY", "sk-orca-test")
+        llm = OrcaRouterProvider().create_chat_model("orcarouter/auto", max_tokens=123)
+        assert isinstance(llm, ChatOpenAI)
+        assert llm.model_name == "orcarouter/auto"
+        assert llm.max_tokens == 123
+
+    def test_default_model(self) -> None:
+        assert OrcaRouterProvider().resolve_model() == "orcarouter/auto"
+        # All slots inherit DEFAULT_MODEL — orcarouter/auto everywhere.
+        assert OrcaRouterProvider().resolve_model("meta_analyzer") == "orcarouter/auto"
+
+    def test_metadata_known_model(self) -> None:
+        provider = OrcaRouterProvider()
+        assert provider.get_context_length("orcarouter/auto") == 200_000
+        assert provider.get_max_output_tokens("orcarouter/auto") == 64_000
 
 
 class TestAnthropicProvider:
@@ -569,6 +607,13 @@ class TestProviderSelection:
         creds = resolve_provider_credentials()
         assert creds == ("sk-ant-x", None)
         assert isinstance(get_metadata_provider(), AnthropicProvider)
+
+    def test_select_orcarouter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "orcarouter")
+        monkeypatch.setenv("ORCAROUTER_API_KEY", "sk-orca-x")
+        creds = resolve_provider_credentials()
+        assert creds == ("sk-orca-x", ORCAROUTER_BASE_URL)
+        assert isinstance(get_metadata_provider(), OrcaRouterProvider)
 
     def test_create_chat_model_uses_native_anthropic_when_configured(
         self, monkeypatch: pytest.MonkeyPatch
