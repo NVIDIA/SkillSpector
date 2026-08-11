@@ -1169,7 +1169,7 @@ class TestLicenseFiles:
         ],
     )
     def test_all_license_family_paths_suppress_ea3(self, path: str) -> None:
-        content, match_line = self._range_content(0)
+        content, match_line = self._range_content(4)
         findings = static_runner.run_static_patterns(
             {"components": [path], "file_cache": {path: content}},
             [excessive_agency_module],
