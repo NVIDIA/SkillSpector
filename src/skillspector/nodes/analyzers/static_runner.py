@@ -106,6 +106,7 @@ _LICENSE_CANONICAL_RANGES: tuple[tuple[tuple[str, ...], int], ...] = (
             'the copyright owner. For the purposes of this definition, "submitted"',
             "means any form of electronic, verbal, or written communication sent",
             "to the Licensor or its representatives, including but not limited to",
+            "communication on electronic mailing lists, source code control systems,",
         ),
         2,
     ),
