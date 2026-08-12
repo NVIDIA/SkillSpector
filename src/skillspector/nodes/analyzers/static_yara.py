@@ -40,7 +40,7 @@ from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
-from .common import get_context, get_line_number
+from .common import get_context_from_lines
 from .pattern_defaults import PatternCategory
 from .static_runner import MAX_FILE_CHARS, analyzer_finding_to_finding
 
@@ -207,7 +207,12 @@ def _extract_match_strings(match: yara.Match) -> tuple[int, str | None]:
     return first_offset, matched_text
 
 
-def _has_local_destructive_autonomy_evidence(match: yara.Match, content: str) -> bool:
+def _line_number_from_byte_offset(data: bytes, offset: int) -> int:
+    """Return the 1-based line number for a YARA byte offset in *data*."""
+    return data[:offset].count(b"\n") + 1
+
+
+def _has_local_destructive_autonomy_evidence(match: yara.Match, data: bytes) -> bool:
     """Require destructive and autonomy evidence to occur in one local context.
 
     YARA string conditions are file-wide. Without this post-match check, a
@@ -221,7 +226,7 @@ def _has_local_destructive_autonomy_evidence(match: yara.Match, content: str) ->
     for string_match in match.strings or []:
         identifier = str(string_match.identifier)
         for instance in string_match.instances or []:
-            line = get_line_number(content, instance.offset)
+            line = _line_number_from_byte_offset(data, instance.offset)
             if identifier == "$destructive_rm_root":
                 return True
             if identifier.startswith("$destructive_"):
@@ -274,7 +279,7 @@ def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[Analyze
     for match in matches:
         if (
             match.rule == _DESTRUCTIVE_AUTONOMY_RULE
-            and not _has_local_destructive_autonomy_evidence(match, content)
+            and not _has_local_destructive_autonomy_evidence(match, data)
         ):
             logger.debug(
                 "%s: ignored cross-context destructive/autonomy match in %s",
@@ -284,18 +289,17 @@ def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[Analyze
             continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(match)
+        start_line = _line_number_from_byte_offset(data, first_offset)
 
         findings.append(
             AnalyzerFinding(
                 rule_id=rule_id,
                 message=_build_message(match.rule, match.namespace, description),
                 severity=severity,
-                location=Location(
-                    file=file_path, start_line=get_line_number(content, first_offset)
-                ),
+                location=Location(file=file_path, start_line=start_line),
                 confidence=confidence,
                 tags=[PatternCategory.YARA_MATCH.value],
-                context=get_context(content, first_offset),
+                context=get_context_from_lines(content.splitlines(), start_line),
                 matched_text=matched_text,
             )
         )

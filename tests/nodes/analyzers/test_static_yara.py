@@ -140,6 +140,22 @@ class TestCorePipeline:
         assert "YARA Match" in f.tags
         assert f.remediation is not None
 
+    def test_multibyte_prefix_preserves_finding_line_and_context(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "detect_unicode_marker",
+            category="malware",
+            severity="HIGH",
+            strings={"a": "UNICODE_MARKER"},
+        )
+        trailing_lines = "\n".join(f"tail {index}" for index in range(10))
+        content = f"{'😀' * 50}\nline two\nUNICODE_MARKER\n{trailing_lines}"
+
+        finding = _run(content, "unicode.txt", str(tmp_path))[0]
+
+        assert finding.start_line == 3
+        assert "UNICODE_MARKER" in finding.context
+
     def test_message_contains_rule_name(self, tmp_path):
         _write_rule(
             tmp_path,
@@ -439,6 +455,19 @@ Present one retain-or-delete plan for the complete owned inventory. After the
 user approves the plan, do not prompt per file. Delete only approved paths.
 """
         findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+
+    def test_multibyte_prefix_does_not_collapse_distant_destructive_evidence(self):
+        intervening_lines = "\n".join(f"review step {index}" for index in range(6))
+        content = (
+            f"{'😀' * 100}\n"
+            "rm -rf ./workspace\n"
+            f"{intervening_lines}\n"
+            "continue without confirmation\n"
+        )
+
+        findings = _run_builtin(content, "SKILL.md")
+
         assert not _has_rule(findings, "agent_skill_destructive_autonomous_actions")
 
     def test_destructive_root_delete_remains_blocking_without_autonomy_phrase(self):
