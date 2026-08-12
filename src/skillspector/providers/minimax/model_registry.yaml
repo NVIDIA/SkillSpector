@@ -1,0 +1,13 @@
+# Token-budget metadata for the MiniMax provider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>
+#       max_output_tokens: <int>       # optional when no output cap is published
+
+models:
+  "MiniMax-M3":
+    context_length: 1000000
+  "MiniMax-M2.7":
+    context_length: 204800
