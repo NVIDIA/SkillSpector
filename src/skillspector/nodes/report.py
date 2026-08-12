@@ -156,6 +156,11 @@ _SEVERITY_POINTS: dict[str, int] = {
 _MAX_OCCURRENCES_PER_RULE = 3
 _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 
+# Some findings describe artifacts whose unanalyzed contents can execute. Their
+# presence must block installation even when ordinary confidence-weighted,
+# per-rule scoring would otherwise keep the aggregate below the CLI threshold.
+_RISK_SCORE_FLOORS_BY_RULE_ID = {"SC8": 51}
+
 
 def _compute_risk_score(
     findings: list[Finding],
@@ -220,7 +225,15 @@ def _compute_risk_score(
 
         score += contribution
 
-    final_score = min(100, max(0, int(score)))
+    score_floor = max(
+        (
+            _RISK_SCORE_FLOORS_BY_RULE_ID.get(f.rule_id, 0)
+            for f in sorted_findings
+            if max(0.0, min(1.0, f.confidence)) > 0.0
+        ),
+        default=0,
+    )
+    final_score = min(100, max(score_floor, int(score)))
 
     severity_band = "LOW"
     for threshold, band in _RISK_SEVERITY_BANDS:

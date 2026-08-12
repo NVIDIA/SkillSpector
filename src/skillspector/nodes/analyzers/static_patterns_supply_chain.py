@@ -1188,7 +1188,6 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
     return findings
 
 
-
 # ---------------------------------------------------------------------------
 # SC8: Shipped Python bytecode (closes silent __pycache__ / .pyc skip)
 # ---------------------------------------------------------------------------
@@ -1277,7 +1276,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         extra_findings: list[Finding],
         fallback_analyzer_id: str,
     ) -> None:
-        """Attach dependency/manifest findings to the matching completed work item."""
+        """Attach supplemental findings to the matching completed work item."""
         if not extra_findings:
             return
         finding_ids = [finding.finding_id for finding in extra_findings]
@@ -1344,10 +1343,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     if isinstance(skill_path, str) and skill_path.strip():
         bytecode_findings = _analyze_shipped_bytecode(skill_path)
         findings.extend(bytecode_findings)
-        if bytecode_findings:
+        for finding_path in sorted({finding.file.rstrip("/") for finding in bytecode_findings}):
             record_extra_findings(
-                skill_path,
-                bytecode_findings,
+                finding_path,
+                [
+                    finding
+                    for finding in bytecode_findings
+                    if finding.file.rstrip("/") == finding_path
+                ],
                 f"{ANALYZER_ID}_bytecode",
             )
 
