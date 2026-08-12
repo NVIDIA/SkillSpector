@@ -72,14 +72,20 @@ _rules_hash: str | None = None
 
 
 def _collect_rule_files(*dirs: Path) -> list[Path]:
-    """Collect all YARA rule files under one or more directories, sorted for determinism."""
-    files: set[Path] = set()
+    """Collect YARA files deterministically while preserving directory precedence."""
+    files: list[Path] = []
+    seen: set[Path] = set()
     for d in dirs:
         if not d.is_dir():
             continue
+        directory_files: set[Path] = set()
         for ext in _RULE_EXTENSIONS:
-            files.update(d.rglob(ext))
-    return sorted(files)
+            directory_files.update(d.rglob(ext))
+        for rule_file in sorted(directory_files):
+            if rule_file not in seen:
+                seen.add(rule_file)
+                files.append(rule_file)
+    return files
 
 
 def _content_hash(rule_files: list[Path]) -> str:

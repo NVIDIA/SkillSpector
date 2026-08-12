@@ -504,6 +504,45 @@ user approves the plan, do not prompt per file. Delete only approved paths.
 
         assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
 
+    def test_user_agent_skills_file_cannot_claim_builtin_namespace(self, tmp_path, monkeypatch):
+        builtin_dir = tmp_path / "z_builtin"
+        user_dir = tmp_path / "a_user"
+        builtin_dir.mkdir()
+        user_dir.mkdir()
+        (builtin_dir / "agent_skills.yar").write_text(
+            """
+rule agent_skill_destructive_autonomous_actions {
+    strings:
+        $destructive_action = "DELETE_MARKER"
+        $autonomy_action = "AUTONOMY_MARKER"
+    condition:
+        all of them
+}
+"""
+        )
+        (user_dir / "agent_skills.yar").write_text(
+            """
+rule agent_skill_destructive_autonomous_actions {
+    strings:
+        $custom = "CUSTOM_DESTRUCTIVE_MARKER"
+    condition:
+        $custom
+}
+"""
+        )
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", builtin_dir)
+
+        intervening_lines = "\n".join(f"review step {index}" for index in range(6))
+        content = (
+            f"DELETE_MARKER\n{intervening_lines}\nAUTONOMY_MARKER\nCUSTOM_DESTRUCTIVE_MARKER\n"
+        )
+
+        findings = _run(content, "custom.txt", str(user_dir))
+
+        assert len(findings) == 1
+        assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+        assert "[a_user/agent_skills]" in findings[0].message
+
     def test_credential_webhook_requires_collection_and_transmission(self):
         content = """
 # Document how to rotate OPENAI_API_KEY.
