@@ -34,7 +34,6 @@ import pytest
 
 from skillspector.graph import graph
 
-
 # Keys the CLI reads from the result dict *after* the graph run.
 # Derived from cli.py: _write_result, _cleanup_result, exit-code check.
 _CLI_CONSUMED_KEYS = frozenset(
@@ -98,7 +97,4 @@ def test_stream_and_invoke_produce_same_cli_keys(tmp_path: Path) -> None:
                 f"invoke={set(inv_parsed.keys())}, stream={set(stm_parsed.keys())}"
             )
         else:
-            assert inv == stm, (
-                f"value mismatch for CLI key {key!r}: "
-                f"invoke={inv!r}, stream={stm!r}"
-            )
+            assert inv == stm, f"value mismatch for CLI key {key!r}: invoke={inv!r}, stream={stm!r}"
