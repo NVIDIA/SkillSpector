@@ -253,7 +253,14 @@ class TestLLMCallTelemetry:
         assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_partial_batch_failure_records_llm_success(self) -> None:
+    def test_partial_batch_failure_records_llm_failure(self) -> None:
+        """One batch succeeding does not hide another batch's dropped coverage.
+
+        Regression for the case where a two-file run has one file batch
+        succeed and the other 429 / time out: the record must be ok=False so
+        the report can detect the coverage gap, not ok=True just because
+        `outcome.successful` was non-empty.
+        """
         from skillspector.llm_analyzer_base import LLMAnalyzerBase
 
         async def partially_succeeds(self, batches, **_kwargs):
@@ -267,7 +274,7 @@ class TestLLMCallTelemetry:
         with patch.object(LLMAnalyzerBase, "arun_batches", partially_succeeds):
             result = node({"file_cache": {"first.py": "print(1)", "second.py": "print(2)"}})
 
-        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": True, "error": None}]
+        assert result["llm_call_log"] == [{"node": ANALYZER_ID, "ok": False, "error": None}]
 
     @patch(MOCK_PATCH_TARGET)
     def test_exception_records_ok_false(self, mock_get_model: MagicMock) -> None:

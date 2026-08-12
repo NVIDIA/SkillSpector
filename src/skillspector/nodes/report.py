@@ -748,20 +748,33 @@ def _build_metadata(
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    llm_available, llm_error = is_llm_available()
+    provider_available, llm_error = is_llm_available()
     attempted, succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
-    # meta_analysis_applied reflects whether the LLM meta-analysis effectively
-    # ran in full: requested, available, and every attempted call succeeded.
-    meta_analysis_applied = use_llm and llm_available and not degraded
+
+    # meta_analyzer's own record, independent of whether a DIFFERENT
+    # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
+    # batch. A missing record means meta_analyzer never ran (e.g. there were
+    # no findings to filter), which is not itself a failure, so it reads as
+    # vacuously ok. When it does run it always emits exactly one record.
+    meta_analyzer_records = [r for r in llm_call_log if r.get("node") == "meta_analyzer"]
+    meta_analyzer_ok = all(bool(r.get("ok")) for r in meta_analyzer_records)
+
+    # meta_analysis_applied / llm_available answer "did meta-analysis itself
+    # run": the provider was available and meta_analyzer's own call (if it
+    # ran) succeeded. A different analyzer's partial batch loss is a
+    # coverage gap, reported separately below via llm_degraded /
+    # llm_calls_attempted / llm_calls_succeeded, and must not flip these two
+    # fields false on its own - that conflated two independent contracts
+    # (meta-analysis ran vs. some coverage was lost) into one boolean.
+    meta_analysis_applied = use_llm and provider_available and meta_analyzer_ok
 
     meta: dict[str, object] = {
         "has_executable_scripts": has_executable_scripts,
         "skillspector_version": skillspector_version,
         "llm_requested": use_llm,
         # llm_available reflects runtime truth: the binary/credentials were
-        # available AND every attempted call succeeded (a dropped batch is
-        # coverage the caller did not actually get, same as none at all).
-        "llm_available": llm_available and not degraded,
+        # available AND meta_analyzer's own call (if it ran) succeeded.
+        "llm_available": provider_available and meta_analyzer_ok,
         "meta_analysis_applied": meta_analysis_applied,
         # A list (including an empty list) makes observability explicit. Empty
         # means the provider/transport supplied no counters; it is never an
@@ -784,7 +797,7 @@ def _build_metadata(
             f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed; "
             f"results reflect static analysis only for the affected batch(es).{detail}"
         )
-    elif use_llm and not llm_available:
+    elif use_llm and not provider_available:
         meta["llm_error"] = llm_error
     if transitive_targets_scanned is not None:
         meta["transitive_targets_scanned"] = transitive_targets_scanned
