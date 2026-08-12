@@ -194,17 +194,17 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
 
 def _extract_match_strings(match: yara.Match) -> tuple[int, str | None]:
     """Extract the first match offset and a joined matched-text snippet from a YARA match."""
-    first_offset = 0
+    first_offset: int | None = None
     parts: list[str] = []
     for sd in match.strings or []:
         for inst in sd.instances or []:
-            if first_offset == 0:
+            if first_offset is None or inst.offset < first_offset:
                 first_offset = inst.offset
             matched_bytes = inst.matched_data
             if isinstance(matched_bytes, bytes):
                 parts.append(matched_bytes.decode("utf-8", errors="replace"))
     matched_text = "; ".join(parts)[:200] if parts else None
-    return first_offset, matched_text
+    return first_offset if first_offset is not None else 0, matched_text
 
 
 def _line_number_from_byte_offset(data: bytes, offset: int) -> int:

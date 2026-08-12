@@ -156,6 +156,23 @@ class TestCorePipeline:
         assert finding.start_line == 3
         assert "UNICODE_MARKER" in finding.context
 
+    def test_match_at_byte_zero_remains_the_first_offset(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "detect_multiple_markers",
+            category="malware",
+            severity="HIGH",
+            strings={"first": "START_MARKER", "later": "LATER_MARKER"},
+        )
+
+        finding = _run(
+            "START_MARKER\nmiddle line\nLATER_MARKER",
+            "multiple.txt",
+            str(tmp_path),
+        )[0]
+
+        assert finding.start_line == 1
+
     def test_message_contains_rule_name(self, tmp_path):
         _write_rule(
             tmp_path,
