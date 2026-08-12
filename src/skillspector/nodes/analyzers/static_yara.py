@@ -62,6 +62,7 @@ _CATEGORY_MAP: dict[str, tuple[str, Severity]] = {
 _DEFAULT_RULE_ID = "YR4"
 _DEFAULT_SEVERITY = Severity.MEDIUM
 _DEFAULT_CONFIDENCE = 0.7
+_DESTRUCTIVE_AUTONOMY_NAMESPACE = "agent_skills"
 _DESTRUCTIVE_AUTONOMY_RULE = "agent_skill_destructive_autonomous_actions"
 _MAX_DESTRUCTIVE_AUTONOMY_LINE_DISTANCE = 3
 
@@ -278,7 +279,8 @@ def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[Analyze
     findings: list[AnalyzerFinding] = []
     for match in matches:
         if (
-            match.rule == _DESTRUCTIVE_AUTONOMY_RULE
+            match.namespace == _DESTRUCTIVE_AUTONOMY_NAMESPACE
+            and match.rule == _DESTRUCTIVE_AUTONOMY_RULE
             and not _has_local_destructive_autonomy_evidence(match, data)
         ):
             logger.debug(

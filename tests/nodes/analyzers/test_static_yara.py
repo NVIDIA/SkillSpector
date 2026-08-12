@@ -491,6 +491,19 @@ user approves the plan, do not prompt per file. Delete only approved paths.
         findings = _run_builtin("rm -rf /\n", "setup.sh")
         assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
 
+    def test_user_rule_with_destructive_rule_name_is_not_post_filtered(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "agent_skill_destructive_autonomous_actions",
+            category="hack_tool",
+            severity="MEDIUM",
+            strings={"custom": "CUSTOM_DESTRUCTIVE_MARKER"},
+        )
+
+        findings = _run("CUSTOM_DESTRUCTIVE_MARKER", "custom.txt", str(tmp_path))
+
+        assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+
     def test_credential_webhook_requires_collection_and_transmission(self):
         content = """
 # Document how to rotate OPENAI_API_KEY.
