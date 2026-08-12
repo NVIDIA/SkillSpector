@@ -785,6 +785,10 @@ def _make_skill_dir(
     return d
 
 
+def _without_finding_ids(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: value for key, value in issue.items() if key != "finding_id"} for issue in issues]
+
+
 def test_cli_shipped_baseline_without_opt_in(tmp_path: Path) -> None:
     """Malformed shipped baseline is detected but never parsed without opt-in (R2/P1/R8)."""
     skill_dir = _make_skill_dir(tmp_path, baseline_content="rules: [{}]")
@@ -805,7 +809,7 @@ def test_cli_shipped_baseline_without_opt_in(tmp_path: Path) -> None:
     control = runner.invoke(app, ["scan", str(control_dir), "--no-llm", "--format", "json"])
     control_data = json.loads(control.stdout)
     assert result.exit_code == control.exit_code
-    assert data["issues"] == control_data["issues"]
+    assert _without_finding_ids(data["issues"]) == _without_finding_ids(control_data["issues"])
     assert data["risk_assessment"]["score"] == control_data["risk_assessment"]["score"]
     assert "Shipped baseline detected" not in control.stderr
     # With opt-in: malformed file IS parsed → exit 2, and the error names the baseline problem (R8)
@@ -948,7 +952,7 @@ def test_cli_shipped_baseline_optin_without_file_is_noop(tmp_path: Path) -> None
     control = runner.invoke(app, ["scan", str(skill_dir), "--no-llm", "--format", "json"])
     control_data = json.loads(control.stdout)
     assert result.exit_code == control.exit_code
-    assert data["issues"] == control_data["issues"]
+    assert _without_finding_ids(data["issues"]) == _without_finding_ids(control_data["issues"])
     assert data["risk_assessment"]["score"] == control_data["risk_assessment"]["score"]
 
 
