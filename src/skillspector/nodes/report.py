@@ -713,12 +713,13 @@ def _llm_runtime_status(
     """Return ``(attempted, succeeded, degraded)`` from the LLM call log.
 
     ``degraded`` is True when the LLM stage was requested and at least one call
-    was attempted, but every call failed at runtime — meaning the report
-    reflects static analysis only despite a deep scan being requested.
+    was attempted, but not every call succeeded: a dropped or throttled batch
+    (e.g. a 429) leaves the same coverage gap as a full failure, so a partial
+    pass is degraded too, not just a total one.
     """
     attempted = len(llm_call_log)
     succeeded = sum(1 for r in llm_call_log if r.get("ok"))
-    degraded = bool(use_llm and attempted > 0 and succeeded == 0)
+    degraded = bool(use_llm and attempted > 0 and succeeded < attempted)
     return attempted, succeeded, degraded
 
 
@@ -726,12 +727,13 @@ def _llm_degradation_notice(
     use_llm: bool, llm_call_log: Sequence[Mapping[str, object]]
 ) -> str | None:
     """Return a human-readable degraded-scan warning, or None if not degraded."""
-    attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    attempted, succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     if not degraded:
         return None
+    failed = attempted - succeeded
     return (
-        f"LLM analysis was requested but all {attempted} LLM call(s) failed - "
-        "results reflect STATIC analysis only."
+        f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed - "
+        "results reflect STATIC analysis only for the affected batch(es)."
     )
 
 
@@ -749,7 +751,7 @@ def _build_metadata(
     llm_available, llm_error = is_llm_available()
     attempted, succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analysis_applied reflects whether the LLM meta-analysis effectively
-    # ran: requested, available, and not fully degraded (every call failing).
+    # ran in full: requested, available, and every attempted call succeeded.
     meta_analysis_applied = use_llm and llm_available and not degraded
 
     meta: dict[str, object] = {
@@ -757,7 +759,8 @@ def _build_metadata(
         "skillspector_version": skillspector_version,
         "llm_requested": use_llm,
         # llm_available reflects runtime truth: the binary/credentials were
-        # available AND the stage was not fully degraded (every call failing).
+        # available AND every attempted call succeeded (a dropped batch is
+        # coverage the caller did not actually get, same as none at all).
         "llm_available": llm_available and not degraded,
         "meta_analysis_applied": meta_analysis_applied,
         # A list (including an empty list) makes observability explicit. Empty
@@ -776,9 +779,10 @@ def _build_metadata(
             {str(r.get("error")) for r in llm_call_log if not r.get("ok") and r.get("error")}
         )
         detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
+        failed = attempted - succeeded
         meta["llm_error"] = (
-            f"LLM analysis was requested but all {attempted} LLM call(s) failed; "
-            f"results reflect static analysis only.{detail}"
+            f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed; "
+            f"results reflect static analysis only for the affected batch(es).{detail}"
         )
     elif use_llm and not llm_available:
         meta["llm_error"] = llm_error

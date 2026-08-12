@@ -991,8 +991,13 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     assert "static analysis only" in meta["llm_error"]
 
 
-def test_report_not_degraded_when_some_calls_succeeded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At least one successful LLM call -> not degraded, llm_available stays True."""
+def test_report_degraded_when_some_calls_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dropped/throttled batch degrades the scan even though other calls succeeded.
+
+    A rate-limited provider can 429 one batch (e.g. the security-discovery
+    analyzer) while the rest of the fan-out succeeds; that is still a coverage
+    gap and must not read as a clean, fully-analyzed scan.
+    """
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
@@ -1007,10 +1012,11 @@ def test_report_not_degraded_when_some_calls_succeeded(monkeypatch: pytest.Monke
         ],
     }
     meta = _meta_from_json_report(state)
-    assert meta["llm_available"] is True
-    assert "llm_degraded" not in meta
+    assert meta["llm_available"] is False  # a dropped batch is not full coverage
+    assert meta["llm_degraded"] is True
     assert meta["llm_calls_attempted"] == 2
     assert meta["llm_calls_succeeded"] == 1
+    assert "1 of 2" in meta["llm_error"]
 
 
 def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1217,6 +1223,32 @@ def test_unavailable_provider_floors_recommendation_even_with_success_records(
     payload = json.loads(result["report_body"])
     assert payload["risk_assessment"]["recommendation"] == "CAUTION"
     assert payload["metadata"]["llm_available"] is False
+
+
+def test_partial_llm_failure_also_floors_recommendation_at_caution() -> None:
+    """A rate-limited provider dropping one batch must not read as a clean scan.
+
+    Matches the reported failure: llm_calls_attempted=4, llm_calls_succeeded=3
+    (one batch 429'd and was dropped), yet the report emitted a plain SAFE
+    verdict because only an all-calls-failed scan was treated as degraded.
+    """
+    state: SkillspectorState = {
+        "filtered_findings": [],  # static score 0 -> would be SAFE
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_security_discovery", ok=False, error="429 rate limited"),
+            llm_call_record("semantic_developer_intent", ok=True),
+            llm_call_record("semantic_quality_policy", ok=True),
+            llm_call_record("meta_analyzer", ok=True),
+        ],
+    }
+    result = report(state)
+    assert result["risk_score"] == 0  # score is left honest
+    assert result["risk_recommendation"] == "CAUTION"  # never SAFE on a partial pass
 
 
 def test_non_degraded_clean_scan_stays_safe() -> None:
