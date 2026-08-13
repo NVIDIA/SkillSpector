@@ -24,6 +24,7 @@ import base64
 import json
 import os
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -136,6 +137,29 @@ def test_build_context_ast_cache_handle_is_checkpoint_serializable(tmp_path: Pat
 
     serializer = JsonPlusSerializer()
     assert serializer.dumps_typed(result)
+
+
+def test_build_context_reads_directory_with_windows_secure_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows' handle-based fallback keeps normal directory scans usable."""
+    _make_skill_spec_dir(tmp_path)
+
+    def open_with_windows_handle(path: Path) -> BinaryIO:
+        return path.open("rb")
+
+    monkeypatch.setattr("skillspector.input_handler._HAS_SECURE_DIR_FD", False)
+    monkeypatch.setattr("skillspector.input_handler._IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "skillspector.input_handler._open_regular_file_from_windows_handle",
+        open_with_windows_handle,
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["file_cache"]["SKILL.md"].startswith("---")
+    assert result["file_cache"]["scripts/run.py"] == "print(1)\n"
+    assert result["manifest"]["name"] == "test-skill"
 
 
 def test_build_context_missing_skill_path() -> None:
@@ -446,14 +470,11 @@ def test_build_context_reports_read_error_without_fake_empty_content(
     """Unreadable files remain inventoried but are absent from the content cache."""
     target = tmp_path / "broken.py"
     target.write_text("print(1)\n", encoding="utf-8")
-    original = Path.read_text
 
-    def fail_target(path: Path, *args: object, **kwargs: object) -> str:
-        if path == target:
-            raise PermissionError("sensitive operating-system detail")
-        return original(path, *args, **kwargs)
+    def deny_open(*args: object, **kwargs: object) -> int:
+        raise PermissionError("sensitive operating-system detail")
 
-    monkeypatch.setattr(Path, "read_text", fail_target)
+    monkeypatch.setattr("skillspector.input_handler.os.open", deny_open)
     result = build_context({"skill_path": str(tmp_path)})
 
     assert "broken.py" in result["components"]
@@ -479,8 +500,8 @@ def test_build_context_records_non_regular_files_in_the_ledger(tmp_path: Path) -
     assert event["reason_code"] == "not_regular_file"
 
 
-def test_build_context_records_dangling_symlink_in_the_ledger(tmp_path: Path) -> None:
-    """Dangling entries are not silently omitted during discovery."""
+def test_build_context_excludes_dangling_symlink_from_scan_scope(tmp_path: Path) -> None:
+    """Symlinks are excluded rather than read as files from an unknown target."""
     dangling = tmp_path / "missing.py"
     try:
         dangling.symlink_to("no-longer-present.py")
@@ -489,10 +510,10 @@ def test_build_context_records_dangling_symlink_in_the_ledger(tmp_path: Path) ->
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert "missing.py" in result["components"]
+    assert "missing.py" not in result["components"]
     assert "missing.py" not in result["file_cache"]
     event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "missing.py")
-    assert event["reason_code"] == "file_disappeared"
+    assert event["reason_code"] == "not_regular_file"
 
 
 def test_build_context_records_stat_errors_in_the_ledger(
@@ -531,3 +552,118 @@ def test_build_context_records_non_regular_entries_in_the_ledger(tmp_path: Path)
         entry for entry in result["inspection_ledger"] if entry["path"] == "inspection.pipe"
     )
     assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_rejects_symlink_to_external_file(tmp_path: Path) -> None:
+    """A symlinked file outside skill_dir must not enter the component cache."""
+    secret = tmp_path.parent / "external_secret.txt"
+    secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
+
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
+    (skill_dir / "creds.md").symlink_to(secret)
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert "creds.md" not in result["components"]
+    assert "creds.md" not in result["file_cache"]
+    assert all("hunter2" not in content for content in result["file_cache"].values())
+
+
+def test_build_context_rejects_symlinked_directory(tmp_path: Path) -> None:
+    """A symlinked subdirectory outside skill_dir must not be traversed."""
+    external = tmp_path.parent / "external_dir"
+    external.mkdir(exist_ok=True)
+    (external / "leak.md").write_text("PRIVATE_KEY=xyz", encoding="utf-8")
+
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
+    (skill_dir / "linked").symlink_to(external, target_is_directory=True)
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert not any(path.startswith("linked/") for path in result["components"])
+    assert all("PRIVATE_KEY" not in content for content in result["file_cache"].values())
+
+
+def test_build_context_rejects_junctioned_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows junctions must be excluded before os.walk can traverse them."""
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "leak.md").write_text("PRIVATE_KEY=xyz", encoding="utf-8")
+    original_is_junction = Path.is_junction
+
+    def is_junction(path: Path) -> bool:
+        return path == linked or original_is_junction(path)
+
+    monkeypatch.setattr(Path, "is_junction", is_junction)
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert not any(path.startswith("linked/") for path in result["components"])
+    assert all("PRIVATE_KEY" not in content for content in result["file_cache"].values())
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "linked/")
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_rejects_in_tree_symlink(tmp_path: Path) -> None:
+    """Even an in-tree symlink is skipped rather than read through."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "real.md").write_text("real content", encoding="utf-8")
+    (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
+    (skill_dir / "alias.md").symlink_to(skill_dir / "real.md")
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert "real.md" in result["components"]
+    assert "alias.md" not in result["components"]
+
+
+def test_build_context_rejects_file_swapped_to_symlink_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path replaced after stat must not leak its new symlink target."""
+    from skillspector.nodes.build_context import _open_regular_file_no_follow
+
+    secret = tmp_path.parent / "external_secret.txt"
+    secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
+    target = tmp_path / "payload.md"
+    target.write_text("safe", encoding="utf-8")
+
+    def replace_target(path: Path) -> BinaryIO:
+        if path.name == target.name:
+            path.unlink()
+            path.symlink_to(secret)
+        return _open_regular_file_no_follow(path)
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context._open_regular_file_no_follow", replace_target
+    )
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "payload.md" in result["components"]
+    assert "payload.md" not in result["file_cache"]
+    assert all("hunter2" not in content for content in result["file_cache"].values())
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "payload.md")
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_rejects_symlinked_manifest(tmp_path: Path) -> None:
+    """Manifest parsing cannot bypass symlink rejection applied to the cache."""
+    external = tmp_path.parent / "external_manifest.md"
+    external.write_text(
+        "---\nname: private-name\ndescription: private-description\n---\n", encoding="utf-8"
+    )
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").symlink_to(external)
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert result["manifest"] == {}
+    assert "SKILL.md" not in result["components"]
+    assert "SKILL.md" not in result["file_cache"]

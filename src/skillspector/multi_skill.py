@@ -25,6 +25,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from skillspector.input_handler import (
+    _FileOpenError,
+    _open_regular_file_no_follow,
+    _UnsafeFileError,
+    validate_local_input_path,
+)
 from skillspector.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +66,10 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
 
     Returns a MultiSkillDetectionResult with detected skills.
     """
+    try:
+        directory = validate_local_input_path(directory)
+    except ValueError:
+        return MultiSkillDetectionResult(is_multi_skill=False)
     if not directory.is_dir():
         return MultiSkillDetectionResult(is_multi_skill=False)
 
@@ -69,7 +79,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
 
     skills: list[SkillDirectory] = []
     for child in sorted(directory.iterdir()):
-        if not child.is_dir():
+        if _is_link_or_junction(child) or not child.is_dir():
             continue
         if child.name.startswith("."):
             continue
@@ -93,7 +103,18 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
 
 def _has_skill_md(directory: Path) -> bool:
     """Check if directory contains a SKILL.md or skill.md at root level."""
-    return (directory / "SKILL.md").is_file() or (directory / "skill.md").is_file()
+    return any(
+        not _is_link_or_junction(path) and path.is_file()
+        for path in (directory / "SKILL.md", directory / "skill.md")
+    )
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    """Return True for links or uninspectable paths that must not be followed."""
+    try:
+        return path.is_symlink() or path.is_junction()
+    except OSError:
+        return True
 
 
 def _extract_skill_name(skill_dir: Path) -> str:
@@ -104,11 +125,12 @@ def _extract_skill_name(skill_dir: Path) -> str:
 
     for name in ("SKILL.md", "skill.md"):
         path = skill_dir / name
-        if not path.is_file():
+        if _is_link_or_junction(path) or not path.is_file():
             continue
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            with _open_regular_file_no_follow(path) as source:
+                content = source.read().decode("utf-8", errors="replace")
+        except (OSError, _FileOpenError, _UnsafeFileError):
             continue
         if not content.startswith("---"):
             break
