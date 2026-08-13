@@ -15,6 +15,15 @@
 
 models:
   # NVIDIA-curated NIMs on build.nvidia.com.
+  "z-ai/glm-5.2":
+    context_length: 1000000
+
+  "z-ai/glm-5.1":
+    context_length: 205000
+
+  "moonshotai/kimi-k2.6":
+    context_length: 256000
+
   "deepseek-ai/deepseek-v4-pro":
     context_length: 1000000
     max_output_tokens: 128000

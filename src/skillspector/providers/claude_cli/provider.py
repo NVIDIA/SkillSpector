@@ -36,8 +36,9 @@ BINARY_NAME = "claude"
 class ClaudeCLIProvider(AgentCLIProviderBase):
     """Claude CLI provider (no API key; uses the local ``claude`` login).
 
-    No model is pinned: ``claude`` runs with the user's own default model and
-    thinking-level config. Set ``SKILLSPECTOR_MODEL`` to override.
+    No model is pinned: ``claude`` falls back to its remaining runtime default
+    after SkillSpector strips user, project, and local settings. Set
+    ``SKILLSPECTOR_MODEL`` to override.
     """
 
     BINARY_NAME = "claude"

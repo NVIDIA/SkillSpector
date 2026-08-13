@@ -53,6 +53,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import SecretStr
 
 from skillspector.providers import registry
+from skillspector.providers.chat_models import resolve_reasoning_effort
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -231,15 +232,19 @@ class AnthropicProxyProvider:
 
         bearer_token, endpoint_url = creds
 
-        return _ChatAnthropicProxy(
-            proxy_endpoint_url=endpoint_url,
-            proxy_bearer_token=bearer_token,
-            model_name=model,
-            anthropic_api_key=SecretStr("anthropic-proxy-placeholder"),
-            max_tokens=max_tokens,
-            default_request_timeout=timeout,
-            stop_sequences=None,
-        )
+        kwargs = {
+            "proxy_endpoint_url": endpoint_url,
+            "proxy_bearer_token": bearer_token,
+            "model_name": model,
+            "anthropic_api_key": SecretStr("anthropic-proxy-placeholder"),
+            "max_tokens": max_tokens,
+            "default_request_timeout": timeout,
+            "stop_sequences": None,
+        }
+        effort = resolve_reasoning_effort()
+        if effort is not None:
+            kwargs["effort"] = effort
+        return _ChatAnthropicProxy(**kwargs)
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)

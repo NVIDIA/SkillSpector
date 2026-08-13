@@ -336,6 +336,46 @@ class TestEdgeCases:
         result = behavioral_ast.node(state)
         assert result["findings"] == []
 
+    def test_file_size_gate_scans_exact_character_limit(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        prefix = 'exec("x")\n'
+        code = prefix + (" " * (MAX_FILE_CHARS - len(prefix)))
+        assert len(code) == MAX_FILE_CHARS
+        assert any(f.rule_id == "AST1" for f in _run(code))
+
+    def test_file_size_gate_skips_over_character_limit(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        prefix = 'exec("x")\n'
+        code = prefix + (" " * (MAX_FILE_CHARS - len(prefix) + 1))
+        assert len(code) == MAX_FILE_CHARS + 1
+        assert _run(code) == []
+
+    def test_file_size_gate_multibyte_under_character_limit_scanned(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        prefix = 'exec("x")\n# '
+        code = prefix + ("🦄" * 250_000)
+        assert len(code) <= MAX_FILE_CHARS
+        assert len(code.encode("utf-8")) > MAX_FILE_CHARS
+        assert any(f.rule_id == "AST1" for f in _run(code))
+
+    def test_file_size_gate_skips_only_oversized_component(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        big = 'exec("x")\n' + (" " * MAX_FILE_CHARS)
+        small = 'exec("ok")\n'
+        state = {
+            "components": ["big.py", "small.py"],
+            "file_cache": {"big.py": big, "small.py": small},
+        }
+
+        result = behavioral_ast.node(state)
+        files = {f.file for f in result["findings"]}
+        assert "big.py" not in files
+        assert "small.py" in files
+
 
 class TestImportAliasEvasion:
     """Dangerous calls must be detected through ``from ... import`` and ``import ... as``.
@@ -476,3 +516,32 @@ class TestImportlibDynamicChainEvasion:
         """A benign dynamic import (``json.loads``) must not match a sink ladder."""
         findings = _run("import importlib\nimportlib.import_module('json').loads('{}')\n")
         assert findings == []
+
+
+class TestInspectionLedgerResponse:
+    def test_syntax_error_is_skipped_without_creating_non_python_work(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["broken.py", "README.md"],
+                "file_cache": {"broken.py": "def broken(:\n", "README.md": "# docs\n"},
+            }
+        )
+
+        assert [event["path"] for event in result["inspection_ledger"]] == ["broken.py"]
+        assert result["inspection_ledger"][0]["outcome"] == "skipped"
+        assert result["inspection_ledger"][0]["reason_code"] == "syntax_error"
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_completed_work_references_the_emitted_findings(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["run.py"],
+                "file_cache": {"run.py": "import os\nos.system(user_input)\n"},
+            }
+        )
+
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] == "completed"
+        assert event["emitted_finding_ids"] == [
+            finding.finding_id for finding in result["findings"]
+        ]

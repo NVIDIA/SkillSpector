@@ -22,32 +22,49 @@ in the active provider — see ``tests/unit/test_providers.py``.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
 from pydantic import BaseModel
 
 from skillspector import llm_utils
+from skillspector.inference_usage import InferenceUsageCollector
 from skillspector.llm_utils import (
     AgentCLIChatModel,
+    StructuredOutputParseError,
+    _ainvoke_with_usage,
     _extract_json_object,
+    _invoke_with_usage,
     _resolve_llm_credentials,
     chat_completion,
+    chat_model_provider_name,
     fetch_model_token_limits,
     get_chat_model,
     is_llm_available,
+    new_inference_usage_collector,
+    run_async,
 )
-from skillspector.providers import NO_LLM_API_KEY_MESSAGE, resolve_provider_credentials
+from skillspector.providers import (
+    NO_LLM_API_KEY_MESSAGE,
+    reset_provider,
+    resolve_chat_model_credentials,
+    resolve_provider_credentials,
+    use_provider,
+)
 from skillspector.providers.nv_build import NvBuildProvider
 from skillspector.providers.openai import OpenAIProvider
 
 _LLM_ENV_VARS = (
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "NVIDIA_INFERENCE_KEY",
+    "SKILLSPECTOR_REASONING_EFFORT",
     "SKILLSPECTOR_MODEL",
     "SKILLSPECTOR_PROVIDER",
 )
@@ -119,6 +136,84 @@ class TestCredentialResolution:
         llm = get_chat_model(model="claude-opus-4-6")
         assert isinstance(llm, ChatAnthropic)
         assert llm.model == "claude-opus-4-6"
+
+    def test_injected_provider_without_credentials_builds_native_chat_model(self) -> None:
+        chat_model = object()
+
+        class _InjectedProvider:
+            DEFAULT_MODEL = "injected-default"
+            SLOT_DEFAULTS = {"meta_analyzer": "injected-default"}
+
+            def get_context_length(self, model: str) -> int | None:
+                return 4096 if model == "injected-default" else None
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return 128 if model == "injected-default" else None
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "injected-default"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+            def create_chat_model(
+                self,
+                model: str,
+                *,
+                max_tokens: int,
+                timeout: float | None = 120,
+            ) -> object:
+                assert model == "injected-default"
+                assert max_tokens == 128
+                assert timeout == 120
+                return chat_model
+
+        token = use_provider(_InjectedProvider())
+        try:
+            assert is_llm_available() == (True, None)
+            assert get_chat_model() is chat_model
+        finally:
+            reset_provider(token)
+
+    def test_injected_provider_without_native_model_does_not_fall_back_to_openai(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fallback")
+
+        class _InjectedProvider:
+            DEFAULT_MODEL = "injected-default"
+            SLOT_DEFAULTS = {}
+
+            def get_context_length(self, model: str) -> int | None:
+                return 4096
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return 128
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "injected-default"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+            def create_chat_model(
+                self,
+                model: str,
+                *,
+                max_tokens: int,
+                timeout: float | None = 120,
+            ) -> object | None:
+                return None
+
+        token = use_provider(_InjectedProvider())
+        try:
+            assert resolve_chat_model_credentials() is None
+            assert is_llm_available() == (False, NO_LLM_API_KEY_MESSAGE)
+            with pytest.raises(ValueError) as exc_info:
+                get_chat_model()
+            assert str(exc_info.value) == NO_LLM_API_KEY_MESSAGE
+        finally:
+            reset_provider(token)
 
 
 class TestFetchModelTokenLimits:
@@ -198,6 +293,50 @@ class TestIsLlmAvailable:
             ok, err = is_llm_available()
         assert ok is False
         assert "not found" in (err or "").lower()
+
+    def test_bound_cli_provider_uses_cli_availability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bound CLI providers should use is_available, not the HTTP probe path."""
+
+        class _InjectedCLIProvider:
+            DEFAULT_MODEL = "cli-default"
+            SLOT_DEFAULTS = {"meta_analyzer": "cli-default"}
+
+            def get_context_length(self, model: str) -> int | None:
+                return 4096
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return 128
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "cli-default"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+            def complete(
+                self,
+                prompt: str,
+                *,
+                model: str,
+                max_output_tokens: int,
+            ) -> str:
+                return "ok"
+
+        provider = _InjectedCLIProvider()
+        provider.is_available = MagicMock(return_value=(False, "binary not found on PATH"))
+        token = use_provider(provider)
+        try:
+            with patch("skillspector.llm_utils.create_chat_model") as mock_create_chat_model:
+                ok, err = is_llm_available()
+        finally:
+            reset_provider(token)
+
+        assert ok is False
+        assert err == "binary not found on PATH"
+        provider.is_available.assert_called_once_with()
+        mock_create_chat_model.assert_not_called()
 
 
 class TestChatCompletionCLIDispatch:
@@ -298,6 +437,80 @@ class TestGetChatModelCLIAdapter:
                     "x"
                 )
 
+    def test_structured_usage_marks_response_before_sync_parse_failure(self) -> None:
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = "not structured JSON"
+        runnable = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024).with_structured_output(
+            _Schema
+        )
+        collector = InferenceUsageCollector(
+            node="semantic_quality_policy",
+            request_kind="structured_output",
+            provider="claude_cli",
+            requested_model="claude-sonnet-4-6",
+        )
+
+        with pytest.raises(ValueError, match="JSON"):
+            _invoke_with_usage(runnable, "prompt", collector)
+
+        assert collector.response_received is True
+        assert collector.snapshot() == []
+
+    async def test_concurrent_structured_usage_marks_each_async_response(self) -> None:
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = "not structured JSON"
+        runnable = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024).with_structured_output(
+            _Schema
+        )
+        collectors = [
+            InferenceUsageCollector(
+                node=f"semantic_quality_policy_{index}",
+                request_kind="structured_output",
+                provider="claude_cli",
+                requested_model="claude-sonnet-4-6",
+            )
+            for index in range(2)
+        ]
+
+        results = await asyncio.gather(
+            *(
+                _ainvoke_with_usage(runnable, f"prompt-{index}", collector)
+                for index, collector in enumerate(collectors)
+            ),
+            return_exceptions=True,
+        )
+
+        assert all(isinstance(result, ValueError) for result in results)
+        assert all(collector.response_received for collector in collectors)
+        assert all(collector.snapshot() == [] for collector in collectors)
+
+    def test_structured_usage_does_not_mark_pre_response_transport_failure(self) -> None:
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.side_effect = RuntimeError("CLI process failed")
+        runnable = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024).with_structured_output(
+            _Schema
+        )
+        collector = InferenceUsageCollector(
+            node="semantic_quality_policy",
+            request_kind="structured_output",
+            provider="claude_cli",
+            requested_model="claude-sonnet-4-6",
+        )
+
+        with pytest.raises(RuntimeError, match="CLI process failed"):
+            _invoke_with_usage(runnable, "prompt", collector)
+
+        assert collector.response_received is False
+
 
 class TestExtractJsonObject:
     def test_plain_json(self) -> None:
@@ -309,12 +522,42 @@ class TestExtractJsonObject:
     def test_prose_wrapped_json(self) -> None:
         assert _extract_json_object('Here you go:\n{"a": 1}\nDone.') == {"a": 1}
 
-    def test_garbage_raises(self) -> None:
-        with pytest.raises(ValueError):
+    def test_garbage_raises_structured_output_parse_error(self) -> None:
+        with pytest.raises(StructuredOutputParseError):
             _extract_json_object("not json")
 
 
 class TestGetChatModel:
+    def test_bedrock_dispatch_remains_telemetry_provider_with_openai_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+        fake_model = MagicMock()
+
+        with patch(
+            "skillspector.providers.bedrock.provider.BedrockProvider.create_chat_model",
+            return_value=fake_model,
+        ):
+            chat_model = get_chat_model(model="us.anthropic.claude-sonnet-4-6-20250915-v1:0")
+
+        assert chat_model_provider_name(chat_model) == "bedrock"
+        collector = new_inference_usage_collector(
+            node="meta_analyzer",
+            request_kind="structured_output",
+            model="us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            chat_model=chat_model,
+        )
+        message = AIMessage(
+            content="ok",
+            usage_metadata={"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+        )
+        collector.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=message)]], llm_output={})
+        )
+
+        assert collector.snapshot()[0]["provider"] == "bedrock"
+
     def test_openai_fallback_uses_openai_default_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -347,3 +590,48 @@ class TestGetChatModel:
 
 def _chat_model_name(llm: object) -> str:
     return str(getattr(llm, "model_name", None) or getattr(llm, "model", None))
+
+
+class TestRunAsync:
+    """Tests for run_async helper function that handles nested event loops."""
+
+    async def _test_async_function(self, value: int, delay: float = 0) -> int:
+        """Simple async function for testing."""
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return value * 2
+
+    async def _test_async_function_raises(self) -> None:
+        """Async function that raises an exception for testing."""
+        raise ValueError("Test exception")
+
+    def test_run_async_without_running_loop(self) -> None:
+        """Test run_async works correctly when there is no running event loop."""
+        result = run_async(self._test_async_function(42))
+        assert result == 84
+
+    def test_run_async_with_running_loop(self) -> None:
+        """Test run_async works correctly even when there is already a running event loop.
+
+        This regression test covers the scenario where SkillSpector is invoked from
+        environments like Jupyter Notebooks, FastAPI, or LangGraph Studio that already
+        have an active event loop.
+        """
+
+        async def _test_in_running_loop() -> int:
+            # Call run_async from within an already running event loop
+            return run_async(self._test_async_function(100))
+
+        # Use asyncio.run to create a running loop context
+        result = asyncio.run(_test_in_running_loop())
+        assert result == 200
+
+    def test_run_async_propagates_exceptions(self) -> None:
+        """Test exceptions from async functions are properly propagated."""
+        with pytest.raises(ValueError, match="Test exception"):
+            run_async(self._test_async_function_raises())
+
+    def test_run_async_with_delay(self) -> None:
+        """Test run_async correctly handles async functions with await calls."""
+        result = run_async(self._test_async_function(5, delay=0.01))
+        assert result == 10

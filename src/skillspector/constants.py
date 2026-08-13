@@ -28,6 +28,9 @@ MAX_INPUT_TOKENS_PCT = 0.75
 DEFAULT_CONTEXT_LENGTH = 128_000
 # Risk score threshold above which a scan is treated as unsafe.
 RISK_THRESHOLD = 50
+# Maximum text-file size processed by static analyzers and lightweight
+# format recognizers.
+MAX_FILE_BYTES = 1_000_000
 
 # Default-model selection lives on each provider (see providers/<name>/provider.py
 # for ``DEFAULT_MODEL`` and ``SLOT_DEFAULTS``).  The active provider's
@@ -52,21 +55,28 @@ _MODEL_SLOTS: tuple[str, ...] = (
 )
 
 
-def _resolve_slot_model(slot: str) -> str:
+def _resolve_slot_model(slot: str, provider=None) -> str:
     """Resolve the model for *slot* with per-slot env var override support.
 
     Precedence: ``SKILLSPECTOR_MODEL_{SLOT}`` env var > provider
     ``resolve_model(slot)`` (which itself runs ``SKILLSPECTOR_MODEL`` env >
     provider slot default > provider ``DEFAULT_MODEL``).
     """
+    provider = provider or get_metadata_provider()
     env_key = f"SKILLSPECTOR_MODEL_{slot.upper()}"
     env_val = os.environ.get(env_key, "").strip()
     if env_val:
         return env_val
-    return _provider.resolve_model(slot)
+    return provider.resolve_model(slot)
 
 
-MODEL_CONFIG: dict[str, str] = {slot: _resolve_slot_model(slot) for slot in _MODEL_SLOTS}
+def build_model_config() -> dict[str, str]:
+    """Resolve the model map for the currently active provider."""
+    provider = get_metadata_provider()
+    return {slot: _resolve_slot_model(slot, provider) for slot in _MODEL_SLOTS}
+
+
+MODEL_CONFIG: dict[str, str] = {slot: _resolve_slot_model(slot, _provider) for slot in _MODEL_SLOTS}
 
 
 def _validate_model_config() -> None:
