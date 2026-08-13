@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from skillspector.nodes.analyzers import static_patterns_deserialization
+from skillspector.nodes.analyzers import static_patterns_deserialization, static_runner
 
 
 def _run(code: str, filename: str) -> list:
@@ -101,3 +101,35 @@ class TestFindingMetadata:
         assert ds1[0].remediation
         assert ds1[0].context is not None
         assert ds1[0].category == "Insecure Deserialization"
+
+
+class TestLedger:
+    def test_node_accounts_for_every_component(self):
+        """The node reports inspection-ledger work items and an analyzer status."""
+        result = static_patterns_deserialization.node(
+            {
+                "components": ["exploit.php", "clean.rb"],
+                "file_cache": {
+                    "exploit.php": "<?php unserialize($_GET['d']); ?>",
+                    "clean.rb": "x = JSON.parse(data)\n",
+                },
+            }
+        )
+
+        events = result["inspection_ledger"]
+        assert [event["path"] for event in events] == ["exploit.php", "clean.rb"]
+        assert {event["outcome"] for event in events} == {"completed"}
+        assert [status["analyzer_id"] for status in result["analyzer_status_events"]] == [
+            "static_patterns_deserialization"
+        ]
+
+    def test_oversized_file_recorded_as_skipped(self):
+        result = static_patterns_deserialization.node(
+            {
+                "components": ["big.php"],
+                "file_cache": {"big.php": "x" * (static_runner.MAX_FILE_CHARS + 1)},
+            }
+        )
+
+        assert [event["outcome"] for event in result["inspection_ledger"]] == ["skipped"]
+        assert result["findings"] == []
