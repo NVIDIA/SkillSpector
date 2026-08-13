@@ -28,17 +28,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
 from pydantic import BaseModel
 
 from skillspector import llm_utils
+from skillspector.inference_usage import InferenceUsageCollector
 from skillspector.llm_utils import (
     AgentCLIChatModel,
+    StructuredOutputParseError,
+    _ainvoke_with_usage,
     _extract_json_object,
+    _invoke_with_usage,
     _resolve_llm_credentials,
     chat_completion,
+    chat_model_provider_name,
     fetch_model_token_limits,
     get_chat_model,
     is_llm_available,
+    new_inference_usage_collector,
     run_async,
 )
 from skillspector.providers import (
@@ -430,6 +437,80 @@ class TestGetChatModelCLIAdapter:
                     "x"
                 )
 
+    def test_structured_usage_marks_response_before_sync_parse_failure(self) -> None:
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = "not structured JSON"
+        runnable = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024).with_structured_output(
+            _Schema
+        )
+        collector = InferenceUsageCollector(
+            node="semantic_quality_policy",
+            request_kind="structured_output",
+            provider="claude_cli",
+            requested_model="claude-sonnet-4-6",
+        )
+
+        with pytest.raises(ValueError, match="JSON"):
+            _invoke_with_usage(runnable, "prompt", collector)
+
+        assert collector.response_received is True
+        assert collector.snapshot() == []
+
+    async def test_concurrent_structured_usage_marks_each_async_response(self) -> None:
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = "not structured JSON"
+        runnable = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024).with_structured_output(
+            _Schema
+        )
+        collectors = [
+            InferenceUsageCollector(
+                node=f"semantic_quality_policy_{index}",
+                request_kind="structured_output",
+                provider="claude_cli",
+                requested_model="claude-sonnet-4-6",
+            )
+            for index in range(2)
+        ]
+
+        results = await asyncio.gather(
+            *(
+                _ainvoke_with_usage(runnable, f"prompt-{index}", collector)
+                for index, collector in enumerate(collectors)
+            ),
+            return_exceptions=True,
+        )
+
+        assert all(isinstance(result, ValueError) for result in results)
+        assert all(collector.response_received for collector in collectors)
+        assert all(collector.snapshot() == [] for collector in collectors)
+
+    def test_structured_usage_does_not_mark_pre_response_transport_failure(self) -> None:
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.side_effect = RuntimeError("CLI process failed")
+        runnable = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024).with_structured_output(
+            _Schema
+        )
+        collector = InferenceUsageCollector(
+            node="semantic_quality_policy",
+            request_kind="structured_output",
+            provider="claude_cli",
+            requested_model="claude-sonnet-4-6",
+        )
+
+        with pytest.raises(RuntimeError, match="CLI process failed"):
+            _invoke_with_usage(runnable, "prompt", collector)
+
+        assert collector.response_received is False
+
 
 class TestExtractJsonObject:
     def test_plain_json(self) -> None:
@@ -441,12 +522,42 @@ class TestExtractJsonObject:
     def test_prose_wrapped_json(self) -> None:
         assert _extract_json_object('Here you go:\n{"a": 1}\nDone.') == {"a": 1}
 
-    def test_garbage_raises(self) -> None:
-        with pytest.raises(ValueError):
+    def test_garbage_raises_structured_output_parse_error(self) -> None:
+        with pytest.raises(StructuredOutputParseError):
             _extract_json_object("not json")
 
 
 class TestGetChatModel:
+    def test_bedrock_dispatch_remains_telemetry_provider_with_openai_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+        fake_model = MagicMock()
+
+        with patch(
+            "skillspector.providers.bedrock.provider.BedrockProvider.create_chat_model",
+            return_value=fake_model,
+        ):
+            chat_model = get_chat_model(model="us.anthropic.claude-sonnet-4-6-20250915-v1:0")
+
+        assert chat_model_provider_name(chat_model) == "bedrock"
+        collector = new_inference_usage_collector(
+            node="meta_analyzer",
+            request_kind="structured_output",
+            model="us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            chat_model=chat_model,
+        )
+        message = AIMessage(
+            content="ok",
+            usage_metadata={"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+        )
+        collector.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=message)]], llm_output={})
+        )
+
+        assert collector.snapshot()[0]["provider"] == "bedrock"
+
     def test_openai_fallback_uses_openai_default_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

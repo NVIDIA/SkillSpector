@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -632,6 +633,37 @@ def _drain_stream(stream: Any, buf: bytearray, cap: int, on_overflow: Any) -> No
             pass
 
 
+_CLEANUP_RETRIES = 10
+_CLEANUP_RETRY_DELAY_S = 0.2
+
+
+def _cleanup_temp_dir(path: str) -> None:
+    """Best-effort removal of the per-invocation temp cwd.
+
+    On Windows a directory cannot be deleted while any process has it as its
+    working directory or holds a handle inside it. The agent CLI's process
+    tree can outlive the direct child by a beat (a ``.cmd`` shim's node child,
+    or a killed-but-not-reaped child on the timeout path), so the first
+    attempts may fail transiently with ``WinError 32``. Retry briefly, then
+    leak the directory with a warning rather than raise: by the time cleanup
+    runs the model's response is already in hand, and a temp-dir leak must
+    never fail the batch (#315).
+    """
+    for _ in range(_CLEANUP_RETRIES):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError:
+            time.sleep(_CLEANUP_RETRY_DELAY_S)
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.isdir(path):
+        logger.warning(
+            "Could not remove temp dir %s (handle still held by the CLI "
+            "process tree?); leaking it rather than failing the batch",
+            path,
+        )
+
+
 def _run_bounded(
     proc: subprocess.Popen, prompt_bytes: bytes, timeout: float
 ) -> tuple[int | None, bytes, bytes, bool]:
@@ -767,7 +799,12 @@ def run_agent_cli(
     child_env = _scrub_env()
 
     # -- Run in a temporary directory (no CWD access) -------------------------
-    with tempfile.TemporaryDirectory(prefix="skillspector_cli_") as tmp_cwd:
+    # mkdtemp + explicit best-effort cleanup instead of TemporaryDirectory:
+    # the context manager's rmtree-at-__exit__ raises on Windows while the
+    # CLI's process tree still holds the directory as its cwd, turning an
+    # already-successful call into a batch failure (#315).
+    tmp_cwd = tempfile.mkdtemp(prefix="skillspector_cli_")
+    try:
         logger.debug(
             "Running %s argv=%r cwd=%s timeout=%ss",
             binary_name,
@@ -792,6 +829,8 @@ def run_agent_cli(
         # CLI cannot exhaust memory before the cap is enforced (a chatty child
         # could otherwise buffer unbounded output until the timeout).
         returncode, stdout_raw, stderr_raw, overflow = _run_bounded(proc, prompt_bytes, timeout)
+    finally:
+        _cleanup_temp_dir(tmp_cwd)
 
     # -- Fail-closed checks ---------------------------------------------------
     if overflow:

@@ -733,3 +733,95 @@ class TestAntigravityDisabled:
         ok, reason = _agent_cli.is_available("agy")
         assert ok is False
         assert "disabled" in (reason or "")
+
+
+# ---------------------------------------------------------------------------
+# _cleanup_temp_dir — Windows-safe temp cwd removal (#315)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupTempDir:
+    """Cleanup failure must never outrank a successful CLI response (#315).
+
+    On Windows the CLI's process tree can hold the temp cwd (a ``.cmd``
+    shim's node child, or a killed child on the timeout path), so rmtree can
+    fail transiently — or persistently — after the model already answered.
+    """
+
+    def test_removes_directory(self, tmp_path) -> None:
+        target = tmp_path / "cli_cwd"
+        target.mkdir()
+        (target / "scratch.txt").write_text("x")
+        _agent_cli._cleanup_temp_dir(str(target))
+        assert not target.exists()
+
+    def test_retries_transient_failure_then_succeeds(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "cli_cwd"
+        target.mkdir()
+        real_rmtree = _agent_cli.shutil.rmtree
+        calls = {"n": 0}
+
+        def flaky_rmtree(path, ignore_errors=False):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise OSError(32, "held by another process")
+            return real_rmtree(path, ignore_errors=ignore_errors)
+
+        monkeypatch.setattr(_agent_cli.shutil, "rmtree", flaky_rmtree)
+        monkeypatch.setattr(_agent_cli.time, "sleep", lambda _s: None)
+        _agent_cli._cleanup_temp_dir(str(target))
+        assert not target.exists()
+        assert calls["n"] == 3
+
+    def test_never_raises_when_removal_keeps_failing(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "cli_cwd"
+        target.mkdir()
+
+        def stuck_rmtree(path, ignore_errors=False):
+            if not ignore_errors:
+                raise OSError(32, "held by another process")
+
+        monkeypatch.setattr(_agent_cli.shutil, "rmtree", stuck_rmtree)
+        monkeypatch.setattr(_agent_cli.time, "sleep", lambda _s: None)
+        # Must not raise; the directory is leaked deliberately.
+        _agent_cli._cleanup_temp_dir(str(target))
+        assert target.exists()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows handle semantics")
+    def test_open_handle_does_not_raise_on_windows(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real open handle inside the dir — the exact WinError 32 case."""
+        target = tmp_path / "cli_cwd"
+        target.mkdir()
+        monkeypatch.setattr(_agent_cli.time, "sleep", lambda _s: None)
+        held = open(target / "held.txt", "w")  # noqa: SIM115 — handle held on purpose
+        try:
+            _agent_cli._cleanup_temp_dir(str(target))  # must not raise
+        finally:
+            held.close()
+        _agent_cli._cleanup_temp_dir(str(target))
+        assert not target.exists()
+
+
+@patch("skillspector.providers._agent_cli.find_binary", return_value=CLAUDE_BINARY)
+@patch("skillspector.providers._agent_cli.subprocess.Popen")
+class TestRunAgentCLISurvivesCleanupFailure:
+    def test_response_returned_when_temp_dir_cannot_be_removed(
+        self, mock_popen: MagicMock, _mock_binary: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for #315: rmtree failure must not fail the batch."""
+        mock_popen.return_value = _make_ok_process(_GOOD_CLAUDE_OUTPUT.encode())
+
+        def stuck_rmtree(path, ignore_errors=False):
+            if not ignore_errors:
+                raise OSError(32, "held by another process")
+
+        monkeypatch.setattr(_agent_cli.shutil, "rmtree", stuck_rmtree)
+        monkeypatch.setattr(_agent_cli.time, "sleep", lambda _s: None)
+        result = run_agent_cli("claude", PROMPT, model=MODEL)
+        assert result  # the model's answer survives the cleanup failure

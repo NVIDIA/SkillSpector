@@ -132,6 +132,25 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
 class TestNvBuildProvider:
     """build.nvidia.com provider — credentials + bundled YAML metadata."""
 
+    @pytest.mark.parametrize(
+        ("model", "context_length"),
+        [
+            ("z-ai/glm-5.2", 1_000_000),
+            ("z-ai/glm-5.1", 205_000),
+            ("moonshotai/kimi-k2.6", 256_000),
+        ],
+    )
+    def test_nv_build_reported_model_metadata(self, model: str, context_length: int) -> None:
+        provider = NvBuildProvider()
+        assert provider.get_context_length(model) == context_length
+        assert provider.get_max_output_tokens(model) is None
+
+    @pytest.mark.parametrize("model", ["glm-5.2", "z-ai/glm-5.2 "])
+    def test_nv_build_model_near_match_stays_unresolved(self, model: str) -> None:
+        provider = NvBuildProvider()
+        assert provider.get_context_length(model) is None
+        assert provider.get_max_output_tokens(model) is None
+
     def test_returns_none_without_env_var(self) -> None:
         assert NvBuildProvider().resolve_credentials() is None
 

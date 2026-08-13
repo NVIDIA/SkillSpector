@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from skillspector.input_handler import InputHandler
+from skillspector.input_handler import InputHandler, validate_local_input_path
 from skillspector.logging_config import get_logger
 from skillspector.state import SkillspectorState
 
@@ -59,7 +59,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
 
     if skill_path and isinstance(skill_path, str) and skill_path.strip():
         try:
-            resolved = Path(skill_path).resolve()
+            resolved = validate_local_input_path(Path(skill_path))
             return {
                 "skill_path": str(resolved),
                 "temp_dir_for_cleanup": None,

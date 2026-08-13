@@ -36,7 +36,9 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.input_handler import validate_local_input_path
 from skillspector.logging_config import get_logger, set_level
+from skillspector.mcp_registry import scan_registry
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
 from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
 
@@ -136,6 +138,7 @@ def _scan_state(
     if baseline is not None:
         # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
         state["baseline"] = load_baseline(baseline)
+        state["baseline_path"] = os.path.abspath(baseline.expanduser())
         state["show_suppressed"] = show_suppressed
     return state
 
@@ -253,6 +256,13 @@ def scan(
             help="Show detailed progress.",
         ),
     ] = False,
+    mcp_registry: Annotated[
+        bool,
+        typer.Option(
+            "--mcp-registry",
+            help="Scan an MCP Registry payload or URL instead of a skill.",
+        ),
+    ] = False,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -284,10 +294,43 @@ def scan(
                                              chain when unset; AWS_REGION default: us-west-2)
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
     """
+    if mcp_registry:
+        if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
+            console.print(
+                "[red]Error:[/red] --mcp-registry cannot be combined with "
+                "--recursive, --baseline, --show-suppressed, or --yara-rules-dir"
+            )
+            raise typer.Exit(code=2)
+        if format != FormatChoice.json:
+            console.print("[red]Error:[/red] --mcp-registry currently supports only --format json")
+            raise typer.Exit(code=2)
+        try:
+            result = scan_registry(input_path)
+            report = json.dumps(result, indent=2)
+            if output:
+                output.write_text(report, encoding="utf-8")
+                console.print(f"Report saved to: {output}")
+            else:
+                print(report)
+            if result["risk_score"] > RISK_THRESHOLD:
+                raise typer.Exit(code=1)
+        except typer.Exit:
+            raise
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=2) from e
+        return
+
     if verbose:
         set_level("DEBUG")
 
-    resolved_path = Path(input_path).resolve()
+    resolved_path = Path(input_path)
+    if not input_path.startswith(("http://", "https://", "git@")):
+        try:
+            resolved_path = validate_local_input_path(resolved_path)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=2) from e
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
@@ -581,6 +624,7 @@ def baseline(
             console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
         state = _scan_state(input_path, FormatChoice.json, no_llm)
+        state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
         findings = result.get("filtered_findings") or result.get("findings") or []
         data = build_baseline_dict(

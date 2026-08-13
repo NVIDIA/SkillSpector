@@ -22,6 +22,7 @@ from typing import Annotated, NotRequired
 
 from typing_extensions import TypedDict
 
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     AnalysisCompleteness,
     AnalyzerStatusEvent,
@@ -58,7 +59,11 @@ class SkillspectorState(TypedDict, total=False):
     # build_context node populates these
     components: list[str]
     file_cache: dict[str, str]
+    # Retained for compatibility with the persisted workflow-state schema.
     ast_cache: dict[str, str]
+    # Key for the process-local parsed-AST cache.  The ASTs themselves stay
+    # outside state because they are not checkpoint-serializable.
+    python_ast_cache_key: str | None
     manifest: dict[str, object]
     previous_manifest: dict[str, object] | None
 
@@ -83,11 +88,21 @@ class SkillspectorState(TypedDict, total=False):
     # the parallel analyzer nodes (same pattern as ``findings``).
     llm_call_log: Annotated[list[LLMCallRecord], operator.add]
 
+    # Exact provider-response token counters. Each LLM-backed node appends its
+    # per-call records; the report exposes the sanitized projection under
+    # metadata.inference_usage. Missing records mean "not observable", never
+    # an estimated zero.
+    inference_usage: Annotated[list[InferenceUsageRecord], operator.add]
+
     # Baseline / false-positive suppression. `baseline` is a loaded
     # skillspector.suppression.Baseline (set by CLI/API); the report node drops
     # matching findings before scoring. `show_suppressed` keeps them in the
     # report (marked) for review; `suppressed_findings` is the report output.
     baseline: object | None
+    # Absolute path selected by `scan --baseline` or targeted by `baseline -o`.
+    # When it is inside the scan target, build_context excludes only that file
+    # so waiver text cannot scan itself or enter regenerated fingerprints.
+    baseline_path: str | None
     show_suppressed: bool
     suppressed_findings: list[object]
 
@@ -146,6 +161,7 @@ class AnalyzerNodeResponse(TypedDict):
     # LLM-backed analyzers also report one telemetry record; static analyzers
     # omit it (NotRequired keeps the key optional for them).
     llm_call_log: NotRequired[list[LLMCallRecord]]
+    inference_usage: NotRequired[list[InferenceUsageRecord]]
 
 
 class MetaAnalyzerResponse(TypedDict):
@@ -156,3 +172,4 @@ class MetaAnalyzerResponse(TypedDict):
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
     llm_call_log: NotRequired[list[LLMCallRecord]]
+    inference_usage: NotRequired[list[InferenceUsageRecord]]
