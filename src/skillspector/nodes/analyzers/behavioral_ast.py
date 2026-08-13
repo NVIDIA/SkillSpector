@@ -188,12 +188,14 @@ def _loader_arg_name(node: ast.expr) -> str | None:
     return None
 
 
+def _is_true_constant(node: ast.expr) -> bool:
+    """True if *node* is the literal ``True``."""
+    return isinstance(node, ast.Constant) and node.value is True
+
+
 def _kwarg_is_true(node: ast.Call, name: str) -> bool:
     """True if keyword *name* is passed as a literal ``True``."""
-    return any(
-        kw.arg == name and isinstance(kw.value, ast.Constant) and kw.value.value is True
-        for kw in node.keywords
-    )
+    return any(kw.arg == name and _is_true_constant(kw.value) for kw in node.keywords)
 
 
 def _deserialization_message(call_name: str, node: ast.Call) -> str | None:
@@ -222,11 +224,14 @@ def _deserialization_message(call_name: str, node: ast.Call) -> str | None:
             else ("Insecure deserialization: torch.load() without weights_only=True")
         )
     if call_name == "numpy.load":
-        return (
-            "Insecure deserialization: numpy.load(allow_pickle=True)"
-            if _kwarg_is_true(node, "allow_pickle")
-            else None
-        )
+        # ``allow_pickle`` is the third positional parameter (file, mmap_mode,
+        # allow_pickle, ...), so ``numpy.load(f, None, True)`` enables pickle
+        # loading without ever naming the keyword.
+        if _kwarg_is_true(node, "allow_pickle") or (
+            len(node.args) >= 3 and _is_true_constant(node.args[2])
+        ):
+            return "Insecure deserialization: numpy.load(allow_pickle=True)"
+        return None
     return None
 
 

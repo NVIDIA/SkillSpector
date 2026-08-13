@@ -271,6 +271,18 @@ class TestInsecureDeserialization:
         findings = _run('import numpy as np\nnp.load("arr.npy", allow_pickle=True)')
         assert any(f.rule_id == "AST10" for f in findings)
 
+    def test_numpy_load_allow_pickle_positional_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_mmap_mode_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", "r")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_false_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, False)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
     # ── no false positives on safe data parsing ───────────────────────
 
     def test_json_loads_no_finding(self):
