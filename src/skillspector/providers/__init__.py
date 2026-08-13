@@ -27,6 +27,7 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     anthropic_proxy → AnthropicProxyProvider  (Vertex-style raw-predict proxy)
     bedrock         → BedrockProvider         (AWS Bedrock Runtime, SigV4)
     nv_build        → NvBuildProvider          (build.nvidia.com)
+    orcarouter      → OrcaRouterProvider       (api.orcarouter.ai)
     claude_cli      → ClaudeCLIProvider       (local ``claude`` binary, no API key)
     codex_cli       → CodexCLIProvider        (local ``codex`` binary, no API key)
     gemini_cli      → GeminiCLIProvider       (local ``gemini`` binary, no API key)
@@ -120,6 +121,10 @@ def _select_active_provider() -> LLMProvider:
         return BedrockProvider()
     if name == "nv_build":
         return NvBuildProvider()
+    if name == "orcarouter":
+        from .orcarouter import OrcaRouterProvider
+
+        return OrcaRouterProvider()
     if name == "claude_cli":
         from .claude_cli import ClaudeCLIProvider
 
@@ -149,7 +154,7 @@ def _select_active_provider() -> LLMProvider:
     raise ValueError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
         "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
-        "claude_cli, codex_cli, gemini_cli, antigravity_cli (or unset)."
+        "orcarouter, claude_cli, codex_cli, gemini_cli, antigravity_cli (or unset)."
     )
 
 
