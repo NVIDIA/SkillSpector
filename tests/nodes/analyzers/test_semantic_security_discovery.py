@@ -331,6 +331,27 @@ class TestErrorHandling:
         assert "reason_code" not in status
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_generic_exception_preserves_missing_cache_events(self) -> None:
+        from skillspector.llm_analyzer_base import LLMAnalyzerBase
+
+        with patch.object(
+            LLMAnalyzerBase,
+            "run_batches",
+            side_effect=RuntimeError("LLM service unavailable"),
+        ):
+            result = node(
+                {
+                    "components": ["cached.py", "missing.py"],
+                    "file_cache": {"cached.py": "print('ready')\n"},
+                }
+            )
+
+        assert [(event["path"], event["reason_code"]) for event in result["inspection_ledger"]] == [
+            ("missing.py", "missing_file_cache")
+        ]
+        assert result["analyzer_status_events"][0]["status"] == "unavailable"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_validation_error_returns_empty(self) -> None:
         """Malformed LLM response (ValidationError) must not crash the graph."""
         # Build a real ValidationError by feeding bad data to the schema

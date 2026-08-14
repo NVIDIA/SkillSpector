@@ -4,6 +4,7 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/NVIDIA/SkillSpector/badge)](https://scorecard.dev/viewer/?uri=github.com/NVIDIA/SkillSpector)
 
 ## Overview
 
@@ -11,16 +12,18 @@ AI agent skills (used by Claude Code, Codex CLI, Gemini CLI, etc.) execute with 
 
 SkillSpector helps you answer: **"Is this skill safe to install?"**
 
+SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidia.com/skills/), which scans, evaluates, and signs agent skills before publication. Skills that pass are published to the [NVIDIA skills catalog](https://github.com/NVIDIA/skills).
+
 ## Documentation
 
+- **[Scan agent skills before installation](https://docs.nvidia.com/skills/scanning-agent-skills)** — Hosted guide: when to scan, how to read a report, and how to gate installs.
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
-- **[OWASP AST10 coverage](docs/OWASP-AST10-COVERAGE.md)** — Revision-pinned crosswalk from SkillSpector's current rule catalog to the OWASP Agentic Skills Top 10, with rationale and gap notes.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
 
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **68 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **69 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
@@ -213,6 +216,10 @@ A baseline can also use drift-tolerant glob rules (by rule id, file path, or
 message) — see [`.skillspector-baseline.example.yaml`](.skillspector-baseline.example.yaml).
 Exact fingerprint baselines are evidence-bound: changing the scanned source or
 SkillSpector version keeps the finding active until it is reviewed again.
+When a selected baseline or baseline output is stored inside the skill
+directory, SkillSpector excludes that exact file from content analysis so its
+suppression text cannot create findings or enter regenerated fingerprints;
+sibling files remain in normal scan scope.
 
 ### LLM Analysis
 
@@ -346,9 +353,9 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **68 vulnerability patterns** across 17 categories:
+SkillSpector detects **69 vulnerability patterns** across 17 categories:
 
-### Prompt Injection (5 patterns)
+### Prompt Injection (6 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -357,6 +364,7 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 | P3 | Exfiltration Commands | HIGH | Instructions to transmit context externally |
 | P4 | Behavior Manipulation | MEDIUM | Subtle instructions altering agent decisions |
 | P5 | Harmful Content | CRITICAL | Instructions that could cause physical harm |
+| P9 | Whitespace Padding | MEDIUM | Large whitespace padding hiding instructions below/beside the visible area |
 
 ### Anti-Refusal (3 patterns)
 
@@ -371,7 +379,7 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | E1 | External Transmission | MEDIUM | Sending data to external URLs |
-| E2 | Env Variable Harvesting | HIGH | Collecting API keys and secrets |
+| E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets |
 | E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
 
@@ -383,7 +391,7 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 | PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
 | PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
 
-### Supply Chain (6 patterns)
+### Supply Chain (7+ patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -393,6 +401,7 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 | SC4 | Known Vulnerable Dependencies | HIGH | Dependencies with known CVEs (live OSV.dev lookup) |
 | SC5 | Abandoned Dependencies | MEDIUM | Unmaintained packages without security updates |
 | SC6 | Typosquatting | HIGH | Package names similar to popular packages |
+| SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 
 ### Excessive Agency (4 patterns)
 
@@ -637,13 +646,46 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
   "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
   "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 } } ],
-  "metadata": { "has_executable_scripts": false, "skillspector_version": "...", "llm_requested": true, "llm_available": true }
+  "metadata": {
+    "has_executable_scripts": false,
+    "skillspector_version": "...",
+    "llm_requested": true,
+    "llm_available": true,
+    "inference_usage": [
+      {
+        "node": "semantic_security_discovery",
+        "request_kind": "structured_output",
+        "provider": "nv_inference",
+        "model": "azure/anthropic/claude-opus-4-6",
+        "model_source": "provider_response",
+        "usage_source": "provider_response",
+        "prompt_tokens": 1000,
+        "completion_tokens": 100,
+        "cached_tokens": 400,
+        "cache_write_tokens": 50,
+        "total_tokens": 1100
+      }
+    ]
+  }
 }
 ```
 
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
 - `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
+- `metadata.inference_usage` contains one sanitized record per LLM response when the
+  provider exposes token counters. It is an empty list when usage is unavailable;
+  SkillSpector never estimates missing tokens. Prompt totals are inclusive of cache
+  reads and writes so downstream pricing can separate those partitions safely.
+  `model_source` distinguishes an independently identified provider model from
+  the exact requested model used when response identity is absent or ambiguous.
+  SkillSpector does not currently send Anthropic prompt-cache controls, so its
+  scan requests cannot select the separate 5-minute or 1-hour cache-write tiers;
+  TTL-specific response fields are normalized defensively into the aggregate
+  cache-write counter.
+- See [Inference usage telemetry](docs/INFERENCE_USAGE.md) for the complete
+  provenance, cache-accounting, privacy, fail-closed ingestion, and downstream
+  pricing contract.
 - The full per-issue shape is defined by `Finding.to_dict()` in [models.py](src/skillspector/models.py); rely on the fields above and treat any additional fields as best-effort.
 
 For CI/IDE tooling, `--format sarif` emits SARIF 2.1.0.
@@ -695,9 +737,17 @@ SkillSpector uses a two-stage detection pipeline:
 - Fast regex-based pattern matching across 11 static analyzers
 - AST-based behavioral analysis detecting dangerous calls (exec, eval, subprocess, etc.)
 - Live vulnerability lookups via OSV.dev for known CVEs in dependencies
-- Scans all files in the skill
+- Scans all analyzer-eligible files in the skill
 - High recall (catches most issues)
 - Moderate precision (some false positives)
+
+A valid, root-level OpenSSF Model Signing signature (`skill.oms.sig`) is retained in the
+component inventory as type `oms_signature`, but excluded from static and LLM content analysis.
+OMS bundles necessarily contain long base64-encoded payload, signature, and certificate fields;
+generic obfuscated-code checks can otherwise misclassify those fields as hidden executable content.
+The recognizer checks the minimal OMS DSSE/in-toto structure; it does not verify the signature,
+certificate chain, transparency-log entry, or signer identity. Invalid or unrecognized signature
+files are scanned normally.
 
 ### Stage 2: LLM Semantic Analysis (Optional)
 - Evaluates context and intent
@@ -723,7 +773,7 @@ The tool requires outbound HTTPS access to `api.osv.dev` for live vulnerability 
 SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not do before relying on it:
 
 - **It never executes the scanned skill.** All analysis is static (regex, Python AST, YARA) plus optional LLM evaluation of file *contents* — the skill's code is never run.
-- **LLM analysis sends file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. Use `--no-llm` to keep contents local (static analysis only).
+- **LLM analysis sends analyzer-eligible file contents to the configured provider.** When LLM analysis is enabled (the default), file contents are sent to the active `SKILLSPECTOR_PROVIDER` endpoint. Recognized OMS signature files are excluded. Use `--no-llm` to keep contents local (static analysis only).
 - **SC4 sends dependency names to OSV.dev.** The supply-chain check queries [OSV.dev](https://osv.dev) with the package names and versions the skill declares, to look up known CVEs. This is fundamental to the check and runs even with `--no-llm`. It sends dependency coordinates (not file contents), requires no API key, and falls back to a bundled list when OSV.dev is unreachable.
 - **It does not sandbox the host.** SkillSpector flags risky patterns *before* you install a skill; it does not contain or isolate a skill you choose to install anyway.
 

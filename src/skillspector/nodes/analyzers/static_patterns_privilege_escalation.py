@@ -159,6 +159,40 @@ _PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
     r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
     re.IGNORECASE,
 )
+_PE3_TOKEN_LIFECYCLE_CONTEXT = re.compile(
+    r"\b(?:expires?|expiry|lifespan|refresh[ _-]?token|oauth|bearer|token endpoint|"
+    r"renew(?:ed|al|ing)?|revoked)\b"
+    r"|grant_type\s*=\s*client_credentials|(?:^|\W)401(?:\W|$)",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_ACTION_CONTEXT = re.compile(
+    r"\b(?:steal|exfiltrat\w*|dump|harvest|scrape|upload|transmit|send|copy|extract)\b"
+    r"|\b(?:read|open|load)\b[^\n]{0,80}\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
+    r"(?<![\w.-])(?:\.ssh|\.aws)(?:[/\\]|$)"
+    r"|(?<![\w.-])\.env(?:\.[\w-]+)?\b"
+    r"|/etc/(?:passwd|shadow)\b"
+    r"|\b(?:tokens?\.json|credentials?|secrets?)\b[^\n]{0,80}"
+    r"\b(?:read|open|load|copy|upload|transmit)\b",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_NOUN_MODIFIER = re.compile(
+    r"\b(?:an?|the|new|resulting|stored|ssa|actor|oauth|bearer|glean|user)\s+$",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_LIFESPAN_PREFIX = re.compile(
+    r"\s*(?:[-*|>#`]+\s*)*(?:\*{0,2}lifespan\s*:\s*\*{0,2}\s*)?",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_LIFESPAN_SUFFIX = re.compile(
+    r"\s*(?:~?\d|expires?|is\s+(?:valid|used)|lasts?\b)",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_LIFECYCLE_DOCUMENTATION_DIRS = frozenset(
+    {"docs", "documentation", "procedures", "references", "examples", "guides"}
+)
 
 
 def _source_line(content: str, match: re.Match[str]) -> str:
@@ -168,6 +202,48 @@ def _source_line(content: str, match: re.Match[str]) -> str:
     if line_end < 0:
         line_end = len(content)
     return content[line_start:line_end]
+
+
+def _is_access_token_lifecycle_noun(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    file_path: str,
+) -> bool:
+    """Return True for a bounded OAuth ``access token`` noun in documentation.
+
+    PE3's generic ``access … tokens?`` rule cannot distinguish the verb
+    "access tokens" from the OAuth compound noun "access token". Suppress only
+    noun-shaped matches with nearby lifecycle evidence, and fail closed when
+    the context contains credential actions or sensitive sources.
+    """
+    if file_type not in {"markdown", "text"}:
+        return False
+    normalized_parts = file_path.replace("\\", "/").lower().split("/")
+    if not any(part in _PE3_TOKEN_LIFECYCLE_DOCUMENTATION_DIRS for part in normalized_parts):
+        return False
+    if match.group(0).lower() not in {"access token", "access tokens"}:
+        return False
+
+    context = get_context(content, match.start())
+    if not _PE3_TOKEN_LIFECYCLE_CONTEXT.search(context):
+        return False
+    if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
+        return False
+
+    line = _source_line(content, match)
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    relative_start = match.start() - line_start
+    relative_end = match.end() - line_start
+    prefix = line[:relative_start]
+    suffix = line[relative_end:]
+
+    has_noun_modifier = _PE3_ACCESS_TOKEN_NOUN_MODIFIER.search(prefix) is not None
+    is_lifecycle_subject = bool(
+        _PE3_ACCESS_TOKEN_LIFESPAN_PREFIX.fullmatch(prefix)
+        and _PE3_ACCESS_TOKEN_LIFESPAN_SUFFIX.match(suffix)
+    )
+    return has_noun_modifier or is_lifecycle_subject
 
 
 def _is_qualified_benign_access_requirement(
@@ -245,7 +321,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
-            if _is_pe3_documentation_example(content, match, file_type):
+            if _is_pe3_documentation_example(content, match, file_type, file_path):
                 continue
             if _is_qualified_benign_access_requirement(content, match, file_type):
                 continue
@@ -335,26 +411,35 @@ def _is_documentation_example(context: str, file_type: str) -> bool:
     return _has_documentation_indicator(context, _DOCUMENTATION_EXAMPLE_INDICATORS)
 
 
-def _is_pe3_documentation_example(content: str, match: re.Match[str], file_type: str) -> bool:
-    """Filter only the reviewed, position-bound access-token UI path.
+def _is_pe3_documentation_example(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    file_path: str,
+) -> bool:
+    """Filter reviewed, position-bound access-token documentation forms.
 
     Generic words such as ``example``, ``documentation``, ``Required``, and
     ``environment variable`` are attacker-controllable prose and must never
     suppress an otherwise actionable credential-access match. Even negated
     references remain findings because another malicious clause can share the
-    same line.
+    same line. The OAuth lifecycle exception is separately bounded by noun
+    grammar, lifecycle evidence, and action/sensitive-source vetoes.
     """
     if file_type not in {"markdown", "text"}:
         return False
-    line = _source_line(content, match)
     if match.group(0).lower() not in {"access token", "access tokens"}:
         return False
+
+    line = _source_line(content, match)
     navigation = _PE3_SAFE_ACCESS_TOKEN_NAVIGATION.search(line)
-    if navigation is None:
-        return False
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    match_span = (match.start() - line_start, match.end() - line_start)
-    return navigation.span("target") == match_span
+    if navigation is not None:
+        line_start = content.rfind("\n", 0, match.start()) + 1
+        match_span = (match.start() - line_start, match.end() - line_start)
+        if navigation.span("target") == match_span:
+            return True
+
+    return _is_access_token_lifecycle_noun(content, match, file_type, file_path)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

@@ -162,6 +162,35 @@ def test_meta_failure_preserves_primary_coverage_but_fails_execution() -> None:
     assert effective_ids == [finding.finding_id]
 
 
+def test_skipped_meta_event_that_drops_findings_is_a_fatal_accounting_error() -> None:
+    """Finalization rejects malformed skipped meta rows that bypass the factory."""
+    finding = Finding(rule_id="P1", message="unsafe", file="SKILL.md")
+    skipped_meta = ledger_event(
+        outcome=LedgerOutcome.SKIPPED,
+        phase="meta",
+        analyzer_id="meta_analyzer",
+        reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+        path="SKILL.md",
+        input_finding_ids=[finding.finding_id],
+        emitted_finding_ids=[finding.finding_id],
+    )
+    skipped_meta["emitted_finding_ids"] = []
+
+    completeness, _ = finalize_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [finding],
+            "inspection_ledger": [skipped_meta],
+        }
+    )
+
+    assert completeness["execution_successful"] is False
+    assert completeness["ledger_exceptions"][0]["reason_code"] == (
+        LedgerReason.FINDING_ACCOUNTING_ERROR
+    )
+    assert completeness["ledger_exceptions"][0]["fatal"] is True
+
+
 def test_json_round_trip_keeps_failed_ledger_work_fatal() -> None:
     """Deserialized StrEnum values must retain failure semantics."""
     state = json.loads(

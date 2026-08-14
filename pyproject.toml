@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skillspector"
-version = "2.5.1"
+version = "2.9.4"
 description = "SkillSpector: Security scanner for AI agent skills (Claude Code, Cursor, and similar). Scans skills for vulnerabilities, malicious patterns, and security risks before installation. Supports Git repos, URLs, zips, and local directories; runs static pattern checks and optional LLM semantic analysis; outputs terminal, JSON, and Markdown reports with risk scoring."
 readme = "README.md"
 license = "Apache-2.0"
@@ -34,6 +34,7 @@ dependencies = [
     "typer>=0.23.0,<0.24",
     "rich>=14.3.0",
     "httpx>=0.28.0",
+    "packaging>=24.0",
     "pyyaml>=6.0.1",
     "pydantic>=2.12.0",
     "openai>=2.25.0",
@@ -50,7 +51,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mcp = [
-    "mcp>=1.2.0",
+    "mcp>=1.29.0,<2.0.0",
 ]
 dev = [
     "skillspector[mcp]",

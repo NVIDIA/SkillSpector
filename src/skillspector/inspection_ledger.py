@@ -48,6 +48,8 @@ class LedgerReason(StrEnum):
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
+    LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     UNACCOUNTED_WORK = "unaccounted_work"
     FINDING_ACCOUNTING_ERROR = "finding_accounting_error"
@@ -56,6 +58,8 @@ class LedgerReason(StrEnum):
     RULES_UNAVAILABLE = "rules_unavailable"
     MANIFEST_ABSENT = "manifest_absent"
     NO_APPLICABLE_FILES = "no_applicable_files"
+    OMS_SIGNATURE = "oms_signature"
+    BASELINE_FILE = "baseline_file"
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
@@ -73,6 +77,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.SYNTAX_ERROR: "Python source could not be parsed.",
     LedgerReason.LLM_BATCH_FAILED: "LLM analysis failed for this file range.",
+    LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
+        "LLM returned a malformed structured response after bounded retries."
+    ),
+    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
     LedgerReason.FINDING_ACCOUNTING_ERROR: (
@@ -85,7 +93,22 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.RULES_UNAVAILABLE: ("Analyzer rules were unavailable before execution."),
     LedgerReason.MANIFEST_ABSENT: ("No compatible manifest was present for this analyzer."),
     LedgerReason.NO_APPLICABLE_FILES: ("No files matched this analyzer's applicability contract."),
+    LedgerReason.OMS_SIGNATURE: (
+        "Recognized OMS signature metadata is excluded from content analysis."
+    ),
+    LedgerReason.BASELINE_FILE: (
+        "The explicitly selected suppression baseline is excluded from content analysis."
+    ),
 }
+
+
+def outcome_for_llm_batch_failure(reason: LedgerReason) -> LedgerOutcome:
+    """Return the terminal ledger outcome for an exhausted LLM batch."""
+    return (
+        LedgerOutcome.SKIPPED
+        if reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        else LedgerOutcome.FAILED
+    )
 
 
 class PlannedWorkTarget(TypedDict):
@@ -265,11 +288,12 @@ def ledger_event(
             raise ValueError("non-completed producers cannot reference findings")
     elif outcome is LedgerOutcome.COMPLETED and not set(emitted_ids).issubset(input_ids):
         raise ValueError("completed meta events must emit a subset of input findings")
-    elif outcome is LedgerOutcome.FAILED and emitted_ids != input_ids:
-        raise ValueError("failed meta events must pass every input finding through")
-    elif outcome is not LedgerOutcome.COMPLETED and outcome is not LedgerOutcome.FAILED:
+    elif outcome in (LedgerOutcome.FAILED, LedgerOutcome.SKIPPED):
+        if emitted_ids != input_ids:
+            raise ValueError("failed or skipped meta events must pass every input finding through")
+    elif outcome is not LedgerOutcome.COMPLETED:
         if input_ids or emitted_ids:
-            raise ValueError("skipped meta events cannot reference findings")
+            raise ValueError("non-completed meta events cannot reference findings")
 
     work_identity = analyzer_id or f"{record_type.value}:{phase}"
     event: InspectionLedgerEvent = {
@@ -600,7 +624,11 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
             and not set(emitted_ids).issubset(input_ids)
         ):
             accounting_error(event.get("path"))
-        if is_meta and outcome == LedgerOutcome.FAILED and emitted_ids != input_ids:
+        if (
+            is_meta
+            and outcome in (LedgerOutcome.FAILED, LedgerOutcome.SKIPPED)
+            and emitted_ids != input_ids
+        ):
             accounting_error(event.get("path"))
         for finding_id in [*input_ids, *emitted_ids]:
             if finding_id not in findings_by_id:

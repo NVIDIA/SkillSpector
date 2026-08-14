@@ -49,6 +49,32 @@ def test_cli_scan_local_directory(tmp_path: Path) -> None:
     assert "scan-test" in result.output or "skill" in result.output
 
 
+def test_cli_rejects_symlinked_parent_before_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive preflight must not inspect a directory behind a symlinked parent."""
+    external_skill = tmp_path / "external" / "skill"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+    symlinked_parent = tmp_path / "linked"
+    try:
+        symlinked_parent.symlink_to(external_skill.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    def fail_if_called(_: Path) -> MultiSkillDetectionResult:
+        raise AssertionError("preflight must not inspect an unsafe input path")
+
+    monkeypatch.setattr("skillspector.cli.detect_skills", fail_if_called)
+    result = runner.invoke(
+        app,
+        ["scan", str(symlinked_parent / external_skill.name), "--recursive", "--no-llm"],
+    )
+
+    assert result.exit_code == 2
+    assert "symlinked parent" in result.output
+
+
 def test_cli_scan_output_to_file(tmp_path: Path) -> None:
     """scan with --output writes report to file."""
     skill_dir = tmp_path / "skill"
@@ -325,6 +351,135 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     data = json.loads(scan.output)
     assert data["issues"] == []
     assert data["risk_assessment"]["score"] == 0
+
+
+def test_cli_baseline_regeneration_excludes_in_tree_output(tmp_path: Path) -> None:
+    """Regeneration cannot fingerprint findings created by the old output file."""
+    skill = tmp_path / "skill"
+    baseline_file = skill / "config" / "skillspector-baseline.yaml"
+    baseline_file.parent.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: regenerate-baseline\n---\nUse --privileged for required device access.\n",
+        encoding="utf-8",
+    )
+    baseline_file.write_text(
+        "version: 2\n"
+        "rules:\n"
+        "  - id: PE5\n"
+        "    path: SKILL.md\n"
+        '    message: "*--privileged*"\n'
+        "    reason: reviewed device access\n"
+        "fingerprints: []\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "baseline",
+            str(skill),
+            "--no-llm",
+            "--output",
+            str(baseline_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    generated = yaml.safe_load(baseline_file.read_text(encoding="utf-8"))
+    assert [entry["rule_id"] for entry in generated["fingerprints"]] == ["PE5"]
+    assert [entry["file"] for entry in generated["fingerprints"]] == ["SKILL.md"]
+
+
+def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> None:
+    """A selected in-tree baseline cannot create findings from its own rule text."""
+    skill = tmp_path / "skill"
+    baseline_file = skill / "config" / "skillspector-baseline.yaml"
+    baseline_file.parent.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: in-tree-baseline\n---\nUse --privileged for required device access.\n",
+        encoding="utf-8",
+    )
+    baseline_file.write_text(
+        "version: 2\n"
+        "rules:\n"
+        "  - id: PE5\n"
+        "    path: SKILL.md\n"
+        '    message: "*--privileged*"\n'
+        "    reason: reviewed device access\n"
+        "fingerprints: []\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--format",
+            "json",
+            "--baseline",
+            str(baseline_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["issues"] == []
+    assert [finding["id"] for finding in data["suppressed"]] == ["PE5"]
+    assert data["suppressed"][0]["location"]["file"] == "SKILL.md"
+    assert all(
+        component["path"] != "config/skillspector-baseline.yaml" for component in data["components"]
+    )
+    assert any(
+        exclusion["path"] == "config/skillspector-baseline.yaml"
+        and exclusion["reason_code"] == "baseline_file"
+        for exclusion in data["analysis_completeness"]["scope_exclusions"]
+    )
+
+
+def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
+    """Sibling files remain in scope even when their content resembles a baseline."""
+    skill = tmp_path / "skill"
+    config = skill / "config"
+    config.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: selected-baseline-only\n---\n# Safe skill\n",
+        encoding="utf-8",
+    )
+    baseline_file = config / "skillspector-baseline.yaml"
+    baseline_file.write_text(
+        "version: 2\n"
+        "rules:\n"
+        "  - id: PE5\n"
+        "    path: SKILL.md\n"
+        '    message: "*--privileged*"\n'
+        "    reason: reviewed device access\n"
+        "fingerprints: []\n",
+        encoding="utf-8",
+    )
+    (config / "review.yaml").write_text("flag: --privileged\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--format",
+            "json",
+            "--baseline",
+            str(baseline_file),
+        ],
+    )
+
+    assert result.exit_code in {0, 1}, result.output
+    data = json.loads(result.output)
+    pe5_files = {
+        finding["location"]["file"] for finding in data["issues"] if finding["id"] == "PE5"
+    }
+    assert pe5_files == {"config/review.yaml"}
+    assert data["suppressed_count"] == 0
 
 
 def test_recursive_multi_skill_scan_rejects_shared_baseline(tmp_path: Path) -> None:

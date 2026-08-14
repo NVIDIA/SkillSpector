@@ -18,19 +18,29 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import re
 import unicodedata
+from typing import cast
 
+from pydantic import BaseModel, Field, field_validator
+
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     analyzer_status_event,
+    analyzer_status_for_events,
     ledger_event,
+    outcome_for_llm_batch_failure,
 )
-from skillspector.llm_utils import chat_completion
+from skillspector.llm_analyzer_base import Batch, LLMAnalyzerBase
 from skillspector.models import Finding
+from skillspector.nodes.analyzers.whitespace_padding import (
+    ZERO_WIDTH_CHARS,
+    detect_whitespace_padding,
+)
+from skillspector.providers import get_active_provider
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -141,8 +151,14 @@ _HTML_COMMENT_RE = re.compile(r"<\\?!--.*?-->", re.DOTALL)
 # Markdown comment: [//]: # (...)
 _MARKDOWN_COMMENT_RE = re.compile(r"\[//\]:\s*#\s*\(.*?\)")
 
-# Zero-width chars followed by visible text
-_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d]+\S")
+# Zero-width chars followed by visible text.
+#
+# The character class is derived from the shared ``ZERO_WIDTH_CHARS`` constant in
+# ``whitespace_padding`` so TP1's hidden-text check and P2/P9 cannot drift apart
+# (single shared definition). Converging on the shared set also adds U+2060 (WORD
+# JOINER) and U+FEFF (ZERO WIDTH NO-BREAK SPACE / BOM) coverage to this check \u2014 a
+# strict improvement over the previous U+200B/U+200C/U+200D-only class.
+_ZERO_WIDTH_RE = re.compile("[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]+\\S")
 
 # Base64 blobs (>=50 chars) — checked AFTER data URI to avoid double-counting
 _BASE64_RE = re.compile(r"[A-Za-z0-9+/]{50,}={0,2}")
@@ -300,6 +316,63 @@ def _check_tp1(text: str, source_field: str) -> list[Finding]:
                 remediation=(
                     "Remove base64-encoded blobs from metadata fields. "
                     "Metadata should contain only human-readable plain text."
+                ),
+            )
+        )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# P9: Whitespace padding (shared detector)
+# ---------------------------------------------------------------------------
+
+
+def _check_p9_padding(text: str, source_field: str) -> list[Finding]:
+    """Detect whitespace-padding runs hidden in a metadata text field.
+
+    Uses the shared ``detect_whitespace_padding`` scanner. Severity is per kind:
+    "horizontal" and "vertical" runs surface as MEDIUM / 0.7 confidence, while
+    "block" runs (a contiguous multibyte span over the byte budget that stays
+    under the line/char primaries) surface as LOW / 0.4. The "ratio" signal is
+    skipped (manifest fields are too short for the 4 KB floor to apply).
+    "vertical" runs matter here because padding built from Unicode line
+    separators (U+2028 / U+2029 / U+0085) splits into many blank logical lines
+    and is classified vertical, yet inside a single description field it is still
+    a hidden run that must surface a P9. Emits one P9 finding per surviving run.
+    """
+    findings: list[Finding] = []
+
+    for run in detect_whitespace_padding(text):
+        if run.kind not in ("horizontal", "vertical", "block"):
+            continue
+        if run.kind in ("horizontal", "vertical"):
+            severity = "MEDIUM"
+            confidence = 0.7
+        else:  # "block"
+            severity = "LOW"
+            confidence = 0.4
+        findings.append(
+            Finding(
+                rule_id="P9",
+                message=(
+                    f"Whitespace padding found in '{source_field}': "
+                    "large whitespace run may hide instructions from reviewers."
+                ),
+                severity=severity,
+                confidence=confidence,
+                file="SKILL.md",
+                category=_CATEGORY,
+                tags=list(_FRAMEWORK_TAGS),
+                matched_text=run.summary,
+                explanation=(
+                    "Large runs of whitespace padding in metadata fields can push injected "
+                    "instructions out of a human reviewer's view while the AI agent still "
+                    "processes the full text."
+                ),
+                remediation=(
+                    "Remove oversized whitespace runs from metadata fields. "
+                    "Descriptions should contain normal, visible text only."
                 ),
             )
         )
@@ -688,20 +761,68 @@ _TP4_EXECUTABLE_TYPES = frozenset(
 )
 
 
-def _check_tp4(state: SkillspectorState) -> tuple[list[Finding], LLMCallRecord | None, str | None]:
+class _TP4AnalysisResult(BaseModel):
+    """Validated response from the description-behavior mismatch check."""
+
+    is_mismatch: bool
+    confidence: float = 0.0
+    declared_purpose_summary: str = ""
+    actual_behavior_summary: str = ""
+    mismatched_capabilities: list[str] = Field(default_factory=list)
+    explanation: str = ""
+
+    @field_validator("confidence")
+    @classmethod
+    def _validate_confidence(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
+        return value
+
+
+class _TP4Analyzer(LLMAnalyzerBase):
+    """Run TP4 through the shared structured-output analyzer lifecycle."""
+
+    response_schema = _TP4AnalysisResult
+
+    def __init__(self, model: str) -> None:
+        super().__init__(base_prompt="", model=model, node=ANALYZER_ID)
+
+    def build_prompt(self, batch: Batch, **_kwargs: object) -> str:
+        """Use TP4's purpose-built prompt without the generic file wrapper."""
+        return batch.content
+
+    def parse_response(  # type: ignore[override]  # TP4 returns its typed assessment.
+        self, response: object, _batch: Batch
+    ) -> list[_TP4AnalysisResult]:
+        if isinstance(response, _TP4AnalysisResult):
+            return [response]
+        raise NotImplementedError("TP4 requires a structured assessment response")
+
+
+def _check_tp4(
+    state: SkillspectorState,
+) -> tuple[
+    list[Finding],
+    LLMCallRecord | None,
+    str | None,
+    LedgerReason | None,
+    list[InferenceUsageRecord],
+]:
     """TP4: LLM-based description-behavior mismatch detection.
 
-    Returns ``(findings, record, error_class)`` where *record* is the LLM-call telemetry for
-    ``llm_call_log`` — or ``None`` when no LLM call was attempted (no
-    description / no executable code), so an intentional no-op is never counted
-    as a degraded LLM stage. See :func:`skillspector.state.llm_call_record`.
+    Returns ``(findings, record, error_class, failure_reason, inference_usage)`` where
+    *record* is the LLM-call telemetry for ``llm_call_log`` — or ``None`` when
+    no LLM call was attempted (no description / no executable code), so an
+    intentional no-op is never counted as a degraded LLM stage. Token usage is
+    emitted only when the provider response supplied it.
     """
     attempted = False
+    analyzer: _TP4Analyzer | None = None
     try:
         manifest: dict = state.get("manifest") or {}
         description = manifest.get("description")
         if not description or not isinstance(description, str) or not description.strip():
-            return [], None, None
+            return [], None, None, None, []
 
         triggers = manifest.get("triggers") or []
         permissions = manifest.get("permissions")
@@ -723,12 +844,13 @@ def _check_tp4(state: SkillspectorState) -> tuple[list[Finding], LLMCallRecord |
                 code_parts.append(f"### {path} ({file_type})\n{content}")
 
         if not code_parts:
-            return [], None, None
+            return [], None, None, None, []
 
         code_contents = "\n\n".join(code_parts)
 
         model_config: dict = state.get("model_config") or {}
         model = model_config.get(ANALYZER_ID) or model_config.get("default")
+        model = model or get_active_provider().resolve_model()
 
         prompt = f"""You are a security auditor. Your task: determine whether a skill's declared
 description accurately represents what its code actually does.
@@ -757,47 +879,55 @@ Do NOT flag:
 - Utility code that supports the declared purpose (logging, error handling)
 - Over-declared permissions (covered by a separate analyzer)
 
-Respond in JSON matching this exact schema:
-{{
-  "is_mismatch": true/false,
-  "confidence": 0.0-1.0,
-  "declared_purpose_summary": "one-sentence summary of what the description claims",
-  "actual_behavior_summary": "one-sentence summary of what the code actually does",
-  "mismatched_capabilities": ["list of capabilities in code but not in description"],
-  "explanation": "why this is or is not a mismatch"
-}}"""
+Return the assessment using the provided structured output schema."""
 
+        analyzer = _TP4Analyzer(model)
         attempted = True
-        response = chat_completion(prompt, model=model)
-
-        # Parse JSON — handle optional ```json code blocks
-        json_text = response.strip()
-        if json_text.startswith("```"):
-            # Strip opening fence (```json or ```)
-            first_newline = json_text.find("\n")
-            if first_newline != -1:
-                json_text = json_text[first_newline + 1 :]
-            # Strip closing fence
-            if json_text.rstrip().endswith("```"):
-                json_text = json_text.rstrip()[:-3].rstrip()
-
-        result = json.loads(json_text)
+        outcome = analyzer.run_batches_detailed([Batch(file_path="SKILL.md", content=prompt)])
+        if outcome.failures:
+            failure = outcome.failures[0]
+            return (
+                [],
+                llm_call_record(
+                    ANALYZER_ID,
+                    ok=False,
+                    error=f"TP4 LLM batch failed: {failure.error_class}",
+                ),
+                failure.error_class,
+                failure.reason,
+                cast(list[InferenceUsageRecord], analyzer.inference_usage),
+            )
+        result = outcome.successful[0][1][0]
+        if not isinstance(result, _TP4AnalysisResult):
+            raise RuntimeError("TP4 returned an unexpected structured response type")
         ok_record = llm_call_record(ANALYZER_ID, ok=True)
 
-        if not result.get("is_mismatch"):
-            return [], ok_record, None
+        if not result.is_mismatch:
+            return (
+                [],
+                ok_record,
+                None,
+                None,
+                cast(list[InferenceUsageRecord], analyzer.inference_usage),
+            )
 
-        confidence = float(result.get("confidence", 0.0))
+        confidence = result.confidence
         if confidence < 0.5:
-            return [], ok_record, None
+            return (
+                [],
+                ok_record,
+                None,
+                None,
+                cast(list[InferenceUsageRecord], analyzer.inference_usage),
+            )
 
         severity = "HIGH" if confidence >= 0.7 else "MEDIUM"
 
-        mismatched = result.get("mismatched_capabilities") or []
+        mismatched = result.mismatched_capabilities
         mismatched_str = ", ".join(mismatched) if mismatched else "unspecified"
-        explanation = result.get("explanation", "")
-        declared = result.get("declared_purpose_summary", description[:80])
-        actual = result.get("actual_behavior_summary", "")
+        explanation = result.explanation
+        declared = result.declared_purpose_summary or description[:80]
+        actual = result.actual_behavior_summary
 
         return (
             [
@@ -821,6 +951,8 @@ Respond in JSON matching this exact schema:
             ],
             ok_record,
             None,
+            None,
+            cast(list[InferenceUsageRecord], analyzer.inference_usage),
         )
 
     except Exception as exc:
@@ -828,8 +960,16 @@ Respond in JSON matching this exact schema:
         # Only record a failure if the LLM call was actually attempted; a failure
         # before the call (e.g. building the prompt) is not an LLM-stage failure.
         if attempted:
-            return [], llm_call_record(ANALYZER_ID, ok=False, error=str(exc)), type(exc).__name__
-        return [], None, None
+            return (
+                [],
+                llm_call_record(ANALYZER_ID, ok=False, error=str(exc)),
+                type(exc).__name__,
+                LedgerReason.LLM_BATCH_FAILED,
+                cast(list[InferenceUsageRecord], analyzer.inference_usage)
+                if analyzer is not None
+                else [],
+            )
+        return [], None, None, None, []
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +1008,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     for text, source_field, is_identifier in metadata_texts:
         findings.extend(_check_tp2(text, source_field, is_identifier))
 
+    # P9: Whitespace padding — check non-identifier (free-text) fields only
+    for text, source_field, is_identifier in metadata_texts:
+        if not is_identifier:
+            findings.extend(_check_p9_padding(text, source_field))
+
     # TP3: Parameter description injection — check parameters
     params = manifest.get("parameters") or []
     if isinstance(params, list):
@@ -891,35 +1036,32 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     tp4_record: LLMCallRecord | None = None
     tp4_findings: list[Finding] = []
     tp4_error_class: str | None = None
+    tp4_failure_reason: LedgerReason | None = None
+    tp4_usage: list[InferenceUsageRecord] = []
     if state.get("use_llm", True):
-        tp4_findings, tp4_record, tp4_error_class = _check_tp4(state)
+        tp4_findings, tp4_record, tp4_error_class, tp4_failure_reason, tp4_usage = _check_tp4(state)
         findings.extend(tp4_findings)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     if tp4_record is not None:
+        tp4_event_outcome = (
+            LedgerOutcome.COMPLETED
+            if tp4_record["ok"]
+            else outcome_for_llm_batch_failure(tp4_failure_reason or LedgerReason.LLM_BATCH_FAILED)
+        )
         tp4_event = ledger_event(
             analyzer_id=ANALYZER_ID,
-            outcome=LedgerOutcome.COMPLETED if tp4_record["ok"] else LedgerOutcome.FAILED,
+            outcome=tp4_event_outcome,
             phase="semantic",
             path="SKILL.md",
-            reason=None if tp4_record["ok"] else LedgerReason.LLM_BATCH_FAILED,
+            reason=(
+                None if tp4_record["ok"] else tp4_failure_reason or LedgerReason.LLM_BATCH_FAILED
+            ),
             emitted_finding_ids=[finding.finding_id for finding in tp4_findings],
             error_class=tp4_error_class,
         )
         ledger.append(tp4_event)
-    status = analyzer_status_event(
-        analyzer_id=ANALYZER_ID,
-        status="failed" if tp4_record is not None and not tp4_record["ok"] else "completed",
-        planned_work=[
-            {
-                "work_id": event["work_id"],
-                "path": event["path"],
-                "start_line": event["start_line"],
-                "end_line": event["end_line"],
-            }
-            for event in ledger
-        ],
-    )
+    status = analyzer_status_for_events(ANALYZER_ID, ledger)
     result: AnalyzerNodeResponse = {
         "findings": findings,
         "inspection_ledger": ledger,
@@ -929,4 +1071,5 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     # degradation detector counts this node consistently with the semantic ones.
     if tp4_record is not None:
         result["llm_call_log"] = [tp4_record]
+        result["inference_usage"] = tp4_usage
     return result

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from skillspector.inspection_ledger import finalize_ledger
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import Batch, BatchExecutionResult, BatchFailure
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
@@ -201,6 +201,79 @@ class TestMetaLedgerResponse:
             }
             for event in events
         ]
+
+    def test_connection_failure_remains_fatal(self) -> None:
+        failed = _lineage_finding("failed", "failed.py", 3)
+        failed_batch = Batch(file_path="failed.py", content="failed", findings=[failed])
+
+        events, status = _meta_ledger_response(
+            [failed_batch],
+            BatchExecutionResult(
+                failures=[
+                    BatchFailure(
+                        batch=failed_batch,
+                        error_class="APIConnectionError",
+                        reason=LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED,
+                    )
+                ]
+            ),
+            [failed],
+        )
+
+        assert events[0]["outcome"] is LedgerOutcome.FAILED
+        assert events[0]["reason_code"] == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        assert events[0]["message"] == "LLM connection failed after bounded retries."
+        assert status["status"] == "failed"
+
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["failed.py"],
+                "findings": [failed],
+                "effective_finding_ids": [failed.finding_id],
+                "inspection_ledger": events,
+                "analyzer_status_events": [status],
+            }
+        )
+
+        assert completeness["execution_successful"] is False
+        assert completeness["ledger_exceptions"][0]["fatal"] is True
+
+    def test_structured_response_failure_is_nonfatal_and_degraded(self) -> None:
+        failed = _lineage_finding("failed", "failed.py", 3)
+        failed_batch = Batch(file_path="failed.py", content="failed", findings=[failed])
+
+        events, status = _meta_ledger_response(
+            [failed_batch],
+            BatchExecutionResult(
+                failures=[
+                    BatchFailure(
+                        batch=failed_batch,
+                        error_class="ValidationError",
+                        reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                    )
+                ]
+            ),
+            [failed],
+        )
+
+        assert events[0]["outcome"] is LedgerOutcome.SKIPPED
+        assert events[0]["input_finding_ids"] == [failed.finding_id]
+        assert events[0]["emitted_finding_ids"] == [failed.finding_id]
+        assert status["status"] == "degraded"
+
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["failed.py"],
+                "findings": [failed],
+                "effective_finding_ids": [failed.finding_id],
+                "inspection_ledger": events,
+                "analyzer_status_events": [status],
+            }
+        )
+
+        assert completeness["execution_successful"] is True
+        assert completeness["is_complete"] is False
+        assert completeness["ledger_exceptions"][0]["fatal"] is False
 
     def test_overlapping_batches_do_not_reaccount_completed_finding(self) -> None:
         shared = _lineage_finding("shared", "complete.py", 1)
