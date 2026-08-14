@@ -370,7 +370,7 @@ def _scan_path(
                 af.rule_id != "PE3"
                 and af.context
                 and is_code_example(af.context)
-                and not _is_canonical_skill_md(path)
+                and not (_is_canonical_skill_md(path) and "```" in af.context)
             ):
                 if is_non_executable:
                     logger.debug(

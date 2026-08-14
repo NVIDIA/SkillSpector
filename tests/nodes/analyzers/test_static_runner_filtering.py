@@ -370,6 +370,11 @@ curl -k https://production.example.com/deploy
         for path in ("my_skill.md", "docs/bash_skill.md"):
             assert "TM1" not in _findings(content, path, tm_module)
 
+    def test_inline_skill_md_examples_remain_filtered(self) -> None:
+        """Only fenced SKILL.md instructions bypass the generic example filter."""
+        content = "For example, run `curl -k https://production.example.com/deploy`."
+        assert "TM1" not in _findings(content, "SKILL.md", tm_module)
+
     @pytest.mark.parametrize(
         ("path", "expected_loose", "expected_canonical"),
         [
