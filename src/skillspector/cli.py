@@ -40,7 +40,12 @@ from skillspector.input_handler import validate_local_input_path
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
-from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
+from skillspector.suppression import (
+    build_baseline_dict,
+    dump_baseline,
+    effective_findings,
+    load_baseline,
+)
 
 logger = get_logger(__name__)
 
@@ -468,8 +473,7 @@ def _scan_multi_skill(
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        finding_count = len(effective_findings(result))
         execution = "failed" if result.get("execution_successful") is False else "successful"
         console.print(
             f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
@@ -491,8 +495,7 @@ def _scan_multi_skill(
                 combined_skills.append({"name": skill.name, "error": result["error"]})
             else:
                 payload = _recursive_json_payload(result) or {}
-                selected_findings = result.get("filtered_findings") or result.get("findings") or []
-                finding_count = len(selected_findings) if isinstance(selected_findings, list) else 0
+                finding_count = len(effective_findings(result))
                 entry = {
                     "name": skill.name,
                     "path": skill.relative_path,
@@ -626,7 +629,7 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
-        findings = result.get("filtered_findings") or result.get("findings") or []
+        findings = effective_findings(result)
         data = build_baseline_dict(
             findings,
             reason=reason,

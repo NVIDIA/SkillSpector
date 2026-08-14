@@ -36,6 +36,7 @@ from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
+from skillspector.suppression import effective_findings
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -137,7 +138,7 @@ async def run_scan(
                 },
             },
         )
-        findings = result.get("filtered_findings") or result.get("findings") or []
+        findings = effective_findings(result)
         risk_score = int(result.get("risk_score") or 0)
         execution_successful = bool(result.get("execution_successful", True))
         analysis_completeness = result.get("analysis_completeness") or {}

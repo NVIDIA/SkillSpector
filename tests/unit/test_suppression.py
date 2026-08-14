@@ -25,10 +25,12 @@ import yaml
 from skillspector.models import Finding
 from skillspector.suppression import (
     Baseline,
+    SuppressedFinding,
     SuppressionRule,
     baseline_from_dict,
     build_baseline_dict,
     dump_baseline,
+    effective_findings,
     finding_fingerprint,
     load_baseline,
     partition_findings,
@@ -533,3 +535,85 @@ def test_exact_baseline_fails_closed_when_source_or_scanner_changes() -> None:
         )
         assert kept == [finding]
         assert suppressed == []
+
+
+def _partitioned_finding(rule_id: str) -> Finding:
+    """Build a distinct finding with a stable, inspectable rule id."""
+    return Finding(rule_id=rule_id, message=f"message for {rule_id}", file="SKILL.md")
+
+
+def test_effective_findings_keeps_an_empty_filtered_list() -> None:
+    """An empty filtered list is a real answer, not a missing one.
+
+    The previous `filtered_findings or findings` idiom treated `[]` as falsy and
+    fell back to the raw pre-filter findings, over-reporting a skill whose
+    findings were all filtered out.
+    """
+    raw = [_partitioned_finding("SQP-1"), _partitioned_finding("SQP-2")]
+    result = {"findings": raw, "filtered_findings": [], "suppressed_findings": []}
+
+    assert effective_findings(result) == []
+
+
+def test_effective_findings_subtracts_the_suppressed_partition() -> None:
+    """`filtered_findings` is kept+suppressed, so suppressed must be removed."""
+    kept = _partitioned_finding("SQP-1")
+    dropped = _partitioned_finding("SQP-2")
+    result = {
+        "findings": [kept, dropped],
+        "filtered_findings": [kept, dropped],
+        "suppressed_findings": [SuppressedFinding(finding=dropped, reason="baselined")],
+    }
+
+    assert effective_findings(result) == [kept]
+
+
+def test_effective_findings_fully_suppressed_skill_reports_none() -> None:
+    """A fully baselined skill scores 0, so it must report 0 findings too."""
+    findings = [_partitioned_finding("SQP-1"), _partitioned_finding("SQP-2")]
+    result = {
+        "findings": findings,
+        "filtered_findings": list(findings),
+        "suppressed_findings": [
+            SuppressedFinding(finding=finding, reason="baselined") for finding in findings
+        ],
+    }
+
+    assert effective_findings(result) == []
+
+
+def test_effective_findings_passes_through_without_a_baseline() -> None:
+    """With nothing suppressed the filtered set is returned unchanged."""
+    findings = [_partitioned_finding("SQP-1"), _partitioned_finding("SQP-2")]
+    result = {"findings": findings, "filtered_findings": list(findings)}
+
+    assert effective_findings(result) == findings
+
+
+def test_effective_findings_falls_back_to_raw_findings_without_subtracting() -> None:
+    """Raw findings are not the population that produced `suppressed_findings`.
+
+    When `filtered_findings` is absent the report never ran its partition, so
+    subtracting a suppressed list against the raw findings would be unsound.
+    """
+    raw = [_partitioned_finding("SQP-1"), _partitioned_finding("SQP-2")]
+    result = {
+        "findings": raw,
+        "suppressed_findings": [SuppressedFinding(finding=raw[0], reason="baselined")],
+    }
+
+    assert effective_findings(result) == raw
+
+
+@pytest.mark.parametrize("malformed", ["not-a-list", 7, None, {}])
+def test_effective_findings_treats_malformed_filtered_as_absent(malformed: object) -> None:
+    """A non-list `filtered_findings` degrades to the raw list, never to a crash."""
+    raw = [_partitioned_finding("SQP-1")]
+
+    assert effective_findings({"findings": raw, "filtered_findings": malformed}) == raw
+
+
+def test_effective_findings_on_an_empty_result_is_empty() -> None:
+    """A result carrying neither key yields no findings rather than raising."""
+    assert effective_findings({}) == []
+    assert effective_findings({"findings": "malformed"}) == []
