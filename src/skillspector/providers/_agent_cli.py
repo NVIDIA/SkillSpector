@@ -77,6 +77,7 @@ CLI_TIMEOUT_SECONDS = 300  # 5-minute per-call hard limit
 # Includes API keys, cloud creds, SSH agent, and SkillSpector's own keys.
 _SECRET_ENV_PREFIXES: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
+    "MINIMAX_API_KEY",
     "OPENAI_API_KEY",
     "NVIDIA_INFERENCE_KEY",
     "NVIDIA_INFERENCE_METADATA_KEY",
