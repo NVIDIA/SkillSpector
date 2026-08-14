@@ -41,6 +41,7 @@ class PatternCategory(StrEnum):
     AGENT_SNOOPING = "Agent Snooping"
     ANTI_REFUSAL = "Anti-Refusal"
     SERVER_SIDE_REQUEST_FORGERY = "Server-Side Request Forgery"
+    DESERIALIZATION = "Insecure Deserialization"
 
 
 # Pattern-specific explanations (why the finding is dangerous)
@@ -50,8 +51,9 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "P3": "Instructions found that direct the agent to transmit conversation context or user data to external services.",
     "P4": "Subtle instructions detected that may alter agent decision-making or introduce hidden biases.",
     "P5": "This content may contain harmful instructions that could cause physical harm if followed. CRITICAL: Review carefully before use.",
+    "P9": "Large whitespace padding was detected (a block of blank lines or a long run of spaces). This can push injected instructions below or to the right of the visible area so a human reviewer never sees them while the agent still reads them. Manual review of the hidden content is recommended.",
     "E1": "Data is being sent to an external URL. This could be legitimate telemetry or data exfiltration. Manual review is recommended.",
-    "E2": "Code accesses environment variables that may contain secrets (API keys, tokens). This is a common pattern for credential theft.",
+    "E2": "Code enumerates, copies, or searches environment variables for secrets. Bulk environment access can collect credentials unrelated to the skill's stated purpose.",
     "E3": "Code scans file system directories looking for sensitive files. This could be reconnaissance for credential theft.",
     "E4": "Code or instructions that leak agent conversation context to external services, potentially exposing sensitive user interactions.",
     "E5": "Data is uploaded to cloud storage (S3 / GCS / Azure Blob). This may be a legitimate backup or exfiltration to an external bucket. Manual review is recommended.",
@@ -91,6 +93,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SC5": "Dependency appears abandoned or unmaintained. Abandoned packages no longer receive security patches, leaving known and future vulnerabilities unaddressed.",
     "SC6": "Package name closely resembles a popular package, suggesting possible typosquatting. Attackers publish malicious packages with similar names to trick developers into installing them.",
     "SC7": "Code pulls a container image with signature or registry verification disabled (--disable-content-trust, DOCKER_CONTENT_TRUST=0, --insecure-registry). This accepts tampered or unverified images and is a container supply-chain risk.",
+    "SC8": "Skill ships Python bytecode (__pycache__/ or .pyc/.pyo). Discovery skips these paths, so malicious bytecode can score SAFE while decoy sources look clean.",
     # Trigger Abuse
     "TR1": "Skill uses overly broad trigger patterns that match common words or phrases, causing it to activate in unintended contexts and potentially shadow other skills.",
     "TR2": "Skill trigger shadows a common built-in command or another skill's trigger, potentially intercepting requests meant for trusted functionality.",
@@ -101,6 +104,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "TT3": "Credentials or environment variables flow to a network sink. This is a high-confidence indicator of credential exfiltration.",
     "TT4": "File contents flow to a network sink. This may indicate data exfiltration of sensitive files.",
     "TT5": "External input (network, user) flows to a code execution sink. This enables remote code execution or command injection.",
+    "TT6": "External input or file contents flow to an insecure deserializer (pickle, marshal, dill, jsonpickle, joblib, yaml.unsafe_load). Deserializing untrusted data reconstructs arbitrary objects and enables remote code execution.",
     # Behavioral AST (B.2.1)
     "AST1": "Direct exec() call allows arbitrary code execution. An attacker can inject code that runs with the full privileges of the process.",
     "AST2": "Direct eval() call evaluates arbitrary expressions. This can be exploited to execute malicious code or exfiltrate data.",
@@ -111,6 +115,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "AST7": "Dynamic getattr() with a non-literal attribute name can access arbitrary object attributes, potentially bypassing access controls.",
     "AST8": "A dangerous execution chain combines code execution (exec/eval) with a dynamic source (network, encoded data, dynamic import), creating a high-confidence attack vector.",
     "AST9": "Reflective access to an execution sink via getattr() with a constant name (e.g. getattr(os, 'system'), getattr(builtins, 'exec')) is functionally identical to a direct exec/os.system call but evades name-based detection. This is a deliberate evasion technique rather than idiomatic code.",
+    "AST10": "Untrusted data is passed to an insecure deserializer (pickle, marshal, dill, jsonpickle, joblib, yaml.load without a safe Loader, or torch.load without weights_only). These deserializers reconstruct arbitrary objects and invoke callables during loading, so deserializing attacker-controlled bytes is equivalent to arbitrary code execution.",
     # YARA (B.1.12)
     "YR1": "YARA rule matched a known malware signature (reverse shell, backdoor, ransomware, C2 framework, or info stealer).",
     "YR2": "YARA rule matched a known webshell pattern (PHP, Python, JSP, or ASPX webshell).",
@@ -119,7 +124,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     # MCP Least Privilege (B.3.1)
     "LP1": "Code uses capabilities (network, shell, file write, etc.) not covered by declared permissions. The skill does more than it claims, which may indicate deceptive intent.",
     "LP2": "Permission list contains a wildcard ('*' or 'all'), granting blanket access with no least-privilege boundary. This disables permission-based security controls entirely.",
-    "LP3": "Skill has no permissions field in its manifest but code uses detectable capabilities. Without declared permissions, the skill's intent is opaque and cannot be validated.",
+    "LP3": "Skill declares no tool scope ('permissions' or 'allowed-tools') in its manifest but code uses detectable capabilities. Without a declaration, the skill's intent is opaque and cannot be validated.",
     "LP4": "Permission is declared but no corresponding code capability was detected. This may indicate removed functionality or pre-staging for future abuse.",
     # MCP Tool Poisoning (B.3.2)
     "TP1": "Hidden instructions detected in skill metadata (description, triggers, or parameters). These concealed directives can steer LLM behavior without the user's knowledge.",
@@ -138,6 +143,11 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SSRF1": "Code accesses a cloud instance metadata endpoint (e.g. 169.254.169.254). A single request can return temporary IAM credentials, making this a high-value SSRF target for credential theft.",
     "SSRF2": "Code issues a request to a loopback, link-local, or private-range host. This can reach internal services not meant to be exposed and is a common SSRF pivot.",
     "SSRF3": "Request target host is built from a dynamic or untrusted value. If the host is attacker-influenced, this enables SSRF to arbitrary internal or metadata endpoints.",
+    # Insecure Deserialization (multi-language)
+    "DS1": "PHP unserialize() on untrusted input enables object injection: crafted serialized data instantiates arbitrary classes and triggers magic methods (__wakeup/__destruct), leading to POP-chain code execution.",
+    "DS2": "Ruby Marshal.load / Marshal.restore reconstructs arbitrary objects from a binary blob. On attacker-controlled input this is a well-known remote code execution vector.",
+    "DS3": "Ruby YAML.load / Psych.load / Oj.load (in object mode) can instantiate arbitrary Ruby objects from untrusted YAML/JSON, enabling code execution. Use YAML.safe_load or Psych.safe_load instead.",
+    "DS4": "JavaScript deserialization via node-serialize/funcster/serialize-to-js evaluates embedded functions (the _$$ND_FUNC$$_ marker), so unserializing attacker input executes arbitrary code in the Node process.",
 }
 
 # Rule ID -> category (for report output)
@@ -147,6 +157,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "P3": PatternCategory.PROMPT_INJECTION.value,
     "P4": PatternCategory.PROMPT_INJECTION.value,
     "P5": PatternCategory.PROMPT_INJECTION.value,
+    "P9": PatternCategory.PROMPT_INJECTION.value,
     "P6": PatternCategory.SYSTEM_PROMPT_LEAKAGE.value,
     "P7": PatternCategory.SYSTEM_PROMPT_LEAKAGE.value,
     "P8": PatternCategory.SYSTEM_PROMPT_LEAKAGE.value,
@@ -181,6 +192,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SC5": PatternCategory.SUPPLY_CHAIN.value,
     "SC6": PatternCategory.SUPPLY_CHAIN.value,
     "SC7": PatternCategory.SUPPLY_CHAIN.value,
+    "SC8": PatternCategory.SUPPLY_CHAIN.value,
     "TR1": PatternCategory.TRIGGER_ABUSE.value,
     "TR2": PatternCategory.TRIGGER_ABUSE.value,
     "TR3": PatternCategory.TRIGGER_ABUSE.value,
@@ -189,6 +201,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "TT3": PatternCategory.DATA_EXFILTRATION.value,
     "TT4": PatternCategory.DATA_EXFILTRATION.value,
     "TT5": PatternCategory.PRIVILEGE_ESCALATION.value,
+    "TT6": PatternCategory.DESERIALIZATION.value,
     # YARA (B.1.12)
     "YR1": PatternCategory.YARA_MATCH.value,
     "YR2": PatternCategory.YARA_MATCH.value,
@@ -216,6 +229,11 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SSRF1": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
     "SSRF2": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
     "SSRF3": PatternCategory.SERVER_SIDE_REQUEST_FORGERY.value,
+    # Insecure Deserialization (multi-language)
+    "DS1": PatternCategory.DESERIALIZATION.value,
+    "DS2": PatternCategory.DESERIALIZATION.value,
+    "DS3": PatternCategory.DESERIALIZATION.value,
+    "DS4": PatternCategory.DESERIALIZATION.value,
 }
 
 # Rule ID -> pattern display name (for report output)
@@ -225,6 +243,7 @@ PATTERN_NAMES: dict[str, str] = {
     "P3": "External Transmission Instructions",
     "P4": "Subtle Steering",
     "P5": "Harmful Content",
+    "P9": "Whitespace Padding",
     "P6": "System Prompt Leakage",
     "P7": "System Prompt Leakage",
     "P8": "System Prompt Leakage",
@@ -259,6 +278,7 @@ PATTERN_NAMES: dict[str, str] = {
     "SC5": "Abandoned Dependency",
     "SC6": "Typosquatting Dependency",
     "SC7": "Untrusted Container Image",
+    "SC8": "Shipped Python Bytecode",
     "TR1": "Overly Broad Trigger",
     "TR2": "Shadow Command Trigger",
     "TR3": "Keyword Baiting Trigger",
@@ -294,6 +314,14 @@ PATTERN_NAMES: dict[str, str] = {
     "SSRF1": "Cloud Metadata Access",
     "SSRF2": "Internal Network Request",
     "SSRF3": "Dynamic Request Target",
+    # Behavioral AST / Taint deserialization
+    "AST10": "Insecure Deserialization",
+    "TT6": "Untrusted Data to Deserializer Flow",
+    # Insecure Deserialization (multi-language)
+    "DS1": "PHP Object Injection",
+    "DS2": "Ruby Marshal Deserialization",
+    "DS3": "Unsafe Ruby YAML Deserialization",
+    "DS4": "Unsafe JavaScript Deserialization",
 }
 
 # Pattern-specific remediations (how to fix the issue)
@@ -303,8 +331,9 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "P3": "Remove instructions that send user data, prompts, or context to external URLs. If telemetry is needed, use documented, privacy-preserving methods.",
     "P4": "Review content for implicit steering or bias. Ensure instructions are explicit and align with the skill's stated purpose.",
     "P5": "Remove all content that could lead to harmful outcomes. Add safety guardrails and human oversight for any high-risk operations.",
+    "P9": "Remove the large whitespace padding (blank-line blocks or long space runs) and review any content hidden below or to the right of it. Keep skill files compact and reviewable so no instructions can be concealed off-screen.",
     "E1": "Verify the destination URL is trusted and necessary. Remove or replace with documented APIs. Ensure no secrets, tokens, or PII are transmitted.",
-    "E2": "Avoid reading sensitive env vars (API keys, tokens) unless strictly required. Use secrets managers or secure config. Never log or transmit credentials.",
+    "E2": "Read only explicitly required environment variables by name. Avoid enumerating or copying the full environment, and never log or transmit credentials to untrusted destinations.",
     "E3": "Remove unnecessary filesystem scanning. If file access is needed, use explicit, scoped paths. Avoid reading ~/.ssh, ~/.aws, or credential directories.",
     "E4": "Remove any code that sends prompts, responses, or session data externally. Preserve user privacy; never exfiltrate conversation content.",
     "E5": "Verify the destination bucket is trusted and owned by you. Never upload credentials, secrets, or workspace contents to external or unverified cloud storage.",
@@ -344,6 +373,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SC5": "Replace the abandoned dependency with an actively maintained alternative. Check the package's repository for last commit date and open issues.",
     "SC6": "Verify the package name is correct and not a typosquatting variant. Compare against the official package name on PyPI or npm.",
     "SC7": "Keep image signature verification (Docker Content Trust / cosign) and registry TLS enabled. Pull only signed images from trusted registries; never disable content-trust or use insecure registries in skill code.",
+    "SC8": "Do not ship __pycache__/ or .pyc/.pyo in skills. Delete bytecode before packaging; if presence is intentional for a lab fixture, quarantine it outside the skill install path.",
     # Trigger Abuse
     "TR1": "Use specific, narrow trigger patterns that match only the skill's intended use case. Avoid single-word or common-phrase triggers.",
     "TR2": "Choose triggers that do not conflict with built-in commands or other skills. Prefix with a unique namespace if necessary.",
@@ -358,12 +388,14 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "AST7": "Replace dynamic getattr() with explicit attribute access or a dictionary lookup with an allowlist of permitted attributes.",
     "AST8": "Remove the execution chain entirely. Never pass network data, decoded bytes, or dynamically imported code to exec()/eval(). Use structured data formats instead.",
     "AST9": "Call the function directly instead of reflectively (write exec(...) / os.system(...) explicitly), or remove it. If reflection is genuinely required, restrict it to an allowlist of safe attribute names that excludes execution sinks.",
+    "AST10": "Never deserialize untrusted input with pickle/marshal/dill/jsonpickle/joblib. Use a data-only format such as JSON. For YAML use yaml.safe_load; for PyTorch use torch.load(..., weights_only=True); for numpy avoid allow_pickle=True. If a binary format is unavoidable, verify an HMAC/signature over the bytes before loading.",
     # Behavioral Taint Tracking (B.2.2)
     "TT1": "Add validation or sanitization between the data source and sink. Never pass raw source data directly to a sink without checking its content.",
     "TT2": "Validate tainted variables before passing them to sinks. Use allowlists, type checks, or sanitization functions on data from external sources.",
     "TT3": "Never send credentials or environment variables over the network. Use secure credential stores and avoid transmitting secrets in request bodies or URLs.",
     "TT4": "Validate and filter file contents before sending over the network. Ensure sensitive files (credentials, configs) are never transmitted to external endpoints.",
     "TT5": "Never pass external input to exec(), eval(), os.system(), or subprocess without strict validation. Use allowlists and parameterized commands instead.",
+    "TT6": "Do not deserialize external input or bundled/downloaded files with pickle/marshal/dill/jsonpickle/joblib/yaml.unsafe_load. Use JSON or another data-only format, and verify integrity (HMAC/signature) before loading any binary blob.",
     # YARA (B.1.12)
     "YR1": "Remove the malware payload or compromised file entirely. Investigate how it entered the skill and audit all other artifacts for additional indicators of compromise.",
     "YR2": "Remove the webshell code immediately. Webshells provide unauthorized remote command execution. Audit the skill for additional backdoors or persistence mechanisms.",
@@ -372,7 +404,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     # MCP Least Privilege (B.3.1)
     "LP1": "Add the missing permission to SKILL.md, or remove the code that requires it.",
     "LP2": "Replace wildcard permissions ('*', 'all', 'full', 'any') with an explicit list of required permissions.",
-    "LP3": "Add a 'permissions' field to SKILL.md listing the capabilities this skill requires.",
+    "LP3": "Declare the skill's tool scope: for Claude Code / Agent Skills SKILL.md, list the tools the skill may invoke in the 'allowed-tools' frontmatter field; for MCP server manifests, add a 'permissions' list naming the required capabilities.",
     "LP4": "Remove the declared permission if the corresponding capability is no longer used.",
     # MCP Tool Poisoning (B.3.2)
     "TP1": "Remove hidden content (HTML comments, markdown comments, zero-width characters, base64 blobs) from metadata fields. Metadata should contain plain, visible text only.",
@@ -391,6 +423,11 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SSRF1": "Remove access to cloud metadata endpoints unless strictly required. If metadata is needed, restrict it (e.g. IMDSv2 with hop limit) and never expose returned credentials.",
     "SSRF2": "Avoid requests to loopback/link-local/private hosts from skill code. If internal access is intended, document it and validate the target against an allowlist.",
     "SSRF3": "Do not build request URLs from untrusted input. Validate the host against an allowlist and reject internal/metadata addresses before issuing the request.",
+    # Insecure Deserialization (multi-language)
+    "DS1": "Avoid unserialize() on untrusted PHP input. Use json_decode() for data, or restrict allowed classes via the second argument: unserialize($data, ['allowed_classes' => false]).",
+    "DS2": "Never call Marshal.load/Marshal.restore on untrusted data. Use JSON.parse for data exchange; Marshal is only safe for data you produced and trust.",
+    "DS3": "Replace YAML.load/Psych.load with YAML.safe_load (or Psych.safe_load) and pass an explicit permitted-classes allowlist. For Oj, avoid :object mode on untrusted input.",
+    "DS4": "Do not use node-serialize/funcster/serialize-to-js to deserialize untrusted input. Use JSON.parse for data, which never executes embedded code.",
 }
 
 

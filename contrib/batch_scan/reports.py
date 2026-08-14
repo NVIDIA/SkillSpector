@@ -39,6 +39,47 @@ def sorted_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
     )
 
 
+def _completeness(entry: dict[str, object]) -> dict[str, object]:
+    """Return a child scan's public completeness projection, never its raw ledger."""
+    value = entry.get("analysis_completeness")
+    return value if isinstance(value, dict) else {}
+
+
+def _inspection_summary(results: list[dict[str, object]]) -> dict[str, int]:
+    """Aggregate public child completeness while keeping transport errors separate."""
+    completed_results = [result for result in results if not result.get("error")]
+    return {
+        "failed_executions": sum(
+            1 for result in completed_results if result.get("execution_successful") is False
+        ),
+        "incomplete_skills": sum(
+            1 for result in completed_results if not _completeness(result).get("is_complete", True)
+        ),
+        "partially_inspected_files": sum(
+            int(_completeness(result).get("partially_inspected_files", 0) or 0)
+            for result in completed_results
+        ),
+        "entirely_uninspected_files": sum(
+            int(_completeness(result).get("entirely_uninspected_files", 0) or 0)
+            for result in completed_results
+        ),
+    }
+
+
+def _exception_groups(results: list[dict[str, object]]) -> list[tuple[str, list[dict[str, object]]]]:
+    """Collect every public exception by child skill, without sampling rows."""
+    groups: list[tuple[str, list[dict[str, object]]]] = []
+    for result in sorted_results(results):
+        exceptions = _completeness(result).get("ledger_exceptions", [])
+        if not isinstance(exceptions, list) or not exceptions:
+            continue
+        safe_exceptions = [exception for exception in exceptions if isinstance(exception, dict)]
+        if safe_exceptions:
+            name = str(result.get("skill", {}).get("name", "unknown"))
+            groups.append((name, safe_exceptions))
+    return groups
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Terminal (Rich)
 # ═══════════════════════════════════════════════════════════════════
@@ -85,6 +126,14 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
     capture.print(f"[bold]Total:[/bold] {total} skill(s) scanned")
     if errs:
         capture.print(f"[red]Errors:[/red] {errs}")
+    inspection = _inspection_summary(results)
+    capture.print(
+        "[bold]Inspection:[/bold] "
+        f"{inspection['failed_executions']} failed execution(s), "
+        f"{inspection['incomplete_skills']} incomplete skill(s), "
+        f"{inspection['partially_inspected_files']} partial file(s), "
+        f"{inspection['entirely_uninspected_files']} entirely uninspected file(s)"
+    )
     if non_en:
         capture.print(
             f"[bold]Multilingual:[/bold] {non_en} non-English skill(s) "
@@ -157,6 +206,14 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
         capture.print(
             f"[green]{low_count} skill(s)[/green] with LOW risk — likely safe"
         )
+    for skill_name, exceptions in _exception_groups(results):
+        capture.print(f"[bold]Ledger exceptions — {skill_name}[/bold]")
+        for exception in exceptions:
+            capture.print(
+                "  - "
+                f"{exception.get('reason_code', 'unknown')} "
+                f"{exception.get('path', '')}: {exception.get('message', '')}"
+            )
     capture.print()
 
     return capture.export_text()
@@ -235,6 +292,13 @@ def _format_terminal_plain(results: list[dict[str, object]]) -> str:
             f"  {skill.get('name', '?'):40s} "
             f"{risk.get('score', 0):>3}/100 {risk.get('severity', 'LOW'):<8s}"
         )
+    for skill_name, exceptions in _exception_groups(results):
+        lines.append(f"Ledger exceptions — {skill_name}")
+        for exception in exceptions:
+            lines.append(
+                f"  - {exception.get('reason_code', 'unknown')} "
+                f"{exception.get('path', '')}: {exception.get('message', '')}"
+            )
     return "\n".join(lines)
 
 
@@ -258,6 +322,8 @@ def _format_json(results: list[dict[str, object]]) -> str:
             "risk_assessment": r.get("risk_assessment", {}),
             "components": r.get("components", []),
             "issues": r.get("issues", []),
+            "execution_successful": r.get("execution_successful", "error" not in r),
+            "analysis_completeness": _completeness(r),
             "scan_mode": r.get("scan_mode", "multilingual-enhanced"),
             "enhancements": r.get("enhancements", {}),
         }
@@ -292,6 +358,7 @@ def _format_json(results: list[dict[str, object]]) -> str:
                 "gap_fill_applied": gap_fill_skills,
                 "gap_fill_findings": gap_fill_total,
             },
+            "inspection_completeness": _inspection_summary(results),
         },
         "skills": entries,
         "metadata": {
@@ -351,6 +418,11 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
     lines.append(f"| 🔴 HIGH | {high} |")
     lines.append(f"| 🟡 MEDIUM | {medium} |")
     lines.append(f"| 🟢 LOW | {low_count} |")
+    inspection = _inspection_summary(results)
+    lines.append(f"| Failed executions | {inspection['failed_executions']} |")
+    lines.append(f"| Incomplete skills | {inspection['incomplete_skills']} |")
+    lines.append(f"| Partially inspected files | {inspection['partially_inspected_files']} |")
+    lines.append(f"| Entirely uninspected files | {inspection['entirely_uninspected_files']} |")
     lines.append("")
 
     lines.append("## Skills by Risk Score\n")
@@ -407,6 +479,18 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
                     lines.append(f"  - Remediation: {rem}")
                 lines.append("")
         lines.append("")
+
+    exception_groups = _exception_groups(results)
+    if exception_groups:
+        lines.append("## Ledger Exceptions\n")
+        for skill_name, exceptions in exception_groups:
+            lines.append(f"### {skill_name}\n")
+            for exception in exceptions:
+                lines.append(
+                    f"- **{exception.get('reason_code', 'unknown')}** "
+                    f"`{exception.get('path', '')}`: {exception.get('message', '')}"
+                )
+            lines.append("")
 
     lines.append(f"\n*Generated by SkillSpector v{_skillspector_version}*")
     return "\n".join(lines)

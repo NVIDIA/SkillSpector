@@ -148,6 +148,132 @@ def _is_read_only_passwd_volume_match(content: str, match: re.Match[str]) -> boo
     return False
 
 
+_BENIGN_ACCESS_REQUIREMENT_ROWS = frozenset(
+    {
+        "| GTL access credential | Runner-gated job start |",
+        "| GTL access credential | Runner-gated job create/start/monitor/collect |",
+    }
+)
+_PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
+    r"(?:^|>|\b(?:navigate|go)\s+to\s+)\s*settings\s*>\s*(?:ci/cd\s*>\s*)?"
+    r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_LIFECYCLE_CONTEXT = re.compile(
+    r"\b(?:expires?|expiry|lifespan|refresh[ _-]?token|oauth|bearer|token endpoint|"
+    r"renew(?:ed|al|ing)?|revoked)\b"
+    r"|grant_type\s*=\s*client_credentials|(?:^|\W)401(?:\W|$)",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_ACTION_CONTEXT = re.compile(
+    r"\b(?:steal|exfiltrat\w*|dump|harvest|scrape|upload|transmit|send|copy|extract)\b"
+    r"|\b(?:read|open|load)\b[^\n]{0,80}\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
+    r"(?<![\w.-])(?:\.ssh|\.aws)(?:[/\\]|$)"
+    r"|(?<![\w.-])\.env(?:\.[\w-]+)?\b"
+    r"|/etc/(?:passwd|shadow)\b"
+    r"|\b(?:tokens?\.json|credentials?|secrets?)\b[^\n]{0,80}"
+    r"\b(?:read|open|load|copy|upload|transmit)\b",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_NOUN_MODIFIER = re.compile(
+    r"\b(?:an?|the|new|resulting|stored|ssa|actor|oauth|bearer|glean|user)\s+$",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_LIFESPAN_PREFIX = re.compile(
+    r"\s*(?:[-*|>#`]+\s*)*(?:\*{0,2}lifespan\s*:\s*\*{0,2}\s*)?",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_LIFESPAN_SUFFIX = re.compile(
+    r"\s*(?:~?\d|expires?|is\s+(?:valid|used)|lasts?\b)",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_LIFECYCLE_DOCUMENTATION_DIRS = frozenset(
+    {"docs", "documentation", "procedures", "references", "examples", "guides"}
+)
+
+
+def _source_line(content: str, match: re.Match[str]) -> str:
+    """Return only the source line containing *match*."""
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(content)
+    return content[line_start:line_end]
+
+
+def _is_access_token_lifecycle_noun(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    file_path: str,
+) -> bool:
+    """Return True for a bounded OAuth ``access token`` noun in documentation.
+
+    PE3's generic ``access … tokens?`` rule cannot distinguish the verb
+    "access tokens" from the OAuth compound noun "access token". Suppress only
+    noun-shaped matches with nearby lifecycle evidence, and fail closed when
+    the context contains credential actions or sensitive sources.
+    """
+    if file_type not in {"markdown", "text"}:
+        return False
+    normalized_parts = file_path.replace("\\", "/").lower().split("/")
+    if not any(part in _PE3_TOKEN_LIFECYCLE_DOCUMENTATION_DIRS for part in normalized_parts):
+        return False
+    if match.group(0).lower() not in {"access token", "access tokens"}:
+        return False
+
+    context = get_context(content, match.start())
+    if not _PE3_TOKEN_LIFECYCLE_CONTEXT.search(context):
+        return False
+    if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
+        return False
+
+    line = _source_line(content, match)
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    relative_start = match.start() - line_start
+    relative_end = match.end() - line_start
+    prefix = line[:relative_start]
+    suffix = line[relative_end:]
+
+    has_noun_modifier = _PE3_ACCESS_TOKEN_NOUN_MODIFIER.search(prefix) is not None
+    is_lifecycle_subject = bool(
+        _PE3_ACCESS_TOKEN_LIFESPAN_PREFIX.fullmatch(prefix)
+        and _PE3_ACCESS_TOKEN_LIFESPAN_SUFFIX.match(suffix)
+    )
+    return has_noun_modifier or is_lifecycle_subject
+
+
+def _is_qualified_benign_access_requirement(
+    content: str, match: re.Match[str], file_type: str
+) -> bool:
+    """Suppress only the reviewed GTL requirement row in its exact table."""
+    if file_type != "markdown" or match.group(0) != "access credential":
+        return False
+
+    lines = content.splitlines()
+    row_index = get_line_number(content, match.start()) - 1
+    if row_index >= len(lines) or lines[row_index].strip() not in _BENIGN_ACCESS_REQUIREMENT_ROWS:
+        return False
+
+    table_start = row_index
+    while table_start > 0 and lines[table_start - 1].strip().startswith("|"):
+        table_start -= 1
+    if table_start + 1 >= len(lines):
+        return False
+    if lines[table_start].strip() != "| Requirement | Purpose |":
+        return False
+    if lines[table_start + 1].strip() != "| --- | --- |":
+        return False
+
+    heading_index = table_start - 1
+    while heading_index >= 0 and not lines[heading_index].strip():
+        heading_index -= 1
+    return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
@@ -195,9 +321,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
-            if _is_documentation_example(context, file_type):
+            if _is_pe3_documentation_example(content, match, file_type, file_path):
+                continue
+            if _is_qualified_benign_access_requirement(content, match, file_type):
                 continue
             if _is_read_only_passwd_volume_match(content, match):
+                continue
+            if _is_negated_safety_constraint(content, match):
                 continue
             findings.append(
                 AnalyzerFinding(
@@ -258,41 +388,85 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
-def _is_documentation_example(context: str, file_type: str) -> bool:
+_DOCUMENTATION_EXAMPLE_INDICATORS = (
+    "example:",
+    "for example",
+    "e.g.",
+    "such as",
+    "documentation",
+    "# warning:",
+    "# note:",
+    "**warning**",
+    "**note**",
+    "```",
+)
+
+
+def _has_documentation_indicator(context: str, indicators: tuple[str, ...]) -> bool:
     ctx_lower = context.lower()
-    doc_indicators = (
-        "example:",
-        "for example",
-        "e.g.",
-        "such as",
-        "documentation",
-        "# warning:",
-        "# note:",
-        "**warning**",
-        "**note**",
-        "```",
-        # CI/CD setup instructions (GitLab/GitHub settings navigation)
-        "settings >",
-        "navigate to",
-        "go to ",
-        "> ci/cd",
-        "> runners",
-        "> merge request",
-        "> access token",
-        # Environment variable documentation tables
-        "| yes |",
-        "| no |",
-        "| required |",
-        "| optional |",
-        "env variable",
-        "environment variable",
-        "create ",
+    return any(indicator in ctx_lower for indicator in indicators)
+
+
+def _is_documentation_example(context: str, file_type: str) -> bool:
+    if file_type not in {"markdown", "text"}:
+        return False
+    return _has_documentation_indicator(context, _DOCUMENTATION_EXAMPLE_INDICATORS)
+
+
+def _is_pe3_documentation_example(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    file_path: str,
+) -> bool:
+    """Filter reviewed, position-bound access-token documentation forms.
+
+    Generic words such as ``example``, ``documentation``, ``Required``, and
+    ``environment variable`` are attacker-controllable prose and must never
+    suppress an otherwise actionable credential-access match. Even negated
+    references remain findings because another malicious clause can share the
+    same line. The OAuth lifecycle exception is separately bounded by noun
+    grammar, lifecycle evidence, and action/sensitive-source vetoes.
+    """
+    if file_type not in {"markdown", "text"}:
+        return False
+    if match.group(0).lower() not in {"access token", "access tokens"}:
+        return False
+
+    line = _source_line(content, match)
+    navigation = _PE3_SAFE_ACCESS_TOKEN_NAVIGATION.search(line)
+    if navigation is not None:
+        line_start = content.rfind("\n", 0, match.start()) + 1
+        match_span = (match.start() - line_start, match.end() - line_start)
+        if navigation.span("target") == match_span:
+            return True
+
+    return _is_access_token_lifecycle_noun(content, match, file_type, file_path)
+
+
+def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+    """Return True when a privilege-escalation phrase is forbidden in policy prose."""
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    phrase = line[local_start : local_start + len(match.group(0))]
+    escaped = re.escape(phrase.strip())
+    if not escaped:
+        return False
+    clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
+    prefix = line[clause_start + 1 : local_start]
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
+    negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
+    return (
+        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
     )
-    return any(ind in ctx_lower for ind in doc_indicators)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run privilege_escalation patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

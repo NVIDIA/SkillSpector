@@ -187,6 +187,109 @@ class TestDangerousChains:
         assert len(ast8) >= 1
 
 
+class TestInsecureDeserialization:
+    """AST10: deserializers that reconstruct arbitrary objects / execute code."""
+
+    def test_pickle_loads_produces_ast10(self):
+        findings = _run("import pickle\nobj = pickle.loads(data)")
+        ast10 = [f for f in findings if f.rule_id == "AST10"]
+        assert len(ast10) == 1
+        assert ast10[0].severity == "MEDIUM"
+        assert "pickle.loads" in ast10[0].message
+
+    def test_pickle_load_produces_ast10(self):
+        findings = _run('import pickle\nobj = pickle.load(open("f.pkl", "rb"))')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_marshal_loads_produces_ast10(self):
+        findings = _run("import marshal\nmarshal.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_dill_loads_produces_ast10(self):
+        findings = _run("import dill\ndill.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_jsonpickle_decode_produces_ast10(self):
+        findings = _run("import jsonpickle\njsonpickle.decode(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_pandas_read_pickle_produces_ast10(self):
+        findings = _run('import pandas as pd\ndf = pd.read_pickle("data.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_joblib_load_produces_ast10(self):
+        findings = _run('import joblib\nm = joblib.load("model.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_unsafe_load_produces_ast10(self):
+        findings = _run("import yaml\nyaml.unsafe_load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_from_import_alias_evasion(self):
+        findings = _run("from pickle import loads\nloads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    # ── yaml.load: argument-aware ─────────────────────────────────────
+
+    def test_yaml_load_without_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_kwarg_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_positional_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_unsafe_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.FullLoader)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_safe_load_no_finding(self):
+        findings = _run("import yaml\nyaml.safe_load(s)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── torch.load: argument-aware ────────────────────────────────────
+
+    def test_torch_load_without_weights_only_produces_ast10(self):
+        findings = _run('import torch\ntorch.load("model.pt")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_torch_load_with_weights_only_no_finding(self):
+        findings = _run('import torch\ntorch.load("model.pt", weights_only=True)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── numpy.load: argument-aware ────────────────────────────────────
+
+    def test_numpy_load_default_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", allow_pickle=True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_positional_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_mmap_mode_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", "r")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_false_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, False)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── no false positives on safe data parsing ───────────────────────
+
+    def test_json_loads_no_finding(self):
+        findings = _run("import json\njson.loads('{}')")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+
 class TestEdgeCases:
     def test_non_python_files_skipped(self):
         state = {
@@ -413,3 +516,32 @@ class TestImportlibDynamicChainEvasion:
         """A benign dynamic import (``json.loads``) must not match a sink ladder."""
         findings = _run("import importlib\nimportlib.import_module('json').loads('{}')\n")
         assert findings == []
+
+
+class TestInspectionLedgerResponse:
+    def test_syntax_error_is_skipped_without_creating_non_python_work(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["broken.py", "README.md"],
+                "file_cache": {"broken.py": "def broken(:\n", "README.md": "# docs\n"},
+            }
+        )
+
+        assert [event["path"] for event in result["inspection_ledger"]] == ["broken.py"]
+        assert result["inspection_ledger"][0]["outcome"] == "skipped"
+        assert result["inspection_ledger"][0]["reason_code"] == "syntax_error"
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_completed_work_references_the_emitted_findings(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["run.py"],
+                "file_cache": {"run.py": "import os\nos.system(user_input)\n"},
+            }
+        )
+
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] == "completed"
+        assert event["emitted_finding_ids"] == [
+            finding.finding_id for finding in result["findings"]
+        ]

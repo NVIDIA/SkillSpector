@@ -36,7 +36,7 @@ cleanly — a missing tool never fails the suite.
 
 Each case verifies, against the real binary:
   1. A call returns non-empty text with NO model pinned — ``model=""`` means the
-     CLI uses the user's OWN default model (``--model`` is omitted).
+     CLI receives no explicit ``--model`` override.
   2. A prompt containing a prompt-injection is returned as analysis *text*, not
      executed (the capability-stripped, fail-closed invocation; the flags that
      guarantee this are unit-tested in ``tests/unit/test_agent_cli.py``).
@@ -73,12 +73,12 @@ class TestAgentCliLive:
     """Smoke tests that drive each real CLI through the hardened runner."""
 
     def test_returns_text_with_no_pinned_model(self, cli: str) -> None:
-        """``model=""`` -> the CLI runs with the user's own default model."""
+        """``model=""`` -> the CLI runs without an explicit ``--model`` flag."""
         _require(cli)
         out = _agent_cli.run_agent_cli(
             cli,
             "Reply with exactly one word: PONG",
-            model="",  # no --model: honour the user's own CLI-configured model
+            model="",  # no --model: let the CLI pick its own fallback model
             max_output_tokens=64,
         )
         assert isinstance(out, str)

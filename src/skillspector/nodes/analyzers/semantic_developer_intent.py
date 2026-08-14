@@ -23,7 +23,13 @@ its actual code behavior using LLM-based analysis.
 from __future__ import annotations
 
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL, MODEL_CONFIG
-from skillspector.llm_analyzer_base import LLMAnalyzerBase
+from skillspector.inspection_ledger import LedgerReason, analyzer_status_event
+from skillspector.llm_analyzer_base import (
+    BatchExecutionResult,
+    BatchFailure,
+    LLMAnalyzerBase,
+    ledger_events_for_batches,
+)
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call_record
@@ -156,11 +162,31 @@ def _format_manifest(manifest: dict) -> str:
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Discover developer-intent findings via LLM analysis."""
     if not state.get("use_llm", True):
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="disabled",
+                    reason=LedgerReason.DISABLED_BY_CONFIGURATION,
+                )
+            ],
+        }
 
     file_cache: dict[str, str] = state.get("file_cache") or {}
     if not file_cache:
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="not_applicable",
+                    reason=LedgerReason.NO_APPLICABLE_FILES,
+                )
+            ],
+        }
 
     manifest: dict = state.get("manifest") or {}
     model_config: dict[str, str] = state.get("model_config") or {}
@@ -171,19 +197,50 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         or _SKILLSPECTOR_DEFAULT_MODEL
     )
 
+    analyzer: LLMAnalyzerBase | None = None
+    batches = []
     try:
         prompt = ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest))
-        analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model)
+        analyzer = LLMAnalyzerBase(base_prompt=prompt, model=model, node=ANALYZER_ID)
         batches = analyzer.get_batches(sorted(file_cache), file_cache)
         results = run_async(analyzer.arun_batches(batches))
-        findings = analyzer.collect_findings(results)
+        outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
+        findings = analyzer.collect_findings(outcome.successful)
+        events, status = ledger_events_for_batches(ANALYZER_ID, outcome)
         logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-        return {"findings": findings, "llm_call_log": [llm_call_record(ANALYZER_ID, ok=True)]}
-    except ValueError:
-        raise
+        return {
+            "findings": findings,
+            "inspection_ledger": events,
+            "analyzer_status_events": [status],
+            "llm_call_log": [
+                llm_call_record(ANALYZER_ID, ok=bool(outcome.successful) or not outcome.failures)
+            ],
+            "inference_usage": analyzer.inference_usage,
+        }
     except Exception as exc:
+        post_response_value_error = (
+            isinstance(exc, ValueError) and analyzer is not None and analyzer.response_received
+        )
+        if isinstance(exc, ValueError) and not post_response_value_error:
+            raise
         logger.warning("%s failed: %s", ANALYZER_ID, exc)
+        if post_response_value_error:
+            events, status = ledger_events_for_batches(
+                ANALYZER_ID,
+                BatchExecutionResult(
+                    failures=[
+                        BatchFailure(batch=batch, error_class=type(exc).__name__)
+                        for batch in batches
+                    ]
+                ),
+            )
+        else:
+            events = []
+            status = analyzer_status_event(analyzer_id=ANALYZER_ID, status="unavailable")
         return {
             "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": [status],
             "llm_call_log": [llm_call_record(ANALYZER_ID, ok=False, error=str(exc))],
+            "inference_usage": analyzer.inference_usage if analyzer is not None else [],
         }

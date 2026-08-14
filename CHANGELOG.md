@@ -1,400 +1,511 @@
-### [2.4.1 (Monday, July 20, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.4.0&to=release%2F2.4.1)
+### 2.9.4 (Wednesday, August 12, 2026)
 ### Features/Bug Fixes
-* fix(provider): keep reasoning effort pass-through consistent (#283) ([f0029184](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f0029184d96cb75b7a11060e37ac09ae8028b788))
-* feat(provider): keep reasoning effort consistent across Anthropic paths (#283) ([c9809a4c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c9809a4c82e46bb13da1513f18bc530fbc699b63))
-* feat(provider): forward reasoning effort to OpenAI-compatible models (#283) ([a2c438e7](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a2c438e70bcf5411b132ea7e4720b70b08f15041))
-* fix(analyzer): align file-size guard with character semantics (#284) ([494a0ac4](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/494a0ac4ad632fac0d2065f585acb0b01954ac70))
+* fix(mcp): reject local targets over HTTP transport (#196)
+* Add Skill Inspector companion skill (#253)
+* fix(lp3): remediation and docs name allowed-tools for SKILL.md (#316)
+* chore(openssf-scorecard): Add badge (#351)
+* Detect whitespace padding used to hide prompt-injection instructions (P9) (#24)
+* fix(analyzers): HIGH SC8 when skill ships __pycache__ or .pyc (#357)
+* Revert "Scope the locality guard to the namespace"
+* Scope the locality guard to the namespace
+* fix(security): reject symlinks in skill walk + disable git symlinks on clone
 ---
-### [2.4.0 (Monday, July 20, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.13&to=release%2F2.4.0)
+### 2.9.3 (Tuesday, August 11, 2026)
 ### Features/Bug Fixes
-* fix(analyzer): reduce cupynumeric false positives ([b3840e76](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b3840e766a5481b315458490c17859a4694359eb))
-* fix(analyzer): reduce security-pattern false positives ([450f623a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/450f623a517fb7004f3e6426aaa8d6fd31c51c5e))
-* fix(analyzer): scope passwd mount and rm detection ([4cb73a29](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/4cb73a2919be076ad3b9761213303ab4a297dad6))
+* fix(llm): surface invalid responses as degraded (skipped, non-fatal, incomplete)
 ---
-### [2.3.13 (Tuesday, July 14, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.12&to=release%2F2.3.13)
+### 2.9.2 (Monday, August 10, 2026)
 ### Features/Bug Fixes
-* fix: mask release command failures ([564870a1](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/564870a1f0bf5d0cdfba56e43486423e9756931c))
-* ci: validate default branch pushes ([8092a9e7](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8092a9e73c400b6759bd2eba53e0a08eff360353))
-* Fix Sonar finding in YARA rule materialization ([a7bb3d4d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a7bb3d4dfe7d944a7dcaeb5abc2c1280a3abbf99))
-* feat(provider): allow scoped LLM provider injection (#243) ([fa07d56b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/fa07d56bb387c1c92b817aca41a603136b535ba4))
-* fix emoji zwj prompt injection false positive ([bd9a6630](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/bd9a66309abfcdc46fe030a4e0c46a0f49f36d64))
-* fix(analyzer): keep executable doc calls outside suppression (#251) ([8b7569fe](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8b7569fec4a703d7b2a8b16adecd586a99d45f3e))
-* fix(analyzer): keep inline block comments out of doc gating (#251) ([e87c0896](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e87c0896d7a5d346dc67cd58661d433419ccf86f))
-* fix(analyzer): classify docs from the finding line (#251) ([5b696557](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5b696557d97a6eedd2f5d3415c8ad2f5691092d5))
-* fix(analyzer): keep config-file findings outside doc gating (#251) ([c4a9f0c2](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c4a9f0c2accd4ec9894e5d60522c171ea1ac4763))
-* fix(analyzer): gate documentation false positives for PE3/RA1/TM1/AR2 (#251) ([7fae683f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/7fae683f65adc6143f971b60ec0059578312eb96))
-* fix(cli): preserve full per-skill JSON payload in recursive scans (#228) ([624edc35](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/624edc3592ec70a6c924132b4149d5d8f7d8c03b))
-* fix(yara): skip malformed unicode encoded rules (#236) ([5d5275ae](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5d5275aed15c375fe572817f25d2874985b2a313))
-* fix(yara): reduce packaged malware-signature false positives (#236) ([878ee050](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/878ee0505603a42d651fc002c079b2f096dd0764))
-* fix(sc7): exclude --disable-content-trust=false to keep content-trust-enabled pulls clean ([4a4eed7c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/4a4eed7c96bcef37b5e2fc3fac80d0795c48ffad))
-* fix(analyzer): rely on runner for SC7 example filtering to close executable bypass ([79ebb0bb](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/79ebb0bbb9502f76cfdd4acee3037c966fe65e7b))
-* feat(analyzer): detect untrusted container image pull as SC7 ([5af944be](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5af944be3b8016f805b4ce77ad3ef63b58ef2e48))
-* fix(report): preserve exact SARIF severity metadata (#229) ([b903836c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b903836c71f5891947cd0c1b8e4dad5454e8e7a6))
-* fix(report): preserve remaining SARIF finding fields (#229) ([b0691ded](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b0691dedd9243e5c7f514fb04a143186b2192545))
-* fix(report): preserve full finding metadata in SARIF output (#229) ([2adabfb2](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2adabfb28b5a2c2daf5f9e78e050af683b6d5913))
-* Format: ruff lint and format fixes ([f97ac489](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f97ac489bf07670c95c0724ff64c6a8878f93d78))
-* Add unit tests for run_async utility function ([32c2b624](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/32c2b624359a5fc00aab665cbb3b7cf9c6cca723))
-* Fix: remove unused asyncio import from meta_analyzer.py ([d3c48b61](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d3c48b61301cccc1578cf7fcb2a66b8a3e233aef))
-* Fix: Allow running in environments with existing event loop ([bc27b71d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/bc27b71d87ef4db0d4da033c2c668526662b5786))
+* fix(llm): retry malformed structured responses
 ---
-### [2.3.12 (Monday, July 13, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.11&to=release%2F2.3.12)
+### 2.9.1 (Monday, August 10, 2026)
 ### Features/Bug Fixes
-* fix: mask release command secrets ([d00fa2d5](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d00fa2d586a4e338723b758d1027f9aa5d1ed26b))
-* docs: correct MCP fixture expectations ([84da0b8e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/84da0b8e32186cb06702e59bbf0a1ebc8d28e022))
-* fix(mcp): prove stdio initialize compatibility (#199) ([59242513](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5924251323e7319864464cf174f3b52f1a9bcd94))
-* fix: trim batch scan README command whitespace ([374a81de](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/374a81deae1ccfd6bb50599669e39eeffa6289bc))
-* rename contrib/multilingual to contrib/batch_scan and update README usage ([ea2b2b48](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ea2b2b48c0b1e70c9a584d249ca6f270d29586ff))
-* ci: align GitHub CI with deterministic checks ([a76f1319](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a76f1319ec08436ba8f781115604236782708d1e))
+* fix(llm): add bounded connection retries
 ---
-### [2.3.11 (Monday, July 06, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.10&to=release%2F2.3.11)
+### 2.9.0 (Monday, August 10, 2026)
+### Features/Bug Fixes
+* fix(e2): allow targeted environment credential reads
+* fix: remediate nSpect High vulnerabilities
+* fix(yara): require local destructive autonomy evidence
+---
+### 2.8.2 (Friday, August 07, 2026)
+### Features/Bug Fixes
+* fix(mcp): retry malformed TP4 responses
+---
+### 2.8.1 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(llm): isolate malformed structured responses per batch
+---
+### 2.8.0 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(baseline): exclude selected baseline from scans
+---
+### 2.7.2 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(pe3): distinguish OAuth access-token nouns from credential access
+---
+### 2.7.0 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(telemetry): harden inference usage normalization
+---
+### 2.6.0 (Wednesday, August 05, 2026)
+### Features/Bug Fixes
+* feat(release): auto-generate versioned release notes like CHANGELOG
+* feat(telemetry): export provider inference usage
+---
+### 2.5.3 (Tuesday, August 04, 2026)
+### Features/Bug Fixes
+* fix(analyzers): share Python AST parsing for environment-read detection (#332)
+* fix(output-handling): avoid RegExp.exec false positives (#341)
+* docs(skill): allow delegated import MR preparation
+* docs(lifecycle): optimize OSS import queue and cutoff
+---
+### 2.5.2 (Tuesday, August 04, 2026)
+### Features/Bug Fixes
+* test(mp2): lock the layout-span guard against regressions (#342)
+* fix(nv_build): cover reported model metadata (#279)
+* (chore) pin dependencies for workflows and Docker base images (#238)
+* fix(analyzer): reduce instructional-prose false positives in static scans (#103) (#232)
+* fix(input-handler): bound URL, zip, and git ingest paths (#164)
+* fix: read exact versions from Python lockfiles for OSV (#263)
+* feat(mcp): add registry posture scanning (#280)
+* fix: exclude valid OMS signatures from content analysis (#261)
+* fix(static): markdown table and quote syntax is not an execution signal (#321)
+* fix(agent-cli): Windows temp-cwd cleanup must not fail a successful batch (#317)
+* fix(supply-chain): SC4 must not claim a vulnerability it did not verify (#319)
+* docs: link to the Verified Skills pipeline and hosted docs (#347)
+* test(release): make changelog assertions version-aware
+* fix(release): harden patch publishing and changelog baseline
+---
+### 2.5.1 (Thursday, July 30, 2026)
+### Features/Bug Fixes
+* feat(llm): configurable analyzer fan-out concurrency via SKILLSPECTOR_MAX_LLM_CONCURRENCY (part of #303) (#305)
+* release: prepare package and skill lifecycle
+* fix(analyzer): avoid OH1 false positives for subprocess --output and capture_output
+* docs: clarify 2.5.0 execution accounting
+---
+### 2.5.0 (Friday, July 24, 2026)
+### Features/Bug Fixes
+* feat: Implement canonical inspection ledger reporting
+* fix(security): harden P6, PE3, and baseline fingerprints
+* fix(release): preserve GitHub PR titles in changelog
+* feat: publish GitHub releases from labeled PRs
+* docs: add skill-driven GitHub lifecycle
+---
+### 2.4.4 (Thursday, July 23, 2026)
+### Features/Bug Fixes
+* fix(anthropic): re-apply ANTHROPIC_BASE_URL override reverted by 2.4.3 snapshot (#301)
+---
+### 2.4.3 (Wednesday, July 22, 2026)
+### Features/Bug Fixes
+* Clarify CLI runtime model fallback in provider docs
+* fix(provider): align Claude fallback contract with settings isolation (#295)
+* fix(provider): isolate Claude settings hooks in spawned CLI (#295)
+* fix(suppression): match reported finding text
+* ci: disable optional provider test
+* feat: publish a public-safe changelog
+---
+### 2.4.2 (Tuesday, July 21, 2026)
+### Features/Bug Fixes
+* fix(oss): keep internal provider references private
+---
+### 2.4.1 (Monday, July 20, 2026)
+### Features/Bug Fixes
+* fix(provider): keep reasoning effort pass-through consistent (#283)
+* feat(provider): keep reasoning effort consistent across Anthropic paths (#283)
+* feat(provider): forward reasoning effort to OpenAI-compatible models (#283)
+* fix(analyzer): align file-size guard with character semantics (#284)
+---
+### 2.4.0 (Monday, July 20, 2026)
+### Features/Bug Fixes
+* fix(analyzer): reduce cupynumeric false positives
+* fix(analyzer): reduce security-pattern false positives
+* fix(analyzer): scope passwd mount and rm detection
+---
+### 2.3.13 (Tuesday, July 14, 2026)
+### Features/Bug Fixes
+* fix: mask release command failures
+* ci: validate default branch pushes
+* Fix Sonar finding in YARA rule materialization
+* feat(provider): allow scoped LLM provider injection (#243)
+* fix emoji zwj prompt injection false positive
+* fix(analyzer): keep executable doc calls outside suppression (#251)
+* fix(analyzer): keep inline block comments out of doc gating (#251)
+* fix(analyzer): classify docs from the finding line (#251)
+* fix(analyzer): keep config-file findings outside doc gating (#251)
+* fix(analyzer): gate documentation false positives for PE3/RA1/TM1/AR2 (#251)
+* fix(cli): preserve full per-skill JSON payload in recursive scans (#228)
+* fix(yara): skip malformed unicode encoded rules (#236)
+* fix(yara): reduce packaged malware-signature false positives (#236)
+* fix(sc7): exclude --disable-content-trust=false to keep content-trust-enabled pulls clean
+* fix(analyzer): rely on runner for SC7 example filtering to close executable bypass
+* feat(analyzer): detect untrusted container image pull as SC7
+* fix(report): preserve exact SARIF severity metadata (#229)
+* fix(report): preserve remaining SARIF finding fields (#229)
+* fix(report): preserve full finding metadata in SARIF output (#229)
+* Format: ruff lint and format fixes
+* Add unit tests for run_async utility function
+* Fix: remove unused asyncio import from meta_analyzer.py
+* Fix: Allow running in environments with existing event loop
+---
+### 2.3.12 (Monday, July 13, 2026)
+### Features/Bug Fixes
+* fix: mask release command secrets
+* docs: correct MCP fixture expectations
+* fix(mcp): prove stdio initialize compatibility (#199)
+* fix: trim batch scan README command whitespace
+* rename contrib/multilingual to contrib/batch_scan and update README usage
+* ci: align GitHub CI with deterministic checks
+---
+### 2.3.11 (Monday, July 06, 2026)
 ### Features/Bug Fixes
 ---
-### [2.3.10 (Monday, July 06, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.9&to=release%2F2.3.10)
+### 2.3.10 (Monday, July 06, 2026)
 ### Features/Bug Fixes
-* refactor: centralize cleanup and risk threshold ([f7868378](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f78683788df16269fb9b7350686154a621de10a5))
-* docs: finalize PR #100 review — docs, tests, world-class polish ([18d46dcb](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/18d46dcb8feaac35dd639c2cc80ad2afaf751747))
-* fix: wire ApiKeyPool into llm_analyzer_base graph path ([464eaddc](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/464eaddc04c69ef3da21ab767826830e8ed9680e))
-* fix: add SPDX headers, from __future__ annotations, conftest.py to all test files - Add SPDX license header to 8 test files - Add from __future__ import annotations to 8 test files - Fix Unicode stdout crash in test_pool_wiring.py on Windows - Add conftest.py with pytest markers registration - 120 tests passing Co-Authored-By: Claude <noreply@anthropic.com> ([59e34c34](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/59e34c340df48ccee08434b231893a194014e931))
-* docs: reorganize into core guides and process archive ([c48ee723](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c48ee7231166b7ed65b5f612272494a44fad0226))
-* docs: add CONTRIBUTING guide, rejected alternatives, gap-fill selection criteria ([0abe875b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/0abe875b77dc0bbc2e0d39f8d7352be7ee73693e))
-* fix: add Windows Unicode stdout support for CJK output ([319d6618](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/319d66189b6e47954d367f4bb9c50d57684198eb))
-* fix: add SPDX headers, cross-platform cleanup, and comprehensive documentation ([5487a8d2](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5487a8d2f220bf91c8567c970f83ed5bc16cfae5))
-* docs: organize documentation, translate to English, add NVIDIA convention audit ([39f9f140](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/39f9f1401ac6256108d332c26f25f533cee8f045))
-* fix: suppress asyncio noise, sanitize meta-analyzer output quirks ([8f4870fa](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8f4870faffcd7350e5c0fb0bf27dbbd56a09925e))
-* fix: resolve LLM race condition, JSON parsing, and connection timeout ([7cf7488c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/7cf7488cd2fb8da66917eba68b6973ecbc004b5c))
-* add contrib multilingual batch scanner ([29d8d016](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/29d8d0164879fa09ca4c5d7a6b4ebe10384a6a47))
+* refactor: centralize cleanup and risk threshold
+* docs: finalize PR #100 review — docs, tests, world-class polish
+* fix: wire ApiKeyPool into llm_analyzer_base graph path
+* fix: add SPDX headers, from __future__ annotations, conftest.py to all test files - Add SPDX license header to 8 test files - Add from __future__ import annotations to 8 test files - Fix Unicode stdout crash in test_pool_wiring.py on Windows - Add conftest.py with pytest markers registration - 120 tests passing Co-Authored-By: Claude <noreply@anthropic.com>
+* docs: reorganize into core guides and process archive
+* docs: add CONTRIBUTING guide, rejected alternatives, gap-fill selection criteria
+* fix: add Windows Unicode stdout support for CJK output
+* fix: add SPDX headers, cross-platform cleanup, and comprehensive documentation
+* docs: organize documentation, translate to English, add NVIDIA convention audit
+* fix: suppress asyncio noise, sanitize meta-analyzer output quirks
+* fix: resolve LLM race condition, JSON parsing, and connection timeout
+* add contrib multilingual batch scanner
 ---
-### [2.3.9 (Tuesday, June 30, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.8&to=release%2F2.3.9)
+### 2.3.9 (Tuesday, June 30, 2026)
 ### Features/Bug Fixes
-* test: restore LLM-backed graph integration coverage ([d32b915a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d32b915aef28bfd1e6bc97668f7eba92e43c442a))
-* test: keep graph integration scans offline ([5f3ef93f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5f3ef93f0ef3a10156edd12e6cd8b9e36f22b52b))
-* style: format MCP least-privilege analyzer ([9625f495](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/9625f495677fad11d7ca67d3da76716d9afcfc69))
-* docs: correct stale analyzer status and dangling references ([d4cc4a5a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d4cc4a5ab129cc932061d38972a173131a07b682))
-* feat(providers): local agent-CLI providers (claude/codex/gemini), no API key ([cc8e82b8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/cc8e82b8ead37e12cacffaa17f5efaf62de39c5c))
-* feat(ossf-scorecard): add ossf-scorecard github action integration ([63b5f68b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/63b5f68b051607527163ed6d6efe9c7aa85f56e2))
-* fix(mcp): feed allowed-tools into LP1 under-declaration check ([19fc38af](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/19fc38afd2418d549623ea5297f6b5b027bbf668))
-* fix(mcp): treat allowed-tools as a permission declaration for LP3 ([77bf29e8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/77bf29e84baaec4525dd50fff230217236bda863))
-* test(input): add SSRF gate coverage for scp-extracted hosts ([97f3b8fc](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/97f3b8fc7556e4be991d271ba57313f6660a90fe))
-* fix(cli): preserve empty string from _result_body when sarif_report absent ([9261d9b5](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/9261d9b5304baf2c8290b9f0f7c9f070614bdd3d))
-* Support Python 3.14 ([afd19edb](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/afd19edb75bbcc91f390f2a281533433ba29f1ea))
-* feat(analyzer): detect privileged Kubernetes workload deployment as TM4 ([ed78c4f9](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ed78c4f92940184891ed1c5fcc635c216a588d3f))
-* test(input): clarify scp_private_ip test covers allowlist gate ([f83d375d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f83d375defd80c785d826d5d1a852000a239ac9e))
-* fix(cli): write concatenated multi-skill report to --output for non-JSON formats ([a029f974](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a029f974cc06d4939eb53aa6160541d9d387e8ca))
-* fix(input): support scp-style SSH Git URLs in host validation ([ced95dc5](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ced95dc5c23fe4561e62f0f98016ba4651311df5))
+* test: restore LLM-backed graph integration coverage
+* test: keep graph integration scans offline
+* style: format MCP least-privilege analyzer
+* docs: correct stale analyzer status and dangling references
+* feat(providers): local agent-CLI providers (claude/codex/gemini), no API key
+* feat(ossf-scorecard): add ossf-scorecard github action integration
+* fix(mcp): feed allowed-tools into LP1 under-declaration check
+* fix(mcp): treat allowed-tools as a permission declaration for LP3
+* test(input): add SSRF gate coverage for scp-extracted hosts
+* fix(cli): preserve empty string from _result_body when sarif_report absent
+* Support Python 3.14
+* feat(analyzer): detect privileged Kubernetes workload deployment as TM4
+* test(input): clarify scp_private_ip test covers allowlist gate
+* fix(cli): write concatenated multi-skill report to --output for non-JSON formats
+* fix(input): support scp-style SSH Git URLs in host validation
 ---
-### [2.3.8 (Monday, June 29, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.7&to=release%2F2.3.8)
+### 2.3.8 (Monday, June 29, 2026)
 ### Features/Bug Fixes
-* style: fix merge-ref lint failures ([c2675824](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c2675824f193e51dbc64939ef59bc58c9188a4d7))
-* style: format chat model provider warning ([2092bcff](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2092bcff0083cc1e2a6d79250ce1884e416ee49d))
-* fix: address non-blocking reviewer nits from #178 and #179 ([25828190](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/258281906ace987fc275580816fa3226ebbd1e3a))
-* revert: restore provider CI failure policy ([b69c59f9](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b69c59f97193d2da78a3d9139414de2bb5b26eb2))
-* ci: make live provider validation non-blocking ([425ebf93](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/425ebf937d0bb9f31a3366e3404b69b61d3d1456))
-* style: complete GitHub PR 194 formatting for PR 125 ([7cf23c79](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/7cf23c792573da27d682d1e8e7346fec3660d9d8))
-* style: complete GitHub PR 194 formatting for PR 122 ([fcc7d2bc](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/fcc7d2bc8e53784aaced660fd5255db44cc8dc65))
-* style: apply GitHub PR 194 lint fix to PR 178 import ([3899f397](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/3899f39711782a3409effc3c2b74926aba4c234d))
-* style: apply GitHub PR 194 lint fix to PR 172 import ([cb2526fa](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/cb2526fa2f7f354b9d36ea535f082d8fd276b270))
-* style: apply GitHub PR 194 lint fix to PR 125 import ([58a91564](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/58a91564adf4b5ce05b2f76bb4f8d3ad82432dfa))
-* style: apply GitHub PR 194 lint fix to PR 122 import ([97626561](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/97626561dc8b7ea94c1a03fe07ad11e8b21542e3))
-* feat: add AWS Bedrock provider for Claude via SigV4 ([5bd6b642](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5bd6b6421edacb88558c56cc6ee241b5f990564f))
-* fix: address non-blocking reviewer nits from #140, #141, #143 ([5a6d2681](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5a6d268148acfa5965b31b75faf48632f6883925))
-* feat(analyzer): detect cloud-storage exfiltration as E5 ([89c3b6b2](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/89c3b6b220401b1314c12002defe9fdda96aa78a))
-* docs(mcp): clarify setup before users choose stdio ([8a30c436](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8a30c43610ae824ce9dc158b4230638f02fac7b5))
-* feat(analyzer): detect privileged container execution and escape primitives as PE5 ([e9f46353](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e9f4635345d41be9651d6176f4a64965ff19ed3d))
-* docs(mcp): document HTTP transport trust model ([3493632d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/3493632dc36c7e1be22b9a659d23c75c9fd70f61))
-* fix(report): strip ANSI/control bytes from report output ([1d97d455](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/1d97d455b364c649229335331987d6fe6b0da03b))
-* fix(behavioral): detect builtins.* and importlib.import_module sink evasions ([173a56cd](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/173a56cdd124936f649fe720bd04f6c7a2909ce6))
-* feat: per-slot model env overrides and model validation ([4b9e8f91](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/4b9e8f915a86017ea788656e5c436e0d854ac618))
-* fix(P2): narrow emoji tag carve-out to ISO-3166-2 codes (close smuggling bypass) ([8ebac993](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8ebac99380dbea6be052156e3011e74efbcc2e12))
-* fix(P2): detect Unicode Tag-block "ASCII smuggling" hidden instructions ([99481670](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/99481670e30355be8747879c9b74f5c0652d7ca5))
-* feat(analyzer): implement MCP rug-pull detection (RP1-RP3) ([348ca12c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/348ca12c10ea953ddb8bcaeab6d821890f5b92a5))
-* fix(scoring): apply 1.3x multiplier only to findings from executable files ([78db5356](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/78db535692557580f26dc22396e28fdf284c1a16))
-* feat(scripts): add PR review agent automation tooling ([8c618e07](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8c618e07520439ce0048cca13ebef1ff0dad05bf))
+* style: fix merge-ref lint failures
+* style: format chat model provider warning
+* fix: address non-blocking reviewer nits from #178 and #179
+* revert: restore provider CI failure policy
+* ci: make live provider validation non-blocking
+* style: complete GitHub PR 194 formatting for PR 125
+* style: complete GitHub PR 194 formatting for PR 122
+* style: apply GitHub PR 194 lint fix to PR 178 import
+* style: apply GitHub PR 194 lint fix to PR 172 import
+* style: apply GitHub PR 194 lint fix to PR 125 import
+* style: apply GitHub PR 194 lint fix to PR 122 import
+* feat: add AWS Bedrock provider for Claude via SigV4
+* fix: address non-blocking reviewer nits from #140, #141, #143
+* feat(analyzer): detect cloud-storage exfiltration as E5
+* docs(mcp): clarify setup before users choose stdio
+* feat(analyzer): detect privileged container execution and escape primitives as PE5
+* docs(mcp): document HTTP transport trust model
+* fix(report): strip ANSI/control bytes from report output
+* fix(behavioral): detect builtins.* and importlib.import_module sink evasions
+* feat: per-slot model env overrides and model validation
+* fix(P2): narrow emoji tag carve-out to ISO-3166-2 codes (close smuggling bypass)
+* fix(P2): detect Unicode Tag-block "ASCII smuggling" hidden instructions
+* feat(analyzer): implement MCP rug-pull detection (RP1-RP3)
+* fix(scoring): apply 1.3x multiplier only to findings from executable files
+* feat(scripts): add PR review agent automation tooling
 ---
-### [2.3.7 (Wednesday, June 24, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.6&to=release%2F2.3.7)
+### 2.3.7 (Wednesday, June 24, 2026)
 ### Features/Bug Fixes
 ---
-### [2.3.6 (Wednesday, June 24, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.5&to=release%2F2.3.6)
+### 2.3.6 (Wednesday, June 24, 2026)
 ### Features/Bug Fixes
-* feat(analyzer): detect SSRF (cloud metadata, internal-network, dynamic-host requests) ([d5c77535](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d5c7753559eeba73bf3a8154e21ceb64bc7b5b16))
-* feat(analyzer): add anti-refusal statement detection (AR1-AR3) ([aa676942](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/aa67694272f39425308d55ea00e6a0f06a433797))
-* address review feedback on #106 ([6ca3b023](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6ca3b02367dd7bba1e79c8b57ff3661bc8797dce))
-* feat(report): add baseline / false-positive suppression ([0767452f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/0767452f4c0fa594467dcd47c9e8c4c58a522f94))
-* style: format meta analyzer regression test ([94579243](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/94579243c2a8a7849339a8b40f6f0eec3f610b8e))
-* test: align meta analyzer drop cases with severity floor ([ef192e77](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ef192e77306bcad53a10d7334ed1151ea546b512))
-* style: format static runner filtering changes ([8e96c144](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8e96c14433f59a71bef6c1e968d89214da43a479))
-* style: format MP2 regex backtracking test ([cdfa268b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/cdfa268b3c13c10f71583421d68ce14d0ed0180c))
-* Fix Windows path separators and console encoding ([a80d45f5](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a80d45f5c1f9997e941897ec68d8d2314febbc49))
-* fix(llm): isolate batch failures in Stage 2 and keep unanalysed findings ([248bc87f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/248bc87fc549e4e29324fa49e116c6d0ac71e1c3))
-* test(scoring): add regression test for input-order-dependent severity sort ([d0234c72](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d0234c7252a2bafe4313cabf4abeead65afb8e47))
-* fix(scoring): document confidence scaling, sort by severity within rule bucket ([e6895df5](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e6895df5627fc8e35ad7f341442f1c9d559dc4b3))
-* fix(patterns): fix lint and whitespace-bearing stuffing false negative ([8a5f7d8a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8a5f7d8a0d95d6347da83bfb956bd1be00c91ab2))
-* fix(patterns): skip single-char repetitions in MP2 to avoid separator false positives ([2bef07a6](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2bef07a668b04cf542cc505acfcd781575c3c5d5))
-* fix(patterns): anchor MP2 regex to prevent catastrophic backtracking ([c46c389e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c46c389ed4a37b14a69eb2dcd5b178a8d9385a0f))
-* ci: fix DCO check bypass and harden the CI workflow ([de9aabaa](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/de9aabaa67e52b5e4e7cf5ca5c99071299e01f8c))
-* ci: add GitHub Actions CI/CD workflow ([0f395273](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/0f39527332300ea8e2fc0a8b6c81c561dcde3bcf))
-* fix(static-runner): remove .svg from binary extensions ([6de794bc](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6de794bcadc2c686f422c1203c67e8ccf1b68db6))
-* fix(static-runner): exempt SKILL.md from PE3 .env doc filter ([b50edd3e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b50edd3e74a686daa8add90ae39d8549c1a62a8e))
-* fix(static-runner): skip binary/PDF files and filter PE3 .env doc references ([ddf7d703](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ddf7d703723af3d83b9cc9e054954b5ea1e29147))
-* fix(security)(skillspector): unsafe deserialization via yaml load ([b5c20b9f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b5c20b9fb259f5cdc1d6315fa6c6a8d22715ac4d))
-* fix(security)(skillspector): potential information disclosure via error message ([bf2678c8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/bf2678c8f9825ec599cd14207841307ea35652dc))
-* fix(analyzer): deduplicate PE4 findings per line to avoid double-reporting ([cfeabd34](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/cfeabd3499c71920ea838357c8e1cdc966033fbc))
-* feat(analyzer): detect Docker socket access as PE4 privilege escalation ([426a3348](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/426a334842dc854c4ff89db7f03a505ef497167f))
-* feat(mcp): expose SkillSpector as an MCP server with scan_skill tool ([2ad41c29](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2ad41c29059912c379189b96bf9b2a191cf3e759))
-* test(meta_analyzer): add regression tests for static findings with end_line=None ([5720122d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5720122d41a992b202b8ed3cb3ac53d6d9af5ef1))
-* fix(supply_chain): scan [build-system].requires in pyproject.toml ([34a881d6](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/34a881d6ceff8d20a095792ddcccad21870cb81d))
-* security(meta_analyzer): add severity-gated floor to apply_filter ([45196904](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/45196904f6e14b7cfd861be685d66c66686baf2f))
-* chore(oss): exclude changelog from public snapshots ([a035fb5e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a035fb5ea535c56625e9c07ab1ae5971548255b1))
+* feat(analyzer): detect SSRF (cloud metadata, internal-network, dynamic-host requests)
+* feat(analyzer): add anti-refusal statement detection (AR1-AR3)
+* address review feedback on #106
+* feat(report): add baseline / false-positive suppression
+* style: format meta analyzer regression test
+* test: align meta analyzer drop cases with severity floor
+* style: format static runner filtering changes
+* style: format MP2 regex backtracking test
+* Fix Windows path separators and console encoding
+* fix(llm): isolate batch failures in Stage 2 and keep unanalysed findings
+* test(scoring): add regression test for input-order-dependent severity sort
+* fix(scoring): document confidence scaling, sort by severity within rule bucket
+* fix(patterns): fix lint and whitespace-bearing stuffing false negative
+* fix(patterns): skip single-char repetitions in MP2 to avoid separator false positives
+* fix(patterns): anchor MP2 regex to prevent catastrophic backtracking
+* ci: fix DCO check bypass and harden the CI workflow
+* ci: add GitHub Actions CI/CD workflow
+* fix(static-runner): remove .svg from binary extensions
+* fix(static-runner): exempt SKILL.md from PE3 .env doc filter
+* fix(static-runner): skip binary/PDF files and filter PE3 .env doc references
+* fix(security)(skillspector): unsafe deserialization via yaml load
+* fix(security)(skillspector): potential information disclosure via error message
+* fix(analyzer): deduplicate PE4 findings per line to avoid double-reporting
+* feat(analyzer): detect Docker socket access as PE4 privilege escalation
+* feat(mcp): expose SkillSpector as an MCP server with scan_skill tool
+* test(meta_analyzer): add regression tests for static findings with end_line=None
+* fix(supply_chain): scan [build-system].requires in pyproject.toml
+* security(meta_analyzer): add severity-gated floor to apply_filter
+* chore(oss): exclude changelog from public snapshots
 ---
-### [2.3.5 (Tuesday, June 23, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.4&to=release%2F2.3.5)
+### 2.3.5 (Tuesday, June 23, 2026)
 ### Features/Bug Fixes
-* test: align agent snooping same-line expectation ([e17285ca](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e17285ca8f36561690480f0c07ee441658ce7b9c))
-* test: pin nv_build provider default expectation ([d0337d91](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d0337d9199bf2643185f4f1d0376ee9bd13338a6))
-* style: format behavioral AST getattr detection ([8c983330](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8c9833306e7d81c0f43e4aecff36d3240f268de0))
-* style: format input handler SSRF changes ([c5c091d4](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c5c091d4f6445cc237388948e45d5bf811be3fb2))
-* test: remove unused sarif pytest import ([5b9cd0f8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5b9cd0f87f5b1ccc128fc86ebd13e99d3f714f55))
-* style: format meta analyzer fallback tests ([dcf2da48](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/dcf2da4811dfb171714b061f652441c45748d929))
-* test: avoid duplicate agent snooping test class name ([9cec5537](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/9cec55373a6608e43560c40acf7c6d918ede068f))
-* feat(report): add analysis_completeness field to JSON output ([befa577e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/befa577e24de53ae39bb870757290c2d6599cd5a))
-* fix(schemas): normalize confidence from 0-100 scale before Pydantic validation ([f42d2062](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f42d2062b209bbef3e6746a13a7871eb91989d29))
-* chore: add perseus-ctx and mimir-mcp to popular PyPI packages ([d653513c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d653513cbba3f30ae4e662928f460f881203c663))
-* feat(pi): add SkillSpector scan tool ([d817291f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d817291f929a5ac0f28634b6ff682c7071e4b681))
-* fix(static-patterns): restrict code-example hard-drop to non-executable files ([bfda8a14](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/bfda8a1459d7e4ce5ac3e473f31c88e6ccc38f4c))
-* fix(multi-skill): address review nits - typing, dead code, help text, findings source ([cbd464eb](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/cbd464eb83dc528611b835fea425ddba97ef6a13))
-* fix(dedup): apply deduplication to score computation only, preserve all findings in report ([664a9742](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/664a97423fb4f4d5e59a3ae5ae95a2ef208582c4))
-* feat: support uv tool install and document in README ([b6e15eea](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b6e15eea4fd903e7ce7879f8c12b1599de1d8a1f))
-* fix(behavioral-ast): detect reflective exec via getattr() literal (AST9) ([bf2142bc](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/bf2142bccc1443d41986512fa98def8a4fb1ef1e))
-* fix(input-handler): disable HTTP redirect following to close SSRF bypass ([180e798f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/180e798f409c3ed717f3955a151c7efb8d92369b))
-* fix(report): filter empty LLM findings and add SARIF rules[] array ([39edc051](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/39edc051c02ce014cb7474e977e7669658494bbe))
-* fix(meta-analyzer): add severity floor, downweight instead of drop, fail-closed on LLM error ([3ca60615](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/3ca60615ddecdb0d5c9dacb8d172ff019d1b7dfd))
-* fix(static-patterns): filter false positives from documentation and code examples ([8ac1a7ca](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8ac1a7cacaf71212f7f2e7e39e23cc5c1f679c2b))
-* feat(cli): add --recursive flag for multi-skill directory scanning ([261c47ac](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/261c47ac6e2a0958cccc637fbdb7a72681edeeee))
-* fix(findings): deduplicate cross-analyzer findings before scoring ([805ba8ec](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/805ba8ec2360167b33172f4166a83c6fa1e48380))
-* fix(input-handler): validate git/download URLs against SSRF and add zip-slip protection ([c6ff6a91](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c6ff6a91ff7ce8eee1ba8cac1bbfbf985a5a654b))
-* fix(meta-analyzer): add heuristic fallback filter for --no-llm mode ([afb0206b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/afb0206b8a835d9acd7c807744f61a53f070e736))
-* docs: document the integration contract and trust model ([c5535334](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c553533485478dbc04e29c5fe2bfefa45fb3261f))
-* fix(supply-chain): exclude pyproject metadata keys from dependency extraction ([5f638465](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5f63846523265a7718b75cd199450d2f77786db7))
-* feat: implement MCP rug pull analyzer and unit tests ([69fff902](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/69fff902e9d1c3a8e283eba143a7ea0cc84de26e))
-* fix(sc4): pass version to OSV for all requirement operators, not just == and <= ([96ca0728](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/96ca072804d1ab83f0156bd01b775110cee311e6))
-* fix: use OpenAI default model for OpenAI fallback ([718ef1e3](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/718ef1e36fcd2299494a38314a2592536de9a3c0))
-* feat(analyzer): detect skills snooping on the agent ecosystem ([96f67f0b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/96f67f0bffd07866a64cf679ea941d29af75c4d9))
-* docs: correct stale analyzer status and dangling references ([01362fff](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/01362fffc7febde78e5ed07d96f9a358a8ebeaa1))
+* test: align agent snooping same-line expectation
+* test: pin nv_build provider default expectation
+* style: format behavioral AST getattr detection
+* style: format input handler SSRF changes
+* test: remove unused sarif pytest import
+* style: format meta analyzer fallback tests
+* test: avoid duplicate agent snooping test class name
+* feat(report): add analysis_completeness field to JSON output
+* fix(schemas): normalize confidence from 0-100 scale before Pydantic validation
+* chore: add perseus-ctx and mimir-mcp to popular PyPI packages
+* feat(pi): add SkillSpector scan tool
+* fix(static-patterns): restrict code-example hard-drop to non-executable files
+* fix(multi-skill): address review nits - typing, dead code, help text, findings source
+* fix(dedup): apply deduplication to score computation only, preserve all findings in report
+* feat: support uv tool install and document in README
+* fix(behavioral-ast): detect reflective exec via getattr() literal (AST9)
+* fix(input-handler): disable HTTP redirect following to close SSRF bypass
+* fix(report): filter empty LLM findings and add SARIF rules[] array
+* fix(meta-analyzer): add severity floor, downweight instead of drop, fail-closed on LLM error
+* fix(static-patterns): filter false positives from documentation and code examples
+* feat(cli): add --recursive flag for multi-skill directory scanning
+* fix(findings): deduplicate cross-analyzer findings before scoring
+* fix(input-handler): validate git/download URLs against SSRF and add zip-slip protection
+* fix(meta-analyzer): add heuristic fallback filter for --no-llm mode
+* docs: document the integration contract and trust model
+* fix(supply-chain): exclude pyproject metadata keys from dependency extraction
+* feat: implement MCP rug pull analyzer and unit tests
+* fix(sc4): pass version to OSV for all requirement operators, not just == and <=
+* fix: use OpenAI default model for OpenAI fallback
+* feat(analyzer): detect skills snooping on the agent ecosystem
+* docs: correct stale analyzer status and dangling references
 ---
-### [2.3.4 (Tuesday, June 23, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.3&to=release%2F2.3.4)
+### 2.3.4 (Tuesday, June 23, 2026)
 ### Features/Bug Fixes
-* Revert "Merge branch 'keshavp/codex/revert-mr-43' into 'main'" ([aff60d73](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/aff60d738f210edefc32db00b66a3d48fd8f2742))
+* Revert "Merge branch 'keshavp/codex/revert-mr-43' into 'main'"
 ---
-### [2.3.3 (Tuesday, June 23, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.2&to=release%2F2.3.3)
+### 2.3.3 (Tuesday, June 23, 2026)
 ### Features/Bug Fixes
-* Revert "Merge branch 'github/pr-119' into 'main'" ([a89979b4](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a89979b4975c6e99f8cbe7836ff682010287ee0c))
+* Revert "Merge branch 'github/pr-119' into 'main'"
 ---
-### [2.3.2 (Monday, June 22, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.1&to=release%2F2.3.2)
+### 2.3.2 (Monday, June 22, 2026)
 ### Features/Bug Fixes
-* feat(release): auto-generate CHANGELOG.md on each release ([9e6f5590](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/9e6f5590c263f35de2325e73c9f2b7b77e7723ee))
-* style: format lint fixes for PR 156 ([d24fedca](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d24fedca827df320232a9edc6e57f19d3c5cce92))
-* fix(yara): use content hash for rule cache invalidation ([a47c7f76](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a47c7f7652b4cb2532d86d5d0ee460983989d205))
+* feat(release): auto-generate CHANGELOG.md on each release
+* style: format lint fixes for PR 156
+* fix(yara): use content hash for rule cache invalidation
 ---
-### [2.3.1 (Monday, June 22, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.3.0&to=release%2F2.3.1)
+### 2.3.1 (Monday, June 22, 2026)
 ### Features/Bug Fixes
-* fix(scoring): prevent risk score saturation via per-rule diminishing returns ([b286cf0f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b286cf0fb41570db0ae417f29baedf9cbf689467))
-* fix(meta-analyzer): keep LLM-confirmed findings when model returns end_line ([47170c06](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/47170c06508e079508d4d3d1e5797d8535df7bce))
-* add openai project header ([c7437d2d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c7437d2d3a1b307ccef0978c434a450a4c7e2ad2))
-* fix(yara): reduce remote bootstrap false positives ([20fb4045](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/20fb4045986ab8685faf71351f7869f380c0413c))
-* feat(yara): add agent skill abuse signatures ([c77a5e93](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c77a5e93717f5d632fc767bb25f20f842b43119e))
+* fix(scoring): prevent risk score saturation via per-rule diminishing returns
+* fix(meta-analyzer): keep LLM-confirmed findings when model returns end_line
+* add openai project header
+* fix(yara): reduce remote bootstrap false positives
+* feat(yara): add agent skill abuse signatures
 ---
-### [2.3.0 (Monday, June 22, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.2.3&to=release%2F2.3.0)
+### 2.3.0 (Monday, June 22, 2026)
 ### Features/Bug Fixes
-* style: format OSV fallback changes ([069e7721](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/069e772120ca33edec87434ac16156eb4ba65635))
-* style: format agent snooping analyzer ([e07d48a1](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e07d48a15f2b6a76e2d540b86c4cf946980dffd2))
-* style: format taint tracking tests ([29a7d77c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/29a7d77c90474c7ae735305b4414d52c2da510f2))
-* style: format supply chain analyzer ([128306dd](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/128306dd0168623338ae2784f3488c1de4d603f7))
-* fix: avoid literal bidi controls in tests ([73e14193](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/73e1419340c2dc1e5e14db0dcca30f9ed323e839))
-* style: format anthropic proxy provider ([1899b926](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/1899b9267a347ff4cbc4242fad8ffb9468fbd435))
-* fix: reduce anthropic proxy sonar duplication ([7a809c1d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/7a809c1d2af96e52258f204e2080ffc1c7073f2b))
-* feat: drop ge/le schema bounds on LLM finding confidence and start_line ([14818cb3](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/14818cb3fc0a8b2042b958361763d83fc0c7bfb6))
-* fix(build_context): use forward-slash component paths (cross-platform) ([01452ec1](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/01452ec1e834fc76c5ffd23009737906481a04a3))
-* fix(sc4): add global _last_query_ok declaration, validate env var, derive fallback count ([d1d65395](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d1d65395724bb5d3ed0b09e46bec52fa95215133))
-* fix(sc4): surface OSV.dev fallback warnings and add configurable timeout ([1e601ec2](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/1e601ec2c1ccc9a429ae8c2bf0a9288759b6003a))
-* fix(supply-chain): require relative edit distance for SC6 typosquat detection ([5b9a5dd3](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5b9a5dd3a5209596be923872005c7059628696c5))
-* feat(analyzer): add agent snooping detector (AS1/AS2/AS3) ([d3b19633](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d3b19633c7bace40ea36b7025cdf26f801a31901))
-* fix(P2): add bidi control character detection (CVE-2021-42574 / Trojan Source) ([2c672795](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2c672795905b17744d926dbe1f63ca834e552449))
-* fix(meta_analyzer): parse stringified findings array from LLM ([6d6d684a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6d6d684aee920627bada281f04e1c595d43cca30))
-* fix(mcp): anchor TP3 loopback URL exemption to a host boundary ([b9d7415c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b9d7415ccd696a8740f473a7fa44fa4f26824375))
-* fix(analyzers): resolve import aliases in AST and taint analyzers ([5de942ec](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/5de942ec79f90b8e63279b51cc49a77cf1d7c116))
-* fix: validate trusted source hosts for SC2 ([86ffe27f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/86ffe27ffd90031ce04358b5a98c9f3b1659a663))
-* fix: restrict Python version to <3.14 due to jsonschema-rs/PyO3 incompatibility ([6d2952f3](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6d2952f3c2ca66813a42a2b079cb8e917493ead4))
-* feat(provider): add anthropic_proxy provider for Vertex-style raw-predict endpoints ([cc7bc744](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/cc7bc7448461bc959b1a659011317fabf73d2db2))
+* style: format OSV fallback changes
+* style: format agent snooping analyzer
+* style: format taint tracking tests
+* style: format supply chain analyzer
+* fix: avoid literal bidi controls in tests
+* style: format anthropic proxy provider
+* fix: reduce anthropic proxy sonar duplication
+* feat: drop ge/le schema bounds on LLM finding confidence and start_line
+* fix(build_context): use forward-slash component paths (cross-platform)
+* fix(sc4): add global _last_query_ok declaration, validate env var, derive fallback count
+* fix(sc4): surface OSV.dev fallback warnings and add configurable timeout
+* fix(supply-chain): require relative edit distance for SC6 typosquat detection
+* feat(analyzer): add agent snooping detector (AS1/AS2/AS3)
+* fix(P2): add bidi control character detection (CVE-2021-42574 / Trojan Source)
+* fix(meta_analyzer): parse stringified findings array from LLM
+* fix(mcp): anchor TP3 loopback URL exemption to a host boundary
+* fix(analyzers): resolve import aliases in AST and taint analyzers
+* fix: validate trusted source hosts for SC2
+* fix: restrict Python version to <3.14 due to jsonschema-rs/PyO3 incompatibility
+* feat(provider): add anthropic_proxy provider for Vertex-style raw-predict endpoints
 ---
-### [2.2.3 (Tuesday, June 16, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.2.2&to=release%2F2.2.3)
+### 2.2.3 (Tuesday, June 16, 2026)
 ### Features/Bug Fixes
-* chore: refresh uv lock for python 3.14 ([0f544153](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/0f5441530f43e565666715254e8db4f3eda3cbee))
+* chore: refresh uv lock for python 3.14
 ---
-### [2.2.2 (Tuesday, June 16, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.2.0&to=release%2F2.2.2)
+### 2.2.2 (Tuesday, June 16, 2026)
 ### Features/Bug Fixes
-* chore: widen python range to <3.15 and bump version to 2.2.1 ([156dac75](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/156dac7576252fe4410b4a5a7d6d29e1b16816e0))
+* chore: widen python range to <3.15 and bump version to 2.2.1
 ---
-### [2.2.0 (Tuesday, June 16, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.1.5&to=release%2F2.2.0)
+### 2.2.0 (Tuesday, June 16, 2026)
 ### Features/Bug Fixes
-* Fixing â Release failed: uv.lock exists, but  is not installed or is not on PATH ([295f0539](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/295f0539f073d3981819fb7dc9538f9cea05a21b))
-* Create native LangChain chat models per provider ([3f1182f8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/3f1182f8752d0e67c5c2a7a98451bceae4ff8d9a))
+* Fixing â Release failed: uv.lock exists, but  is not installed or is not on PATH
+* Create native LangChain chat models per provider
 ---
-### [2.1.5 (Monday, June 15, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.1.4&to=release%2F2.1.5)
+### 2.1.5 (Monday, June 15, 2026)
 ### Features/Bug Fixes
-* Revert "test: preserve default graph invocation in PR 45 import" ([95e90724](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/95e90724b4274992846cd885aaaa88bc26628b46))
-* test: preserve default graph invocation in PR 45 import ([b4f94617](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b4f946178e4e8b4926c17628beb2ea596f31d978))
-* Reject invalid skill paths ([c327071a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c327071afaaaa59339d4c65449d7e400fd8af172))
-* fix: add explicit returns in docker smoke test functions ([69600455](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/696004558348125dea2ff0ebb9abf0035415d05a))
-* docs: fix model registry path ([f368b3f5](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f368b3f56bda82f019348f0f7a4e80e09f54193d))
-* ci: extract Docker smoke suite ([ec75bf3b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ec75bf3bb286ed08b13a829c67a75ac0731c4230))
-* ci: add Docker GitHub URL smoke test ([94ae8438](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/94ae843836a4a8e50347eef1d7209393ff625f74))
-* fix(docker): install git for repository scans ([2311abc9](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2311abc963e82aae6e756b16254fabab92020833))
+* Revert "test: preserve default graph invocation in PR 45 import"
+* test: preserve default graph invocation in PR 45 import
+* Reject invalid skill paths
+* fix: add explicit returns in docker smoke test functions
+* docs: fix model registry path
+* ci: extract Docker smoke suite
+* ci: add Docker GitHub URL smoke test
+* fix(docker): install git for repository scans
 ---
-### [2.1.4 (Saturday, June 13, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.1.3&to=release%2F2.1.4)
+### 2.1.4 (Saturday, June 13, 2026)
 ### Features/Bug Fixes
-* ci: add Docker smoke test ([23d86bde](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/23d86bde612edc3529603f3fa159ad827c965376))
-* chore: add Docker build ignore file ([832cbf29](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/832cbf29cf0f41330562ac3ba65fc07b6f15ad86))
-* docs: simplify Docker usage examples ([71635d6a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/71635d6ad5345f94cf06fdef1a4dd37a3a9c2c2e))
-* fix: use official Python Docker base ([6e619356](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6e619356b4bdc23c2e1582b71fe862f6c8c49926))
-* feat: adds dockerfile to run it without installing python ([ea1f5de1](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ea1f5de18b85cf0e4ed4cbed628d54118772912f))
+* ci: add Docker smoke test
+* chore: add Docker build ignore file
+* docs: simplify Docker usage examples
+* fix: use official Python Docker base
+* feat: adds dockerfile to run it without installing python
 ---
-### [2.1.3 (Wednesday, June 10, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.1.2&to=release%2F2.1.3)
+### 2.1.3 (Wednesday, June 10, 2026)
 ### Features/Bug Fixes
-* Revert "chore: bump version to 2.1.3" ([e5eddfb4](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e5eddfb41e1ee2dd970388f4c2d80ed95ccff15f))
-* Constrain supported Python versions ([926bd038](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/926bd038d7faf2ba5963ec45a67bfac3a0e9fef5))
-* Fix uv venv py-version ([e010aada](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e010aada945c7b2eafe4df557aa1b7f01cbe73bb))
-* fix: refresh uv lock during release ([040cf3e0](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/040cf3e064d2bf7188dd0093018a28d090b2c5f7))
-* Add contribution flow diagrams ([6461595d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6461595d00c7802ac58253b04357a5df5f4b09ab))
-* Make contribution sync flows explicit ([276b3217](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/276b3217d8cdd5f97ec779fb0d81adad657ccdfd))
-* Remove copy-pr-bot references ([50a877b7](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/50a877b70263134615d212c6960102745a0110b4))
-* Clarify external PR import docs ([f7f233cc](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f7f233ccf5a9365adbcf22a9f7ebc5b18b24dd1c))
-* Reorganize GitHub release docs ([82c34f16](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/82c34f16be8faa0e551194943621d77182f4e332))
-* Add GitHub PR import skill ([a314914e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a314914e18880d7ea27e0a54736a30ad938f90b1))
+* Revert "chore: bump version to 2.1.3"
+* Constrain supported Python versions
+* Fix uv venv py-version
+* fix: refresh uv lock during release
+* Add contribution flow diagrams
+* Make contribution sync flows explicit
+* Remove copy-pr-bot references
+* Clarify external PR import docs
+* Reorganize GitHub release docs
+* Add GitHub PR import skill
 ---
-### [2.1.2 (Tuesday, June 09, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.1.1&to=release%2F2.1.2)
+### 2.1.2 (Tuesday, June 09, 2026)
 ### Features/Bug Fixes
-* Revert "chore: bump version to 2.1.2" ([0ad91c2b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/0ad91c2b79483d6c0c63e64435a7315f1f1be4f1))
-* fix(mcp): make TP3 (and parameter-scoped TP1/TP2) reachable on real scans ([ae7999c9](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ae7999c9fbbc8695db32716c792b4867657267c1))
-* Add SkillSpector GitHub release skill ([a19a79b3](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a19a79b3c82481c42ce833faec4fb2138fc435b8))
+* Revert "chore: bump version to 2.1.2"
+* fix(mcp): make TP3 (and parameter-scoped TP1/TP2) reachable on real scans
+* Add SkillSpector GitHub release skill
 ---
-### [2.1.1 (Thursday, June 04, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.1.0&to=release%2F2.1.1)
+### 2.1.1 (Thursday, June 04, 2026)
 ### Features/Bug Fixes
-* Revert "chore: bump version to 2.1.1" ([1f5f95b8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/1f5f95b8f2ec68864bcfb3a84ed41e5184abda9b))
-* Enforce non-mutating lint checks in CI ([39d8b7e9](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/39d8b7e98c8851a4b4c423599973b507f5c32357))
+* Revert "chore: bump version to 2.1.1"
+* Enforce non-mutating lint checks in CI
 ---
-### [2.1.0 (Thursday, June 04, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F2.0.0&to=release%2F2.1.0)
+### 2.1.0 (Thursday, June 04, 2026)
 ### Features/Bug Fixes
-* Skip eval dataset prose in static scans ([f88878f2](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f88878f2cd32590dd08b839c68349871b3585fe5))
-* chore: add security policy ([ad4306ff](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ad4306ff1404b37210c2593839ffe84053871c5d))
-* chore: drop guardrail integration files ([4f4ced8b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/4f4ced8bfafbc9d4f9883fb957447a22593dba8f))
-* chore(oss): strip OSS_RELEASE.md and the release script from snapshots ([2a77d9a4](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2a77d9a471b5c0b9fe9642b57eed56594509a3e1))
-* chore(oss): switch release script to orphan branch ([b1469aa8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b1469aa81ae0c65d21c22aab955cc55c42926d41))
-* Revert "docs(cli): drop nv_inference from scan --help" ([403a0e30](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/403a0e30c95c346566245734e698c0730da48c85))
-* docs(cli): drop nv_inference from scan --help ([815a7ffa](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/815a7ffae04ca3977199d936961768a0a1aa4af7))
-* docs(oss): sanitize internal references from user-facing files ([424814d0](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/424814d06c569d2b44eee8e5962b1c49b66db74d))
-* chore(oss): drop broken make typecheck target ([138a601e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/138a601e01802002fa4627ba06a42845038c45c2))
+* Skip eval dataset prose in static scans
+* chore: add security policy
+* chore: drop guardrail integration files
+* chore(oss): strip OSS_RELEASE.md and the release script from snapshots
+* chore(oss): switch release script to orphan branch
+* Revert "docs(cli): drop nv_inference from scan --help"
+* docs(cli): drop nv_inference from scan --help
+* docs(oss): sanitize internal references from user-facing files
+* chore(oss): drop broken make typecheck target
 ---
-### [2.0.0 (Thursday, May 07, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.5.0&to=release%2F2.0.0)
+### 2.0.0 (Thursday, May 07, 2026)
 ### Features/Bug Fixes
-* test(oss): mark SDI fixture tests as integration; fix nv_inference detection ([461966f8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/461966f80dbace625abd862615f93cb64cb2619a))
-* docs(oss): trim OSS_RELEASE.md to the how-to section only ([fa6a4c85](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/fa6a4c857d08e6231d40df098b55544353216842))
-* chore(oss): rename make-public.sh to create-oss-release.sh, auto-name + pull main ([2fe3be79](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2fe3be7985f78df6fe53df292a0a75411aa3ab93))
-* chore(oss): split Makefile + consolidate internal-only files ([eff85296](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/eff8529649adc696e4a2b67b7c3eef25cc6df87d))
-* feat(providers): selectable provider + per-provider model defaults ([3a2735d9](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/3a2735d93e8f7906bea8b5574b12fd5cabf20332))
-* refactor(providers): per-package layout with bundled YAML registries ([f718d112](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f718d112e4c3a0a68ebdb50433e0ff2382b78966))
-* chore: remove agent metadata from OSS config ([daf46789](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/daf46789cca2371e6944aaa5b86ae6eb451dcfdb))
-* refactor(providers): isolate NVIDIA-specific code behind a single registration ([0d0bbbb9](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/0d0bbbb98235f81c8eb99ab714a5ef27e25fdf93))
-* chore(oss): prepare branch for public OSS release ([ef9af648](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ef9af6484f99e91aa6e9adf9f0ff872ded22d00a))
-* feat(llm): generalize credential resolution for OSS-default endpoints ([d3585465](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d358546537a27bc0957ea46e02d91518322321c4))
-* refactor(metadata): introduce ModelMetadataProvider abstraction ([cc3d8a5b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/cc3d8a5b1ed34da95826bbf0d1d61319d0bbf14a))
-* feat(tracing): support LANGCHAIN_TAGS_EXTRA env var for LangSmith tags ([2ba416cb](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2ba416cbb7af7cd921ae8a47af7e6338235f90c5))
+* test(oss): mark SDI fixture tests as integration; fix nv_inference detection
+* docs(oss): trim OSS_RELEASE.md to the how-to section only
+* chore(oss): rename make-public.sh to create-oss-release.sh, auto-name + pull main
+* chore(oss): split Makefile + consolidate internal-only files
+* feat(providers): selectable provider + per-provider model defaults
+* refactor(providers): per-package layout with bundled YAML registries
+* chore: remove agent metadata from OSS config
+* refactor(providers): isolate NVIDIA-specific code behind a single registration
+* chore(oss): prepare branch for public OSS release
+* feat(llm): generalize credential resolution for OSS-default endpoints
+* refactor(metadata): introduce ModelMetadataProvider abstraction
+* feat(tracing): support LANGCHAIN_TAGS_EXTRA env var for LangSmith tags
 ---
-### [1.5.0 (Friday, May 01, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.4.0&to=release%2F1.5.0)
+### 1.5.0 (Friday, May 01, 2026)
 ### Features/Bug Fixes
-* feat(tracing): support LANGCHAIN_TAGS_EXTRA env var for LangSmith tags ([b4a1f07a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b4a1f07a9ea7266fde46ddb7e48cd5bc1870fcb3))
+* feat(tracing): support LANGCHAIN_TAGS_EXTRA env var for LangSmith tags
 ---
-### [1.4.0 (Tuesday, April 28, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.3.0&to=release%2F1.4.0)
+### 1.4.0 (Tuesday, April 28, 2026)
 ### Features/Bug Fixes
-* feat(mcp): MCP analyzers, Apache 2.0 license migration, and OSS compliance ([b365956c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b365956c14504c21cd2cc486c532727e3ac43b87))
+* feat(mcp): MCP analyzers, Apache 2.0 license migration, and OSS compliance
 ---
-### [1.3.0 (Friday, April 24, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.2.0&to=release%2F1.3.0)
+### 1.3.0 (Friday, April 24, 2026)
 ### Features/Bug Fixes
-* LangSmith Tracing + Integration Test Fixes ([4338a727](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/4338a727495836589def1da739fdcfa17ab64673))
+* LangSmith Tracing + Integration Test Fixes
 ---
-### [1.2.0 (Monday, April 06, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.1.4&to=release%2F1.2.0)
+### 1.2.0 (Monday, April 06, 2026)
 ### Features/Bug Fixes
-* docs(mcp): address review nitpicks on B.3.1 and B.3.2 docs ([ea356a7e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ea356a7ee996c374ca4700d0b089b2507b1f60c7))
-* docs(mcp): add detailed documentation for B.3.1 and B.3.2 analyzers ([fb91c3d4](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/fb91c3d476d19d9fac0ac394970f7f8646fdeb16))
-* fix(mcp): move noqa directive to correct line for ruff S603 suppression ([33f4b56f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/33f4b56f80e320176e13c8169f7580b7649b618b))
-* fix(mcp): address CodeRabbit review feedback ([79b46a9e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/79b46a9ec380dd847d850f7f282d75ce0fda1028))
-* test(mcp): add full-pipeline integration tests for SARIF and end-to-end ([92b2fd6b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/92b2fd6b22566d7d6bf3580e983532d9be82b312))
-* feat(mcp): implement B.3.2 TP4 LLM description-behavior mismatch ([f01eff3b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f01eff3b529978c62c1e2f482aeb72315a5d0110))
-* feat(mcp): implement B.3.2 TP1-TP3 static metadata poisoning detection ([385fc1dd](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/385fc1dde82c83fe59b7224b213a1200f64522c2))
-* feat(mcp): implement B.3.1 mcp_least_privilege (LP1-LP4) ([af966514](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/af966514e49e86f1dfbda72c6610fa226f7a58ba))
-* feat(mcp): add MCP pattern categories, LP/TP rule registry entries, and test fixtures ([d1b5aa0c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d1b5aa0c7dbe3185fc907ce39575ab3817b4f3fc))
+* docs(mcp): address review nitpicks on B.3.1 and B.3.2 docs
+* docs(mcp): add detailed documentation for B.3.1 and B.3.2 analyzers
+* fix(mcp): move noqa directive to correct line for ruff S603 suppression
+* fix(mcp): address CodeRabbit review feedback
+* test(mcp): add full-pipeline integration tests for SARIF and end-to-end
+* feat(mcp): implement B.3.2 TP4 LLM description-behavior mismatch
+* feat(mcp): implement B.3.2 TP1-TP3 static metadata poisoning detection
+* feat(mcp): implement B.3.1 mcp_least_privilege (LP1-LP4)
+* feat(mcp): add MCP pattern categories, LP/TP rule registry entries, and test fixtures
 ---
-### [1.1.4 (Wednesday, March 25, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.1.3&to=release%2F1.1.4)
+### 1.1.4 (Wednesday, March 25, 2026)
 ### Features/Bug Fixes
-* Detects markdown code blocks (```), code-comment indicators (// â, // â, // GOOD:, // BAD:), and documentation keywords ([2693ce1f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2693ce1fd2656037b7cf86ab6e3fa85a531a8966))
+* Detects markdown code blocks (```), code-comment indicators (// â, // â, // GOOD:, // BAD:), and documentation keywords
 ---
-### [1.1.3 (Tuesday, March 24, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.1.2&to=release%2F1.1.3)
+### 1.1.3 (Tuesday, March 24, 2026)
 ### Features/Bug Fixes
-* Reduce false positives for Dockerfile idioms and CI/CD docs ([21d63934](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/21d63934b873f30507ef2e3ac805e35b26e4d940))
+* Reduce false positives for Dockerfile idioms and CI/CD docs
 ---
-### [1.1.2 (Tuesday, March 24, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.1.1&to=release%2F1.1.2)
+### 1.1.2 (Tuesday, March 24, 2026)
 ### Features/Bug Fixes
-* Removed duplicate tests ([fac3a542](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/fac3a5421eec66a64a1c7ed3732ef95846dd705d))
+* Removed duplicate tests
 ---
-### [1.1.1 (Tuesday, March 24, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.1.0&to=release%2F1.1.1)
+### 1.1.1 (Tuesday, March 24, 2026)
 ### Features/Bug Fixes
-* TM1 (Tool Parameter Abuse) - 19 false positives fixed: ([0f89749a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/0f89749a862182f49af1ef19aa16ddcb78a9b1fa))
+* TM1 (Tool Parameter Abuse) - 19 false positives fixed:
 ---
-### [1.1.0 (Tuesday, March 24, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F1.0.0&to=release%2F1.1.0)
+### 1.1.0 (Tuesday, March 24, 2026)
 ### Features/Bug Fixes
-* Move skillspector-specific safe patterns and LLM key checks from nv-base into skillspector ([881fb4c8](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/881fb4c896488c465fba84fecd18162b7516b336))
+* Move skillspector-specific safe patterns and LLM key checks from nv-base into skillspector
 ---
-### [1.0.0 (Thursday, March 19, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F0.3.1&to=release%2F1.0.0)
+### 1.0.0 (Thursday, March 19, 2026)
 ### Features/Bug Fixes
-* feat: added yara based analyzer ([c86747d6](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/c86747d62e660b6695b8272205da2f45e82f7b1d))
-* feat: implement data-flow analyzer: sources -> sinks ([20415b6c](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/20415b6ce3bcff2a5e9a25b1ed6731833f9f8adf))
-* Implement `semantic_developer_intent` analyzer (SADD B.4.2) ([f8033c91](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f8033c91cd2a9b3bdcd8acab1a9b4d7c1a047e85))
-* Replace hardcoded CVE lists with live OSV.dev vulnerability lookups (SC4) ([40bdf9d6](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/40bdf9d6087d19d2d29876f08a4ac9a3924e0a6a))
-* Implement semantic_security_discovery analyzer (SADD B.4.1) ([8515f36a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/8515f36a38d0e7989a4dd5b7624708801c0970ad))
-* Implement `semantic_quality_policy` analyzer (SADD B.4.3) and fix meta_analyzer finding duplication bug ([80e921aa](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/80e921aa7fa2e8dad6de3c57b2c7e681b4059c56))
-* Implement static analyzers (EA, OH, P6-P8, MP, TM, RA) and extend supply chain (SC4-SC6, TR1-TR3) ([6bc171b6](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6bc171b6c009c76b711f4d0862dc933239824445))
+* feat: added yara based analyzer
+* feat: implement data-flow analyzer: sources -> sinks
+* Implement `semantic_developer_intent` analyzer (SADD B.4.2)
+* Replace hardcoded CVE lists with live OSV.dev vulnerability lookups (SC4)
+* Implement semantic_security_discovery analyzer (SADD B.4.1)
+* Implement `semantic_quality_policy` analyzer (SADD B.4.3) and fix meta_analyzer finding duplication bug
+* Implement static analyzers (EA, OH, P6-P8, MP, TM, RA) and extend supply chain (SC4-SC6, TR1-TR3)
 ---
-### [0.3.1 (Friday, March 13, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F0.3.0&to=release%2F0.3.1)
+### 0.3.1 (Friday, March 13, 2026)
 ### Features/Bug Fixes
-* Ignore .claude/ ([84260e98](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/84260e98dd44907f1f2572843c416335382116fd))
-* Revert "chore: bump version to 0.3.1" ([29c367de](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/29c367de48b1f04c488812c1bf44afe99b9326fd))
-* Revert "chore: bump version to 0.3.2" ([04e681ed](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/04e681ed6db4a825a943d44e2fa688830041ad67))
-* feat: LLMAnalyzerBase — reusable base class for LLM-powered analyzer nodes ([14e611ff](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/14e611ff135dc8589a5263591b9d2990a8c11afb))
-* feat: implemented analyzer for dangerous execution chains ([b14945cc](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b14945cc48e08adb1a28e7e4419c61dca069c080))
-* Restore dev changes: guardrails, typer compatibility, docs, and finding output shape ([2743a7b0](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2743a7b0b7fd6c3da735c95b29f0fe9b7cdc2e12))
-* Revert to state at d74cbf9: undo merge keshavp/dev, guardrail update, typer downgrade, docs, finding output ([10265b5b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/10265b5b3c55d1682085955b8cadf75a7e1dd4d5))
-* Update guardrail version ([d8ee92b6](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d8ee92b64eed0c5ca6da86b6dd642cb22e79c8e0))
-* downgrade typer version for compatibility with nv-base ([6b6b6cb2](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6b6b6cb2ead9ed1ada0cf9bb93f1c191770d3888))
-* docs: clarify venv setup and uv/pip fallback in Makefile and docs ([542b20d0](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/542b20d0dc498d715388762b7cebc38fc2236c85))
-* feat: full finding output shape and Finding model cleanup ([b3a21d51](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/b3a21d513ba94052476390b84271c5c5d72e4934))
-* Revert "chore: bump version to 0.4.0" ([3bdd8037](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/3bdd8037df457ddab9ced26e53b1193c558ae9d6))
-* add Skillspector v2 LangGraph workflow scaffold ([e2fd3849](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/e2fd3849e9798de717276f846193f6f6e8c0cefb))
+* Ignore .claude/
+* Revert "chore: bump version to 0.3.1"
+* Revert "chore: bump version to 0.3.2"
+* feat: LLMAnalyzerBase — reusable base class for LLM-powered analyzer nodes
+* feat: implemented analyzer for dangerous execution chains
+* Restore dev changes: guardrails, typer compatibility, docs, and finding output shape
+* Revert to state at d74cbf9: undo merge keshavp/dev, guardrail update, typer downgrade, docs, finding output
+* Update guardrail version
+* downgrade typer version for compatibility with nv-base
+* docs: clarify venv setup and uv/pip fallback in Makefile and docs
+* feat: full finding output shape and Finding model cleanup
+* Revert "chore: bump version to 0.4.0"
+* add Skillspector v2 LangGraph workflow scaffold
 ---
-### [0.3.0 (Monday, February 09, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F0.2.0&to=release%2F0.3.0)
+### 0.3.0 (Monday, February 09, 2026)
 ### Features/Bug Fixes
-* Replace generic LLM unavailable message with pattern-specific explanations ([43d93a4b](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/43d93a4be341dd59804ce5478a8831fb2d9037e3))
+* Replace generic LLM unavailable message with pattern-specific explanations
 ---
-### [0.2.0 (Friday, February 06, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/compare?from=release%2F0.1.3&to=release%2F0.2.0)
+### 0.2.0 (Friday, February 06, 2026)
 ### Features/Bug Fixes
-* Unify LLM access via NVIDIA Inference Hub ([6acbbeae](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/6acbbeae5ecb92df81d8b280a103a1fc8ca73073))
-* docs: condense RELEASE.md for clarity ([3924841e](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/3924841ea2c59f03081e8e4dd32bfec324ea8e37))
-* Integration with NV-BASE ([7bc31c25](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/7bc31c253cb841c20687984bbf70b5ec5bcea4cd))
+* Unify LLM access via NVIDIA Inference Hub
+* docs: condense RELEASE.md for clarity
+* Integration with NV-BASE
 ---
-### [0.1.3 (Friday, January 30, 2026)](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/tags/release%2F0.1.3)
+### 0.1.3 (Friday, January 30, 2026)
 ### Features/Bug Fixes
-* docs: update installation and release management instructions ([afbb25bb](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/afbb25bb0c9cca6c8b702fe9295f00868893a49a))
-* chore: add Makefile with development and build targets ([23d82b78](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/23d82b7823d6d21a0e9dcf0227c86595908d515c))
-* feat: add Poetry auth.toml credential support to release script ([2a1ca938](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/2a1ca9381f955eaba56a38a911ad1108fc507ea4))
-* feat: add release script for nv-shared-pypi publishing ([a508243f](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/a508243f19e0a4fdd4185d63c6520df095dbaea1))
-* Update GitLab Issues link to new demos space ([f2eaad9a](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/f2eaad9a0889a9044381c98dbda10399c31ba3f3))
-* Initial commit ([ebf1418d](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/ebf1418da720d2d9ea315b05c0b5f6e28e825c87))
-* Add all 15 vulnerability patterns and author info ([4d79c612](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/4d79c612f5c98ab94b1dd1d12257aec5063e939b))
-* Initial commit: SkillSpector security scanner for AI agent skills ([d2940d39](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/d2940d3998cb70598046a29cf0826d2bad14b030))
-* Initial commit ([558c5be3](https://gitlab-master.nvidia.com/ai_tools/nvcarps_team/skillspector/-/commit/558c5be394db7d3bc27d3a471a87c6990a653cda))
+* docs: update installation and release management instructions
+* chore: add Makefile with development and build targets
+* feat: add Poetry auth.toml credential support to release script
+* feat: add release script for nv-shared-pypi publishing
+* Update GitLab Issues link to new demos space
+* Initial commit
+* Add all 15 vulnerability patterns and author info
+* Initial commit: SkillSpector security scanner for AI agent skills
+* Initial commit

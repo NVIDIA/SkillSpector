@@ -20,14 +20,31 @@ Uses skill spec layout: SKILL.md, references/, scripts/, assets/
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from skillspector.constants import MODEL_CONFIG
 from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
+from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import SkillspectorState
+
+_OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
+# Pinned from NVIDIA/skills at commit 1f01acfe1aece58ba95d124eafdfb5bb93523db6:
+# skills/mcore-split-pr/skill.oms.sig
+
+
+def _write_real_oms_signature(root: Path, relative_path: str = "skill.oms.sig") -> Path:
+    target = root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_OMS_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
 
 
 def _make_skill_spec_dir(root: Path, *, skill_md_name: str = "SKILL.md") -> None:
@@ -76,7 +93,16 @@ def test_build_context_real_directory_with_skill_md(tmp_path: Path) -> None:
         "allowed-tools": [],
         "parameters": [],
     }
-    assert result["ast_cache"] == {}
+    python_ast_cache_key = result["python_ast_cache_key"]
+    assert isinstance(python_ast_cache_key, str)
+    parsed_python = get_python_ast(
+        python_ast_cache_key,
+        result["file_cache"]["scripts/run.py"],
+        "scripts/run.py",
+    )
+    assert isinstance(parsed_python, ParsedPythonFile)
+    assert parsed_python.is_parseable
+    assert parsed_python.tree is not None
     assert result["previous_manifest"] is None
     assert "component_metadata" in result
     assert isinstance(result["component_metadata"], list)
@@ -90,6 +116,50 @@ def test_build_context_real_directory_with_skill_md(tmp_path: Path) -> None:
     assert run_py_meta.get("lines") == 1
     assert "has_executable_scripts" in result
     assert result["has_executable_scripts"] is True
+
+
+def test_build_context_ast_cache_skips_oversized_python(tmp_path: Path) -> None:
+    """Prewarming respects the same source-size limit as AST analyzers."""
+    from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS
+
+    (tmp_path / "oversized.py").write_text("x = 1\n" + "#" * MAX_PYTHON_AST_SOURCE_CHARS)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["python_ast_cache_key"] is None
+
+
+def test_build_context_ast_cache_handle_is_checkpoint_serializable(tmp_path: Path) -> None:
+    """Raw AST objects remain in runtime storage, not checkpointed graph state."""
+    (tmp_path / "script.py").write_text("import os\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    serializer = JsonPlusSerializer()
+    assert serializer.dumps_typed(result)
+
+
+def test_build_context_reads_directory_with_windows_secure_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows' handle-based fallback keeps normal directory scans usable."""
+    _make_skill_spec_dir(tmp_path)
+
+    def open_with_windows_handle(path: Path) -> BinaryIO:
+        return path.open("rb")
+
+    monkeypatch.setattr("skillspector.input_handler._HAS_SECURE_DIR_FD", False)
+    monkeypatch.setattr("skillspector.input_handler._IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "skillspector.input_handler._open_regular_file_from_windows_handle",
+        open_with_windows_handle,
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["file_cache"]["SKILL.md"].startswith("---")
+    assert result["file_cache"]["scripts/run.py"] == "print(1)\n"
+    assert result["manifest"]["name"] == "test-skill"
 
 
 def test_build_context_missing_skill_path() -> None:
@@ -160,6 +230,95 @@ def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
 
     assert result["model_config"]["default"] == "bound-default"
     assert result["model_config"]["meta_analyzer"] == "bound-meta"
+
+
+def test_build_context_inventories_but_excludes_valid_root_oms_signature(
+    tmp_path: Path,
+) -> None:
+    """A real OMS signature is reported as metadata but withheld from analyzers."""
+    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
+    signature_path = _write_real_oms_signature(tmp_path)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "skill.oms.sig" not in result["components"]
+    assert "skill.oms.sig" not in result["file_cache"]
+    assert any(
+        event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
+        for event in result["inspection_ledger"]
+    )
+    signature_meta = next(
+        item for item in result["component_metadata"] if item["path"] == "skill.oms.sig"
+    )
+    assert signature_meta == {
+        "path": "skill.oms.sig",
+        "type": "oms_signature",
+        "lines": 1,
+        "executable": False,
+        "size_bytes": signature_path.stat().st_size,
+    }
+
+
+def test_build_context_excludes_future_oms_predicate_version(tmp_path: Path) -> None:
+    """OMS predicate revisions remain excluded without relaxing the namespace check."""
+    bundle = json.loads(_OMS_FIXTURE.read_text(encoding="utf-8"))
+    payload = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
+    payload["predicateType"] = "https://model_signing/signature/v1.1"
+    bundle["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(payload).encode("utf-8")
+    ).decode("ascii")
+    (tmp_path / "skill.oms.sig").write_text(json.dumps(bundle), encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "skill.oms.sig" not in result["components"]
+    assert any(
+        event["path"] == "skill.oms.sig" and event["reason_code"] == "oms_signature"
+        for event in result["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_case", ["malformed_json", "wrong_media_type", "message_signature"]
+)
+def test_build_context_scans_unrecognized_root_oms_signature(
+    tmp_path: Path,
+    invalid_case: str,
+) -> None:
+    """Malformed and non-OMS Sigstore files retain normal scanner behavior."""
+    content = _OMS_FIXTURE.read_text(encoding="utf-8")
+    if invalid_case == "malformed_json":
+        content = "{not-json"
+    else:
+        bundle = json.loads(content)
+        if invalid_case == "wrong_media_type":
+            bundle["mediaType"] = "application/vnd.dev.sigstore.bundle.v0.2+json"
+        else:
+            bundle["messageSignature"] = {"signature": "YWJj"}
+            del bundle["dsseEnvelope"]
+        content = json.dumps(bundle)
+    (tmp_path / "skill.oms.sig").write_text(content, encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["file_cache"]["skill.oms.sig"] == content
+    signature_meta = next(
+        item for item in result["component_metadata"] if item["path"] == "skill.oms.sig"
+    )
+    assert signature_meta["type"] == "other"
+
+
+def test_build_context_scans_nested_oms_signature(tmp_path: Path) -> None:
+    """Only the signature at the skill root is eligible for recognition."""
+    nested = _write_real_oms_signature(tmp_path, "nested/skill.oms.sig")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_text(encoding="utf-8")
+    signature_meta = next(
+        item for item in result["component_metadata"] if item["path"] == "nested/skill.oms.sig"
+    )
+    assert signature_meta["type"] == "other"
 
 
 def test_build_context_skips_skip_dirs(tmp_path: Path) -> None:
@@ -273,3 +432,238 @@ def test_build_context_parses_allowed_tools_comma_string(tmp_path: Path) -> None
     state: SkillspectorState = {"skill_path": str(tmp_path)}
     result = build_context(state)
     assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
+
+
+def test_build_context_reports_exclusion_boundary_without_descendants(tmp_path: Path) -> None:
+    """Excluded directory trees produce one boundary record, not child records."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    excluded = tmp_path / "node_modules" / "pkg"
+    excluded.mkdir(parents=True)
+    (excluded / "index.js").write_text("alert(1)\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+    exclusions = [
+        event for event in result["inspection_ledger"] if event["outcome"] == "out_of_scope"
+    ]
+
+    assert [event["path"] for event in exclusions] == ["node_modules/"]
+    assert "node_modules/pkg/index.js" not in result["components"]
+
+
+def test_build_context_reports_hidden_file_as_a_scope_exclusion(tmp_path: Path) -> None:
+    """Hidden files are excluded individually without a directory marker."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=not-reported\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+    exclusions = [
+        event for event in result["inspection_ledger"] if event["outcome"] == "out_of_scope"
+    ]
+
+    assert [event["path"] for event in exclusions] == [".env"]
+    assert ".env" not in result["components"]
+
+
+def test_build_context_reports_read_error_without_fake_empty_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable files remain inventoried but are absent from the content cache."""
+    target = tmp_path / "broken.py"
+    target.write_text("print(1)\n", encoding="utf-8")
+
+    def deny_open(*args: object, **kwargs: object) -> int:
+        raise PermissionError("sensitive operating-system detail")
+
+    monkeypatch.setattr("skillspector.input_handler.os.open", deny_open)
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "broken.py" in result["components"]
+    assert "broken.py" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "broken.py")
+    assert event["reason_code"] == "read_error"
+    assert event["error_class"] == "PermissionError"
+    assert "sensitive" not in event["message"]
+
+
+def test_build_context_records_non_regular_files_in_the_ledger(tmp_path: Path) -> None:
+    """Named pipes are inventoried so the cache phase can report their failure."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes are unavailable on this platform")
+    pipe = tmp_path / "events.pipe"
+    os.mkfifo(pipe)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "events.pipe" in result["components"]
+    assert "events.pipe" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "events.pipe")
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_excludes_dangling_symlink_from_scan_scope(tmp_path: Path) -> None:
+    """Symlinks are excluded rather than read as files from an unknown target."""
+    dangling = tmp_path / "missing.py"
+    try:
+        dangling.symlink_to("no-longer-present.py")
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "missing.py" not in result["components"]
+    assert "missing.py" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "missing.py")
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_records_stat_errors_in_the_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unstatable discovered entry produces structured STAT_ERROR evidence."""
+    target = tmp_path / "protected.py"
+    target.write_text("print(1)\n", encoding="utf-8")
+    original = Path.stat
+
+    def fail_target(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if path == target:
+            raise PermissionError("sensitive operating-system detail")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_target)
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "protected.py" in result["components"]
+    assert "protected.py" not in result["file_cache"]
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "protected.py")
+    assert event["reason_code"] == "stat_error"
+    assert event["error_class"] == "PermissionError"
+
+
+def test_build_context_records_non_regular_entries_in_the_ledger(tmp_path: Path) -> None:
+    """A discovered FIFO is retained as failed ledger evidence, never silently skipped."""
+    fifo = tmp_path / "inspection.pipe"
+    os.mkfifo(fifo)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "inspection.pipe" in result["components"]
+    assert "inspection.pipe" not in result["file_cache"]
+    event = next(
+        entry for entry in result["inspection_ledger"] if entry["path"] == "inspection.pipe"
+    )
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_rejects_symlink_to_external_file(tmp_path: Path) -> None:
+    """A symlinked file outside skill_dir must not enter the component cache."""
+    secret = tmp_path.parent / "external_secret.txt"
+    secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
+
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
+    (skill_dir / "creds.md").symlink_to(secret)
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert "creds.md" not in result["components"]
+    assert "creds.md" not in result["file_cache"]
+    assert all("hunter2" not in content for content in result["file_cache"].values())
+
+
+def test_build_context_rejects_symlinked_directory(tmp_path: Path) -> None:
+    """A symlinked subdirectory outside skill_dir must not be traversed."""
+    external = tmp_path.parent / "external_dir"
+    external.mkdir(exist_ok=True)
+    (external / "leak.md").write_text("PRIVATE_KEY=xyz", encoding="utf-8")
+
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
+    (skill_dir / "linked").symlink_to(external, target_is_directory=True)
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert not any(path.startswith("linked/") for path in result["components"])
+    assert all("PRIVATE_KEY" not in content for content in result["file_cache"].values())
+
+
+def test_build_context_rejects_junctioned_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows junctions must be excluded before os.walk can traverse them."""
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "leak.md").write_text("PRIVATE_KEY=xyz", encoding="utf-8")
+    original_is_junction = Path.is_junction
+
+    def is_junction(path: Path) -> bool:
+        return path == linked or original_is_junction(path)
+
+    monkeypatch.setattr(Path, "is_junction", is_junction)
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert not any(path.startswith("linked/") for path in result["components"])
+    assert all("PRIVATE_KEY" not in content for content in result["file_cache"].values())
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "linked/")
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_rejects_in_tree_symlink(tmp_path: Path) -> None:
+    """Even an in-tree symlink is skipped rather than read through."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "real.md").write_text("real content", encoding="utf-8")
+    (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
+    (skill_dir / "alias.md").symlink_to(skill_dir / "real.md")
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert "real.md" in result["components"]
+    assert "alias.md" not in result["components"]
+
+
+def test_build_context_rejects_file_swapped_to_symlink_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path replaced after stat must not leak its new symlink target."""
+    from skillspector.nodes.build_context import _open_regular_file_no_follow
+
+    secret = tmp_path.parent / "external_secret.txt"
+    secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
+    target = tmp_path / "payload.md"
+    target.write_text("safe", encoding="utf-8")
+
+    def replace_target(path: Path) -> BinaryIO:
+        if path.name == target.name:
+            path.unlink()
+            path.symlink_to(secret)
+        return _open_regular_file_no_follow(path)
+
+    monkeypatch.setattr(
+        "skillspector.nodes.build_context._open_regular_file_no_follow", replace_target
+    )
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "payload.md" in result["components"]
+    assert "payload.md" not in result["file_cache"]
+    assert all("hunter2" not in content for content in result["file_cache"].values())
+    event = next(entry for entry in result["inspection_ledger"] if entry["path"] == "payload.md")
+    assert event["reason_code"] == "not_regular_file"
+
+
+def test_build_context_rejects_symlinked_manifest(tmp_path: Path) -> None:
+    """Manifest parsing cannot bypass symlink rejection applied to the cache."""
+    external = tmp_path.parent / "external_manifest.md"
+    external.write_text(
+        "---\nname: private-name\ndescription: private-description\n---\n", encoding="utf-8"
+    )
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").symlink_to(external)
+
+    result = build_context({"skill_path": str(skill_dir)})
+
+    assert result["manifest"] == {}
+    assert "SKILL.md" not in result["components"]
+    assert "SKILL.md" not in result["file_cache"]

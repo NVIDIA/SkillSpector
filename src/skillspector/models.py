@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from skillspector.state import SkillspectorState
@@ -61,12 +62,18 @@ class AnalyzerFinding:
     matched_text: str | None = None
 
 
+def _new_finding_id() -> str:
+    """Return an opaque, run-unique identity for one logical finding."""
+    return f"finding-{uuid4().hex}"
+
+
 @dataclass
 class Finding:
     """Finding model for graph state and report output (shape aligned with to_dict)."""
 
     rule_id: str
     message: str
+    finding_id: str = field(default_factory=_new_finding_id)
     severity: str = "LOW"
     confidence: float = 0.5
     file: str = "SKILL.md"
@@ -87,6 +94,7 @@ class Finding:
         """Return a JSON-serializable dict representation (full finding shape)."""
         return {
             "id": self.rule_id,
+            "finding_id": self.finding_id,
             "category": self.category,
             "pattern": self.pattern,
             "severity": self.severity,

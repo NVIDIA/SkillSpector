@@ -34,7 +34,7 @@ class TestMcpRugPullNode:
             "previous_manifest": None,
         }
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     def test_missing_previous_manifest_key_skips(self) -> None:
         """Returns empty findings when previous_manifest key is missing in state."""
@@ -45,7 +45,7 @@ class TestMcpRugPullNode:
             },
         }
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     def test_identical_manifests_returns_empty(self) -> None:
         """Returns empty findings when current and previous manifests are identical."""
@@ -68,7 +68,7 @@ class TestMcpRugPullNode:
             "previous_manifest": manifest,
         }
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     def test_rp1_permission_expansion(self) -> None:
         """RP1 is triggered when a new permission is added in the current manifest."""
@@ -106,7 +106,7 @@ class TestMcpRugPullNode:
             },
         }
         result = node(state)
-        assert result == {"findings": []}
+        assert result["findings"] == []
 
     def test_rp2_trigger_added(self) -> None:
         """RP2 is triggered when a trigger phrase is added."""
@@ -250,3 +250,13 @@ class TestMcpRugPullNode:
         rule_ids = {f.rule_id for f in findings}
         assert rule_ids == {"RP1", "RP2", "RP3"}
         assert len(findings) == 3
+
+
+class TestInspectionLedgerResponse:
+    def test_missing_manifest_is_an_analyzer_level_non_applicability(self) -> None:
+        result = node({"components": [], "file_cache": {}})
+
+        assert result["inspection_ledger"] == []
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "not_applicable"
+        assert status["reason_code"] == "manifest_absent"

@@ -151,6 +151,19 @@ P8_PATTERNS = [
     ),
 ]
 
+_BENIGN_OUTPUT_RULES_HEADING = "## Output Rules (Both Modes)"
+
+
+def _is_benign_output_rules_heading(content: str, match: re.Match[str], file_type: str) -> bool:
+    """Return True only for the reported benign Markdown heading."""
+    if file_type != "markdown" or match.group(0) != "Output Rules":
+        return False
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(content)
+    return content[line_start:line_end].strip() == _BENIGN_OUTPUT_RULES_HEADING
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for system prompt leakage patterns (P6–P8)."""
@@ -166,6 +179,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     for pattern, confidence in P6_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if _is_benign_output_rules_heading(content, match, file_type):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -214,6 +229,6 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run system_prompt_leakage patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

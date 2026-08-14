@@ -39,6 +39,8 @@ import inspect
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 _project_root = Path(__file__).resolve().parents[3]
 if str(_project_root) not in sys.path:
@@ -60,6 +62,7 @@ from contrib.batch_scan.runner import (
     _original_base_build_prompt,
     _original_meta_parse,
     _original_meta_build_prompt,
+    _patched_base_init,
     _verify_patch_targets,
     _apply_patches,
     _restore_patches,
@@ -245,6 +248,37 @@ class TestGuardPatch1Init(unittest.TestCase):
                 _verify_patch_targets()
         finally:
             LLMAnalyzerBase.__init__ = original
+
+    def test_guard_catches_missing_node_param(self) -> None:
+        original = LLMAnalyzerBase.__init__
+
+        def _broken_init(self, base_prompt, model):
+            pass
+
+        try:
+            LLMAnalyzerBase.__init__ = _broken_init
+            with self.assertRaisesRegex(RuntimeError, "node"):
+                _verify_patch_targets()
+        finally:
+            LLMAnalyzerBase.__init__ = original
+
+    def test_patched_init_forwards_keyword_only_node(self) -> None:
+        instance = SimpleNamespace()
+        with patch("contrib.batch_scan.runner._original_base_init") as original_init:
+            _patched_base_init(
+                instance,
+                "prompt",
+                "model",
+                node="semantic_security_discovery",
+            )
+
+        original_init.assert_called_once_with(
+            instance,
+            "prompt",
+            "model",
+            node="semantic_security_discovery",
+        )
+        self.assertIsNone(instance.response_schema)
 
     def test_guard_catches_missing_response_schema_attr(self) -> None:
         """If upstream removes response_schema class attr, guard must raise."""

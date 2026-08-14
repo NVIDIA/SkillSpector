@@ -438,9 +438,22 @@ class PooledChatModel:
         """Async invoke with automatic key switching on rate-limit."""
         return await self._ainvoke_with_retry(prompt)
 
+    def invoke_with_usage(self, prompt: str, collector: object) -> object:
+        """Invoke while forwarding the telemetry callback to the selected model."""
+        return self._invoke_with_retry(prompt, callbacks=[collector])
+
+    async def ainvoke_with_usage(self, prompt: str, collector: object) -> object:
+        """Async usage-aware counterpart to :meth:`invoke_with_usage`."""
+        return await self._ainvoke_with_retry(prompt, callbacks=[collector])
+
     # -- Internal -------------------------------------------------------------
 
-    def _invoke_with_retry(self, prompt: str) -> object:
+    def _invoke_with_retry(
+        self,
+        prompt: str,
+        *,
+        callbacks: list[object] | None = None,
+    ) -> object:
         """Sync retry loop — acquire slot, call LLM, release, retry on 429."""
         last_exception: Exception | None = None
 
@@ -448,7 +461,10 @@ class PooledChatModel:
             key = self._pool.acquire()
             llm = self._build_llm(key)
             try:
-                result = llm.invoke(prompt)
+                if callbacks is None:
+                    result = llm.invoke(prompt)
+                else:
+                    result = llm.invoke(prompt, config={"callbacks": callbacks})
                 self._pool.release(key, success=True)
                 if attempt > 0:
                     self._pool.record_retry_success()
@@ -472,7 +488,12 @@ class PooledChatModel:
             "due to rate-limit errors"
         ) from last_exception
 
-    async def _ainvoke_with_retry(self, prompt: str) -> object:
+    async def _ainvoke_with_retry(
+        self,
+        prompt: str,
+        *,
+        callbacks: list[object] | None = None,
+    ) -> object:
         """Async retry loop — non-blocking acquire first, block only if full."""
         import asyncio
         last_exception: Exception | None = None
@@ -483,7 +504,10 @@ class PooledChatModel:
                 key = await asyncio.to_thread(self._pool.acquire)
             llm = self._build_llm(key)
             try:
-                result = await llm.ainvoke(prompt)
+                if callbacks is None:
+                    result = await llm.ainvoke(prompt)
+                else:
+                    result = await llm.ainvoke(prompt, config={"callbacks": callbacks})
                 self._pool.release(key, success=True)
                 if attempt > 0:
                     self._pool.record_retry_success()

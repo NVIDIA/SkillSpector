@@ -43,7 +43,7 @@ Equivalent CLI:
 - `format`: `terminal`, `json`, `markdown`, or `sarif`. Default: `terminal`.
 - `output`: optional report path.
 - `noLlm`: default `true`.
-- `provider`: optional `openai`, `anthropic`, `anthropic_proxy`, `nv_build`, or `nv_inference`.
+- `provider`: optional `openai`, `anthropic`, `anthropic_proxy`, or `nv_build`.
 - `model`: optional model override.
 - `yaraRulesDir`: optional directory of extra YARA rules.
 - `verbose`: optional detailed progress.

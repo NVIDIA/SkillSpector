@@ -27,13 +27,20 @@ import binascii
 import hashlib
 from pathlib import Path
 
-import yara
+import yara  # type: ignore[import-not-found]
 
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
-from .common import get_context, get_line_number
+from .common import get_context_from_lines
 from .pattern_defaults import PatternCategory
 from .static_runner import MAX_FILE_CHARS, analyzer_finding_to_finding
 
@@ -55,6 +62,9 @@ _CATEGORY_MAP: dict[str, tuple[str, Severity]] = {
 _DEFAULT_RULE_ID = "YR4"
 _DEFAULT_SEVERITY = Severity.MEDIUM
 _DEFAULT_CONFIDENCE = 0.7
+_DESTRUCTIVE_AUTONOMY_NAMESPACE = "agent_skills"
+_DESTRUCTIVE_AUTONOMY_RULE = "agent_skill_destructive_autonomous_actions"
+_MAX_DESTRUCTIVE_AUTONOMY_LINE_DISTANCE = 3
 
 # Module-level cache keyed by a content hash of all rule directories.
 _compiled_rules: yara.Rules | None = None
@@ -62,14 +72,20 @@ _rules_hash: str | None = None
 
 
 def _collect_rule_files(*dirs: Path) -> list[Path]:
-    """Collect all YARA rule files under one or more directories, sorted for determinism."""
-    files: set[Path] = set()
+    """Collect YARA files deterministically while preserving directory precedence."""
+    files: list[Path] = []
+    seen: set[Path] = set()
     for d in dirs:
         if not d.is_dir():
             continue
+        directory_files: set[Path] = set()
         for ext in _RULE_EXTENSIONS:
-            files.update(d.rglob(ext))
-    return sorted(files)
+            directory_files.update(d.rglob(ext))
+        for rule_file in sorted(directory_files):
+            if rule_file not in seen:
+                seen.add(rule_file)
+                files.append(rule_file)
+    return files
 
 
 def _content_hash(rule_files: list[Path]) -> str:
@@ -185,17 +201,51 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
 
 def _extract_match_strings(match: yara.Match) -> tuple[int, str | None]:
     """Extract the first match offset and a joined matched-text snippet from a YARA match."""
-    first_offset = 0
+    first_offset: int | None = None
     parts: list[str] = []
     for sd in match.strings or []:
         for inst in sd.instances or []:
-            if first_offset == 0:
+            if first_offset is None or inst.offset < first_offset:
                 first_offset = inst.offset
             matched_bytes = inst.matched_data
             if isinstance(matched_bytes, bytes):
                 parts.append(matched_bytes.decode("utf-8", errors="replace"))
     matched_text = "; ".join(parts)[:200] if parts else None
-    return first_offset, matched_text
+    return first_offset if first_offset is not None else 0, matched_text
+
+
+def _line_number_from_byte_offset(data: bytes, offset: int) -> int:
+    """Return the 1-based line number for a YARA byte offset in *data*."""
+    return data[:offset].count(b"\n") + 1
+
+
+def _has_local_destructive_autonomy_evidence(match: yara.Match, data: bytes) -> bool:
+    """Require destructive and autonomy evidence to occur in one local context.
+
+    YARA string conditions are file-wide. Without this post-match check, a
+    scoped workspace reset near the start of a long skill combines with unrelated
+    prose such as "do not prompt per file" much later and becomes a false HIGH.
+    Root deletion remains blocking without autonomy evidence, matching the rule's
+    explicit condition.
+    """
+    destructive_lines: list[int] = []
+    autonomy_lines: list[int] = []
+    for string_match in match.strings or []:
+        identifier = str(string_match.identifier)
+        for instance in string_match.instances or []:
+            line = _line_number_from_byte_offset(data, instance.offset)
+            if identifier == "$destructive_rm_root":
+                return True
+            if identifier.startswith("$destructive_"):
+                destructive_lines.append(line)
+            elif identifier.startswith("$autonomy_"):
+                autonomy_lines.append(line)
+
+    return any(
+        abs(destructive_line - autonomy_line) <= _MAX_DESTRUCTIVE_AUTONOMY_LINE_DISTANCE
+        for destructive_line in destructive_lines
+        for autonomy_line in autonomy_lines
+    )
 
 
 def _parse_meta(match: yara.Match) -> tuple[str, Severity, float, str | None]:
@@ -230,28 +280,34 @@ def _build_message(rule_name: str, namespace: str, description: str | None) -> s
 def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[AnalyzerFinding]:
     """Run compiled YARA rules against *content* and return AnalyzerFindings."""
     data = content.encode("utf-8", errors="replace")
-    try:
-        matches = rules.match(data=data)
-    except Exception as exc:
-        logger.debug("%s: match error on %s: %s", ANALYZER_ID, file_path, exc)
-        return []
+    matches = rules.match(data=data)
 
     findings: list[AnalyzerFinding] = []
     for match in matches:
+        if (
+            match.namespace == _DESTRUCTIVE_AUTONOMY_NAMESPACE
+            and match.rule == _DESTRUCTIVE_AUTONOMY_RULE
+            and not _has_local_destructive_autonomy_evidence(match, data)
+        ):
+            logger.debug(
+                "%s: ignored cross-context destructive/autonomy match in %s",
+                ANALYZER_ID,
+                file_path,
+            )
+            continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(match)
+        start_line = _line_number_from_byte_offset(data, first_offset)
 
         findings.append(
             AnalyzerFinding(
                 rule_id=rule_id,
                 message=_build_message(match.rule, match.namespace, description),
                 severity=severity,
-                location=Location(
-                    file=file_path, start_line=get_line_number(content, first_offset)
-                ),
+                location=Location(file=file_path, start_line=start_line),
                 confidence=confidence,
                 tags=[PatternCategory.YARA_MATCH.value],
-                context=get_context(content, first_offset),
+                context=get_context_from_lines(content.splitlines(), start_line),
                 matched_text=matched_text,
             )
         )
@@ -266,15 +322,35 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     rules = _load_rules(extra_dir)
     if rules is None:
         logger.info("%s: 0 findings (no rules available)", ANALYZER_ID)
-        return {"findings": []}
+        return {
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id=ANALYZER_ID,
+                    status="unavailable",
+                    reason=LedgerReason.RULES_UNAVAILABLE,
+                )
+            ],
+        }
 
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
     findings = []
+    events: list[InspectionLedgerEvent] = []
 
     for path in components:
         content = file_cache.get(path)
         if content is None:
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.MISSING_FILE_CACHE,
+                )
+            )
             continue
         if len(content) > MAX_FILE_CHARS:
             logger.debug(
@@ -283,9 +359,76 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 path,
                 MAX_FILE_CHARS,
             )
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.SKIPPED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.SIZE_LIMIT,
+                    observed_characters=len(content),
+                    limit_characters=MAX_FILE_CHARS,
+                    observed_bytes=len(content.encode("utf-8")),
+                )
+            )
             continue
-        for af in _match_file(rules, content, path):
-            findings.append(analyzer_finding_to_finding(af))
+        try:
+            path_findings = [
+                analyzer_finding_to_finding(af) for af in _match_file(rules, content, path)
+            ]
+        except Exception as exc:
+            logger.warning("%s: match error on %s: %s", ANALYZER_ID, path, exc)
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        findings.extend(path_findings)
+        events.append(
+            ledger_event(
+                analyzer_id=ANALYZER_ID,
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                path=path,
+                emitted_finding_ids=[finding.finding_id for finding in path_findings],
+            )
+        )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    if not events:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status="not_applicable",
+            reason=LedgerReason.NO_APPLICABLE_FILES,
+        )
+    else:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status=(
+                "failed"
+                if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
+                else "degraded"
+                if any(event["outcome"] is LedgerOutcome.SKIPPED for event in events)
+                else "completed"
+            ),
+            planned_work=[
+                {
+                    "work_id": event["work_id"],
+                    "path": event["path"],
+                    "start_line": event["start_line"],
+                    "end_line": event["end_line"],
+                }
+                for event in events
+            ],
+        )
+    return {
+        "findings": findings,
+        "inspection_ledger": events,
+        "analyzer_status_events": [status],
+    }
