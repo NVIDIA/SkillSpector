@@ -25,13 +25,21 @@ from __future__ import annotations
 import ast
 from typing import NamedTuple
 
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    PlannedWorkTarget,
+    analyzer_status_event,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import (
     apply_import_aliases,
-    build_import_aliases,
     build_type_map,
     get_context_from_lines,
     get_source_segment,
@@ -39,7 +47,7 @@ from .common import (
     resolve_dotted_name,
     resolve_dynamic_import_call,
 )
-from .static_runner import MAX_FILE_BYTES, analyzer_finding_to_finding
+from .static_runner import MAX_FILE_CHARS, analyzer_finding_to_finding
 
 ANALYZER_ID = "behavioral_taint_tracking"
 logger = get_logger(__name__)
@@ -317,16 +325,14 @@ def _find_tainted_in_expr(node: ast.expr, tainted: dict[str, _TaintedVar]) -> _T
     return None
 
 
-def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
-    try:
-        tree = ast.parse(content, filename=file_path)
-    except SyntaxError:
-        logger.debug("SyntaxError parsing %s, skipping", file_path)
+def _analyze_python(python_ast: ParsedPythonFile, file_path: str) -> list[AnalyzerFinding]:
+    tree = python_ast.tree
+    if tree is None:
         return []
 
-    type_map = build_type_map(tree)
-    aliases = build_import_aliases(tree)
-    lines = content.splitlines()
+    aliases = python_ast.import_aliases
+    type_map = build_type_map(tree, aliases)
+    lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
     seen: set[tuple[str, int]] = set()
@@ -424,16 +430,87 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files and detect source\u2192sink data flows."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
+    python_ast_cache_key = state.get("python_ast_cache_key")
     all_findings: list[Finding] = []
+    ledger_events: list[InspectionLedgerEvent] = []
 
     for path in components:
         if not path.endswith(".py"):
             continue
         content = file_cache.get(path)
-        if content is None or len(content) > MAX_FILE_BYTES:
-            continue
-        raw = _analyze_python(content, path)
-        all_findings.extend(analyzer_finding_to_finding(af) for af in raw)
+        if content is None:
+            event = ledger_event(
+                outcome=LedgerOutcome.FAILED,
+                phase="behavioral",
+                analyzer_id=ANALYZER_ID,
+                path=path,
+                reason=LedgerReason.MISSING_FILE_CACHE,
+            )
+        elif len(content) > MAX_FILE_CHARS:
+            event = ledger_event(
+                outcome=LedgerOutcome.SKIPPED,
+                phase="behavioral",
+                analyzer_id=ANALYZER_ID,
+                path=path,
+                reason=LedgerReason.SIZE_LIMIT,
+                observed_characters=len(content),
+                limit_characters=MAX_FILE_CHARS,
+                observed_bytes=len(content.encode("utf-8")),
+            )
+        else:
+            python_ast = get_python_ast(python_ast_cache_key, content, path)
+            if not python_ast.is_parseable:
+                event = ledger_event(
+                    outcome=LedgerOutcome.SKIPPED,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.SYNTAX_ERROR,
+                )
+            else:
+                raw = _analyze_python(python_ast, path)
+                path_findings = [analyzer_finding_to_finding(af) for af in raw]
+                all_findings.extend(path_findings)
+                event = ledger_event(
+                    outcome=LedgerOutcome.COMPLETED,
+                    phase="behavioral",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    emitted_finding_ids=[finding.finding_id for finding in path_findings],
+                )
+        ledger_events.append(event)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(all_findings))
-    return {"findings": all_findings}
+    planned_work: list[PlannedWorkTarget] = [
+        {
+            "work_id": event["work_id"],
+            "path": event["path"],
+            "start_line": event["start_line"],
+            "end_line": event["end_line"],
+        }
+        for event in ledger_events
+    ]
+    if not ledger_events:
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status="not_applicable",
+            reason=LedgerReason.NO_APPLICABLE_FILES,
+        )
+    else:
+        outcomes = {event["outcome"] for event in ledger_events}
+        status = analyzer_status_event(
+            analyzer_id=ANALYZER_ID,
+            status=(
+                "failed"
+                if LedgerOutcome.FAILED in outcomes
+                else "degraded"
+                if LedgerOutcome.SKIPPED in outcomes
+                else "completed"
+            ),
+            planned_work=planned_work,
+        )
+    return {
+        "findings": all_findings,
+        "inspection_ledger": ledger_events,
+        "analyzer_status_events": [status],
+    }

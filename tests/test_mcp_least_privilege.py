@@ -478,3 +478,13 @@ class TestEdgeCases:
             assert lp1.confidence < 0.75, (
                 f"Expected reduced confidence for test-file-only capability, got {lp1.confidence}"
             )
+
+
+class TestInspectionLedgerResponse:
+    def test_missing_manifest_is_an_analyzer_level_non_applicability(self) -> None:
+        result = mcp_least_privilege.node({"components": [], "file_cache": {}})
+
+        assert result["inspection_ledger"] == []
+        status = result["analyzer_status_events"][0]
+        assert status["status"] == "not_applicable"
+        assert status["reason_code"] == "manifest_absent"

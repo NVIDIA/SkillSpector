@@ -23,8 +23,10 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
+from skillspector.inspection_ledger import guard_analyzer_node
 from skillspector.nodes.analyzers import ANALYZER_NODE_IDS, ANALYZER_NODES
 from skillspector.nodes.build_context import build_context
+from skillspector.nodes.finalize_inspection_ledger import finalize_inspection_ledger
 from skillspector.nodes.meta_analyzer import meta_analyzer
 from skillspector.nodes.report import report
 from skillspector.nodes.resolve_input import resolve_input
@@ -38,17 +40,21 @@ def create_graph():
     workflow.add_node("resolve_input", resolve_input)
     workflow.add_node("build_context", build_context)
     workflow.add_node("meta_analyzer", meta_analyzer)
+    workflow.add_node("finalize_inspection_ledger", finalize_inspection_ledger)
     workflow.add_node("report", report)
 
     for analyzer_id in ANALYZER_NODE_IDS:
-        workflow.add_node(analyzer_id, ANALYZER_NODES[analyzer_id])
+        workflow.add_node(
+            analyzer_id, guard_analyzer_node(analyzer_id, ANALYZER_NODES[analyzer_id])
+        )
 
     workflow.add_edge(START, "resolve_input")
     workflow.add_edge("resolve_input", "build_context")
     for analyzer_id in ANALYZER_NODE_IDS:
         workflow.add_edge("build_context", analyzer_id)
         workflow.add_edge(analyzer_id, "meta_analyzer")
-    workflow.add_edge("meta_analyzer", "report")
+    workflow.add_edge("meta_analyzer", "finalize_inspection_ledger")
+    workflow.add_edge("finalize_inspection_ledger", "report")
     workflow.add_edge("report", END)
     return workflow.compile()
 
