@@ -35,22 +35,61 @@ other OpenAI-compatible endpoint is configured via the standard
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
-from typing import NoReturn
+import threading
+import weakref
+from collections.abc import Coroutine
+from typing import Any, NoReturn
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.runnables import Runnable
 
+from skillspector.inference_usage import InferenceUsageCollector, provider_name
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
     create_chat_model,
+    create_chat_model_with_provider,
     get_active_provider,
     get_metadata_provider,
     has_cli_capability,
+    has_provider_binding,
     raise_no_llm_api_key_configured,
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
 from skillspector.providers.openai import OpenAIProvider
+
+_CHAT_MODEL_PROVIDERS: dict[int, tuple[weakref.ReferenceType[object], str]] = {}
+_CHAT_MODEL_PROVIDERS_LOCK = threading.Lock()
+
+
+def register_chat_model_provider(chat_model: object, provider: object) -> None:
+    """Associate a constructed chat model with its effective provider."""
+    model_id = id(chat_model)
+    label = provider if isinstance(provider, str) else provider_name(provider)
+
+    def _discard(model_ref: weakref.ReferenceType[object]) -> None:
+        with _CHAT_MODEL_PROVIDERS_LOCK:
+            current = _CHAT_MODEL_PROVIDERS.get(model_id)
+            if current is not None and current[0] is model_ref:
+                _CHAT_MODEL_PROVIDERS.pop(model_id, None)
+
+    try:
+        model_ref = weakref.ref(chat_model, _discard)
+    except TypeError:
+        return
+    with _CHAT_MODEL_PROVIDERS_LOCK:
+        _CHAT_MODEL_PROVIDERS[model_id] = (model_ref, str(label))
+
+
+def chat_model_provider_name(chat_model: object) -> str | None:
+    """Return the provider recorded by the model-construction dispatch."""
+    with _CHAT_MODEL_PROVIDERS_LOCK:
+        current = _CHAT_MODEL_PROVIDERS.get(id(chat_model))
+        if current is None or current[0]() is not chat_model:
+            return None
+        return current[1]
 
 
 def _resolve_llm_credentials() -> tuple[str, str | None]:
@@ -71,6 +110,9 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
 
 def _resolve_default_chat_model() -> str:
     """Return the default chat model for the endpoint that will be used."""
+    if has_provider_binding():
+        return get_metadata_provider().resolve_model()
+
     if resolve_provider_credentials() is not None:
         return get_metadata_provider().resolve_model()
 
@@ -84,13 +126,26 @@ def _resolve_default_chat_model() -> str:
 def is_llm_available() -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
-    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) the check
-    delegates to the provider's ``is_available()`` method (binary on PATH +
-    auth).  For HTTP providers, it falls back to credential resolution.
+    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) are checked
+    through their ``is_available()`` method first.  Other providers probe the
+    same native chat-model path used by :func:`get_chat_model`; unbound HTTP
+    providers keep the credential-resolution and OpenAI fallback path.
     """
     provider = get_active_provider()
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
+
+    if has_provider_binding():
+        try:
+            model = provider.resolve_model()
+            create_chat_model(
+                model=model,
+                max_tokens=get_max_output_tokens(model),
+                timeout=120,
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        return True, None
     try:
         _resolve_llm_credentials()
     except ValueError as exc:
@@ -123,6 +178,10 @@ class _AgentCLIMessage:
         self.content = content
 
 
+class StructuredOutputParseError(ValueError):
+    """Raised when a structured-output response does not contain a JSON object."""
+
+
 def _extract_json_object(raw: str) -> dict:
     """Extract a single JSON object from a CLI model's text response.
 
@@ -151,7 +210,9 @@ def _extract_json_object(raw: str) -> dict:
                 return obj
         except json.JSONDecodeError:
             pass
-    raise ValueError(f"could not extract a JSON object from CLI response: {raw[:200]!r}")
+    raise StructuredOutputParseError(
+        f"could not extract a JSON object from CLI response: {raw[:200]!r}"
+    )
 
 
 class _StructuredAgentCLIModel:
@@ -176,16 +237,38 @@ class _StructuredAgentCLIModel:
             f"before or after the JSON.\n\nJSON Schema:\n{schema_json}"
         )
 
-    def invoke(self, prompt: str) -> object:
-        raw = self._provider.complete(  # type: ignore[attr-defined]
+    def _complete(self, prompt: str) -> str:
+        """Return provider output before structured parsing begins."""
+        return self._provider.complete(  # type: ignore[attr-defined,no-any-return]
             self._augment(prompt),
             model=self._model,
             max_output_tokens=self._max_output_tokens,
         )
+
+    def invoke(self, prompt: str) -> object:
+        raw = self._complete(prompt)
         return self._schema.model_validate(_extract_json_object(raw))
 
     async def ainvoke(self, prompt: str) -> object:
         return await asyncio.to_thread(self.invoke, prompt)
+
+    def invoke_with_usage(
+        self,
+        prompt: str,
+        collector: InferenceUsageCollector,
+    ) -> object:
+        """Mark this invocation after transport success and before parsing."""
+        raw = self._complete(prompt)
+        collector.mark_response_received()
+        return self._schema.model_validate(_extract_json_object(raw))
+
+    async def ainvoke_with_usage(
+        self,
+        prompt: str,
+        collector: InferenceUsageCollector,
+    ) -> object:
+        """Async counterpart to :meth:`invoke_with_usage`."""
+        return await asyncio.to_thread(self.invoke_with_usage, prompt, collector)
 
 
 class AgentCLIChatModel:
@@ -252,17 +335,81 @@ def get_chat_model(model: str | None = None) -> BaseChatModel | AgentCLIChatMode
     provider = get_active_provider()
     if has_cli_capability(provider):
         resolved_model = model or provider.resolve_model()
-        return AgentCLIChatModel(provider, resolved_model, get_max_output_tokens(resolved_model))
+        chat_model = AgentCLIChatModel(
+            provider,
+            resolved_model,
+            get_max_output_tokens(resolved_model),
+        )
+        register_chat_model_provider(chat_model, provider)
+        return chat_model
 
     model = model or _resolve_default_chat_model()
-    return create_chat_model(
+    chat_model, effective_provider = create_chat_model_with_provider(
         model=model,
         max_tokens=get_max_output_tokens(model),
         timeout=120,
     )
+    register_chat_model_provider(chat_model, effective_provider)
+    return chat_model
 
 
-def chat_completion(prompt: str, *, model: str | None = None) -> str:
+def _invoke_with_usage(runnable: object, prompt: str, collector: InferenceUsageCollector) -> object:
+    """Invoke a LangChain runnable with telemetry without changing CLI adapters."""
+    if isinstance(runnable, Runnable):
+        return runnable.invoke(prompt, config={"callbacks": [collector]})
+    if isinstance(runnable, _StructuredAgentCLIModel):
+        return runnable.invoke_with_usage(prompt, collector)
+    invoke_with_usage = getattr(type(runnable), "invoke_with_usage", None)
+    if callable(invoke_with_usage):
+        return invoke_with_usage(runnable, prompt, collector)
+    if isinstance(runnable, AgentCLIChatModel):
+        response = runnable.invoke(prompt)
+        collector.mark_response_received()
+        return response
+    return runnable.invoke(prompt)  # type: ignore[attr-defined]
+
+
+async def _ainvoke_with_usage(
+    runnable: object, prompt: str, collector: InferenceUsageCollector
+) -> object:
+    """Async counterpart to :func:`_invoke_with_usage`."""
+    if isinstance(runnable, Runnable):
+        return await runnable.ainvoke(prompt, config={"callbacks": [collector]})
+    if isinstance(runnable, _StructuredAgentCLIModel):
+        return await runnable.ainvoke_with_usage(prompt, collector)
+    ainvoke_with_usage = getattr(type(runnable), "ainvoke_with_usage", None)
+    if callable(ainvoke_with_usage):
+        return await ainvoke_with_usage(runnable, prompt, collector)
+    if isinstance(runnable, AgentCLIChatModel):
+        response = await runnable.ainvoke(prompt)
+        collector.mark_response_received()
+        return response
+    return await runnable.ainvoke(prompt)  # type: ignore[attr-defined]
+
+
+def new_inference_usage_collector(
+    *, node: str, request_kind: str, model: str, chat_model: object | None = None
+) -> InferenceUsageCollector:
+    """Build a collector labeled with the provider that will handle the call."""
+    effective_provider = (
+        chat_model_provider_name(chat_model) if chat_model is not None else None
+    ) or provider_name(get_active_provider())
+    return InferenceUsageCollector(
+        node=node,
+        request_kind=request_kind,
+        provider=effective_provider,
+        requested_model=model,
+    )
+
+
+def chat_completion(
+    prompt: str,
+    *,
+    model: str | None = None,
+    usage_collector: InferenceUsageCollector | None = None,
+    node: str = "chat_completion",
+    request_kind: str = "chat_completion",
+) -> str:
     """Request a single chat completion and return the assistant content.
 
     Routes through :func:`get_chat_model`, which dispatches to the CLI adapter
@@ -272,7 +419,50 @@ def chat_completion(prompt: str, *, model: str | None = None) -> str:
     which normalise content blocks to a single string) and falls back to
     ``.content`` for the CLI adapter's ``_AgentCLIMessage``.
     """
-    response = get_chat_model(model=model).invoke(prompt)
+    chat_model = get_chat_model(model=model)
+    active_provider = get_active_provider()
+    resolved_model = str(
+        model
+        or getattr(chat_model, "model_name", None)
+        or getattr(chat_model, "model", None)
+        or active_provider.resolve_model()
+    )
+    collector = usage_collector or new_inference_usage_collector(
+        node=node,
+        request_kind=request_kind,
+        model=resolved_model,
+        chat_model=chat_model,
+    )
+    effective_provider = chat_model_provider_name(chat_model)
+    if usage_collector is not None and effective_provider is not None:
+        collector.set_provider(effective_provider)
+    response = _invoke_with_usage(chat_model, prompt, collector)
     if hasattr(response, "text"):
         return response.text  # type: ignore[union-attr]
     return response.content or ""  # type: ignore[union-attr]
+
+
+def run_async(coroutine: Coroutine) -> Any:
+    """
+    Run an async coroutine in a synchronous context, even if there's already a running event loop.
+
+    This function safely handles nested event loop scenarios (e.g. Jupyter Notebooks, FastAPI,
+    LangGraph Studio) by offloading the coroutine execution to a separate thread with its own
+    event loop when a running loop is detected.
+
+    Args:
+        coroutine: The async coroutine to run
+
+    Returns:
+        The result of the coroutine execution
+
+    Raises:
+        Any exception raised by the coroutine is re-raised as-is
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coroutine).result()

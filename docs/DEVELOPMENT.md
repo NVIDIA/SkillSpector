@@ -79,6 +79,7 @@ All targets assume the virtual environment is **already created and activated**.
 | `zip_bytes`, `mode` | Optional zip input and scan mode |
 | `components` | List of relative file paths in the skill |
 | `file_cache` | Map of path → file contents |
+| `inspection_ledger` | Structured evidence for files excluded, skipped, or failed during analysis; a recognized OMS signature is recorded as an `oms_signature` scope exclusion. |
 | `ast_cache` | Map of path → AST representation (for future use) |
 | `manifest`, `previous_manifest` | Parsed skill metadata (e.g. from SKILL.md) |
 | `component_metadata` | List of dicts: path, type, lines, executable, size_bytes (from build_context) |
@@ -90,7 +91,7 @@ All targets assume the virtual environment is **already created and activated**.
 | `show_suppressed` | When True, baseline-suppressed findings are listed in the report (still excluded from the risk score) |
 | `suppressed_findings` | List of `SuppressedFinding` (finding + reason) produced by the report node |
 | `findings` | All raw findings from analyzers (reducer: `operator.add`) |
-| `filtered_findings` | Findings after meta_analyzer |
+| `filtered_findings` | Report-stage compatibility projection selected from `effective_finding_ids` |
 | `model_config` | Optional model IDs per node (e.g. default, meta_analyzer) |
 | `risk_severity` | Severity band from risk score: LOW, MEDIUM, HIGH, CRITICAL |
 | `risk_recommendation` | SAFE, CAUTION, or DO_NOT_INSTALL (from report node) |
@@ -128,7 +129,7 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 | **resolve_input** | Consumes `input_path` or `skill_path`; resolves URLs/zips/files via InputHandler; sets `skill_path` and (when needed) `temp_dir_for_cleanup` | [resolve_input.py](../src/skillspector/nodes/resolve_input.py) |
 | **build_context** | Reads `skill_path`, populates `components`, `file_cache`, `ast_cache`, `manifest`, `component_metadata`, `has_executable_scripts` | [build_context.py](../src/skillspector/nodes/build_context.py) |
 | **Analyzers** | 22 nodes; each returns `AnalyzerNodeResponse` (list of `Finding`). State reducer appends to `findings`. | [nodes/analyzers/__init__.py](../src/skillspector/nodes/analyzers/__init__.py) (`ANALYZER_NODE_IDS`, `ANALYZER_NODES`) |
-| **meta_analyzer** | Per-file LLM filter/enrich of `findings` → `filtered_findings` via `LLMMetaAnalyzer`; one LLM call per file (or per chunk for oversized files); token budgets from `constants.py`; falls back when `use_llm` is False | [meta_analyzer.py](../src/skillspector/nodes/meta_analyzer.py), [llm_analyzer_base.py](../src/skillspector/nodes/llm_analyzer_base.py) |
+| **meta_analyzer** | Per-file LLM filter/enrich of canonical `findings`; emits ordered `effective_finding_ids` for report selection. One LLM call per file (or per chunk for oversized files); token budgets from `constants.py`; falls back when `use_llm` is False. | [meta_analyzer.py](../src/skillspector/nodes/meta_analyzer.py), [llm_analyzer_base.py](../src/skillspector/nodes/llm_analyzer_base.py) |
 | **report** | Applies baseline suppression (`state["baseline"]`), then builds SARIF 2.1.0, computes `risk_score`, `risk_severity`, `risk_recommendation` from the non-suppressed findings; writes `report_body` from `output_format` (terminal/json/markdown/sarif) | [report.py](../src/skillspector/nodes/report.py) |
 
 ---
@@ -145,7 +146,7 @@ There are no conditional edges: after `resolve_input` → `build_context`, all a
 | `llm_utils.py` | `chat_completion()` for OpenAI-compatible / NVIDIA Inference API |
 | `cli.py` | Typer app: `scan` (with input resolution, `--format`, `--no-llm`), `--version` |
 | `input_handler.py` | Resolves Git URL, file URL, .zip, single file, or directory to a local directory path |
-| `suppression.py` | Baseline / false-positive suppression: `Baseline`, `SuppressionRule`, `load_baseline`, `partition_findings`, `finding_fingerprint`, `build_baseline_dict` (see [SUPPRESSION.md](SUPPRESSION.md)) |
+| `suppression.py` | Baseline / false-positive suppression: `Baseline`, `SuppressionRule`, `load_baseline`, `partition_findings`, `finding_fingerprint`, `build_baseline_dict`; exact v2 fingerprints require the scanner version and source `file_cache` (see [SUPPRESSION.md](SUPPRESSION.md)) |
 | `__init__.py` | Package version (from pyproject.toml via `importlib.metadata`) |
 | `sarif_models.py` | SARIF 2.1.0 Pydantic models and `validate_sarif_report()` |
 | **nodes/** | |
@@ -207,7 +208,7 @@ result = graph.invoke({
 # Or: graph.stream(...)
 ```
 
-Optional state keys: `mode`, `model_config`, `output_format`, `use_llm`. The result includes `findings`, `filtered_findings`, `sarif_report`, `risk_score`, `risk_severity`, `risk_recommendation`, and `report_body` (formatted string for the requested `output_format`).
+Optional state keys: `mode`, `model_config`, `output_format`, `use_llm`. The final report result includes canonical `findings`, the report-projected `filtered_findings`, `sarif_report`, `risk_score`, `risk_severity`, `risk_recommendation`, and `report_body` (formatted string for the requested `output_format`).
 
 ---
 
@@ -221,13 +222,41 @@ Optional state keys: `mode`, `model_config`, `output_format`, `use_llm`. The res
 - **Commands**: `make test`, `make test-cov`.
 - **Key tests**: [test_graph.py](../tests/integration/test_graph.py) invokes the graph and asserts `findings`, `sarif_report`, `risk_score`, `report_body`; [test_input_handler.py](../tests/unit/test_input_handler.py) covers directory, zip, and single-file resolution; [test_resolve_input.py](../tests/nodes/test_resolve_input.py) covers the resolve_input node; [test_build_context.py](../tests/nodes/test_build_context.py) asserts `component_metadata` and `has_executable_scripts`.
 
+### CI coverage: public GitHub and internal GitLab
+
+SkillSpector uses its public GitHub Actions workflow as the contributor-facing
+quality gate and runs an additional validation pipeline in NVIDIA's internal
+GitLab. The two pipelines intentionally share the core checks, while each also
+has checks suited to its environment.
+
+| Check | Public GitHub CI | Internal GitLab CI |
+|-------|------------------|--------------------|
+| Trigger | Pull requests to `main` and pushes to `main` | Merge requests targeting `main` and pushes to the default branch |
+| Runtime | Python 3.12 with `uv` on GitHub-hosted Ubuntu runners | Python 3.12 with `uv` in a container on internal Kubernetes runners |
+| Lint and formatting | Ruff lint and format checks | The same Ruff lint and format checks |
+| Unit tests | Non-integration, non-provider tests with coverage | The same unit-test set with Cobertura coverage artifacts |
+| Integration tests | Not run | Full-graph integration suite; these tests may call configured LLM providers |
+| Live provider tests | Not run | Optional manual tests against OpenAI, Anthropic, and NVIDIA Build using masked CI credentials |
+| Docker smoke test | Runs when Docker- or application-related files change and uploads smoke reports | Runs for the same categories of changes with Docker-in-Docker and preserves smoke reports |
+| Static analysis | OpenSSF Scorecard runs in a separate public workflow | SonarQube runs after unit tests and is currently non-blocking |
+| Contribution policy | DCO sign-off check on pull requests | No separate DCO job |
+| Automated review | No review bot job is defined in the workflow | CodeRabbit is connected through an external integration/webhook, not a runner job |
+
+The internal pipeline therefore adds coverage for the full application flow,
+live provider connectivity, and SonarQube analysis. Its default-branch pipeline
+rechecks the exact commit that landed after a merge. Live provider testing is
+manual so it only sends requests when a maintainer chooses to run it; missing
+credentials produce a warning, while invalid credentials or provider failures
+fail the corresponding test. SonarQube is informational today and does not
+block a merge request.
+
 ---
 
 ## 8. Data models
 
 - **Finding** ([models.py](../src/skillspector/models.py)): `rule_id`, `message`, `severity`, `confidence`, `file`, `start_line`, `end_line`, `category`, `pattern`, `finding`, `explanation`, `remediation`, `code_snippet`, `intent`, `tags`, `context`, `matched_text`. This is the type stored in state and used in SARIF and JSON report output.
 - **AnalyzerFinding**: Analyzer-facing type with `Location` and `Severity` enum. Convert to `Finding` via [static_runner.analyzer_finding_to_finding](../src/skillspector/nodes/analyzers/static_runner.py) (or equivalent).
-- **SARIF**: [sarif_models.py](../src/skillspector/sarif_models.py) provides Pydantic models for SARIF 2.1.0. The report node builds a `SarifLog` from `filtered_findings`.
+- **SARIF**: [sarif_models.py](../src/skillspector/sarif_models.py) provides Pydantic models for SARIF 2.1.0. The report node builds a `SarifLog` from its effective-ID-selected findings.
 
 ---
 
@@ -269,6 +298,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
+| `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged; unset or blank preserves provider-default behavior. | `high` |
 | `ANTHROPIC_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=anthropic`. | `sk-ant-...` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). For `claude_cli`, this is passed as `--model` to the `claude` binary. | `gpt-5.2` |
 

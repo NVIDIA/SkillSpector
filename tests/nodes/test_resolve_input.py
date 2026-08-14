@@ -17,6 +17,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from skillspector.nodes.resolve_input import resolve_input
 
 
@@ -36,6 +38,21 @@ def test_resolve_input_with_skill_path_only(tmp_path: Path) -> None:
     update = resolve_input(state)
     assert update["skill_path"] == str(tmp_path.resolve())
     assert update.get("temp_dir_for_cleanup") is None
+
+
+def test_resolve_input_rejects_skill_path_with_symlinked_parent(tmp_path: Path) -> None:
+    """The skill_path-only route must enforce the same symlink policy as input_path."""
+    external_skill = tmp_path / "external" / "skill"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# External skill", encoding="utf-8")
+    symlinked_parent = tmp_path / "linked"
+    try:
+        symlinked_parent.symlink_to(external_skill.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    with pytest.raises(ValueError, match="symlinked parent"):
+        resolve_input({"skill_path": str(symlinked_parent / external_skill.name)})
 
 
 def test_resolve_input_prefers_input_path_over_skill_path(tmp_path: Path) -> None:
