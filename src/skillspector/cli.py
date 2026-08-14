@@ -36,6 +36,7 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.input_handler import validate_local_input_path
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
@@ -323,7 +324,13 @@ def scan(
     if verbose:
         set_level("DEBUG")
 
-    resolved_path = Path(input_path).resolve()
+    resolved_path = Path(input_path)
+    if not input_path.startswith(("http://", "https://", "git@")):
+        try:
+            resolved_path = validate_local_input_path(resolved_path)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=2) from e
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
