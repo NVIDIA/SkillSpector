@@ -27,14 +27,15 @@ installed.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
-from skillspector.providers import resolve_provider_credentials
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -44,11 +45,33 @@ logger = get_logger(__name__)
 VALID_FORMATS = ("json", "markdown", "sarif", "terminal")
 
 
+def _is_local_target(target: str) -> bool:
+    """Return True when ``target`` names local filesystem content."""
+    stripped = target.strip()
+    if stripped.startswith("file://"):
+        return True
+    if stripped.startswith("git@"):
+        return False
+    if stripped.startswith(("\\\\", "//")):
+        return True
+    if "://" in stripped:
+        return False
+
+    try:
+        candidate = Path(stripped).expanduser()
+    except RuntimeError:
+        return True
+    if candidate.is_absolute() or candidate.drive:
+        return True
+    return candidate.exists()
+
+
 async def run_scan(
     target: str,
     *,
     use_llm: bool = True,
     output_format: str = "json",
+    allow_local_targets: bool = True,
     yara_rules_dir: str | None = None,
 ) -> dict[str, Any]:
     """Invoke the SkillSpector graph and return a structured verdict.
@@ -56,10 +79,14 @@ async def run_scan(
     Args:
         target: Git URL, file URL, ``.zip``, ``.md`` file, or local directory.
         use_llm: Whether to request the optional LLM semantic pass on top of
-            static analysis. Honoured only when provider credentials resolve;
-            the returned payload reports what actually happened.
+            static analysis. Honoured only when the active provider can
+            actually build or run the LLM pass; the returned payload reports
+            what actually happened.
         output_format: Format of the embedded ``report`` string. One of
             :data:`VALID_FORMATS`.
+        allow_local_targets: Whether local filesystem targets are allowed.
+            HTTP MCP calls set this to ``False`` so routable servers do not
+            accept caller-controlled local paths.
         yara_rules_dir: Optional directory of additional YARA rules.
 
     Returns:
@@ -71,8 +98,13 @@ async def run_scan(
     """
     if output_format not in VALID_FORMATS:
         raise ValueError(f"output_format must be one of {VALID_FORMATS}, got {output_format!r}")
+    if not allow_local_targets:
+        local_target = _is_local_target(target)
+        local_yara_rules = yara_rules_dir is not None and _is_local_target(yara_rules_dir)
+        if local_target or local_yara_rules:
+            raise ValueError("local targets are disabled for this MCP transport")
 
-    llm_available = resolve_provider_credentials() is not None
+    llm_available, _ = is_llm_available()
     llm_used = use_llm and llm_available
 
     state: dict[str, Any] = {
@@ -107,12 +139,20 @@ async def run_scan(
         )
         findings = result.get("filtered_findings") or result.get("findings") or []
         risk_score = int(result.get("risk_score") or 0)
+        execution_successful = bool(result.get("execution_successful", True))
+        analysis_completeness = result.get("analysis_completeness") or {}
+        entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
+        safe_to_install = (
+            risk_score <= RISK_THRESHOLD and execution_successful and entirely_uninspected == 0
+        )
         return {
             "target": target,
             "risk_score": risk_score,
             "severity": result.get("risk_severity"),
             "recommendation": result.get("risk_recommendation"),
-            "safe_to_install": risk_score <= RISK_THRESHOLD,
+            "safe_to_install": safe_to_install,
+            "execution_successful": execution_successful,
+            "analysis_completeness": analysis_completeness,
             "findings": [f.to_dict() for f in findings],
             "report": result.get("report_body") or "",
             # Honest LLM accounting — never silently imply a full semantic scan.
@@ -127,10 +167,11 @@ async def run_scan(
             cleanup_result(result)
 
 
-def build_server(name: str = "skillspector") -> FastMCP:
+def build_server(name: str = "skillspector", *, allow_local_targets: bool = False) -> FastMCP:
     """Construct the FastMCP server exposing the ``scan_skill`` tool.
 
     Requires the optional ``mcp`` dependency (``pip install 'skillspector[mcp]'``).
+    Local targets stay disabled unless the caller selects a trusted transport.
     """
     try:
         from mcp.server.fastmcp import FastMCP
@@ -160,14 +201,19 @@ def build_server(name: str = "skillspector") -> FastMCP:
         actually ran, so a low score from a static-only scan is not mistaken for
         a clean full scan.
         """
-        return await run_scan(target, use_llm=use_llm, output_format=output_format)
+        return await run_scan(
+            target,
+            use_llm=use_llm,
+            output_format=output_format,
+            allow_local_targets=allow_local_targets,
+        )
 
     return server
 
 
 def run(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
     """Run the MCP server over ``stdio`` (local agents) or ``http`` (remote/A2A)."""
-    server = build_server()
+    server = build_server(allow_local_targets=transport == "stdio")
     if transport == "stdio":
         server.run(transport="stdio")
     elif transport == "http":

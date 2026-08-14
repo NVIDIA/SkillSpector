@@ -212,6 +212,6 @@ def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run rogue_agent patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

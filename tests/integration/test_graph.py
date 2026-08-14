@@ -42,6 +42,89 @@ def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
     assert "components" in data
 
 
+def test_graph_excludes_valid_oms_signature_from_static_findings(tmp_path: Path) -> None:
+    """A real OMS signature remains inventoried without producing scan findings."""
+    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
+    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
+    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = graph.invoke(
+        {
+            "skill_path": str(tmp_path),
+            "output_format": "json",
+            "use_llm": False,
+        }
+    )
+
+    report = json.loads(result["report_body"])
+    signature_component = next(
+        component for component in report["components"] if component["path"] == "skill.oms.sig"
+    )
+    assert signature_component["type"] == "oms_signature"
+    assert report["analysis_completeness"]["coverage_percent"] == 100.0
+    assert report["analysis_completeness"]["scope_exclusions"] == [
+        {
+            "outcome": "out_of_scope",
+            "phase": "discovery",
+            "reason_code": "oms_signature",
+            "message": "Recognized OMS signature metadata is excluded from content analysis.",
+            "path": "skill.oms.sig",
+            "start_line": None,
+            "end_line": None,
+            "fatal": False,
+        }
+    ]
+    assert report["analysis_completeness"]["ledger_exceptions"] == []
+    assert report["analysis_completeness"]["execution_successful"] is True
+    assert "skill.oms.sig" not in result["components"]
+    assert "skill.oms.sig" not in result["file_cache"]
+    assert not any(
+        event["path"] == "skill.oms.sig" and event["outcome"] == "failed"
+        for event in result["inspection_ledger"]
+    )
+    assert all(finding.file != "skill.oms.sig" for finding in result["findings"])
+    assert all(issue["file"] != "skill.oms.sig" for issue in report["issues"])
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
+def test_graph_reports_oms_scope_exclusion_in_every_non_json_format(
+    tmp_path: Path, output_format: str
+) -> None:
+    """OMS scope exclusions remain visible in every user-facing report format."""
+    fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
+    (tmp_path / "SKILL.md").write_text("---\nname: signed\n---\n# Signed\n", encoding="utf-8")
+    (tmp_path / "skill.oms.sig").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result = graph.invoke(
+        {
+            "skill_path": str(tmp_path),
+            "output_format": output_format,
+            "use_llm": False,
+        }
+    )
+
+    scope_exclusion = result["analysis_completeness"]["scope_exclusions"]
+    assert scope_exclusion[0]["path"] == "skill.oms.sig"
+    assert scope_exclusion[0]["reason_code"] == "oms_signature"
+
+    if output_format == "sarif":
+        notifications = result["sarif_report"]["runs"][0]["invocations"][0][
+            "toolExecutionNotifications"
+        ]
+        notification = next(
+            item for item in notifications if item["properties"]["reasonCode"] == "oms_signature"
+        )
+        assert notification["level"] == "note"
+        assert notification["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == (
+            "skill.oms.sig"
+        )
+    else:
+        expected_heading = "Scope exclusions" if output_format == "terminal" else "Scope Exclusions"
+        assert expected_heading in result["report_body"]
+        assert "oms_signature" in result["report_body"]
+        assert "skill.oms.sig" in result["report_body"]
+
+
 def test_graph_invoke_returns_findings_and_report(tmp_path: Path) -> None:
     """Graph runs to completion; returns findings, SARIF report, report_body, risk_score."""
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
@@ -85,10 +168,26 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
     def boom(*_a: object, **_k: object) -> object:
         raise RuntimeError("simulated LLM transport failure")
 
-    # Fail both LLM transports: get_chat_model (semantic analyzers + meta) and
-    # chat_completion (mcp_tool_poisoning TP4).
+    class FailingTP4Analyzer:
+        """Simulate an attempted TP4 request failing after analyzer setup."""
+
+        @property
+        def inference_usage(self) -> list[object]:
+            return []
+
+        def __init__(self, _model: str) -> None:
+            pass
+
+        def run_batches_detailed(self, _batches: object) -> object:
+            raise RuntimeError("simulated LLM transport failure")
+
+    # Semantic analyzers and meta_analyzer fail while constructing their shared
+    # transport. TP4's analyzer construction is deliberately not an attempted
+    # LLM call, so fail it at batch execution to assert its ledger projection.
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", boom)
-    monkeypatch.setattr("skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion", boom)
+    monkeypatch.setattr(
+        "skillspector.nodes.analyzers.mcp_tool_poisoning._TP4Analyzer", FailingTP4Analyzer
+    )
 
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"})
 
@@ -103,14 +202,16 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
         "semantic_developer_intent",
         "semantic_quality_policy",
         "meta_analyzer",
+        "mcp_tool_poisoning",
     } <= nodes
 
     meta = json.loads(result["report_body"])["metadata"]
     assert meta["llm_available"] is False
     assert meta["llm_degraded"] is True
     assert meta["llm_calls_succeeded"] == 0
+    assert result["execution_successful"] is False
 
     notification = result["sarif_report"]["runs"][0]["invocations"][0][
         "toolExecutionNotifications"
     ][0]
-    assert notification["level"] == "warning"
+    assert notification["level"] == "error"

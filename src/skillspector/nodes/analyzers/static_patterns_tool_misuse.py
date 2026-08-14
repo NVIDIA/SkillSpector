@@ -44,21 +44,32 @@ TM1_PATTERNS = [
     # shell=True is a classic command injection vector
     (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True", 0.8),
     (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
-    # Dangerous flags — \b prevents matching rm/del inside words like firmware, format
-    (r"\b(?:rm|del|erase)\s+[^|]*-(?:r|rf|fr)\s+[/~]", 0.9),
+    # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
+    # Memory Manager headers) are not interpreted as destructive commands.
+    (r"\b(?:rm\b|del\b|erase\b)\s+[^|]*-(?:r|rf|fr)\s+[/~]", 0.9),
     (r"--force\s+(?:delete|remove|push|reset|clean)", 0.7),
-    (r"--no-?(?:verify|check|validate|confirm|protect|safe)", 0.75),
+    # A bare application-defined --no-verify flag is ambiguous. Match it only
+    # for known Git hook bypasses below; retain the other explicit unsafe flags.
+    (r"--no-?(?:check|validate|confirm|protect|safe)\b", 0.75),
     (r"--skip-?(?:validation|verification|checks?|auth|tests?)", 0.7),
-    (r"--allow-?(?:empty|root|unrelated|unsafe)", 0.65),
+    # --allow-empty is a benign git-commit option, unlike the bypass flags below.
+    (r"--allow-?(?:root|unrelated|unsafe)\b", 0.65),
     # Dangerous globs and wildcards in destructive commands
-    # \b prevents matching substrings (e.g. "firmware", "format", "performance")
-    # [^)\n]{0,80} bounds the span to avoid matching across long prose to a stray "/"
-    (r"\b(?:rm|shutil\.rmtree)\s*\(?[^)\n]{0,80}['\"]?\s*/\s*['\"]?", 0.85),
+    # Match a path in the actual rm argument token. Stop at whitespace and shell
+    # redirection operators so `rm "$VAR" 2>/dev/null` does not borrow the slash
+    # from the redirection target.
+    (
+        r"\brm\b\s+(?:-[A-Za-z]+\s+)*(?:--\s+)?"
+        r"(?:['\"][^'\"]*/[^'\"]*['\"]|[^\s|;&>]*/[^\s|;&>]*)",
+        0.85,
+    ),
+    (r"\bshutil\.rmtree\s*\(\s*['\"]\s*/", 0.85),
     (r"(?:chmod|chown)\s+[^|]*(?:777|666|a\+rwx)", 0.8),
     # Git force operations
     (r"git\s+push\s+[^|]*--force", 0.7),
     (r"git\s+reset\s+--hard", 0.65),
     (r"git\s+clean\s+-[fd]+x", 0.7),
+    (r"\bgit\s+(?:am|commit|merge|push)\b[^\n|]*--no-verify\b", 0.75),
     # Curl/wget with unsafe parameters
     (r"curl\s+[^|]*-k\b", 0.6),
     (r"curl\s+[^|]*--insecure\b", 0.65),
@@ -74,7 +85,7 @@ TM1_PATTERNS = [
     ),
     # Dangerous tool parameter patterns in instructions
     (
-        r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|--no-verify|-rf)\b",
+        r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|-rf)\b",
         0.75,
     ),
 ]
@@ -82,7 +93,7 @@ TM1_PATTERNS = [
 # TM2: Chaining Abuse — chained commands to bypass safety
 TM2_PATTERNS = [
     # Shell command chaining with dangerous commands (\b prevents substring matches)
-    (r"(?:&&|;)\s*\b(?:rm|del|erase)\s+-", 0.75),
+    (r"(?:&&|;)\s*\b(?:rm\b|del\b|erase\b)\s+-", 0.75),
     (r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh", 0.9),
     (r"(?:&&|;)\s*(?:sudo|su\s+)", 0.75),
     (r"(?:&&|;)\s*(?:chmod|chown)\s+(?:777|666|a\+rwx|-R)", 0.75),
@@ -336,6 +347,6 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run tool_misuse patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

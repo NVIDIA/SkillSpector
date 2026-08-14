@@ -8,8 +8,8 @@
     "extensions": ["./extensions/skillspector.ts"]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": ">=0.78.1",
+    "@earendil-works/pi-coding-agent": ">=0.78.1",
     "typebox": "*"
   }
 }

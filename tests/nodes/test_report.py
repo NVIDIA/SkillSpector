@@ -84,6 +84,13 @@ class TestComputeRiskScoreBasic:
         score, _, _ = _compute_risk_score(findings, False)
         assert score == 12  # 25 * 1.0 * 0.5 = 12.5 -> int(12.5) = 12
 
+    def test_shipped_bytecode_enforces_blocking_risk_floor(self) -> None:
+        findings = [_finding("SC8", "HIGH", confidence=0.95, file="payload.pyc")]
+        score, band, recommendation = _compute_risk_score(findings, False)
+        assert score == 51
+        assert band == "HIGH"
+        assert recommendation == "DO_NOT_INSTALL"
+
     def test_unknown_severity_defaults_to_low_points(self) -> None:
         f = _finding("R1", "LOW")
         f.severity = ""
@@ -475,6 +482,52 @@ class TestReportNode:
         assert "## Components" in body
         assert "## Issues" in body
 
+    def test_report_markdown_lists_nonfatal_llm_validation_exception(self) -> None:
+        """A non-fatal structured-output failure remains visible in the report."""
+        state: SkillspectorState = {
+            "filtered_findings": [],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "markdown",
+            "execution_successful": True,
+            "analysis_completeness": {
+                "coverage_percent": 0.0,
+                "fully_inspected_files": 0,
+                "partially_inspected_files": 0,
+                "entirely_uninspected_files": 1,
+                "is_complete": False,
+                "execution_successful": True,
+                "ledger_exceptions": [
+                    {
+                        "reason_code": "llm_structured_response_invalid",
+                        "path": "SKILL.md",
+                        "message": "LLM returned a malformed structured response after bounded retries.",
+                        "fatal": False,
+                    }
+                ],
+                "scope_exclusions": [],
+                "analyzer_statuses": [
+                    {
+                        "analyzer_id": "semantic_quality_policy",
+                        "status": "degraded",
+                        "planned_work": [],
+                    }
+                ],
+                "limitations": ["Analyzer semantic_quality_policy status: degraded."],
+            },
+        }
+
+        body = report(state)["report_body"]
+
+        assert "| Execution | successful |" in body
+        assert "### Ledger Exceptions" in body
+        assert "llm_structured_response_invalid" in body
+        assert "`SKILL.md`" in body
+        assert "### Analyzer Statuses" in body
+        assert "### Limitations" in body
+
     def test_report_output_format_terminal(self) -> None:
         """output_format terminal produces Rich-formatted output."""
         state: SkillspectorState = {
@@ -506,6 +559,37 @@ class TestReportNode:
         data = json.loads(body)
         assert "runs" in data
         assert data.get("$schema") or "runs" in data
+
+    def test_report_output_format_sarif_includes_finding_properties(self) -> None:
+        finding = _finding("E2", "HIGH", "env harvest", confidence=0.85, file="tool.py")
+        finding.category = "environment"
+        finding.pattern = r"os\.environ"
+        finding.finding = "TOKEN lookup"
+        finding.explanation = "Environment-derived secret access"
+        finding.remediation = "Drop env var usage"
+        finding.code_snippet = "os.environ['TOKEN']"
+        finding.intent = "secret_exfiltration"
+        finding.tags = ["env", "secret"]
+        state: SkillspectorState = {
+            "filtered_findings": [finding],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "sarif",
+        }
+        result = report(state)
+        result_row = result["sarif_report"]["runs"][0]["results"][0]
+        assert result_row["properties"]["severity"] == "HIGH"
+        assert result_row["properties"]["category"] == "environment"
+        assert result_row["properties"]["pattern"] == r"os\.environ"
+        assert result_row["properties"]["confidence"] == 0.85
+        assert result_row["properties"]["finding"] == "TOKEN lookup"
+        assert result_row["properties"]["explanation"] == "Environment-derived secret access"
+        assert result_row["properties"]["remediation"] == "Drop env var usage"
+        assert result_row["properties"]["code_snippet"] == "os.environ['TOKEN']"
+        assert result_row["properties"]["intent"] == "secret_exfiltration"
+        assert result_row["properties"]["tags"] == ["env", "secret"]
 
     def test_report_default_output_format_is_sarif(self) -> None:
         """When output_format is missing, report uses sarif."""
@@ -553,8 +637,17 @@ class TestReportNode:
 def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     """A baseline-suppressed CRITICAL finding does not count toward the risk score."""
     baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="false positive")])
+    suppressed_finding = _finding("P5", "CRITICAL", confidence=1.0)
+    suppressed_finding.category = "critical_path"
+    suppressed_finding.pattern = r"exec\("
+    suppressed_finding.finding = "exec call"
+    suppressed_finding.explanation = "Dynamic execution remains reachable"
+    suppressed_finding.remediation = "Drop suspicious logic"
+    suppressed_finding.code_snippet = "exec(payload)"
+    suppressed_finding.intent = "command_execution"
+    suppressed_finding.tags = ["critical", "injection"]
     state: SkillspectorState = {
-        "filtered_findings": [_finding("P5", "CRITICAL")],
+        "filtered_findings": [suppressed_finding],
         "component_metadata": [],
         "has_executable_scripts": False,
         "manifest": {},
@@ -570,7 +663,19 @@ def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     # (audit trail) so consumers exclude them from counts.
     sarif_results = result["sarif_report"]["runs"][0]["results"]
     assert len(sarif_results) == 1
-    assert sarif_results[0]["suppressions"][0]["kind"] == "external"
+    suppressed_result = sarif_results[0]
+    assert suppressed_result["suppressions"][0]["kind"] == "external"
+    assert suppressed_result["suppressions"][0]["justification"] == "false positive"
+    assert suppressed_result["properties"]["severity"] == "CRITICAL"
+    assert suppressed_result["properties"]["category"] == "critical_path"
+    assert suppressed_result["properties"]["pattern"] == r"exec\("
+    assert suppressed_result["properties"]["confidence"] == 1.0
+    assert suppressed_result["properties"]["finding"] == "exec call"
+    assert suppressed_result["properties"]["explanation"] == "Dynamic execution remains reachable"
+    assert suppressed_result["properties"]["remediation"] == "Drop suspicious logic"
+    assert suppressed_result["properties"]["code_snippet"] == "exec(payload)"
+    assert suppressed_result["properties"]["intent"] == "command_execution"
+    assert suppressed_result["properties"]["tags"] == ["critical", "injection"]
     assert len(result["suppressed_findings"]) == 1
 
 
@@ -723,6 +828,51 @@ def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) 
     assert "llm_calls_attempted" not in meta
 
 
+def test_json_report_exposes_only_sanitized_provider_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+        "inference_usage": [
+            {
+                "node": "meta_analyzer",
+                "request_kind": "structured_output",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "model_source": "provider_response",
+                "usage_source": "provider_response",
+                "prompt_tokens": 123,
+                "completion_tokens": 45,
+                "total_tokens": 168,
+                "secret": "not serialized",
+            }
+        ],
+    }
+
+    meta = _meta_from_json_report(state)
+
+    assert meta["inference_usage"] == [
+        {
+            "node": "meta_analyzer",
+            "request_kind": "structured_output",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "model_source": "provider_response",
+            "usage_source": "provider_response",
+            "prompt_tokens": 123,
+            "completion_tokens": 45,
+            "total_tokens": 168,
+        }
+    ]
+
+
 def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm False -> failures (if any) never mark the scan degraded."""
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
@@ -799,8 +949,8 @@ def test_report_sarif_carries_degradation_notification() -> None:
     validate_sarif_report(result["sarif_report"])
 
 
-def test_report_sarif_no_invocations_when_not_degraded() -> None:
-    """A healthy scan's SARIF output is unchanged (no invocations block)."""
+def test_report_sarif_has_successful_invocation_when_not_degraded() -> None:
+    """SARIF always records the single canonical inspection invocation."""
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -811,7 +961,9 @@ def test_report_sarif_no_invocations_when_not_degraded() -> None:
         "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
     }
     result = report(state)
-    assert "invocations" not in result["sarif_report"]["runs"][0]
+    invocations = result["sarif_report"]["runs"][0]["invocations"]
+    assert len(invocations) == 1
+    assert invocations[0]["executionSuccessful"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -914,3 +1066,24 @@ def test_report_doc_findings_no_multiplier() -> None:
     # Without the multiplier: 2 HIGH = 50, not 65
     assert result["risk_score"] == 50
     assert result["risk_severity"] == "MEDIUM"
+
+
+def test_report_sarif_preserves_high_vs_critical_severity() -> None:
+    """HIGH and CRITICAL both map to SARIF error, but properties keep the exact severity."""
+    state: SkillspectorState = {
+        "filtered_findings": [
+            _finding("R1", "HIGH", message="high finding", file="high.py"),
+            _finding("R2", "CRITICAL", message="critical finding", file="critical.py"),
+        ],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "sarif",
+    }
+    results = report(state)["sarif_report"]["runs"][0]["results"]
+    by_rule = {item["ruleId"]: item for item in results}
+    assert by_rule["R1"]["level"] == "error"
+    assert by_rule["R2"]["level"] == "error"
+    assert by_rule["R1"]["properties"]["severity"] == "HIGH"
+    assert by_rule["R2"]["properties"]["severity"] == "CRITICAL"
