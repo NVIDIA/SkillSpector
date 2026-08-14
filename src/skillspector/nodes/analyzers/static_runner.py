@@ -209,6 +209,16 @@ def _is_canonical_skill_md(path: str) -> bool:
     return normalized.rsplit("/", 1)[-1].lower() == "skill.md"
 
 
+def _is_fenced_code_block(content: str, line_number: int) -> bool:
+    """Return True when a 1-based content line is inside a triple-backtick block."""
+    if line_number <= 1:
+        return False
+    fence_count = sum(
+        line.lstrip().startswith("```") for line in content.splitlines()[: line_number - 1]
+    )
+    return fence_count % 2 == 1
+
+
 _DOCUMENTATION_DIR_NAMES = (
     "docs",
     "documentation",
@@ -370,7 +380,10 @@ def _scan_path(
                 af.rule_id != "PE3"
                 and af.context
                 and is_code_example(af.context)
-                and not (_is_canonical_skill_md(path) and "```" in af.context)
+                and not (
+                    _is_canonical_skill_md(path)
+                    and _is_fenced_code_block(content, af.location.start_line)
+                )
             ):
                 if is_non_executable:
                     logger.debug(

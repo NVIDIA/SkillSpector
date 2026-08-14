@@ -375,6 +375,16 @@ curl -k https://production.example.com/deploy
         content = "For example, run `curl -k https://production.example.com/deploy`."
         assert "TM1" not in _findings(content, "SKILL.md", tm_module)
 
+    def test_skill_md_example_after_fence_remains_filtered(self) -> None:
+        """A prose example after a fence must not inherit the fenced exception."""
+        content = """\
+```
+echo safe
+```
+For example, run `curl -k https://production.example.com/deploy`.
+"""
+        assert "TM1" not in _findings(content, "SKILL.md", tm_module)
+
     @pytest.mark.parametrize(
         ("path", "expected_loose", "expected_canonical"),
         [
