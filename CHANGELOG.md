@@ -1,3 +1,15 @@
+### 2.9.4 (Wednesday, August 12, 2026)
+### Features/Bug Fixes
+* fix(mcp): reject local targets over HTTP transport (#196)
+* Add Skill Inspector companion skill (#253)
+* fix(lp3): remediation and docs name allowed-tools for SKILL.md (#316)
+* chore(openssf-scorecard): Add badge (#351)
+* Detect whitespace padding used to hide prompt-injection instructions (P9) (#24)
+* fix(analyzers): HIGH SC8 when skill ships __pycache__ or .pyc (#357)
+* Revert "Scope the locality guard to the namespace"
+* Scope the locality guard to the namespace
+* fix(security): reject symlinks in skill walk + disable git symlinks on clone
+---
 ### 2.9.3 (Tuesday, August 11, 2026)
 ### Features/Bug Fixes
 * fix(llm): surface invalid responses as degraded (skipped, non-fatal, incomplete)

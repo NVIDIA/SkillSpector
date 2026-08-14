@@ -32,6 +32,12 @@ from stat import S_ISREG
 import yaml
 
 from skillspector.constants import MAX_FILE_BYTES, build_model_config
+from skillspector.input_handler import (
+    _FileOpenError,
+    _open_regular_file_no_follow,
+    _UnsafeFileError,
+    validate_local_input_path,
+)
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -86,7 +92,7 @@ def _resolve_skill_dir(state: SkillspectorState) -> Path:
     if not skill_path or not isinstance(skill_path, str) or not skill_path.strip():
         raise ValueError("skill_path is required; provide input_path or skill_path to scan")
     try:
-        resolved = Path(skill_path).resolve()
+        resolved = validate_local_input_path(Path(skill_path))
     except (OSError, RuntimeError) as e:
         raise ValueError(f"Invalid skill_path: {skill_path}") from e
     if not resolved.is_dir():
@@ -130,23 +136,50 @@ def _selected_baseline_component(
     return None
 
 
+def _is_symlink(path: Path) -> bool:
+    """Return whether *path* is a link or junction without masking later stat errors."""
+    try:
+        return path.is_symlink() or path.is_junction()
+    except OSError:
+        return False
+
+
+def _resolves_outside(path: Path, root: Path) -> bool:
+    """Return whether *path* resolves outside an already-resolved *root*."""
+    try:
+        return not path.resolve(strict=False).is_relative_to(root)
+    except OSError:
+        return False
+
+
+def _read_text_no_follow(path: Path) -> str:
+    """Read a regular file without following symlinks at open time."""
+    with _open_regular_file_no_follow(path) as source:
+        return source.read().decode("utf-8", errors="replace")
+
+
 def _walk_skill_files(
     skill_dir: Path,
 ) -> tuple[list[str], list[InspectionLedgerEvent]]:
     """Walk skill files and record scan-scope exclusions.
 
-    Skips _SKIP_DIRS and hidden files except those starting with .claude.
+    Skips _SKIP_DIRS, hidden files except those starting with .claude, and
+    symlinks, which must never supply content to remote LLM analyzers.
     """
     paths: list[str] = []
     exclusions: list[InspectionLedgerEvent] = []
-    for root, dirnames, filenames in os.walk(skill_dir):
+    skill_root = skill_dir.resolve(strict=False)
+    for root, dirnames, filenames in os.walk(skill_dir, followlinks=False):
         root_path = Path(root)
         dirnames.sort()
         filenames.sort()
         relative_root = root_path.relative_to(skill_dir)
 
         skipped_dirnames = [name for name in dirnames if name in _SKIP_DIRS]
-        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
+        symlinked_dirnames = [name for name in dirnames if _is_symlink(root_path / name)]
+        dirnames[:] = [
+            name for name in dirnames if name not in _SKIP_DIRS and name not in symlinked_dirnames
+        ]
         for dirname in skipped_dirnames:
             boundary = (relative_root / dirname).as_posix()
             exclusions.append(
@@ -156,6 +189,17 @@ def _walk_skill_files(
                     phase="discovery",
                     path=f"{boundary}/",
                     reason=LedgerReason.EXCLUDED_DIRECTORY,
+                )
+            )
+        for dirname in symlinked_dirnames:
+            boundary = (relative_root / dirname).as_posix()
+            exclusions.append(
+                ledger_event(
+                    outcome=LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                    phase="discovery",
+                    path=f"{boundary}/",
+                    reason=LedgerReason.NOT_REGULAR_FILE,
                 )
             )
 
@@ -174,10 +218,21 @@ def _walk_skill_files(
                 continue
 
             # Use forward slashes on every OS: these relative paths are dict keys
-            # and SARIF/URI locations, so they must be portable.  Do not filter
-            # on ``is_file()`` here: it follows symlinks and silently discards
-            # dangling or non-regular entries before the cache phase can record
-            # their terminal ledger evidence.
+            # and SARIF/URI locations, so they must be portable.  Other
+            # non-regular entries remain inventoried for cache-phase evidence;
+            # symlinks are excluded before they can be read.
+            full = root_path / filename
+            if _is_symlink(full) or _resolves_outside(full, skill_root):
+                exclusions.append(
+                    ledger_event(
+                        outcome=LedgerOutcome.OUT_OF_SCOPE,
+                        record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                        phase="discovery",
+                        path=relative_path,
+                        reason=LedgerReason.NOT_REGULAR_FILE,
+                    )
+                )
+                continue
             paths.append(relative_path)
     paths.sort()
     return paths, exclusions
@@ -310,8 +365,20 @@ def _read_file_cache(
     """Build readable file content and terminal events for cache failures."""
     file_cache: dict[str, str] = {}
     ledger_events: list[InspectionLedgerEvent] = []
+    skill_root = skill_dir.resolve(strict=False)
     for path in components:
         full = skill_dir / path
+        if _is_symlink(full) or _resolves_outside(full, skill_root):
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.NOT_REGULAR_FILE,
+                )
+            )
+            continue
         try:
             file_stat = full.stat()
         except FileNotFoundError as exc:
@@ -350,7 +417,7 @@ def _read_file_cache(
             )
             continue
         try:
-            content = full.read_text(encoding="utf-8", errors="replace")
+            content = _read_text_no_follow(full)
             file_cache[path] = content
         except FileNotFoundError as exc:
             ledger_events.append(
@@ -361,6 +428,28 @@ def _read_file_cache(
                     path=path,
                     reason=LedgerReason.FILE_DISAPPEARED,
                     error_class=type(exc).__name__,
+                )
+            )
+        except _UnsafeFileError:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=LedgerRecordType.SCOPE_BOUNDARY,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.NOT_REGULAR_FILE,
+                )
+            )
+        except _FileOpenError as exc:
+            logger.debug("Could not read file: %s", path)
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.READ_ERROR,
+                    error_class=exc.error_class,
                 )
             )
         except OSError as exc:
@@ -384,13 +473,14 @@ def _parse_manifest(skill_dir: Path) -> dict[str, object]:
     Returns dict with name, description, triggers (list), permissions (list),
     allowed-tools (list), parameters (list). Returns {} if no file or parse fails.
     """
+    skill_root = skill_dir.resolve(strict=False)
     for name in ("SKILL.md", "skill.md"):
         path = skill_dir / name
-        if not path.is_file():
+        if _is_symlink(path) or _resolves_outside(path, skill_root) or not path.is_file():
             continue
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            content = _read_text_no_follow(path)
+        except (OSError, _FileOpenError, _UnsafeFileError):
             logger.debug("Could not read manifest file: %s", name)
             return {}
         if not content.startswith("---"):
