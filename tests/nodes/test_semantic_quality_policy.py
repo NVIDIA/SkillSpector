@@ -21,8 +21,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
+from langchain_core.runnables import Runnable, RunnableConfig
 
+from skillspector.inspection_ledger import LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMFinding
+from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.models import Finding
 from skillspector.nodes.analyzers.semantic_quality_policy import (
     ANALYZER_ID,
@@ -57,6 +62,34 @@ _SAMPLE_LLM_RESPONSE = LLMAnalysisResult(
         ),
     ],
 )
+
+
+class _PostResponseValueErrorRunnable(Runnable[str, object]):
+    """Emit a real callback response before simulating structured parsing failure."""
+
+    def __init__(self, response: LLMResult) -> None:
+        self._response = response
+
+    def _raise_after_response(self, config: RunnableConfig | None) -> object:
+        for callback in (config or {}).get("callbacks", []):
+            callback.on_llm_end(self._response)
+        raise ValueError("structured output parse failed")
+
+    def invoke(
+        self,
+        input: str,
+        config: RunnableConfig | None = None,
+        **kwargs: object,
+    ) -> object:
+        return self._raise_after_response(config)
+
+    async def ainvoke(
+        self,
+        input: str,
+        config: RunnableConfig | None = None,
+        **kwargs: object,
+    ) -> object:
+        return self._raise_after_response(config)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +293,59 @@ class TestErrorHandling:
         status = result["analyzer_status_events"][0]
         assert status["status"] == "unavailable"
         assert "reason_code" not in status
+
+    def test_post_response_value_error_preserves_provider_usage(self) -> None:
+        message = AIMessage(
+            content="malformed structured response",
+            response_metadata={"model_name": "azure/anthropic/claude-opus-4-6"},
+            usage_metadata={
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+            },
+        )
+        response = LLMResult(
+            generations=[[ChatGeneration(message=message)]],
+            llm_output={},
+        )
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = _PostResponseValueErrorRunnable(response)
+
+        with patch(MOCK_PATCH_TARGET, return_value=mock_llm):
+            result = node({"file_cache": {"SKILL.md": "# Skill"}})
+
+        assert result["findings"] == []
+        assert result["inference_usage"][0]["prompt_tokens"] == 10
+        assert result["inference_usage"][0]["completion_tokens"] == 2
+        assert result["llm_call_log"][0]["ok"] is False
+        assert result["inspection_ledger"]
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+        completeness, _ = finalize_ledger(
+            {
+                "components": ["SKILL.md"],
+                "findings": [],
+                "inspection_ledger": result["inspection_ledger"],
+                "analyzer_status_events": result["analyzer_status_events"],
+            }
+        )
+        assert completeness["execution_successful"] is False
+
+    def test_post_response_value_error_without_usage_records_partial_coverage(self) -> None:
+        provider = MagicMock()
+        provider.complete.return_value = "not valid structured JSON"
+        cli_model = AgentCLIChatModel(provider, "gpt-5.6-sol", 1024)
+
+        with patch(MOCK_PATCH_TARGET, return_value=cli_model):
+            result = node({"file_cache": {"SKILL.md": "# Skill"}})
+
+        assert result["findings"] == []
+        assert result["inference_usage"] == []
+        assert result["inspection_ledger"]
+        assert result["inspection_ledger"][0]["outcome"] == "skipped"
+        assert result["inspection_ledger"][0]["reason_code"] == (
+            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        )
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
 
 
 # ---------------------------------------------------------------------------

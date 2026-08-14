@@ -39,6 +39,11 @@ skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml --show-supp
 | `skillspector scan <path> --baseline FILE --show-suppressed` | Also list the suppressed findings (they still don't affect the score). |
 
 A missing, malformed, or unsupported baseline file exits with code 2.
+When a selected baseline or baseline output is stored inside the scan target,
+SkillSpector treats that exact file as an explicit scope exclusion. This
+prevents sensitive rule text from creating a finding against itself or entering
+regenerated fingerprints. Other baseline files and sibling YAML/JSON files
+remain in normal scan scope unless they are selected with `--baseline` or `-o`.
 
 ## Baseline file format
 

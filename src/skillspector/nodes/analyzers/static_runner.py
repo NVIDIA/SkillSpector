@@ -30,6 +30,11 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding
+from skillspector.python_ast import (
+    MAX_PYTHON_AST_SOURCE_CHARS,
+    ParsedPythonFile,
+    get_python_ast,
+)
 from skillspector.state import AnalyzerNodeResponse
 
 from .common import is_code_example
@@ -57,7 +62,7 @@ FILE_TYPES: dict[str, str] = {
     ".rs": "rust",
 }
 
-MAX_FILE_CHARS = 1_000_000
+MAX_FILE_CHARS = MAX_PYTHON_AST_SOURCE_CHARS
 _EVAL_DATASET_FILES = {
     "evals/evals.json",
     "evals/evals.jsonl",
@@ -219,6 +224,34 @@ _EXECUTION_SIGNAL = re.compile(
 )
 
 
+# Markdown syntax that collides with shell metacharacters. A table row is delimited by "|" and
+# a quoted line begins with ">": neither is a pipe or a redirection, but _EXECUTION_SIGNAL reads
+# them as one and the prose classification below is then skipped for the whole line.
+#
+# Only the *delimiters* are removed — the leading and trailing bar of a row and the quote marker.
+# A bar inside a cell may well be a real pipe in a documented command, and it must keep counting
+# as an execution signal.
+_MD_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+_MD_BLOCKQUOTE = re.compile(r"^\s*>+\s?")
+_MD_ESCAPED_BAR = "\\|"
+_BAR_PLACEHOLDER = "\x00"
+
+
+def _strip_markdown_structure(line: str) -> str:
+    r"""Drop markdown delimiters that would otherwise read as shell metacharacters.
+
+    In a table row an unescaped ``|`` separates cells; a literal pipe inside a cell has to be
+    written ``\|`` (CommonMark). That distinction is what makes this safe: the delimiters are
+    removed, while a documented ``cmd \| tee log`` keeps its pipe and still counts as an
+    execution signal.
+    """
+    if _MD_TABLE_ROW.match(line):
+        line = line.replace(_MD_ESCAPED_BAR, _BAR_PLACEHOLDER)
+        line = line.replace("|", " ")
+        line = line.replace(_BAR_PLACEHOLDER, "|")
+    return _MD_BLOCKQUOTE.sub("", line)
+
+
 def _is_documentation_context(af: AnalyzerFinding, file_type: str, path: str, content: str) -> bool:
     """Return true when a governed finding is prose or a comment without execution signals."""
     if af.rule_id not in _SEMANTIC_STRING_DOC_PRONE_RULES:
@@ -232,7 +265,7 @@ def _is_documentation_context(af: AnalyzerFinding, file_type: str, path: str, co
         else af.context or ""
     )
     if file_type in _DOC_PROSE_FILE_TYPES:
-        if _EXECUTION_SIGNAL.search(matched_line):
+        if _EXECUTION_SIGNAL.search(_strip_markdown_structure(matched_line)):
             return False
         return True
     return bool(matched_line and matched_line.lstrip().startswith(("#", "//")))
@@ -280,14 +313,36 @@ def analyzer_finding_to_finding(
     )
 
 
-def _scan_path(path: str, content: str, pattern_modules: list) -> list[Finding]:
+def _uses_python_ast(module: object) -> bool:
+    """Return whether a pattern module explicitly opts into the shared AST hook."""
+    return getattr(module, "USES_PYTHON_AST", False) is True
+
+
+def _scan_path(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    python_ast_cache_key: str | None = None,
+) -> list[Finding]:
     """Run pattern modules for one already-applicable file path."""
     findings: list[Finding] = []
     file_type = _infer_file_type(path)
     is_doc_markdown = _is_documentation_markdown(path)
     is_non_executable = file_type in _NON_EXECUTABLE_FILE_TYPES
+    python_ast: ParsedPythonFile | None = None
+    if file_type == "python" and any(_uses_python_ast(module) for module in pattern_modules):
+        python_ast = get_python_ast(python_ast_cache_key, content, path)
+
     for module in pattern_modules:
-        raw = module.analyze(content=content, file_path=path, file_type=file_type)
+        if file_type == "python" and _uses_python_ast(module):
+            raw = module.analyze(
+                content=content,
+                file_path=path,
+                file_type=file_type,
+                python_ast=python_ast,
+            )
+        else:
+            raw = module.analyze(content=content, file_path=path, file_type=file_type)
         for af in raw:
             if _is_env_file_reference_in_docs(af, file_type, path, content):
                 logger.debug(
@@ -344,6 +399,7 @@ def run_static_patterns(
     """
     components = cast(list[str], state.get("components") or [])
     file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
     findings: list[Finding] = []
 
     for path in components:
@@ -365,7 +421,7 @@ def run_static_patterns(
         if _is_binary_file(path, content):
             logger.debug("Skipping binary file: %s", path)
             continue
-        findings.extend(_scan_path(path, content, pattern_modules))
+        findings.extend(_scan_path(path, content, pattern_modules, python_ast_cache_key))
 
     return findings
 
@@ -378,6 +434,7 @@ def run_static_patterns_with_ledger(
     analyzer_id = str(getattr(pattern_modules[0], "ANALYZER_ID", "static_patterns"))
     components = cast(list[str], state.get("components") or [])
     file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
 
@@ -421,7 +478,7 @@ def run_static_patterns_with_ledger(
                 )
             else:
                 try:
-                    path_findings = _scan_path(path, content, pattern_modules)
+                    path_findings = _scan_path(path, content, pattern_modules, python_ast_cache_key)
                 except Exception as exc:
                     logger.warning("%s: scan error on %s: %s", analyzer_id, path, exc)
                     event = ledger_event(

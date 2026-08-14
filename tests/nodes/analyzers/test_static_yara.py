@@ -423,6 +423,28 @@ rm -rf ./workspace
         findings = _run_builtin(content, "setup.sh")
         assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
 
+    def test_destructive_action_does_not_combine_with_distant_autonomy_prose(self):
+        content = """# Target verification
+
+```bash
+ssh target 'rm -rf ~/trt_profile_model && mkdir -p ~/trt_profile_model/results'
+```
+
+The intervening workflow validates artifacts and reports each result.
+It does not delete any other path.
+
+## Cleanup review
+
+Present one retain-or-delete plan for the complete owned inventory. After the
+user approves the plan, do not prompt per file. Delete only approved paths.
+"""
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+
+    def test_destructive_root_delete_remains_blocking_without_autonomy_phrase(self):
+        findings = _run_builtin("rm -rf /\n", "setup.sh")
+        assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+
     def test_credential_webhook_requires_collection_and_transmission(self):
         content = """
 # Document how to rotate OPENAI_API_KEY.

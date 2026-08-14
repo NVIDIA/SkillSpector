@@ -34,8 +34,10 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     analyzer_status_event,
+    analyzer_status_for_events,
     inspection_work_id,
     ledger_event,
+    outcome_for_llm_batch_failure,
 )
 from skillspector.llm_analyzer_base import (
     Batch,
@@ -335,7 +337,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
     response_schema = MetaAnalyzerResult
 
     def __init__(self, model: str):
-        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model)
+        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model, node="meta_analyzer")
 
     def _estimate_extra_overhead(self, findings: list[Finding]) -> int:
         if not findings:
@@ -559,35 +561,20 @@ def _meta_ledger_response(
         events.append(
             ledger_event(
                 analyzer_id="meta_analyzer",
-                outcome=LedgerOutcome.FAILED,
+                outcome=outcome_for_llm_batch_failure(failure.reason),
                 phase="meta",
                 path=batch.file_path,
                 start_line=batch.start_line if batch.end_line is not None else None,
                 end_line=batch.end_line,
-                reason=LedgerReason.LLM_BATCH_FAILED,
+                reason=failure.reason,
                 input_finding_ids=input_ids,
                 emitted_finding_ids=input_ids,
                 error_class=failure.error_class,
             )
         )
-    status = analyzer_status_event(
-        analyzer_id="meta_analyzer",
-        status=(
-            "failed"
-            if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
-            else "completed"
-        ),
-        planned_work=[
-            {
-                "work_id": event["work_id"],
-                "path": event["path"],
-                "start_line": event["start_line"],
-                "end_line": event["end_line"],
-            }
-            for event in events
-        ],
-    )
-    return events, status
+    if not events:
+        return events, analyzer_status_event(analyzer_id="meta_analyzer", status="completed")
+    return events, analyzer_status_for_events("meta_analyzer", events)
 
 
 def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
@@ -644,6 +631,8 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     metadata_text = _format_metadata(manifest)
     files_with_findings = sorted({f.file for f in findings})
 
+    analyzer: LLMMetaAnalyzer | None = None
+    batches: list[Batch] = []
     try:
         # Construct inside the try so a chat-model construction failure is caught
         # and recorded as a degraded LLM call (consistent with the semantic
@@ -732,21 +721,34 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                     ok=bool(detailed.successful) or not detailed.failures,
                 )
             ],
+            "inference_usage": analyzer.inference_usage,
         }
-    except ValueError:
-        raise
     except Exception as e:
+        post_response_value_error = (
+            isinstance(e, ValueError) and analyzer is not None and analyzer.response_received
+        )
+        if isinstance(e, ValueError) and not post_response_value_error:
+            raise
         logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
         filtered = _passthrough_with_defaults(findings)
+        if post_response_value_error:
+            ledger_events, status = _meta_ledger_response(
+                batches,
+                BatchExecutionResult(
+                    failures=[
+                        BatchFailure(batch=batch, error_class=type(e).__name__) for batch in batches
+                    ]
+                ),
+                filtered,
+            )
+        else:
+            ledger_events = []
+            status = analyzer_status_event(analyzer_id="meta_analyzer", status="unavailable")
         return {
             "findings": filtered,
             "effective_finding_ids": [finding.finding_id for finding in filtered],
-            "inspection_ledger": [],
-            "analyzer_status_events": [
-                analyzer_status_event(
-                    analyzer_id="meta_analyzer",
-                    status="unavailable",
-                )
-            ],
+            "inspection_ledger": ledger_events,
+            "analyzer_status_events": [status],
             "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],
+            "inference_usage": analyzer.inference_usage if analyzer is not None else [],
         }

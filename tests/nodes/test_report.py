@@ -84,6 +84,13 @@ class TestComputeRiskScoreBasic:
         score, _, _ = _compute_risk_score(findings, False)
         assert score == 12  # 25 * 1.0 * 0.5 = 12.5 -> int(12.5) = 12
 
+    def test_shipped_bytecode_enforces_blocking_risk_floor(self) -> None:
+        findings = [_finding("SC8", "HIGH", confidence=0.95, file="payload.pyc")]
+        score, band, recommendation = _compute_risk_score(findings, False)
+        assert score == 51
+        assert band == "HIGH"
+        assert recommendation == "DO_NOT_INSTALL"
+
     def test_unknown_severity_defaults_to_low_points(self) -> None:
         f = _finding("R1", "LOW")
         f.severity = ""
@@ -475,6 +482,52 @@ class TestReportNode:
         assert "## Components" in body
         assert "## Issues" in body
 
+    def test_report_markdown_lists_nonfatal_llm_validation_exception(self) -> None:
+        """A non-fatal structured-output failure remains visible in the report."""
+        state: SkillspectorState = {
+            "filtered_findings": [],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": "markdown",
+            "execution_successful": True,
+            "analysis_completeness": {
+                "coverage_percent": 0.0,
+                "fully_inspected_files": 0,
+                "partially_inspected_files": 0,
+                "entirely_uninspected_files": 1,
+                "is_complete": False,
+                "execution_successful": True,
+                "ledger_exceptions": [
+                    {
+                        "reason_code": "llm_structured_response_invalid",
+                        "path": "SKILL.md",
+                        "message": "LLM returned a malformed structured response after bounded retries.",
+                        "fatal": False,
+                    }
+                ],
+                "scope_exclusions": [],
+                "analyzer_statuses": [
+                    {
+                        "analyzer_id": "semantic_quality_policy",
+                        "status": "degraded",
+                        "planned_work": [],
+                    }
+                ],
+                "limitations": ["Analyzer semantic_quality_policy status: degraded."],
+            },
+        }
+
+        body = report(state)["report_body"]
+
+        assert "| Execution | successful |" in body
+        assert "### Ledger Exceptions" in body
+        assert "llm_structured_response_invalid" in body
+        assert "`SKILL.md`" in body
+        assert "### Analyzer Statuses" in body
+        assert "### Limitations" in body
+
     def test_report_output_format_terminal(self) -> None:
         """output_format terminal produces Rich-formatted output."""
         state: SkillspectorState = {
@@ -773,6 +826,51 @@ def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) 
     assert meta["llm_available"] is True
     assert "llm_degraded" not in meta
     assert "llm_calls_attempted" not in meta
+
+
+def test_json_report_exposes_only_sanitized_provider_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+        "inference_usage": [
+            {
+                "node": "meta_analyzer",
+                "request_kind": "structured_output",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "model_source": "provider_response",
+                "usage_source": "provider_response",
+                "prompt_tokens": 123,
+                "completion_tokens": 45,
+                "total_tokens": 168,
+                "secret": "not serialized",
+            }
+        ],
+    }
+
+    meta = _meta_from_json_report(state)
+
+    assert meta["inference_usage"] == [
+        {
+            "node": "meta_analyzer",
+            "request_kind": "structured_output",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "model_source": "provider_response",
+            "usage_source": "provider_response",
+            "prompt_tokens": 123,
+            "completion_tokens": 45,
+            "total_tokens": 168,
+        }
+    ]
 
 
 def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:

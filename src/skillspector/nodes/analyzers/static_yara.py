@@ -62,6 +62,8 @@ _CATEGORY_MAP: dict[str, tuple[str, Severity]] = {
 _DEFAULT_RULE_ID = "YR4"
 _DEFAULT_SEVERITY = Severity.MEDIUM
 _DEFAULT_CONFIDENCE = 0.7
+_DESTRUCTIVE_AUTONOMY_RULE = "agent_skill_destructive_autonomous_actions"
+_MAX_DESTRUCTIVE_AUTONOMY_LINE_DISTANCE = 3
 
 # Module-level cache keyed by a content hash of all rule directories.
 _compiled_rules: yara.Rules | None = None
@@ -205,6 +207,35 @@ def _extract_match_strings(match: yara.Match) -> tuple[int, str | None]:
     return first_offset, matched_text
 
 
+def _has_local_destructive_autonomy_evidence(match: yara.Match, content: str) -> bool:
+    """Require destructive and autonomy evidence to occur in one local context.
+
+    YARA string conditions are file-wide. Without this post-match check, a
+    scoped workspace reset near the start of a long skill combines with unrelated
+    prose such as "do not prompt per file" much later and becomes a false HIGH.
+    Root deletion remains blocking without autonomy evidence, matching the rule's
+    explicit condition.
+    """
+    destructive_lines: list[int] = []
+    autonomy_lines: list[int] = []
+    for string_match in match.strings or []:
+        identifier = str(string_match.identifier)
+        for instance in string_match.instances or []:
+            line = get_line_number(content, instance.offset)
+            if identifier == "$destructive_rm_root":
+                return True
+            if identifier.startswith("$destructive_"):
+                destructive_lines.append(line)
+            elif identifier.startswith("$autonomy_"):
+                autonomy_lines.append(line)
+
+    return any(
+        abs(destructive_line - autonomy_line) <= _MAX_DESTRUCTIVE_AUTONOMY_LINE_DISTANCE
+        for destructive_line in destructive_lines
+        for autonomy_line in autonomy_lines
+    )
+
+
 def _parse_meta(match: yara.Match) -> tuple[str, Severity, float, str | None]:
     """Extract rule_id, severity, confidence, and description from a YARA match's meta."""
     meta: dict[str, object] = match.meta or {}
@@ -241,6 +272,16 @@ def _match_file(rules: yara.Rules, content: str, file_path: str) -> list[Analyze
 
     findings: list[AnalyzerFinding] = []
     for match in matches:
+        if (
+            match.rule == _DESTRUCTIVE_AUTONOMY_RULE
+            and not _has_local_destructive_autonomy_evidence(match, content)
+        ):
+            logger.debug(
+                "%s: ignored cross-context destructive/autonomy match in %s",
+                ANALYZER_ID,
+                file_path,
+            )
+            continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(match)
 

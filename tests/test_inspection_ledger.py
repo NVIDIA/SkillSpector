@@ -11,6 +11,7 @@ from skillspector.inspection_ledger import (
     analyzer_status_for_events,
     inspection_work_id,
     ledger_event,
+    outcome_for_llm_batch_failure,
 )
 
 
@@ -68,6 +69,21 @@ def test_analyzer_status_for_events_summarizes_terminal_work() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected_outcome"),
+    [
+        (LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID, LedgerOutcome.SKIPPED),
+        (LedgerReason.LLM_BATCH_FAILED, LedgerOutcome.FAILED),
+        (LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerOutcome.FAILED),
+    ],
+)
+def test_outcome_for_llm_batch_failure_preserves_failure_policy(
+    reason: LedgerReason, expected_outcome: LedgerOutcome
+) -> None:
+    """Only exhausted malformed structured responses are non-fatal."""
+    assert outcome_for_llm_batch_failure(reason) is expected_outcome
+
+
 def test_failed_producer_ledger_event_cannot_reference_findings() -> None:
     """Failed producers do not claim findings they did not successfully emit."""
     with pytest.raises(ValueError, match="cannot reference findings"):
@@ -95,13 +111,22 @@ def test_completed_meta_event_emits_a_subset_of_its_inputs() -> None:
     assert event["emitted_finding_ids"] == ["finding-a"]
 
 
-def test_failed_meta_event_must_pass_every_input_through() -> None:
-    """Failed meta work is fail-closed and preserves every input ID."""
+@pytest.mark.parametrize(
+    ("outcome", "reason"),
+    [
+        (LedgerOutcome.FAILED, LedgerReason.LLM_BATCH_FAILED),
+        (LedgerOutcome.SKIPPED, LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID),
+    ],
+)
+def test_unprocessed_meta_event_must_pass_every_input_through(
+    outcome: LedgerOutcome, reason: LedgerReason
+) -> None:
+    """Failed or skipped meta work is fail-closed and preserves every input ID."""
     event = ledger_event(
-        outcome=LedgerOutcome.FAILED,
+        outcome=outcome,
         phase="meta",
         analyzer_id="meta_analyzer",
-        reason=LedgerReason.LLM_BATCH_FAILED,
+        reason=reason,
         path="SKILL.md",
         input_finding_ids=["finding-a", "finding-b"],
         emitted_finding_ids=["finding-a", "finding-b"],

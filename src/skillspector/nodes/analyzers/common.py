@@ -21,6 +21,7 @@ import ast
 from typing import Any
 
 from skillspector.models import Finding
+from skillspector.python_ast import build_import_aliases
 
 
 def make_dummy_finding(analyzer_id: str) -> Finding:
@@ -205,38 +206,9 @@ def resolve_dynamic_import_call(
     return f"{module_name}.{func.attr}"
 
 
-def _build_import_aliases(tree: ast.Module) -> dict[str, str]:
-    """Map locally imported names to their fully-qualified module paths.
-
-    ``from pathlib import Path`` → ``{"Path": "pathlib.Path"}``
-    ``import socket``           → ``{"socket": "socket"}``
-    ``import pathlib``          → ``{"pathlib": "pathlib"}``
-    """
-    aliases: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                local = alias.asname or alias.name
-                aliases[local] = alias.name
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            for alias in node.names:
-                local = alias.asname or alias.name
-                aliases[local] = f"{module}.{alias.name}" if module else alias.name
-    return aliases
-
-
-def build_import_aliases(tree: ast.Module) -> dict[str, str]:
-    """Map locally bound names to their fully-qualified import paths.
-
-    Public entry point around the import scan already used by :func:`build_type_map`.
-    Callers pass the result to :func:`resolve_call_name` /
-    :func:`resolve_call_name_typed` to defeat import-alias evasion.
-    """
-    return _build_import_aliases(tree)
-
-
-def build_type_map(tree: ast.Module) -> dict[str, str]:
+def build_type_map(
+    tree: ast.Module, import_aliases: dict[str, str] | None = None
+) -> dict[str, str]:
     """Infer variable types from constructor calls.
 
     Scans assignments (``var = Type(...)``) and ``with`` statements
@@ -244,7 +216,7 @@ def build_type_map(tree: ast.Module) -> dict[str, str]:
     Import aliases are resolved so ``from pathlib import Path; p = Path(x)``
     maps ``p`` → ``"pathlib.Path"``.
     """
-    import_aliases = _build_import_aliases(tree)
+    import_aliases = build_import_aliases(tree) if import_aliases is None else import_aliases
     type_map: dict[str, str] = {}
 
     def _resolve_ctor(call_node: ast.Call) -> str | None:

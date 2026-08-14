@@ -86,7 +86,9 @@ def set_api_pool(pool: "ApiKeyPool | None") -> None:
     def _pooled_get_chat_model(model=None):
         if _api_pool:
             from .api_pool import PooledChatModel
-            return PooledChatModel(_api_pool)
+            pooled_model = PooledChatModel(_api_pool)
+            _llm_utils.register_chat_model_provider(pooled_model, "openai")
+            return pooled_model
         return _original_get_chat_model(model)
 
     _llm_utils.get_chat_model = _pooled_get_chat_model
@@ -120,7 +122,7 @@ _patches_depth: int = 0  # nesting counter — safe for re-entrant context manag
 _original_base_init = LLMAnalyzerBase.__init__
 
 
-def _patched_base_init(self, base_prompt, model):
+def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
     """Set response_schema=None on the instance dict BEFORE original init.
 
     Relies on Python MRO guarantee: instance.__dict__ is always checked
@@ -128,7 +130,7 @@ def _patched_base_init(self, base_prompt, model):
     a library internal.
     """
     self.response_schema = None
-    _original_base_init(self, base_prompt, model)
+    _original_base_init(self, base_prompt, model, node=node)
 
 
 # -- Patch 2: LLMAnalyzerBase.parse_response handles raw JSON --------------
@@ -316,13 +318,19 @@ def _verify_patch_targets() -> None:
 
     from skillspector.llm_analyzer_base import Batch, LLMFinding
 
-    # -- Patch 1: LLMAnalyzerBase.__init__(self, base_prompt, model) ---------
+    # -- Patch 1: LLMAnalyzerBase.__init__(..., *, node=...) -----------------
     _check_signature(
         LLMAnalyzerBase.__init__,
         ["self", "base_prompt", "model"],
         "LLMAnalyzerBase.__init__",
         1,
     )
+    _node_param = inspect.signature(LLMAnalyzerBase.__init__).parameters.get("node")
+    if _node_param is None or _node_param.kind != inspect.Parameter.KEYWORD_ONLY:
+        raise RuntimeError(
+            "Patch 1 target changed: LLMAnalyzerBase.__init__ must retain its "
+            "keyword-only 'node' parameter."
+        )
     if not hasattr(LLMAnalyzerBase, "response_schema"):
         raise RuntimeError(
             "Patch 1 target lost: LLMAnalyzerBase no longer has "

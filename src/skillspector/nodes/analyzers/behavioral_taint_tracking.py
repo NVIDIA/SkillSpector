@@ -35,11 +35,11 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import (
     apply_import_aliases,
-    build_import_aliases,
     build_type_map,
     get_context_from_lines,
     get_source_segment,
@@ -325,12 +325,14 @@ def _find_tainted_in_expr(node: ast.expr, tainted: dict[str, _TaintedVar]) -> _T
     return None
 
 
-def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
-    tree = ast.parse(content, filename=file_path)
+def _analyze_python(python_ast: ParsedPythonFile, file_path: str) -> list[AnalyzerFinding]:
+    tree = python_ast.tree
+    if tree is None:
+        return []
 
-    type_map = build_type_map(tree)
-    aliases = build_import_aliases(tree)
-    lines = content.splitlines()
+    aliases = python_ast.import_aliases
+    type_map = build_type_map(tree, aliases)
+    lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
     seen: set[tuple[str, int]] = set()
@@ -428,6 +430,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files and detect source\u2192sink data flows."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
+    python_ast_cache_key = state.get("python_ast_cache_key")
     all_findings: list[Finding] = []
     ledger_events: list[InspectionLedgerEvent] = []
 
@@ -455,9 +458,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 observed_bytes=len(content.encode("utf-8")),
             )
         else:
-            try:
-                raw = _analyze_python(content, path)
-            except SyntaxError:
+            python_ast = get_python_ast(python_ast_cache_key, content, path)
+            if not python_ast.is_parseable:
                 event = ledger_event(
                     outcome=LedgerOutcome.SKIPPED,
                     phase="behavioral",
@@ -466,6 +468,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     reason=LedgerReason.SYNTAX_ERROR,
                 )
             else:
+                raw = _analyze_python(python_ast, path)
                 path_findings = [analyzer_finding_to_finding(af) for af in raw]
                 all_findings.extend(path_findings)
                 event = ledger_event(
