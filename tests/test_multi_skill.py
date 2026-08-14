@@ -124,6 +124,41 @@ class TestDetectSkills:
         names = {s.name for s in result.skills}
         assert "hidden" not in names
 
+    def test_symlinked_skill_directory_is_skipped(self, tmp_path: Path) -> None:
+        """Detection must not read a skill manifest through a directory symlink."""
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        external = tmp_path.parent / "external-skill"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / "linked-skill").symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+
+    def test_symlinked_root_is_not_detected(self, tmp_path: Path) -> None:
+        """Direct callers cannot use detection to inspect a symlinked root."""
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+        symlink = tmp_path / "linked-root"
+        try:
+            symlink.symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(symlink)
+
+        assert result.is_multi_skill is False
+        assert result.has_root_skill is False
+
     def test_nonexistent_path(self, tmp_path: Path) -> None:
         """Non-existent path returns not multi-skill."""
         result = detect_skills(tmp_path / "does-not-exist")
