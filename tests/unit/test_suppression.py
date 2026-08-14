@@ -24,10 +24,12 @@ import yaml
 
 from skillspector.models import Finding
 from skillspector.suppression import (
+    SHIPPED_BASELINE_FILENAME,
     Baseline,
     SuppressionRule,
     baseline_from_dict,
     build_baseline_dict,
+    discover_baseline,
     dump_baseline,
     finding_fingerprint,
     load_baseline,
@@ -533,3 +535,46 @@ def test_exact_baseline_fails_closed_when_source_or_scanner_changes() -> None:
         )
         assert kept == [finding]
         assert suppressed == []
+
+
+# --- discover_baseline --------------------------------------------------------
+
+
+def test_discover_baseline_returns_canonical_file(tmp_path: Path) -> None:
+    f = tmp_path / SHIPPED_BASELINE_FILENAME
+    f.write_text("version: 1\nrules: []\n", encoding="utf-8")
+    result = discover_baseline(tmp_path)
+    assert result == f
+
+
+def test_discover_baseline_returns_none_when_absent(tmp_path: Path) -> None:
+    assert discover_baseline(tmp_path) is None
+
+
+def test_discover_baseline_returns_none_for_non_directory(tmp_path: Path) -> None:
+    f = tmp_path / "SKILL.md"
+    f.write_text("# hi", encoding="utf-8")
+    assert discover_baseline(f) is None
+
+
+def test_discover_baseline_ignores_noncanonical_siblings(tmp_path: Path) -> None:
+    (tmp_path / ".skillspector-baseline.yml").write_text(
+        "version: 1\nrules: []\n", encoding="utf-8"
+    )
+    (tmp_path / ".skillspector-baseline.json").write_text(
+        '{"version": 1, "rules": []}', encoding="utf-8"
+    )
+    assert discover_baseline(tmp_path) is None
+
+
+def test_discover_baseline_ignores_nested_files(tmp_path: Path) -> None:
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / SHIPPED_BASELINE_FILENAME).write_text("version: 1\nrules: []\n", encoding="utf-8")
+    assert discover_baseline(tmp_path) is None
+
+
+def test_discover_baseline_ignores_directory_named_like_baseline(tmp_path: Path) -> None:
+    d = tmp_path / SHIPPED_BASELINE_FILENAME
+    d.mkdir()
+    assert discover_baseline(tmp_path) is None

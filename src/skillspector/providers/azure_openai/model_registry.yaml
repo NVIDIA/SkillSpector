@@ -1,0 +1,23 @@
+# Token-budget metadata for the AzureOpenAIProvider (Azure-hosted OpenAI
+# deployments).  Bundled with the package; consulted whenever the active
+# provider is AzureOpenAIProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+
+models:
+  "gpt-4o":
+    context_length: 128000
+    max_output_tokens: 16384
+  "gpt-4o-mini":
+    context_length: 128000
+    max_output_tokens: 16384
+  "gpt-4":
+    context_length: 8192
+    max_output_tokens: 4096
+  "gpt-4-turbo":
+    context_length: 128000
+    max_output_tokens: 4096
