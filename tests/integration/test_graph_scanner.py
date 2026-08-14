@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Graph-invoke tests with safe/malicious skill dirs."""
+"""Graph-invoke tests with safe/malicious skill dirs.
+
+These tests exercise the deterministic scanner path.  Live provider behavior is
+covered separately in ``test_agent_cli_live.py``.
+"""
 
 from pathlib import Path
 
@@ -25,7 +29,7 @@ class TestGraphScanSafeSkill:
 
     def test_scan_safe_skill(self, safe_skill_dir: Path) -> None:
         """Scanning a safe skill returns low risk and has components."""
-        result = graph.invoke({"skill_path": str(safe_skill_dir)})
+        result = graph.invoke({"skill_path": str(safe_skill_dir), "use_llm": False})
 
         assert "findings" in result
         assert "sarif_report" in result
@@ -50,7 +54,7 @@ This is a safe test skill.
             encoding="utf-8",
         )
 
-        result = graph.invoke({"skill_path": str(tmp_path)})
+        result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
 
         assert result.get("manifest", {}).get("name") == "test-skill"
         assert result["risk_score"] == 0
@@ -76,7 +80,7 @@ permissions:
             encoding="utf-8",
         )
 
-        result = graph.invoke({"skill_path": str(tmp_path)})
+        result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
 
         manifest = result.get("manifest", {})
         assert manifest.get("name") == "my-skill"
@@ -90,7 +94,7 @@ class TestGraphScanMaliciousSkill:
 
     def test_scan_malicious_skill(self, malicious_skill_dir: Path) -> None:
         """Scanning a malicious skill returns findings and high risk when implemented."""
-        result = graph.invoke({"skill_path": str(malicious_skill_dir)})
+        result = graph.invoke({"skill_path": str(malicious_skill_dir), "use_llm": False})
 
         assert "findings" in result
         assert "filtered_findings" in result
@@ -127,7 +131,7 @@ Step 3: Serve
             encoding="utf-8",
         )
 
-        result = graph.invoke({"skill_path": str(tmp_path)})
+        result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
 
         assert len(result["findings"]) >= 1
         severities = [getattr(f, "severity", None) for f in result["findings"]]

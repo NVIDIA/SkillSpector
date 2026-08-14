@@ -15,12 +15,52 @@
 
 """Tests for skillspector input_handler (resolve directory, zip, single file)."""
 
+import ctypes
+import os
+import sys
+from errno import ENOENT
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from skillspector.input_handler import ALLOWED_GIT_HOSTS, InputHandler
+from skillspector.input_handler import (
+    ALLOWED_GIT_HOSTS,
+    InputHandler,
+    _open_regular_file_from_windows_handle,
+)
+
+
+def _mock_windows_secure_open(
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+    *,
+    handle: int = 1,
+    attributes: int = 0,
+    final_path: str | None = None,
+) -> None:
+    """Install a handle-level Windows open simulation on any platform."""
+
+    def get_file_information(_handle: int, information: object) -> bool:
+        information._obj.dwFileAttributes = attributes  # type: ignore[attr-defined]
+        return True
+
+    def get_final_path(_handle: int, buffer: object, _size: int, _flags: int) -> int:
+        opened_path = final_path or str(source)
+        buffer.value = opened_path  # type: ignore[attr-defined]
+        return len(opened_path)
+
+    kernel32 = SimpleNamespace(
+        CreateFileW=lambda *_args: handle,
+        GetFileInformationByHandle=get_file_information,
+        GetFinalPathNameByHandleW=get_final_path,
+        CloseHandle=lambda _handle: True,
+    )
+    msvcrt = SimpleNamespace(open_osfhandle=lambda _handle, _flags: os.open(source, os.O_RDONLY))
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    monkeypatch.setattr(os, "O_BINARY", 0, raising=False)
+    monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
 
 
 def test_resolve_directory(tmp_path: Path) -> None:
@@ -48,6 +88,216 @@ def test_resolve_single_md_file(tmp_path: Path) -> None:
         assert source_type == "file"
     finally:
         handler.cleanup()
+
+
+def test_resolve_single_symlinked_file_raises(tmp_path: Path) -> None:
+    """Standalone file inputs must not dereference symlinks before scanning."""
+    secret = tmp_path / "external_secret.md"
+    secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
+    symlink = tmp_path / "SKILL.md"
+    try:
+        symlink.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked input"):
+            handler.resolve(str(symlink))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_with_symlinked_parent_raises(tmp_path: Path) -> None:
+    """Standalone file inputs must not traverse a symlinked parent directory."""
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    (external_dir / "secret.md").write_text("AWS_SECRET=hunter2", encoding="utf-8")
+    symlinked_parent = tmp_path / "linked"
+    try:
+        symlinked_parent.symlink_to(external_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked parent"):
+            handler.resolve(str(symlinked_parent / "secret.md"))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_directory_with_symlinked_parent_raises(tmp_path: Path) -> None:
+    """Directory inputs must not escape through a symlinked ancestor."""
+    external_skill = tmp_path / "external" / "skill"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# External skill", encoding="utf-8")
+    symlinked_parent = tmp_path / "linked"
+    try:
+        symlinked_parent.symlink_to(external_skill.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked parent"):
+            handler.resolve(str(symlinked_parent / external_skill.name))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_junctioned_directory_raises(tmp_path: Path) -> None:
+    """Directory inputs must reject terminal Windows junctions too."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    handler = InputHandler()
+    try:
+        with patch.object(Path, "is_junction", autospec=True) as is_junction:
+            is_junction.side_effect = lambda path: path == skill_dir
+            with pytest.raises(ValueError, match="junctioned input"):
+                handler.resolve(str(skill_dir))
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_with_junction_parent_raises(tmp_path: Path) -> None:
+    """Standalone file inputs must not traverse Windows junctions."""
+    source = tmp_path / "linked" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        with patch.object(Path, "is_junction", autospec=True) as is_junction:
+            is_junction.side_effect = lambda path: path == source.parent
+            with pytest.raises(ValueError, match="symlinked parent"):
+                handler.resolve(str(source))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_through_root_owned_system_alias(tmp_path: Path) -> None:
+    """Root-owned system aliases do not prevent scanning ordinary local files."""
+    root_alias = Path("/var")
+    try:
+        relative_path = tmp_path.relative_to("/private/var")
+    except ValueError:
+        pytest.skip("temporary directory is not below the macOS /var alias")
+    if not root_alias.is_symlink():
+        pytest.skip("/var is not a system alias on this platform")
+
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(str(root_alias / relative_path / source.name))
+        assert (resolved / source.name).read_text(encoding="utf-8") == "# Skill"
+        assert source_type == "file"
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_symlinked_zip_raises(tmp_path: Path) -> None:
+    """Local archives must be rejected before their symlink target is opened."""
+    archive = tmp_path / "external_archive.zip"
+    archive.write_bytes(b"not opened")
+    symlink = tmp_path / "skill.zip"
+    try:
+        symlink.symlink_to(archive)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked input"):
+            handler.resolve(str(symlink))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_open_failure_does_not_create_temp_dir(tmp_path: Path) -> None:
+    """Failed secure opens leave no handler-owned temporary directory behind."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        with patch("skillspector.input_handler.os.open", side_effect=OSError("denied")):
+            with pytest.raises(ValueError, match="Could not safely open"):
+                handler.resolve(str(source))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_rejects_platform_without_safe_open_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scanning must fail closed when neither secure-open implementation is available."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        monkeypatch.setattr("skillspector.input_handler._HAS_SECURE_DIR_FD", False)
+        monkeypatch.setattr("skillspector.input_handler._IS_WINDOWS", False)
+        with pytest.raises(ValueError, match="Secure no-follow file opens are unavailable"):
+            handler.resolve(str(source))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_windows_no_follow_open_reads_verified_regular_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open accepts a verified regular file handle."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    _mock_windows_secure_open(monkeypatch, source)
+
+    with _open_regular_file_from_windows_handle(source) as opened:
+        assert opened.read() == b"# Skill"
+
+
+def test_windows_no_follow_open_rejects_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open reports a missing file without exposing a handle."""
+    source = tmp_path / "missing.md"
+    _mock_windows_secure_open(monkeypatch, source, handle=ctypes.c_void_p(-1).value)
+    monkeypatch.setattr(
+        "skillspector.input_handler._windows_last_error", lambda: OSError(ENOENT, "missing")
+    )
+
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        _open_regular_file_from_windows_handle(source)
+
+
+def test_windows_no_follow_open_rejects_reparse_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open rejects a reparse-point handle before reading it."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    _mock_windows_secure_open(monkeypatch, source, attributes=0x00000400)
+
+    with pytest.raises(ValueError, match="Could not safely open"):
+        _open_regular_file_from_windows_handle(source)
+
+
+def test_windows_no_follow_open_rejects_canonical_path_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open rejects a handle whose resolved path changed."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    _mock_windows_secure_open(monkeypatch, source, final_path=str(tmp_path / "outside.md"))
+
+    with pytest.raises(ValueError, match="Could not safely open"):
+        _open_regular_file_from_windows_handle(source)
 
 
 def test_resolve_zip_file(tmp_path: Path) -> None:
@@ -95,6 +345,27 @@ def test_cleanup_idempotent(tmp_path: Path) -> None:
     handler.resolve(str(tmp_path / "a.md"))
     handler.cleanup()
     handler.cleanup()
+
+
+def test_clone_git_disables_symlinks() -> None:
+    """git clone must prevent symlinked entries from materializing as links."""
+    handler = InputHandler()
+    try:
+        with (
+            patch.object(handler, "_validate_url_host", return_value="github.com"),
+            patch(
+                "skillspector.input_handler.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ) as mock_run,
+        ):
+            handler._clone_git("https://github.com/example/repo.git")
+            cmd = mock_run.call_args.args[0]
+
+        assert cmd[:2] == ["git", "-c"]
+        assert "core.symlinks=false" in cmd
+        assert cmd.index("-c") < cmd.index("clone")
+    finally:
+        handler.cleanup()
 
 
 def test_scp_url_is_git_url() -> None:

@@ -50,10 +50,12 @@ def _is_local_target(target: str) -> bool:
     stripped = target.strip()
     if stripped.startswith("file://"):
         return True
-    if stripped.startswith(("http://", "https://", "git@", "ssh://", "git+ssh://")):
+    if stripped.startswith("git@"):
         return False
     if stripped.startswith(("\\\\", "//")):
         return True
+    if "://" in stripped:
+        return False
 
     try:
         candidate = Path(stripped).expanduser()
@@ -61,8 +63,6 @@ def _is_local_target(target: str) -> bool:
         return True
     if candidate.is_absolute() or candidate.drive:
         return True
-    if "://" in stripped:
-        return False
     return candidate.exists()
 
 

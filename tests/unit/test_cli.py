@@ -49,6 +49,32 @@ def test_cli_scan_local_directory(tmp_path: Path) -> None:
     assert "scan-test" in result.output or "skill" in result.output
 
 
+def test_cli_rejects_symlinked_parent_before_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive preflight must not inspect a directory behind a symlinked parent."""
+    external_skill = tmp_path / "external" / "skill"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+    symlinked_parent = tmp_path / "linked"
+    try:
+        symlinked_parent.symlink_to(external_skill.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    def fail_if_called(_: Path) -> MultiSkillDetectionResult:
+        raise AssertionError("preflight must not inspect an unsafe input path")
+
+    monkeypatch.setattr("skillspector.cli.detect_skills", fail_if_called)
+    result = runner.invoke(
+        app,
+        ["scan", str(symlinked_parent / external_skill.name), "--recursive", "--no-llm"],
+    )
+
+    assert result.exit_code == 2
+    assert "symlinked parent" in result.output
+
+
 def test_cli_scan_output_to_file(tmp_path: Path) -> None:
     """scan with --output writes report to file."""
     skill_dir = tmp_path / "skill"
