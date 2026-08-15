@@ -33,16 +33,16 @@ from skillspector.models import Finding
 logger = get_logger(__name__)
 
 
-def _same_file_key(finding: Finding) -> tuple[str, str, str]:
+def _same_file_key(finding: Finding) -> tuple[str, str, str, str]:
     """Build a deduplication key for same-file matches."""
     matched = (finding.matched_text or "").strip()[:100]
-    return (finding.rule_id, finding.file, matched)
+    return (finding.rule_id, finding.file, matched, finding.source_url or "")
 
 
-def _cross_file_key(finding: Finding) -> tuple[str, str]:
+def _cross_file_key(finding: Finding) -> tuple[str, str, str]:
     """Build a cross-file deduplication key from rule_id and normalized matched_text."""
     matched = (finding.matched_text or "").strip()[:100]
-    return (finding.rule_id, matched)
+    return (finding.rule_id, matched, finding.source_url or "")
 
 
 def deduplicate(findings: list[Finding]) -> list[Finding]:
@@ -62,7 +62,7 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
     original_count = len(findings)
 
     # Pass 1: Same-file deduplication
-    same_file_best: dict[tuple[str, str, str], Finding] = {}
+    same_file_best: dict[tuple[str, str, str, str], Finding] = {}
     for f in findings:
         key = _same_file_key(f)
         existing = same_file_best.get(key)
@@ -72,7 +72,7 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
     after_same_file = list(same_file_best.values())
 
     # Pass 2: Cross-file deduplication (only for findings WITH matched_text)
-    cross_file_best: dict[tuple[str, str], Finding] = {}
+    cross_file_best: dict[tuple[str, str, str], Finding] = {}
     no_text_findings: list[Finding] = []
 
     for f in after_same_file:

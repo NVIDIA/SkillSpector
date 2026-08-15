@@ -89,10 +89,12 @@ class Finding:
     tags: list[str] = field(default_factory=list)
     context: str | None = None
     matched_text: str | None = None
+    transitive_depth: int = 0
+    source_url: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dict representation (full finding shape)."""
-        return {
+        data: dict[str, object] = {
             "id": self.rule_id,
             "finding_id": self.finding_id,
             "category": self.category,
@@ -113,6 +115,11 @@ class Finding:
             # finding the LLM filter did not confirm but which is preserved anyway).
             "tags": list(self.tags),
         }
+        if self.transitive_depth:
+            data["transitive_depth"] = self.transitive_depth
+        if self.source_url:
+            data["source_url"] = self.source_url
+        return data
 
     def __str__(self) -> str:
         return f"{self.rule_id}: {self.message} ({self.file}:{self.start_line})"

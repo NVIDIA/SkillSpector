@@ -47,7 +47,7 @@ from errno import ELOOP, ENOENT, ENOTDIR
 from pathlib import Path
 from stat import S_ISLNK, S_ISREG
 from typing import BinaryIO, cast
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -75,6 +75,11 @@ ALLOWED_DOWNLOAD_HOSTS = frozenset(
         "huggingface.co",
     }
 )
+_DIRECT_FILE_URL_SUFFIXES = (
+    ".md",
+    ".py",
+    ".sh",
+)
 
 # Hard ceiling on what any single ingest path can pull into the temp dir.
 # Sized above the per-file analysis cap (``MAX_FILE_BYTES`` = 1 MB) so a
@@ -87,11 +92,6 @@ INGEST_MAX_BYTES = 100 * 1024 * 1024  # 100 MiB
 # entry is small but the entry count itself exhausts the filesystem.
 INGEST_MAX_ZIP_MEMBERS = 10_000
 
-# Chunk size for streaming HTTP downloads.  Small enough that the
-# byte-count breach check fires promptly; large enough to keep syscall
-# overhead reasonable on legitimate inputs.
-_DOWNLOAD_CHUNK_BYTES = 64 * 1024
-
 
 class IngestLimitExceededError(ValueError):
     """Raised when an ingest path exceeds an ``INGEST_MAX_*`` budget.
@@ -99,6 +99,10 @@ class IngestLimitExceededError(ValueError):
     Subclass of ``ValueError`` so existing callers that catch
     ``ValueError`` from ``InputHandler.resolve()`` continue to work.
     """
+
+
+class _TraversalBudgetError(ValueError):
+    """Raised when transitive input work should truncate rather than fail."""
 
 
 def _is_private_ip(host: str) -> bool:
@@ -392,8 +396,9 @@ class InputHandler:
     Normalizes all inputs to a local directory path for scanning.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, transitive_budget: object | None = None) -> None:
         self._temp_dir: Path | None = None
+        self._transitive_budget = transitive_budget
 
     def resolve(self, input_path: str) -> tuple[Path, str]:
         """
@@ -448,6 +453,49 @@ class InputHandler:
             self._temp_dir = Path(tempfile.mkdtemp(prefix="skillspector_"))
         return self._temp_dir
 
+    def _remaining_seconds(self) -> float | None:
+        remaining = getattr(self._transitive_budget, "remaining_seconds", None)
+        if callable(remaining):
+            try:
+                return float(remaining())
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _remaining_bytes(self) -> int | None:
+        remaining = getattr(self._transitive_budget, "remaining_bytes", None)
+        if callable(remaining):
+            try:
+                return int(remaining())
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _note_truncation(self, reason: str) -> None:
+        note = getattr(self._transitive_budget, "note_truncation", None)
+        if callable(note):
+            note(reason)
+
+    def _empty_result_dir(self, reason: str, name: str) -> Path:
+        self._note_truncation(reason)
+        temp_dir = self._get_temp_dir()
+        target = temp_dir / name
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _measure_tree_bytes(self, root: Path) -> int:
+        total = 0
+        for path in root.rglob("*"):
+            if not path.is_file() or path.is_symlink() or ".git" in path.parts:
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                logger.debug("Could not stat cloned file: %s", path)
+        return total
+
     def _is_git_url(self, path: str) -> bool:
         """Check if path is a Git repository URL."""
         if not path.startswith(("https://", "git@")):
@@ -455,7 +503,13 @@ class InputHandler:
         parsed = urlparse(path)
         host = parsed.hostname or ""
         if any(allowed in host for allowed in ALLOWED_GIT_HOSTS):
-            if "/raw/" in path or "/blob/" in path or path.endswith((".md", ".py", ".sh")):
+            lower_path = parsed.path.lower()
+            if (
+                "/raw/" in lower_path
+                or "/blob/" in lower_path
+                or "/archive/" in lower_path
+                or lower_path.endswith(_DIRECT_FILE_URL_SUFFIXES)
+            ):
                 return False
             return True
         if path.endswith(".git"):
@@ -502,21 +556,34 @@ class InputHandler:
         self._validate_url_host(url, ALLOWED_GIT_HOSTS)
         temp_dir = self._get_temp_dir()
         clone_dir = temp_dir / "repo"
+        remaining_seconds = self._remaining_seconds()
+        remaining_bytes = self._remaining_bytes()
+        if remaining_seconds is not None and remaining_seconds <= 0:
+            return self._empty_result_dir(
+                "Transitive time budget exhausted before git clone", "repo"
+            )
+        if remaining_bytes is not None and remaining_bytes <= 0:
+            return self._empty_result_dir(
+                "Transitive byte budget exhausted before git clone", "repo"
+            )
+        clone_command = [
+            "git",
+            "-c",
+            "core.symlinks=false",
+            "clone",
+            "--depth",
+            "1",
+            url,
+            str(clone_dir),
+        ]
+        if remaining_bytes is not None:
+            clone_command.insert(6, f"--filter=blob:limit={remaining_bytes}")
         try:
             subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "core.symlinks=false",
-                    "clone",
-                    "--depth",
-                    "1",
-                    url,
-                    str(clone_dir),
-                ],
+                clone_command,
                 check=True,
                 capture_output=True,
-                timeout=60,
+                timeout=remaining_seconds if remaining_seconds is not None else 60,
                 shell=False,
             )
         except subprocess.CalledProcessError as e:
@@ -524,12 +591,20 @@ class InputHandler:
             raise ValueError(f"Failed to clone repository: {e.stderr.decode()}") from e
         except subprocess.TimeoutExpired:
             logger.warning("Git clone timed out for %s", url)
-            raise ValueError("Git clone timed out after 60 seconds") from None
+            raise ValueError(
+                f"Git clone timed out after {remaining_seconds or 60:.0f} seconds"
+            ) from None
         except FileNotFoundError:
             logger.warning("Git not found when cloning %s", url)
             raise ValueError(
                 "Git is not installed. Please install git to scan repositories."
             ) from None
+
+        tree_bytes = self._measure_tree_bytes(clone_dir)
+        if remaining_bytes is not None and tree_bytes > remaining_bytes:
+            return self._empty_result_dir(
+                "Transitive byte budget exceeded by cloned repository", "repo"
+            )
 
         # Post-clone size check: a successful --depth 1 clone may still
         # land an arbitrarily large tree on disk before we can measure
@@ -564,6 +639,8 @@ class InputHandler:
         partial file produced by a mid-stream breach is removed before
         the exception propagates.
         """
+        if self._transitive_budget is not None:
+            return self._download_transitive_file(url)
         self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)
         temp_dir = self._get_temp_dir()
         parsed = urlparse(url)
@@ -575,38 +652,35 @@ class InputHandler:
         download_path = temp_dir / "_download.partial"
         content_type = ""
         try:
+            self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)
             with httpx.Client(follow_redirects=False, timeout=30) as client:
                 with client.stream("GET", url) as response:
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "")
                     # Cheap up-front check: trust Content-Length when the
                     # server provides it, so we abort before reading any
-                    # body bytes.  Streaming check below covers the case
+                    # body bytes. Streaming check below covers the case
                     # where the header is missing or wrong.
                     declared = response.headers.get("content-length")
                     if declared is not None:
                         try:
                             declared_bytes = int(declared)
                         except ValueError:
-                            # Malformed header — fall through to the
-                            # streamed byte counter, which is authoritative.
                             declared_bytes = None
                         if declared_bytes is not None and declared_bytes > INGEST_MAX_BYTES:
                             raise IngestLimitExceededError(
-                                f"Download exceeded ingest cap: "
-                                f"Content-Length {declared} bytes > "
+                                f"Download exceeded ingest cap: Content-Length {declared} bytes > "
                                 f"INGEST_MAX_BYTES ({INGEST_MAX_BYTES})"
                             )
 
                     received = 0
                     with download_path.open("wb") as out:
-                        for chunk in response.iter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                        for chunk in response.iter_bytes():
                             received += len(chunk)
                             if received > INGEST_MAX_BYTES:
                                 raise IngestLimitExceededError(
-                                    f"Download exceeded ingest cap: streamed "
-                                    f"{received} bytes > INGEST_MAX_BYTES "
-                                    f"({INGEST_MAX_BYTES})"
+                                    f"Download exceeded ingest cap: streamed {received} bytes > "
+                                    f"INGEST_MAX_BYTES ({INGEST_MAX_BYTES})"
                                 )
                             out.write(chunk)
         except httpx.HTTPError as e:
@@ -628,6 +702,78 @@ class InputHandler:
         download_path.replace(file_path)
         return temp_dir
 
+    def _download_transitive_file(self, url: str) -> Path:
+        temp_dir = self._get_temp_dir()
+        try:
+            headers, final_url, content = self._download_with_redirect_validation(url)
+            filename = Path(urlparse(final_url).path).name or "SKILL.md"
+        except _TraversalBudgetError as exc:
+            return self._empty_result_dir(str(exc), "download")
+        except httpx.HTTPError as exc:
+            raise ValueError(f"Failed to download file: {exc}") from exc
+        if filename.endswith(".zip") or headers.get("content-type", "").startswith(
+            "application/zip"
+        ):
+            zip_path = temp_dir / "download.zip"
+            zip_path.write_bytes(content)
+            return self._extract_zip(zip_path)
+        (temp_dir / filename).write_bytes(content)
+        return temp_dir
+
+    def _download_with_redirect_validation(self, url: str) -> tuple[dict[str, str], str, bytes]:
+        current_url = url
+        for _ in range(5):
+            remaining_seconds = self._remaining_seconds()
+            if remaining_seconds is not None and remaining_seconds <= 0:
+                raise _TraversalBudgetError("Transitive time budget exhausted before download")
+            self._validate_url_host(current_url, ALLOWED_DOWNLOAD_HOSTS)
+            with httpx.Client(follow_redirects=False, timeout=remaining_seconds or 30) as client:
+                with client.stream("GET", current_url) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError(f"Redirect response missing location: {current_url}")
+                        current_url = urljoin(current_url, location)
+                        continue
+                    response.raise_for_status()
+                    remaining_bytes = self._remaining_bytes()
+                    declared = response.headers.get("content-length")
+                    if declared is not None:
+                        try:
+                            declared_bytes = int(declared)
+                        except ValueError:
+                            declared_bytes = None
+                        if declared_bytes is not None and declared_bytes > INGEST_MAX_BYTES:
+                            raise IngestLimitExceededError(
+                                f"Download exceeded ingest cap: Content-Length {declared} bytes > "
+                                f"INGEST_MAX_BYTES ({INGEST_MAX_BYTES})"
+                            )
+                        if (
+                            declared_bytes is not None
+                            and remaining_bytes is not None
+                            and declared_bytes > remaining_bytes
+                        ):
+                            raise _TraversalBudgetError(
+                                "Transitive byte budget exceeded by downloaded file"
+                            )
+                    content = bytearray()
+                    for chunk in response.iter_bytes():
+                        if self._remaining_seconds() is not None and self._remaining_seconds() <= 0:
+                            raise _TraversalBudgetError(
+                                "Transitive time budget exhausted during download"
+                            )
+                        content.extend(chunk)
+                        if len(content) > INGEST_MAX_BYTES:
+                            raise IngestLimitExceededError(
+                                "Download exceeded ingest cap while following redirect"
+                            )
+                        if remaining_bytes is not None and len(content) > remaining_bytes:
+                            raise _TraversalBudgetError(
+                                "Transitive byte budget exceeded by downloaded file"
+                            )
+                    return dict(response.headers), current_url, bytes(content)
+        raise ValueError(f"Too many redirects while downloading: {url}")
+
     def _extract_zip(self, zip_path: Path) -> Path:
         """Extract a zip file, bounded by ``INGEST_MAX_BYTES`` and ``INGEST_MAX_ZIP_MEMBERS``.
 
@@ -639,6 +785,11 @@ class InputHandler:
         member name is applied before extraction to reject entries whose
         resolved path escapes the extraction directory.
         """
+        remaining_bytes = self._remaining_bytes()
+        if remaining_bytes is not None and remaining_bytes <= 0:
+            return self._empty_result_dir(
+                "Transitive byte budget exhausted before zip extraction", "extracted"
+            )
         with _open_regular_file_no_follow(zip_path) as archive_file:
             temp_dir = self._get_temp_dir()
             extract_dir = temp_dir / "extracted"
@@ -652,6 +803,10 @@ class InputHandler:
                             f"INGEST_MAX_ZIP_MEMBERS ({INGEST_MAX_ZIP_MEMBERS})"
                         )
                     total_uncompressed = sum(info.file_size for info in infos)
+                    if remaining_bytes is not None and total_uncompressed > remaining_bytes:
+                        return self._empty_result_dir(
+                            "Transitive byte budget exceeded by zip extraction", "extracted"
+                        )
                     if total_uncompressed > INGEST_MAX_BYTES:
                         raise IngestLimitExceededError(
                             f"Zip exceeded ingest cap: uncompressed "
@@ -677,6 +832,15 @@ class InputHandler:
 
     def _wrap_single_file(self, file_path: Path) -> Path:
         """Wrap a single file in a temporary directory for consistent handling."""
+        remaining_bytes = self._remaining_bytes()
+        if remaining_bytes is not None:
+            try:
+                if file_path.stat().st_size > remaining_bytes:
+                    return self._empty_result_dir(
+                        "Transitive byte budget exceeded by single-file input", "file"
+                    )
+            except OSError:
+                pass
         with _open_regular_file_no_follow(file_path) as source:
             temp_dir = self._get_temp_dir()
             dest = temp_dir / file_path.name

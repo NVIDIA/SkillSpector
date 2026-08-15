@@ -604,6 +604,32 @@ class TestReportNode:
         json.loads(body)
         assert "sarif_report" in result
 
+    def test_report_surfaces_transitive_provenance(self) -> None:
+        finding = _finding("T1", "HIGH", "child issue", file="dep.py")
+        finding.source_url = "https://github.com/org/dep"
+        finding.transitive_depth = 2
+        state: SkillspectorState = {
+            "filtered_findings": [finding],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "output_format": "markdown",
+        }
+
+        markdown = report(state)["report_body"]
+        assert "https://github.com/org/dep" in markdown
+        assert "Transitive depth:** 2" in markdown
+
+        state["output_format"] = "sarif"
+        sarif = report(state)["sarif_report"]
+        properties = sarif["runs"][0]["results"][0]["properties"]
+        assert properties["sourceUrl"] == "https://github.com/org/dep"
+        assert properties["transitiveDepth"] == 2
+
+        state["output_format"] = "terminal"
+        terminal = report(state)["report_body"]
+        assert "https://github.com/org/dep" in terminal
+
     def test_report_dedup_affects_score_only_not_report_output(self) -> None:
         """Deduplication reduces score but all affected files appear in the report."""
         duplicated = [

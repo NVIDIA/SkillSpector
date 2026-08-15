@@ -98,8 +98,14 @@ def _normalize_component_path(path: str) -> str:
     return posixpath.normpath(normalized)
 
 
-def _component_content(file_cache: Mapping[str, str], file_path: str) -> str | None:
+def _component_content(
+    file_cache: Mapping[str, str], file_path: str, *, source_url: str | None = None
+) -> str | None:
     """Look up *file_path* while tolerating slash-style differences."""
+    if source_url:
+        source_key = f"{source_url}::{file_path}"
+        if source_key in file_cache:
+            return file_cache[source_key]
     if file_path in file_cache:
         return file_cache[file_path]
     normalized = _normalize_component_path(file_path)
@@ -154,6 +160,11 @@ def finding_fingerprint(
             "code_snippet": finding.code_snippet or "",
         },
     }
+    if finding.source_url or finding.transitive_depth:
+        payload["source"] = {
+            "url": finding.source_url or "",
+            "depth": finding.transitive_depth,
+        }
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
@@ -375,7 +386,9 @@ def partition_findings(
     for finding in findings:
         reason = baseline.reason_for(
             finding,
-            file_content=_component_content(cache, finding.file or ""),
+            file_content=_component_content(
+                cache, finding.file or "", source_url=finding.source_url
+            ),
             scanner_version=scanner_version,
         )
         if reason is None:
@@ -405,7 +418,7 @@ def build_baseline_dict(
     entries: list[dict[str, str]] = []
     seen_hashes: set[str] = set()
     for finding in findings:
-        content = _component_content(file_cache, finding.file or "")
+        content = _component_content(file_cache, finding.file or "", source_url=finding.source_url)
         if content is None:
             raise ValueError(
                 f"cannot create an exact fingerprint: source content missing for {finding.file!r}"

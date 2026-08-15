@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,28 @@ def test_fingerprint_differs_on_field_change() -> None:
     assert _fingerprint(_finding(context="different context")) != base
     assert _fingerprint(_finding(), content=SKILL_CONTENT + "changed") != base
     assert _fingerprint(_finding(), scanner_version="2.3.12") != base
+
+
+def test_transitive_fingerprint_and_baseline_are_source_aware() -> None:
+    first = replace(_finding(), source_url="https://github.com/org/first", transitive_depth=1)
+    second = replace(_finding(), source_url="https://github.com/org/second", transitive_depth=1)
+    assert _fingerprint(first) != _fingerprint(second)
+
+    file_cache = {
+        "https://github.com/org/first::skill-a/SKILL.md": SKILL_CONTENT,
+        "https://github.com/org/second::skill-a/SKILL.md": SKILL_CONTENT,
+    }
+    baseline = baseline_from_dict(
+        build_baseline_dict([first], file_cache=file_cache, scanner_version=SCANNER_VERSION)
+    )
+    kept, suppressed = partition_findings(
+        [first, second],
+        baseline,
+        file_cache=file_cache,
+        scanner_version=SCANNER_VERSION,
+    )
+    assert kept == [second]
+    assert [item.finding for item in suppressed] == [first]
 
 
 def test_fingerprint_canonical_encoding_avoids_delimiter_collision() -> None:

@@ -47,7 +47,13 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.python_ast import prewarm_python_ast_cache
-from skillspector.state import SkillspectorState
+from skillspector.state import (
+    SkillspectorState,
+    transitive_note_truncation,
+    transitive_remaining_bytes,
+    transitive_remaining_seconds,
+    transitive_traversal_state,
+)
 
 logger = get_logger(__name__)
 
@@ -360,13 +366,22 @@ def _build_component_metadata(
 
 
 def _read_file_cache(
-    skill_dir: Path, components: list[str]
+    skill_dir: Path,
+    components: list[str],
+    state: SkillspectorState | None = None,
 ) -> tuple[dict[str, str], list[InspectionLedgerEvent]]:
     """Build readable file content and terminal events for cache failures."""
     file_cache: dict[str, str] = {}
     ledger_events: list[InspectionLedgerEvent] = []
     skill_root = skill_dir.resolve(strict=False)
+    traversal = transitive_traversal_state(state) if state is not None else None
+    remaining_bytes = transitive_remaining_bytes(state) if state is not None else None
     for path in components:
+        remaining_seconds = transitive_remaining_seconds(state) if state is not None else None
+        if remaining_seconds is not None and remaining_seconds <= 0:
+            if state is not None:
+                transitive_note_truncation(state, f"time budget exhausted before reading {path}")
+            break
         full = skill_dir / path
         if _is_symlink(full) or _resolves_outside(full, skill_root):
             ledger_events.append(
@@ -405,6 +420,10 @@ def _read_file_cache(
                 )
             )
             continue
+        if remaining_bytes is not None and file_stat.st_size > remaining_bytes:
+            if state is not None:
+                transitive_note_truncation(state, f"byte budget exhausted before reading {path}")
+            break
         if not S_ISREG(file_stat.st_mode):
             ledger_events.append(
                 ledger_event(
@@ -418,7 +437,16 @@ def _read_file_cache(
             continue
         try:
             content = _read_text_no_follow(full)
+            content_bytes = len(content.encode("utf-8"))
+            if remaining_bytes is not None and content_bytes > remaining_bytes:
+                if state is not None:
+                    transitive_note_truncation(state, f"byte budget exhausted while reading {path}")
+                break
             file_cache[path] = content
+            record_bytes = getattr(traversal, "record_bytes", None)
+            if callable(record_bytes):
+                record_bytes(content_bytes)
+            remaining_bytes = transitive_remaining_bytes(state) if state is not None else None
         except FileNotFoundError as exc:
             ledger_events.append(
                 ledger_event(
@@ -570,7 +598,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         )
         for path in sorted(selected_baselines)
     ]
-    file_cache, cache_events = _read_file_cache(skill_dir, components)
+    file_cache, cache_events = _read_file_cache(skill_dir, components, state)
     python_ast_cache_key = prewarm_python_ast_cache(components, file_cache)
     manifest = _parse_manifest(skill_dir)
     metadata_components = [

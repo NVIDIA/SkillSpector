@@ -108,6 +108,16 @@ class TestCrossFileDedup:
         assert result[0].confidence == 0.9
         assert result[0].file == "b.py"
 
+    def test_same_pattern_from_different_transitive_sources_is_preserved(self) -> None:
+        first = _finding(file="tool.py")
+        first.source_url = "https://github.com/org/first"
+        second = _finding(file="tool.py")
+        second.source_url = "https://github.com/org/second"
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
     def test_different_patterns_across_files_not_deduped(self) -> None:
         """Different matched texts are independent even with same rule_id."""
         findings = [

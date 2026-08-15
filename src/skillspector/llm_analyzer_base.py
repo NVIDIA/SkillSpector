@@ -31,6 +31,7 @@ import asyncio
 import os
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -464,11 +465,20 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
 
-    def __init__(self, base_prompt: str, model: str, *, node: str = "llm_analyzer"):
+    def __init__(
+        self,
+        base_prompt: str,
+        model: str,
+        *,
+        node: str = "llm_analyzer",
+        timeout: float | None | Callable[[], float | None] = None,
+    ):
         self.base_prompt = base_prompt
         self.model = model
+        self._timeout = timeout
+        self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model)
+        self._llm = get_chat_model(model=model, timeout=self._remaining_timeout())
         self._uses_native_connection_retries = _uses_native_connection_retries(self._llm)
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
@@ -479,6 +489,20 @@ class LLMAnalyzerBase:
             model=model,
             chat_model=self._llm,
         )
+
+    def _remaining_timeout(self) -> float | None:
+        if callable(self._timeout):
+            return self._timeout()
+        return self._timeout
+
+    def _model_for_call(self) -> tuple[object, object | None]:
+        if not self._dynamic_timeout:
+            return self._llm, self._structured_llm
+        llm = get_chat_model(model=self.model, timeout=self._remaining_timeout())
+        structured = (
+            llm.with_structured_output(self.response_schema) if self.response_schema else None
+        )
+        return llm, structured
 
     @property
     def inference_usage(self) -> list[dict[str, object]]:
@@ -585,15 +609,14 @@ class LLMAnalyzerBase:
             estimate_tokens(prompt),
             len(batch.findings),
         )
-        if self._structured_llm:
+        llm, structured_llm = self._model_for_call()
+        if structured_llm:
             try:
-                response = _invoke_with_usage(self._structured_llm, prompt, self._usage_collector)
+                response = _invoke_with_usage(structured_llm, prompt, self._usage_collector)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
-            response = _raw_response_text(
-                _invoke_with_usage(self._llm, prompt, self._usage_collector)
-            )
+            response = _raw_response_text(_invoke_with_usage(llm, prompt, self._usage_collector))
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
@@ -649,16 +672,15 @@ class LLMAnalyzerBase:
             estimate_tokens(prompt),
             len(batch.findings),
         )
-        if self._structured_llm:
+        llm, structured_llm = self._model_for_call()
+        if structured_llm:
             try:
-                response = await _ainvoke_with_usage(
-                    self._structured_llm, prompt, self._usage_collector
-                )
+                response = await _ainvoke_with_usage(structured_llm, prompt, self._usage_collector)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
             response = _raw_response_text(
-                await _ainvoke_with_usage(self._llm, prompt, self._usage_collector)
+                await _ainvoke_with_usage(llm, prompt, self._usage_collector)
             )
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
