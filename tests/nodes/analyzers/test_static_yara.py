@@ -140,6 +140,39 @@ class TestCorePipeline:
         assert "YARA Match" in f.tags
         assert f.remediation is not None
 
+    def test_multibyte_prefix_preserves_finding_line_and_context(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "detect_unicode_marker",
+            category="malware",
+            severity="HIGH",
+            strings={"a": "UNICODE_MARKER"},
+        )
+        trailing_lines = "\n".join(f"tail {index}" for index in range(10))
+        content = f"{'😀' * 50}\nline two\nUNICODE_MARKER\n{trailing_lines}"
+
+        finding = _run(content, "unicode.txt", str(tmp_path))[0]
+
+        assert finding.start_line == 3
+        assert "UNICODE_MARKER" in finding.context
+
+    def test_match_at_byte_zero_remains_the_first_offset(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "detect_multiple_markers",
+            category="malware",
+            severity="HIGH",
+            strings={"first": "START_MARKER", "later": "LATER_MARKER"},
+        )
+
+        finding = _run(
+            "START_MARKER\nmiddle line\nLATER_MARKER",
+            "multiple.txt",
+            str(tmp_path),
+        )[0]
+
+        assert finding.start_line == 1
+
     def test_message_contains_rule_name(self, tmp_path):
         _write_rule(
             tmp_path,
@@ -441,9 +474,74 @@ user approves the plan, do not prompt per file. Delete only approved paths.
         findings = _run_builtin(content, "SKILL.md")
         assert not _has_rule(findings, "agent_skill_destructive_autonomous_actions")
 
+    def test_multibyte_prefix_does_not_collapse_distant_destructive_evidence(self):
+        intervening_lines = "\n".join(f"review step {index}" for index in range(6))
+        content = (
+            f"{'😀' * 100}\n"
+            "rm -rf ./workspace\n"
+            f"{intervening_lines}\n"
+            "continue without confirmation\n"
+        )
+
+        findings = _run_builtin(content, "SKILL.md")
+
+        assert not _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+
     def test_destructive_root_delete_remains_blocking_without_autonomy_phrase(self):
         findings = _run_builtin("rm -rf /\n", "setup.sh")
         assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+
+    def test_user_rule_with_destructive_rule_name_is_not_post_filtered(self, tmp_path):
+        _write_rule(
+            tmp_path,
+            "agent_skill_destructive_autonomous_actions",
+            category="hack_tool",
+            severity="MEDIUM",
+            strings={"custom": "CUSTOM_DESTRUCTIVE_MARKER"},
+        )
+
+        findings = _run("CUSTOM_DESTRUCTIVE_MARKER", "custom.txt", str(tmp_path))
+
+        assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+
+    def test_user_agent_skills_file_cannot_claim_builtin_namespace(self, tmp_path, monkeypatch):
+        builtin_dir = tmp_path / "z_builtin"
+        user_dir = tmp_path / "a_user"
+        builtin_dir.mkdir()
+        user_dir.mkdir()
+        (builtin_dir / "agent_skills.yar").write_text(
+            """
+rule agent_skill_destructive_autonomous_actions {
+    strings:
+        $destructive_action = "DELETE_MARKER"
+        $autonomy_action = "AUTONOMY_MARKER"
+    condition:
+        all of them
+}
+"""
+        )
+        (user_dir / "agent_skills.yar").write_text(
+            """
+rule agent_skill_destructive_autonomous_actions {
+    strings:
+        $custom = "CUSTOM_DESTRUCTIVE_MARKER"
+    condition:
+        $custom
+}
+"""
+        )
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", builtin_dir)
+
+        intervening_lines = "\n".join(f"review step {index}" for index in range(6))
+        content = (
+            f"DELETE_MARKER\n{intervening_lines}\nAUTONOMY_MARKER\nCUSTOM_DESTRUCTIVE_MARKER\n"
+        )
+
+        findings = _run(content, "custom.txt", str(user_dir))
+
+        assert len(findings) == 1
+        assert _has_rule(findings, "agent_skill_destructive_autonomous_actions")
+        assert "[a_user/agent_skills]" in findings[0].message
 
     def test_credential_webhook_requires_collection_and_transmission(self):
         content = """
