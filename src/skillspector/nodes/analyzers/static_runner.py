@@ -355,7 +355,7 @@ def _scan_path(
             # PE3's analyzer owns its narrowly qualified safe references.
             # Generic documentation words are attacker-controlled and must
             # not hard-drop HIGH credential-access findings here.
-            if af.rule_id != "PE3" and af.context and is_code_example(af.context):
+            if af.rule_id != "PE3" and af.context and is_code_example(af.context, path=path):
                 if is_non_executable:
                     logger.debug(
                         "Filtered code-example finding in non-executable: %s in %s:%d",
