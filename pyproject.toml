@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skillspector"
-version = "2.9.4"
+version = "2.9.5"
 description = "SkillSpector: Security scanner for AI agent skills (Claude Code, Cursor, and similar). Scans skills for vulnerabilities, malicious patterns, and security risks before installation. Supports Git repos, URLs, zips, and local directories; runs static pattern checks and optional LLM semantic analysis; outputs terminal, JSON, and Markdown reports with risk scoring."
 readme = "README.md"
 license = "Apache-2.0"
@@ -81,8 +81,12 @@ Issues = "https://github.com/NVIDIA/skillspector/issues"
 [tool.hatch.build]
 exclude = [".claude/", ".cursor/", ".agents/"]
 
+[tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/skillspector"]
+core-metadata-version = "2.4"
 
 [tool.ruff]
 line-length = 100

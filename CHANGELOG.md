@@ -1,3 +1,13 @@
+### 2.9.5 (Friday, August 14, 2026)
+### Features/Bug Fixes
+* Scope the locality guard to the namespace (#365)
+* Use byte offsets for YARA line lookup (#364)
+* feat(cli): opt-in discovery of an author-shipped baseline (#278) (#286)
+* feat: add Ollama, Azure OpenAI, and generic OpenAI-compatible providers (#179)
+* fix: bound MCP extra to supported major version (#339)
+* fix(analyzers): reduce false positives for negated safety constraints (#254)
+* feat(analyzer): detect insecure deserialization (AST10, TT6, DS1–DS4) (#246)
+---
 ### 2.9.4 (Wednesday, August 12, 2026)
 ### Features/Bug Fixes
 * fix(mcp): reject local targets over HTTP transport (#196)
