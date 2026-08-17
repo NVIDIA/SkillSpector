@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from skillspector.models import Finding
@@ -74,3 +76,41 @@ def test_report_emits_clean_utf8_for_all_formats(fmt: str) -> None:
     assert "\x1b" not in body, f"ESC leaked into {fmt}"
     # The readable content survives the sanitization.
     assert "leak" in body and "here" in body
+
+
+@pytest.mark.parametrize("fmt", ["markdown", "json", "sarif", "terminal"])
+def test_report_redacts_url_credentials_from_every_finding_field(fmt: str) -> None:
+    username = "output-user-sentinel"
+    password = "output-password-sentinel"
+    token = "output-token-sentinel"
+    url = f"https://{username}:{password}@packages.example.invalid/?token={token}"
+    finding = Finding(
+        rule_id="E2",
+        message=f"credential-bearing destination {url}",
+        severity="HIGH",
+        confidence=0.9,
+        file="setup.sh",
+        start_line=1,
+        finding=url,
+        explanation=url,
+        remediation=url,
+        context=url,
+        matched_text=url,
+        code_snippet=url,
+        evidence={"destination": url},
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": fmt,
+    }
+
+    result = report(state)
+    rendered = result["report_body"]
+    serialized_findings = json.dumps([item.to_dict() for item in result["filtered_findings"]])
+    for secret in (username, password, token):
+        assert secret not in rendered
+        assert secret not in serialized_findings
