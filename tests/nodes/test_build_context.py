@@ -450,18 +450,19 @@ def test_build_context_reports_exclusion_boundary_without_descendants(tmp_path: 
     assert "node_modules/pkg/index.js" not in result["components"]
 
 
-def test_build_context_reports_hidden_file_as_a_scope_exclusion(tmp_path: Path) -> None:
-    """Hidden files are excluded individually without a directory marker."""
+def test_build_context_inventories_hidden_file_for_local_analysis(tmp_path: Path) -> None:
+    """Hidden regular files stay local and never enter the LLM-visible cache."""
     (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
     (tmp_path / ".env").write_text("TOKEN=not-reported\n", encoding="utf-8")
 
     result = build_context({"skill_path": str(tmp_path)})
-    exclusions = [
-        event for event in result["inspection_ledger"] if event["outcome"] == "out_of_scope"
-    ]
-
-    assert [event["path"] for event in exclusions] == [".env"]
-    assert ".env" not in result["components"]
+    assert ".env" in result["components"]
+    assert ".env" in result["local_file_cache"]
+    assert ".env" not in result["file_cache"]
+    assert ".env" not in result["llm_components"]
+    assert not any(
+        event.get("reason_code") == "hidden_file" for event in result["inspection_ledger"]
+    )
 
 
 def test_build_context_reports_read_error_without_fake_empty_content(

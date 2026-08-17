@@ -58,7 +58,11 @@ class SkillspectorState(TypedDict, total=False):
 
     # build_context node populates these
     components: list[str]
+    # Visible authored text that may be submitted to external LLM providers.
+    llm_components: list[str]
     file_cache: dict[str, str]
+    # Full local-only deterministic view, including hidden and nested content.
+    local_file_cache: dict[str, str]
     # Retained for compatibility with the persisted workflow-state schema.
     ast_cache: dict[str, str]
     # Key for the process-local parsed-AST cache.  The ASTs themselves stay

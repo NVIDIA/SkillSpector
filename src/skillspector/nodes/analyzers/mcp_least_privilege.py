@@ -214,7 +214,7 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Analyze manifest permissions vs code capabilities; emit LP1-LP4 findings."""
     manifest: dict = state.get("manifest") or {}
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     component_metadata: list[dict] = state.get("component_metadata") or []
 
     # Skip: no manifest

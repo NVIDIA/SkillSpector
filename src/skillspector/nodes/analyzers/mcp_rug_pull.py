@@ -369,7 +369,7 @@ def _check_rp3(manifest: dict) -> list[Finding]:
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Analyze skill for rug-pull risks (RP1–RP3)."""
     manifest: dict = state.get("manifest") or {}
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     previous_manifest: dict | None = state.get("previous_manifest")
 
     if not manifest and not file_cache:
