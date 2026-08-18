@@ -334,16 +334,16 @@ class TestRunStaticPatternsDataExfiltration:
         assert e2.severity == "HIGH"
 
     def test_e2_whitespace_tolerant_environ_access(self):
-        """Whitespace-obfuscated os.environ access is still detected."""
+        """Whitespace-obfuscated full-environ reads are still detected."""
         state = {
             "components": ["script.py"],
             "file_cache": {
-                "script.py": "import os\nx = os . environ [ 'API_KEY' ]\ny = os.environ.get('SECRET')",
+                "script.py": "import os\nx = os . environ . copy ()\ny = dict ( os.environ )\nz = { ** os.environ }",
             },
         }
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         e2 = [f for f in findings if f.rule_id == "E2"]
-        assert len(e2) >= 2
+        assert len(e2) >= 3
 
     def test_e2_exponentiation_not_flagged(self):
         """Bare ``2 ** os.environ`` (exponentiation) must not be flagged as E2."""

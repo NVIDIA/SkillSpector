@@ -60,13 +60,6 @@ E1_PATTERNS = [
 E2_PYTHON_FALLBACK_PATTERNS = [
     # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
-    # Python: os.environ["KEY"] / os.environ['SECRET'] — whitespace-tolerant
-    (
-        r"os\s*\.\s*environ\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[^'\"]*['\"]\s*\]",
-        0.8,
-    ),
-    # Python: os.environ.get("KEY") — whitespace-tolerant
-    (r"os\s*\.\s*environ\s*\.\s*get\s*\([^)]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", 0.7),
     # Python: os.environ.copy() — full environ read
     (r"os\s*\.\s*environ\s*\.\s*copy\s*\(\s*\)", 0.6),
     # Python: dict(os.environ) — full environ read via dict()
@@ -91,8 +84,6 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
     "items": 0.7,
     "keys": 0.6,
     "values": 0.6,
-    "get": 0.7,
-    "setdefault": 0.6,
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
@@ -196,14 +187,11 @@ def _analyze_python_environment_reads(
 ) -> list[AnalyzerFinding] | None:
     """Detect materializing or enumerating the complete ``os.environ`` mapping.
 
-    Detects full mapping copies/enumerations (``items()``, ``keys()``,
-    ``values()``, ``copy()``, ``dict(os.environ)``, ``{**os.environ}``),
-    single-key lookups (``os.environ['KEY']``, ``os.environ.get('SECRET')``),
-    and iteration over ``os.environ``. Single-key access is flagged at the same
-    severity because credential keys are the primary target of env harvesting.
-    Credential flows to network and execution sinks remain covered by the
-    behavioral taint analyzer. AST parsing makes this check insensitive to
-    formatting and lets it resolve ``os`` / ``environ`` import aliases.
+    A full mapping copy or enumeration is an environment-harvesting signal, unlike a
+    targeted single-key lookup or passing ``os.environ`` through to a child process.
+    Credential flows to network and execution sinks remain covered by the behavioral
+    taint analyzer. AST parsing makes this check insensitive to formatting and lets it
+    resolve ``os`` / ``environ`` import aliases.
 
     ``None`` means the source could not be parsed, so callers can retain the regex
     fallback for malformed Python files.  Standalone callers parse through the
@@ -279,10 +267,6 @@ def _analyze_python_environment_reads(
         elif isinstance(ast_node, (ast.For, ast.AsyncFor, ast.comprehension)):
             if _is_os_environ_reference(ast_node.iter, aliases):
                 emit(ast_node.iter, 0.7)
-
-        elif isinstance(ast_node, ast.Subscript):
-            if _is_os_environ_reference(ast_node.value, aliases):
-                emit(ast_node, 0.7)
 
     return findings
 
