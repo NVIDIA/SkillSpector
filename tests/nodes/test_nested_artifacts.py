@@ -51,6 +51,16 @@ def _document_members(**extra: bytes) -> dict[str, bytes]:
     }
 
 
+def _with_unsupported_compression(data: bytes, method: int = 99) -> bytes:
+    encoded = bytearray(data)
+    local_header = encoded.find(b"PK\x03\x04")
+    central_header = encoded.find(b"PK\x01\x02")
+    assert local_header >= 0 and central_header >= 0
+    encoded[local_header + 8 : local_header + 10] = method.to_bytes(2, "little")
+    encoded[central_header + 10 : central_header + 12] = method.to_bytes(2, "little")
+    return bytes(encoded)
+
+
 def test_hidden_disguised_document_inventories_nested_executable_locally(tmp_path: Path) -> None:
     archive_path = tmp_path / ".instructions.docx.txt"
     _write_archive(archive_path, _document_members(**{"word/sync1.sh": b"#!/bin/sh\necho ok\n"}))
@@ -122,6 +132,62 @@ def test_nested_zip_preserves_full_virtual_provenance(tmp_path: Path) -> None:
     assert metadata["concealed_executable"] is True
 
 
+def test_visible_document_concealment_survives_recursive_zip(tmp_path: Path) -> None:
+    inner = _zip_bytes({"payload.sh": b"#!/bin/sh\necho nested\n"})
+    outer_path = tmp_path / "nested.docx"
+    _write_archive(outer_path, _document_members(**{"word/embedded.zip": inner}))
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = "nested.docx!/word/embedded.zip!/payload.sh"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    assert metadata["nested_path"] == "word/embedded.zip!/payload.sh"
+    assert metadata["container_ancestry"] == ["docx", "zip"]
+    assert metadata["concealment_reasons"] == ["document_container"]
+    finding = next(item for item in findings if item.file == virtual_path)
+    assert finding.severity == "HIGH"
+    assert finding.evidence["nested_path"] == "word/embedded.zip!/payload.sh"
+    assert finding.evidence["container_ancestry"] == ["docx", "zip"]
+
+
+@pytest.mark.parametrize(
+    ("member_name", "content"),
+    [
+        ("payload.ps1", b"Write-Host 'review'\n"),
+        ("payload.pyc", b"\x42\x0d\x0d\x0a bytecode"),
+        ("payload.exe", b"MZ executable"),
+    ],
+)
+def test_document_execution_relevant_suffixes_emit_sc9(
+    tmp_path: Path, member_name: str, content: bytes
+) -> None:
+    outer_path = tmp_path / "payloads.docx"
+    _write_archive(outer_path, _document_members(**{f"word/{member_name}": content}))
+
+    context = build_context({"skill_path": str(tmp_path)})
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    finding = next(item for item in findings if item.file.endswith(member_name))
+    assert finding.rule_id == "SC9"
+    assert finding.severity == "HIGH"
+    assert finding.evidence["concealment"] == "document_container"
+
+
+def test_hidden_extensionless_executable_shebang_file_emits_sc9(tmp_path: Path) -> None:
+    path = tmp_path / ".bootstrap"
+    path.write_text("#!/bin/sh\necho local\n", encoding="utf-8")
+    path.chmod(0o755)
+
+    context = build_context({"skill_path": str(tmp_path)})
+    metadata = next(item for item in context["component_metadata"] if item["path"] == path.name)
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    assert metadata["executable"] is True
+    assert metadata["concealed_executable"] is True
+    assert findings[0].severity == "HIGH"
+
+
 @pytest.mark.parametrize(
     ("member", "reason"),
     [
@@ -164,6 +230,49 @@ def test_malformed_zip_marks_inspection_incomplete(tmp_path: Path) -> None:
 
     assert any(
         event.get("reason_code") == LedgerReason.ARCHIVE_MALFORMED for event in result.ledger_events
+    )
+
+
+def test_expected_document_with_incompatible_bytes_is_incomplete_and_local_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "broken.docx"
+    path.write_bytes(b"not an office container")
+
+    context = build_context({"skill_path": str(tmp_path)})
+
+    assert path.name not in context["file_cache"]
+    assert path.name in context["local_file_cache"]
+    metadata = next(item for item in context["component_metadata"] if item["path"] == path.name)
+    assert metadata["local_only"] is True
+    assert any(
+        event.get("reason_code") == LedgerReason.ARCHIVE_FORMAT_MISMATCH
+        and event.get("path") == path.name
+        for event in context["inspection_ledger"]
+    )
+
+
+def test_unsupported_compression_is_not_reported_as_encryption(tmp_path: Path) -> None:
+    path = tmp_path / "unsupported.zip"
+    path.write_bytes(_with_unsupported_compression(_zip_bytes({"payload.sh": b"#!/bin/sh\n"})))
+
+    result = inspect_nested_artifacts(tmp_path, [path.name])
+    reasons = {event.get("reason_code") for event in result.ledger_events}
+
+    assert LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION in reasons
+    assert LedgerReason.ARCHIVE_ENCRYPTED not in reasons
+
+
+def test_truncated_nested_archive_retains_full_provenance(tmp_path: Path) -> None:
+    path = tmp_path / "outer.zip"
+    _write_archive(path, {"nested.zip": b"PK\x03\x04truncated"})
+
+    result = inspect_nested_artifacts(tmp_path, [path.name])
+
+    assert any(
+        event.get("reason_code") == LedgerReason.ARCHIVE_TRUNCATED
+        and event.get("path") == "outer.zip!/nested.zip"
+        for event in result.ledger_events
     )
 
 
@@ -240,4 +349,53 @@ def test_depth_member_size_and_time_limits_are_reported(
     assert any(
         event.get("reason_code") == LedgerReason.ARCHIVE_TIME_LIMIT
         for event in time_result.ledger_events
+    )
+
+
+def test_member_limit_is_checked_before_sorting_attacker_controlled_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import skillspector.nested_artifacts as nested
+
+    monkeypatch.setattr(nested, "ARCHIVE_MAX_MEMBERS", 1)
+    path = tmp_path / "members.zip"
+    _write_archive(path, {"two.txt": b"2", "one.txt": b"1"})
+    zip_sort_calls = 0
+
+    def guarded_sort(infos: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
+        nonlocal zip_sort_calls
+        zip_sort_calls += 1
+        return infos
+
+    monkeypatch.setattr(nested, "_sorted_infos", guarded_sort)
+
+    result = inspect_nested_artifacts(tmp_path, [path.name])
+
+    assert zip_sort_calls == 0
+    assert any(
+        event.get("reason_code") == LedgerReason.ARCHIVE_MEMBER_LIMIT
+        for event in result.ledger_events
+    )
+
+
+def test_reserved_virtual_delimiter_cannot_collide_with_recursive_provenance(
+    tmp_path: Path,
+) -> None:
+    inner = _zip_bytes({"payload.sh": b"#!/bin/sh\n"})
+    path = tmp_path / "collision.zip"
+    _write_archive(
+        path,
+        {
+            "evil": inner,
+            "evil!/payload.sh": b"#!/bin/sh\necho impersonated\n",
+        },
+    )
+
+    result = inspect_nested_artifacts(tmp_path, [path.name])
+
+    assert result.components.count("collision.zip!/evil!/payload.sh") == 1
+    assert result.file_cache["collision.zip!/evil!/payload.sh"] == "#!/bin/sh\n"
+    assert any(
+        event.get("reason_code") == LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH
+        for event in result.ledger_events
     )

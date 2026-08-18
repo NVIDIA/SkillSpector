@@ -1273,14 +1273,22 @@ def _analyze_concealed_executables(
         if not path:
             continue
         outer_path = str(metadata.get("outer_path", path.split("!/", 1)[0]))
-        nested_path = path.split("!/", 1)[1] if "!/" in path else path
+        nested_path = str(
+            metadata.get("nested_path", path.split("!/", 1)[1] if "!/" in path else path)
+        )
         container_type = str(metadata.get("container_type", "zip"))
-        if container_type in {"docx", "xlsx", "pptx"}:
-            concealment = "document_container"
-        elif metadata.get("outer_hidden") or metadata.get("hidden"):
-            concealment = "hidden_artifact"
-        else:
-            concealment = "disguised_container"
+        raw_reasons = metadata.get("concealment_reasons", [])
+        concealment_reasons = (
+            [str(item) for item in raw_reasons] if isinstance(raw_reasons, list) else []
+        )
+        if not concealment_reasons:
+            if container_type in {"docx", "xlsx", "pptx"}:
+                concealment_reasons.append("document_container")
+            elif metadata.get("outer_hidden") or metadata.get("hidden"):
+                concealment_reasons.append("hidden_artifact")
+            else:
+                concealment_reasons.append("disguised_container")
+        concealment = concealment_reasons[0]
         findings.append(
             Finding(
                 rule_id="SC9",
@@ -1311,8 +1319,10 @@ def _analyze_concealed_executables(
                     "outer_path": outer_path,
                     "nested_path": nested_path,
                     "container_type": container_type,
+                    "container_ancestry": metadata.get("container_ancestry", [container_type]),
                     "container_depth": metadata.get("container_depth", 1),
                     "concealment": concealment,
+                    "concealment_reasons": concealment_reasons,
                     "local_only": True,
                 },
             )

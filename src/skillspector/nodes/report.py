@@ -989,8 +989,8 @@ def _format_markdown(
                 lines.append("")
             if f.evidence:
                 lines.append("**Evidence:**")
-                for key, value in sorted(f.evidence.items()):
-                    lines.append(f"- **{key}:** `{value}`")
+                for key, evidence_value in sorted(f.evidence.items()):
+                    lines.append(f"- **{key}:** `{evidence_value}`")
                 lines.append("")
             lines.append("---\n")
 

@@ -41,7 +41,31 @@ ARCHIVE_MAX_SECONDS = 5.0
 
 _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _EXECUTABLE_SUFFIXES = frozenset(
-    {".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".rb", ".go", ".rs", ".pl"}
+    {
+        ".app",
+        ".bash",
+        ".bat",
+        ".bin",
+        ".cmd",
+        ".com",
+        ".dll",
+        ".dylib",
+        ".exe",
+        ".go",
+        ".js",
+        ".msi",
+        ".pl",
+        ".ps1",
+        ".py",
+        ".pyc",
+        ".pyo",
+        ".rb",
+        ".rs",
+        ".sh",
+        ".so",
+        ".ts",
+        ".zsh",
+    }
 )
 _OOXML_MARKERS: tuple[tuple[str, str], ...] = (
     ("word/", "docx"),
@@ -95,9 +119,26 @@ def _container_type(names: list[str]) -> str:
     return "zip"
 
 
+def _expected_container_type(path: str) -> str | None:
+    suffix = Path(path).suffix.lower()
+    return next(
+        (
+            container_type
+            for container_type, suffixes in _EXPECTED_SUFFIXES.items()
+            if suffix in suffixes
+        ),
+        None,
+    )
+
+
 def _safe_member_name(name: str) -> str | None:
     normalized = name.replace("\\", "/")
-    if not normalized or "\x00" in normalized or normalized.startswith(("/", "//")):
+    if (
+        not normalized
+        or "\x00" in normalized
+        or "!/" in normalized
+        or normalized.startswith(("/", "//"))
+    ):
         return None
     if len(normalized) >= 2 and normalized[1] == ":":
         return None
@@ -112,10 +153,46 @@ def _zip_member_is_link(info: zipfile.ZipInfo) -> bool:
     return bool(mode and stat.S_ISLNK(mode))
 
 
+def is_executable_content(path: str, data: bytes, mode: int = 0) -> bool:
+    """Classify filesystem and archive content with one static-only policy."""
+    suffix = Path(path).suffix.lower()
+    executable_magic = data.startswith(
+        (b"#!", b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xcf\xfa\xed\xfe")
+    )
+    return suffix in _EXECUTABLE_SUFFIXES or executable_magic or bool(mode & 0o111)
+
+
 def _member_executable(info: zipfile.ZipInfo, safe_name: str, data: bytes) -> bool:
-    suffix = Path(safe_name).suffix.lower()
-    mode = info.external_attr >> 16
-    return suffix in _EXECUTABLE_SUFFIXES or data.startswith(b"#!") or bool(mode & 0o111)
+    return is_executable_content(safe_name, data, info.external_attr >> 16)
+
+
+def _nested_path(outer_path: str, virtual_path: str) -> str:
+    prefix = f"{outer_path}!/"
+    return virtual_path[len(prefix) :] if virtual_path.startswith(prefix) else virtual_path
+
+
+def _sorted_infos(infos: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
+    return sorted(infos, key=lambda item: item.filename)
+
+
+def _record_outer_metadata(
+    result: NestedInspectionResult,
+    *,
+    path: str,
+    container_type: str,
+    hidden: bool,
+    disguised: bool,
+) -> None:
+    result.outer_metadata[path] = {
+        "type": container_type,
+        "container_type": container_type,
+        "container_ancestry": [container_type],
+        "hidden": hidden,
+        "disguised": disguised,
+        # Recognized and expected containers are never provider input,
+        # including when their bytes cannot be fully inspected.
+        "local_only": True,
+    }
 
 
 def _virtual_type(path: str, data: bytes, nested_type: str | None) -> str:
@@ -171,6 +248,8 @@ def _add_unreadable_component(
     outer_path: str,
     member_path: str,
     container_type: str,
+    container_ancestry: tuple[str, ...],
+    concealment_reasons: tuple[str, ...],
     depth: int,
 ) -> None:
     if virtual_path not in result.file_cache:
@@ -188,10 +267,12 @@ def _add_unreadable_component(
                 "outer_path": outer_path,
                 "nested_path": member_path,
                 "container_type": container_type,
+                "container_ancestry": list(container_ancestry),
                 "container_depth": depth,
                 "hidden": _is_hidden_path(member_path),
                 "local_only": True,
                 "concealed_executable": False,
+                "concealment_reasons": list(concealment_reasons),
             }
         )
 
@@ -203,19 +284,64 @@ def _inspect_zip_bytes(
     container_virtual_path: str,
     depth: int,
     outer_hidden: bool,
-    outer_disguised: bool,
+    outer_disguised: bool | None,
+    outer_expected_type: str | None,
+    ancestor_container_types: tuple[str, ...],
     budget: _Budget,
     result: NestedInspectionResult,
 ) -> None:
+    if budget.expired():
+        _exception(result, path=container_virtual_path, reason=LedgerReason.ARCHIVE_TIME_LIMIT)
+        return
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
     except (zipfile.BadZipFile, OSError, ValueError):
-        _exception(result, path=container_virtual_path, reason=LedgerReason.ARCHIVE_MALFORMED)
+        reason = LedgerReason.ARCHIVE_MALFORMED if depth == 1 else LedgerReason.ARCHIVE_TRUNCATED
+        _exception(result, path=container_virtual_path, reason=reason)
         return
 
     with archive:
-        infos = sorted(archive.infolist(), key=lambda item: item.filename)
+        if budget.expired():
+            _exception(result, path=container_virtual_path, reason=LedgerReason.ARCHIVE_TIME_LIMIT)
+            return
+
+        # ZipFile has already parsed the central directory. Enforce the cumulative
+        # entry budget before sorting or inspecting any attacker-controlled names.
+        infos = archive.filelist
+        remaining_members = ARCHIVE_MAX_MEMBERS - budget.members
+        if len(infos) > remaining_members:
+            _exception(
+                result,
+                path=container_virtual_path,
+                reason=LedgerReason.ARCHIVE_MEMBER_LIMIT,
+            )
+            return
+        budget.members += len(infos)
+        infos = _sorted_infos(infos)
         current_type = _container_type([info.filename for info in infos])
+        effective_outer_disguised = (
+            outer_disguised
+            if outer_disguised is not None
+            else outer_expected_type is None or outer_expected_type != current_type
+        )
+        if depth == 1:
+            _record_outer_metadata(
+                result,
+                path=outer_path,
+                container_type=current_type,
+                hidden=outer_hidden,
+                disguised=effective_outer_disguised,
+            )
+        container_ancestry = (*ancestor_container_types, current_type)
+        inherited_reason_list: list[str] = []
+        if any(item in {"docx", "xlsx", "pptx"} for item in container_ancestry):
+            inherited_reason_list.append("document_container")
+        if outer_hidden:
+            inherited_reason_list.append("hidden_artifact")
+        if effective_outer_disguised:
+            inherited_reason_list.append("disguised_container")
+        inherited_reasons = tuple(inherited_reason_list)
+        seen_names: set[str] = set()
 
         for info in infos:
             if info.is_dir():
@@ -225,13 +351,6 @@ def _inspect_zip_bytes(
                     result, path=container_virtual_path, reason=LedgerReason.ARCHIVE_TIME_LIMIT
                 )
                 return
-            if budget.members >= ARCHIVE_MAX_MEMBERS:
-                _exception(
-                    result, path=container_virtual_path, reason=LedgerReason.ARCHIVE_MEMBER_LIMIT
-                )
-                return
-            budget.members += 1
-
             safe_name = _safe_member_name(info.filename)
             if safe_name is None:
                 _exception(
@@ -241,14 +360,33 @@ def _inspect_zip_bytes(
                 )
                 continue
             virtual_path = f"{container_virtual_path}!/{safe_name}"
+            if safe_name in seen_names or virtual_path in result.file_cache:
+                _exception(
+                    result,
+                    path=virtual_path,
+                    reason=LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH,
+                )
+                continue
+            seen_names.add(safe_name)
+            member_path = _nested_path(outer_path, virtual_path)
+            concealment_reasons = tuple(
+                dict.fromkeys(
+                    (
+                        *inherited_reasons,
+                        *(("hidden_artifact",) if _is_hidden_path(safe_name) else ()),
+                    )
+                )
+            )
 
             if _zip_member_is_link(info):
                 _add_unreadable_component(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
                 _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_LINK_MEMBER)
@@ -258,8 +396,10 @@ def _inspect_zip_bytes(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
                 _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_ENCRYPTED)
@@ -271,8 +411,10 @@ def _inspect_zip_bytes(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
                 _exception(
@@ -288,8 +430,10 @@ def _inspect_zip_bytes(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
                 _exception(
@@ -305,8 +449,10 @@ def _inspect_zip_bytes(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
                 _exception(
@@ -321,24 +467,50 @@ def _inspect_zip_bytes(
             try:
                 with archive.open(info) as source:
                     member_data = source.read(MAX_FILE_BYTES + 1)
-            except RuntimeError:
+            except NotImplementedError:
                 _add_unreadable_component(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
-                _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_ENCRYPTED)
+                _exception(
+                    result,
+                    path=virtual_path,
+                    reason=LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION,
+                )
+                continue
+            except RuntimeError as exc:
+                _add_unreadable_component(
+                    result,
+                    virtual_path=virtual_path,
+                    outer_path=outer_path,
+                    member_path=member_path,
+                    container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
+                    depth=depth,
+                )
+                reason = (
+                    LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION
+                    if "compress" in str(exc).lower() or "not supported" in str(exc).lower()
+                    else LedgerReason.ARCHIVE_TRUNCATED
+                )
+                _exception(result, path=virtual_path, reason=reason)
                 continue
             except (zipfile.BadZipFile, EOFError, OSError, ValueError):
                 _add_unreadable_component(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
                 _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_TRUNCATED)
@@ -349,8 +521,10 @@ def _inspect_zip_bytes(
                     result,
                     virtual_path=virtual_path,
                     outer_path=outer_path,
-                    member_path=safe_name,
+                    member_path=member_path,
                     container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
                     depth=depth,
                 )
                 _exception(
@@ -362,26 +536,65 @@ def _inspect_zip_bytes(
                 )
                 continue
 
+            if budget.expired():
+                _add_unreadable_component(
+                    result,
+                    virtual_path=virtual_path,
+                    outer_path=outer_path,
+                    member_path=member_path,
+                    container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
+                    depth=depth,
+                )
+                _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_TIME_LIMIT)
+                return
+            if budget.uncompressed_bytes + len(member_data) > ARCHIVE_MAX_UNCOMPRESSED_BYTES:
+                _add_unreadable_component(
+                    result,
+                    virtual_path=virtual_path,
+                    outer_path=outer_path,
+                    member_path=member_path,
+                    container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
+                    depth=depth,
+                )
+                _exception(
+                    result,
+                    path=virtual_path,
+                    reason=LedgerReason.ARCHIVE_SIZE_LIMIT,
+                    observed_bytes=budget.uncompressed_bytes + len(member_data),
+                    limit_bytes=ARCHIVE_MAX_UNCOMPRESSED_BYTES,
+                )
+                return
+            if len(member_data) > compressed * ARCHIVE_MAX_COMPRESSION_RATIO:
+                _add_unreadable_component(
+                    result,
+                    virtual_path=virtual_path,
+                    outer_path=outer_path,
+                    member_path=member_path,
+                    container_type=current_type,
+                    container_ancestry=container_ancestry,
+                    concealment_reasons=concealment_reasons,
+                    depth=depth,
+                )
+                _exception(
+                    result,
+                    path=virtual_path,
+                    reason=LedgerReason.ARCHIVE_COMPRESSION_RATIO,
+                    observed_bytes=len(member_data),
+                    limit_bytes=compressed * ARCHIVE_MAX_COMPRESSION_RATIO,
+                )
+                continue
+
             budget.uncompressed_bytes += len(member_data)
-            nested_type: str | None = None
             nested_zip = _is_zip_signature(member_data)
-            if nested_zip and zipfile.is_zipfile(io.BytesIO(member_data)):
-                try:
-                    with zipfile.ZipFile(io.BytesIO(member_data)) as nested_archive:
-                        nested_type = _container_type(
-                            [nested_info.filename for nested_info in nested_archive.infolist()]
-                        )
-                except (zipfile.BadZipFile, OSError, ValueError):
-                    nested_type = "zip"
+            nested_type: str | None = "zip" if nested_zip else None
 
             executable = _member_executable(info, safe_name, member_data)
             member_hidden = _is_hidden_path(safe_name)
-            concealed = executable and (
-                current_type in {"docx", "xlsx", "pptx"}
-                or outer_hidden
-                or outer_disguised
-                or member_hidden
-            )
+            concealed = executable and bool(concealment_reasons)
             virtual_type = _virtual_type(safe_name, member_data, nested_type)
             result.components.append(virtual_path)
             result.file_cache[virtual_path] = member_data.decode("utf-8", errors="replace")
@@ -397,21 +610,20 @@ def _inspect_zip_bytes(
                     "executable": executable,
                     "size_bytes": len(member_data),
                     "outer_path": outer_path,
-                    "nested_path": safe_name,
+                    "nested_path": member_path,
                     "container_type": current_type,
+                    "container_ancestry": list(container_ancestry),
                     "container_depth": depth,
                     "hidden": member_hidden,
                     "outer_hidden": outer_hidden,
-                    "outer_disguised": outer_disguised,
+                    "outer_disguised": effective_outer_disguised,
                     "local_only": True,
                     "concealed_executable": concealed,
+                    "concealment_reasons": list(concealment_reasons),
                 }
             )
 
             if not nested_zip:
-                continue
-            if not zipfile.is_zipfile(io.BytesIO(member_data)):
-                _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_MALFORMED)
                 continue
             if depth >= ARCHIVE_MAX_DEPTH:
                 _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_DEPTH_LIMIT)
@@ -422,7 +634,9 @@ def _inspect_zip_bytes(
                 container_virtual_path=virtual_path,
                 depth=depth + 1,
                 outer_hidden=outer_hidden,
-                outer_disguised=outer_disguised,
+                outer_disguised=effective_outer_disguised,
+                outer_expected_type=outer_expected_type,
+                ancestor_container_types=container_ancestry,
                 budget=budget,
                 result=result,
             )
@@ -438,6 +652,9 @@ def inspect_nested_artifacts(
     result = NestedInspectionResult()
     for path in components:
         full_path = skill_dir / path
+        expected_type = _expected_container_type(path)
+        hidden = _is_hidden_path(path)
+
         try:
             size = full_path.stat().st_size
         except OSError:
@@ -451,12 +668,32 @@ def inspect_nested_artifacts(
             except (OSError, _FileOpenError, _UnsafeFileError):
                 continue
             if _is_zip_signature(signature):
+                _record_outer_metadata(
+                    result,
+                    path=path,
+                    container_type=expected_type or "zip",
+                    hidden=hidden,
+                    disguised=expected_type is None,
+                )
                 _exception(
                     result,
                     path=path,
                     reason=LedgerReason.ARCHIVE_SIZE_LIMIT,
                     observed_bytes=size,
                     limit_bytes=ARCHIVE_MAX_UNCOMPRESSED_BYTES,
+                )
+            elif expected_type is not None:
+                _record_outer_metadata(
+                    result,
+                    path=path,
+                    container_type=expected_type,
+                    hidden=hidden,
+                    disguised=False,
+                )
+                _exception(
+                    result,
+                    path=path,
+                    reason=LedgerReason.ARCHIVE_FORMAT_MISMATCH,
                 )
             continue
         try:
@@ -465,27 +702,29 @@ def inspect_nested_artifacts(
         except (OSError, _FileOpenError, _UnsafeFileError):
             continue
         if not _is_zip_signature(data):
+            if expected_type is not None:
+                _record_outer_metadata(
+                    result,
+                    path=path,
+                    container_type=expected_type,
+                    hidden=hidden,
+                    disguised=False,
+                )
+                _exception(
+                    result,
+                    path=path,
+                    reason=LedgerReason.ARCHIVE_FORMAT_MISMATCH,
+                )
             continue
-        if not zipfile.is_zipfile(io.BytesIO(data)):
-            _exception(result, path=path, reason=LedgerReason.ARCHIVE_MALFORMED)
-            continue
-
-        try:
-            with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                container_type = _container_type([info.filename for info in archive.infolist()])
-        except (zipfile.BadZipFile, OSError, ValueError):
-            _exception(result, path=path, reason=LedgerReason.ARCHIVE_MALFORMED)
-            continue
-
-        hidden = _is_hidden_path(path)
-        disguised = Path(path).suffix.lower() not in _EXPECTED_SUFFIXES[container_type]
-        result.outer_metadata[path] = {
-            "type": container_type,
-            "container_type": container_type,
-            "hidden": hidden,
-            "disguised": disguised,
-            "local_only": hidden or disguised,
-        }
+        # Record a conservative local-only identity before parsing the central
+        # directory. The bounded inspector refines this after its early checks.
+        _record_outer_metadata(
+            result,
+            path=path,
+            container_type=expected_type or "zip",
+            hidden=hidden,
+            disguised=expected_type is None,
+        )
         budget = _Budget(started_at=clock(), clock=clock)
         _inspect_zip_bytes(
             data,
@@ -493,7 +732,9 @@ def inspect_nested_artifacts(
             container_virtual_path=path,
             depth=1,
             outer_hidden=hidden,
-            outer_disguised=disguised,
+            outer_disguised=None,
+            outer_expected_type=expected_type,
+            ancestor_container_types=(),
             budget=budget,
             result=result,
         )
