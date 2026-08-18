@@ -19,7 +19,10 @@ from pathlib import PurePosixPath
 
 from skillspector.models import Finding
 
-_URL_RE = re.compile(r"(?:sparse\+)?(?:https?|git\+https?)://[^\s'\"<>]+", re.IGNORECASE)
+_URL_RE = re.compile(
+    r"(?:https?|ssh|git\+https?|git\+ssh|sparse\+https)://[^\s'\"<>]+",
+    re.IGNORECASE,
+)
 _VARIABLE_RE = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
@@ -27,11 +30,19 @@ _ASSIGNMENT_RE = re.compile(
     r"^\s*(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.+?)\s*$"
 )
 _SENSITIVE_QUERY_KEY = re.compile(r"(?:auth|credential|key|pass|secret|signature|token)", re.I)
-_EXECUTABLE_SUFFIXES = frozenset({".sh", ".bash", ".zsh", ".py", ".js", ".ts", ".rb"})
+_SHELL_SUFFIXES = frozenset({".sh", ".bash", ".zsh"})
+_SHELL_SHEBANG_RE = re.compile(r"^#![^\n]*(?:^|/|\s)(?:ba|z|da|k)?sh(?:\s|$)", re.I)
+
+Assignments = dict[str, list[tuple[int, str]]]
 
 _CANONICAL_DESTINATIONS: dict[str, frozenset[str]] = {
     "npm": frozenset({"https://registry.npmjs.org/"}),
-    "yarn": frozenset({"https://registry.npmjs.org/"}),
+    "yarn": frozenset(
+        {
+            "https://registry.npmjs.org/",
+            "https://registry.yarnpkg.com/",
+        }
+    ),
     "pip": frozenset({"https://pypi.org/simple/"}),
     "poetry": frozenset({"https://pypi.org/simple/"}),
     "maven": frozenset(
@@ -63,6 +74,28 @@ class SourceChange:
     matched_text: str
 
 
+@dataclass(frozen=True)
+class _HeredocRegion:
+    target: str
+    body: str
+    start_line: int
+    expand_variables: bool
+
+
+_HEREDOC_TARGET = r'(?P<target>"[^"]+"|\'[^\']+\'|[^\s;]+)'
+_HEREDOC_DELIMITER = r"(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+_HEREDOC_HEADERS = (
+    re.compile(
+        rf"^\s*cat\b.*?(?<![<>])>(?!>)\s*{_HEREDOC_TARGET}\s*"
+        rf"<<(?P<strip_tabs>-?)\s*{_HEREDOC_DELIMITER}"
+    ),
+    re.compile(
+        rf"^\s*cat\b.*?<<(?P<strip_tabs>-?)\s*{_HEREDOC_DELIMITER}\s*"
+        rf"(?<![<>])>(?!>)\s*{_HEREDOC_TARGET}"
+    ),
+)
+
+
 def _strip_shell_comment(value: str) -> str:
     """Remove an unquoted shell comment without interpreting the command."""
     quote: str | None = None
@@ -74,10 +107,10 @@ def _strip_shell_comment(value: str) -> str:
     return value.strip()
 
 
-def _literal_assignments(content: str) -> dict[str, str]:
+def _literal_assignments(content: str) -> Assignments:
     """Collect simple literal local assignments; never evaluate shell syntax."""
-    assignments: dict[str, str] = {}
-    for line in content.splitlines():
+    assignments: Assignments = {}
+    for line_number, line in enumerate(content.splitlines(), 1):
         match = _ASSIGNMENT_RE.match(line)
         if not match:
             continue
@@ -88,22 +121,23 @@ def _literal_assignments(content: str) -> dict[str, str]:
             continue
         if _VARIABLE_RE.search(value):
             continue
-        assignments[match.group("name")] = value
+        assignments.setdefault(match.group("name"), []).append((line_number, value))
     return assignments
 
 
-def _resolve_value(value: str, assignments: dict[str, str]) -> tuple[str, bool]:
-    """Resolve simple variable references from the same file."""
+def _resolve_value(value: str, assignments: Assignments, use_line: int) -> tuple[str, bool]:
+    """Resolve simple variables from the latest literal assignment before use."""
     resolved = _strip_shell_comment(value).strip().strip(";,)")
     if len(resolved) >= 2 and resolved[0] == resolved[-1] and resolved[0] in {'"', "'"}:
         resolved = resolved[1:-1]
 
     def replacement(match: re.Match[str]) -> str:
         name = match.group("braced") or match.group("plain") or ""
-        return assignments.get(name, match.group(0))
+        prior = [assigned for line, assigned in assignments.get(name, []) if line < use_line]
+        return prior[-1] if prior else match.group(0)
 
     resolved = _VARIABLE_RE.sub(replacement, resolved).strip().strip("\"'")
-    dynamic = bool(_VARIABLE_RE.search(resolved) or "$(" in resolved or "`" in resolved)
+    dynamic = bool("$" in resolved or "`" in resolved)
     return ("unresolved" if dynamic or not resolved else resolved, not dynamic and bool(resolved))
 
 
@@ -201,9 +235,9 @@ def _add_change(
     file: str,
     line: int,
     matched_text: str,
-    assignments: dict[str, str],
+    assignments: Assignments,
 ) -> None:
-    destination, resolved = _resolve_value(raw_destination, assignments)
+    destination, resolved = _resolve_value(raw_destination, assignments, line)
     if resolved and _is_canonical(ecosystem, destination):
         return
     changes.append(
@@ -221,7 +255,7 @@ def _add_change(
 
 
 def _parse_npmrc(
-    content: str, file: str, start_line: int, assignments: dict[str, str]
+    content: str, file: str, start_line: int, assignments: Assignments
 ) -> list[SourceChange]:
     changes: list[SourceChange] = []
     for offset, line in enumerate(content.splitlines()):
@@ -248,7 +282,7 @@ def _parse_npmrc(
 
 
 def _parse_yarnrc(
-    content: str, file: str, start_line: int, assignments: dict[str, str]
+    content: str, file: str, start_line: int, assignments: Assignments
 ) -> list[SourceChange]:
     changes: list[SourceChange] = []
     current_scope: str | None = None
@@ -288,7 +322,7 @@ def _parse_yarnrc(
 
 
 def _parse_pip_config(
-    content: str, file: str, start_line: int, assignments: dict[str, str]
+    content: str, file: str, start_line: int, assignments: Assignments
 ) -> list[SourceChange]:
     changes: list[SourceChange] = []
     section: str | None = None
@@ -318,7 +352,7 @@ def _parse_pip_config(
     return changes
 
 
-def _parse_poetry(content: str, file: str, assignments: dict[str, str]) -> list[SourceChange]:
+def _parse_poetry(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
     changes: list[SourceChange] = []
     try:
         parsed = tomllib.loads(content)
@@ -353,7 +387,7 @@ def _parse_poetry(content: str, file: str, assignments: dict[str, str]) -> list[
     return changes
 
 
-def _parse_maven(content: str, file: str, assignments: dict[str, str]) -> list[SourceChange]:
+def _parse_maven(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
     changes: list[SourceChange] = []
     try:
         root = ET.fromstring(content)
@@ -388,7 +422,7 @@ def _parse_maven(content: str, file: str, assignments: dict[str, str]) -> list[S
     return changes
 
 
-def _parse_cargo(content: str, file: str, assignments: dict[str, str]) -> list[SourceChange]:
+def _parse_cargo(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
     changes: list[SourceChange] = []
     try:
         parsed = tomllib.loads(content)
@@ -458,47 +492,67 @@ def _parse_cargo(content: str, file: str, assignments: dict[str, str]) -> list[S
     return changes
 
 
-def _heredocs(content: str) -> list[tuple[str, str, int]]:
-    """Return generated target, body, and first body line for simple heredocs."""
+def _heredocs(content: str) -> list[_HeredocRegion]:
+    """Return bounded, linearly parsed generated-configuration heredocs."""
     lines = content.splitlines()
-    regions: list[tuple[str, str, int]] = []
-    header = re.compile(
-        r">\s*(?P<target>\"[^\"]+\"|'[^']+'|\S+)\s*<<-?\s*['\"]?(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)"
-    )
+    regions: list[_HeredocRegion] = []
     index = 0
     while index < len(lines):
-        match = header.search(lines[index])
+        match = next(
+            (
+                candidate
+                for pattern in _HEREDOC_HEADERS
+                if (candidate := pattern.search(lines[index])) is not None
+            ),
+            None,
+        )
         if not match:
             index += 1
             continue
         delimiter = match.group("delimiter")
+        strip_tabs = match.group("strip_tabs") == "-"
         end = index + 1
-        while end < len(lines) and lines[end].strip() != delimiter:
+        while end < len(lines):
+            terminator = lines[end].lstrip("\t") if strip_tabs else lines[end]
+            if terminator == delimiter:
+                break
             end += 1
         if end >= len(lines):
-            index += 1
-            continue
+            # An unmatched heredoc consumes the remaining shell input. Stopping
+            # here both reflects that ambiguity and prevents repeated O(n) scans.
+            break
+        body_lines = lines[index + 1 : end]
+        if strip_tabs:
+            body_lines = [line.lstrip("\t") for line in body_lines]
         regions.append(
-            (match.group("target").strip("'\""), "\n".join(lines[index + 1 : end]), index + 2)
+            _HeredocRegion(
+                target=match.group("target").strip("'\""),
+                body="\n".join(body_lines),
+                start_line=index + 2,
+                expand_variables=not bool(match.group("quote")),
+            )
         )
         index = end + 1
     return regions
 
 
 def _parse_generated_configs(
-    content: str, file: str, assignments: dict[str, str]
+    content: str, file: str, assignments: Assignments
 ) -> list[SourceChange]:
     changes: list[SourceChange] = []
-    for target, body, start_line in _heredocs(content):
-        lower = target.lower()
+    for region in _heredocs(content):
+        lower = region.target.lower()
+        region_assignments = assignments if region.expand_variables else {}
         if lower.endswith(".npmrc"):
-            changes.extend(_parse_npmrc(body, file, start_line, assignments))
+            changes.extend(_parse_npmrc(region.body, file, region.start_line, region_assignments))
         elif lower.endswith(".yarnrc") or lower.endswith((".yarnrc.yml", ".yarnrc.yaml")):
-            changes.extend(_parse_yarnrc(body, file, start_line, assignments))
+            changes.extend(_parse_yarnrc(region.body, file, region.start_line, region_assignments))
         elif lower.endswith(("pip.conf", "pip.ini")):
-            changes.extend(_parse_pip_config(body, file, start_line, assignments))
+            changes.extend(
+                _parse_pip_config(region.body, file, region.start_line, region_assignments)
+            )
         elif lower.endswith(("settings.xml", "pom.xml")):
-            generated = _parse_maven(body, file, assignments)
+            generated = _parse_maven(region.body, file, region_assignments)
             changes.extend(
                 SourceChange(
                     ecosystem=change.ecosystem,
@@ -507,13 +561,13 @@ def _parse_generated_configs(
                     scope=change.scope,
                     destination=change.destination,
                     file=change.file,
-                    line=start_line + change.line - 1,
+                    line=region.start_line + change.line - 1,
                     matched_text=change.matched_text,
                 )
                 for change in generated
             )
         elif lower.endswith("pyproject.toml"):
-            generated = _parse_poetry(body, file, assignments)
+            generated = _parse_poetry(region.body, file, region_assignments)
             changes.extend(
                 SourceChange(
                     ecosystem=change.ecosystem,
@@ -522,13 +576,13 @@ def _parse_generated_configs(
                     scope=change.scope,
                     destination=change.destination,
                     file=change.file,
-                    line=start_line + change.line - 1,
+                    line=region.start_line + change.line - 1,
                     matched_text=change.matched_text,
                 )
                 for change in generated
             )
         elif ".cargo/" in lower and lower.endswith(("/config", "/config.toml")):
-            generated = _parse_cargo(body, file, assignments)
+            generated = _parse_cargo(region.body, file, region_assignments)
             changes.extend(
                 SourceChange(
                     ecosystem=change.ecosystem,
@@ -537,7 +591,7 @@ def _parse_generated_configs(
                     scope=change.scope,
                     destination=change.destination,
                     file=change.file,
-                    line=start_line + change.line - 1,
+                    line=region.start_line + change.line - 1,
                     matched_text=change.matched_text,
                 )
                 for change in generated
@@ -545,8 +599,51 @@ def _parse_generated_configs(
     return changes
 
 
-def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> list[SourceChange]:
+def _shell_segments(line: str) -> list[str]:
+    """Split executable shell command lists without evaluating shell syntax."""
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            current.append(character)
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            current.append(character)
+            escaped = True
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = None if quote == character else character if quote is None else quote
+            current.append(character)
+            index += 1
+            continue
+        if quote is None and character == "#" and (not current or current[-1].isspace()):
+            break
+        pair = line[index : index + 2]
+        if quote is None and (character == ";" or pair in {"&&", "||"}):
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += 2 if pair in {"&&", "||"} else 1
+            continue
+        current.append(character)
+        index += 1
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _parse_commands(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
     changes: list[SourceChange] = []
+    command_prefix = r"^\s*(?:[$>]\s+)?(?:(?:command|sudo)\s+)?"
     patterns: tuple[tuple[str, str, str, str, re.Pattern[str]], ...] = (
         (
             "npm",
@@ -554,7 +651,9 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "npm config set",
             "scope",
             re.compile(
-                r"\bnpm\s+config\s+set\s+(?P<scope>@[\w.-]+:)?registry\s+(?P<dest>\S+)", re.I
+                command_prefix
+                + r"npm\s+config\s+set\s+(?P<scope>@[\w.-]+:)?registry\s+(?P<dest>\S+)",
+                re.I,
             ),
         ),
         (
@@ -563,7 +662,9 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "yarn config set",
             "scope",
             re.compile(
-                r"\byarn\s+config\s+set\s+(?:registry|npmRegistryServer)\s+(?P<dest>\S+)", re.I
+                command_prefix
+                + r"yarn\s+config\s+set\s+(?:registry|npmRegistryServer)\s+(?P<dest>\S+)",
+                re.I,
             ),
         ),
         (
@@ -571,14 +672,24 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "replace",
             "pip --index-url",
             "none",
-            re.compile(r"\bpip(?:3)?\b[^\n]*?--index-url(?:=|\s+)(?P<dest>\S+)", re.I),
+            re.compile(
+                command_prefix
+                + r"(?:python(?:3)?\s+-m\s+)?pip(?:3)?\b[^\n]*?"
+                + r"(?:--index-url|-i)(?:=|\s+)(?P<dest>\S+)",
+                re.I,
+            ),
         ),
         (
             "pip",
             "add",
             "pip --extra-index-url",
             "none",
-            re.compile(r"\bpip(?:3)?\b[^\n]*?--extra-index-url(?:=|\s+)(?P<dest>\S+)", re.I),
+            re.compile(
+                command_prefix
+                + r"(?:python(?:3)?\s+-m\s+)?pip(?:3)?\b[^\n]*?"
+                + r"--extra-index-url(?:=|\s+)(?P<dest>\S+)",
+                re.I,
+            ),
         ),
         (
             "pip",
@@ -586,7 +697,9 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "pip config set",
             "none",
             re.compile(
-                r"\bpip(?:3)?\s+config\s+set\s+(?:global\.)?index-url\s+(?P<dest>\S+)", re.I
+                command_prefix
+                + r"pip(?:3)?\s+config\s+set\s+(?:global\.)?index-url\s+(?P<dest>\S+)",
+                re.I,
             ),
         ),
         (
@@ -595,7 +708,9 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "pip config set",
             "none",
             re.compile(
-                r"\bpip(?:3)?\s+config\s+set\s+(?:global\.)?extra-index-url\s+(?P<dest>\S+)", re.I
+                command_prefix
+                + r"pip(?:3)?\s+config\s+set\s+(?:global\.)?extra-index-url\s+(?P<dest>\S+)",
+                re.I,
             ),
         ),
         (
@@ -604,7 +719,10 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "poetry source add",
             "poetry",
             re.compile(
-                r"\bpoetry\s+source\s+add(?:\s+--\S+)*\s+(?P<scope>[\w.-]+)\s+(?P<dest>\S+)", re.I
+                command_prefix
+                + r"poetry\s+source\s+add(?:\s+--\S+)*\s+"
+                + r"(?P<scope>[\w.-]+)\s+(?P<dest>\S+)",
+                re.I,
             ),
         ),
         (
@@ -613,7 +731,10 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "poetry config repositories",
             "poetry",
             re.compile(
-                r"\bpoetry\s+config\s+repositories\.(?P<scope>[\w.-]+)\s+(?P<dest>\S+)", re.I
+                command_prefix
+                + r"poetry\s+config\s+repositories\."
+                + r"(?P<scope>[\w.-]+)\s+(?P<dest>\S+)",
+                re.I,
             ),
         ),
         (
@@ -621,15 +742,18 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
             "replace",
             "Maven CLI repository",
             "none",
-            re.compile(r"-Dmaven\.repo\.remote=(?P<dest>\S+)", re.I),
+            re.compile(
+                command_prefix + r"mvn\b[^\n]*?-Dmaven\.repo\.remote=(?P<dest>\S+)",
+                re.I,
+            ),
         ),
     )
     for line_number, line in enumerate(content.splitlines(), 1):
-        stripped = line.lstrip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        for ecosystem, operation, surface, scope_mode, pattern in patterns:
-            for match in pattern.finditer(line):
+        for segment in _shell_segments(line):
+            for ecosystem, operation, surface, scope_mode, pattern in patterns:
+                match = pattern.search(segment)
+                if not match:
+                    continue
                 scope = match.groupdict().get("scope") if scope_mode != "none" else None
                 if scope:
                     scope = scope.rstrip(":")
@@ -646,34 +770,34 @@ def _parse_commands(content: str, file: str, assignments: dict[str, str]) -> lis
                     assignments=assignments,
                 )
 
-        env_match = re.match(
-            r"\s*(?:export\s+)?(?P<name>NPM_CONFIG_REGISTRY|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|CARGO_REGISTRIES_[A-Za-z0-9_]+_INDEX)\s*=\s*(?P<dest>.+)$",
-            line,
-            re.I,
-        )
-        if env_match:
-            name = env_match.group("name").upper()
-            if name == "NPM_CONFIG_REGISTRY":
-                ecosystem, operation, scope = "npm", "replace", None
-            elif name == "PIP_INDEX_URL":
-                ecosystem, operation, scope = "pip", "replace", None
-            elif name == "PIP_EXTRA_INDEX_URL":
-                ecosystem, operation, scope = "pip", "add", None
-            else:
-                ecosystem, operation = "cargo", "add"
-                scope = name.removeprefix("CARGO_REGISTRIES_").removesuffix("_INDEX").lower()
-            _add_change(
-                changes,
-                ecosystem=ecosystem,
-                operation=operation,
-                surface="environment variable",
-                scope=scope,
-                raw_destination=env_match.group("dest"),
-                file=file,
-                line=line_number,
-                matched_text=line,
-                assignments=assignments,
+            env_match = re.match(
+                r"\s*(?:export\s+)?(?P<name>NPM_CONFIG_REGISTRY|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|CARGO_REGISTRIES_[A-Za-z0-9_]+_INDEX)\s*=\s*(?P<dest>.+)$",
+                segment,
+                re.I,
             )
+            if env_match:
+                name = env_match.group("name").upper()
+                if name == "NPM_CONFIG_REGISTRY":
+                    ecosystem, operation, scope = "npm", "replace", None
+                elif name == "PIP_INDEX_URL":
+                    ecosystem, operation, scope = "pip", "replace", None
+                elif name == "PIP_EXTRA_INDEX_URL":
+                    ecosystem, operation, scope = "pip", "add", None
+                else:
+                    ecosystem, operation = "cargo", "add"
+                    scope = name.removeprefix("CARGO_REGISTRIES_").removesuffix("_INDEX").lower()
+                _add_change(
+                    changes,
+                    ecosystem=ecosystem,
+                    operation=operation,
+                    surface="environment variable",
+                    scope=scope,
+                    raw_destination=env_match.group("dest"),
+                    file=file,
+                    line=line_number,
+                    matched_text=line,
+                    assignments=assignments,
+                )
     return changes
 
 
@@ -695,7 +819,7 @@ def _markdown_shell_content(content: str) -> str:
     return "\n".join(output)
 
 
-def _changes_for_file(content: str, file: str) -> list[SourceChange]:
+def _changes_for_file(content: str, file: str, *, executable: bool = False) -> list[SourceChange]:
     normalized = file.replace("\\", "/")
     lower = normalized.lower()
     name = PurePosixPath(normalized).name.lower()
@@ -722,7 +846,10 @@ def _changes_for_file(content: str, file: str) -> list[SourceChange]:
     elif name in {"config", "config.toml"} and "/.cargo/" in f"/{lower}":
         changes.extend(_parse_cargo(content, file, assignments))
 
-    is_script = PurePosixPath(normalized).suffix.lower() in _EXECUTABLE_SUFFIXES
+    suffix = PurePosixPath(normalized).suffix.lower()
+    is_script = suffix in _SHELL_SUFFIXES or (
+        not suffix and executable and bool(_SHELL_SHEBANG_RE.search(content[:256]))
+    )
     actionable = _markdown_shell_content(content) if name in {"skill.md", "readme.md"} else content
     if is_script or actionable != content:
         command_assignments = _literal_assignments(actionable) or assignments
@@ -787,12 +914,17 @@ def analyze_dependency_sources(
         for metadata in component_metadata or []
         if metadata.get("local_only") is True
     }
+    executable_paths = {
+        str(metadata.get("path", ""))
+        for metadata in component_metadata or []
+        if metadata.get("executable") is True
+    }
     changes: list[SourceChange] = []
     for file in components:
         content = file_cache.get(file)
         if content is None or "\x00" in content[:8192]:
             continue
-        changes.extend(_changes_for_file(content, file))
+        changes.extend(_changes_for_file(content, file, executable=file in executable_paths))
 
     findings: list[Finding] = []
     seen: set[tuple[object, ...]] = set()

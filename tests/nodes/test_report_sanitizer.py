@@ -79,11 +79,12 @@ def test_report_emits_clean_utf8_for_all_formats(fmt: str) -> None:
 
 
 @pytest.mark.parametrize("fmt", ["markdown", "json", "sarif", "terminal"])
-def test_report_redacts_url_credentials_from_every_finding_field(fmt: str) -> None:
+@pytest.mark.parametrize("scheme", ["https", "ssh", "git+https", "sparse+https"])
+def test_report_redacts_url_credentials_from_every_finding_field(fmt: str, scheme: str) -> None:
     username = "output-user-sentinel"
     password = "output-password-sentinel"
     token = "output-token-sentinel"
-    url = f"https://{username}:{password}@packages.example.invalid/?token={token}"
+    url = f"{scheme}://{username}:{password}@packages.example.invalid/?token={token}"
     finding = Finding(
         rule_id="E2",
         message=f"credential-bearing destination {url}",

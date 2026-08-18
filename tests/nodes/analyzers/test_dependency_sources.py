@@ -12,7 +12,12 @@ import pytest
 from skillspector.dependency_sources import analyze_dependency_sources
 from skillspector.llm_analyzer_base import Batch
 from skillspector.models import Finding
-from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer
+from skillspector.nodes.meta_analyzer import (
+    PER_FILE_ANALYSIS_PROMPT,
+    LLMMetaAnalyzer,
+    _fallback_filtered,
+    _passthrough_with_defaults,
+)
 from skillspector.nodes.report import report
 from skillspector.state import SkillspectorState
 
@@ -181,6 +186,58 @@ def test_canonical_defaults_do_not_produce_sc10() -> None:
     assert _analyze(files) == []
 
 
+@pytest.mark.parametrize("filename", [".yarnrc", ".yarnrc.yml"])
+def test_yarn_documented_public_default_does_not_produce_sc10(filename: str) -> None:
+    content = (
+        'registry "https://registry.yarnpkg.com"\n'
+        if filename == ".yarnrc"
+        else "npmRegistryServer: https://registry.yarnpkg.com\n"
+    )
+
+    assert _analyze({filename: content}) == []
+
+
+def test_variable_resolution_uses_assignment_visible_at_command_line() -> None:
+    script = """SRC=https://packages.example.invalid
+npm config set registry "$SRC"
+SRC=https://registry.npmjs.org/
+"""
+
+    findings = _analyze({"setup.sh": script})
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 2
+    assert findings[0].evidence["destination"] == "https://packages.example.invalid"
+
+
+def test_single_prior_literal_assignment_resolves_statically() -> None:
+    script = """SRC=https://packages.example.invalid
+npm config set registry "${SRC}"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+    assert finding.evidence["destination_status"] == "resolved"
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "${SRC:-https://packages.example.invalid}",
+        "$(printf https://packages.example.invalid)",
+        "`printf https://packages.example.invalid`",
+        "$UNASSIGNED_SOURCE",
+    ],
+)
+def test_dynamic_or_unsupported_shell_expansions_remain_unresolved(expression: str) -> None:
+    finding = _analyze({"setup.sh": f"npm config set registry {expression}\n"})[0]
+
+    assert finding.evidence["destination"] == "unresolved"
+    assert finding.evidence["destination_status"] == "unresolved"
+    assert finding.severity == "HIGH"
+
+
 def test_unresolved_destination_is_high_trust_boundary_change() -> None:
     script = """#!/bin/sh
 cat > .npmrc << EOF
@@ -254,6 +311,48 @@ def test_url_credentials_are_redacted_from_findings_and_all_reports(output_forma
         assert secret not in rendered
 
 
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "ssh://registry-user-sentinel:registry-password-sentinel@packages.example.invalid/index?token=registry-token-sentinel",
+        "git+https://registry-user-sentinel:registry-password-sentinel@packages.example.invalid/index?token=registry-token-sentinel",
+        "sparse+https://registry-user-sentinel:registry-password-sentinel@packages.example.invalid/index?token=registry-token-sentinel",
+    ],
+)
+def test_cargo_url_credentials_are_redacted_for_supported_schemes(destination: str) -> None:
+    content = f'[registries.private]\nindex = "{destination}"\n'
+
+    finding = _analyze({".cargo/config.toml": content})[0]
+    serialized = json.dumps(finding.to_dict())
+
+    for secret in (
+        "registry-user-sentinel",
+        "registry-password-sentinel",
+        "registry-token-sentinel",
+    ):
+        assert secret not in serialized
+    assert "packages.example.invalid" in serialized
+
+
+def test_sc10_credentials_are_redacted_before_provider_prompt_construction() -> None:
+    username = "provider-user-sentinel"
+    password = "provider-password-sentinel"
+    token = "provider-token-sentinel"
+    content = f"registry=ssh://{username}:{password}@packages.example.invalid/index?token={token}\n"
+    finding = _analyze({".npmrc": content})[0]
+    analyzer = LLMMetaAnalyzer.__new__(LLMMetaAnalyzer)
+    analyzer.base_prompt = PER_FILE_ANALYSIS_PROMPT
+    analyzer._input_budget = 100_000
+
+    batch = analyzer.get_batches([".npmrc"], {".npmrc": content}, [finding])[0]
+    prompt = analyzer.build_prompt(batch, metadata_text="No metadata available")
+
+    for secret in (username, password, token):
+        assert secret not in batch.content
+        assert secret not in prompt
+    assert "packages.example.invalid" in prompt
+
+
 def test_hidden_source_finding_is_marked_local_only() -> None:
     findings = _analyze(
         {".npmrc": "registry=https://packages.example.invalid\n"},
@@ -275,4 +374,97 @@ def test_sc10_survives_optional_llm_filtering_when_unconfirmed() -> None:
     assert len(kept) == 1
     assert kept[0].rule_id == "SC10"
     assert kept[0].severity == "HIGH"
-    assert "llm-unconfirmed" in kept[0].tags
+    assert kept[0] is finding
+    assert kept[0].tags == ["supply-chain", "dependency-source"]
+
+
+def test_sc10_provider_confirmation_cannot_replace_deterministic_fields() -> None:
+    finding = _analyze({".npmrc": "registry=https://packages.example.invalid\n"})[0]
+    original = finding.to_dict()
+    batch = Batch(file_path=".npmrc", content="redacted", findings=[finding])
+    provider_item = {
+        "pattern_id": "SC10",
+        "is_vulnerability": True,
+        "confidence": 0.6,
+        "start_line": finding.start_line,
+        "explanation": "provider alternate explanation",
+        "remediation": "provider alternate remediation",
+        "_file": ".npmrc",
+    }
+    analyzer = LLMMetaAnalyzer.__new__(LLMMetaAnalyzer)
+
+    kept = analyzer.apply_filter([finding], [(batch, [provider_item])])
+
+    assert kept == [finding]
+    assert kept[0].to_dict() == original
+    assert kept[0].confidence == 1.0
+    assert kept[0].message == finding.message
+
+
+def test_sc10_static_only_and_provider_failure_paths_preserve_canonical_record() -> None:
+    finding = _analyze({".npmrc": "registry=https://packages.example.invalid\n"})[0]
+
+    assert _fallback_filtered([finding]) == [finding]
+    assert _passthrough_with_defaults([finding]) == [finding]
+
+
+def test_common_heredoc_redirection_order_is_detected_at_config_line() -> None:
+    script = """cat <<EOF > .npmrc
+registry=https://packages.example.invalid
+EOF
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 2
+    assert finding.evidence["surface"] == ".npmrc"
+
+
+def test_quoted_heredoc_delimiter_does_not_expand_variables() -> None:
+    script = """SOURCE=https://packages.example.invalid
+cat <<'EOF' > .npmrc
+registry=${SOURCE}
+EOF
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 3
+    assert finding.evidence["destination"] == "unresolved"
+    assert finding.evidence["destination_status"] == "unresolved"
+
+
+def test_repeated_unmatched_heredocs_are_bounded_and_do_not_produce_sc10() -> None:
+    script = "\n".join("cat <<EOF > .npmrc" for _ in range(2_000))
+
+    assert _analyze({"setup.sh": script}) == []
+
+
+def test_echoed_and_source_language_command_text_is_not_actionable() -> None:
+    destination = "https://packages.example.invalid"
+    files = {
+        "setup.sh": f"echo npm config set registry {destination}\n",
+        "example.py": f'command = "npm config set registry {destination}"\n',
+        "example.js": f'const command = "npm config set registry {destination}";\n',
+    }
+
+    assert _analyze(files) == []
+
+
+def test_pip_short_index_option_is_detected() -> None:
+    finding = _analyze(
+        {"setup.sh": "pip install -i https://packages.example.invalid/simple package-name\n"}
+    )[0]
+
+    assert finding.evidence["ecosystem"] == "pip"
+    assert finding.evidence["operation"] == "replace"
+
+
+def test_extensionless_executable_shell_script_is_actionable() -> None:
+    content = "#!/bin/sh\nnpm config set registry https://packages.example.invalid\n"
+    metadata = [{"path": "bootstrap", "executable": True}]
+
+    finding = _analyze({"bootstrap": content}, metadata)[0]
+
+    assert finding.start_line == 2
+    assert finding.evidence["ecosystem"] == "npm"
