@@ -1,3 +1,7 @@
+### 2.9.6 (Tuesday, August 18, 2026)
+### Features/Bug Fixes
+* fix(pe3): distinguish OAuth token nouns from access actions (#392)
+---
 ### 2.9.5 (Friday, August 14, 2026)
 ### Features/Bug Fixes
 * Scope the locality guard to the namespace (#365)
