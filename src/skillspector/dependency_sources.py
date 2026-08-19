@@ -29,6 +29,10 @@ _VARIABLE_RE = re.compile(
 _ASSIGNMENT_RE = re.compile(
     r"^\s*(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.+?)\s*$"
 )
+_FUNCTION_DECLARATION_RE = re.compile(
+    r"^\s*(?:function\s+(?P<bash>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\(\s*\))?"
+    r"|(?P<posix>[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))(?P<rest>.*)$"
+)
 _SENSITIVE_QUERY_KEY = re.compile(r"(?:auth|credential|key|pass|secret|signature|token)", re.I)
 _SHELL_SUFFIXES = frozenset({".sh", ".bash", ".zsh"})
 _SHELL_SHEBANG_RE = re.compile(r"^#![^\n]*(?:^|/|\s)(?:ba|z|da|k)?sh(?:\s|$)", re.I)
@@ -86,6 +90,12 @@ class _HeredocRegion:
 
 _HEREDOC_TARGET = r'(?P<target>"[^"]+"|\'[^\']+\'|[^\s;]+)'
 _HEREDOC_DELIMITER = r"(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+_SHELL_HEREDOC_OPERATOR = re.compile(
+    r"<<(?P<strip_tabs>-?)(?!<)\s*(?:"
+    r"(?P<quote>['\"])(?P<quoted>[^'\"]+)(?P=quote)|"
+    r"\\?(?P<bare>[A-Za-z_][A-Za-z0-9_]*)"
+    r")"
+)
 _HEREDOC_HEADERS = (
     re.compile(
         rf"^\s*cat\b.*?(?<![<>])>(?!>)\s*{_HEREDOC_TARGET}\s*"
@@ -109,6 +119,104 @@ def _strip_shell_comment(value: str) -> str:
     return value.strip()
 
 
+def _brace_delta(value: str) -> int:
+    """Count shell grouping braces while ignoring quotes and parameter expansion."""
+    quote: str | None = None
+    escaped = False
+    parameter_depth = 0
+    delta = 0
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = None if quote == character else character if quote is None else quote
+            index += 1
+            continue
+        if quote is not None:
+            index += 1
+            continue
+        if character == "#" and (index == 0 or value[index - 1].isspace()):
+            break
+        if character == "$" and value[index : index + 2] == "${":
+            parameter_depth += 1
+            index += 2
+            continue
+        if character == "}" and parameter_depth:
+            parameter_depth -= 1
+        elif character == "{":
+            delta += 1
+        elif character == "}":
+            delta -= 1
+        index += 1
+    return delta
+
+
+def _assignment_match(segment: str) -> re.Match[str] | None:
+    """Return an assignment occupying one bounded shell command segment."""
+    candidate = segment.rsplit("{", 1)[-1].strip().removesuffix("}").strip()
+    keyword = re.match(r"^(?:then|do|else)\b\s*(?P<rest>.*)$", candidate)
+    if keyword:
+        candidate = keyword.group("rest")
+    return _ASSIGNMENT_RE.match(candidate)
+
+
+def _function_context(content: str, data_lines: set[int]) -> tuple[set[int], dict[str, set[str]]]:
+    """Locate function definitions and variables they may assign, without executing them."""
+    lines = content.splitlines()
+    function_lines: set[int] = set()
+    assigned_by_function: dict[str, set[str]] = {}
+    index = 0
+    while index < len(lines):
+        line_number = index + 1
+        if line_number in data_lines:
+            index += 1
+            continue
+        declaration = _FUNCTION_DECLARATION_RE.match(_strip_shell_comment(lines[index]))
+        if not declaration:
+            index += 1
+            continue
+        name = declaration.group("bash") or declaration.group("posix") or ""
+        rest = declaration.group("rest")
+        opening_index = index if rest.lstrip().startswith("{") else None
+        if opening_index is None:
+            candidate = index + 1
+            while candidate < len(lines) and not _strip_shell_comment(lines[candidate]).strip():
+                candidate += 1
+            if candidate >= len(lines) or not _strip_shell_comment(
+                lines[candidate]
+            ).lstrip().startswith("{"):
+                index += 1
+                continue
+            opening_index = candidate
+
+        function_lines.add(line_number)
+        depth = 0
+        cursor = opening_index
+        assigned_names: set[str] = set()
+        while cursor < len(lines):
+            function_lines.add(cursor + 1)
+            fragment = rest if cursor == index else lines[cursor]
+            depth += _brace_delta(fragment)
+            for _, segment in _shell_parts(fragment):
+                assignment = _assignment_match(segment)
+                if assignment:
+                    assigned_names.add(assignment.group("name"))
+            cursor += 1
+            if depth <= 0:
+                break
+        assigned_by_function.setdefault(name, set()).update(assigned_names)
+        index = max(index + 1, cursor)
+    return function_lines, assigned_by_function
+
+
 def _literal_assignments(content: str) -> Assignments:
     """Collect definite top-level assignments without evaluating shell syntax.
 
@@ -119,44 +227,44 @@ def _literal_assignments(content: str) -> Assignments:
     """
     assignments: Assignments = {}
     heredoc_data_lines = _heredoc_data_lines(content)
-    function_depth = 0
+    function_lines, assigned_by_function = _function_context(content, heredoc_data_lines)
     control_depth = 0
     for line_number, line in enumerate(content.splitlines(), 1):
-        if line_number in heredoc_data_lines:
+        if line_number in heredoc_data_lines or line_number in function_lines:
             continue
-        stripped = _strip_shell_comment(line).strip()
-        if not stripped:
-            continue
+        for separator, segment in _shell_parts(line):
+            stripped = segment.strip()
+            if re.match(r"^(?:fi|done|esac)\b", stripped):
+                control_depth = max(0, control_depth - 1)
+                continue
+            if re.match(r"^(?:if|case|for|while|until|select)\b", stripped):
+                control_depth += 1
+                continue
 
-        if re.match(r"^}\s*(?:;|$)", stripped):
-            function_depth = max(0, function_depth - 1)
-            continue
-        if re.match(r"^(?:fi|done|esac)\b", stripped):
-            control_depth = max(0, control_depth - 1)
-            continue
-        function_header = re.match(
-            r"^(?:function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?"
-            r"|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{",
-            stripped,
-        )
-        if function_header:
-            if not re.search(r"}\s*(?:;|$)", stripped[function_header.end() :]):
-                function_depth += 1
-            continue
-        if re.match(r"^(?:if|case|for|while|until|select)\b", stripped):
-            control_depth += 1
-            continue
+            match = _assignment_match(stripped)
+            if match:
+                value = _strip_shell_comment(match.group("value")).strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                resolved_value: str | None = value
+                if (
+                    control_depth
+                    or separator in {"&&", "||", "|", "|&"}
+                    or not value
+                    or "$" in value
+                    or "`" in value
+                ):
+                    resolved_value = None
+                assignments.setdefault(match.group("name"), []).append(
+                    (line_number, resolved_value)
+                )
+                continue
 
-        match = _ASSIGNMENT_RE.match(line)
-        if not match or function_depth:
-            continue
-        value = _strip_shell_comment(match.group("value")).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        resolved_value: str | None = value
-        if control_depth or not value or "$" in value or "`" in value:
-            resolved_value = None
-        assignments.setdefault(match.group("name"), []).append((line_number, resolved_value))
+            call_candidate = re.sub(r"^(?:then|do|else)\b\s*", "", stripped)
+            call = re.match(r"^(?:command\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b", call_candidate)
+            if call and call.group("name") in assigned_by_function:
+                for name in assigned_by_function[call.group("name")]:
+                    assignments.setdefault(name, []).append((line_number, None))
     return assignments
 
 
@@ -574,21 +682,76 @@ def _heredocs(content: str) -> list[_HeredocRegion]:
     return regions
 
 
+def _shell_heredoc_specs(line: str) -> list[tuple[str, bool]]:
+    """Return unquoted heredoc delimiters declared by one shell command line."""
+    specs: list[tuple[str, bool]] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = None if quote == character else character if quote is None else quote
+            index += 1
+            continue
+        if quote is None and character == "#" and (index == 0 or line[index - 1].isspace()):
+            break
+        if (
+            quote is None
+            and line[index : index + 2] == "<<"
+            and (index == 0 or line[index - 1] != "<")
+        ):
+            match = _SHELL_HEREDOC_OPERATOR.match(line, index)
+            if match:
+                delimiter = match.group("quoted") or match.group("bare") or ""
+                specs.append((delimiter, match.group("strip_tabs") == "-"))
+                index = match.end()
+                continue
+        index += 1
+    return specs
+
+
 def _heredoc_data_lines(content: str) -> set[int]:
-    """Return body and terminator lines that are data, not shell commands."""
-    return {
-        line_number
-        for region in _heredocs(content)
-        for line_number in range(region.start_line, region.end_line + 1)
-    }
+    """Return all shell heredoc body and terminator lines in one bounded pass."""
+    lines = content.splitlines()
+    data_lines: set[int] = set()
+    index = 0
+    while index < len(lines):
+        specs = _shell_heredoc_specs(lines[index])
+        if not specs:
+            index += 1
+            continue
+        body_index = index + 1
+        for delimiter, strip_tabs in specs:
+            end = body_index
+            while end < len(lines):
+                terminator = lines[end].lstrip("\t") if strip_tabs else lines[end]
+                if terminator == delimiter:
+                    break
+                end += 1
+            data_lines.update(range(body_index + 1, min(end + 2, len(lines) + 1)))
+            if end >= len(lines):
+                return data_lines
+            body_index = end + 1
+        index = body_index
+    return data_lines
 
 
 def _parse_generated_configs(
     content: str, file: str, assignments: Assignments
 ) -> list[SourceChange]:
     changes: list[SourceChange] = []
+    heredoc_data_lines = _heredoc_data_lines(content)
     for region in _heredocs(content):
-        if not region.complete:
+        if not region.complete or region.start_line - 1 in heredoc_data_lines:
             continue
         lower = region.target.lower()
         region_assignments = assignments if region.expand_variables else {}
@@ -648,10 +811,11 @@ def _parse_generated_configs(
     return changes
 
 
-def _shell_segments(line: str) -> list[str]:
-    """Split executable shell command lists without evaluating shell syntax."""
-    segments: list[str] = []
+def _shell_parts(line: str) -> list[tuple[str | None, str]]:
+    """Split shell command lists while retaining the preceding control operator."""
+    parts: list[tuple[str | None, str]] = []
     current: list[str] = []
+    separator: str | None = None
     quote: str | None = None
     escaped = False
     index = 0
@@ -675,19 +839,26 @@ def _shell_segments(line: str) -> list[str]:
         if quote is None and character == "#" and (not current or current[-1].isspace()):
             break
         pair = line[index : index + 2]
-        if quote is None and (character == ";" or character == "|" or pair in {"&&", "||", "|&"}):
+        delimiter = pair if pair in {"&&", "||", "|&"} else character
+        if quote is None and (character in {";", "|"} or pair in {"&&", "||", "|&"}):
             segment = "".join(current).strip()
             if segment:
-                segments.append(segment)
+                parts.append((separator, segment))
             current = []
+            separator = delimiter
             index += 2 if pair in {"&&", "||", "|&"} else 1
             continue
         current.append(character)
         index += 1
     segment = "".join(current).strip()
     if segment:
-        segments.append(segment)
-    return segments
+        parts.append((separator, segment))
+    return parts
+
+
+def _shell_segments(line: str) -> list[str]:
+    """Split executable shell command lists without evaluating shell syntax."""
+    return [segment for _, segment in _shell_parts(line)]
 
 
 def _parse_commands(content: str, file: str, assignments: Assignments) -> list[SourceChange]:

@@ -242,6 +242,55 @@ npm config set registry "$SRC"
     assert findings[0].evidence["destination"] == "https://packages.example.invalid"
 
 
+def test_assignment_in_split_line_function_declaration_cannot_suppress_sc10() -> None:
+    script = """#!/bin/sh
+SRC=https://packages.example.invalid
+configure_later()
+{
+  SRC=https://registry.npmjs.org/
+}
+npm config set registry "$SRC"
+"""
+
+    findings = _analyze({"setup.sh": script})
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 7
+    assert findings[0].evidence["destination"] == "https://packages.example.invalid"
+
+
+def test_called_function_assignment_keeps_possible_redirect_high() -> None:
+    script = """#!/bin/sh
+SRC=https://registry.npmjs.org/
+use_private() {
+  SRC=https://packages.example.invalid
+}
+use_private
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 7
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "unresolved"
+    assert finding.evidence["destination_status"] == "unresolved"
+
+
+def test_conditionally_called_function_keeps_possible_redirect_high() -> None:
+    script = """SRC=https://registry.npmjs.org/
+use_private() { SRC=https://packages.example.invalid; }
+if test -f use-private; then use_private; fi
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 4
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "unresolved"
+
+
 def test_conditional_assignment_keeps_possible_noncanonical_redirect_high() -> None:
     script = """#!/bin/sh
 SRC=https://packages.example.invalid
@@ -258,6 +307,43 @@ npm config set registry "$SRC"
     assert findings[0].severity == "HIGH"
     assert findings[0].evidence["destination"] == "unresolved"
     assert findings[0].evidence["destination_status"] == "unresolved"
+
+
+def test_inline_conditional_assignment_keeps_possible_redirect_high() -> None:
+    script = """SRC=https://registry.npmjs.org/
+if test -f use-private; then SRC=https://packages.example.invalid; fi
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 3
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "unresolved"
+
+
+@pytest.mark.parametrize("operator", ["&&", "||"])
+def test_short_circuit_assignment_keeps_possible_redirect_high(operator: str) -> None:
+    script = f"""SRC=https://registry.npmjs.org/
+test -f use-private {operator} SRC=https://packages.example.invalid
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 3
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "unresolved"
+
+
+def test_definite_assignment_after_inline_conditional_clears_ambiguity() -> None:
+    script = """SRC=https://packages.example.invalid
+if test -f use-private; then SRC=https://other.example.invalid; fi
+SRC=https://registry.npmjs.org/
+npm config set registry "$SRC"
+"""
+
+    assert _analyze({"setup.sh": script}) == []
 
 
 def test_single_prior_literal_assignment_resolves_statically() -> None:
@@ -475,6 +561,32 @@ def test_command_text_in_unrelated_heredoc_is_not_actionable() -> None:
 cat <<'EOF' > instructions.txt
 npm config set registry https://packages.example.invalid
 EOF
+"""
+
+    assert _analyze({"setup.sh": script}) == []
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "tee instructions.txt <<'EOF'",
+        "cat <<'EOF'",
+        "cat <<'EOF' >> instructions.txt",
+        "cat 3<<'EOF' 1>&3",
+    ],
+)
+def test_command_text_in_generic_heredoc_is_not_actionable(header: str) -> None:
+    script = f"{header}\nnpm config set registry https://packages.example.invalid\nEOF\n"
+
+    assert _analyze({"setup.sh": script}) == []
+
+
+def test_generated_config_text_nested_in_unrelated_heredoc_is_not_actionable() -> None:
+    script = """tee instructions.txt <<'OUTER'
+cat <<EOF > .npmrc
+registry=https://packages.example.invalid
+EOF
+OUTER
 """
 
     assert _analyze({"setup.sh": script}) == []
