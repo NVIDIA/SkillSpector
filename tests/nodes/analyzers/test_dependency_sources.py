@@ -210,6 +210,56 @@ SRC=https://registry.npmjs.org/
     assert findings[0].evidence["destination"] == "https://packages.example.invalid"
 
 
+def test_assignment_text_in_unrelated_heredoc_cannot_suppress_sc10() -> None:
+    script = """#!/bin/sh
+SRC=https://packages.example.invalid
+cat <<'EOF' > instructions.txt
+SRC=https://registry.npmjs.org/
+EOF
+npm config set registry "$SRC"
+"""
+
+    findings = _analyze({"setup.sh": script})
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 6
+    assert findings[0].evidence["destination"] == "https://packages.example.invalid"
+
+
+def test_assignment_in_uncalled_function_cannot_suppress_sc10() -> None:
+    script = """#!/bin/sh
+SRC=https://packages.example.invalid
+configure_later() {
+  SRC=https://registry.npmjs.org/
+}
+npm config set registry "$SRC"
+"""
+
+    findings = _analyze({"setup.sh": script})
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 6
+    assert findings[0].evidence["destination"] == "https://packages.example.invalid"
+
+
+def test_conditional_assignment_keeps_possible_noncanonical_redirect_high() -> None:
+    script = """#!/bin/sh
+SRC=https://packages.example.invalid
+if test -f use-default; then
+  SRC=https://registry.npmjs.org/
+fi
+npm config set registry "$SRC"
+"""
+
+    findings = _analyze({"setup.sh": script})
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 6
+    assert findings[0].severity == "HIGH"
+    assert findings[0].evidence["destination"] == "unresolved"
+    assert findings[0].evidence["destination_status"] == "unresolved"
+
+
 def test_single_prior_literal_assignment_resolves_statically() -> None:
     script = """SRC=https://packages.example.invalid
 npm config set registry "${SRC}"
@@ -418,6 +468,27 @@ EOF
 
     assert finding.start_line == 2
     assert finding.evidence["surface"] == ".npmrc"
+
+
+def test_command_text_in_unrelated_heredoc_is_not_actionable() -> None:
+    script = """#!/bin/sh
+cat <<'EOF' > instructions.txt
+npm config set registry https://packages.example.invalid
+EOF
+"""
+
+    assert _analyze({"setup.sh": script}) == []
+
+
+def test_dependency_source_command_in_pipeline_stage_is_actionable() -> None:
+    script = "printf y | npm config set registry https://packages.example.invalid\n"
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 1
+    assert finding.severity == "HIGH"
+    assert finding.evidence["ecosystem"] == "npm"
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
 
 
 def test_quoted_heredoc_delimiter_does_not_expand_variables() -> None:

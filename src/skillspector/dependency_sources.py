@@ -33,7 +33,7 @@ _SENSITIVE_QUERY_KEY = re.compile(r"(?:auth|credential|key|pass|secret|signature
 _SHELL_SUFFIXES = frozenset({".sh", ".bash", ".zsh"})
 _SHELL_SHEBANG_RE = re.compile(r"^#![^\n]*(?:^|/|\s)(?:ba|z|da|k)?sh(?:\s|$)", re.I)
 
-Assignments = dict[str, list[tuple[int, str]]]
+Assignments = dict[str, list[tuple[int, str | None]]]
 
 _CANONICAL_DESTINATIONS: dict[str, frozenset[str]] = {
     "npm": frozenset({"https://registry.npmjs.org/"}),
@@ -79,7 +79,9 @@ class _HeredocRegion:
     target: str
     body: str
     start_line: int
+    end_line: int
     expand_variables: bool
+    complete: bool
 
 
 _HEREDOC_TARGET = r'(?P<target>"[^"]+"|\'[^\']+\'|[^\s;]+)'
@@ -108,20 +110,53 @@ def _strip_shell_comment(value: str) -> str:
 
 
 def _literal_assignments(content: str) -> Assignments:
-    """Collect simple literal local assignments; never evaluate shell syntax."""
+    """Collect definite top-level assignments without evaluating shell syntax.
+
+    Heredoc data and function bodies are inert at their physical location, so
+    their assignment-shaped text is ignored. Assignments in conditional or
+    iterative control flow are recorded as ambiguous so they cannot silently
+    make an earlier possible destination appear canonical.
+    """
     assignments: Assignments = {}
+    heredoc_data_lines = _heredoc_data_lines(content)
+    function_depth = 0
+    control_depth = 0
     for line_number, line in enumerate(content.splitlines(), 1):
+        if line_number in heredoc_data_lines:
+            continue
+        stripped = _strip_shell_comment(line).strip()
+        if not stripped:
+            continue
+
+        if re.match(r"^}\s*(?:;|$)", stripped):
+            function_depth = max(0, function_depth - 1)
+            continue
+        if re.match(r"^(?:fi|done|esac)\b", stripped):
+            control_depth = max(0, control_depth - 1)
+            continue
+        function_header = re.match(
+            r"^(?:function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?"
+            r"|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*\{",
+            stripped,
+        )
+        if function_header:
+            if not re.search(r"}\s*(?:;|$)", stripped[function_header.end() :]):
+                function_depth += 1
+            continue
+        if re.match(r"^(?:if|case|for|while|until|select)\b", stripped):
+            control_depth += 1
+            continue
+
         match = _ASSIGNMENT_RE.match(line)
-        if not match:
+        if not match or function_depth:
             continue
         value = _strip_shell_comment(match.group("value")).strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
-        if not value or any(token in value for token in ("`", "$(")):
-            continue
-        if _VARIABLE_RE.search(value):
-            continue
-        assignments.setdefault(match.group("name"), []).append((line_number, value))
+        resolved_value: str | None = value
+        if control_depth or not value or "$" in value or "`" in value:
+            resolved_value = None
+        assignments.setdefault(match.group("name"), []).append((line_number, resolved_value))
     return assignments
 
 
@@ -134,7 +169,7 @@ def _resolve_value(value: str, assignments: Assignments, use_line: int) -> tuple
     def replacement(match: re.Match[str]) -> str:
         name = match.group("braced") or match.group("plain") or ""
         prior = [assigned for line, assigned in assignments.get(name, []) if line < use_line]
-        return prior[-1] if prior else match.group(0)
+        return prior[-1] if prior and prior[-1] is not None else match.group(0)
 
     resolved = _VARIABLE_RE.sub(replacement, resolved).strip().strip("\"'")
     dynamic = bool("$" in resolved or "`" in resolved)
@@ -517,10 +552,7 @@ def _heredocs(content: str) -> list[_HeredocRegion]:
             if terminator == delimiter:
                 break
             end += 1
-        if end >= len(lines):
-            # An unmatched heredoc consumes the remaining shell input. Stopping
-            # here both reflects that ambiguity and prevents repeated O(n) scans.
-            break
+        complete = end < len(lines)
         body_lines = lines[index + 1 : end]
         if strip_tabs:
             body_lines = [line.lstrip("\t") for line in body_lines]
@@ -529,11 +561,26 @@ def _heredocs(content: str) -> list[_HeredocRegion]:
                 target=match.group("target").strip("'\""),
                 body="\n".join(body_lines),
                 start_line=index + 2,
+                end_line=end + 1 if complete else len(lines),
                 expand_variables=not bool(match.group("quote")),
+                complete=complete,
             )
         )
+        if not complete:
+            # An unmatched heredoc consumes the remaining shell input. Stopping
+            # here both reflects that ambiguity and prevents repeated O(n) scans.
+            break
         index = end + 1
     return regions
+
+
+def _heredoc_data_lines(content: str) -> set[int]:
+    """Return body and terminator lines that are data, not shell commands."""
+    return {
+        line_number
+        for region in _heredocs(content)
+        for line_number in range(region.start_line, region.end_line + 1)
+    }
 
 
 def _parse_generated_configs(
@@ -541,6 +588,8 @@ def _parse_generated_configs(
 ) -> list[SourceChange]:
     changes: list[SourceChange] = []
     for region in _heredocs(content):
+        if not region.complete:
+            continue
         lower = region.target.lower()
         region_assignments = assignments if region.expand_variables else {}
         if lower.endswith(".npmrc"):
@@ -626,12 +675,12 @@ def _shell_segments(line: str) -> list[str]:
         if quote is None and character == "#" and (not current or current[-1].isspace()):
             break
         pair = line[index : index + 2]
-        if quote is None and (character == ";" or pair in {"&&", "||"}):
+        if quote is None and (character == ";" or character == "|" or pair in {"&&", "||", "|&"}):
             segment = "".join(current).strip()
             if segment:
                 segments.append(segment)
             current = []
-            index += 2 if pair in {"&&", "||"} else 1
+            index += 2 if pair in {"&&", "||", "|&"} else 1
             continue
         current.append(character)
         index += 1
@@ -643,6 +692,7 @@ def _shell_segments(line: str) -> list[str]:
 
 def _parse_commands(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
     changes: list[SourceChange] = []
+    heredoc_data_lines = _heredoc_data_lines(content)
     command_prefix = r"^\s*(?:[$>]\s+)?(?:(?:command|sudo)\s+)?"
     patterns: tuple[tuple[str, str, str, str, re.Pattern[str]], ...] = (
         (
@@ -749,6 +799,8 @@ def _parse_commands(content: str, file: str, assignments: Assignments) -> list[S
         ),
     )
     for line_number, line in enumerate(content.splitlines(), 1):
+        if line_number in heredoc_data_lines:
+            continue
         for segment in _shell_segments(line):
             for ecosystem, operation, surface, scope_mode, pattern in patterns:
                 match = pattern.search(segment)
