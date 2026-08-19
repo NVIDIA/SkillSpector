@@ -242,6 +242,9 @@ class TestLP1UnderdeclaredCapability:
         for lp1 in lp1_findings:
             assert lp1.severity == "HIGH", f"Expected HIGH severity for LP1, got {lp1.severity}"
             assert lp1.confidence >= 0.70
+            assert lp1.remediation is not None
+            assert "'permissions' list" in lp1.remediation
+            assert "SKILL.md" not in lp1.remediation
 
 
 class TestLP3NoPermissions:
@@ -306,6 +309,9 @@ class TestLP3AllowedTools:
         )
         for lp1 in lp1_findings:
             assert lp1.severity == "HIGH", f"Expected HIGH severity for LP1, got {lp1.severity}"
+            assert lp1.remediation is not None
+            assert "'allowed-tools'" in lp1.remediation
+            assert "'permissions'" not in lp1.remediation
 
     def test_allowed_tools_fully_covered_no_lp1(self):
         """allowed-tools: [Bash] + only shell code → no LP1 (capability is covered)."""
