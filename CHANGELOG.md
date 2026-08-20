@@ -1,3 +1,29 @@
+### 2.9.6 (Tuesday, August 18, 2026)
+### Features/Bug Fixes
+* fix(pe3): distinguish OAuth token nouns from access actions (#392)
+---
+### 2.9.5 (Friday, August 14, 2026)
+### Features/Bug Fixes
+* Scope the locality guard to the namespace (#365)
+* Use byte offsets for YARA line lookup (#364)
+* feat(cli): opt-in discovery of an author-shipped baseline (#278) (#286)
+* feat: add Ollama, Azure OpenAI, and generic OpenAI-compatible providers (#179)
+* fix: bound MCP extra to supported major version (#339)
+* fix(analyzers): reduce false positives for negated safety constraints (#254)
+* feat(analyzer): detect insecure deserialization (AST10, TT6, DS1–DS4) (#246)
+---
+### 2.9.4 (Wednesday, August 12, 2026)
+### Features/Bug Fixes
+* fix(mcp): reject local targets over HTTP transport (#196)
+* Add Skill Inspector companion skill (#253)
+* fix(lp3): remediation and docs name allowed-tools for SKILL.md (#316)
+* chore(openssf-scorecard): Add badge (#351)
+* Detect whitespace padding used to hide prompt-injection instructions (P9) (#24)
+* fix(analyzers): HIGH SC8 when skill ships __pycache__ or .pyc (#357)
+* Revert "Scope the locality guard to the namespace"
+* Scope the locality guard to the namespace
+* fix(security): reject symlinks in skill walk + disable git symlinks on clone
+---
 ### 2.9.3 (Tuesday, August 11, 2026)
 ### Features/Bug Fixes
 * fix(llm): surface invalid responses as degraded (skipped, non-fatal, incomplete)
