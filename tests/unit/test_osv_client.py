@@ -26,8 +26,8 @@ from skillspector.nodes.analyzers.osv_client import (
     ECOSYSTEM_NPM,
     ECOSYSTEM_PYPI,
     VulnResult,
-    _cache,
     _estimate_cvss_severity,
+    _put_cache,
     _severity_from_vuln,
     clear_cache,
     query_batch,
@@ -222,9 +222,10 @@ class TestQueryBatch:
         mock_client.post.return_value = mock_post_resp
         mock_client.get.return_value = mock_get_resp
 
-        import time
-
-        _cache[("jinja2", "2.4.1", "PyPI")] = (time.monotonic(), [cached_vuln])
+        # Seed through the module's own writer rather than the raw dict: the cache entry now
+        # carries the advisory total alongside the results, and a test that hand-builds the
+        # tuple breaks on a private shape it has no reason to know.
+        _put_cache(("jinja2", "2.4.1", "PyPI"), [cached_vuln])
 
         with patch(
             "skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=mock_client
@@ -310,3 +311,74 @@ class TestQueryBatch:
             query_batch([("jinja2", "2.4.1")], ECOSYSTEM_PYPI)
 
         assert was_osv_reachable() is False
+
+
+class TestAdvisoryTruncation:
+    """The 10-advisory cap must leave a trace the report can carry.
+
+    The cap itself is a defensible engineering choice: OSV detail lookups are one HTTP request
+    each, and a package with 153 advisories would mean 153 round trips. What is not defensible
+    is that the drop is invisible — ``logger.warning`` does not reach the JSON artifact, so a
+    consumer reading ``execution_successful: true`` cannot tell that 143 advisories were never
+    examined, nor that the reported severity is the worst of ten rather than the worst of all.
+    """
+
+    @staticmethod
+    def _mock_client(n_advisories: int) -> MagicMock:
+        batch = {"results": [{"vulns": [{"id": f"GHSA-{i:04d}"} for i in range(n_advisories)]}]}
+        post_resp = MagicMock()
+        post_resp.json.return_value = batch
+        post_resp.raise_for_status = MagicMock()
+        get_resp = MagicMock()
+        get_resp.json.return_value = {"id": "GHSA-0000", "summary": "s", "severity": []}
+        get_resp.raise_for_status = MagicMock()
+        client = MagicMock()
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+        client.post.return_value = post_resp
+        client.get.return_value = get_resp
+        return client
+
+    def test_truncation_is_recorded_with_observed_and_limit(self) -> None:
+        from skillspector.nodes.analyzers.osv_client import last_truncations
+
+        with patch("httpx.Client", return_value=self._mock_client(12)):
+            results = query_batch([("jinja2", "3.1.2")], ECOSYSTEM_PYPI)
+
+        assert len(results[0]) == 10, "the cap itself must still hold"
+        assert last_truncations() == [("jinja2", "3.1.2", 10, 12)]
+
+    def test_no_truncation_leaves_no_record(self) -> None:
+        from skillspector.nodes.analyzers.osv_client import last_truncations
+
+        with patch("httpx.Client", return_value=self._mock_client(3)):
+            query_batch([("jinja2", "3.1.2")], ECOSYSTEM_PYPI)
+
+        assert last_truncations() == []
+
+    def test_cached_package_still_reports_its_truncation(self) -> None:
+        """A second scan of the same package must not lose the disclosure.
+
+        The cache is keyed by (name, version, ecosystem) and stores the *truncated* list. If the
+        record lived only on the fetch path, a package seen twice in one run — the same
+        dependency in requirements.txt and pyproject.toml is the ordinary case — would report
+        the truncation the first time and hide it the second.
+        """
+        from skillspector.nodes.analyzers.osv_client import last_truncations
+
+        with patch("httpx.Client", return_value=self._mock_client(12)):
+            query_batch([("jinja2", "3.1.2")], ECOSYSTEM_PYPI)
+            query_batch([("jinja2", "3.1.2")], ECOSYSTEM_PYPI)
+
+        assert last_truncations() == [("jinja2", "3.1.2", 10, 12)]
+
+    def test_previous_truncations_do_not_leak_into_the_next_query(self) -> None:
+        from skillspector.nodes.analyzers.osv_client import last_truncations
+
+        with patch("httpx.Client", return_value=self._mock_client(12)):
+            query_batch([("jinja2", "3.1.2")], ECOSYSTEM_PYPI)
+        clear_cache()
+        with patch("httpx.Client", return_value=self._mock_client(2)):
+            query_batch([("flask", "2.0.0")], ECOSYSTEM_PYPI)
+
+        assert last_truncations() == []

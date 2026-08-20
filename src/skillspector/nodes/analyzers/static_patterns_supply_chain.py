@@ -38,14 +38,26 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
-from skillspector.inspection_ledger import LedgerOutcome, analyzer_status_for_events, ledger_event
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_for_events,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import get_context, get_line_number
-from .osv_client import ECOSYSTEM_NPM, ECOSYSTEM_PYPI, VulnResult, query_batch, was_osv_reachable
+from .osv_client import (
+    ECOSYSTEM_NPM,
+    ECOSYSTEM_PYPI,
+    VulnResult,
+    last_truncations,
+    query_batch,
+    was_osv_reachable,
+)
 from .pattern_defaults import PatternCategory
 from .static_runner import analyzer_finding_to_finding
 
@@ -892,6 +904,15 @@ def _sc4_from_osv(
     """
     pkg_pairs = [(name, version) for name, version, _ in packages]
     osv_results = query_batch(pkg_pairs, ecosystem)
+    # OSV detail lookups are capped, so `vulns` below can be a subset. The finding must quote the
+    # number OSV reported, not the number this process chose to fetch: "10 advisory(ies)" for a
+    # package that has 153 is a false statement, and it is exactly the number a reader uses to
+    # judge the package. The severity is still the worst of the examined ten and may therefore
+    # understate the package; that is why the ledger records the cap as an incompleteness.
+    totals = {
+        (name.lower().replace("_", "-"), version): total
+        for name, version, _examined, total in last_truncations()
+    }
 
     findings: list[AnalyzerFinding] = []
     covered: set[str] = set()
@@ -908,10 +929,12 @@ def _sc4_from_osv(
         severity = _osv_severity_to_app(worst_severity)
         confidence = _SEVERITY_CONFIDENCE.get(worst_severity.upper(), 0.75)
         vuln_desc = _format_vuln_ids(vulns)
+        reported = totals.get((pkg_name.lower().replace("_", "-"), pkg_version), len(vulns))
+        capped = "" if reported == len(vulns) else f" (first {len(vulns)} examined)"
         if pkg_version:
             message = (
                 f"Known Vulnerable Dependency: {pkg_name}=={pkg_version}"
-                f" — {len(vulns)} advisory(ies): {vuln_desc}"
+                f" — {reported} advisory(ies){capped}: {vuln_desc}"
             )
             matched_text = f"{pkg_name}=={pkg_version}"
         else:
@@ -924,9 +947,9 @@ def _sc4_from_osv(
             severity = Severity.LOW
             confidence = 0.4
             message = (
-                f"Unverifiable Dependency: {pkg_name} has {len(vulns)} known advisory(ies)"
-                f" ({vuln_desc}), but the manifest does not pin a version, so it is unknown"
-                " whether the installed release is affected"
+                f"Unverifiable Dependency: {pkg_name} has {reported} known advisory(ies)"
+                f"{capped} ({vuln_desc}), but the manifest does not pin a version, so it is"
+                " unknown whether the installed release is affected"
             )
             matched_text = pkg_name
         findings.append(
@@ -1325,6 +1348,22 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             dependency_findings,
             f"{ANALYZER_ID}_dependencies",
         )
+        # A capped advisory lookup is work this analyzer decided not to do. The ledger already
+        # accounts for files left unread; advisories left unfetched belong in the same place,
+        # or `analysis_completeness` reports a scan that examined everything when it did not.
+        for name, version, examined, total in last_truncations():
+            response["inspection_ledger"].append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.SKIPPED,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.RESULT_LIMIT,
+                    observed_count=total,
+                    limit_count=examined,
+                    stage=f"osv_vuln_details:{name}=={version or 'unpinned'}",
+                )
+            )
 
     # TR1–TR3: trigger analysis from manifest
     manifest: dict[str, object] = state.get("manifest") or {}

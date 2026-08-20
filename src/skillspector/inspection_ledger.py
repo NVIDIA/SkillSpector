@@ -60,9 +60,13 @@ class LedgerReason(StrEnum):
     NO_APPLICABLE_FILES = "no_applicable_files"
     OMS_SIGNATURE = "oms_signature"
     BASELINE_FILE = "baseline_file"
+    RESULT_LIMIT = "result_limit"
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
+    LedgerReason.RESULT_LIMIT: (
+        "Only the first N results were examined; the remainder were not retrieved."
+    ),
     LedgerReason.EXCLUDED_DIRECTORY: ("Directory tree is excluded from the configured scan scope."),
     LedgerReason.HIDDEN_FILE: "Hidden file is excluded from the configured scan scope.",
     LedgerReason.FILE_DISAPPEARED: ("Inventoried file disappeared before it could be inspected."),
@@ -141,6 +145,8 @@ class InspectionLedgerEvent(TypedDict):
     limit_characters: NotRequired[int]
     observed_bytes: NotRequired[int]
     limit_bytes: NotRequired[int]
+    observed_count: NotRequired[int]
+    limit_count: NotRequired[int]
 
 
 class AnalyzerStatusEvent(TypedDict):
@@ -262,6 +268,8 @@ def ledger_event(
     limit_characters: int | None = None,
     observed_bytes: int | None = None,
     limit_bytes: int | None = None,
+    observed_count: int | None = None,
+    limit_count: int | None = None,
 ) -> InspectionLedgerEvent:
     """Create one validated terminal ledger record without sensitive payloads."""
     _validate_range(start_line, end_line)
@@ -324,6 +332,10 @@ def ledger_event(
         event["observed_bytes"] = observed_bytes
     if limit_bytes is not None:
         event["limit_bytes"] = limit_bytes
+    if observed_count is not None:
+        event["observed_count"] = observed_count
+    if limit_count is not None:
+        event["limit_count"] = limit_count
     return event
 
 

@@ -159,3 +159,41 @@ def test_failed_event_includes_sanitized_failure_metadata_only_when_provided() -
 
     assert event["error_class"] == "PermissionError"
     assert event["stage"] == "read"
+
+
+def test_result_limit_event_carries_observed_and_limit_counts() -> None:
+    """A capped result set is a first-class incompleteness, like a size limit on a file.
+
+    The ledger already distinguishes "not read because too large" from "read". It had no way to
+    say "read, but only the first N of M results", so an analyzer that capped its own work had
+    nowhere to put the fact. Without the two counts the event says something happened but not
+    how much was lost, which is the same silence one level up.
+    """
+    event = ledger_event(
+        outcome=LedgerOutcome.SKIPPED,
+        phase="static",
+        analyzer_id="static_patterns_supply_chain",
+        path="requirements.txt",
+        reason=LedgerReason.RESULT_LIMIT,
+        observed_count=153,
+        limit_count=10,
+    )
+
+    assert event["reason_code"] is LedgerReason.RESULT_LIMIT
+    assert event["observed_count"] == 153
+    assert event["limit_count"] == 10
+    assert event["message"], "every reason must carry a human-readable message"
+
+
+def test_counts_are_omitted_when_not_supplied() -> None:
+    """Optional evidence stays optional: absent means absent, not zero."""
+    event = ledger_event(
+        outcome=LedgerOutcome.SKIPPED,
+        phase="static",
+        analyzer_id="static_patterns_supply_chain",
+        path="requirements.txt",
+        reason=LedgerReason.READ_ERROR,
+    )
+
+    assert "observed_count" not in event
+    assert "limit_count" not in event

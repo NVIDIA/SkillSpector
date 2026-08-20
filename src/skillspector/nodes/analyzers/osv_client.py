@@ -52,6 +52,16 @@ if (env_val := os.environ.get("SKILLSPECTOR_OSV_TIMEOUT")) is not None:
 # Used by the supply-chain analyzer to surface fallback warnings.
 _last_query_ok: bool = True
 
+# Detail lookups cost one HTTP request each, so a package with 153 advisories would mean 153
+# round trips. The cap is deliberate; what it must not be is invisible.
+_MAX_VULN_DETAILS = 10
+
+# Packages whose advisory list was capped during the last query_batch() call, as
+# (name, version, examined, total). Same accessor pattern as _last_query_ok: the analyzer reads
+# it right after the call and turns it into ledger evidence, so the drop reaches the report
+# instead of stopping at a log line no consumer of the JSON will ever see.
+_last_truncations: list[tuple[str, str | None, int, int]] = []
+
 # Ecosystem identifiers expected by OSV.dev (case-sensitive).
 ECOSYSTEM_PYPI = "PyPI"
 ECOSYSTEM_NPM = "npm"
@@ -68,9 +78,13 @@ class VulnResult:
 
 
 # ---------------------------------------------------------------------------
-# In-memory cache: (name, version, ecosystem) -> list[VulnResult]
+# In-memory cache: (name, version, ecosystem) -> (results, total advisories reported by OSV)
+#
+# The total is stored next to the results because the results may be a capped subset of it. A
+# package appearing in two dependency files is the ordinary case, and without the total the
+# second lookup — a cache hit — would report the truncation as if it had not happened.
 # ---------------------------------------------------------------------------
-_cache: dict[tuple[str, str | None, str], tuple[float, list[VulnResult]]] = {}
+_cache: dict[tuple[str, str | None, str], tuple[float, list[VulnResult], int]] = {}
 _CACHE_TTL_SECS = 3600.0  # 1 hour
 
 
@@ -78,19 +92,21 @@ def _cache_key(name: str, version: str | None, ecosystem: str) -> tuple[str, str
     return (name.lower().replace("_", "-"), version, ecosystem)
 
 
-def _get_cached(key: tuple[str, str | None, str]) -> list[VulnResult] | None:
+def _get_cached(key: tuple[str, str | None, str]) -> tuple[list[VulnResult], int] | None:
     entry = _cache.get(key)
     if entry is None:
         return None
-    ts, results = entry
+    ts, results, total = entry
     if (time.monotonic() - ts) > _CACHE_TTL_SECS:
         del _cache[key]
         return None
-    return results
+    return results, total
 
 
-def _put_cache(key: tuple[str, str | None, str], results: list[VulnResult]) -> None:
-    _cache[key] = (time.monotonic(), results)
+def _put_cache(
+    key: tuple[str, str | None, str], results: list[VulnResult], total: int | None = None
+) -> None:
+    _cache[key] = (time.monotonic(), results, len(results) if total is None else total)
 
 
 def clear_cache() -> None:
@@ -198,12 +214,16 @@ def _parse_vuln(vuln: dict) -> VulnResult:
 
 
 def _fetch_vuln_details(vuln_ids: list[str]) -> list[VulnResult]:
-    """Fetch full vulnerability details for a list of IDs."""
-    if len(vuln_ids) > 10:
-        logger.warning("Processing 10 of %d vulnerabilities, truncating the rest", len(vuln_ids))
+    """Fetch full vulnerability details for at most _MAX_VULN_DETAILS IDs."""
+    if len(vuln_ids) > _MAX_VULN_DETAILS:
+        logger.warning(
+            "Processing %d of %d vulnerabilities, truncating the rest",
+            _MAX_VULN_DETAILS,
+            len(vuln_ids),
+        )
     results: list[VulnResult] = []
     with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
-        for vid in vuln_ids[:10]:
+        for vid in vuln_ids[:_MAX_VULN_DETAILS]:
             try:
                 resp = client.get(f"{_OSV_VULN_URL}/{vid}")
                 resp.raise_for_status()
@@ -244,6 +264,8 @@ def query_batch(
     """
     global _last_query_ok
 
+    _last_truncations.clear()
+
     if not packages:
         return []
 
@@ -256,7 +278,8 @@ def query_batch(
         key = _cache_key(name, version, ecosystem)
         cached = _get_cached(key)
         if cached is not None:
-            all_results[i] = cached
+            all_results[i] = cached[0]
+            _record_truncation(name, version, cached[0], cached[1])
         else:
             uncached_indices.append(i)
             uncached_queries.append(_build_query(name, version, ecosystem))
@@ -291,7 +314,8 @@ def query_batch(
             all_results[idx] = vuln_details
 
             name, version = packages[idx]
-            _put_cache(_cache_key(name, version, ecosystem), vuln_details)
+            _record_truncation(name, version, vuln_details, len(vuln_ids))
+            _put_cache(_cache_key(name, version, ecosystem), vuln_details, len(vuln_ids))
 
     except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as exc:
         logger.warning("OSV.dev API request failed, falling back to static data: %s", exc)
@@ -312,6 +336,27 @@ def is_available() -> bool:
             return resp.status_code == 200
     except (httpx.HTTPError, httpx.TimeoutException):
         return False
+
+
+def _record_truncation(
+    name: str, version: str | None, examined: list[VulnResult], total: int
+) -> None:
+    """Note that *name* had more advisories than were examined, once per query_batch call."""
+    if total <= len(examined):
+        return
+    entry = (name, version, len(examined), total)
+    if entry not in _last_truncations:
+        _last_truncations.append(entry)
+
+
+def last_truncations() -> list[tuple[str, str | None, int, int]]:
+    """Return (name, version, examined, total) for packages capped by the last query_batch().
+
+    Empty when nothing was capped. Callers read this immediately after query_batch() and turn
+    it into ledger evidence: the cap is a defensible cost decision, but a report that says
+    `execution_successful: true` while two thirds of the advisories were never fetched is not.
+    """
+    return list(_last_truncations)
 
 
 def was_osv_reachable() -> bool:
