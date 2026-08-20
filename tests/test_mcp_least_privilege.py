@@ -94,12 +94,12 @@ def _make_state(fixture_name: str) -> dict:
     for item in fixture_dir.rglob("*"):
         if not item.is_file():
             continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
+        rel = item.relative_to(fixture_dir)
+        if any(skip in rel.parts for skip in _SKIP_DIRS):
             continue
         if item.name.startswith(".") and not item.name.startswith(".claude"):
             continue
-        rel = item.relative_to(fixture_dir).as_posix()  # forward slashes on every OS
-        components.append(rel)
+        components.append(rel.as_posix())  # forward slashes on every OS
     components.sort()
 
     # Build file_cache
