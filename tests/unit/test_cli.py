@@ -16,6 +16,7 @@
 """Tests for skillspector CLI (skillspector scan, --version)."""
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -28,7 +29,9 @@ from typer.testing import CliRunner
 
 from skillspector import __version__
 from skillspector.cli import FormatChoice, _scan_multi_skill, app
+from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory
+from skillspector.suppression import SuppressedFinding
 
 runner = CliRunner()
 
@@ -1133,3 +1136,139 @@ def test_cli_scan_json_preserves_single_skill_contract(
     assert payload["issues"] == [{"id": "X-1", "severity": "low"}]
     assert payload["suppressed_count"] == 0
     assert payload["suppressed"] == []
+
+
+def _combined_json_counts(results: list[dict[str, Any]], tmp_path: Path) -> list[int]:
+    """Run a recursive JSON scan over stubbed results and return per-skill counts."""
+    skills = [
+        SkillDirectory(path=tmp_path / f"skill{i}", name=f"skill{i}", relative_path=f"skill{i}")
+        for i in range(1, len(results) + 1)
+    ]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills, has_root_skill=False)
+    out = tmp_path / "combined.json"
+
+    with patch("skillspector.cli.graph.invoke", side_effect=results):
+        _scan_multi_skill(
+            detection, FormatChoice.json, out, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    data = json.loads(out.read_text(encoding="utf-8"))
+    return [entry["finding_count"] for entry in data["skills"]]
+
+
+def test_cli_recursive_json_count_excludes_suppressed_findings(tmp_path: Path) -> None:
+    """Combined JSON counts the active findings, not the pre-partition set.
+
+    `report` returns `filtered_findings` as kept+suppressed and scores only the
+    kept subset, so counting `filtered_findings` made a fully suppressed
+    sub-skill report risk 0 alongside a non-zero finding count.
+    """
+    findings = [
+        Finding(rule_id="SQP-1", message="one"),
+        Finding(rule_id="SQP-2", message="two"),
+        Finding(rule_id="SQP-3", message="three"),
+    ]
+    fully_suppressed = {
+        "report_body": "{}",
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": list(findings),
+        "filtered_findings": list(findings),
+        "suppressed_findings": [
+            SuppressedFinding(finding=finding, reason="baselined") for finding in findings
+        ],
+    }
+    partly_suppressed = {
+        "report_body": "{}",
+        "risk_score": 20,
+        "risk_severity": "LOW",
+        "findings": list(findings),
+        "filtered_findings": list(findings),
+        "suppressed_findings": [
+            SuppressedFinding(finding=finding, reason="baselined") for finding in findings[:2]
+        ],
+    }
+
+    assert _combined_json_counts([fully_suppressed, partly_suppressed], tmp_path) == [0, 1]
+
+
+def test_cli_recursive_json_count_respects_an_empty_filtered_list(tmp_path: Path) -> None:
+    """Every-finding-filtered is reported as 0, not as the raw pre-filter count."""
+    result = {
+        "report_body": "{}",
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": [Finding(rule_id="SQP-1", message="one")],
+        "filtered_findings": [],
+        "suppressed_findings": [],
+    }
+
+    assert _combined_json_counts([result], tmp_path) == [0]
+
+
+def test_cli_recursive_summary_count_excludes_suppressed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The terminal summary's Findings column uses the same active count.
+
+    Pinned separately from the JSON path: the two call sites are independent
+    lines, so a regression in one is invisible to a test covering the other.
+    """
+    findings = [Finding(rule_id="SQP-1", message="one"), Finding(rule_id="SQP-2", message="two")]
+    result = {
+        "report_body": "# report",
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": list(findings),
+        "filtered_findings": list(findings),
+        "suppressed_findings": [
+            SuppressedFinding(finding=finding, reason="baselined") for finding in findings
+        ],
+    }
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True,
+        skills=[SkillDirectory(path=tmp_path / "solo", name="solo", relative_path="solo")],
+        has_root_skill=False,
+    )
+
+    with patch("skillspector.cli.graph.invoke", side_effect=[result]):
+        _scan_multi_skill(
+            detection, FormatChoice.terminal, None, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    summary = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    row = next(line for line in summary.splitlines() if line.strip().startswith("solo"))
+    assert row.split() == ["solo", "0", "LOW", "0", "successful"]
+
+
+def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> None:
+    """`skillspector baseline` fingerprints what the scan reported, not raw findings.
+
+    Closes a mutation survivor: reverting this call site to the old
+    `filtered_findings or findings` passed the entire suite, because nothing
+    drove the baseline command through an empty filtered list. An empty filtered
+    list means every finding was filtered out, so building a baseline from the
+    raw list would write fingerprints suppressing findings the scan never
+    reported, and would fail closed on the next run for no reason.
+    """
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    source = "---\nname: b\n---\nbody\n"
+    (skill / "SKILL.md").write_text(source, encoding="utf-8")
+    out = tmp_path / "baseline.yaml"
+
+    result = {
+        "findings": [Finding(rule_id="SQP-1", message="one", file="SKILL.md")],
+        "filtered_findings": [],
+        "suppressed_findings": [],
+        "file_cache": {"SKILL.md": source},
+        "risk_score": 0,
+    }
+
+    with patch("skillspector.cli.graph.invoke", return_value=result):
+        invocation = runner.invoke(app, ["baseline", str(skill), "-o", str(out), "--no-llm"])
+
+    assert invocation.exit_code == 0, invocation.output
+    written = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert written.get("fingerprints", []) == []
+    assert "0 suppressed finding(s)" in re.sub(r"\x1b\[[0-9;]*m", "", invocation.output)

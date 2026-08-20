@@ -26,7 +26,9 @@ import pytest
 
 from skillspector import mcp_server
 from skillspector.mcp_server import run_scan
+from skillspector.models import Finding
 from skillspector.providers import reset_provider, use_provider
+from skillspector.suppression import SuppressedFinding
 
 
 def _write_skill(tmp_path: Path, body: str = "# Safe skill") -> Path:
@@ -478,3 +480,48 @@ async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
             tools = await asyncio.wait_for(session.list_tools(), timeout=15)
 
     assert "scan_skill" in {tool.name for tool in tools.tools}
+
+
+async def test_run_scan_findings_exclude_the_suppressed_partition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MCP verdict lists the findings that drove the score, not kept+suppressed.
+
+    `run_scan` serialises this list straight to the calling agent, so a
+    baseline-suppressed finding leaking in tells the agent a skill is dirtier
+    than the risk score it is gating on.
+    """
+    kept = Finding(rule_id="SQP-1", message="kept")
+    dropped = Finding(rule_id="SQP-2", message="suppressed")
+    result = {
+        "findings": [kept, dropped],
+        "filtered_findings": [kept, dropped],
+        "suppressed_findings": [SuppressedFinding(finding=dropped, reason="baselined")],
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "report_body": "# report",
+    }
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan(str(_write_skill(tmp_path)), use_llm=False, output_format="json")
+
+    assert [finding["id"] for finding in verdict["findings"]] == ["SQP-1"]
+
+
+async def test_run_scan_respects_an_empty_filtered_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every-finding-filtered reports no findings, not the raw pre-filter list."""
+    result = {
+        "findings": [Finding(rule_id="SQP-1", message="one")],
+        "filtered_findings": [],
+        "suppressed_findings": [],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "report_body": "# report",
+    }
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan(str(_write_skill(tmp_path)), use_llm=False, output_format="json")
+
+    assert verdict["findings"] == []
