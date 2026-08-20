@@ -169,7 +169,7 @@ def _is_env_file_reference_in_docs(
         return False
     if file_type not in ("markdown", "text"):
         return False
-    if file_path.replace("\\", "/").lower().endswith("skill.md"):
+    if _is_skill_md(file_path):
         return False
     if not finding.context:
         return False
@@ -196,6 +196,27 @@ def _is_env_file_reference_in_docs(
 def _is_eval_dataset(path: str) -> bool:
     """Return True for authored eval datasets that contain test-case prose."""
     return path.replace("\\", "/") in _EVAL_DATASET_FILES
+
+
+def _is_skill_md(path: str) -> bool:
+    """Return True for paths with the existing loose SKILL.md suffix match."""
+    return path.lower().endswith("skill.md")
+
+
+def _is_canonical_skill_md(path: str) -> bool:
+    """Return True for files literally named SKILL.md."""
+    normalized = path.replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1].lower() == "skill.md"
+
+
+def _is_fenced_code_block(content: str, line_number: int) -> bool:
+    """Return True when a 1-based content line is inside a triple-backtick block."""
+    if line_number <= 1:
+        return False
+    fence_count = sum(
+        line.lstrip().startswith("```") for line in content.splitlines()[: line_number - 1]
+    )
+    return fence_count % 2 == 1
 
 
 _DOCUMENTATION_DIR_NAMES = (
@@ -256,7 +277,7 @@ def _is_documentation_context(af: AnalyzerFinding, file_type: str, path: str, co
     """Return true when a governed finding is prose or a comment without execution signals."""
     if af.rule_id not in _SEMANTIC_STRING_DOC_PRONE_RULES:
         return False
-    if path.replace("\\", "/").lower().endswith("skill.md"):
+    if _is_skill_md(path):
         return False
     lines = content.splitlines()
     matched_line = (
@@ -276,7 +297,7 @@ def _is_documentation_markdown(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
     if not normalized.endswith((".md", ".markdown")):
         return False
-    if normalized.endswith("skill.md"):
+    if _is_skill_md(path):
         return False
     parts = normalized.split("/")
     return any(part in _DOCUMENTATION_DIR_NAMES for part in parts[:-1])
@@ -355,7 +376,15 @@ def _scan_path(
             # PE3's analyzer owns its narrowly qualified safe references.
             # Generic documentation words are attacker-controlled and must
             # not hard-drop HIGH credential-access findings here.
-            if af.rule_id != "PE3" and af.context and is_code_example(af.context):
+            if (
+                af.rule_id != "PE3"
+                and af.context
+                and is_code_example(af.context)
+                and not (
+                    _is_canonical_skill_md(path)
+                    and _is_fenced_code_block(content, af.location.start_line)
+                )
+            ):
                 if is_non_executable:
                     logger.debug(
                         "Filtered code-example finding in non-executable: %s in %s:%d",
