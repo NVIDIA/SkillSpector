@@ -27,19 +27,15 @@ models:
     context_length: 202749
     max_output_tokens: 32768
 
-  "z-ai/glm-5.1":
-    context_length: 205000
-
   "moonshotai/kimi-k2.6":
     context_length: 256000
 
-  "deepseek-ai/deepseek-v4-pro":
-    context_length: 1000000
-    max_output_tokens: 128000
-
-  "deepseek-ai/deepseek-v4-flash":
-    context_length: 1000000
-    max_output_tokens: 128000
+  # deepseek-v4-flash e' a fine vita dal 2026-08-07 e risponde 410 Gone; il successore
+  # servito e' deepseek-v4-flash-0731. I limiti qui sotto sono prudenti: non sono stati
+  # sondati, e una finestra sottostimata e' il verso sicuro in cui sbagliare.
+  "deepseek-ai/deepseek-v4-flash-0731":
+    context_length: 128000
+    max_output_tokens: 16384
 
   "openai/gpt-oss-120b":
     context_length: 128000
