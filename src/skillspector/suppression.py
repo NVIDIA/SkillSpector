@@ -331,6 +331,23 @@ def load_baseline(path: str | Path) -> Baseline:
     return baseline_from_dict(data)
 
 
+SHIPPED_BASELINE_FILENAME = ".skillspector-baseline.yaml"
+
+
+def discover_baseline(skill_dir: str | Path) -> Path | None:
+    """Return the baseline shipped at the top level of *skill_dir*, or None.
+
+    Pure existence check for the single canonical filename
+    (``.skillspector-baseline.yaml``, the name ``skillspector baseline`` writes
+    by default). The file is never read here, so an untrusted shipped baseline
+    is not parsed until the caller decides to load it. Nested files are ignored;
+    per-sub-skill discovery belongs to the recursive path and is out of scope.
+    ``.yml`` / ``.json`` baselines stay usable through explicit ``--baseline``.
+    """
+    candidate = Path(skill_dir) / SHIPPED_BASELINE_FILENAME
+    return candidate if candidate.is_file() else None
+
+
 def partition_findings(
     findings: list[Finding],
     baseline: Baseline | None,
@@ -368,6 +385,49 @@ def partition_findings(
     if suppressed:
         logger.debug("Suppressed %d finding(s) via baseline", len(suppressed))
     return kept, suppressed
+
+
+def effective_findings(result: Mapping[str, object]) -> list[Finding]:
+    """Return the findings from a graph *result* that actually drove its risk score.
+
+    The report node returns ``filtered_findings`` as the full pre-partition set
+    (kept plus baseline-suppressed) alongside ``suppressed_findings``, but scores
+    and SARIF results from the kept subset alone. Consumers that want the numbers
+    the report itself published must therefore subtract the suppressed partition.
+
+    Two failure modes this exists to prevent, both of which over-report:
+
+    * ``result.get("filtered_findings") or result.get("findings")`` treats an
+      empty filtered list as absent and falls back to the raw pre-filter
+      findings. An empty list is a real answer -- every finding was filtered out
+      or suppressed -- not a missing one.
+    * Using ``filtered_findings`` directly counts baseline-suppressed findings
+      that the report excluded from the score, so a fully suppressed skill
+      reports risk 0 alongside a non-zero finding count.
+
+    Falls back to the raw ``findings`` list only when ``filtered_findings`` is
+    absent or malformed, and does not subtract there: raw findings are not the
+    population that produced ``suppressed_findings``.
+    """
+    filtered = result.get("filtered_findings")
+    if not isinstance(filtered, list):
+        raw = result.get("findings")
+        return list(raw) if isinstance(raw, list) else []
+
+    suppressed = result.get("suppressed_findings")
+    if not isinstance(suppressed, list) or not suppressed:
+        return list(filtered)
+
+    suppressed_ids = {
+        entry.finding.finding_id
+        for entry in suppressed
+        if isinstance(entry, SuppressedFinding) and entry.finding is not None
+    }
+    return [
+        finding
+        for finding in filtered
+        if not isinstance(finding, Finding) or finding.finding_id not in suppressed_ids
+    ]
 
 
 def build_baseline_dict(

@@ -62,5 +62,6 @@ def test_sc8_single_pyc_blocks_install_and_cli_exit(tmp_path: Path) -> None:
         "score": 51,
         "severity": "HIGH",
         "recommendation": "DO_NOT_INSTALL",
+        "max_issue_severity": "HIGH",
     }
     assert any(issue["id"] == "SC8" for issue in report["issues"])
