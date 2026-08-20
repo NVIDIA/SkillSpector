@@ -112,6 +112,10 @@ class SkillspectorState(TypedDict, total=False):
     # Component metadata for reporting and risk scoring (from build_context)
     component_metadata: list[dict[str, object]]
     has_executable_scripts: bool
+    # Structured workflow context for phase-1 AISOP/AISP summaries
+    structured_skill_context: dict[str, object]
+    # Report-only structured skill summaries emitted outside the finding pipeline
+    structured_summaries: Annotated[list[dict[str, object]], operator.add]
 
     # Output: report node writes formatted string here
     output_format: str
@@ -158,6 +162,7 @@ class AnalyzerNodeResponse(TypedDict):
     findings: list[Finding]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
+    structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers
     # omit it (NotRequired keeps the key optional for them).
     llm_call_log: NotRequired[list[LLMCallRecord]]

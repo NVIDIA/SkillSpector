@@ -94,12 +94,12 @@ def _make_state(fixture_name: str) -> dict:
     for item in fixture_dir.rglob("*"):
         if not item.is_file():
             continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
+        rel = item.relative_to(fixture_dir)
+        if any(skip in rel.parts for skip in _SKIP_DIRS):
             continue
         if item.name.startswith(".") and not item.name.startswith(".claude"):
             continue
-        rel = item.relative_to(fixture_dir).as_posix()  # forward slashes on every OS
-        components.append(rel)
+        components.append(rel.as_posix())  # forward slashes on every OS
     components.sort()
 
     # Build file_cache
@@ -242,6 +242,9 @@ class TestLP1UnderdeclaredCapability:
         for lp1 in lp1_findings:
             assert lp1.severity == "HIGH", f"Expected HIGH severity for LP1, got {lp1.severity}"
             assert lp1.confidence >= 0.70
+            assert lp1.remediation is not None
+            assert "'permissions' list" in lp1.remediation
+            assert "SKILL.md" not in lp1.remediation
 
 
 class TestLP3NoPermissions:
@@ -306,6 +309,9 @@ class TestLP3AllowedTools:
         )
         for lp1 in lp1_findings:
             assert lp1.severity == "HIGH", f"Expected HIGH severity for LP1, got {lp1.severity}"
+            assert lp1.remediation is not None
+            assert "'allowed-tools'" in lp1.remediation
+            assert "'permissions'" not in lp1.remediation
 
     def test_allowed_tools_fully_covered_no_lp1(self):
         """allowed-tools: [Bash] + only shell code → no LP1 (capability is covered)."""
