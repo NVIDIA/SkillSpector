@@ -1092,6 +1092,35 @@ def test_report_meta_analysis_not_applied_when_meta_analyzer_itself_fails(
     assert meta["filtering_mode"] == "heuristic"
 
 
+def test_report_meta_analysis_not_applied_when_no_meta_analyzer_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty meta_analyzer_records list must not vacuously satisfy meta_analysis_applied.
+
+    meta_analyzer never runs when there are no findings to filter (it
+    short-circuits to not_applicable), so its records list is empty and
+    all([]) is True; a plain all(...) check with no non-empty guard reports
+    meta_analysis_applied=True with no meta-analyzer call ever made.
+    meta_analysis_applied now requires at least one record and all of them ok.
+    llm_available stays True: provider availability is a separate contract
+    from whether meta_analyzer had anything to do.
+    """
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [],
+    }
+    meta = _meta_from_json_report(state)
+    assert meta["meta_analysis_applied"] is False
+    assert meta["llm_available"] is True
+    assert meta["filtering_mode"] == "heuristic"
+
+
 def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm True but no LLM calls attempted (e.g. empty skill) -> not degraded."""
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))

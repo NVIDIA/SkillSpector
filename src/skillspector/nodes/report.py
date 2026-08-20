@@ -755,18 +755,30 @@ def _build_metadata(
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
     # batch. A missing record means meta_analyzer never ran (e.g. there were
     # no findings to filter), which is not itself a failure, so it reads as
-    # vacuously ok. When it does run it always emits exactly one record.
+    # vacuously ok for llm_available (provider/runtime truth). When it does
+    # run it always emits exactly one record.
     meta_analyzer_records = [r for r in llm_call_log if r.get("node") == "meta_analyzer"]
     meta_analyzer_ok = all(bool(r.get("ok")) for r in meta_analyzer_records)
+    # meta_analysis_applied is stricter: "did meta-analysis actually run"
+    # cannot be satisfied vacuously. all([]) is True on an empty list, so
+    # meta_analyzer_ok alone is also True when meta_analyzer made no call at
+    # all (the no-findings path) - require at least one record, and that
+    # record must have succeeded.
+    meta_analyzer_succeeded = bool(meta_analyzer_records) and meta_analyzer_ok
 
-    # meta_analysis_applied / llm_available answer "did meta-analysis itself
-    # run": the provider was available and meta_analyzer's own call (if it
-    # ran) succeeded. A different analyzer's partial batch loss is a
-    # coverage gap, reported separately below via llm_degraded /
-    # llm_calls_attempted / llm_calls_succeeded, and must not flip these two
-    # fields false on its own - that conflated two independent contracts
-    # (meta-analysis ran vs. some coverage was lost) into one boolean.
-    meta_analysis_applied = use_llm and provider_available and meta_analyzer_ok
+    # meta_analysis_applied / llm_available answer different questions.
+    # llm_available is provider availability: the binary/credentials were
+    # available AND meta_analyzer's own call (if it ran) succeeded - it stays
+    # vacuously true when meta_analyzer never ran, because the provider being
+    # reachable does not depend on there being findings to filter.
+    # meta_analysis_applied is "did meta-analysis itself run", which needs an
+    # actual successful meta_analyzer record, not just the absence of a
+    # failure. A different analyzer's partial batch loss is a coverage gap,
+    # reported separately below via llm_degraded / llm_calls_attempted /
+    # llm_calls_succeeded, and must not flip these two fields on its own -
+    # that would conflate two independent contracts (meta-analysis ran vs.
+    # some coverage was lost) into one boolean.
+    meta_analysis_applied = use_llm and provider_available and meta_analyzer_succeeded
 
     meta: dict[str, object] = {
         "has_executable_scripts": has_executable_scripts,
