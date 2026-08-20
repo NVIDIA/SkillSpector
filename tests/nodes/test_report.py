@@ -696,6 +696,56 @@ def test_report_baseline_keeps_unmatched_finding() -> None:
     assert len(result["suppressed_findings"]) == 1
 
 
+def test_report_json_reports_worst_issue_severity() -> None:
+    """max_issue_severity names the worst finding even when the verdict normalizes it away.
+
+    A single HIGH finding scores below the HIGH band, so risk_assessment.severity reads
+    LOW. Before this field, a consumer reading the verdict got the opposite of what the
+    findings said, with nothing in the report flagging the disagreement.
+    """
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("PE3", "HIGH")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+    }
+    data = json.loads(report(state)["report_body"])
+    assert data["risk_assessment"]["max_issue_severity"] == "HIGH"
+    assert data["issues"][0]["severity"] == "HIGH"
+
+
+def test_report_json_worst_issue_severity_is_none_without_findings() -> None:
+    """With no issues the field says NONE, not the empty string or a bare LOW."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+    }
+    data = json.loads(report(state)["report_body"])
+    assert data["risk_assessment"]["max_issue_severity"] == "NONE"
+
+
+def test_report_json_worst_issue_severity_ignores_suppressed() -> None:
+    """A suppressed finding is not a reported issue, so it must not set the maximum."""
+    baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="fp")])
+    state: SkillspectorState = {
+        "filtered_findings": [_finding("P5", "CRITICAL"), _finding("PE3", "MEDIUM")],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": baseline,
+    }
+    data = json.loads(report(state)["report_body"])
+    assert data["risk_assessment"]["max_issue_severity"] == "MEDIUM"
+
+
 def test_report_json_includes_suppressed_section() -> None:
     """JSON output reports suppressed_count and a suppressed array."""
     baseline = Baseline(rules=[SuppressionRule(rule_id="P5", reason="fp")])
