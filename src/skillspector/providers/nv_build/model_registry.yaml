@@ -15,8 +15,17 @@
 
 models:
   # NVIDIA-curated NIMs on build.nvidia.com.
+  # 202749 e' il tetto COMBINATO ingresso+uscita che l'endpoint impone, ed e' riportato
+  # alla lettera nel 400 che restituisce quando lo si supera. Dichiarando la finestra
+  # nominale di 1000000, model_info calcolava un budget d'uscita di 250000 token
+  # (ctx * (1 - MAX_INPUT_TOKENS_PCT)) e OGNI chiamata falliva:
+  #   "This model configuration accepts at most 202749 combined input and output tokens.
+  #    However, your request has 1249 input tokens and asks for 250000 output tokens"
+  # Una finestra sovrastimata non degrada con grazia: azzera lo stadio LLM. Sottostimare
+  # e' sicuro, sovrastimare no.
   "z-ai/glm-5.2":
-    context_length: 1000000
+    context_length: 202749
+    max_output_tokens: 32768
 
   "z-ai/glm-5.1":
     context_length: 205000

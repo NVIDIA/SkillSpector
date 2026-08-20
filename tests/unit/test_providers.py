@@ -135,7 +135,7 @@ class TestNvBuildProvider:
     @pytest.mark.parametrize(
         ("model", "context_length"),
         [
-            ("z-ai/glm-5.2", 1_000_000),
+            ("z-ai/glm-5.2", 202_749),
             ("z-ai/glm-5.1", 205_000),
             ("moonshotai/kimi-k2.6", 256_000),
         ],
@@ -143,7 +143,17 @@ class TestNvBuildProvider:
     def test_nv_build_reported_model_metadata(self, model: str, context_length: int) -> None:
         provider = NvBuildProvider()
         assert provider.get_context_length(model) == context_length
-        assert provider.get_max_output_tokens(model) is None
+
+    def test_glm_declares_both_limits(self) -> None:
+        """max_output_tokens is optional, and its absence is not neutral.
+
+        Without it the output budget is derived as a percentage of the context
+        window, which is what produced a 250_000-token request against an
+        endpoint accepting 202_749 combined.
+        """
+        provider = NvBuildProvider()
+        assert provider.get_context_length("z-ai/glm-5.2") == 202_749
+        assert provider.get_max_output_tokens("z-ai/glm-5.2") == 32_768
 
     @pytest.mark.parametrize("model", ["glm-5.2", "z-ai/glm-5.2 "])
     def test_nv_build_model_near_match_stays_unresolved(self, model: str) -> None:
