@@ -27,7 +27,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 _project_root = Path(__file__).resolve().parents[3]
 if str(_project_root) not in sys.path:
@@ -39,6 +39,7 @@ from contrib.batch_scan.api_pool import (
     PooledChatModel,
     create_api_key_pool_from_env,
 )
+from skillspector.llm_utils import _ainvoke_with_usage, _invoke_with_usage
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +458,44 @@ class TestResourceLeakRecovery(unittest.TestCase):
         self.assertEqual(pool.active_requests, 1)
         pool.release(key, success=False)
         self.assertEqual(pool.active_requests, 0)
+
+
+class TestPooledUsageCallbacks(unittest.TestCase):
+    def test_sync_wrapper_forwards_collector_to_selected_langchain_model(self):
+        pool = _make_pool(n=1)
+        model = _make_pooled_model(pool)
+        collector = object()
+        response = object()
+        llm = MagicMock()
+        llm.invoke.return_value = response
+
+        with patch.object(model, "_build_llm", return_value=llm):
+            result = _invoke_with_usage(model, "prompt", collector)
+
+        self.assertIs(result, response)
+        llm.invoke.assert_called_once_with(
+            "prompt",
+            config={"callbacks": [collector]},
+        )
+
+
+class TestPooledAsyncUsageCallbacks(unittest.IsolatedAsyncioTestCase):
+    async def test_async_wrapper_forwards_collector_to_selected_langchain_model(self):
+        pool = _make_pool(n=1)
+        model = _make_pooled_model(pool)
+        collector = object()
+        response = object()
+        llm = MagicMock()
+        llm.ainvoke = AsyncMock(return_value=response)
+
+        with patch.object(model, "_build_llm", return_value=llm):
+            result = await _ainvoke_with_usage(model, "prompt", collector)
+
+        self.assertIs(result, response)
+        llm.ainvoke.assert_awaited_once_with(
+            "prompt",
+            config={"callbacks": [collector]},
+        )
 
 
 if __name__ == "__main__":

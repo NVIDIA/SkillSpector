@@ -85,3 +85,27 @@ class TestValidateBaseUrl:
         validate_base_url("not-a-url-at-all")
         validate_base_url("")
         validate_base_url("ftp://bad")
+
+
+class TestSourcesCompileWithoutSyntaxWarning:
+    """Every shipped module compiles clean: a stray ``\\|`` in a docstring warns on 3.12+."""
+
+    def test_no_syntax_warning_in_package(self) -> None:
+        import pathlib
+        import warnings
+
+        import skillspector
+
+        package_root = pathlib.Path(skillspector.__file__).parent
+        offenders: list[str] = []
+        for path in sorted(package_root.rglob("*.py")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            offenders += [
+                f"{path}: {w.category.__name__}: {w.message}"
+                for w in caught
+                if issubclass(w.category, SyntaxWarning)
+            ]
+
+        assert not offenders, "\n".join(offenders)

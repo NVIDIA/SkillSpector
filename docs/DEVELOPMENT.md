@@ -79,6 +79,7 @@ All targets assume the virtual environment is **already created and activated**.
 | `zip_bytes`, `mode` | Optional zip input and scan mode |
 | `components` | List of relative file paths in the skill |
 | `file_cache` | Map of path → file contents |
+| `inspection_ledger` | Structured evidence for files excluded, skipped, or failed during analysis; a recognized OMS signature is recorded as an `oms_signature` scope exclusion. |
 | `ast_cache` | Map of path → AST representation (for future use) |
 | `manifest`, `previous_manifest` | Parsed skill metadata (e.g. from SKILL.md) |
 | `component_metadata` | List of dicts: path, type, lines, executable, size_bytes (from build_context) |

@@ -1,0 +1,43 @@
+# Token-budget metadata for the OpenAICompatibleProvider (Groq, Together AI,
+# Mistral, DeepInfra, Fireworks, LiteLLM, and other OpenAI-compatible
+# endpoints).  Bundled with the package; consulted whenever the active
+# provider is OpenAICompatibleProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+
+models:
+  # Groq
+  "llama-3.1-70b-versatile":
+    context_length: 131072
+    max_output_tokens: 8192
+  "llama-3.1-8b-instant":
+    context_length: 131072
+    max_output_tokens: 8192
+  "mixtral-8x7b-32768":
+    context_length: 32768
+    max_output_tokens: 4096
+
+  # Together AI
+  "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo":
+    context_length: 131072
+    max_output_tokens: 4096
+  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo":
+    context_length: 131072
+    max_output_tokens: 4096
+
+  # Mistral
+  "mistral-large-latest":
+    context_length: 131072
+    max_output_tokens: 8192
+  "mistral-small-latest":
+    context_length: 131072
+    max_output_tokens: 8192
+
+  # DeepInfra / generic
+  "deepseek-ai/DeepSeek-V3":
+    context_length: 65536
+    max_output_tokens: 8192

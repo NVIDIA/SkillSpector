@@ -22,17 +22,19 @@ is its own subpackage with a ``provider.py`` and a bundled
 
 Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
 
-    openai          → OpenAIProvider          (api.openai.com)
-    anthropic       → AnthropicProvider       (api.anthropic.com)
-    anthropic_proxy → AnthropicProxyProvider  (Vertex-style raw-predict proxy)
-    bedrock         → BedrockProvider         (AWS Bedrock Runtime, SigV4)
-    nv_build        → NvBuildProvider          (build.nvidia.com)
-    claude_cli      → ClaudeCLIProvider       (local ``claude`` binary, no API key)
-    codex_cli       → CodexCLIProvider        (local ``codex`` binary, no API key)
-    gemini_cli      → GeminiCLIProvider       (local ``gemini`` binary, no API key)
-    antigravity_cli → AntigravityCLIProvider  (local ``agy`` binary; registered
-                                               but disabled — agy is TTY-only and
-                                               can't be captured; use gemini_cli)
+    openai            → OpenAIProvider              (api.openai.com)
+    anthropic         → AnthropicProvider            (api.anthropic.com)
+    anthropic_proxy   → AnthropicProxyProvider       (Vertex-style raw-predict proxy)
+    bedrock           → BedrockProvider              (AWS Bedrock Runtime, SigV4)
+    nv_build          → NvBuildProvider              (build.nvidia.com)
+    ollama            → OllamaProvider               (local Ollama instance)
+    azure_openai      → AzureOpenAIProvider          (Azure OpenAI Service)
+    openai_compatible → OpenAICompatibleProvider     (Groq, Together AI, Mistral, etc.)
+    claude_cli        → ClaudeCLIProvider            (local ``claude`` binary, no API key)
+    codex_cli         → CodexCLIProvider             (local ``codex`` binary, no API key)
+    gemini_cli        → GeminiCLIProvider            (local ``gemini`` binary, no API key)
+    antigravity_cli   → AntigravityCLIProvider       (local ``agy`` binary; registered
+                                                      but disabled; use gemini_cli)
 
 When unset, the selector defaults to ``nv_build``.
 
@@ -65,6 +67,7 @@ NO_LLM_API_KEY_MESSAGE = (
     "No LLM API key configured. Set the credential env var for the "
     "active provider, or set OPENAI_API_KEY (and optionally "
     "OPENAI_BASE_URL) to use a standard OpenAI-compatible endpoint. "
+    "For local models, try SKILLSPECTOR_PROVIDER=ollama. "
     "Use --no-llm to skip LLM analysis and run static checks only."
 )
 
@@ -118,6 +121,18 @@ def _select_active_provider() -> LLMProvider:
         from .bedrock import BedrockProvider
 
         return BedrockProvider()
+    if name == "ollama":
+        from .ollama import OllamaProvider
+
+        return OllamaProvider()
+    if name == "azure_openai":
+        from .azure_openai import AzureOpenAIProvider
+
+        return AzureOpenAIProvider()
+    if name == "openai_compatible":
+        from .openai_compatible import OpenAICompatibleProvider
+
+        return OpenAICompatibleProvider()
     if name == "nv_build":
         return NvBuildProvider()
     if name == "claude_cli":
@@ -149,6 +164,7 @@ def _select_active_provider() -> LLMProvider:
     raise ValueError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
         "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
+        "ollama, azure_openai, openai_compatible, "
         "claude_cli, codex_cli, gemini_cli, antigravity_cli (or unset)."
     )
 
@@ -197,13 +213,13 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
     return _openai_fallback_provider().resolve_credentials()
 
 
-def create_chat_model(
+def create_chat_model_with_provider(
     model: str,
     *,
     max_tokens: int,
     timeout: float | None = 120,
-) -> BaseChatModel:
-    """Create the active provider's native LangChain chat model.
+) -> tuple[BaseChatModel, LLMProvider]:
+    """Create a chat model and return the provider that actually built it.
 
     CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) do not have
     a native LangChain chat model — callers that need CLI transport should use
@@ -220,7 +236,7 @@ def create_chat_model(
     if not has_cli_capability(provider):
         llm = provider.create_chat_model(model, max_tokens=max_tokens, timeout=timeout)
         if llm is not None:
-            return llm
+            return llm, provider
 
         if has_provider_binding():
             raise_no_llm_api_key_configured()
@@ -228,15 +244,31 @@ def create_chat_model(
         from .openai import OpenAIProvider
 
         if not isinstance(provider, OpenAIProvider):
-            llm = _openai_fallback_provider().create_chat_model(
+            fallback_provider = _openai_fallback_provider()
+            llm = fallback_provider.create_chat_model(
                 model,
                 max_tokens=max_tokens,
                 timeout=timeout,
             )
             if llm is not None:
-                return llm
+                return llm, fallback_provider
 
     raise_no_llm_api_key_configured()
+
+
+def create_chat_model(
+    model: str,
+    *,
+    max_tokens: int,
+    timeout: float | None = 120,
+) -> BaseChatModel:
+    """Create the active provider's native LangChain chat model."""
+    llm, _provider = create_chat_model_with_provider(
+        model,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+    return llm
 
 
 __all__ = [
@@ -247,6 +279,7 @@ __all__ = [
     "ModelMetadataProvider",
     "NO_LLM_API_KEY_MESSAGE",
     "create_chat_model",
+    "create_chat_model_with_provider",
     "get_active_provider",
     "get_metadata_provider",
     "has_cli_capability",

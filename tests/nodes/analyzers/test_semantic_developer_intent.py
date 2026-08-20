@@ -388,6 +388,31 @@ _SDI_FIXTURES = Path(__file__).resolve().parent.parent.parent / "fixtures" / "sd
 _sdi_fixture_test = pytest.mark.integration
 
 
+def _mock_sdi_structured_llm(monkeypatch: pytest.MonkeyPatch, rule_id: str | None) -> MagicMock:
+    """Return a deterministic structured response for an SDI fixture case."""
+    mock_llm = MagicMock()
+    structured_llm = MagicMock()
+    findings = (
+        []
+        if rule_id is None
+        else [
+            LLMFinding(
+                rule_id=rule_id,
+                message="Fixture response identifies the declared-behavior mismatch.",
+                severity="HIGH",
+                start_line=1,
+                confidence=0.9,
+                explanation="The fixture response is a valid structured LLM result.",
+                remediation="Update the declared behavior to match the implementation.",
+            )
+        ]
+    )
+    structured_llm.ainvoke = AsyncMock(return_value=LLMAnalysisResult(findings=findings))
+    mock_llm.with_structured_output.return_value = structured_llm
+    monkeypatch.setattr(MOCK_PATCH_TARGET, lambda **_kwargs: mock_llm)
+    return structured_llm
+
+
 def _build_file_cache(skill_dir: Path) -> dict[str, str]:
     cache: dict[str, str] = {}
     for item in sorted(skill_dir.rglob("*")):
@@ -422,7 +447,8 @@ def _load_manifest(skill_dir: Path) -> dict:
 class TestSdi1Mismatch:
     """SDI-1: skill claiming local-only but making network calls → findings."""
 
-    def test_mismatch_produces_finding(self) -> None:
+    def test_mismatch_produces_finding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mock_sdi_structured_llm(monkeypatch, "SDI-1")
         skill_dir = _SDI_FIXTURES / "sdi1_mismatch"
         if not skill_dir.is_dir():
             pytest.skip("sdi1_mismatch fixture not present")
@@ -446,7 +472,8 @@ class TestSdi1Mismatch:
 class TestSdi2Inappropriate:
     """SDI-2: formatter skill using subprocess → findings."""
 
-    def test_inappropriate_capability_flagged(self) -> None:
+    def test_inappropriate_capability_flagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mock_sdi_structured_llm(monkeypatch, "SDI-2")
         skill_dir = _SDI_FIXTURES / "sdi2_inappropriate"
         if not skill_dir.is_dir():
             pytest.skip("sdi2_inappropriate fixture not present")
@@ -470,7 +497,8 @@ class TestSdi2Inappropriate:
 class TestSdi3ScopeCreep:
     """SDI-3: read-only permissions declared but code writes files → findings."""
 
-    def test_scope_creep_flagged(self) -> None:
+    def test_scope_creep_flagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mock_sdi_structured_llm(monkeypatch, "SDI-3")
         skill_dir = _SDI_FIXTURES / "sdi3_scope_creep"
         if not skill_dir.is_dir():
             pytest.skip("sdi3_scope_creep fixture not present")
@@ -494,7 +522,8 @@ class TestSdi3ScopeCreep:
 class TestSdi4Divergence:
     """SDI-4: docstrings contradict what the code does → findings."""
 
-    def test_divergence_flagged(self) -> None:
+    def test_divergence_flagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mock_sdi_structured_llm(monkeypatch, "SDI-4")
         skill_dir = _SDI_FIXTURES / "sdi4_divergence"
         if not skill_dir.is_dir():
             pytest.skip("sdi4_divergence fixture not present")
@@ -519,7 +548,8 @@ class TestSdi4Divergence:
 class TestSdiClean:
     """Shared clean fixture: well-formed skill → no SDI findings."""
 
-    def test_clean_skill_produces_no_sdi_findings(self) -> None:
+    def test_clean_skill_produces_no_sdi_findings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mock_sdi_structured_llm(monkeypatch, None)
         skill_dir = _SDI_FIXTURES / "sdi_clean"
         if not skill_dir.is_dir():
             pytest.skip("sdi_clean fixture not present")

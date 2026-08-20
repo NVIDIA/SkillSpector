@@ -1,0 +1,52 @@
+{
+  "servers": [
+    {
+      "server": {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": "ac.tandem/docs-mcp",
+        "title": "Tandem Docs",
+        "description": "Remote MCP server for Tandem docs.",
+        "version": "0.3.2",
+        "websiteUrl": "https://tandem.ac/docs-mcp",
+        "repository": {"url": "https://github.com/frumu-ai/tandem", "source": "github"},
+        "remotes": [{"type": "streamable-http", "url": "https://tandem.ac/mcp"}]
+      },
+      "_meta": {
+        "io.modelcontextprotocol.registry/official": {
+          "status": "active",
+          "publishedAt": "2026-04-22T21:06:34.500049Z",
+          "updatedAt": "2026-04-22T21:06:34.500049Z",
+          "isLatest": true
+        }
+      }
+    },
+    {
+      "server": {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": "ai.adeu/adeu",
+        "description": "Automated DOCX Redlining Engine",
+        "repository": {"url": "https://github.com/dealfluence/adeu", "source": "github"},
+        "version": "1.7.1",
+        "packages": [{
+          "registryType": "npm",
+          "identifier": "@adeu/mcp-server",
+          "version": "1.7.1",
+          "fileSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "transport": {"type": "stdio"}
+        }]
+      },
+      "_meta": {"io.modelcontextprotocol.registry/official": {"status": "active", "isLatest": true}}
+    },
+    {
+      "server": {
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": "ai.agenticshelf/graffeo",
+        "title": "Graffeo Coffee Roasting",
+        "version": "1.0.0",
+        "remotes": [{"type": "streamable-http", "url": "http://example.invalid/mcp"}]
+      },
+      "_meta": {"io.modelcontextprotocol.registry/official": {"status": "deprecated", "isLatest": false}}
+    }
+  ],
+  "metadata": {"count": 3}
+}

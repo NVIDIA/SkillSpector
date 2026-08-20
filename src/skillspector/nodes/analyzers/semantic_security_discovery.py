@@ -150,8 +150,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
 
     batches: list[Batch] = []
+    analyzer: LLMAnalyzerBase | None = None
     try:
-        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model)
+        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model, node=ANALYZER_ID)
         batches = analyzer.get_batches(available_components, file_cache)
         results = analyzer.run_batches(batches)
         outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
@@ -180,6 +181,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "llm_call_log": [
                 llm_call_record(ANALYZER_ID, ok=bool(outcome.successful) or not outcome.failures)
             ],
+            "inference_usage": analyzer.inference_usage,
         }
     except ValidationError as exc:
         # Malformed LLM response — degrade gracefully rather than crashing the graph
@@ -211,19 +213,43 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "llm_call_log": [
                 llm_call_record(ANALYZER_ID, ok=False, error=f"malformed LLM response: {exc}")
             ],
+            "inference_usage": analyzer.inference_usage if analyzer is not None else [],
         }
-    except ValueError:
-        raise
     except Exception as exc:
+        post_response_value_error = (
+            isinstance(exc, ValueError) and analyzer is not None and analyzer.response_received
+        )
+        if isinstance(exc, ValueError) and not post_response_value_error:
+            raise
         logger.warning("%s failed: %s", ANALYZER_ID, exc)
+        if post_response_value_error:
+            outcome = BatchExecutionResult(
+                failures=[
+                    BatchFailure(batch=batch, error_class=type(exc).__name__) for batch in batches
+                ]
+            )
+            events, _ = ledger_events_for_batches(ANALYZER_ID, outcome)
+            all_events = [*missing_cache_events, *events]
+            status = analyzer_status_event(
+                analyzer_id=ANALYZER_ID,
+                status="failed",
+                planned_work=[
+                    {
+                        "work_id": event["work_id"],
+                        "path": event["path"],
+                        "start_line": event["start_line"],
+                        "end_line": event["end_line"],
+                    }
+                    for event in all_events
+                ],
+            )
+        else:
+            all_events = list(missing_cache_events)
+            status = analyzer_status_event(analyzer_id=ANALYZER_ID, status="unavailable")
         return {
             "findings": [],
-            "inspection_ledger": [],
-            "analyzer_status_events": [
-                analyzer_status_event(
-                    analyzer_id=ANALYZER_ID,
-                    status="unavailable",
-                )
-            ],
+            "inspection_ledger": all_events,
+            "analyzer_status_events": [status],
             "llm_call_log": [llm_call_record(ANALYZER_ID, ok=False, error=str(exc))],
+            "inference_usage": analyzer.inference_usage if analyzer is not None else [],
         }

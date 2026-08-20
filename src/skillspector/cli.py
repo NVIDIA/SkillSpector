@@ -36,9 +36,16 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.input_handler import validate_local_input_path
 from skillspector.logging_config import get_logger, set_level
+from skillspector.mcp_registry import scan_registry
 from skillspector.multi_skill import MultiSkillDetectionResult, detect_skills
-from skillspector.suppression import build_baseline_dict, dump_baseline, load_baseline
+from skillspector.suppression import (
+    build_baseline_dict,
+    discover_baseline,
+    dump_baseline,
+    load_baseline,
+)
 
 logger = get_logger(__name__)
 
@@ -70,6 +77,7 @@ app = typer.Typer(
 )
 
 console = Console()
+err_console = Console(stderr=True)
 
 
 class FormatChoice(StrEnum):
@@ -136,6 +144,7 @@ def _scan_state(
     if baseline is not None:
         # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
         state["baseline"] = load_baseline(baseline)
+        state["baseline_path"] = os.path.abspath(baseline.expanduser())
         state["show_suppressed"] = show_suppressed
     return state
 
@@ -245,12 +254,30 @@ def scan(
             "do not count toward the risk score).",
         ),
     ] = False,
+    use_shipped_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--use-shipped-baseline",
+            help="Apply a baseline shipped at the top level of the scanned skill "
+            "directory (.skillspector-baseline.yaml). Off by default: a skill "
+            "author's baseline can suppress findings in your scan, so a discovered "
+            "baseline is only reported until you opt in. Ignored when --baseline "
+            "is given.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
             "--verbose",
             "-V",
             help="Show detailed progress.",
+        ),
+    ] = False,
+    mcp_registry: Annotated[
+        bool,
+        typer.Option(
+            "--mcp-registry",
+            help="Scan an MCP Registry payload or URL instead of a skill.",
         ),
     ] = False,
 ) -> None:
@@ -284,10 +311,43 @@ def scan(
                                              chain when unset; AWS_REGION default: us-west-2)
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
     """
+    if mcp_registry:
+        if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
+            console.print(
+                "[red]Error:[/red] --mcp-registry cannot be combined with "
+                "--recursive, --baseline, --show-suppressed, or --yara-rules-dir"
+            )
+            raise typer.Exit(code=2)
+        if format != FormatChoice.json:
+            console.print("[red]Error:[/red] --mcp-registry currently supports only --format json")
+            raise typer.Exit(code=2)
+        try:
+            result = scan_registry(input_path)
+            report = json.dumps(result, indent=2)
+            if output:
+                output.write_text(report, encoding="utf-8")
+                console.print(f"Report saved to: {output}")
+            else:
+                print(report)
+            if result["risk_score"] > RISK_THRESHOLD:
+                raise typer.Exit(code=1)
+        except typer.Exit:
+            raise
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=2) from e
+        return
+
     if verbose:
         set_level("DEBUG")
 
-    resolved_path = Path(input_path).resolve()
+    resolved_path = Path(input_path)
+    if not input_path.startswith(("http://", "https://", "git@")):
+        try:
+            resolved_path = validate_local_input_path(resolved_path)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=2) from e
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
@@ -311,6 +371,31 @@ def scan(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
+
+    shipped: Path | None = None
+    if baseline is None and resolved_path.is_dir():
+        shipped = discover_baseline(resolved_path)
+    if shipped is not None:
+        if use_shipped_baseline:
+            baseline = shipped
+            err_console.print(f"[yellow]Applying author-shipped baseline:[/yellow] {shipped}")
+            err_console.print(
+                "[dim]Suppressed findings do not count toward the risk score; "
+                "use --show-suppressed to list them.[/dim]"
+            )
+        else:
+            err_console.print(
+                f"[yellow]Shipped baseline detected (not applied):[/yellow] {shipped}"
+            )
+            err_console.print(
+                "[dim]Review it, then re-run with --use-shipped-baseline to apply its "
+                "suppressions. Findings and risk score are unaffected until you opt in.[/dim]"
+            )
+    elif use_shipped_baseline and baseline is None:
+        err_console.print(
+            f"[dim]--use-shipped-baseline: no shipped baseline found in {resolved_path}; "
+            "scanning without a baseline.[/dim]"
+        )
 
     result = None
     try:
@@ -581,6 +666,7 @@ def baseline(
             console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
         state = _scan_state(input_path, FormatChoice.json, no_llm)
+        state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
         findings = result.get("filtered_findings") or result.get("findings") or []
         data = build_baseline_dict(

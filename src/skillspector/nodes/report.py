@@ -35,11 +35,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from skillspector import __version__ as skillspector_version
+from skillspector.inference_usage import sanitize_inference_usage
 from skillspector.inspection_ledger import AnalysisCompleteness
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.python_ast import clear_python_ast_cache
 from skillspector.sarif_models import (
     SARIF_SCHEMA_URI,
     SarifArtifactLocation,
@@ -154,6 +156,11 @@ _SEVERITY_POINTS: dict[str, int] = {
 _MAX_OCCURRENCES_PER_RULE = 3
 _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 
+# Some findings describe artifacts whose unanalyzed contents can execute. Their
+# presence must block installation even when ordinary confidence-weighted,
+# per-rule scoring would otherwise keep the aggregate below the CLI threshold.
+_RISK_SCORE_FLOORS_BY_RULE_ID = {"SC8": 51}
+
 
 def _compute_risk_score(
     findings: list[Finding],
@@ -218,7 +225,15 @@ def _compute_risk_score(
 
         score += contribution
 
-    final_score = min(100, max(0, int(score)))
+    score_floor = max(
+        (
+            _RISK_SCORE_FLOORS_BY_RULE_ID.get(f.rule_id, 0)
+            for f in sorted_findings
+            if max(0.0, min(1.0, f.confidence)) > 0.0
+        ),
+        default=0,
+    )
+    final_score = min(100, max(score_floor, int(score)))
 
     severity_band = "LOW"
     for threshold, band in _RISK_SEVERITY_BANDS:
@@ -602,6 +617,7 @@ def _build_metadata(
     has_executable_scripts: bool,
     use_llm: bool,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
+    inference_usage: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
@@ -619,6 +635,10 @@ def _build_metadata(
         # available AND the stage was not fully degraded (every call failing).
         "llm_available": llm_available and not degraded,
         "meta_analysis_applied": meta_analysis_applied,
+        # A list (including an empty list) makes observability explicit. Empty
+        # means the provider/transport supplied no counters; it is never an
+        # estimated zero-cost assertion.
+        "inference_usage": sanitize_inference_usage(inference_usage),
     }
     if not meta_analysis_applied:
         meta["filtering_mode"] = "heuristic"
@@ -651,6 +671,7 @@ def _format_json(
     has_executable_scripts: bool,
     use_llm: bool = True,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
+    inference_usage: Sequence[Mapping[str, object]] | None = None,
     analysis_completeness: Mapping[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     execution_successful: bool = True,
@@ -682,7 +703,12 @@ def _format_json(
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
         "suppressed": [sf.to_dict() for sf in suppressed],
-        "metadata": _build_metadata(has_executable_scripts, use_llm, llm_call_log),
+        "metadata": _build_metadata(
+            has_executable_scripts,
+            use_llm,
+            llm_call_log,
+            inference_usage,
+        ),
         "execution_successful": execution_successful,
     }
     data["analysis_completeness"] = dict(analysis_completeness or {})
@@ -850,6 +876,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     Finalization owns completeness derivation. The report node only selects the
     validated finding IDs, applies baseline suppression, and renders all surfaces.
     """
+    clear_python_ast_cache(state.get("python_ast_cache_key"))
     raw_findings = state.get("findings", [])
     findings_by_id = {finding.finding_id: finding for finding in raw_findings}
     effective_ids = state.get("effective_finding_ids")
@@ -894,6 +921,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
     llm_call_log = state.get("llm_call_log") or []
+    inference_usage = state.get("inference_usage") or []
 
     _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     degraded_notice = _llm_degradation_notice(use_llm, llm_call_log)
@@ -916,7 +944,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings_for_scoring, has_executable_scripts, component_metadata
     )
-
     exceptions = analysis_completeness.get("ledger_exceptions", [])
     fatal_exception = (
         any(
@@ -969,6 +996,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             has_executable_scripts,
             use_llm=use_llm,
             llm_call_log=llm_call_log,
+            inference_usage=inference_usage,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
             execution_successful=execution_successful,

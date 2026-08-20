@@ -15,6 +15,12 @@ concurrency:
   group: publish-github-release
   cancel-in-progress: false
 
+env:
+  UV_VERSION: "0.10.10"
+  PYTHON_VERSION: "3.12"
+  UV_CACHE_DIR: .uv-cache
+  UV_LINK_MODE: copy
+
 jobs:
   publish:
     if: >-
@@ -27,13 +33,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
-      - uses: actions/setup-python@v5
+      - name: Set up uv
+        # Pinned to a full commit SHA (third-party action); comment tracks the tag.
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
-          python-version: "3.12"
+          version: "${{ env.UV_VERSION }}"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: "${{ env.PYTHON_VERSION }}"
+      - name: Install locked build tooling
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Build and validate distribution artifacts
+        run: |
+          uv run --no-sync python -m build --no-isolation
+          uv run --no-sync twine check dist/*
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python scripts/release/public/create_github_release.py \
             --repository "$GITHUB_REPOSITORY" \
-            --target "${{ github.event.pull_request.merge_commit_sha }}"
+            --target "${{ github.event.pull_request.merge_commit_sha }}" \
+            --asset dist/*.whl \
+            --asset dist/*.tar.gz

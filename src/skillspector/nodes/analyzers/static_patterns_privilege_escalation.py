@@ -159,6 +159,46 @@ _PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
     r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
     re.IGNORECASE,
 )
+_PE3_TOKEN_ACTION_CONTEXT = re.compile(
+    r"\b(?:steal(?:s|ing|en)?|exfiltrat(?:e|es|ed|ing|ion)|dump(?:s|ed|ing)?|"
+    r"harvest(?:s|ed|ing)?|scrap(?:e|es|ed|ing)|upload(?:s|ed|ing)?|"
+    r"transmit(?:s|ted|ting)?|send(?:s|ing)?|sent|cop(?:y|ies|ied|ying)|"
+    r"extract(?:s|ed|ing|ion)?|forward(?:s|ed|ing)?|leak(?:s|ed|ing)?|"
+    r"share(?:s|d|ing)?|expose(?:s|d|ing)?)\b"
+    r"|\bpost(?:s|ed|ing)?\b[^\n]{0,80}"
+    r"\b(?:it|them|(?:the\s+)?(?:access|refresh|bearer|api)[ _-]?tokens?)\b"
+    r"[^\n]{0,40}\bto\b"
+    r"|\b(?:read(?:s|ing)?|open(?:s|ed|ing)?|load(?:s|ed|ing)?)\b[^\n]{0,80}"
+    r"\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
+    r"(?<![\w.-])(?:\.ssh|\.aws)(?:[/\\]|$)"
+    r"|(?<![\w.-])\.env(?:\.[\w-]+)?\b"
+    r"|/etc/(?:passwd|shadow)\b"
+    r"|\b(?:tokens?\.json|credentials?|secrets?)\b[^\n]{0,80}"
+    r"\b(?:read|open|load|copy|upload|transmit)\b",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_DIRECTIVE_PREFIX = re.compile(
+    r"\b(?:please|always|silently|then|next|must|should|shall|can|could|will|may|to)\s*$"
+    r"|\b(?:need(?:s)?|try|attempt)\s+to\s*$"
+    r"|^\s*(?:the\s+|an?\s+)?(?:\w+[ -]+){0,2}"
+    r"(?:agents?|assistants?|tools?|skills?|scripts?|users?|clients?|applications?|"
+    r"attackers?|we|you|they|i)\s*$"
+    r"|^\s*(?:go|navigate)\b.*[,;]\s*$",
+    re.IGNORECASE,
+)
+_PE3_ACCESS_TOKEN_NOUN_SUFFIX = re.compile(
+    r"\s*(?:$|[|,.;:)]|(?:are|were|is|was|expire\w*|remain\w*|contain\w*|"
+    r"include\w*|provide\w*|represent\w*|identify\w*|authenticate\w*|authorize\w*|"
+    r"issued|returned|accepted|rejected|revoked|stored|used|tied|associated)\b)",
+    re.IGNORECASE,
+)
+_PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
+    {"docs", "documentation", "procedures", "references", "examples", "guides"}
+)
+_MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
 
 
 def _source_line(content: str, match: re.Match[str]) -> str:
@@ -168,6 +208,59 @@ def _source_line(content: str, match: re.Match[str]) -> str:
     if line_end < 0:
         line_end = len(content)
     return content[line_start:line_end]
+
+
+def _is_access_token_documentation_noun(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    file_path: str,
+) -> bool:
+    """Return True for a bounded ``access token`` compound noun in documentation.
+
+    PE3's generic ``access … tokens?`` rule cannot distinguish the verb
+    "access tokens" from the OAuth compound noun "access token". A bare
+    singular match is necessarily noun-shaped: the verb form requires a
+    determiner (for example, "access the token"). Plural matches remain
+    ambiguous, so suppress them only when they are not governed by an
+    imperative/modal prefix, or when a line-leading match has noun syntax.
+
+    Any credential action or sensitive source in the bounded context vetoes
+    suppression. This keeps malicious instructions actionable even when they
+    are placed in documentation or next to otherwise benign OAuth prose.
+    """
+    if file_type not in {"markdown", "text"}:
+        return False
+    normalized_parts = file_path.replace("\\", "/").lower().split("/")
+    if not any(part in _PE3_TOKEN_DOCUMENTATION_DIRS for part in normalized_parts):
+        return False
+    matched_text = match.group(0).lower()
+    if matched_text not in {"access token", "access tokens"}:
+        return False
+
+    context = get_context(content, match.start())
+    if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
+        return False
+
+    line = _source_line(content, match)
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    relative_start = match.start() - line_start
+    relative_end = match.end() - line_start
+    prefix = _MARKDOWN_LINE_PREFIX.sub("", line[:relative_start])
+    suffix = line[relative_end:]
+
+    cell_prefix = prefix.rsplit("|", 1)[-1]
+    clause_start = max(cell_prefix.rfind(separator) for separator in ".;:")
+    clause_prefix = cell_prefix[clause_start + 1 :]
+    if _PE3_ACCESS_TOKEN_DIRECTIVE_PREFIX.search(
+        cell_prefix
+    ) or _PE3_ACCESS_TOKEN_DIRECTIVE_PREFIX.search(clause_prefix):
+        return False
+    if matched_text == "access token":
+        return True
+    if not clause_prefix.strip():
+        return _PE3_ACCESS_TOKEN_NOUN_SUFFIX.match(suffix) is not None
+    return True
 
 
 def _is_qualified_benign_access_requirement(
@@ -245,11 +338,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
-            if _is_pe3_documentation_example(content, match, file_type):
+            if _is_pe3_documentation_example(content, match, file_type, file_path):
                 continue
             if _is_qualified_benign_access_requirement(content, match, file_type):
                 continue
             if _is_read_only_passwd_volume_match(content, match):
+                continue
+            if _is_negated_safety_constraint(content, match):
                 continue
             findings.append(
                 AnalyzerFinding(
@@ -335,26 +430,56 @@ def _is_documentation_example(context: str, file_type: str) -> bool:
     return _has_documentation_indicator(context, _DOCUMENTATION_EXAMPLE_INDICATORS)
 
 
-def _is_pe3_documentation_example(content: str, match: re.Match[str], file_type: str) -> bool:
-    """Filter only the reviewed, position-bound access-token UI path.
+def _is_pe3_documentation_example(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    file_path: str,
+) -> bool:
+    """Filter reviewed, position-bound access-token documentation forms.
 
     Generic words such as ``example``, ``documentation``, ``Required``, and
     ``environment variable`` are attacker-controllable prose and must never
     suppress an otherwise actionable credential-access match. Even negated
     references remain findings because another malicious clause can share the
-    same line.
+    same line. The OAuth lifecycle exception is separately bounded by noun
+    grammar, lifecycle evidence, and action/sensitive-source vetoes.
     """
     if file_type not in {"markdown", "text"}:
         return False
-    line = _source_line(content, match)
     if match.group(0).lower() not in {"access token", "access tokens"}:
         return False
+
+    line = _source_line(content, match)
     navigation = _PE3_SAFE_ACCESS_TOKEN_NAVIGATION.search(line)
-    if navigation is None:
-        return False
+    if navigation is not None:
+        line_start = content.rfind("\n", 0, match.start()) + 1
+        match_span = (match.start() - line_start, match.end() - line_start)
+        if navigation.span("target") == match_span:
+            return True
+
+    return _is_access_token_documentation_noun(content, match, file_type, file_path)
+
+
+def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+    """Return True when a privilege-escalation phrase is forbidden in policy prose."""
     line_start = content.rfind("\n", 0, match.start()) + 1
-    match_span = (match.start() - line_start, match.end() - line_start)
-    return navigation.span("target") == match_span
+    line_end = content.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    phrase = line[local_start : local_start + len(match.group(0))]
+    escaped = re.escape(phrase.strip())
+    if not escaped:
+        return False
+    clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
+    prefix = line[clause_start + 1 : local_start]
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
+    negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
+    return (
+        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
+    )
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

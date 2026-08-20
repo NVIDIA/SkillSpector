@@ -35,11 +35,11 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from .common import (
     apply_import_aliases,
-    build_import_aliases,
     build_type_map,
     get_context_from_lines,
     get_source_segment,
@@ -142,7 +142,32 @@ _FILE_WRITE_SINKS = frozenset(
     }
 )
 
-_ALL_SINKS = _NETWORK_OUTPUT_SINKS | _EXEC_SINKS | _FILE_WRITE_SINKS
+# Deserializers that reconstruct arbitrary objects / execute code on their input.
+# When untrusted data (network, user, or a bundled/downloaded file) reaches one of
+# these, it is an RCE-class flow — the deserialization analogue of _EXEC_SINKS.
+# Only unconditionally-unsafe names are listed; argument-dependent forms
+# (yaml.load / torch.load / numpy.load) are handled by behavioral_ast (AST10) where
+# keyword arguments can be inspected without false positives on the hardened forms.
+_DESERIALIZATION_SINKS = frozenset(
+    {
+        "pickle.load",
+        "pickle.loads",
+        "cPickle.load",
+        "cPickle.loads",
+        "_pickle.load",
+        "_pickle.loads",
+        "marshal.load",
+        "marshal.loads",
+        "dill.load",
+        "dill.loads",
+        "jsonpickle.decode",
+        "pandas.read_pickle",
+        "joblib.load",
+        "yaml.unsafe_load",
+    }
+)
+
+_ALL_SINKS = _NETWORK_OUTPUT_SINKS | _EXEC_SINKS | _FILE_WRITE_SINKS | _DESERIALIZATION_SINKS
 
 # Pre-computed for _pick_rule — avoids rebuilding the union on every call.
 _EXTERNAL_INPUT_SOURCES = _NETWORK_INPUT_SOURCES | _USER_INPUT_SOURCES
@@ -153,6 +178,7 @@ _RULE_SEVERITIES: dict[str, Severity] = {
     "TT3": Severity.CRITICAL,
     "TT4": Severity.HIGH,
     "TT5": Severity.CRITICAL,
+    "TT6": Severity.HIGH,
 }
 
 _RULE_CONFIDENCES: dict[str, float] = {
@@ -161,6 +187,7 @@ _RULE_CONFIDENCES: dict[str, float] = {
     "TT3": 0.90,
     "TT4": 0.80,
     "TT5": 0.90,
+    "TT6": 0.85,
 }
 
 _TAG = "Data Flow"
@@ -176,6 +203,7 @@ _SINK_CATEGORIES: list[tuple[frozenset[str], str]] = [
     (_NETWORK_OUTPUT_SINKS, "network output"),
     (_EXEC_SINKS, "code execution"),
     (_FILE_WRITE_SINKS, "file write"),
+    (_DESERIALIZATION_SINKS, "deserialization"),
 ]
 
 
@@ -212,6 +240,10 @@ def _pick_rule(source_name: str, sink_name: str, is_direct: bool) -> str:
         return "TT4"
     if source_name in _EXTERNAL_INPUT_SOURCES and sink_name in _EXEC_SINKS:
         return "TT5"
+    if sink_name in _DESERIALIZATION_SINKS and (
+        source_name in _EXTERNAL_INPUT_SOURCES or source_name in _FILE_READ_SOURCES
+    ):
+        return "TT6"
     return "TT1" if is_direct else "TT2"
 
 
@@ -325,12 +357,14 @@ def _find_tainted_in_expr(node: ast.expr, tainted: dict[str, _TaintedVar]) -> _T
     return None
 
 
-def _analyze_python(content: str, file_path: str) -> list[AnalyzerFinding]:
-    tree = ast.parse(content, filename=file_path)
+def _analyze_python(python_ast: ParsedPythonFile, file_path: str) -> list[AnalyzerFinding]:
+    tree = python_ast.tree
+    if tree is None:
+        return []
 
-    type_map = build_type_map(tree)
-    aliases = build_import_aliases(tree)
-    lines = content.splitlines()
+    aliases = python_ast.import_aliases
+    type_map = build_type_map(tree, aliases)
+    lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
     seen: set[tuple[str, int]] = set()
@@ -428,6 +462,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files and detect source\u2192sink data flows."""
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("file_cache") or {}
+    python_ast_cache_key = state.get("python_ast_cache_key")
     all_findings: list[Finding] = []
     ledger_events: list[InspectionLedgerEvent] = []
 
@@ -455,9 +490,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 observed_bytes=len(content.encode("utf-8")),
             )
         else:
-            try:
-                raw = _analyze_python(content, path)
-            except SyntaxError:
+            python_ast = get_python_ast(python_ast_cache_key, content, path)
+            if not python_ast.is_parseable:
                 event = ledger_event(
                     outcome=LedgerOutcome.SKIPPED,
                     phase="behavioral",
@@ -466,6 +500,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     reason=LedgerReason.SYNTAX_ERROR,
                 )
             else:
+                raw = _analyze_python(python_ast, path)
                 path_findings = [analyzer_finding_to_finding(af) for af in raw]
                 all_findings.extend(path_findings)
                 event = ledger_event(

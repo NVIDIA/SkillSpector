@@ -32,6 +32,11 @@ def _project_version(path: Path) -> str:
     return str(project["version"])
 
 
+def _release_notes_path(version: str) -> Path:
+    """Return the versioned release notes used for the GitHub release body."""
+    return Path("docs") / "release" / f"skillspector-{version}.md"
+
+
 def _github_api_json(endpoint: str) -> dict[str, object] | None:
     """Return a GitHub API object, or ``None`` when *endpoint* is absent."""
     result = subprocess.run(
@@ -136,29 +141,110 @@ def _ensure_tag_at_target(repository: str, tag: str, target: str) -> None:
 
 
 def _release_exists(repository: str, tag: str) -> bool:
-    """Report whether GitHub has a release for *tag*."""
-    escaped_repository = quote(repository, safe="/")
-    escaped_tag = quote(tag, safe="")
-    return _github_api_json(f"repos/{escaped_repository}/releases/tags/{escaped_tag}") is not None
+    """Report whether GitHub has a published or draft release for *tag*."""
+    result = subprocess.run(
+        [
+            "gh",
+            "release",
+            "view",
+            tag,
+            "--repo",
+            repository,
+            "--json",
+            "isDraft",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        error_message = result.stderr.lower()
+        if "release not found" in error_message or "http 404" in error_message:
+            return False
+        result.check_returncode()
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"GitHub CLI returned invalid release JSON for {tag}") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("isDraft"), bool):
+        raise RuntimeError(f"GitHub CLI returned an unexpected release response for {tag}")
+    return True
+
+
+def _reconcile_existing_release(
+    repository: str,
+    tag: str,
+    release_notes: Path,
+    asset_paths: list[str],
+) -> None:
+    """Update and publish an existing release after reconciling its artifacts."""
+    if asset_paths:
+        subprocess.run(
+            [
+                "gh",
+                "release",
+                "upload",
+                tag,
+                "--repo",
+                repository,
+                "--clobber",
+                *asset_paths,
+            ],
+            check=True,
+        )
+    subprocess.run(
+        [
+            "gh",
+            "release",
+            "edit",
+            tag,
+            "--repo",
+            repository,
+            "--notes-file",
+            str(release_notes),
+            "--draft=false",
+        ],
+        check=True,
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True, help="GitHub repository (OWNER/REPO)")
     parser.add_argument("--target", required=True, help="Commit SHA for the release tag")
+    parser.add_argument(
+        "--asset",
+        action="append",
+        type=Path,
+        default=[],
+        help="Release artifact to attach (may be provided more than once)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Report without creating a release")
     args = parser.parse_args()
 
     version = _project_version(Path("pyproject.toml"))
     tag = f"v{version}"
+    release_notes = _release_notes_path(version)
+
+    if not release_notes.is_file():
+        parser.error(f"Release notes must be an existing file: {release_notes}")
 
     if args.dry_run:
         print(f"Would create GitHub release {tag} in {args.repository} at {args.target}")
         return
 
+    missing_assets = [asset for asset in args.asset if not asset.is_file()]
+    if missing_assets:
+        parser.error(
+            "Release assets must be existing files: "
+            + ", ".join(str(asset) for asset in missing_assets)
+        )
+    asset_paths = [str(asset) for asset in args.asset]
+
     _ensure_tag_at_target(args.repository, tag, args.target)
     if _release_exists(args.repository, tag):
-        print(f"GitHub release {tag} already exists at {args.target}; nothing to do.")
+        _reconcile_existing_release(args.repository, tag, release_notes, asset_paths)
         return
 
     subprocess.run(
@@ -172,7 +258,9 @@ def main() -> None:
             "--verify-tag",
             "--title",
             f"SkillSpector {tag}",
-            "--generate-notes",
+            "--notes-file",
+            str(release_notes),
+            *asset_paths,
         ],
         check=True,
     )
