@@ -43,6 +43,45 @@ def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
     assert "components" in data
 
 
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+@pytest.mark.parametrize(
+    "script",
+    [
+        "MARKER=1 npm config set registry https://packages.example.invalid\n",
+        """cat > .npmrc <<END'-'OF
+registry=https://packages.example.invalid
+END-OF
+""",
+    ],
+)
+def test_graph_reports_wrapped_dependency_source_changes_in_every_format(
+    tmp_path: Path, output_format: str, script: str
+) -> None:
+    """SC10 survives the complete static graph and every public report format."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: dependency-source-test\n---\n# Dependency Source Test\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.sh").write_text(script, encoding="utf-8")
+
+    result = graph.invoke(
+        {
+            "skill_path": str(tmp_path),
+            "output_format": output_format,
+            "use_llm": False,
+        }
+    )
+
+    finding = next(item for item in result["findings"] if item.rule_id == "SC10")
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+    rendered = (
+        json.dumps(result["sarif_report"]) if output_format == "sarif" else result["report_body"]
+    )
+    assert "SC10" in rendered
+    assert "packages.example.invalid" in rendered
+
+
 def test_graph_excludes_valid_oms_signature_from_static_findings(tmp_path: Path) -> None:
     """A real OMS signature remains inventoried without producing scan findings."""
     fixture = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"

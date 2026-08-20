@@ -291,6 +291,205 @@ npm config set registry "$SRC"
     assert finding.evidence["destination"] == "unresolved"
 
 
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "if use_private; then :; fi",
+        "MARKER=1 use_private",
+        "{ use_private; }",
+    ],
+)
+def test_function_invocation_shapes_keep_possible_redirect_high(invocation: str) -> None:
+    script = f"""SRC=https://registry.npmjs.org/
+use_private() {{ SRC=https://packages.example.invalid; }}
+{invocation}
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 4
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "unresolved"
+    assert finding.evidence["destination_status"] == "unresolved"
+
+
+@pytest.mark.parametrize(
+    ("script", "ecosystem", "surface"),
+    [
+        (
+            "MARKER=1 npm config set registry https://packages.example.invalid\n",
+            "npm",
+            "npm config set",
+        ),
+        (
+            "if :; then yarn config set registry https://packages.example.invalid; fi\n",
+            "yarn",
+            "yarn config set",
+        ),
+        (
+            "{ pip install --index-url https://packages.example.invalid demo; }\n",
+            "pip",
+            "pip --index-url",
+        ),
+        (
+            "while false; do pip config set global.index-url "
+            "https://packages.example.invalid; done\n",
+            "pip",
+            "pip config set",
+        ),
+        (
+            "MARKER=1 pip install --extra-index-url https://packages.example.invalid demo\n",
+            "pip",
+            "pip --extra-index-url",
+        ),
+        (
+            "{ pip config set global.extra-index-url https://packages.example.invalid; }\n",
+            "pip",
+            "pip config set",
+        ),
+        (
+            "MARKER=1 poetry source add private https://packages.example.invalid\n",
+            "poetry",
+            "poetry source add",
+        ),
+        (
+            "{ poetry config repositories.private https://packages.example.invalid; }\n",
+            "poetry",
+            "poetry config repositories",
+        ),
+        (
+            "if :; then mvn -Dmaven.repo.remote=https://packages.example.invalid verify; fi\n",
+            "maven",
+            "Maven CLI repository",
+        ),
+    ],
+)
+def test_package_manager_commands_remain_detectable_in_shell_wrappers(
+    script: str, ecosystem: str, surface: str
+) -> None:
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.rule_id == "SC10"
+    assert finding.severity == "HIGH"
+    assert finding.evidence["ecosystem"] == ecosystem
+    assert finding.evidence["surface"] == surface
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+def test_assignment_prefixed_command_is_preserved_in_all_reports(output_format: str) -> None:
+    finding = _analyze(
+        {"setup.sh": ("MARKER=1 npm config set registry https://packages.example.invalid\n")}
+    )[0]
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": True,
+        "manifest": {},
+        "output_format": output_format,
+    }
+
+    result = report(state)
+    rendered = json.dumps(result.get("sarif_report", result.get("report_body", "")))
+
+    assert "SC10" in rendered
+    assert "packages.example.invalid" in rendered
+
+
+def test_assignment_in_case_arm_keeps_possible_redirect_high() -> None:
+    script = """SRC=https://registry.npmjs.org/
+case "$MODE" in
+  private) SRC=https://packages.example.invalid ;;
+esac
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 5
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "unresolved"
+    assert finding.evidence["destination_status"] == "unresolved"
+
+
+@pytest.mark.parametrize(
+    "case_body",
+    [
+        "SRC=https://packages.example.invalid",
+        "use_private",
+    ],
+)
+def test_one_line_case_arm_keeps_possible_redirect_high(case_body: str) -> None:
+    function = (
+        "use_private() { SRC=https://packages.example.invalid; }\n"
+        if case_body == "use_private"
+        else ""
+    )
+    script = f"""MODE=private
+SRC=https://registry.npmjs.org/
+{function}case "$MODE" in private) {case_body} ;; esac
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "unresolved"
+    assert finding.evidence["destination_status"] == "unresolved"
+
+
+def test_definite_assignment_after_one_line_case_clears_ambiguity() -> None:
+    script = """MODE=private
+SRC=https://packages.example.invalid
+case "$MODE" in private) SRC=https://other.example.invalid ;; esac
+SRC=https://registry.npmjs.org/
+npm config set registry "$SRC"
+"""
+
+    assert _analyze({"setup.sh": script}) == []
+
+
+def test_assignment_shaped_command_cannot_override_real_assignment() -> None:
+    script = """SRC=https://packages.example.invalid
+SRC = https://registry.npmjs.org/ || true
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+    assert finding.evidence["destination_status"] == "resolved"
+
+
+def test_export_assignment_remains_effective_with_trailing_variable_name() -> None:
+    script = """SRC=https://registry.npmjs.org/
+export SRC=https://packages.example.invalid MARKER
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+    assert finding.evidence["destination_status"] == "resolved"
+
+
+def test_multiple_assignment_words_update_each_variable() -> None:
+    script = """SRC=https://registry.npmjs.org/
+MARKER=1 SRC=https://packages.example.invalid
+npm config set registry "$SRC"
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 3
+    assert finding.severity == "HIGH"
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+    assert finding.evidence["destination_status"] == "resolved"
+
+
 def test_conditional_assignment_keeps_possible_noncanonical_redirect_high() -> None:
     script = """#!/bin/sh
 SRC=https://packages.example.invalid
@@ -554,6 +753,82 @@ EOF
 
     assert finding.start_line == 2
     assert finding.evidence["surface"] == ".npmrc"
+
+
+@pytest.mark.parametrize("delimiter", ["'END-OF'", "END-OF"])
+def test_hyphenated_heredoc_delimiter_is_detected(delimiter: str) -> None:
+    script = f"""cat > "$HOME/.npmrc" <<{delimiter}
+registry=https://packages.example.invalid
+END-OF
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 2
+    assert finding.evidence["surface"] == ".npmrc"
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+
+
+@pytest.mark.parametrize("delimiter", ["END'-'OF", 'END"-"OF', r"END\-OF"])
+def test_word_quoted_heredoc_delimiter_generates_config(delimiter: str) -> None:
+    script = f"""cat > "$HOME/.npmrc" <<{delimiter}
+registry=https://packages.example.invalid
+END-OF
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 2
+    assert finding.severity == "HIGH"
+    assert finding.evidence["surface"] == ".npmrc"
+    assert finding.evidence["destination"] == "https://packages.example.invalid"
+
+
+@pytest.mark.parametrize("delimiter", ["END'-'OF", 'END"-"OF', r"END\-OF"])
+def test_word_quoted_unrelated_heredoc_data_is_not_actionable(delimiter: str) -> None:
+    script = f"""cat <<{delimiter} > instructions.txt
+npm config set registry https://packages.example.invalid
+END-OF
+"""
+
+    assert _analyze({"setup.sh": script}) == []
+
+
+def test_hyphenated_generic_heredoc_does_not_hide_later_command() -> None:
+    script = """cat <<END-OF > instructions.txt
+not executable
+END-OF
+npm config set registry https://packages.example.invalid
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 4
+    assert finding.evidence["surface"] == "npm config set"
+
+
+def test_unsupported_heredoc_word_does_not_partially_consume_later_command() -> None:
+    script = """cat <<END$OF > instructions.txt
+not executable
+npm config set registry https://packages.example.invalid
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 3
+    assert finding.evidence["surface"] == "npm config set"
+
+
+def test_unmatched_word_quote_does_not_partially_consume_later_command() -> None:
+    script = """cat <<END'-OF > instructions.txt
+not executable
+npm config set registry https://packages.example.invalid
+"""
+
+    finding = _analyze({"setup.sh": script})[0]
+
+    assert finding.start_line == 3
+    assert finding.evidence["surface"] == "npm config set"
 
 
 def test_command_text_in_unrelated_heredoc_is_not_actionable() -> None:

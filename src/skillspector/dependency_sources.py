@@ -26,8 +26,9 @@ _URL_RE = re.compile(
 _VARIABLE_RE = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
-_ASSIGNMENT_RE = re.compile(
-    r"^\s*(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.+?)\s*$"
+_ASSIGNMENT_WORD_RE = re.compile(
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)="
+    r"(?P<value>'[^']*'|\"(?:\\.|[^\"\\])*\"|[^\s]*)"
 )
 _FUNCTION_DECLARATION_RE = re.compile(
     r"^\s*(?:function\s+(?P<bash>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\(\s*\))?"
@@ -89,13 +90,14 @@ class _HeredocRegion:
 
 
 _HEREDOC_TARGET = r'(?P<target>"[^"]+"|\'[^\']+\'|[^\s;]+)'
-_HEREDOC_DELIMITER = r"(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
-_SHELL_HEREDOC_OPERATOR = re.compile(
-    r"<<(?P<strip_tabs>-?)(?!<)\s*(?:"
-    r"(?P<quote>['\"])(?P<quoted>[^'\"]+)(?P=quote)|"
-    r"\\?(?P<bare>[A-Za-z_][A-Za-z0-9_]*)"
-    r")"
+_HEREDOC_BARE_CHARACTERS = frozenset(
+    "-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:+/@%"
 )
+_HEREDOC_WORD = (
+    r"(?P<word>(?:\\[^\n]|'[^'\n]*'|\"(?:\\.|[^\"\\\n])*\"|[^\s;|&<>()'\"\\])+)(?=$|[\s;|&<>()])"
+)
+_HEREDOC_DELIMITER = _HEREDOC_WORD
+_SHELL_HEREDOC_OPERATOR = re.compile(rf"<<(?P<strip_tabs>-?)(?!<)\s*{_HEREDOC_DELIMITER}")
 _HEREDOC_HEADERS = (
     re.compile(
         rf"^\s*cat\b.*?(?<![<>])>(?!>)\s*{_HEREDOC_TARGET}\s*"
@@ -159,13 +161,95 @@ def _brace_delta(value: str) -> int:
     return delta
 
 
-def _assignment_match(segment: str) -> re.Match[str] | None:
-    """Return an assignment occupying one bounded shell command segment."""
-    candidate = segment.rsplit("{", 1)[-1].strip().removesuffix("}").strip()
+def _command_segment_body(segment: str, *, allow_case_arm: bool = False) -> str:
+    """Remove bounded shell-control wrappers around one simple command."""
+    candidate = segment.strip().removesuffix("}").strip()
+    candidate = candidate.lstrip("{").lstrip()
     keyword = re.match(r"^(?:then|do|else)\b\s*(?P<rest>.*)$", candidate)
     if keyword:
         candidate = keyword.group("rest")
-    return _ASSIGNMENT_RE.match(candidate)
+    if allow_case_arm:
+        case_arm = re.match(r"^[^)]*\)\s*(?P<rest>.+)$", candidate)
+        if case_arm:
+            candidate = case_arm.group("rest")
+    return candidate.strip()
+
+
+def _leading_assignments(segment: str) -> tuple[list[tuple[str, str]], str]:
+    """Return leading assignment words and the remaining simple command."""
+    candidate = segment.strip()
+    position = 0
+    export = re.match(r"export\b\s*", candidate)
+    if export and _ASSIGNMENT_WORD_RE.match(candidate, export.end()):
+        position = export.end()
+
+    assignments: list[tuple[str, str]] = []
+    while match := _ASSIGNMENT_WORD_RE.match(candidate, position):
+        assignments.append((match.group("name"), match.group("value")))
+        position = match.end()
+        if position >= len(candidate):
+            break
+        if not candidate[position].isspace():
+            return [], candidate
+        position += len(candidate[position:]) - len(candidate[position:].lstrip())
+    remainder = candidate[position:].strip()
+    if (
+        export
+        and assignments
+        and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in remainder.split())
+    ):
+        remainder = ""
+    return assignments, remainder
+
+
+def _normalize_heredoc_word(word: str) -> tuple[str, bool] | None:
+    """Apply bounded shell quote removal to one static heredoc word."""
+    delimiter: list[str] = []
+    quoted = False
+    index = 0
+    while index < len(word):
+        character = word[index]
+        if character == "'":
+            end = word.find("'", index + 1)
+            if end < 0:
+                return None
+            delimiter.append(word[index + 1 : end])
+            quoted = True
+            index = end + 1
+            continue
+        if character == '"':
+            quoted = True
+            index += 1
+            while index < len(word) and word[index] != '"':
+                if word[index] == "\\":
+                    if index + 1 >= len(word):
+                        return None
+                    escaped = word[index + 1]
+                    if escaped in {"$", "`", '"', "\\"}:
+                        delimiter.append(escaped)
+                    else:
+                        delimiter.extend(("\\", escaped))
+                    index += 2
+                else:
+                    delimiter.append(word[index])
+                    index += 1
+            if index >= len(word):
+                return None
+            index += 1
+            continue
+        if character == "\\":
+            if index + 1 >= len(word):
+                return None
+            delimiter.append(word[index + 1])
+            quoted = True
+            index += 2
+            continue
+        if character not in _HEREDOC_BARE_CHARACTERS:
+            return None
+        delimiter.append(character)
+        index += 1
+    normalized = "".join(delimiter)
+    return (normalized, quoted) if normalized else None
 
 
 def _function_context(content: str, data_lines: set[int]) -> tuple[set[int], dict[str, set[str]]]:
@@ -206,9 +290,11 @@ def _function_context(content: str, data_lines: set[int]) -> tuple[set[int], dic
             fragment = rest if cursor == index else lines[cursor]
             depth += _brace_delta(fragment)
             for _, segment in _shell_parts(fragment):
-                assignment = _assignment_match(segment)
-                if assignment:
-                    assigned_names.add(assignment.group("name"))
+                assignment_words, remainder = _leading_assignments(
+                    _command_segment_body(segment, allow_case_arm=True)
+                )
+                if not remainder:
+                    assigned_names.update(name for name, _ in assignment_words)
             cursor += 1
             if depth <= 0:
                 break
@@ -233,34 +319,46 @@ def _literal_assignments(content: str) -> Assignments:
         if line_number in heredoc_data_lines or line_number in function_lines:
             continue
         for separator, segment in _shell_parts(line):
-            stripped = segment.strip()
+            stripped = _command_segment_body(segment, allow_case_arm=bool(control_depth))
             if re.match(r"^(?:fi|done|esac)\b", stripped):
                 control_depth = max(0, control_depth - 1)
                 continue
-            if re.match(r"^(?:if|case|for|while|until|select)\b", stripped):
-                control_depth += 1
+            control = re.match(
+                r"^(?P<keyword>if|elif|case|for|while|until|select)\b\s*(?P<rest>.*)$",
+                stripped,
+            )
+            if control:
+                keyword = control.group("keyword")
+                if keyword != "elif":
+                    control_depth += 1
+                if keyword == "case":
+                    case_arm = re.match(r"^[^)]*\)\s*(?P<rest>.+)$", control.group("rest"))
+                    if not case_arm:
+                        continue
+                    stripped = case_arm.group("rest")
+                elif keyword in {"if", "elif", "while", "until"}:
+                    stripped = control.group("rest")
+                else:
+                    continue
+
+            assignment_words, call_candidate = _leading_assignments(stripped)
+            if assignment_words and not call_candidate:
+                for name, raw_value in assignment_words:
+                    value = _strip_shell_comment(raw_value).strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                        value = value[1:-1]
+                    resolved_value: str | None = value
+                    if (
+                        control_depth
+                        or separator in {"&&", "||", "|", "|&"}
+                        or not value
+                        or "$" in value
+                        or "`" in value
+                    ):
+                        resolved_value = None
+                    assignments.setdefault(name, []).append((line_number, resolved_value))
                 continue
 
-            match = _assignment_match(stripped)
-            if match:
-                value = _strip_shell_comment(match.group("value")).strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-                    value = value[1:-1]
-                resolved_value: str | None = value
-                if (
-                    control_depth
-                    or separator in {"&&", "||", "|", "|&"}
-                    or not value
-                    or "$" in value
-                    or "`" in value
-                ):
-                    resolved_value = None
-                assignments.setdefault(match.group("name"), []).append(
-                    (line_number, resolved_value)
-                )
-                continue
-
-            call_candidate = re.sub(r"^(?:then|do|else)\b\s*", "", stripped)
             call = re.match(r"^(?:command\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b", call_candidate)
             if call and call.group("name") in assigned_by_function:
                 for name in assigned_by_function[call.group("name")]:
@@ -652,7 +750,11 @@ def _heredocs(content: str) -> list[_HeredocRegion]:
         if not match:
             index += 1
             continue
-        delimiter = match.group("delimiter")
+        normalized_word = _normalize_heredoc_word(match.group("word"))
+        if normalized_word is None:
+            index += 1
+            continue
+        delimiter, quoted = normalized_word
         strip_tabs = match.group("strip_tabs") == "-"
         end = index + 1
         while end < len(lines):
@@ -670,7 +772,7 @@ def _heredocs(content: str) -> list[_HeredocRegion]:
                 body="\n".join(body_lines),
                 start_line=index + 2,
                 end_line=end + 1 if complete else len(lines),
-                expand_variables=not bool(match.group("quote")),
+                expand_variables=not quoted,
                 complete=complete,
             )
         )
@@ -711,8 +813,10 @@ def _shell_heredoc_specs(line: str) -> list[tuple[str, bool]]:
         ):
             match = _SHELL_HEREDOC_OPERATOR.match(line, index)
             if match:
-                delimiter = match.group("quoted") or match.group("bare") or ""
-                specs.append((delimiter, match.group("strip_tabs") == "-"))
+                normalized_word = _normalize_heredoc_word(match.group("word"))
+                if normalized_word is not None:
+                    delimiter, _ = normalized_word
+                    specs.append((delimiter, match.group("strip_tabs") == "-"))
                 index = match.end()
                 continue
         index += 1
@@ -973,8 +1077,14 @@ def _parse_commands(content: str, file: str, assignments: Assignments) -> list[S
         if line_number in heredoc_data_lines:
             continue
         for segment in _shell_segments(line):
+            command_candidate = _command_segment_body(segment, allow_case_arm=True)
+            command_candidate = re.sub(r"^(?:[$>]\s+)", "", command_candidate)
+            _, command_candidate = _leading_assignments(command_candidate)
+            wrapper = re.match(r"^(?:command|sudo)\b\s*(?P<rest>.*)$", command_candidate)
+            if wrapper:
+                _, command_candidate = _leading_assignments(wrapper.group("rest"))
             for ecosystem, operation, surface, scope_mode, pattern in patterns:
-                match = pattern.search(segment)
+                match = pattern.search(command_candidate)
                 if not match:
                     continue
                 scope = match.groupdict().get("scope") if scope_mode != "none" else None
@@ -995,7 +1105,7 @@ def _parse_commands(content: str, file: str, assignments: Assignments) -> list[S
 
             env_match = re.match(
                 r"\s*(?:export\s+)?(?P<name>NPM_CONFIG_REGISTRY|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|CARGO_REGISTRIES_[A-Za-z0-9_]+_INDEX)\s*=\s*(?P<dest>.+)$",
-                segment,
+                _command_segment_body(segment, allow_case_arm=True),
                 re.I,
             )
             if env_match:
