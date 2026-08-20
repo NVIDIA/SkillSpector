@@ -103,13 +103,15 @@ def test_cli_writes_report_then_exits_two_for_execution_failure(
     """An incomplete execution preserves the report but takes precedence over risk."""
     (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
     output = tmp_path / "report.json"
+    fake_result = {
+        "report_body": '{"execution_successful": false}',
+        "execution_successful": False,
+        "risk_score": 0,
+    }
+    monkeypatch.setattr("skillspector.cli.graph.invoke", lambda state, config: fake_result)
     monkeypatch.setattr(
-        "skillspector.cli.graph.invoke",
-        lambda state, config: {
-            "report_body": '{"execution_successful": false}',
-            "execution_successful": False,
-            "risk_score": 0,
-        },
+        "skillspector.cli.graph.stream",
+        lambda state, config, stream_mode: iter([{"meta_analyzer": fake_result}]),
     )
 
     result = runner.invoke(app, ["scan", str(tmp_path), "-f", "json", "-o", str(output)])
@@ -208,7 +210,7 @@ def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code == 0, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert [issue for issue in issues if issue["id"] in {"P6", "PE3"}] == []
 
 
@@ -230,7 +232,7 @@ def test_cli_scan_required_table_keeps_malicious_pe3(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code in {0, 1}, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert any(issue["id"] == "PE3" for issue in issues)
 
 
@@ -348,7 +350,7 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
         ],
     )
     assert scan.exit_code == 0
-    data = json.loads(scan.output)
+    data = json.loads(scan.stdout)
     assert data["issues"] == []
     assert data["risk_assessment"]["score"] == 0
 
@@ -424,7 +426,7 @@ def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["issues"] == []
     assert [finding["id"] for finding in data["suppressed"]] == ["PE5"]
     assert data["suppressed"][0]["location"]["file"] == "SKILL.md"
@@ -474,7 +476,7 @@ def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     )
 
     assert result.exit_code in {0, 1}, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     pe5_files = {
         finding["location"]["file"] for finding in data["issues"] if finding["id"] == "PE5"
     }
@@ -531,7 +533,7 @@ def test_recursive_single_skill_scan_still_accepts_baseline(tmp_path: Path) -> N
     )
 
     assert result.exit_code == 0, result.output
-    assert [issue for issue in json.loads(result.output)["issues"] if issue["id"] == "P1"] == []
+    assert [issue for issue in json.loads(result.stdout)["issues"] if issue["id"] == "P1"] == []
 
 
 def test_scan_multi_skill_markdown_output_to_file(
@@ -1083,31 +1085,39 @@ def test_cli_scan_json_preserves_single_skill_contract(
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: single-skill\n---\n# Single", encoding="utf-8")
 
+    fake_result = {
+        "report_body": json.dumps(
+            {
+                "skill": {
+                    "name": "single-skill",
+                    "source": str(skill_dir),
+                    "scanned_at": "2026-06-29T13:00:00+00:00",
+                },
+                "risk_assessment": {
+                    "score": 30,
+                    "severity": "LOW",
+                    "recommendation": "SAFE",
+                },
+                "components": [{"path": "root.py", "type": "python"}],
+                "issues": [{"id": "X-1", "severity": "low"}],
+                "suppressed_count": 0,
+                "suppressed": [],
+                "metadata": {"scan_scope": {"components_scanned": 1}},
+            }
+        )
+    }
+
     def fake_invoke(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
         assert state["input_path"] == str(skill_dir)
-        return {
-            "report_body": json.dumps(
-                {
-                    "skill": {
-                        "name": "single-skill",
-                        "source": str(skill_dir),
-                        "scanned_at": "2026-06-29T13:00:00+00:00",
-                    },
-                    "risk_assessment": {
-                        "score": 30,
-                        "severity": "LOW",
-                        "recommendation": "SAFE",
-                    },
-                    "components": [{"path": "root.py", "type": "python"}],
-                    "issues": [{"id": "X-1", "severity": "low"}],
-                    "suppressed_count": 0,
-                    "suppressed": [],
-                    "metadata": {"scan_scope": {"components_scanned": 1}},
-                }
-            )
-        }
+        return fake_result
 
-    monkeypatch.setattr("skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke))
+    def fake_stream(state: dict[str, Any], config: Any = None, stream_mode: str | None = None):
+        assert state["input_path"] == str(skill_dir)
+        yield {"meta_analyzer": fake_result}
+
+    monkeypatch.setattr(
+        "skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke, stream=fake_stream)
+    )
 
     out_file = tmp_path / "single.json"
     result = runner.invoke(

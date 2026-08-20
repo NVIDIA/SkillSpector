@@ -460,6 +460,8 @@ def scan(
                             result["sarif_report"] = node_output["sarif_report"]
                         if "risk_score" in node_output:
                             result["risk_score"] = node_output["risk_score"]
+                        if "execution_successful" in node_output:
+                            result["execution_successful"] = node_output["execution_successful"]
 
                         # Update UI text based on graph progression
                         if node_name == "resolve_input":

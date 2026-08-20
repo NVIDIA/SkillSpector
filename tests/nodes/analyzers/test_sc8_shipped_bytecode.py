@@ -57,7 +57,7 @@ def test_sc8_single_pyc_blocks_install_and_cli_exit(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1, result.output
-    report = json.loads(result.output)
+    report = json.loads(result.stdout)
     assert report["risk_assessment"] == {
         "score": 51,
         "severity": "HIGH",
