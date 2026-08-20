@@ -402,7 +402,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "YR3": "Remove all cryptocurrency mining code, pool references, and miner binaries. Mining in agent skills is unauthorized resource abuse. Report the skill as malicious.",
     "YR4": "Remove offensive tool references and exploit code. Legitimate agent skills should not contain penetration testing tools, exploit frameworks, or reconnaissance utilities.",
     # MCP Least Privilege (B.3.1)
-    "LP1": "Add the missing permission to SKILL.md, or remove the code that requires it.",
+    "LP1": "Declare the missing capability in the manifest type being scanned: for Agent Skills SKILL.md, add a covering tool to the 'allowed-tools' frontmatter field; for MCP server manifests, add the capability to the 'permissions' list. Otherwise, remove the code that requires it.",
     "LP2": "Replace wildcard permissions ('*', 'all', 'full', 'any') with an explicit list of required permissions.",
     "LP3": "Declare the skill's tool scope: for Claude Code / Agent Skills SKILL.md, list the tools the skill may invoke in the 'allowed-tools' frontmatter field; for MCP server manifests, add a 'permissions' list naming the required capabilities.",
     "LP4": "Remove the declared permission if the corresponding capability is no longer used.",

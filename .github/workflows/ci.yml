@@ -129,6 +129,15 @@ jobs:
           # commit pass. A for-loop over the SHA list checks every commit.
           status=0
           for sha in $(git log --format=%H "${BASE}..${HEAD}"); do
+            parents=$(git show -s --format=%P "$sha")
+            committer_email=$(git show -s --format=%ce "$sha")
+            # GitHub's update-branch API creates a merge commit without a DCO
+            # trailer. Its parents were already checked, so exempt only those
+            # GitHub-generated merge commits; contributor commits still require
+            # sign-off.
+            if [[ "$parents" == *" "* && "$committer_email" == "noreply@github.com" ]]; then
+              continue
+            fi
             if ! git log -1 --format="%B" "$sha" | grep -q "^Signed-off-by:"; then
               echo "  missing Signed-off-by: $sha $(git log -1 --format=%s "$sha")"
               status=1
