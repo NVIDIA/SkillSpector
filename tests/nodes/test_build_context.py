@@ -30,9 +30,16 @@ import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from skillspector.constants import MODEL_CONFIG
-from skillspector.nodes.build_context import build_context
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.nodes import build_context as build_context_module
+from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+from skillspector.nodes.build_context import MAX_CACHE_READ_BYTES, build_context
 from skillspector.providers import reset_provider, use_provider
-from skillspector.python_ast import ParsedPythonFile, get_python_ast
+from skillspector.python_ast import (
+    MAX_PYTHON_AST_CACHE_SOURCE_CHARS,
+    ParsedPythonFile,
+    get_python_ast,
+)
 from skillspector.state import SkillspectorState
 
 _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
@@ -667,3 +674,104 @@ def test_build_context_rejects_symlinked_manifest(tmp_path: Path) -> None:
     assert result["manifest"] == {}
     assert "SKILL.md" not in result["components"]
     assert "SKILL.md" not in result["file_cache"]
+
+
+def _skill_with_large_file(tmp_path: Path, size_bytes: int) -> Path:
+    """Lay out a minimal skill whose scripts/ holds a sparse file of *size_bytes*."""
+    skill = tmp_path / "skill"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: big\n---\nbody\n", encoding="utf-8")
+    huge = skill / "scripts" / "huge.py"
+    with huge.open("wb") as handle:
+        handle.truncate(size_bytes)  # sparse: costs no disk blocks
+    return skill
+
+
+def test_build_context_skips_a_file_over_the_cache_read_bound(tmp_path: Path) -> None:
+    """An oversized file is recorded as skipped instead of being read into memory.
+
+    `_read_file_cache` previously called `_read_text_no_follow`, which does an
+    unbounded `source.read()`, on every discovered component. `INGEST_MAX_BYTES`
+    does not help here: it bounds remote and archive ingest only, so a local
+    directory scan materialized the whole file before any analyzer skipped it.
+    """
+    skill = _skill_with_large_file(tmp_path, MAX_CACHE_READ_BYTES + 1)
+
+    result = build_context({"skill_path": str(skill)})
+
+    assert "scripts/huge.py" not in result["file_cache"]
+    assert "SKILL.md" in result["file_cache"]
+
+    events = [
+        event
+        for event in result["inspection_ledger"]
+        if event.get("path") == "scripts/huge.py" and event.get("phase") == "cache"
+    ]
+    assert len(events) == 1, events
+    event = events[0]
+    assert event["outcome"] == LedgerOutcome.SKIPPED.value
+    assert event["reason_code"] == LedgerReason.SIZE_LIMIT.value
+    assert event["observed_bytes"] == MAX_CACHE_READ_BYTES + 1
+    assert event["limit_bytes"] == MAX_CACHE_READ_BYTES
+
+
+def test_build_context_never_reads_an_oversized_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate must prevent the read, not merely discard its result.
+
+    Asserting only that the path is absent from `file_cache` would still pass if
+    the file were read in full and then dropped, which leaves the peak-memory
+    problem exactly where it was. This pins the read itself.
+    """
+    skill = _skill_with_large_file(tmp_path, MAX_CACHE_READ_BYTES + 1)
+    read_paths: list[str] = []
+    real_read = build_context_module._read_text_no_follow
+
+    def spy(path: Path) -> str:
+        read_paths.append(path.name)
+        return real_read(path)
+
+    monkeypatch.setattr(build_context_module, "_read_text_no_follow", spy)
+
+    build_context({"skill_path": str(skill)})
+
+    assert "huge.py" not in read_paths
+    assert "SKILL.md" in read_paths
+
+
+def test_build_context_still_reads_a_file_at_the_cache_read_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound is inclusive, so a file exactly at the limit is still analyzed.
+
+    Guards the off-by-one in the other direction: an exclusive `>=` here would
+    silently drop content every analyzer would have accepted.
+    """
+    monkeypatch.setattr(build_context_module, "MAX_CACHE_READ_BYTES", 64)
+    skill = tmp_path / "skill"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: edge\n---\nbody\n", encoding="utf-8")
+    (skill / "scripts" / "edge.py").write_bytes(b"x" * 64)
+
+    result = build_context({"skill_path": str(skill)})
+
+    assert result["file_cache"]["scripts/edge.py"] == "x" * 64
+    assert not [
+        event
+        for event in result["inspection_ledger"]
+        if event.get("path") == "scripts/edge.py"
+        and event.get("reason_code") == LedgerReason.SIZE_LIMIT.value
+    ]
+
+
+def test_cache_read_bound_cannot_exclude_content_any_consumer_accepts() -> None:
+    """The bound is derived from the largest character budget downstream.
+
+    UTF-8 uses at most 4 bytes per character, and `errors="replace"` yields one
+    character per undecodable byte, so nothing above this byte count can decode
+    to a character count any consumer would accept. If a consumer ever raises
+    its character budget, this assertion fails and the bound must move with it.
+    """
+    assert MAX_CACHE_READ_BYTES == MAX_PYTHON_AST_CACHE_SOURCE_CHARS * 4
+    assert MAX_CACHE_READ_BYTES >= MAX_FILE_CHARS * 4

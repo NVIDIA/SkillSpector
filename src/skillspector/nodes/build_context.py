@@ -46,7 +46,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.logging_config import get_logger
-from skillspector.python_ast import prewarm_python_ast_cache
+from skillspector.python_ast import MAX_PYTHON_AST_CACHE_SOURCE_CHARS, prewarm_python_ast_cache
 from skillspector.state import SkillspectorState
 
 logger = get_logger(__name__)
@@ -78,6 +78,20 @@ _FILE_TYPES: dict[str, str] = {
 _EXECUTABLE_EXTENSIONS = frozenset(
     {".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".rb", ".go", ".rs", ".pl"}
 )
+
+# Upper bound on a single file read into ``file_cache``.
+#
+# Every downstream consumer bounds itself in *characters*: the analyzers skip at
+# ``static_runner.MAX_FILE_CHARS`` and the prewarmed AST cache rejects a single
+# source above ``MAX_PYTHON_AST_CACHE_SOURCE_CHARS``, the larger of the two.
+# UTF-8 needs at most 4 bytes per character, and ``errors="replace"`` yields one
+# character per undecodable byte, so a file larger than 4x that character budget
+# cannot decode to something any consumer would accept. Reading it would only
+# materialize bytes that are guaranteed to be skipped, which is why the gate is
+# outcome-preserving rather than a new policy: it bounds peak memory for a local
+# directory scan, which ``input_handler.INGEST_MAX_BYTES`` does not cover because
+# that budget applies only to remote and archive ingest.
+MAX_CACHE_READ_BYTES = MAX_PYTHON_AST_CACHE_SOURCE_CHARS * 4
 
 _OMS_SIGNATURE_PATH = "skill.oms.sig"
 _SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
@@ -413,6 +427,19 @@ def _read_file_cache(
                     phase="cache",
                     path=path,
                     reason=LedgerReason.NOT_REGULAR_FILE,
+                )
+            )
+            continue
+        if file_stat.st_size > MAX_CACHE_READ_BYTES:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.SKIPPED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason.SIZE_LIMIT,
+                    observed_bytes=file_stat.st_size,
+                    limit_bytes=MAX_CACHE_READ_BYTES,
                 )
             )
             continue
