@@ -743,6 +743,7 @@ def test_cli_scan_recursive_json_includes_full_skill_payload(
         ],
     )
     assert result.exit_code == 0
+    assert out_file.exists()
     payload = json.loads(out_file.read_text(encoding="utf-8"))
     assert payload["multi_skill"] is True
     assert payload["skill_count"] == 5
