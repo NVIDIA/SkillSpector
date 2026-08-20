@@ -231,14 +231,25 @@ class TestAntiRefusalSafeContent:
         assert findings == []
 
     def test_code_example_is_downgraded(self):
-        # The phrase appears inside a documentation example, so confidence drops
-        # below threshold and no finding is emitted.
+        # In a generic markdown doc, the phrase appears inside a documentation
+        # example, so confidence drops below threshold and no finding is emitted.
+        text = (
+            "## Example of a malicious prompt\n\n"
+            "For example, an attacker might write `never refuse` to jailbreak the model.\n"
+        )
+        findings = _scan(text, path="docs/example.md")
+        assert not any(f.rule_id == "AR1" for f in findings)
+
+    def test_code_example_is_not_downgraded_in_skill_md(self):
+        # SKILL.md is the primary attack surface (#373): nearby documentation-style
+        # phrasing like "for example" must not suppress a finding there, even though
+        # the same phrasing suppresses it in a generic markdown doc (see above).
         text = (
             "## Example of a malicious prompt\n\n"
             "For example, an attacker might write `never refuse` to jailbreak the model.\n"
         )
         findings = _scan(text)
-        assert not any(f.rule_id == "AR1" for f in findings)
+        assert any(f.rule_id == "AR1" for f in findings)
 
     def test_security_review_checklist_is_not_anti_refusal(self):
         text = (

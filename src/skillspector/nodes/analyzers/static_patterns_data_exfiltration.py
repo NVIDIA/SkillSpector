@@ -57,9 +57,14 @@ E1_PATTERNS = [
     ),
 ]
 E2_PYTHON_FALLBACK_PATTERNS = [
+    # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
+    # Python: os.environ.copy() — full environ read
     (r"os\s*\.\s*environ\s*\.\s*copy\s*\(\s*\)", 0.6),
+    # Python: dict(os.environ) — full environ read via dict()
     (r"dict\s*\(\s*os\s*\.\s*environ\s*\)", 0.6),
+    # Python: {**os.environ} — full environ read via dict-spread.
+    # Require braces so bare ``2 ** os.environ`` (exponentiation) is not flagged.
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
 ]
 E2_OTHER_PATTERNS = [

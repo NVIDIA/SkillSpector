@@ -58,7 +58,11 @@ class SkillspectorState(TypedDict, total=False):
 
     # build_context node populates these
     components: list[str]
+    # Visible authored text that may be submitted to external LLM providers.
+    llm_components: list[str]
     file_cache: dict[str, str]
+    # Full local-only deterministic view, including hidden and nested content.
+    local_file_cache: dict[str, str]
     # Retained for compatibility with the persisted workflow-state schema.
     ast_cache: dict[str, str]
     # Key for the process-local parsed-AST cache.  The ASTs themselves stay
@@ -112,6 +116,10 @@ class SkillspectorState(TypedDict, total=False):
     # Component metadata for reporting and risk scoring (from build_context)
     component_metadata: list[dict[str, object]]
     has_executable_scripts: bool
+    # Structured workflow context for phase-1 AISOP/AISP summaries
+    structured_skill_context: dict[str, object]
+    # Report-only structured skill summaries emitted outside the finding pipeline
+    structured_summaries: Annotated[list[dict[str, object]], operator.add]
 
     # Output: report node writes formatted string here
     output_format: str
@@ -158,6 +166,7 @@ class AnalyzerNodeResponse(TypedDict):
     findings: list[Finding]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
+    structured_summaries: NotRequired[list[dict[str, object]]]
     # LLM-backed analyzers also report one telemetry record; static analyzers
     # omit it (NotRequired keeps the key optional for them).
     llm_call_log: NotRequired[list[LLMCallRecord]]

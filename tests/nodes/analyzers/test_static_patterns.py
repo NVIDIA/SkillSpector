@@ -340,6 +340,44 @@ class TestRunStaticPatternsDataExfiltration:
         e2 = next(f for f in findings if f.rule_id == "E2")
         assert e2.severity == "HIGH"
 
+    def test_e2_whitespace_tolerant_environ_access(self):
+        """Whitespace-obfuscated full-environ reads are still detected."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": "import os\nx = os . environ . copy ()\ny = dict ( os.environ )\nz = { ** os.environ }",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [f for f in findings if f.rule_id == "E2"]
+        assert len(e2) >= 3
+
+    def test_e2_exponentiation_not_flagged(self):
+        """Bare ``2 ** os.environ`` (exponentiation) must not be flagged as E2."""
+        # Malformed Python (triggers regex fallback) with exponentiation
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": "import os\nresult = 2 ** os.environ\n   def broken(",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [f for f in findings if f.rule_id == "E2"]
+        # Should NOT flag the exponentiation as env harvesting
+        assert not any("**" in f.matched_text for f in e2)
+
+    def test_e2_dict_spread_environ_flagged(self):
+        """``{**os.environ}`` (dict spread) is flagged as full environ read."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": "import os\nenv_copy = {**os.environ}",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [f for f in findings if f.rule_id == "E2"]
+        assert len(e2) >= 1
+
     def test_e5_boto3_put_object_produces_finding(self):
         """boto3 put_object yields E5, MEDIUM severity."""
         state = {

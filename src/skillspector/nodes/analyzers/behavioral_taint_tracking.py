@@ -461,7 +461,7 @@ def _analyze_python(python_ast: ParsedPythonFile, file_path: str) -> list[Analyz
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Parse Python files and detect source\u2192sink data flows."""
     components: list[str] = state.get("components") or []
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     python_ast_cache_key = state.get("python_ast_cache_key")
     all_findings: list[Finding] = []
     ledger_events: list[InspectionLedgerEvent] = []

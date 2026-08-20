@@ -60,6 +60,20 @@ class LedgerReason(StrEnum):
     NO_APPLICABLE_FILES = "no_applicable_files"
     OMS_SIGNATURE = "oms_signature"
     BASELINE_FILE = "baseline_file"
+    ARCHIVE_FORMAT_MISMATCH = "archive_format_mismatch"
+    ARCHIVE_MALFORMED = "archive_malformed"
+    ARCHIVE_ENCRYPTED = "archive_encrypted"
+    ARCHIVE_UNSUPPORTED_COMPRESSION = "archive_unsupported_compression"
+    ARCHIVE_TRUNCATED = "archive_truncated"
+    ARCHIVE_UNSAFE_MEMBER_PATH = "archive_unsafe_member_path"
+    ARCHIVE_AMBIGUOUS_MEMBER_PATH = "archive_ambiguous_member_path"
+    ARCHIVE_LINK_MEMBER = "archive_link_member"
+    ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
+    ARCHIVE_MEMBER_LIMIT = "archive_member_limit"
+    ARCHIVE_SIZE_LIMIT = "archive_size_limit"
+    ARCHIVE_MEMBER_SIZE_LIMIT = "archive_member_size_limit"
+    ARCHIVE_COMPRESSION_RATIO = "archive_compression_ratio"
+    ARCHIVE_TIME_LIMIT = "archive_time_limit"
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
@@ -99,6 +113,30 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.BASELINE_FILE: (
         "The explicitly selected suppression baseline is excluded from content analysis."
     ),
+    LedgerReason.ARCHIVE_FORMAT_MISMATCH: (
+        "Artifact bytes do not match the container format implied by its filename."
+    ),
+    LedgerReason.ARCHIVE_MALFORMED: "ZIP-compatible content is malformed.",
+    LedgerReason.ARCHIVE_ENCRYPTED: "Archive member is encrypted and could not be inspected.",
+    LedgerReason.ARCHIVE_UNSUPPORTED_COMPRESSION: (
+        "Archive member uses an unsupported compression method."
+    ),
+    LedgerReason.ARCHIVE_TRUNCATED: "Archive member is truncated or unreadable.",
+    LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH: (
+        "Archive member uses an absolute, traversal, or otherwise unsafe path."
+    ),
+    LedgerReason.ARCHIVE_AMBIGUOUS_MEMBER_PATH: (
+        "Archive member name has an ambiguous or duplicate provenance identity."
+    ),
+    LedgerReason.ARCHIVE_LINK_MEMBER: "Archive link member was not followed or read.",
+    LedgerReason.ARCHIVE_DEPTH_LIMIT: "Nested archive depth limit was reached.",
+    LedgerReason.ARCHIVE_MEMBER_LIMIT: "Cumulative archive member limit was reached.",
+    LedgerReason.ARCHIVE_SIZE_LIMIT: "Cumulative archive content size limit was reached.",
+    LedgerReason.ARCHIVE_MEMBER_SIZE_LIMIT: "Archive member exceeds the per-file analysis limit.",
+    LedgerReason.ARCHIVE_COMPRESSION_RATIO: (
+        "Archive member exceeds the permitted compression ratio."
+    ),
+    LedgerReason.ARCHIVE_TIME_LIMIT: "Cumulative archive inspection time limit was reached.",
 }
 
 
