@@ -241,7 +241,7 @@ def test_cli_scan_nonexistent_exits_2() -> None:
     """scan with nonexistent path exits with code 2."""
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])
     assert result.exit_code == 2
-    assert "Error" in result.output or "error" in result.output.lower()
+    assert "error" in result.output.lower()
 
 
 def test_cli_mcp_registry_routes_and_writes_json(tmp_path: Path) -> None:
