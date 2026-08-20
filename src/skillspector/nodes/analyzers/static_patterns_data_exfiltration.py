@@ -32,7 +32,6 @@ from .common import (
     get_context,
     get_context_from_lines,
     get_line_number,
-    is_code_example,
     resolve_call_name,
     resolve_dotted_name,
 )
@@ -358,13 +357,9 @@ def analyze(
                     matched_text=match.group(0)[:200],
                 )
             )
-    # E5: cloud-storage exfiltration. Filtered through is_code_example() because
-    # upload calls commonly appear in SKILL.md docs and examples.
+    # E5: cloud-storage exfiltration. Example filtering is delegated to the runner.
     for pattern, confidence in E5_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            context = ctx(match.start())
-            if is_code_example(context):
-                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -374,7 +369,7 @@ def analyze(
                     location=loc(line_num),
                     confidence=confidence,
                     tags=tag,
-                    context=context,
+                    context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                 )
             )
