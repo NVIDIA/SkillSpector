@@ -153,6 +153,31 @@ _SEVERITY_POINTS: dict[str, int] = {
     "LOW": 5,
 }
 
+# Ranking used only to report the worst finding alongside the normalized verdict.
+# Deliberately separate from _SEVERITY_POINTS: those are scoring weights and may be
+# retuned, while this is an ordering and must stay stable for consumers.
+_SEVERITY_RANK: dict[str, int] = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
+def _max_issue_severity(findings: Sequence[Finding]) -> str:
+    """Highest severity present in the reported issues, or NONE when there are none.
+
+    risk_assessment.severity is a normalized, confidence-weighted verdict: it can read
+    LOW while issues[] contains a HIGH finding. That smoothing is intentional, but until
+    now it was invisible, so every consumer that wanted to gate on the worst finding had
+    to walk issues[] and re-implement this ranking. Reporting it here makes the two
+    numbers comparable without changing either.
+    """
+    worst = 0
+    label = "NONE"
+    for finding in findings:
+        rank = _SEVERITY_RANK.get(str(finding.severity).upper(), 0)
+        if rank > worst:
+            worst = rank
+            label = str(finding.severity).upper()
+    return label
+
+
 _MAX_OCCURRENCES_PER_RULE = 3
 _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 
@@ -689,6 +714,7 @@ def _format_json(
             "score": risk_score,
             "severity": risk_severity,
             "recommendation": risk_recommendation,
+            "max_issue_severity": _max_issue_severity(findings),
         },
         "components": [
             {
