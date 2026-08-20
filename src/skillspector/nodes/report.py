@@ -104,6 +104,10 @@ def _clean_text(value: str | None) -> str | None:
 
 def _sanitize_finding(finding: Finding) -> Finding:
     """Return a copy of *finding* with control/ANSI bytes stripped from text fields."""
+    evidence = {
+        _clean_text(str(key)) or "": _clean_text(value) if isinstance(value, str) else value
+        for key, value in finding.evidence.items()
+    }
     return replace(
         finding,
         message=_clean_text(finding.message) or "",
@@ -113,6 +117,7 @@ def _sanitize_finding(finding: Finding) -> Finding:
         context=_clean_text(finding.context),
         matched_text=_clean_text(finding.matched_text),
         code_snippet=_clean_text(finding.code_snippet),
+        evidence=evidence,
     )
 
 
@@ -131,6 +136,7 @@ def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
         "code_snippet": finding_dict["code_snippet"],
         "intent": finding_dict["intent"],
         "tags": finding_dict["tags"],
+        "evidence": finding_dict["evidence"],
     }
     cleaned = {key: value for key, value in metadata.items() if value is not None}
     return cleaned or None
@@ -641,6 +647,9 @@ def _format_terminal(
             console.print(f"    [dim]Confidence:[/dim] {f.confidence:.0%}")
             if f.remediation:
                 console.print(f"    [dim]Remediation:[/dim] {(f.remediation or '')[:150]}...")
+            if f.evidence:
+                rendered = ", ".join(f"{key}={value}" for key, value in sorted(f.evidence.items()))
+                console.print(f"    [dim]Evidence:[/dim] {rendered}")
             console.print()
     else:
         console.print("\n[green]No security issues detected.[/green]\n")
@@ -978,6 +987,11 @@ def _format_markdown(
             if f.remediation:
                 lines.append(f"**Remediation:** {f.remediation}")
                 lines.append("")
+            if f.evidence:
+                lines.append("**Evidence:**")
+                for key, evidence_value in sorted(f.evidence.items()):
+                    lines.append(f"- **{key}:** `{evidence_value}`")
+                lines.append("")
             lines.append("---\n")
 
     if suppressed:
@@ -1054,7 +1068,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         state.get("execution_successful", analysis_completeness.get("execution_successful", True))
     )
     component_metadata = state.get("component_metadata") or []
-    file_cache = state.get("file_cache") or {}
+    file_cache = state.get("local_file_cache") or state.get("file_cache") or {}
     has_executable_scripts = state.get("has_executable_scripts", False)
     manifest = state.get("manifest") or {}
     skill_path = state.get("skill_path")

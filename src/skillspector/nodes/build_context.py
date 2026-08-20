@@ -46,6 +46,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.logging_config import get_logger
+from skillspector.nested_artifacts import inspect_nested_artifacts, is_executable_content
 from skillspector.python_ast import prewarm_python_ast_cache
 from skillspector.state import SkillspectorState
 from skillspector.structured_skill import extract_structured_skill_context
@@ -76,10 +77,6 @@ _FILE_TYPES: dict[str, str] = {
     ".go": "go",
     ".rs": "rust",
 }
-_EXECUTABLE_EXTENSIONS = frozenset(
-    {".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".rb", ".go", ".rs", ".pl"}
-)
-
 _OMS_SIGNATURE_PATH = "skill.oms.sig"
 _SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
 _IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json"
@@ -164,8 +161,8 @@ def _walk_skill_files(
 ) -> tuple[list[str], list[InspectionLedgerEvent]]:
     """Walk skill files and record scan-scope exclusions.
 
-    Skips _SKIP_DIRS, hidden files except those starting with .claude, and
-    symlinks, which must never supply content to remote LLM analyzers.
+    Skips _SKIP_DIRS and symlinks. Hidden regular files remain in the local
+    deterministic inventory; build_context excludes them from the LLM view.
     """
     paths: list[str] = []
     exclusions: list[InspectionLedgerEvent] = []
@@ -206,18 +203,6 @@ def _walk_skill_files(
 
         for filename in filenames:
             relative_path = (relative_root / filename).as_posix()
-            if filename.startswith(".") and not filename.startswith(".claude"):
-                exclusions.append(
-                    ledger_event(
-                        outcome=LedgerOutcome.OUT_OF_SCOPE,
-                        record_type=LedgerRecordType.SCOPE_BOUNDARY,
-                        phase="discovery",
-                        path=relative_path,
-                        reason=LedgerReason.HIDDEN_FILE,
-                    )
-                )
-                continue
-
             # Use forward slashes on every OS: these relative paths are dict keys
             # and SARIF/URI locations, so they must be portable.  Other
             # non-regular entries remain inventoried for cache-phase evidence;
@@ -244,6 +229,11 @@ def _infer_file_type(path: str) -> str:
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return _FILE_TYPES.get(suffix, "other")
+
+
+def _is_hidden_component(path: str) -> bool:
+    """Return whether any segment of a relative component path is hidden."""
+    return any(part.startswith(".") for part in path.replace("\\", "/").split("/") if part)
 
 
 def _decode_base64_json(value: object) -> dict[str, object] | None:
@@ -301,11 +291,12 @@ def _is_valid_oms_signature(file_path: Path) -> bool:
         return False
 
     statement = _decode_base64_json(envelope.get("payload"))
+    predicate_type = statement.get("predicateType") if statement else None
     return bool(
         statement
         and statement.get("_type") == _IN_TOTO_STATEMENT_TYPE
-        and isinstance(statement.get("predicateType"), str)
-        and statement["predicateType"].startswith(_OMS_PREDICATE_TYPE_PREFIX)
+        and isinstance(predicate_type, str)
+        and predicate_type.startswith(_OMS_PREDICATE_TYPE_PREFIX)
     )
 
 
@@ -330,7 +321,6 @@ def _build_component_metadata(
     has_executable = False
     for path in components:
         full = skill_dir / path
-        suffix = full.suffix.lower()
         file_type = "oms_signature" if path in recognized_oms_signatures else _infer_file_type(path)
         content = file_cache.get(path)
         lines = (
@@ -340,23 +330,42 @@ def _build_component_metadata(
             if path in recognized_oms_signatures
             else 0
         )
-        executable = suffix in _EXECUTABLE_EXTENSIONS
-        if executable:
-            has_executable = True
         try:
-            size_bytes = full.stat().st_size
+            file_stat = full.stat()
+            size_bytes = file_stat.st_size
+            mode = file_stat.st_mode
         except OSError:
             logger.debug("Could not stat file: %s", path)
             size_bytes = 0
-        metadata.append(
-            {
-                "path": path,
-                "type": file_type,
-                "lines": lines,
-                "executable": executable,
-                "size_bytes": size_bytes,
-            }
-        )
+            mode = 0
+        data = content.encode("utf-8", errors="replace") if content is not None else b""
+        executable = is_executable_content(path, data, mode)
+        if executable:
+            has_executable = True
+        component: dict[str, object] = {
+            "path": path,
+            "type": file_type,
+            "lines": lines,
+            "executable": executable,
+            "size_bytes": size_bytes,
+        }
+        if _is_hidden_component(path):
+            component["hidden"] = True
+            component["local_only"] = True
+            if executable:
+                component.update(
+                    {
+                        "outer_path": path,
+                        "nested_path": path,
+                        "container_type": "filesystem",
+                        "container_ancestry": ["filesystem"],
+                        "container_depth": 0,
+                        "outer_hidden": True,
+                        "concealed_executable": True,
+                        "concealment_reasons": ["hidden_artifact"],
+                    }
+                )
+        metadata.append(component)
     return metadata, has_executable
 
 
@@ -571,25 +580,55 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         )
         for path in sorted(selected_baselines)
     ]
-    file_cache, cache_events = _read_file_cache(skill_dir, components)
-    python_ast_cache_key = prewarm_python_ast_cache(components, file_cache)
+    local_file_cache, cache_events = _read_file_cache(skill_dir, components)
+    nested = inspect_nested_artifacts(skill_dir, components)
+    components.extend(path for path in nested.components if path not in components)
+    local_file_cache.update(nested.file_cache)
+
+    # Only ordinary, visible filesystem text remains eligible for remote LLM
+    # analysis. Hidden files and every recognized container/nested member stay
+    # in the deterministic local-only view.
+    recognized_containers = frozenset(nested.outer_metadata)
+    llm_components = [
+        path
+        for path in components
+        if path not in recognized_containers
+        and path not in nested.file_cache
+        and not _is_hidden_component(path)
+    ]
+    file_cache = {
+        path: local_file_cache[path] for path in llm_components if path in local_file_cache
+    }
+    python_ast_cache_key = prewarm_python_ast_cache(components, local_file_cache)
     manifest = _parse_manifest(skill_dir)
     metadata_components = [
         path for path in inventoried_components if path not in selected_baselines
     ]
     component_metadata, has_executable_scripts = _build_component_metadata(
-        skill_dir, metadata_components, file_cache, recognized_oms_signatures
+        skill_dir, metadata_components, local_file_cache, recognized_oms_signatures
+    )
+    for metadata in component_metadata:
+        path = str(metadata.get("path", ""))
+        if path in nested.outer_metadata:
+            metadata.update(nested.outer_metadata[path])
+            metadata["lines"] = 0
+    component_metadata.extend(nested.metadata)
+    has_executable_scripts = has_executable_scripts or any(
+        bool(metadata.get("executable")) for metadata in nested.metadata
     )
     structured_skill_context = extract_structured_skill_context(skill_dir)
 
-    result = {
+    result: dict[str, object] = {
         "components": components,
+        "llm_components": llm_components,
         "file_cache": file_cache,
+        "local_file_cache": local_file_cache,
         "inspection_ledger": [
             *discovery_events,
             *signature_events,
             *baseline_events,
             *cache_events,
+            *nested.ledger_events,
         ],
         "ast_cache": {},
         "python_ast_cache_key": python_ast_cache_key,

@@ -310,6 +310,7 @@ def analyzer_finding_to_finding(
         explanation=get_explanation(af.rule_id),
         code_snippet=af.context,
         intent=None,
+        evidence=dict(af.evidence),
     )
 
 
@@ -398,11 +399,21 @@ def run_static_patterns(
     converts all AnalyzerFindings to Finding via analyzer_finding_to_finding, returns combined list.
     """
     components = cast(list[str], state.get("components") or [])
-    file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    file_cache = cast(
+        dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
+    )
     python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
+    container_paths = {
+        str(metadata.get("path", ""))
+        for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        and "!/" not in str(metadata.get("path", ""))
+    }
     findings: list[Finding] = []
 
     for path in components:
+        if path in container_paths:
+            continue
         if _is_eval_dataset(path):
             logger.debug("Skipping eval dataset prose for static pattern scan: %s", path)
             continue
@@ -433,13 +444,28 @@ def run_static_patterns_with_ledger(
     """Run one static analyzer and account for every planned file work item."""
     analyzer_id = str(getattr(pattern_modules[0], "ANALYZER_ID", "static_patterns"))
     components = cast(list[str], state.get("components") or [])
-    file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    file_cache = cast(
+        dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
+    )
     python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
+    container_paths = {
+        str(metadata.get("path", ""))
+        for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        and "!/" not in str(metadata.get("path", ""))
+    }
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
 
     for path in components:
-        if _is_eval_dataset(path):
+        if path in container_paths:
+            event = ledger_event(
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                analyzer_id=analyzer_id,
+                path=path,
+            )
+        elif _is_eval_dataset(path):
             event = ledger_event(
                 outcome=LedgerOutcome.SKIPPED,
                 phase="static",

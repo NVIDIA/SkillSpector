@@ -646,6 +646,78 @@ class TestReportNode:
         assert result_row["properties"]["intent"] == "secret_exfiltration"
         assert result_row["properties"]["tags"] == ["env", "secret"]
 
+    @pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+    def test_report_preserves_structured_evidence(self, output_format: str) -> None:
+        finding = _finding(
+            "SC9",
+            "HIGH",
+            "concealed executable",
+            confidence=1.0,
+            file="archive.docx!/payload.sh",
+        )
+        finding.evidence = {
+            "outer_path": "archive.docx",
+            "nested_path": "payload.sh",
+        }
+        state: SkillspectorState = {
+            "filtered_findings": [finding],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "output_format": output_format,
+        }
+
+        result = report(state)
+
+        if output_format == "json":
+            issue = json.loads(result["report_body"])["issues"][0]
+            assert issue["evidence"] == finding.evidence
+        elif output_format == "sarif":
+            row = json.loads(result["report_body"])["runs"][0]["results"][0]
+            assert row["properties"]["evidence"] == finding.evidence
+        else:
+            assert "outer_path" in result["report_body"]
+            assert "archive.docx" in result["report_body"]
+
+    @pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+    def test_report_preserves_nested_inspection_limit_reason_and_path(
+        self, output_format: str
+    ) -> None:
+        completeness = {
+            "total_components": 1,
+            "scanned_components": 0,
+            "coverage_percent": 0.0,
+            "is_complete": False,
+            "execution_successful": True,
+            "fully_inspected_files": 0,
+            "partially_inspected_files": 0,
+            "entirely_uninspected_files": 1,
+            "ledger_exceptions": [
+                {
+                    "reason_code": "archive_member_limit",
+                    "path": "outer.zip!/nested.zip",
+                    "message": "Cumulative archive member limit was reached.",
+                    "fatal": False,
+                }
+            ],
+            "scope_exclusions": [],
+            "analyzer_statuses": [],
+            "limitations": [],
+        }
+        state: SkillspectorState = {
+            "filtered_findings": [],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "output_format": output_format,
+            "analysis_completeness": completeness,  # type: ignore[typeddict-item]
+        }
+
+        body = report(state)["report_body"]
+
+        assert "archive_member_limit" in body
+        assert "outer.zip!/nested.zip" in body
+
     def test_report_default_output_format_is_sarif(self) -> None:
         """When output_format is missing, report uses sarif."""
         state: SkillspectorState = {

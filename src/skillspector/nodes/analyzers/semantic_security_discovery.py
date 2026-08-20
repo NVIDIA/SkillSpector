@@ -97,7 +97,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         }
 
     file_cache: dict[str, str] = state.get("file_cache") or {}
-    components: list[str] = state.get("components") or sorted(file_cache.keys())
+    components: list[str] = (
+        state.get("llm_components", [])
+        if "llm_components" in state
+        else state.get("components") or sorted(file_cache.keys())
+    )
     if not components:
         return {
             "findings": [],
