@@ -32,7 +32,6 @@ from .common import (
     get_context,
     get_context_from_lines,
     get_line_number,
-    is_code_example,
     resolve_call_name,
     resolve_dotted_name,
 )
@@ -58,9 +57,14 @@ E1_PATTERNS = [
     ),
 ]
 E2_PYTHON_FALLBACK_PATTERNS = [
+    # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
+    # Python: os.environ.copy() — full environ read
     (r"os\s*\.\s*environ\s*\.\s*copy\s*\(\s*\)", 0.6),
+    # Python: dict(os.environ) — full environ read via dict()
     (r"dict\s*\(\s*os\s*\.\s*environ\s*\)", 0.6),
+    # Python: {**os.environ} — full environ read via dict-spread.
+    # Require braces so bare ``2 ** os.environ`` (exponentiation) is not flagged.
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
 ]
 E2_OTHER_PATTERNS = [
@@ -358,13 +362,9 @@ def analyze(
                     matched_text=match.group(0)[:200],
                 )
             )
-    # E5: cloud-storage exfiltration. Filtered through is_code_example() because
-    # upload calls commonly appear in SKILL.md docs and examples.
+    # E5: cloud-storage exfiltration. Example filtering is delegated to the runner.
     for pattern, confidence in E5_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            context = ctx(match.start())
-            if is_code_example(context):
-                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -374,7 +374,7 @@ def analyze(
                     location=loc(line_num),
                     confidence=confidence,
                     tags=tag,
-                    context=context,
+                    context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                 )
             )

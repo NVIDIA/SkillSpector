@@ -74,12 +74,106 @@ _EVAL_DATASET_FILES = {
     "eval/dataset.yml",
 }
 
+_LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
+_LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+_LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
+
+
+def _normalize_license_line(line: str) -> str:
+    return " ".join(line.casefold().split())
+
+
+# Each range contains the complete adjacent text and the only suppressible line offset.
+_LICENSE_CANONICAL_RANGES: tuple[tuple[tuple[str, ...], int], ...] = (
+    (
+        (
+            '"source" form shall mean the preferred form for making modifications,',
+            "including but not limited to software source code, documentation",
+            "source, and configuration files.",
+        ),
+        1,
+    ),
+    (
+        (
+            "transformation or translation of a source form, including but",
+            "not limited to compiled object code, generated documentation,",
+            "and conversions to other media types.",
+        ),
+        1,
+    ),
+    (
+        (
+            'the copyright owner. For the purposes of this definition, "submitted"',
+            "means any form of electronic, verbal, or written communication sent",
+            "to the Licensor or its representatives, including but not limited to",
+            "communication on electronic mailing lists, source code control systems,",
+        ),
+        2,
+    ),
+    (
+        (
+            "result of this License or out of the use or inability to use the",
+            "Work (including but not limited to damages for loss of goodwill,",
+            "work stoppage, computer failure or malfunction, or any and all",
+        ),
+        1,
+    ),
+    (
+        (
+            'the software is provided "as is", without warranty of any kind, express or',
+            "implied, including but not limited to the warranties of merchantability,",
+            "fitness for a particular purpose and NONINFRINGEMENT. in no event shall the",
+        ),
+        1,
+    ),
+    (
+        (
+            'this software is provided by the copyright holders and contributors "as is"',
+            "and any express or implied warranties, including, but not limited to, the",
+            "implied warranties of merchantability and fitness for a particular purpose are",
+        ),
+        1,
+    ),
+)
+
 
 def _infer_file_type(path: str) -> str:
     """Infer file type from path (extension)."""
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
+
+
+def _is_license_basename(path: str, file_type: str) -> bool:
+    """Return whether a text-like path has a conventional legal-file basename."""
+    if file_type not in _LICENSE_FILE_TYPES:
+        return False
+    basename = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if file_type == "other" and "." in basename:
+        suffix = "." + basename.rsplit(".", 1)[-1].casefold()
+        if suffix not in _LICENSE_OTHER_SUFFIXES:
+            return False
+    return _LICENSE_BASENAME.fullmatch(basename.casefold()) is not None
+
+
+def _is_license_boilerplate_line(content: str, start_line: int) -> bool:
+    """Return whether start_line occupies a registered canonical license range."""
+    lines = content.splitlines()
+    if start_line < 1 or start_line > len(lines):
+        return False
+    normalized_lines = tuple(_normalize_license_line(line) for line in lines)
+    for canonical_lines, match_offset in _LICENSE_CANONICAL_RANGES:
+        range_start = start_line - match_offset - 1
+        range_end = range_start + len(canonical_lines)
+        normalized_canonical_lines = tuple(
+            _normalize_license_line(line) for line in canonical_lines
+        )
+        if (
+            range_start >= 0
+            and normalized_lines[range_start:range_end] == normalized_canonical_lines
+        ):
+            return True
+    return False
 
 
 _BINARY_EXTENSIONS = frozenset(
@@ -310,6 +404,7 @@ def analyzer_finding_to_finding(
         explanation=get_explanation(af.rule_id),
         code_snippet=af.context,
         intent=None,
+        evidence=dict(af.evidence),
     )
 
 
@@ -344,6 +439,13 @@ def _scan_path(
         else:
             raw = module.analyze(content=content, file_path=path, file_type=file_type)
         for af in raw:
+            if (
+                af.rule_id == "EA3"
+                and _is_license_basename(path, file_type)
+                and _is_license_boilerplate_line(content, af.location.start_line)
+            ):
+                logger.debug("Filtered EA3 license boilerplate finding: %s", path)
+                continue
             if _is_env_file_reference_in_docs(af, file_type, path, content):
                 logger.debug(
                     "Filtered PE3 .env doc reference: %s in %s:%d",
@@ -355,7 +457,7 @@ def _scan_path(
             # PE3's analyzer owns its narrowly qualified safe references.
             # Generic documentation words are attacker-controlled and must
             # not hard-drop HIGH credential-access findings here.
-            if af.rule_id != "PE3" and af.context and is_code_example(af.context):
+            if af.rule_id != "PE3" and af.context and is_code_example(af.context, path=path):
                 if is_non_executable:
                     logger.debug(
                         "Filtered code-example finding in non-executable: %s in %s:%d",
@@ -398,11 +500,21 @@ def run_static_patterns(
     converts all AnalyzerFindings to Finding via analyzer_finding_to_finding, returns combined list.
     """
     components = cast(list[str], state.get("components") or [])
-    file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    file_cache = cast(
+        dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
+    )
     python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
+    container_paths = {
+        str(metadata.get("path", ""))
+        for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        and "!/" not in str(metadata.get("path", ""))
+    }
     findings: list[Finding] = []
 
     for path in components:
+        if path in container_paths:
+            continue
         if _is_eval_dataset(path):
             logger.debug("Skipping eval dataset prose for static pattern scan: %s", path)
             continue
@@ -433,13 +545,28 @@ def run_static_patterns_with_ledger(
     """Run one static analyzer and account for every planned file work item."""
     analyzer_id = str(getattr(pattern_modules[0], "ANALYZER_ID", "static_patterns"))
     components = cast(list[str], state.get("components") or [])
-    file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    file_cache = cast(
+        dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
+    )
     python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
+    container_paths = {
+        str(metadata.get("path", ""))
+        for metadata in cast(list[dict[str, object]], state.get("component_metadata") or [])
+        if metadata.get("container_type") in {"zip", "docx", "xlsx", "pptx"}
+        and "!/" not in str(metadata.get("path", ""))
+    }
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
 
     for path in components:
-        if _is_eval_dataset(path):
+        if path in container_paths:
+            event = ledger_event(
+                outcome=LedgerOutcome.COMPLETED,
+                phase="static",
+                analyzer_id=analyzer_id,
+                path=path,
+            )
+        elif _is_eval_dataset(path):
             event = ledger_event(
                 outcome=LedgerOutcome.SKIPPED,
                 phase="static",

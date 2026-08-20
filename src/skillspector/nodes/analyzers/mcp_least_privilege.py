@@ -214,7 +214,7 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Analyze manifest permissions vs code capabilities; emit LP1-LP4 findings."""
     manifest: dict = state.get("manifest") or {}
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     component_metadata: list[dict] = state.get("component_metadata") or []
 
     # Skip: no manifest
@@ -364,6 +364,17 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 confidence = _clamp(0.55 if is_test_only else 0.75)
                 source_files = [p for p, caps in file_capabilities.items() if cap in caps]
                 primary_file = source_files[0] if source_files else "SKILL.md"
+                if allowed_tools:
+                    remediation = (
+                        f"Add a tool that covers the '{cap}' capability to the "
+                        "'allowed-tools' frontmatter field in SKILL.md, or remove "
+                        "the code that requires it."
+                    )
+                else:
+                    remediation = (
+                        f"Add the '{cap}' capability to the MCP server manifest's "
+                        "'permissions' list, or remove the code that requires it."
+                    )
                 logger.debug(
                     "%s: LP1 underdeclared capability %s in %s", ANALYZER_ID, cap, primary_file
                 )
@@ -383,9 +394,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             f"The skill uses '{cap}' capability that is not listed in its permissions. "
                             "This may indicate deceptive intent or missing permission declarations."
                         ),
-                        remediation=(
-                            f"Add the '{cap}' permission to SKILL.md, or remove the code that requires it."
-                        ),
+                        remediation=remediation,
                     )
                 )
 

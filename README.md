@@ -23,7 +23,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **69 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **70 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
@@ -353,7 +353,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **69 vulnerability patterns** across 17 categories:
+SkillSpector detects **70 vulnerability patterns** across 17 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -391,7 +391,7 @@ SkillSpector detects **69 vulnerability patterns** across 17 categories:
 | PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
 | PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
 
-### Supply Chain (7+ patterns)
+### Supply Chain (9+ patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -402,6 +402,7 @@ SkillSpector detects **69 vulnerability patterns** across 17 categories:
 | SC5 | Abandoned Dependencies | MEDIUM | Unmaintained packages without security updates |
 | SC6 | Typosquatting | HIGH | Package names similar to popular packages |
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
+| SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
 
 ### Excessive Agency (4 patterns)
 

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,45 @@ def nested_with_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _write_aisop_bundle(path: Path) -> None:
+    """Write a valid minimal AISOP/AISP bundle file."""
+    bundle = [
+        {
+            "role": "system",
+            "content": {
+                "protocol": "AISOP V1",
+                "format": "AIModal",
+            },
+        },
+        {
+            "role": "user",
+            "content": {
+                "aisop": {"main": "graph TD"},
+                "functions": {
+                    "lookup": {"constraints": ["query"]},
+                    "schedule": {"constraints": ["time"]},
+                },
+                "declared_tools": ["search", "calendar"],
+                "aisp_contract": {
+                    "resources": {
+                        "calendar": {"path": "resources/calendar.json"},
+                        "memory": {"path": "resources/memory.md"},
+                    }
+                },
+            },
+        },
+    ]
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+
+def _make_nested_resources(depth: int) -> dict[str, object]:
+    """Build a deeply nested resources tree for recursion-guard tests."""
+    current: dict[str, object] = {"path": "resources/final.json"}
+    for idx in range(depth, -1, -1):
+        current = {f"resource_{idx}": {"resources": current}}
+    return current
+
+
 class TestDetectSkills:
     """Tests for detect_skills()."""
 
@@ -80,6 +120,115 @@ class TestDetectSkills:
         result = detect_skills(multi_skill_dir)
         names = {s.name for s in result.skills}
         assert names == {"weather-lookup", "email-sender", "file-manager"}
+
+    def test_structured_skill_subdir_detected(self, tmp_path: Path) -> None:
+        """An immediate subdirectory with a valid AISOP/AISP bundle is detected."""
+        sub = tmp_path / "workflow-bundle"
+        sub.mkdir()
+        _write_aisop_bundle(sub / "workflow.aisop.json")
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert result.has_root_skill is False
+        assert len(result.skills) == 1
+        assert result.skills[0].name == "workflow-bundle"
+        assert result.skills[0].path == sub
+
+    def test_single_structured_child_not_multi(self, tmp_path: Path) -> None:
+        """One structured subdirectory should not force multi-skill mode."""
+        sub = tmp_path / "only-structured"
+        sub.mkdir()
+        _write_aisop_bundle(sub / "workflow.aisop.json")
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 1
+
+    @pytest.mark.parametrize("ancestor", [".claude", "venv"])
+    def test_structured_child_under_ancestor_detected(self, tmp_path: Path, ancestor: str) -> None:
+        """Structured children remain discoverable under external ancestors."""
+        skills_dir = tmp_path / ancestor / "skills"
+        sub = skills_dir / "workflow-bundle"
+        sub.mkdir(parents=True)
+        _write_aisop_bundle(sub / "workflow.aisop.json")
+
+        result = detect_skills(skills_dir)
+
+        assert len(result.skills) == 1
+        assert result.skills[0].path == sub
+
+    @pytest.mark.parametrize("skip_dir", ["venv", "node_modules", "__pycache__"])
+    def test_skip_dir_children_with_bundles_ignored(self, tmp_path: Path, skip_dir: str) -> None:
+        """Skip-dir children do not become phantom skills from vendored bundles."""
+        real_skill = tmp_path / "real-skill"
+        real_skill.mkdir()
+        (real_skill / "SKILL.md").write_text("---\nname: real\n---\n", encoding="utf-8")
+
+        bundled_child = tmp_path / skip_dir / "pkg"
+        bundled_child.mkdir(parents=True)
+        _write_aisop_bundle(bundled_child / "workflow.aisop.json")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 1
+        assert result.skills[0].path == real_skill
+
+    def test_structured_bundle_ignored_when_partial(self, tmp_path: Path) -> None:
+        """Malformed AISOP/AISP JSON does not count as a structured child skill."""
+        malformed = tmp_path / "bad-bundle"
+        malformed.mkdir()
+        (malformed / "workflow.aisop.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "role": "system",
+                        "content": {"protocol": "AISOP V1"},
+                    },
+                    {"content": {"functions": []}},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 0
+
+    def test_structured_bundle_ignored_when_over_nested(self, tmp_path: Path) -> None:
+        """Over-nested structured bundles fail closed instead of crashing detection."""
+        nested = tmp_path / "deep-bundle"
+        nested.mkdir()
+        bundle = [
+            {
+                "role": "system",
+                "content": {
+                    "protocol": "AISP V1",
+                    "format": "contract",
+                },
+            },
+            {
+                "role": "user",
+                "content": {
+                    "functions": {"lookup": {"constraints": ["query"]}},
+                    "aisp_contract": {"resources": _make_nested_resources(140)},
+                },
+            },
+        ]
+        (nested / "workflow.aisop.json").write_text(json.dumps(bundle), encoding="utf-8")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 0
+
+    def test_root_skill_still_overrides_structured_nested(self, tmp_path: Path) -> None:
+        """A root SKILL.md still forces single-skill mode with nested structured bundles."""
+        (tmp_path / "SKILL.md").write_text("---\nname: root-skill\n---\n# Root\n", encoding="utf-8")
+        nested = tmp_path / "nested-structured"
+        nested.mkdir()
+        _write_aisop_bundle(nested / "workflow.aisop.json")
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert result.has_root_skill is True
+        assert len(result.skills) == 0
 
     def test_single_skill_not_multi(self, single_skill_dir: Path) -> None:
         """Directory with root SKILL.md is not multi-skill."""

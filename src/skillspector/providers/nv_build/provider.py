@@ -38,13 +38,19 @@ REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 class NvBuildProvider:
     """build.nvidia.com credentials + bundled-YAML metadata provider."""
 
-    # General default — DeepSeek v4 flash for the high-volume per-file
-    # analyzer calls.  meta_analyzer is upgraded to v4 pro for the
-    # aggregation/filter pass where precision matters more.
-    DEFAULT_MODEL = "deepseek-ai/deepseek-v4-flash"
-    SLOT_DEFAULTS: dict[str, str] = {
-        "meta_analyzer": "deepseek-ai/deepseek-v4-pro",
-    }
+    # General default.  The previous defaults (deepseek-v4-flash and, for the
+    # meta_analyzer slot, deepseek-v4-pro) are no longer served: the former
+    # returns 410 Gone (end of life 2026-08-07) and neither appears in
+    # GET /v1/models, so the out-of-the-box path failed every call.
+    #
+    # The replacement is chosen for DETECTION, not latency.  On a bait skill
+    # carrying prose-disguised credential exfiltration, the fast served model
+    # (deepseek-v4-flash-0731, ~1.6 s/call) completed every call, reported no
+    # degradation, and returned a clean verdict — a confident false negative,
+    # which on a security scanner is the worst possible failure.  glm-5.2 costs
+    # ~16 s/call and flags it CRITICAL.
+    DEFAULT_MODEL = "z-ai/glm-5.2"
+    SLOT_DEFAULTS: dict[str, str] = {}
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` from ``NVIDIA_INFERENCE_KEY``."""

@@ -335,7 +335,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         }
 
     components: list[str] = state.get("components") or []
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     findings = []
     events: list[InspectionLedgerEvent] = []
 

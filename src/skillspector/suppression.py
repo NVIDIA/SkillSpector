@@ -387,6 +387,49 @@ def partition_findings(
     return kept, suppressed
 
 
+def effective_findings(result: Mapping[str, object]) -> list[Finding]:
+    """Return the findings from a graph *result* that actually drove its risk score.
+
+    The report node returns ``filtered_findings`` as the full pre-partition set
+    (kept plus baseline-suppressed) alongside ``suppressed_findings``, but scores
+    and SARIF results from the kept subset alone. Consumers that want the numbers
+    the report itself published must therefore subtract the suppressed partition.
+
+    Two failure modes this exists to prevent, both of which over-report:
+
+    * ``result.get("filtered_findings") or result.get("findings")`` treats an
+      empty filtered list as absent and falls back to the raw pre-filter
+      findings. An empty list is a real answer -- every finding was filtered out
+      or suppressed -- not a missing one.
+    * Using ``filtered_findings`` directly counts baseline-suppressed findings
+      that the report excluded from the score, so a fully suppressed skill
+      reports risk 0 alongside a non-zero finding count.
+
+    Falls back to the raw ``findings`` list only when ``filtered_findings`` is
+    absent or malformed, and does not subtract there: raw findings are not the
+    population that produced ``suppressed_findings``.
+    """
+    filtered = result.get("filtered_findings")
+    if not isinstance(filtered, list):
+        raw = result.get("findings")
+        return list(raw) if isinstance(raw, list) else []
+
+    suppressed = result.get("suppressed_findings")
+    if not isinstance(suppressed, list) or not suppressed:
+        return list(filtered)
+
+    suppressed_ids = {
+        entry.finding.finding_id
+        for entry in suppressed
+        if isinstance(entry, SuppressedFinding) and entry.finding is not None
+    }
+    return [
+        finding
+        for finding in filtered
+        if not isinstance(finding, Finding) or finding.finding_id not in suppressed_ids
+    ]
+
+
 def build_baseline_dict(
     findings: list[Finding],
     reason: str = "Accepted finding (auto-generated baseline)",
