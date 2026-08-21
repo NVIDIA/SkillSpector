@@ -60,6 +60,8 @@ HORIZONTAL_RUN_CHARS = 80
 BLOCK_BYTE_BUDGET = 2048
 RATIO_THRESHOLD = 0.90
 RATIO_MIN_FILE_BYTES = 4096
+REPEATED_CHAR_THRESHOLD = 512
+REPEATED_LINE_THRESHOLD = 64
 
 # Replacement character emitted by errors="replace" decoding; a high *density* of
 # it marks binary-ish content, which we bail out of entirely. We key on density
@@ -161,7 +163,7 @@ class PaddingRun:
     set by the detectors that produce span-based runs.
     """
 
-    kind: str  # "vertical" | "horizontal" | "block" | "ratio"
+    kind: str  # "vertical" | "horizontal" | "block" | "ratio" | "repetition"
     start_offset: int  # char offset where the run starts
     start_line: int  # 1-based line number
     length: int  # see class docstring — unit depends on kind
@@ -367,6 +369,50 @@ def _detect_block_and_ratio(content: str) -> list[PaddingRun]:
     return runs
 
 
+def _detect_repetition(content: str) -> list[PaddingRun]:
+    """Detect non-whitespace character and line repetition used as visual padding."""
+    runs: list[PaddingRun] = []
+    index = 0
+    while index < len(content):
+        end = index + 1
+        while end < len(content) and content[end] == content[index]:
+            end += 1
+        if end - index >= REPEATED_CHAR_THRESHOLD and not is_padding_char(content[index]):
+            runs.append(
+                PaddingRun(
+                    kind="repetition",
+                    start_offset=index,
+                    start_line=content[:index].count("\n") + 1,
+                    length=end - index,
+                    followed_by_content=end < len(content),
+                    summary=f"repeated U+{ord(content[index]):04X} x{end - index}",
+                    end_offset=end,
+                )
+            )
+        index = end
+
+    lines, offsets = _split_lines(content)
+    index = 0
+    while index < len(lines):
+        end = index + 1
+        while end < len(lines) and lines[end] == lines[index] and lines[index].strip():
+            end += 1
+        if end - index >= REPEATED_LINE_THRESHOLD:
+            runs.append(
+                PaddingRun(
+                    kind="repetition",
+                    start_offset=offsets[index],
+                    start_line=index + 1,
+                    length=end - index,
+                    followed_by_content=end < len(lines),
+                    summary=f"repeated line x{end - index}",
+                    end_offset=offsets[end],
+                )
+            )
+        index = end
+    return runs
+
+
 def detect_whitespace_padding(content: str, *, file_type: str = "other") -> list[PaddingRun]:
     """Scan *content* for whitespace-padding runs and return structured records.
 
@@ -431,4 +477,5 @@ def detect_whitespace_padding(content: str, *, file_type: str = "other") -> list
             block_kept = True
         deduped_block_ratio.append(run)
 
-    return vertical + horizontal + deduped_block_ratio
+    repetition = [run for run in _detect_repetition(content) if not _overlaps_primary(run)]
+    return vertical + horizontal + deduped_block_ratio + repetition

@@ -189,6 +189,25 @@ class TestComputeRiskScoreExecutableMultiplier:
         # 50 + 50 + 50 = 150, * 1.3 = 195, capped at 100
         assert score == 100
 
+    def test_executable_lookup_is_scoped_for_same_path_in_two_sources(self) -> None:
+        first_identity = f"external/{'a' * 64}"
+        second_identity = f"external/{'b' * 64}"
+        first = _finding("R1", "HIGH", confidence=1.0, file="run.py")
+        first.source_identity = first_identity
+        first.source_digest = f"sha256:{'c' * 64}"
+        first.source_url = "https://github.com/org/shared"
+        second = _finding("R1", "HIGH", confidence=1.0, file="run.py")
+        second.source_identity = second_identity
+        second.source_digest = f"sha256:{'d' * 64}"
+        second.source_url = "https://github.com/org/shared"
+        metadata = [
+            {"path": "run.py", "source_identity": first_identity, "executable": False},
+            {"path": "run.py", "source_identity": second_identity, "executable": True},
+        ]
+
+        assert _compute_risk_score([first], True, metadata)[0] == 25
+        assert _compute_risk_score([second], True, metadata)[0] == 32
+
 
 class TestComputeRiskScoreEdgeCases:
     """Tests for edge cases identified in code review."""
@@ -757,6 +776,48 @@ class TestReportNode:
         terminal = report(state)["report_body"]
         assert "https://github.com/org/dep" in terminal
 
+    def test_report_keeps_same_path_from_distinct_immutable_sources(self) -> None:
+        shared_url = "https://github.com/org/shared"
+        findings: list[Finding] = []
+        for identity, digest in (
+            (f"external/{'a' * 64}", f"sha256:{'c' * 64}"),
+            (f"external/{'b' * 64}", f"sha256:{'d' * 64}"),
+        ):
+            finding = Finding(
+                rule_id="TM1",
+                message="same evidence",
+                severity="HIGH",
+                confidence=1.0,
+                file="tool.py",
+                start_line=7,
+                matched_text="subprocess.run(cmd, shell=True)",
+                source_url=shared_url,
+                source_identity=identity,
+                source_digest=digest,
+                transitive_depth=1,
+            )
+            findings.append(finding)
+        state: SkillspectorState = {
+            "findings": findings,
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "output_format": "json",
+        }
+
+        result = report(state)
+        body = json.loads(result["report_body"])
+
+        assert len(result["filtered_findings"]) == 2
+        assert {issue["source_identity"] for issue in body["issues"]} == {
+            f"external/{'a' * 64}",
+            f"external/{'b' * 64}",
+        }
+        assert {issue["occurrences"][0]["source_digest"] for issue in body["issues"]} == {
+            f"sha256:{'c' * 64}",
+            f"sha256:{'d' * 64}",
+        }
+
     def test_report_dedup_affects_score_only_not_report_output(self) -> None:
         """Deduplication reduces score but all affected files appear in the report."""
         duplicated = [
@@ -915,6 +976,99 @@ def test_report_json_includes_suppressed_section() -> None:
     assert data["suppressed_count"] == 1
     assert data["issues"] == []
     assert data["suppressed"][0]["suppression_reason"] == "fp"
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+def test_report_shares_record_budget_with_suppressed_occurrences(
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: str,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.MAX_FINDING_OUTPUT_RECORDS", 4)
+    active = Finding(
+        rule_id="ACTIVE_BOUND",
+        message="active issue",
+        severity="CRITICAL",
+        confidence=1.0,
+        file="active-a.py",
+        occurrences=[
+            {"file": "active-a.py", "start_line": 1, "end_line": 1},
+            {"file": "active-b.py", "start_line": 2, "end_line": 2},
+        ],
+    )
+    suppressed = Finding(
+        rule_id="SUPPRESSED_BOUND",
+        message="suppressed issue",
+        severity="HIGH",
+        confidence=1.0,
+        file="suppressed-a.py",
+        occurrences=[
+            {"file": "suppressed-a.py", "start_line": 1, "end_line": 1},
+            {"file": "suppressed-b.py", "start_line": 2, "end_line": 2},
+            {"file": "suppressed-c.py", "start_line": 3, "end_line": 3},
+        ],
+    )
+    state: SkillspectorState = {
+        "findings": [active, suppressed],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": output_format,
+        "baseline": Baseline(
+            rules=[SuppressionRule(rule_id="SUPPRESSED_BOUND", reason="accepted")]
+        ),
+        "show_suppressed": True,
+    }
+
+    result = report(state)
+    active_records = sum(
+        max(1, len(finding.occurrences)) for finding in result["filtered_findings"]
+    )
+    suppressed_records = sum(
+        max(1, len(item.finding.occurrences)) for item in result["suppressed_findings"]
+    )
+
+    assert result["risk_score"] == 50
+    assert active_records == 2
+    assert suppressed_records == 2
+    assert active_records + suppressed_records == 4
+    assert len(result["suppressed_findings"][0].finding.occurrences) == 2
+    assert len(result["sarif_report"]["runs"][0]["results"]) <= 4
+
+    body = result["report_body"]
+    if output_format == "json":
+        payload = json.loads(body)
+        serialized_records = sum(len(issue["occurrences"]) for issue in payload["issues"])
+        serialized_records += sum(len(item["occurrences"]) for item in payload["suppressed"])
+        assert serialized_records == 4
+    elif output_format == "sarif":
+        assert len(json.loads(body)["runs"][0]["results"]) <= 4
+    else:
+        assert body.count("ACTIVE_BOUND") == 2
+        assert body.count("SUPPRESSED_BOUND") == 1
+
+
+def test_report_scores_all_active_findings_before_output_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.MAX_FINDING_OUTPUT_RECORDS", 1)
+    findings = [
+        _finding("CRITICAL_BEFORE_BOUND", "CRITICAL"),
+        _finding("HIGH_BEFORE_BOUND", "HIGH"),
+    ]
+    state: SkillspectorState = {
+        "findings": findings,
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+    }
+
+    result = report(state)
+
+    assert result["risk_score"] == 75
+    assert [finding.rule_id for finding in result["filtered_findings"]] == ["CRITICAL_BEFORE_BOUND"]
 
 
 def test_report_markdown_show_suppressed_lists_rows() -> None:
@@ -1167,6 +1321,151 @@ def test_report_sarif_has_successful_invocation_when_not_degraded() -> None:
     invocations = result["sarif_report"]["runs"][0]["invocations"]
     assert len(invocations) == 1
     assert invocations[0]["executionSuccessful"] is True
+
+
+def test_report_sarif_projects_complete_analysis_completeness() -> None:
+    """SARIF consumers can distinguish a complete scan without parsing prose."""
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "sarif",
+        "analysis_completeness": {  # type: ignore[typeddict-item]
+            "total_components": 2,
+            "coverage_percent": 100.0,
+            "is_complete": True,
+            "status": "complete",
+            "fully_inspected_files": 2,
+            "partially_inspected_files": 0,
+            "entirely_uninspected_files": 0,
+            "ledger_exceptions": [],
+            "scope_exclusions": [],
+            "limitations": [],
+        },
+    }
+
+    result = report(state)
+    invocation = result["sarif_report"]["runs"][0]["invocations"][0]
+    projected = invocation["properties"]["analysisCompleteness"]
+
+    assert projected == {
+        "isComplete": True,
+        "status": "complete",
+        "coveragePercent": 100.0,
+        "totalComponents": 2,
+        "fullyInspectedFiles": 2,
+        "partiallyInspectedFiles": 0,
+        "entirelyUninspectedFiles": 0,
+        "ledgerExceptionCount": 0,
+        "scopeExclusionCount": 0,
+        "limitationCount": 0,
+        "notificationRecordLimit": 10_000,
+        "notificationsTruncated": False,
+    }
+    assert (
+        json.loads(result["report_body"])["runs"][0]["invocations"][0]["properties"]
+        == invocation["properties"]
+    )
+    validate_sarif_report(result["sarif_report"])
+
+
+def test_report_sarif_projects_incomplete_analysis_without_internal_payloads() -> None:
+    """The fail-closed SARIF property bag is bounded to safe canonical fields."""
+    secret = "provider-response-must-not-leak"
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "sarif",
+        "analysis_completeness": {  # type: ignore[typeddict-item]
+            "total_components": 2,
+            "coverage_percent": 50.0,
+            "is_complete": False,
+            "status": "partial",
+            "fully_inspected_files": 1,
+            "partially_inspected_files": 0,
+            "entirely_uninspected_files": 1,
+            "ledger_exceptions": [
+                {
+                    "outcome": "skipped",
+                    "phase": "nested_artifact_inspection",
+                    "reason_code": "archive_malformed",
+                    "message": "ZIP-compatible content is malformed.",
+                    "path": "broken.zip",
+                    "fatal": False,
+                    "provider_payload": secret,
+                }
+            ],
+            "scope_exclusions": [],
+            "limitations": [],
+            "internal_debug": secret,
+        },
+    }
+
+    result = report(state)
+    invocation = result["sarif_report"]["runs"][0]["invocations"][0]
+    projected = invocation["properties"]["analysisCompleteness"]
+
+    assert projected["isComplete"] is False
+    assert projected["status"] == "partial"
+    assert projected["coveragePercent"] == 50.0
+    assert projected["fullyInspectedFiles"] == 1
+    assert projected["entirelyUninspectedFiles"] == 1
+    assert projected["ledgerExceptionCount"] == 1
+    assert invocation["toolExecutionNotifications"][0]["properties"]["reasonCode"] == (
+        "archive_malformed"
+    )
+    assert secret not in result["report_body"]
+    validate_sarif_report(result["sarif_report"])
+
+
+def test_report_sarif_bounds_completeness_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.MAX_FINDING_OUTPUT_RECORDS", 2)
+    exceptions = [
+        {
+            "outcome": "partial",
+            "phase": "test",
+            "reason_code": "size_limit",
+            "message": "Inspection reached a size limit.",
+            "path": f"file-{index}.txt",
+            "fatal": False,
+        }
+        for index in range(4)
+    ]
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "sarif",
+        "analysis_completeness": {  # type: ignore[typeddict-item]
+            "total_components": 4,
+            "coverage_percent": 0.0,
+            "is_complete": False,
+            "status": "partial",
+            "fully_inspected_files": 0,
+            "partially_inspected_files": 4,
+            "entirely_uninspected_files": 0,
+            "ledger_exceptions": exceptions,
+            "scope_exclusions": [],
+            "limitations": [],
+        },
+    }
+
+    invocation = report(state)["sarif_report"]["runs"][0]["invocations"][0]
+    notifications = invocation["toolExecutionNotifications"]
+    projected = invocation["properties"]["analysisCompleteness"]
+
+    assert len(notifications) == 2
+    assert notifications[-1]["properties"]["reasonCode"] == "output_limit"
+    assert notifications[-1]["properties"]["observedRecords"] == 4
+    assert projected["ledgerExceptionCount"] == 4
+    assert projected["notificationRecordLimit"] == 2
+    assert projected["notificationsTruncated"] is True
 
 
 # ---------------------------------------------------------------------------

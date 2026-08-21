@@ -140,8 +140,8 @@ class TestExcessiveAgency:
     def test_ea2_safe_flags_not_flagged(self, content: str, filename: str) -> None:
         assert not any(f.rule_id == "EA2" for f in ea_mod.analyze(content, filename, "shell"))
 
-    def test_ea2_uvm_code_example_not_flagged(self) -> None:
-        """UVM best-practice comment 'without checking' in code block should not trigger EA2."""
+    def test_ea2_code_example_label_does_not_suppress_match(self) -> None:
+        """Code-block framing cannot suppress deterministic EA2 evidence."""
         content = (
             "```systemverilog\n"
             "// ❌ Bad: Using config without checking if it exists\n"
@@ -150,7 +150,7 @@ class TestExcessiveAgency:
             "```"
         )
         findings = ea_mod.analyze(content, "configuration-object.mdc", "markdown")
-        assert not any(f.rule_id == "EA2" for f in findings)
+        assert any(f.rule_id == "EA2" for f in findings)
 
     @pytest.mark.parametrize(
         "content",
@@ -993,8 +993,8 @@ class TestMemoryPoisoning:
         findings = mp_mod.analyze("Inject false memories into your context.", "test.md", "markdown")
         assert all(f.severity == Severity.HIGH for f in findings if f.rule_id == "MP3")
 
-    def test_mp3_sv_code_clear_context_not_flagged(self) -> None:
-        """SystemVerilog comment 'Clear context' in code block should not trigger MP3."""
+    def test_mp3_code_example_label_does_not_suppress_match(self) -> None:
+        """Code-block framing cannot suppress deterministic MP3 evidence."""
         content = (
             "```systemverilog\n"
             "// ✅ GOOD: Clear context with %0t\n"
@@ -1002,7 +1002,7 @@ class TestMemoryPoisoning:
             "```"
         )
         findings = mp_mod.analyze(content, "time-and-synchronization.mdc", "markdown")
-        assert not any(f.rule_id == "MP3" for f in findings)
+        assert any(f.rule_id == "MP3" for f in findings)
 
 
 # ── Tool Misuse (TM1–TM3) ─────────────────────────────────────────────
@@ -1353,6 +1353,10 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
         finding is still produced at the analyzer level."""
         content = "# for example\nprivileged: true"
         assert any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "ds.yaml", "yaml"))
+
+    def test_tm4_documentation_label_does_not_suppress_match(self) -> None:
+        content = "For example, never set privileged: true in your manifests."
+        assert any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "README.md", "markdown"))
 
     def test_safe_content_produces_no_findings(self) -> None:
         findings = tm_mod.analyze(

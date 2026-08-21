@@ -494,3 +494,98 @@ class TestInspectionLedgerResponse:
         status = result["analyzer_status_events"][0]
         assert status["status"] == "not_applicable"
         assert status["reason_code"] == "manifest_absent"
+
+    def test_deadline_during_component_marks_every_omitted_scope_partial(self) -> None:
+        class ExpiringWorkflowBudget:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def remaining_seconds(self) -> float:
+                self.calls += 1
+                return 0.001 if self.calls <= 2 else 0.0
+
+        result = mcp_least_privilege.node(
+            {
+                "manifest": {"name": "bounded", "permissions": ["read"]},
+                "local_file_cache": {
+                    "first.py": "import subprocess",
+                    "second.py": "import requests",
+                },
+                "component_metadata": [
+                    {"path": "first.py", "executable": True},
+                    {"path": "second.py", "executable": True},
+                ],
+                "workflow_resource_budget": ExpiringWorkflowBudget(),
+            }
+        )
+
+        assert result["findings"] == []
+        assert [event["path"] for event in result["inspection_ledger"]] == [
+            "first.py",
+            "second.py",
+            "SKILL.md",
+        ]
+        assert all(
+            event["outcome"] == "partial" and event["reason_code"] == "runtime_limit"
+            for event in result["inspection_ledger"]
+        )
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_many_matches_stop_at_construction_cap_and_bound_evidence(
+        self,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(mcp_least_privilege, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        monkeypatch.setattr(mcp_least_privilege, "MAX_FINDINGS_PER_ANALYZER", 2)
+        oversized_permission = "write " + "x" * 20_000
+        result = mcp_least_privilege.node(
+            {
+                "manifest": {
+                    "name": "bounded",
+                    "permissions": [oversized_permission, "network", "env"],
+                },
+                "local_file_cache": {"main.py": "print('no privileged capability')"},
+                "component_metadata": [{"path": "main.py", "executable": True}],
+            }
+        )
+
+        assert len(result["findings"]) == 2
+        assert all(finding.rule_id == "LP4" for finding in result["findings"])
+        assert len(result["findings"][0].message) < 700
+        skill_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "SKILL.md"
+        )
+        assert skill_event["outcome"] == "partial"
+        assert skill_event["reason_code"] == "output_limit"
+        assert skill_event["observed_findings"] == 3
+        assert skill_event["limit_findings"] == 2
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_lp1_cap_marks_current_and_remaining_source_verdicts_partial(
+        self,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(mcp_least_privilege, "MAX_FINDINGS_PER_ARTIFACT", 10)
+        monkeypatch.setattr(mcp_least_privilege, "MAX_FINDINGS_PER_ANALYZER", 1)
+        result = mcp_least_privilege.node(
+            {
+                "manifest": {"name": "bounded", "permissions": ["read"]},
+                "local_file_cache": {
+                    "first.py": "import subprocess",
+                    "second.py": "import requests",
+                },
+                "component_metadata": [
+                    {"path": "first.py", "executable": True},
+                    {"path": "second.py", "executable": True},
+                ],
+            }
+        )
+
+        assert len(result["findings"]) == 1
+        assert result["findings"][0].rule_id == "LP1"
+        assert all(event["outcome"] == "partial" for event in result["inspection_ledger"])
+        assert {event["path"] for event in result["inspection_ledger"]} == {
+            "first.py",
+            "second.py",
+            "SKILL.md",
+        }

@@ -351,11 +351,19 @@ def test_clone_git_disables_symlinks() -> None:
     """git clone must prevent symlinked entries from materializing as links."""
     handler = InputHandler()
     try:
+
+        def fake_clone(command: list[str], **_kwargs: object) -> MagicMock:
+            Path(command[-1]).mkdir(parents=True)
+            process = MagicMock()
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            return process
+
         with (
             patch.object(handler, "_validate_url_host", return_value="github.com"),
             patch(
-                "skillspector.input_handler.subprocess.run",
-                return_value=MagicMock(returncode=0),
+                "skillspector.input_handler.subprocess.Popen",
+                side_effect=fake_clone,
             ) as mock_run,
         ):
             handler._clone_git("https://github.com/example/repo.git")
@@ -382,7 +390,8 @@ def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
 
 def test_validate_url_host_scp_extracts_github() -> None:
     """_validate_url_host extracts 'github.com' from an scp-style URL."""
-    host = InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)
+    with patch("skillspector.input_handler._is_private_ip", return_value=False):
+        host = InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)
     assert host == "github.com"
 
 
@@ -390,9 +399,20 @@ def test_scp_valid_host_clones() -> None:
     """resolve() calls git clone with the scp URL when the host is allowed."""
     handler = InputHandler()
     try:
-        with patch(
-            "skillspector.input_handler.subprocess.run", return_value=MagicMock()
-        ) as mock_run:
+
+        def fake_clone(command: list[str], **_kwargs: object) -> MagicMock:
+            Path(command[-1]).mkdir(parents=True)
+            process = MagicMock()
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            return process
+
+        with (
+            patch("skillspector.input_handler._is_private_ip", return_value=False),
+            patch(
+                "skillspector.input_handler.subprocess.Popen", side_effect=fake_clone
+            ) as mock_run,
+        ):
             handler.resolve("git@github.com:org/repo.git")
         assert mock_run.called
         call_args = mock_run.call_args[0][0]
@@ -415,7 +435,10 @@ def test_scp_private_ip_raises() -> None:
 
 def test_https_url_unchanged() -> None:
     """https URLs continue to extract the host via urlparse without hitting the scp fallback."""
-    host = InputHandler()._validate_url_host("https://github.com/org/repo.git", ALLOWED_GIT_HOSTS)
+    with patch("skillspector.input_handler._is_private_ip", return_value=False):
+        host = InputHandler()._validate_url_host(
+            "https://github.com/org/repo.git", ALLOWED_GIT_HOSTS
+        )
     assert host == "github.com"
 
 

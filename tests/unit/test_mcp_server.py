@@ -226,6 +226,35 @@ async def test_mcp_blocks_install_when_execution_failed(monkeypatch: pytest.Monk
     assert verdict["execution_successful"] is False
 
 
+async def test_mcp_blocks_install_when_analysis_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful, low-risk but partial scan is never safe to install."""
+
+    async def incomplete_result(state: dict, config: dict) -> dict:
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "risk_recommendation": "CAUTION",
+            "execution_successful": True,
+            "analysis_completeness": {
+                "is_complete": False,
+                "status": "partial",
+                "entirely_uninspected_files": 0,
+                "ledger_exceptions": [],
+            },
+            "filtered_findings": [],
+            "report_body": "{}",
+        }
+
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", incomplete_result)
+    verdict = await mcp_server.run_scan("fixture", use_llm=False)
+
+    assert verdict["safe_to_install"] is False
+    assert verdict["execution_successful"] is True
+    assert verdict["analysis_completeness"]["status"] == "partial"
+
+
 async def test_run_scan_rejects_local_target_when_disallowed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -26,6 +26,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from io import StringIO
 from typing import Literal
 
@@ -36,7 +37,7 @@ from rich.table import Table
 
 from skillspector import __version__ as skillspector_version
 from skillspector.inference_usage import sanitize_inference_usage
-from skillspector.inspection_ledger import AnalysisCompleteness
+from skillspector.inspection_ledger import MAX_FINDING_OUTPUT_RECORDS, AnalysisCompleteness
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -94,6 +95,8 @@ _SANITIZED_FIELDS = (
     "code_snippet",
 )
 
+_REPORT_SAFE_SOURCE_ID_RE = re.compile(r"external/[0-9a-f]{64}\Z")
+
 
 def _clean_text(value: str | None) -> str | None:
     """Strip ANSI escape sequences and disallowed control chars (keep tab/newline)."""
@@ -121,7 +124,174 @@ def _sanitize_finding(finding: Finding) -> Finding:
     )
 
 
-def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
+def _occurrence_provenance(
+    finding: Finding, occurrence: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    """Return occurrence-level provenance, falling back to the finding scope."""
+    occurrence = occurrence or {}
+    provenance: dict[str, object] = {}
+    for key, fallback in (
+        ("source_identity", finding.source_identity),
+        ("source_digest", finding.source_digest),
+        ("source_url", finding.source_url),
+    ):
+        value = occurrence.get(key, fallback)
+        if isinstance(value, str) and value:
+            provenance[key] = value
+    depth = occurrence.get("transitive_depth", finding.transitive_depth)
+    if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
+        provenance["transitive_depth"] = depth
+    return provenance
+
+
+def _report_source_identity(provenance: Mapping[str, object]) -> str | None:
+    """Return a safe opaque SARIF scope for source provenance."""
+    identity = provenance.get("source_identity")
+    if isinstance(identity, str) and identity:
+        if _REPORT_SAFE_SOURCE_ID_RE.fullmatch(identity):
+            return identity
+        return f"external/{sha256(identity.encode()).hexdigest()}"
+    digest = provenance.get("source_digest")
+    source_url = provenance.get("source_url")
+    if not digest and not source_url:
+        return None
+    canonical = json.dumps(
+        {"source_digest": digest or "", "source_url": source_url or ""},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"external/{sha256(canonical.encode()).hexdigest()}"
+
+
+def _sarif_artifact_location(
+    finding: Finding, occurrence: Mapping[str, object] | None = None
+) -> SarifArtifactLocation:
+    """Build a source-scoped SARIF artifact location for one occurrence."""
+    occurrence = occurrence or {}
+    file_path = str(occurrence.get("file", finding.file)).replace("\\", "/").lstrip("/")
+    provenance = _occurrence_provenance(finding, occurrence)
+    source_identity = _report_source_identity(provenance)
+    if source_identity:
+        uri = f"{source_identity}/{file_path}"
+    else:
+        uri = str(occurrence.get("file", finding.file))
+    properties = {
+        {
+            "source_identity": "sourceIdentity",
+            "source_digest": "sourceDigest",
+            "source_url": "sourceUrl",
+            "transitive_depth": "transitiveDepth",
+        }[key]: value
+        for key, value in provenance.items()
+    }
+    return SarifArtifactLocation(uri=uri, properties=properties or None)
+
+
+def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
+    """Expand compacted findings for human/JSON output without losing locations."""
+    expanded: list[Finding] = []
+    for finding in findings:
+        occurrences = finding.occurrences or [
+            {
+                "file": finding.file,
+                "start_line": finding.start_line,
+                "end_line": finding.end_line,
+            }
+        ]
+        for occurrence in occurrences:
+            start_value = occurrence.get("start_line", finding.start_line)
+            start_line = start_value if isinstance(start_value, int) else finding.start_line
+            end_value = occurrence.get("end_line")
+            end_line = end_value if isinstance(end_value, int) else None
+            provenance = _occurrence_provenance(finding, occurrence)
+            depth_value = provenance.get("transitive_depth")
+            expanded.append(
+                replace(
+                    finding,
+                    file=str(occurrence.get("file", finding.file)),
+                    start_line=start_line,
+                    end_line=end_line,
+                    source_identity=(
+                        str(provenance["source_identity"])
+                        if "source_identity" in provenance
+                        else None
+                    ),
+                    source_digest=(
+                        str(provenance["source_digest"]) if "source_digest" in provenance else None
+                    ),
+                    source_url=(
+                        str(provenance["source_url"]) if "source_url" in provenance else None
+                    ),
+                    transitive_depth=depth_value if isinstance(depth_value, int) else 0,
+                    occurrences=[],
+                )
+            )
+    return expanded
+
+
+def _finding_output_record_count(findings: Sequence[Finding]) -> int:
+    """Count compact findings using their public occurrence-record footprint."""
+    return sum(max(1, len(finding.occurrences)) for finding in findings)
+
+
+def _bounded_report_findings(
+    findings: list[Finding],
+    *,
+    limit: int | None = None,
+) -> list[Finding]:
+    """Bound compact findings and their occurrence records in severity order."""
+    bounded: list[Finding] = []
+    remaining = max(0, MAX_FINDING_OUTPUT_RECORDS if limit is None else limit)
+    for finding in findings:
+        if remaining <= 0:
+            break
+        occurrences = finding.occurrences
+        record_count = max(1, len(occurrences))
+        if record_count > remaining:
+            if not occurrences:
+                break
+            bounded.append(replace(finding, occurrences=occurrences[:remaining]))
+            remaining = 0
+            break
+        bounded.append(finding)
+        remaining -= record_count
+    return bounded
+
+
+def _bounded_suppressed_findings(
+    findings: list[SuppressedFinding],
+    *,
+    limit: int,
+) -> list[SuppressedFinding]:
+    """Bound suppressed findings with the same occurrence-record accounting."""
+    bounded: list[SuppressedFinding] = []
+    remaining = max(0, limit)
+    for suppressed in findings:
+        if remaining <= 0:
+            break
+        finding = suppressed.finding
+        occurrences = finding.occurrences
+        record_count = max(1, len(occurrences))
+        if record_count > remaining:
+            if not occurrences:
+                break
+            bounded.append(
+                replace(
+                    suppressed,
+                    finding=replace(finding, occurrences=occurrences[:remaining]),
+                )
+            )
+            remaining = 0
+            break
+        bounded.append(suppressed)
+        remaining -= record_count
+    return bounded
+
+
+def _build_sarif_properties(
+    finding: Finding, occurrence: Mapping[str, object] | None = None
+) -> dict[str, object] | None:
     """Project selected finding metadata into a SARIF properties dictionary."""
     finding_dict = finding.to_dict()
     metadata: dict[str, object] = {
@@ -138,10 +308,15 @@ def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
         "tags": finding_dict["tags"],
         "evidence": finding_dict["evidence"],
     }
-    if finding.source_url:
-        metadata["sourceUrl"] = finding.source_url
-    if finding.transitive_depth:
-        metadata["transitiveDepth"] = finding.transitive_depth
+    provenance = _occurrence_provenance(finding, occurrence)
+    for key, sarif_key in (
+        ("source_identity", "sourceIdentity"),
+        ("source_digest", "sourceDigest"),
+        ("source_url", "sourceUrl"),
+        ("transitive_depth", "transitiveDepth"),
+    ):
+        if key in provenance:
+            metadata[sarif_key] = provenance[key]
     cleaned = {key: value for key, value in metadata.items() if value is not None}
     return cleaned or None
 
@@ -276,10 +451,29 @@ def _compute_risk_score(
         key=lambda f: (f.rule_id or "UNKNOWN", severity_rank.get((f.severity or "LOW").upper(), 4)),
     )
 
-    file_executable: dict[str, bool] = {}
+    def component_source_scope(component: Mapping[str, object]) -> str:
+        for key in ("source_identity", "source_url", "source_digest"):
+            value = component.get(key)
+            if isinstance(value, str) and value:
+                return f"{key}:{value}"
+        return ""
+
+    def finding_source_scope(finding: Finding) -> str:
+        for key, value in (
+            ("source_identity", finding.source_identity),
+            ("source_url", finding.source_url),
+            ("source_digest", finding.source_digest),
+        ):
+            if value:
+                return f"{key}:{value}"
+        return ""
+
+    file_executable: dict[tuple[str, str], bool] = {}
     if component_metadata:
         for cm in component_metadata:
-            file_executable[str(cm.get("path", ""))] = bool(cm.get("executable", False))
+            file_executable[(component_source_scope(cm), str(cm.get("path", "")))] = bool(
+                cm.get("executable", False)
+            )
 
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
@@ -303,7 +497,7 @@ def _compute_risk_score(
         contribution = base_points * weight * confidence
 
         # Apply 1.3x multiplier only to findings from executable files
-        if has_executable_scripts and file_executable.get(f.file, False):
+        if has_executable_scripts and file_executable.get((finding_source_scope(f), f.file), False):
             contribution *= 1.3
 
         score += contribution
@@ -342,23 +536,34 @@ def _build_sarif(
     for finding in findings:
         if not finding.rule_id or not finding.message:
             continue
-        region = SarifRegion(startLine=finding.start_line, endLine=finding.end_line)
-        results.append(
-            SarifResult(
-                ruleId=finding.rule_id,
-                message=SarifMessage(text=finding.message),
-                level=_severity_to_sarif_level(finding.severity),
-                properties=_build_sarif_properties(finding),
-                locations=[
-                    SarifLocation(
-                        physicalLocation=SarifPhysicalLocation(
-                            artifactLocation=SarifArtifactLocation(uri=finding.file),
-                            region=region,
+        occurrences = finding.occurrences or [
+            {
+                "file": finding.file,
+                "start_line": finding.start_line,
+                "end_line": finding.end_line,
+            }
+        ]
+        for occurrence in occurrences:
+            start_value = occurrence.get("start_line", finding.start_line)
+            start_line = start_value if isinstance(start_value, int) else finding.start_line
+            end_value = occurrence.get("end_line")
+            end_line = int(end_value) if isinstance(end_value, int) else None
+            results.append(
+                SarifResult(
+                    ruleId=finding.rule_id,
+                    message=SarifMessage(text=finding.message),
+                    level=_severity_to_sarif_level(finding.severity),
+                    properties=_build_sarif_properties(finding, occurrence),
+                    locations=[
+                        SarifLocation(
+                            physicalLocation=SarifPhysicalLocation(
+                                artifactLocation=_sarif_artifact_location(finding, occurrence),
+                                region=SarifRegion(startLine=start_line, endLine=end_line),
+                            )
                         )
-                    )
-                ],
+                    ],
+                )
             )
-        )
         if finding.rule_id not in seen_rule_ids:
             seen_rule_ids[finding.rule_id] = finding.message
 
@@ -368,25 +573,35 @@ def _build_sarif(
         finding = sf.finding
         if not finding.rule_id or not finding.message:
             continue
-        results.append(
-            SarifResult(
-                ruleId=finding.rule_id,
-                message=SarifMessage(text=finding.message),
-                level=_severity_to_sarif_level(finding.severity),
-                properties=_build_sarif_properties(finding),
-                locations=[
-                    SarifLocation(
-                        physicalLocation=SarifPhysicalLocation(
-                            artifactLocation=SarifArtifactLocation(uri=finding.file),
-                            region=SarifRegion(
-                                startLine=finding.start_line, endLine=finding.end_line
-                            ),
+        occurrences = finding.occurrences or [
+            {
+                "file": finding.file,
+                "start_line": finding.start_line,
+                "end_line": finding.end_line,
+            }
+        ]
+        for occurrence in occurrences:
+            start_value = occurrence.get("start_line", finding.start_line)
+            start_line = start_value if isinstance(start_value, int) else finding.start_line
+            end_value = occurrence.get("end_line")
+            end_line = int(end_value) if isinstance(end_value, int) else None
+            results.append(
+                SarifResult(
+                    ruleId=finding.rule_id,
+                    message=SarifMessage(text=finding.message),
+                    level=_severity_to_sarif_level(finding.severity),
+                    properties=_build_sarif_properties(finding, occurrence),
+                    locations=[
+                        SarifLocation(
+                            physicalLocation=SarifPhysicalLocation(
+                                artifactLocation=_sarif_artifact_location(finding, occurrence),
+                                region=SarifRegion(startLine=start_line, endLine=end_line),
+                            )
                         )
-                    )
-                ],
-                suppressions=[SarifSuppression(kind="external", justification=sf.reason)],
+                    ],
+                    suppressions=[SarifSuppression(kind="external", justification=sf.reason)],
+                )
             )
-        )
         if finding.rule_id not in seen_rule_ids:
             seen_rule_ids[finding.rule_id] = finding.message
 
@@ -398,10 +613,91 @@ def _build_sarif(
         for rule_id, description in sorted(seen_rule_ids.items())
     ]
 
-    notifications: list[SarifNotification] = []
     completeness = analysis_completeness or {}
+
+    def nonnegative_count(key: str) -> int:
+        value = completeness.get(key, 0)
+        return max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    raw_ledger_exceptions = completeness.get("ledger_exceptions", [])
+    raw_scope_exclusions = completeness.get("scope_exclusions", [])
+    raw_limitations = completeness.get("limitations", [])
+    ledger_exception_count = (
+        sum(1 for item in raw_ledger_exceptions if isinstance(item, Mapping))
+        if isinstance(raw_ledger_exceptions, list)
+        else 0
+    )
+    scope_exclusion_count = (
+        sum(1 for item in raw_scope_exclusions if isinstance(item, Mapping))
+        if isinstance(raw_scope_exclusions, list)
+        else 0
+    )
+    limitation_count = len(raw_limitations) if isinstance(raw_limitations, list) else 0
+    fully_inspected = nonnegative_count("fully_inspected_files")
+    partially_inspected = nonnegative_count("partially_inspected_files")
+    entirely_uninspected = nonnegative_count("entirely_uninspected_files")
+
+    raw_status = completeness.get("status")
+    requested_status = (
+        raw_status
+        if isinstance(raw_status, str) and raw_status in {"complete", "partial", "failed"}
+        else None
+    )
+    is_complete = (
+        completeness.get("is_complete", True) is True
+        and requested_status in {None, "complete"}
+        and execution_successful
+        and partially_inspected == 0
+        and entirely_uninspected == 0
+        and ledger_exception_count == 0
+        and limitation_count == 0
+    )
+    status = (
+        "complete"
+        if is_complete
+        else "failed"
+        if not execution_successful or requested_status == "failed"
+        else "partial"
+    )
+    raw_coverage = completeness.get("coverage_percent", 100.0 if is_complete else 0.0)
+    coverage = (
+        float(raw_coverage)
+        if isinstance(raw_coverage, (int, float))
+        and not isinstance(raw_coverage, bool)
+        and 0.0 <= float(raw_coverage) <= 100.0
+        else 0.0
+    )
+    completeness_projection: dict[str, object] = {
+        "isComplete": is_complete,
+        "status": status,
+        "coveragePercent": coverage,
+        "totalComponents": nonnegative_count("total_components"),
+        "fullyInspectedFiles": fully_inspected,
+        "partiallyInspectedFiles": partially_inspected,
+        "entirelyUninspectedFiles": entirely_uninspected,
+        # Counts are a deliberately payload-free projection. Detailed, sanitized
+        # exceptions remain represented as bounded SARIF notifications below.
+        "ledgerExceptionCount": ledger_exception_count,
+        "scopeExclusionCount": scope_exclusion_count,
+        "limitationCount": limitation_count,
+        "notificationRecordLimit": MAX_FINDING_OUTPUT_RECORDS,
+        "notificationsTruncated": False,
+    }
+
+    notifications: list[SarifNotification] = []
+    observed_notifications = 0
+    notifications_truncated = False
+
+    def append_notification(notification: SarifNotification) -> None:
+        nonlocal observed_notifications, notifications_truncated
+        observed_notifications += 1
+        if len(notifications) < MAX_FINDING_OUTPUT_RECORDS:
+            notifications.append(notification)
+        else:
+            notifications_truncated = True
+
     for summary in structured_summaries or []:
-        notifications.append(
+        append_notification(
             SarifNotification(
                 message=SarifMessage(text=_structured_summary_notification(summary)),
                 level="note",
@@ -454,7 +750,7 @@ def _build_sarif(
     if isinstance(scope_exclusions, list):
         for exception in scope_exclusions:
             if isinstance(exception, Mapping):
-                notifications.append(notification_from_exception(exception, "note"))
+                append_notification(notification_from_exception(exception, "note"))
     ledger_exceptions = completeness.get("ledger_exceptions", [])
     if isinstance(ledger_exceptions, list):
         for exception in ledger_exceptions:
@@ -462,11 +758,11 @@ def _build_sarif(
                 level: Literal["error", "warning", "note"] = (
                     "error" if exception.get("fatal") else "warning"
                 )
-                notifications.append(notification_from_exception(exception, level))
+                append_notification(notification_from_exception(exception, level))
     limitations = completeness.get("limitations", [])
     if isinstance(limitations, list):
         for limitation in limitations:
-            notifications.append(
+            append_notification(
                 SarifNotification(
                     message=SarifMessage(text=str(limitation)),
                     level="warning",
@@ -474,17 +770,34 @@ def _build_sarif(
                 )
             )
     if degraded_notice:
-        notifications.append(
+        append_notification(
             SarifNotification(
                 message=SarifMessage(text=degraded_notice),
                 level="warning",
                 properties={"kind": "llm_degradation"},
             )
         )
+    if notifications_truncated:
+        completeness_projection["notificationsTruncated"] = True
+        sentinel = SarifNotification(
+            message=SarifMessage(text="Inspection notifications reached the output limit."),
+            level="warning",
+            properties={
+                "kind": "inspection_notification_limit",
+                "reasonCode": "output_limit",
+                "observedRecords": observed_notifications,
+                "limitRecords": MAX_FINDING_OUTPUT_RECORDS,
+            },
+        )
+        # Replace one detailed record so the bounded output always carries the
+        # explicit truncation fact.
+        if notifications:
+            notifications[-1] = sentinel
     invocations = [
         SarifInvocation(
             executionSuccessful=execution_successful,
             toolExecutionNotifications=notifications or None,
+            properties={"analysisCompleteness": completeness_projection},
         )
     ]
 
@@ -522,6 +835,7 @@ def _render_terminal_completeness(
     table.add_column("Metric", style="bold")
     table.add_column("Value")
     table.add_row("Execution", "successful" if execution_successful else "failed")
+    table.add_row("Status", str(completeness.get("status", "complete")))
     table.add_row("Coverage", f"{completeness.get('coverage_percent', 100.0)}%")
     table.add_row("Fully inspected", str(completeness.get("fully_inspected_files", 0)))
     table.add_row("Partially inspected", str(completeness.get("partially_inspected_files", 0)))
@@ -835,6 +1149,8 @@ def _format_json(
                 "executable": c.get("executable"),
                 "size_bytes": c.get("size_bytes"),
                 "source_url": c.get("source_url"),
+                "source_identity": c.get("source_identity"),
+                "source_digest": c.get("source_digest"),
             }
             for c in component_metadata
         ],
@@ -872,6 +1188,7 @@ def _render_markdown_completeness(
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
     lines.append(f"| Execution | {'successful' if execution_successful else 'failed'} |")
+    lines.append(f"| Status | {_markdown_cell(completeness.get('status', 'complete'))} |")
     lines.append(f"| Coverage | {_markdown_cell(completeness.get('coverage_percent', 100.0))}% |")
     lines.append(
         f"| Fully inspected | {_markdown_cell(completeness.get('fully_inspected_files', 0))} |"
@@ -1050,19 +1367,15 @@ def report(state: SkillspectorState) -> dict[str, object]:
     validated finding IDs, applies baseline suppression, and renders all surfaces.
     """
     clear_python_ast_cache(state.get("python_ast_cache_key"))
-    raw_findings = state.get("findings", [])
+    raw_findings = state.get("findings")
+    if raw_findings is None:
+        # Preserve the public node contract for direct callers while ensuring
+        # graph executions prefer the pre-meta canonical finding collection.
+        raw_findings = state.get("filtered_findings", [])
     findings_by_id = {finding.finding_id: finding for finding in raw_findings}
-    effective_ids = state.get("effective_finding_ids")
-    if isinstance(effective_ids, list):
-        selected_findings = [
-            findings_by_id[finding_id]
-            for finding_id in effective_ids
-            if isinstance(finding_id, str) and finding_id in findings_by_id
-        ]
-    else:
-        # Transitional direct-node compatibility. Graph execution always receives
-        # `effective_finding_ids` from finalize_inspection_ledger.
-        selected_findings = state.get("filtered_findings", raw_findings)
+    # Meta/LLM analysis can enrich canonical objects but cannot remove
+    # deterministic findings from primary output.
+    selected_findings = list(findings_by_id.values())
     selected_findings = [_sanitize_finding(finding) for finding in selected_findings]
 
     raw_structured_summaries = state.get("structured_summaries") or []
@@ -1077,6 +1390,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "scanned_components": 0,
         "coverage_percent": 100.0,
         "is_complete": True,
+        "status": "complete",
         "execution_successful": True,
         "fully_inspected_files": 0,
         "partially_inspected_files": 0,
@@ -1111,7 +1425,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
     ]
     if transitive_truncation_reasons:
         analysis_completeness = dict(analysis_completeness)
-        limitations = list(analysis_completeness.get("limitations") or [])
+        raw_limitations = analysis_completeness.get("limitations")
+        limitations = list(raw_limitations) if isinstance(raw_limitations, list) else []
         limitations.append(
             "Transitive traversal truncated: " + "; ".join(transitive_truncation_reasons)
         )
@@ -1144,10 +1459,19 @@ def report(state: SkillspectorState) -> dict[str, object]:
         file_cache=file_cache,
         scanner_version=skillspector_version,
     )
-    findings_for_scoring = deduplicate(active_findings)
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
-        findings_for_scoring, has_executable_scripts, component_metadata
+        active_findings, has_executable_scripts, component_metadata
     )
+    reported_findings = _bounded_report_findings(deduplicate(active_findings))
+    remaining_output_records = max(
+        0,
+        MAX_FINDING_OUTPUT_RECORDS - _finding_output_record_count(reported_findings),
+    )
+    suppressed = _bounded_suppressed_findings(
+        suppressed,
+        limit=remaining_output_records,
+    )
+    display_findings = _expand_occurrences(reported_findings)
     exceptions = analysis_completeness.get("ledger_exceptions", [])
     fatal_exception = (
         any(
@@ -1164,13 +1488,18 @@ def report(state: SkillspectorState) -> dict[str, object]:
     # Fail closed for any incomplete/degraded scan while preserving the honest
     # score and severity. Transitive traversal limits are an additional source
     # of incomplete coverage.
+    incomplete = not bool(analysis_completeness.get("is_complete", True))
     if (
-        degraded or fatal_exception or entirely_uninspected > 0 or transitive_truncation_reasons
+        degraded
+        or fatal_exception
+        or entirely_uninspected > 0
+        or incomplete
+        or transitive_truncation_reasons
     ) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
 
     sarif_report = _build_sarif(
-        active_findings,
+        reported_findings,
         suppressed,
         degraded_notice=degraded_notice,
         analysis_completeness=analysis_completeness,
@@ -1179,7 +1508,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     )
     if output_format == "terminal":
         report_body = _format_terminal(
-            active_findings,
+            display_findings,
             component_metadata,
             manifest,
             skill_path,
@@ -1197,7 +1526,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         )
     elif output_format == "json":
         report_body = _format_json(
-            active_findings,
+            display_findings,
             component_metadata,
             manifest,
             skill_path,
@@ -1224,7 +1553,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
-            active_findings,
+            display_findings,
             component_metadata,
             manifest,
             skill_path,
@@ -1255,8 +1584,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "risk_severity": risk_severity,
         "risk_recommendation": risk_recommendation,
         "report_body": report_body,
-        "filtered_findings": selected_findings,
-        "active_findings": active_findings,
+        "filtered_findings": reported_findings,
         "suppressed_findings": suppressed,
         "execution_successful": execution_successful,
         "transitive_targets_scanned": transitive_targets_scanned,

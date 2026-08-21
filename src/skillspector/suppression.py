@@ -18,7 +18,7 @@
 A *baseline* is a YAML (or JSON) file that tells the report node which findings
 to drop before scoring and reporting. It supports two complementary mechanisms:
 
-* ``rules`` — human-authored, glob-based suppressions. A finding is suppressed
+* ``rules`` — human-authored, glob-based suppressions for the root scan. A finding is suppressed
   when every field a rule specifies (``id``, ``path``, ``message``) glob-matches
   the finding. ``message`` covers both the analyzer description and the matched
   text surfaced as ``finding`` in reports. Unspecified fields match anything.
@@ -75,6 +75,17 @@ logger = get_logger(__name__)
 BASELINE_VERSION = 2
 _FINGERPRINT_SCHEMA = "skillspector-finding-fingerprint-v2"
 _FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SOURCE_IDENTITY_RE = re.compile(r"external/[0-9a-f]{64}\Z")
+
+
+def _has_exact_source_provenance(finding: Finding) -> bool:
+    """Return whether immutable transitive provenance has canonical form."""
+    return bool(
+        finding.source_identity
+        and _SOURCE_IDENTITY_RE.fullmatch(finding.source_identity)
+        and finding.source_digest
+        and _FINGERPRINT_RE.fullmatch(finding.source_digest)
+    )
 
 
 def _match_glob(value: str, pattern: str) -> bool:
@@ -99,13 +110,27 @@ def _normalize_component_path(path: str) -> str:
 
 
 def _component_content(
-    file_cache: Mapping[str, str], file_path: str, *, source_url: str | None = None
+    file_cache: Mapping[str, str],
+    file_path: str,
+    *,
+    source_identity: str | None = None,
+    source_url: str | None = None,
 ) -> str | None:
-    """Look up *file_path* while tolerating slash-style differences."""
-    if source_url:
-        source_key = f"{source_url}::{file_path}"
-        if source_key in file_cache:
-            return file_cache[source_key]
+    """Look up *file_path* without crossing source-scope boundaries."""
+    source_scope = source_identity or source_url
+    if source_scope:
+        normalized_path = _normalize_component_path(file_path)
+        scoped_candidates = (
+            f"{source_scope}::{file_path}",
+            f"{source_scope}::{normalized_path}",
+            f"{source_scope.rstrip('/')}/{normalized_path}",
+        )
+        for source_key in scoped_candidates:
+            if source_key in file_cache:
+                return file_cache[source_key]
+        # A transitive finding must never borrow a same-named root or sibling
+        # component when its own immutable source cache entry is unavailable.
+        return None
     if file_path in file_cache:
         return file_cache[file_path]
     normalized = _normalize_component_path(file_path)
@@ -160,9 +185,21 @@ def finding_fingerprint(
             "code_snippet": finding.code_snippet or "",
         },
     }
-    if finding.source_url or finding.transitive_depth:
+    if (
+        finding.source_identity
+        or finding.source_digest
+        or finding.source_url
+        or finding.transitive_depth
+    ):
         payload["source"] = {
-            "url": finding.source_url or "",
+            "identity": finding.source_identity or "",
+            "digest": finding.source_digest or "",
+            "url": (
+                finding.source_url
+                if not finding.source_identity and not finding.source_digest
+                else ""
+            )
+            or "",
             "depth": finding.transitive_depth,
         }
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -229,9 +266,21 @@ class Baseline:
         scanner_version: str | None = None,
     ) -> str | None:
         """Return the suppression reason for *finding*, or None if not suppressed."""
-        for rule in self.rules:
-            if rule.matches(finding):
-                return rule.reason or "matched suppression rule"
+        is_transitive = bool(
+            finding.source_identity
+            or finding.source_digest
+            or finding.source_url
+            or finding.transitive_depth
+        )
+        # Root-authored globs are intentionally never inherited by dependencies.
+        # A transitive finding needs an exact fingerprint bound to both its opaque
+        # source identity and the immutable digest of the inspected source.
+        if not is_transitive:
+            for rule in self.rules:
+                if rule.matches(finding):
+                    return rule.reason or "matched suppression rule"
+        elif not _has_exact_source_provenance(finding):
+            return None
         if (
             file_content is None
             or not scanner_version
@@ -387,7 +436,10 @@ def partition_findings(
         reason = baseline.reason_for(
             finding,
             file_content=_component_content(
-                cache, finding.file or "", source_url=finding.source_url
+                cache,
+                finding.file or "",
+                source_identity=finding.source_identity,
+                source_url=finding.source_url,
             ),
             scanner_version=scanner_version,
         )
@@ -461,7 +513,23 @@ def build_baseline_dict(
     entries: list[dict[str, str]] = []
     seen_hashes: set[str] = set()
     for finding in findings:
-        content = _component_content(file_cache, finding.file or "", source_url=finding.source_url)
+        is_transitive = bool(
+            finding.source_identity
+            or finding.source_digest
+            or finding.source_url
+            or finding.transitive_depth
+        )
+        if is_transitive and not _has_exact_source_provenance(finding):
+            raise ValueError(
+                "cannot create an exact transitive fingerprint without canonical "
+                "source_identity and source_digest"
+            )
+        content = _component_content(
+            file_cache,
+            finding.file or "",
+            source_identity=finding.source_identity,
+            source_url=finding.source_url,
+        )
         if content is None:
             raise ValueError(
                 f"cannot create an exact fingerprint: source content missing for {finding.file!r}"
@@ -480,6 +548,8 @@ def build_baseline_dict(
                 "rule_id": finding.rule_id,
                 "file": finding.file,
                 "reason": reason.strip(),
+                **({"source_identity": finding.source_identity} if finding.source_identity else {}),
+                **({"source_digest": finding.source_digest} if finding.source_digest else {}),
             }
         )
 

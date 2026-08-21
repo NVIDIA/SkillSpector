@@ -123,10 +123,6 @@ AR3_PATTERNS = [
 
 _RULES = [("AR1", AR1_PATTERNS), ("AR2", AR2_PATTERNS), ("AR3", AR3_PATTERNS)]
 
-# Confidence penalty applied when the match appears inside a code/doc example, and the
-# minimum confidence required to emit a finding after the penalty.
-_EXAMPLE_PENALTY = 0.4
-_MIN_CONFIDENCE = 0.5
 _MODE_ENABLED_RE = re.compile(
     r"\b(?:developer|debug|god|sudo|jailbreak)\s+mode\s+(?:enabled|on|activated|engaged)\b",
     re.IGNORECASE,
@@ -410,36 +406,27 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 match_line = lines[line_num - 1] if lines else content
                 previous_line = lines[line_num - 2] if line_num > 1 else None
                 context = get_context(content, match.start(), context_lines=3)
-                if _MODE_ENABLED_RE.fullmatch(match.group(0)) and (
-                    _SECURITY_REVIEW_CONTEXT_RE.search(context)
-                ):
-                    continue
+                security_review_context = bool(
+                    _MODE_ENABLED_RE.fullmatch(match.group(0))
+                    and _SECURITY_REVIEW_CONTEXT_RE.search(context)
+                )
 
                 line_start = content.rfind("\n", 0, match.start()) + 1
                 line_match_start = match.start() - line_start
                 line_match_end = line_match_start + len(match.group(0))
                 match_clause, _, _ = _match_clause(match_line, line_match_start, line_match_end)
                 is_directive = _is_directly_instructive(match_clause.lower(), match.group(0))
-                confidence = base_confidence
-                if (
-                    is_code_example(context)
-                    and _is_explicit_example_context(context)
-                    and not _is_quoted_match(
-                        match_line,
-                        match.group(0),
-                    )
-                ):
-                    confidence -= _EXAMPLE_PENALTY
-                if _is_benign_ar_context(
+                example_context = is_code_example(context) and _is_explicit_example_context(context)
+                benign_context = _is_benign_ar_context(
                     match_line,
                     match.group(0),
                     line_match_start,
                     line_match_end,
                     previous_line=previous_line,
-                ):
-                    continue
-                if confidence < _MIN_CONFIDENCE:
-                    continue
+                )
+                finding_tags = list(tag)
+                if security_review_context or example_context or benign_context:
+                    finding_tags.extend(["contextual-triage", "likely-benign-context"])
                 findings.append(
                     AnalyzerFinding(
                         rule_id=rule_id,
@@ -449,8 +436,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                             file=file_path,
                             start_line=line_num,
                         ),
-                        confidence=round(confidence, 2),
-                        tags=tag,
+                        confidence=base_confidence,
+                        tags=finding_tags,
                         context=_emitted_context(
                             context,
                             match_line,
