@@ -736,7 +736,7 @@ class TestDocumentationPathConfidenceReduction:
     """Documentation paths do not change finding visibility or confidence."""
 
     def test_sibling_prose_path_preserves_exact_finding_strength(self) -> None:
-        content = "For example, use the parameter to shell=True."
+        content = "Use the option to --force."
 
         def finding_strength(path: str) -> list[tuple[str, str, float]]:
             findings = static_runner.run_static_patterns(
