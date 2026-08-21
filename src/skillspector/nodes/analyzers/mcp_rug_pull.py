@@ -431,18 +431,20 @@ def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
         return
 
     version_str = str(version_value).strip()
+    version_preview = version_str[:200]
     if version_str in ("*", "latest", "any"):
         budget.emit(
             Finding(
                 rule_id="RP3",
-                message=f"Skill version is unpinned: '{version_str}'.",
+                message=f"Skill version is unpinned: '{version_preview}'.",
                 severity="LOW",
                 confidence=0.80,
                 file="SKILL.md",
                 start_line=1,
                 category=_CATEGORY,
                 tags=list(_TAGS),
-                matched_text=version_str,
+                matched_text=version_preview,
+                match_fingerprint=compute_match_fingerprint("RP3", version_str),
                 explanation=(
                     "An unpinned version allows automatic updates to any "
                     "future version, creating a rug-pull risk."
@@ -454,14 +456,15 @@ def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
         budget.emit(
             Finding(
                 rule_id="RP3",
-                message=f"Skill version constraint may be too broad: '{version_str}'.",
+                message=f"Skill version constraint may be too broad: '{version_preview}'.",
                 severity="LOW",
                 confidence=0.40 if version_str.startswith(">=") else 0.50,
                 file="SKILL.md",
                 start_line=1,
                 category=_CATEGORY,
                 tags=list(_TAGS),
-                matched_text=version_str,
+                matched_text=version_preview,
+                match_fingerprint=compute_match_fingerprint("RP3", version_str),
                 explanation=(
                     "Broad version constraints allow automatic major-version "
                     "updates, which could silently introduce malicious changes."

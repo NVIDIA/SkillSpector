@@ -157,6 +157,30 @@ class TestCorePipeline:
             "limit_bytes": 128,
         }
 
+    def test_fingerprint_bound_marks_node_analysis_partial(self, monkeypatch):
+        rules = static_yara.yara.compile(
+            source="rule long_tail { strings: $a = /A{700}X/ condition: $a }"
+        )
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+        monkeypatch.setattr(
+            static_yara,
+            "MAX_YARA_MATCH_FINGERPRINT_BYTES_PER_FILE",
+            128,
+            raising=False,
+        )
+
+        result = static_yara.node(
+            {
+                "components": ["large-match.txt"],
+                "file_cache": {"large-match.txt": "A" * 700 + "X"},
+            }
+        )
+
+        assert result["findings"] == []
+        assert result["inspection_ledger"][0]["outcome"] == "partial"
+        assert result["inspection_ledger"][0]["reason_code"] == "size_limit"
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
     def test_single_match_produces_finding(self, tmp_path):
         _write_rule(
             tmp_path,

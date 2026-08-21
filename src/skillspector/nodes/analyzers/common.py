@@ -30,6 +30,7 @@ MARKDOWN_FENCE_OPEN = re.compile(r"^[ ]{0,3}(`{3,}(?=[^`\r\n]*$)|~{3,})[^\r\n]*$
 MARKDOWN_FENCE_CLOSE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
 LOGICAL_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 LINE_BREAK_CHARS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+MAX_FINDING_CONTEXT_CHARS = 1_000
 
 
 def make_dummy_finding(analyzer_id: str) -> Finding:
@@ -90,14 +91,38 @@ def get_context(content: str, match_start: int, context_lines: int = 3) -> str:
     match_line = get_line_number(content, match_start) - 1
     start_line = max(0, match_line - context_lines)
     end_line = min(len(lines), match_line + context_lines + 1)
-    return "\n".join(lines[start_line:end_line])
+    selected_lines = lines[start_line:end_line]
+    if not selected_lines:
+        return ""
+    relative_line = min(match_line - start_line, len(selected_lines) - 1)
+    line_start = content.rfind("\n", 0, match_start) + 1
+    column = min(max(0, match_start - line_start), len(selected_lines[relative_line]))
+    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line]) + column
+    return _bounded_context("\n".join(selected_lines), anchor)
 
 
 def get_context_from_lines(lines: list[str], lineno: int, window: int = 3) -> str:
     """Extract surrounding lines given pre-split *lines* and a 1-based *lineno*."""
     start = max(0, lineno - 1 - window)
     end = min(len(lines), lineno + window)
-    return "\n".join(lines[start:end])
+    selected_lines = lines[start:end]
+    if not selected_lines:
+        return ""
+    relative_line = min(max(0, lineno - 1 - start), len(selected_lines) - 1)
+    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line])
+    return _bounded_context("\n".join(selected_lines), anchor)
+
+
+def _bounded_context(context: str, anchor: int) -> str:
+    """Return a bounded context window that retains the finding anchor."""
+    if len(context) <= MAX_FINDING_CONTEXT_CHARS:
+        return context
+    half_window = MAX_FINDING_CONTEXT_CHARS // 2
+    start = min(
+        max(0, anchor - half_window),
+        len(context) - MAX_FINDING_CONTEXT_CHARS,
+    )
+    return context[start : start + MAX_FINDING_CONTEXT_CHARS]
 
 
 def resolve_dotted_name(node: ast.expr) -> str | None:

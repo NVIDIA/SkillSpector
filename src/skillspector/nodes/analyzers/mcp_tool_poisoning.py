@@ -256,6 +256,7 @@ def _check_tp1(
 
     # --- Data URIs (check first) ---
     for m in _DATA_URI_RE.finditer(text):
+        complete_match = m.group()
         data_uri_ranges.append((m.start(), m.end()))
         findings.append(
             Finding(
@@ -266,7 +267,8 @@ def _check_tp1(
                 file="SKILL.md",
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
-                matched_text=m.group(),
+                matched_text=complete_match[:4096],
+                match_fingerprint=compute_match_fingerprint("TP1", complete_match),
                 explanation=(
                     "Data URIs embedded in metadata fields can encode and deliver hidden payloads "
                     "to AI agents processing the manifest."
@@ -329,6 +331,7 @@ def _check_tp1(
 
     # --- Zero-width chars ---
     for m in _ZERO_WIDTH_RE.finditer(text):
+        complete_match = m.group()
         findings.append(
             Finding(
                 rule_id="TP1",
@@ -341,7 +344,8 @@ def _check_tp1(
                 file="SKILL.md",
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
-                matched_text=m.group(),
+                matched_text=complete_match[:4096],
+                match_fingerprint=compute_match_fingerprint("TP1", complete_match),
                 explanation=(
                     "Zero-width Unicode characters are invisible to humans but detectable by AI. "
                     "When followed by visible text, they indicate hidden content injection."
@@ -833,7 +837,8 @@ def _check_tp3(
             malicious_url = _TP3_MALICIOUS_URL_RE.search(default_str)
             shell_cmd = _TP3_SHELL_CMD_RE.search(default_str)
             if malicious_url or shell_cmd:
-                matched = (malicious_url or shell_cmd).group()  # type: ignore[union-attr]
+                complete_match = (malicious_url or shell_cmd).group()  # type: ignore[union-attr]
+                matched = complete_match[:4096]
                 findings.append(
                     Finding(
                         rule_id="TP3",
@@ -847,6 +852,7 @@ def _check_tp3(
                         category=_CATEGORY,
                         tags=list(_FRAMEWORK_TAGS),
                         matched_text=matched,
+                        match_fingerprint=compute_match_fingerprint("TP3", complete_match),
                         explanation=(
                             "Default parameter values containing URLs or shell commands may "
                             "trigger unintended network requests or command execution when used "

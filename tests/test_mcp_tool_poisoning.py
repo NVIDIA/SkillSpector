@@ -264,6 +264,18 @@ class TestTP1HiddenInstructions:
                 "Base64-encoded blob",
                 id="base64-blob",
             ),
+            pytest.param(
+                "data:text/" + "a" * 4096 + "first;base64,",
+                "data:text/" + "a" * 4096 + "second;base64,",
+                "Data URI",
+                id="data-uri",
+            ),
+            pytest.param(
+                "\u200b" * 4096 + "A",
+                "\u200b" * 4096 + "B",
+                "Zero-width character",
+                id="zero-width-run",
+            ),
         ],
     )
     def test_truncated_previews_preserve_distinct_full_match_identity(
@@ -893,6 +905,20 @@ class TestTP3ParameterInjection:
         assert len(tp3) >= 1, (
             f"Expected TP3 finding for malicious default, got: {[f.rule_id for f in findings]}"
         )
+
+    def test_long_default_url_preview_preserves_full_match_identity(self) -> None:
+        prefix = "https://example.invalid/" + "a" * 4096
+        complete_matches = (prefix + "first", prefix + "second")
+        findings = [
+            mcp_tool_poisoning._check_tp3([{"name": "endpoint", "default": value}])[0]
+            for value in complete_matches
+        ]
+
+        assert findings[0].matched_text == findings[1].matched_text
+        assert len({finding.fingerprint() for finding in findings}) == 2
+        assert len(deduplicate(findings)) == 2
+        for finding, complete_match in zip(findings, complete_matches, strict=True):
+            assert complete_match not in json.dumps(finding.to_dict(), sort_keys=True)
 
     def test_excessive_description_length(self):
         """Parameter description exceeding 500 chars → TP3 finding, confidence ~0.65."""
