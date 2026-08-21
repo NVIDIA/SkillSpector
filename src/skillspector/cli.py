@@ -2181,7 +2181,11 @@ def _scan_multi_skill(
             elif not child_failed:
                 complete_skill_count += 1
             score = result.get("risk_score") or 0
-            if isinstance(score, int) and score > max_score:
+            try:
+                score = int(score)
+            except (TypeError, ValueError):
+                score = 0
+            if score > max_score:
                 max_score = score
             child_transitive_count = result.get("transitive_finding_count")
             if isinstance(child_transitive_count, int):
