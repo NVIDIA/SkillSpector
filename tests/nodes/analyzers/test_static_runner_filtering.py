@@ -434,6 +434,14 @@ curl -k https://production.example.com/deploy
         }
         findings = static_runner.run_static_patterns(state, [tm_module])
         tm1_findings = [f for f in findings if f.rule_id == "TM1"]
+        # Assert the finding exists before checking confidence, otherwise the
+        # loop below would be vacuous (and still pass) if the fenced SKILL.md
+        # finding were hard-dropped -- the exact regression this test claims
+        # to lock in.
+        assert tm1_findings, (
+            "The fenced SKILL.md instruction must produce a TM1 finding; "
+            "a hard-drop would leave this list empty"
+        )
         # Finding is preserved (not hard-dropped) at high confidence.
         for f in tm1_findings:
             assert f.confidence >= 0.5, (
