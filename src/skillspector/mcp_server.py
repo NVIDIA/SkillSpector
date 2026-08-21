@@ -27,6 +27,7 @@ installed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +45,40 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 VALID_FORMATS = ("json", "markdown", "sarif", "terminal")
+
+
+def _llm_runtime_accounting(*, enabled: bool, result: Mapping[str, object]) -> tuple[bool, bool]:
+    """Return ``(used, complete)`` for an enabled LLM pass.
+
+    Missing or empty telemetry means no call was applicable, matching the graph
+    report's existing no-attempt semantics. For a non-empty log, at least one
+    successful call proves use, while every record must be well formed and
+    successful for the requested pass to be complete.
+    """
+    if not enabled:
+        return False, False
+    call_log = result.get("llm_call_log")
+    if not isinstance(call_log, list) or not call_log:
+        return True, True
+    records = [record for record in call_log if isinstance(record, Mapping)]
+    used = any(record.get("ok") is True for record in records)
+    complete = len(records) == len(call_log) and all(record.get("ok") is True for record in records)
+    return used, complete
+
+
+def _llm_runtime_available(*, preflight_available: bool, result: Mapping[str, object]) -> bool:
+    """Apply the report contract for provider and meta-analysis availability."""
+    if not preflight_available:
+        return False
+    call_log = result.get("llm_call_log")
+    if not isinstance(call_log, list):
+        return True
+    meta_analyzer_records = [
+        record
+        for record in call_log
+        if isinstance(record, Mapping) and record.get("node") == "meta_analyzer"
+    ]
+    return all(bool(record.get("ok")) for record in meta_analyzer_records)
 
 
 def _is_local_target(target: str) -> bool:
@@ -105,22 +140,23 @@ async def run_scan(
         if local_target or local_yara_rules:
             raise ValueError("local targets are disabled for this MCP transport")
 
-    llm_available, _ = is_llm_available()
-    llm_used = use_llm and llm_available
+    llm_preflight_available, _ = is_llm_available()
+    llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {
         "input_path": target,
         "output_format": output_format,
-        "use_llm": llm_used,
+        "use_llm": llm_enabled,
+        "llm_requested": use_llm,
     }
     if yara_rules_dir:
         state["yara_rules_dir"] = yara_rules_dir
 
     logger.debug(
-        "MCP scan started: target=%s, format=%s, llm_used=%s",
+        "MCP scan started: target=%s, format=%s, llm_enabled=%s",
         target,
         output_format,
-        llm_used,
+        llm_enabled,
     )
 
     result: dict[str, Any] | None = None
@@ -132,7 +168,8 @@ async def run_scan(
                 "tags": ["skillspector", "mcp"],
                 "metadata": {
                     "input_path": target,
-                    "use_llm": llm_used,
+                    "use_llm": llm_enabled,
+                    "llm_requested": use_llm,
                     "output_format": output_format,
                     "version": __version__,
                 },
@@ -140,20 +177,30 @@ async def run_scan(
         )
         findings = effective_findings(result)
         risk_score = int(result.get("risk_score") or 0)
+        llm_used, llm_runtime_complete = _llm_runtime_accounting(enabled=llm_enabled, result=result)
+        llm_available = _llm_runtime_available(
+            preflight_available=llm_preflight_available,
+            result=result,
+        )
         execution_successful = bool(result.get("execution_successful", True))
         analysis_completeness = result.get("analysis_completeness") or {}
         entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
+        analysis_requirement_met = not use_llm or llm_runtime_complete
         safe_to_install = (
             risk_score <= RISK_THRESHOLD
             and execution_successful
             and entirely_uninspected == 0
             and bool(analysis_completeness.get("is_complete", True))
+            and analysis_requirement_met
         )
+        recommendation = result.get("risk_recommendation")
+        if not analysis_requirement_met and recommendation == "SAFE":
+            recommendation = "CAUTION"
         return {
             "target": target,
             "risk_score": risk_score,
             "severity": result.get("risk_severity"),
-            "recommendation": result.get("risk_recommendation"),
+            "recommendation": recommendation,
             "safe_to_install": safe_to_install,
             "execution_successful": execution_successful,
             "analysis_completeness": analysis_completeness,
