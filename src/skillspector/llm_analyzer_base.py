@@ -40,6 +40,7 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
@@ -76,21 +77,29 @@ class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
 
 
+class LLMRuntimeLimitError(RuntimeError):
+    """Signal that no shared scan time remains for an LLM operation."""
+
+
 def _is_retryable_api_connection_error(exc: BaseException) -> bool:
     """Return whether *exc* is the narrowly supported transient provider failure."""
     return type(exc).__name__ == "APIConnectionError"
 
 
-def _uses_native_connection_retries(chat_model: object) -> bool:
-    """Set the common native retry budget and report whether it is available."""
+def _uses_native_connection_retries(
+    chat_model: object,
+    *,
+    max_retries: int = API_CONNECTION_MAX_RETRIES,
+) -> bool:
+    """Set the native retry budget and report whether native retries remain enabled."""
     if isinstance(chat_model, ChatOpenAI):
         for client in (chat_model.root_client, chat_model.root_async_client):
             if client is not None:
-                client.max_retries = API_CONNECTION_MAX_RETRIES
-        return True
+                client.max_retries = max_retries
+        return max_retries > 0
     if isinstance(chat_model, ChatAnthropic):
-        chat_model.max_retries = API_CONNECTION_MAX_RETRIES
-        return True
+        chat_model.max_retries = max_retries
+        return max_retries > 0
     return False
 
 
@@ -322,7 +331,11 @@ def ledger_events_for_batches(
                 events.append(
                     ledger_event(
                         analyzer_id=analyzer_id,
-                        outcome=outcome_for_llm_batch_failure(failure.reason),
+                        outcome=(
+                            LedgerOutcome.PARTIAL
+                            if failure.reason is LedgerReason.RUNTIME_LIMIT
+                            else outcome_for_llm_batch_failure(failure.reason)
+                        ),
                         phase="semantic",
                         path=path,
                         start_line=start_line,
@@ -478,8 +491,15 @@ class LLMAnalyzerBase:
         self._timeout = timeout
         self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model, timeout=self._remaining_timeout())
-        self._uses_native_connection_retries = _uses_native_connection_retries(self._llm)
+        self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        # Native SDK retries cannot re-read a workflow-wide deadline between
+        # attempts.  A dynamic deadline therefore uses our explicit retry loop,
+        # which checks and caps every retry/backoff against remaining time.
+        native_retries = 0 if self._dynamic_timeout else API_CONNECTION_MAX_RETRIES
+        self._uses_native_connection_retries = _uses_native_connection_retries(
+            self._llm,
+            max_retries=native_retries,
+        )
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
@@ -492,20 +512,43 @@ class LLMAnalyzerBase:
 
     def _remaining_timeout(self) -> float | None:
         if callable(self._timeout):
-            return self._timeout()
-        return self._timeout
+            remaining = self._timeout()
+        else:
+            remaining = self._timeout
+        if remaining is None:
+            return None
+        return max(0.0, float(remaining))
+
+    def _require_time_remaining(self) -> float | None:
+        """Return the current provider timeout or fail before starting work."""
+        remaining = self._remaining_timeout()
+        if remaining is not None and remaining <= 0:
+            raise LLMRuntimeLimitError("shared scan runtime limit reached")
+        return remaining
+
+    def _sleep_before_retry(self, delay: float) -> None:
+        """Sleep no longer than the current shared deadline permits."""
+        remaining = self._require_time_remaining()
+        time.sleep(delay if remaining is None else min(delay, remaining))
+
+    async def _asleep_before_retry(self, delay: float) -> None:
+        """Asynchronously sleep no longer than the shared deadline permits."""
+        remaining = self._require_time_remaining()
+        await asyncio.sleep(delay if remaining is None else min(delay, remaining))
 
     def _model_for_call(self) -> tuple[object, object | None]:
+        remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
-        llm = get_chat_model(model=self.model, timeout=self._remaining_timeout())
+        llm = get_chat_model(model=self.model, timeout=remaining)
+        _uses_native_connection_retries(llm, max_retries=0)
         structured = (
             llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
         return llm, structured
 
     @property
-    def inference_usage(self) -> list[dict[str, object]]:
+    def inference_usage(self) -> list[InferenceUsageRecord]:
         """Provider-reported usage captured for this analyzer instance."""
         return list(self._usage_collector.snapshot())
 
@@ -632,6 +675,7 @@ class LLMAnalyzerBase:
                     structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS[structured_retries]
                 structured_retries += 1
@@ -642,7 +686,9 @@ class LLMAnalyzerBase:
                     structured_retries,
                     STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
-                time.sleep(delay)
+                self._sleep_before_retry(delay)
+            except LLMRuntimeLimitError:
+                raise
             except Exception as exc:
                 if (
                     not _is_retryable_api_connection_error(exc)
@@ -650,6 +696,7 @@ class LLMAnalyzerBase:
                     or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
                 connection_retries += 1
@@ -660,7 +707,7 @@ class LLMAnalyzerBase:
                     connection_retries,
                     API_CONNECTION_MAX_RETRIES,
                 )
-                time.sleep(delay)
+                self._sleep_before_retry(delay)
 
         raise AssertionError("bounded retry loop must return or raise")
 
@@ -697,6 +744,7 @@ class LLMAnalyzerBase:
                     structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS[structured_retries]
                 structured_retries += 1
@@ -707,7 +755,9 @@ class LLMAnalyzerBase:
                     structured_retries,
                     STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
-                await asyncio.sleep(delay)
+                await self._asleep_before_retry(delay)
+            except LLMRuntimeLimitError:
+                raise
             except Exception as exc:
                 if (
                     not _is_retryable_api_connection_error(exc)
@@ -715,6 +765,7 @@ class LLMAnalyzerBase:
                     or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
                 connection_retries += 1
@@ -725,7 +776,7 @@ class LLMAnalyzerBase:
                     connection_retries,
                     API_CONNECTION_MAX_RETRIES,
                 )
-                await asyncio.sleep(delay)
+                await self._asleep_before_retry(delay)
 
         raise AssertionError("bounded retry loop must return or raise")
 
@@ -769,6 +820,14 @@ class LLMAnalyzerBase:
                         reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
                     )
                 )
+            except LLMRuntimeLimitError as exc:
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(exc).__name__,
+                        reason=LedgerReason.RUNTIME_LIMIT,
+                    )
+                )
             except (ValueError, NotImplementedError):
                 raise
             except Exception as exc:
@@ -807,9 +866,10 @@ class LLMAnalyzerBase:
         Failures are isolated per batch: a provider ``APIConnectionError``
         receives three bounded exponential-backoff retries (500ms, then 1s,
         then 2s) when the chat model has no native retry support. OpenAI and
-        Anthropic chat models use their native three-retry policy instead;
-        native retry timing remains provider-managed. Unrecovered errors cost
-        only their own batch and are omitted from the result.
+        Anthropic chat models use their native three-retry policy instead when
+        the timeout is static. A dynamic workflow deadline disables native
+        retries so every coordinator retry can re-check remaining time.
+        Unrecovered errors cost only their own batch and are omitted from the result.
         Malformed structured responses (Pydantic ``ValidationError`` or CLI
         JSON parse failures) receive three bounded exponential-backoff retries
         and are then isolated to their batch. A batch makes at most seven outer
@@ -860,6 +920,15 @@ class LLMAnalyzerBase:
                         batch=batch,
                         error_class=ValidationError.__name__,
                         reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                    )
+                )
+                continue
+            if isinstance(result, LLMRuntimeLimitError):
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(result).__name__,
+                        reason=LedgerReason.RUNTIME_LIMIT,
                     )
                 )
                 continue

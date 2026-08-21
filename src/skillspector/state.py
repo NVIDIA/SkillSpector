@@ -18,17 +18,125 @@
 from __future__ import annotations
 
 import operator
+from dataclasses import dataclass, field
+from time import monotonic
 from typing import Annotated, NotRequired
 
 from typing_extensions import TypedDict
 
+from skillspector.artifacts import ArtifactRecord, BundleReference
 from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
+    MAX_INSPECTION_LEDGER_EVENTS,
     AnalysisCompleteness,
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    LedgerRecordType,
+    ledger_event,
 )
 from skillspector.models import Finding
+
+MAX_WORKFLOW_SECONDS = 60.0
+MAX_WORKFLOW_BYTES = 64 * 1024 * 1024
+MAX_WORKFLOW_ARTIFACTS = 10_000
+MAX_WORKFLOW_LIMITATION_RECORDS = 256
+
+
+@dataclass(slots=True)
+class WorkflowResourceBudget:
+    """One resource budget shared by every node in a graph invocation.
+
+    The normal graph entry points do not create the CLI's transitive traversal
+    object.  Keeping this smaller contract in graph state gives direct, API,
+    and MCP scans the same aggregate deadline and byte/artifact ceilings.  A
+    supplied transitive traversal remains authoritative because it may carry a
+    stricter allowance shared by several child graph invocations.
+    """
+
+    max_seconds: float = MAX_WORKFLOW_SECONDS
+    max_bytes: int = MAX_WORKFLOW_BYTES
+    max_artifacts: int = MAX_WORKFLOW_ARTIFACTS
+    started_at: float | None = None
+    scanned_bytes: int = 0
+    scanned_artifacts: int = 0
+    truncation_reasons: list[str] = field(default_factory=list)
+    budget_exhausted: bool = False
+
+    def start(self) -> None:
+        """Start the aggregate deadline exactly once."""
+        if self.started_at is None:
+            self.started_at = monotonic()
+
+    def remaining_seconds(self) -> float:
+        """Return the non-negative aggregate workflow time allowance."""
+        self.start()
+        assert self.started_at is not None
+        return max(0.0, self.max_seconds - (monotonic() - self.started_at))
+
+    def remaining_bytes(self) -> int:
+        """Return the exact remaining canonical-byte allowance."""
+        return max(0, self.max_bytes - self.scanned_bytes)
+
+    def remaining_artifacts(self) -> int:
+        """Return the remaining discovery/nested-artifact allowance."""
+        return max(0, self.max_artifacts - self.scanned_artifacts)
+
+    def record_bytes(self, count: int) -> None:
+        """Charge retained canonical bytes to the workflow allowance."""
+        self.start()
+        self.scanned_bytes += max(0, count)
+        if self.scanned_bytes > self.max_bytes:
+            self.note_truncation(f"byte budget {self.max_bytes} exceeded")
+
+    def record_artifacts(self, count: int) -> None:
+        """Charge discovered or expanded artifacts to the workflow allowance."""
+        self.start()
+        self.scanned_artifacts += max(0, count)
+        if self.scanned_artifacts > self.max_artifacts:
+            self.note_truncation(f"artifact budget {self.max_artifacts} exceeded")
+
+    def note_truncation(self, reason: str) -> None:
+        """Retain a bounded, content-free explanation of resource exhaustion."""
+        if len(self.truncation_reasons) >= MAX_WORKFLOW_LIMITATION_RECORDS:
+            sentinel = "additional workflow limitations omitted"
+            if self.truncation_reasons[-1] != sentinel:
+                self.truncation_reasons[-1] = sentinel
+            self.budget_exhausted = True
+            return
+        if reason not in self.truncation_reasons:
+            self.truncation_reasons.append(reason)
+        if "budget" in reason:
+            self.budget_exhausted = True
+
+
+def ensure_workflow_resource_budget(state: SkillspectorState) -> object:
+    """Return and start the strictest resource budget supplied to a graph scan."""
+    transitive = state.get("transitive_traversal_state")
+    existing = state.get("workflow_resource_budget")
+    budget = transitive if _has_resource_budget_contract(transitive) else existing
+    if not _has_resource_budget_contract(budget):
+        budget = WorkflowResourceBudget()
+
+    start = getattr(budget, "start", None)
+    if callable(start):
+        start()
+    else:
+        # The CLI traversal starts lazily through remaining_seconds().  Invoke
+        # it before build-context work so child scans cannot restart the clock.
+        remaining = getattr(budget, "remaining_seconds", None)
+        if callable(remaining):
+            remaining()
+    return budget
+
+
+def _has_resource_budget_contract(candidate: object | None) -> bool:
+    """Recognize a complete time/byte/artifact workflow-budget contract."""
+    return candidate is not None and all(
+        callable(getattr(candidate, method, None))
+        for method in ("remaining_seconds", "remaining_bytes", "remaining_artifacts")
+    )
 
 
 def merge_findings_by_id(existing: list[Finding], updates: list[Finding]) -> list[Finding]:
@@ -43,6 +151,50 @@ def merge_findings_by_id(existing: list[Finding], updates: list[Finding]) -> lis
         else:
             merged[position] = finding
     return merged
+
+
+def merge_inspection_ledger(
+    existing: list[InspectionLedgerEvent],
+    updates: list[InspectionLedgerEvent],
+) -> list[InspectionLedgerEvent]:
+    """Concatenate ledger rows under one workflow-wide deterministic ceiling."""
+    limit = max(1, MAX_INSPECTION_LEDGER_EVENTS)
+    if existing and existing[-1].get("phase") == "ledger_output":
+        prior = existing[-1]
+        try:
+            prior_observed = int(prior.get("observed_records", len(existing)))
+        except (TypeError, ValueError):
+            prior_observed = len(existing)
+        observed = max(len(existing), prior_observed) + len(updates)
+        return [
+            *existing[:-1][: limit - 1],
+            ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="ledger_output",
+                path=str(prior.get("path", "SKILL.md")),
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=observed,
+                limit_records=limit,
+            ),
+        ]
+
+    combined = [*existing, *updates]
+    if len(combined) <= limit:
+        return combined
+    overflow = combined[limit - 1]
+    return [
+        *combined[: limit - 1],
+        ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="ledger_output",
+            path=str(overflow.get("path", "SKILL.md")),
+            reason=LedgerReason.OUTPUT_LIMIT,
+            observed_records=len(combined),
+            limit_records=limit,
+        ),
+    ]
 
 
 class SkillspectorState(TypedDict, total=False):
@@ -63,6 +215,13 @@ class SkillspectorState(TypedDict, total=False):
     file_cache: dict[str, str]
     # Full local-only deterministic view, including hidden and nested content.
     local_file_cache: dict[str, str]
+    # Raw bytes remain the canonical source for YARA and content classification.
+    raw_file_cache: dict[str, bytes]
+    # External-model consumers use the redacted projection for sensitive local files.
+    llm_file_cache: dict[str, str]
+    artifact_inventory: list[ArtifactRecord]
+    artifact_references: list[BundleReference]
+    reference_resolution: dict[str, object]
     # Retained for compatibility with the persisted workflow-state schema.
     ast_cache: dict[str, str]
     # Key for the process-local parsed-AST cache.  The ASTs themselves stay
@@ -73,7 +232,7 @@ class SkillspectorState(TypedDict, total=False):
 
     # Accumulated canonical findings. Same-ID meta updates replace in place.
     findings: Annotated[list[Finding], merge_findings_by_id]
-    inspection_ledger: Annotated[list[InspectionLedgerEvent], operator.add]
+    inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
     effective_finding_ids: list[str]
     analysis_completeness: AnalysisCompleteness
@@ -145,6 +304,9 @@ class SkillspectorState(TypedDict, total=False):
     transitive_truncated: bool
     transitive_truncation_reasons: list[str]
     transitive_traversal_state: object
+    # Present for every graph invocation. Transitive child scans point this at
+    # their already-shared traversal object instead of starting a second clock.
+    workflow_resource_budget: object
 
     # Additional YARA rules directory (user-specified via --yara-rules-dir)
     yara_rules_dir: str | None
@@ -170,9 +332,12 @@ def llm_call_record(node_id: str, *, ok: bool, error: str | None = None) -> LLMC
 
 
 def transitive_traversal_state(state: SkillspectorState) -> object | None:
-    """Return the shared transitive traversal object, when one is present."""
+    """Return the active shared workflow resource object, when one is present."""
     traversal = state.get("transitive_traversal_state")
-    return traversal if traversal is not None else None
+    if traversal is not None:
+        return traversal
+    budget = state.get("workflow_resource_budget")
+    return budget if budget is not None else None
 
 
 def transitive_remaining_seconds(state: SkillspectorState) -> float | None:
@@ -197,6 +362,26 @@ def transitive_remaining_bytes(state: SkillspectorState) -> int | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def transitive_remaining_artifacts(state: SkillspectorState) -> int | None:
+    """Return the remaining shared transitive artifact allowance, when available."""
+    traversal = transitive_traversal_state(state)
+    remaining = getattr(traversal, "remaining_artifacts", None)
+    if callable(remaining):
+        try:
+            return int(remaining())
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def transitive_record_artifacts(state: SkillspectorState, count: int) -> None:
+    """Charge discovered or expanded artifacts to the shared traversal budget."""
+    traversal = transitive_traversal_state(state)
+    record = getattr(traversal, "record_artifacts", None)
+    if callable(record):
+        record(max(0, count))
 
 
 def transitive_note_truncation(state: SkillspectorState, reason: str) -> None:

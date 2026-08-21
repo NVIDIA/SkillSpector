@@ -440,8 +440,8 @@ class TestRunStaticPatternsDataExfiltration:
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         assert any(f.rule_id == "E5" for f in findings)
 
-    def test_e5_documentation_example_excluded(self):
-        """Cloud-upload calls in documentation/examples do not yield E5."""
+    def test_e5_documentation_example_is_retained(self):
+        """Documentation labels cannot suppress deterministic cloud-upload evidence."""
         state = {
             "components": ["README.md"],
             "file_cache": {
@@ -449,7 +449,7 @@ class TestRunStaticPatternsDataExfiltration:
             },
         }
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
-        assert not any(f.rule_id == "E5" for f in findings)
+        assert any(f.rule_id == "E5" for f in findings)
 
     def test_e5_benign_client_creation_no_finding(self):
         """Creating a cloud client without an upload call does not yield E5."""
@@ -477,8 +477,8 @@ class TestRunStaticPatternsDataExfiltration:
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         assert any(f.rule_id == "E5" for f in findings)
 
-    def test_eval_dataset_prose_is_not_scanned_for_static_patterns(self):
-        """Eval datasets are test-case data, not installed skill code."""
+    def test_eval_dataset_prose_is_scanned_for_static_patterns(self):
+        """Eval directories are untrusted bundle content and receive static analysis."""
         for dataset_path in ("evals/evals.json", "eval/dataset.yaml"):
             state = {
                 "components": [dataset_path],
@@ -502,7 +502,7 @@ class TestRunStaticPatternsDataExfiltration:
                 [data_exfiltration_module, privilege_escalation_module],
             )
 
-            assert findings == [], f"Expected no findings for {dataset_path}"
+            assert any(f.rule_id == "PE3" for f in findings), dataset_path
 
 
 class TestRunStaticPatternsSupplyChain:
@@ -553,8 +553,8 @@ class TestRunStaticPatternsSupplyChain:
         findings = static_runner.run_static_patterns(state, [supply_chain_module])
         assert any(f.rule_id == "SC7" for f in findings)
 
-    def test_sc7_documentation_example_excluded(self):
-        """Verification-bypass flags in documentation do not yield SC7."""
+    def test_sc7_documentation_example_is_retained(self):
+        """Documentation labels cannot suppress deterministic verification evidence."""
         state = {
             "components": ["README.md"],
             "file_cache": {
@@ -562,7 +562,7 @@ class TestRunStaticPatternsSupplyChain:
             },
         }
         findings = static_runner.run_static_patterns(state, [supply_chain_module])
-        assert not any(f.rule_id == "SC7" for f in findings)
+        assert any(f.rule_id == "SC7" for f in findings)
 
     def test_sc7_benign_pull_no_finding(self):
         """A normal docker pull with verification on does not yield SC7."""
@@ -865,8 +865,8 @@ class TestRunStaticPatternsPrivilegeEscalationPE4:
         findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
         assert not any(f.rule_id == "PE4" for f in findings)
 
-    def test_pe4_documentation_example_not_flagged(self):
-        """docker.from_env() inside a markdown code block is filtered as documentation."""
+    def test_pe4_documentation_example_is_retained_for_triage(self):
+        """Documentation context annotates deterministic PE4 evidence; it does not delete it."""
         state = {
             "components": ["SKILL.md"],
             "file_cache": {
@@ -876,7 +876,8 @@ class TestRunStaticPatternsPrivilegeEscalationPE4:
             },
         }
         findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
-        assert not any(f.rule_id == "PE4" for f in findings)
+        pe4 = next(f for f in findings if f.rule_id == "PE4")
+        assert {"contextual-triage", "likely-benign-context"} <= set(pe4.tags)
 
     def test_pe4_node_runs_over_state(self):
         """The node entrypoint runs PE4 detection over state and returns findings."""
@@ -1004,8 +1005,8 @@ class TestRunStaticPatternsPrivilegeEscalationPE5:
         findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
         assert not any(f.rule_id == "PE5" for f in findings)
 
-    def test_pe5_documentation_example_not_flagged(self):
-        """--privileged inside a markdown code block is filtered as documentation."""
+    def test_pe5_documentation_example_is_retained_for_triage(self):
+        """Documentation context annotates deterministic PE5 evidence; it does not delete it."""
         state = {
             "components": ["SKILL.md"],
             "file_cache": {
@@ -1013,7 +1014,8 @@ class TestRunStaticPatternsPrivilegeEscalationPE5:
             },
         }
         findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
-        assert not any(f.rule_id == "PE5" for f in findings)
+        pe5 = next(f for f in findings if f.rule_id == "PE5")
+        assert {"contextual-triage", "likely-benign-context"} <= set(pe5.tags)
 
 
 class TestRunStaticPatternsSSRF:
@@ -1170,7 +1172,7 @@ class TestRunStaticPatternsSSRF:
 
 
 class TestSupplyChainLedger:
-    def test_trigger_analysis_uses_distinct_work_after_static_skip(self):
+    def test_oversized_static_input_is_scanned_instead_of_skipped(self):
         result = supply_chain_module.node(
             {
                 "components": ["SKILL.md"],
@@ -1180,8 +1182,7 @@ class TestSupplyChainLedger:
         )
 
         events = result["inspection_ledger"]
-        assert [event["outcome"] for event in events] == ["skipped", "completed"]
-        assert len({event["work_id"] for event in events}) == 2
+        assert [event["outcome"] for event in events] == ["completed"]
 
 
 class TestLicenseFiles:

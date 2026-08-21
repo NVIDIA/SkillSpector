@@ -30,15 +30,18 @@ import subprocess
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from stat import S_IFIFO, S_IFLNK
 
 import httpx
 import pytest
 
 from skillspector.input_handler import (
     INGEST_MAX_BYTES,
+    INGEST_MAX_ZIP_CENTRAL_DIRECTORY_BYTES,
     INGEST_MAX_ZIP_MEMBERS,
     IngestLimitExceededError,
     InputHandler,
+    TransitiveIngestTruncatedError,
 )
 
 # ---------------------------------------------------------------------------
@@ -70,6 +73,22 @@ def _patch_httpx_client(monkeypatch: pytest.MonkeyPatch, handler: Callable) -> N
 # hosts that are not in ``ALLOWED_DOWNLOAD_HOSTS`` before the mocked
 # transport is ever reached.
 _ALLOWED_HOST = "raw.githubusercontent.com"
+
+
+class _CompletedGitProcess:
+    """Minimal successful ``Popen`` stand-in for clone-bound tests."""
+
+    def poll(self) -> int:
+        return 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
 
 
 def _make_zip(zip_path: Path, members: list[tuple[str, bytes]]) -> None:
@@ -108,6 +127,88 @@ def _make_bomb_zip(zip_path: Path, declared_uncompressed: int) -> None:
         raw[:uncomp_offset] + struct.pack("<I", declared_uncompressed) + raw[uncomp_offset + 4 :]
     )
     zip_path.write_bytes(patched)
+
+
+def _make_zip64_count_claim(zip_path: Path, entries: int) -> None:
+    """Promote a small ZIP to ZIP64 while claiming an arbitrary entry count."""
+    _make_zip(zip_path, [("SKILL.md", b"# skill")])
+    raw = zip_path.read_bytes()
+    eocd_offset = raw.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    eocd = bytearray(raw[eocd_offset:])
+    (
+        _signature,
+        _disk,
+        _directory_disk,
+        _entries_on_disk,
+        _entries,
+        directory_size,
+        directory_offset,
+        _comment_size,
+    ) = struct.unpack("<4s4H2LH", eocd[:22])
+    zip64_offset = eocd_offset
+    zip64_eocd = struct.pack(
+        "<4sQ2H2L4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        entries,
+        entries,
+        directory_size,
+        directory_offset,
+    )
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, zip64_offset, 1)
+    struct.pack_into("<HHLL", eocd, 8, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+    zip_path.write_bytes(raw[:eocd_offset] + zip64_eocd + locator + eocd)
+
+
+class _TransitiveBudget:
+    def __init__(self, *, remaining_bytes: int, remaining_seconds: float = 60.0) -> None:
+        self.bytes = remaining_bytes
+        self.seconds = remaining_seconds
+        self.reasons: list[str] = []
+
+    def remaining_bytes(self) -> int:
+        return self.bytes
+
+    def remaining_seconds(self) -> float:
+        return self.seconds
+
+    def note_truncation(self, reason: str) -> None:
+        self.reasons.append(reason)
+
+
+class _RecordingBudget:
+    """Small exact shared-budget stand-in for materialization tests."""
+
+    def __init__(self, *, max_bytes: int, max_artifacts: int, seconds: float = 60.0) -> None:
+        self.max_bytes = max_bytes
+        self.max_artifacts = max_artifacts
+        self.seconds = seconds
+        self.scanned_bytes = 0
+        self.scanned_artifacts = 0
+        self.reasons: list[str] = []
+
+    def remaining_seconds(self) -> float:
+        return self.seconds
+
+    def remaining_bytes(self) -> int:
+        return max(0, self.max_bytes - self.scanned_bytes)
+
+    def remaining_artifacts(self) -> int:
+        return max(0, self.max_artifacts - self.scanned_artifacts)
+
+    def record_bytes(self, count: int) -> None:
+        self.scanned_bytes += max(0, count)
+
+    def record_artifacts(self, count: int) -> None:
+        self.scanned_artifacts += max(0, count)
+
+    def note_truncation(self, reason: str) -> None:
+        self.reasons.append(reason)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +375,52 @@ class TestDownloadBound:
         finally:
             h.cleanup()
 
+    def test_shared_budget_charges_exact_download_bytes_and_artifact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exactly-sized remote file consumes, but does not exceed, both budgets."""
+        body = b"# exact\n"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=body)
+
+        _patch_httpx_client(monkeypatch, handler)
+        budget = _RecordingBudget(max_bytes=len(body), max_artifacts=1)
+        h = InputHandler(transitive_budget=budget)
+        try:
+            resolved, source_type = h.resolve(f"https://{_ALLOWED_HOST}/exact.md")
+            assert source_type == "url"
+            assert (resolved / "exact.md").read_bytes() == body
+            assert budget.scanned_bytes == len(body)
+            assert budget.scanned_artifacts == 1
+            assert budget.remaining_bytes() == 0
+            assert budget.remaining_artifacts() == 0
+            assert budget.reasons == []
+        finally:
+            h.cleanup()
+
+    def test_shared_download_artifact_budget_fails_before_network(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_httpx_client(
+            monkeypatch,
+            lambda _request: pytest.fail("network accessed after artifact budget exhaustion"),
+        )
+        budget = _RecordingBudget(max_bytes=1, max_artifacts=0)
+        h = InputHandler(transitive_budget=budget)
+        try:
+            with pytest.raises(TransitiveIngestTruncatedError) as raised:
+                h.resolve(f"https://{_ALLOWED_HOST}/blocked.md")
+            assert raised.value.truncation.as_dict() == {
+                "code": "artifact_budget_exhausted",
+                "source_type": "download",
+                "message": "Transitive download ingest truncated (artifact_budget_exhausted)",
+            }
+            assert h.temp_dir_for_cleanup() is None
+            assert budget.reasons == [raised.value.truncation.message]
+        finally:
+            h.cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Zip
@@ -296,6 +443,52 @@ class TestZipBound:
         finally:
             h.cleanup()
 
+    def test_shared_artifact_budget_rejects_member_suffix_before_extraction(
+        self, tmp_path: Path
+    ) -> None:
+        zip_path = tmp_path / "two-members.zip"
+        _make_zip(zip_path, [("SKILL.md", b"# skill"), ("run.py", b"print(1)\n")])
+        budget = _RecordingBudget(max_bytes=1024, max_artifacts=1)
+
+        h = InputHandler(transitive_budget=budget)
+        try:
+            with pytest.raises(TransitiveIngestTruncatedError) as raised:
+                h.resolve(str(zip_path))
+            assert raised.value.truncation.as_dict() == {
+                "code": "artifact_budget_exhausted",
+                "source_type": "zip",
+                "message": "Transitive zip ingest truncated (artifact_budget_exhausted)",
+            }
+            assert "SKILL.md" not in str(raised.value)
+            assert "two-members.zip" not in str(raised.value)
+            assert budget.scanned_artifacts == 0
+            assert budget.reasons == [raised.value.truncation.message]
+            assert h.temp_dir_for_cleanup() is None
+        finally:
+            h.cleanup()
+
+    def test_shared_zip_budgets_allow_exact_bytes_and_implicit_directory(
+        self, tmp_path: Path
+    ) -> None:
+        payload = b"# exact zip\n"
+        zip_path = tmp_path / "exact.zip"
+        _make_zip(zip_path, [("nested/SKILL.md", payload)])
+        # Extraction materializes both the implicit directory and the file.
+        budget = _RecordingBudget(max_bytes=len(payload), max_artifacts=2)
+
+        h = InputHandler(transitive_budget=budget)
+        try:
+            resolved, source_type = h.resolve(str(zip_path))
+            assert source_type == "zip"
+            assert (resolved / "SKILL.md").read_bytes() == payload
+            assert budget.scanned_bytes == len(payload)
+            assert budget.scanned_artifacts == 2
+            assert budget.remaining_bytes() == 0
+            assert budget.remaining_artifacts() == 0
+            assert budget.reasons == []
+        finally:
+            h.cleanup()
+
     def test_declared_uncompressed_oversize_rejected_before_extract(self, tmp_path: Path) -> None:
         """Classic zip bomb: small archive, declared-uncompressed size > cap."""
         zip_path = tmp_path / "bomb.zip"
@@ -305,13 +498,10 @@ class TestZipBound:
         try:
             with pytest.raises(IngestLimitExceededError, match="uncompressed"):
                 h.resolve(str(zip_path))
-            # Crucially: nothing extracted.  The extract dir may exist
-            # (we mkdir before pre-checking) but must be empty.
+            # Crucially: nothing is materialized before the metadata check.
             temp = h.temp_dir_for_cleanup()
-            assert temp is not None
-            extract_dir = temp / "extracted"
-            if extract_dir.exists():
-                assert list(extract_dir.iterdir()) == []
+            if temp is not None:
+                assert not (temp / "extracted").exists()
         finally:
             h.cleanup()
 
@@ -325,6 +515,192 @@ class TestZipBound:
         try:
             with pytest.raises(IngestLimitExceededError, match="members"):
                 h.resolve(str(zip_path))
+        finally:
+            h.cleanup()
+
+    def test_eocd_count_rejected_before_infolist(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An oversized ordinary EOCD count never reaches ``ZipFile.infolist``."""
+        zip_path = tmp_path / "claimed-many.zip"
+        _make_zip(zip_path, [("SKILL.md", b"# skill")])
+        raw = bytearray(zip_path.read_bytes())
+        eocd_offset = raw.rfind(b"PK\x05\x06")
+        assert eocd_offset >= 0
+        struct.pack_into("<HH", raw, eocd_offset + 8, 0xFFFE, 0xFFFE)
+        zip_path.write_bytes(raw)
+        monkeypatch.setattr(
+            zipfile.ZipFile,
+            "infolist",
+            lambda _self: pytest.fail("infolist materialized an over-count directory"),
+        )
+
+        h = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="members"):
+                h.resolve(str(zip_path))
+        finally:
+            h.cleanup()
+
+    def test_actual_central_records_cannot_hide_behind_small_eocd_count(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Preflight counts real records, not just attacker-controlled EOCD fields."""
+        zip_path = tmp_path / "lying-count.zip"
+        _make_zip(zip_path, [(f"file-{index}", b"x") for index in range(4)])
+        raw = bytearray(zip_path.read_bytes())
+        eocd_offset = raw.rfind(b"PK\x05\x06")
+        assert eocd_offset >= 0
+        struct.pack_into("<HH", raw, eocd_offset + 8, 1, 1)
+        zip_path.write_bytes(raw)
+        monkeypatch.setattr("skillspector.input_handler.INGEST_MAX_ZIP_MEMBERS", 2)
+        monkeypatch.setattr(
+            zipfile.ZipFile,
+            "infolist",
+            lambda _self: pytest.fail("infolist materialized a lying central directory"),
+        )
+
+        h = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="preflighting members"):
+                h.resolve(str(zip_path))
+        finally:
+            h.cleanup()
+
+    def test_zip64_count_rejected_before_infolist(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """ZIP64 EOCD counts receive the same pre-materialization bound."""
+        zip_path = tmp_path / "claimed-many-zip64.zip"
+        _make_zip64_count_claim(zip_path, INGEST_MAX_ZIP_MEMBERS + 1)
+        monkeypatch.setattr(
+            zipfile.ZipFile,
+            "infolist",
+            lambda _self: pytest.fail("infolist materialized an over-count ZIP64 directory"),
+        )
+
+        h = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="members"):
+                h.resolve(str(zip_path))
+        finally:
+            h.cleanup()
+
+    def test_zip64_under_cap_extracts(self, tmp_path: Path) -> None:
+        """ZIP64 preflight preserves a valid small archive."""
+        zip_path = tmp_path / "small-zip64.zip"
+        _make_zip64_count_claim(zip_path, 1)
+
+        h = InputHandler()
+        try:
+            resolved, source_type = h.resolve(str(zip_path))
+            assert source_type == "zip"
+            assert (resolved / "SKILL.md").read_bytes() == b"# skill"
+        finally:
+            h.cleanup()
+
+    def test_central_directory_bytes_rejected_before_infolist(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Variable-length central-directory metadata has an independent cap."""
+        zip_path = tmp_path / "metadata.zip"
+        _make_zip(zip_path, [("SKILL.md", b"# skill")])
+        assert INGEST_MAX_ZIP_CENTRAL_DIRECTORY_BYTES > 1
+        monkeypatch.setattr("skillspector.input_handler.INGEST_MAX_ZIP_CENTRAL_DIRECTORY_BYTES", 1)
+        monkeypatch.setattr(
+            zipfile.ZipFile,
+            "infolist",
+            lambda _self: pytest.fail("infolist materialized oversized metadata"),
+        )
+
+        h = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="central-directory"):
+                h.resolve(str(zip_path))
+        finally:
+            h.cleanup()
+
+    @pytest.mark.parametrize("mode", [S_IFLNK | 0o777, S_IFIFO | 0o600])
+    def test_links_and_special_members_are_rejected(self, tmp_path: Path, mode: int) -> None:
+        zip_path = tmp_path / "special.zip"
+        info = zipfile.ZipInfo("unsafe")
+        info.create_system = 3
+        info.external_attr = mode << 16
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr(info, b"target")
+
+        h = InputHandler()
+        try:
+            with pytest.raises(ValueError, match="links|special-file"):
+                h.resolve(str(zip_path))
+            temp = h.temp_dir_for_cleanup()
+            assert temp is not None
+            assert not (temp / "extracted").exists()
+        finally:
+            h.cleanup()
+
+    def test_prefix_sibling_zip_slip_is_rejected(self, tmp_path: Path) -> None:
+        """``../extracted_evil`` must not pass a string-prefix containment check."""
+        zip_path = tmp_path / "prefix-slip.zip"
+        _make_zip(zip_path, [("../extracted_evil/payload", b"bad")])
+        h = InputHandler()
+        try:
+            with pytest.raises(ValueError, match="zip-slip"):
+                h.resolve(str(zip_path))
+            temp = h.temp_dir_for_cleanup()
+            assert temp is not None
+            assert not (temp / "extracted_evil").exists()
+        finally:
+            h.cleanup()
+
+    @pytest.mark.parametrize(
+        "member",
+        ["CON", "folder/NUL.txt", "tool.py:payload", "trailing.", "trailing "],
+    )
+    def test_cross_platform_ambiguous_zip_paths_are_rejected(
+        self, tmp_path: Path, member: str
+    ) -> None:
+        zip_path = tmp_path / "ambiguous.zip"
+        _make_zip(zip_path, [(member, b"bad")])
+        h = InputHandler()
+        try:
+            with pytest.raises(ValueError, match="zip-slip"):
+                h.resolve(str(zip_path))
+        finally:
+            h.cleanup()
+
+    def test_extraction_deadline_is_enforced(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        zip_path = tmp_path / "slow.zip"
+        _make_zip(zip_path, [("SKILL.md", b"# skill")])
+        clock = iter((0.0, 0.0, 0.0, 61.0))
+        monkeypatch.setattr("skillspector.input_handler.monotonic", lambda: next(clock, 61.0))
+
+        h = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="time limit"):
+                h.resolve(str(zip_path))
+            temp = h.temp_dir_for_cleanup()
+            if temp is not None:
+                assert not (temp / "extracted").exists()
+        finally:
+            h.cleanup()
+
+    def test_implicit_directories_count_toward_extraction_cap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        zip_path = tmp_path / "deep-count.zip"
+        _make_zip(zip_path, [("a/b/c/file", b"x")])
+        monkeypatch.setattr("skillspector.input_handler.INGEST_MAX_ZIP_MEMBERS", 3)
+
+        h = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="extracted-entry cap"):
+                h.resolve(str(zip_path))
+            temp = h.temp_dir_for_cleanup()
+            assert temp is not None
+            assert not (temp / "extracted").exists()
         finally:
             h.cleanup()
 
@@ -349,14 +725,14 @@ class TestGitCloneBound:
     ) -> None:
         _stub_private_ip_check(monkeypatch)
 
-        def fake_run(cmd, **kwargs):
+        def fake_popen(cmd, **kwargs):
             # cmd is ["git", "clone", "--depth", "1", url, str(clone_dir)]
             clone_dir = Path(cmd[-1])
             clone_dir.mkdir(parents=True, exist_ok=True)
             (clone_dir / "SKILL.md").write_text("# small")
-            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+            return _CompletedGitProcess()
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
         h = InputHandler()
         try:
@@ -366,19 +742,217 @@ class TestGitCloneBound:
         finally:
             h.cleanup()
 
+    def test_shared_git_budget_charges_dot_git_bytes_at_exact_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_private_ip_check(monkeypatch)
+        worktree_bytes = b"x"
+        git_bytes = b"abc"
+        # Entries: .git, SKILL.md, .git/objects, and its pack file.
+        budget = _RecordingBudget(
+            max_bytes=len(worktree_bytes) + len(git_bytes),
+            max_artifacts=4,
+        )
+
+        def fake_popen(cmd, **kwargs):
+            clone_dir = Path(cmd[-1])
+            objects_dir = clone_dir / ".git" / "objects"
+            objects_dir.mkdir(parents=True)
+            (objects_dir / "pack").write_bytes(git_bytes)
+            (clone_dir / "SKILL.md").write_bytes(worktree_bytes)
+            return _CompletedGitProcess()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        h = InputHandler(transitive_budget=budget)
+        try:
+            resolved, source_type = h.resolve("https://github.com/foo/exact")
+            assert source_type == "git"
+            assert (resolved / "SKILL.md").read_bytes() == worktree_bytes
+            assert budget.scanned_bytes == len(worktree_bytes) + len(git_bytes)
+            assert budget.scanned_artifacts == 4
+            assert budget.remaining_bytes() == 0
+            assert budget.remaining_artifacts() == 0
+            assert budget.reasons == []
+        finally:
+            h.cleanup()
+
+    def test_shared_git_byte_limit_includes_dot_git_and_is_sanitized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_private_ip_check(monkeypatch)
+        budget = _RecordingBudget(max_bytes=3, max_artifacts=10)
+
+        def fake_popen(cmd, **kwargs):
+            clone_dir = Path(cmd[-1])
+            objects_dir = clone_dir / ".git" / "objects"
+            objects_dir.mkdir(parents=True)
+            (objects_dir / "secret-pack-name").write_bytes(b"xxxx")
+            return _CompletedGitProcess()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        h = InputHandler(transitive_budget=budget)
+        try:
+            with pytest.raises(TransitiveIngestTruncatedError) as raised:
+                h.resolve("https://github.com/foo/private-name")
+            assert raised.value.truncation.as_dict() == {
+                "code": "byte_budget_exhausted",
+                "source_type": "git",
+                "message": "Transitive git ingest truncated (byte_budget_exhausted)",
+            }
+            assert "secret-pack-name" not in str(raised.value)
+            assert "private-name" not in str(raised.value)
+            assert budget.reasons == [raised.value.truncation.message]
+            temp = h.temp_dir_for_cleanup()
+            assert temp is not None
+            assert not (temp / "repo").exists()
+        finally:
+            h.cleanup()
+
+    def test_shared_git_artifact_limit_is_typed_and_cleans_partial_clone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_private_ip_check(monkeypatch)
+        budget = _RecordingBudget(max_bytes=100, max_artifacts=1)
+
+        def fake_popen(cmd, **kwargs):
+            clone_dir = Path(cmd[-1])
+            clone_dir.mkdir(parents=True)
+            (clone_dir / "SKILL.md").write_bytes(b"x")
+            (clone_dir / "second.txt").write_bytes(b"y")
+            return _CompletedGitProcess()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        h = InputHandler(transitive_budget=budget)
+        try:
+            with pytest.raises(TransitiveIngestTruncatedError) as raised:
+                h.resolve("https://github.com/foo/artifact-limit")
+            assert raised.value.truncation.as_dict() == {
+                "code": "artifact_budget_exhausted",
+                "source_type": "git",
+                "message": "Transitive git ingest truncated (artifact_budget_exhausted)",
+            }
+            assert budget.reasons == [raised.value.truncation.message]
+            temp = h.temp_dir_for_cleanup()
+            assert temp is not None
+            assert not (temp / "repo").exists()
+        finally:
+            h.cleanup()
+
+    def test_clone_tree_entry_count_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _stub_private_ip_check(monkeypatch)
+        monkeypatch.setattr("skillspector.input_handler.INGEST_MAX_TREE_ENTRIES", 3)
+
+        def fake_popen(cmd, **kwargs):
+            clone_dir = Path(cmd[-1])
+            clone_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(4):
+                (clone_dir / f"file-{index}").write_bytes(b"x")
+            return _CompletedGitProcess()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        h = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="entry cap"):
+                h.resolve("https://github.com/foo/many-files")
+            temp = h.temp_dir_for_cleanup()
+            assert temp is not None
+            assert not (temp / "repo").exists()
+        finally:
+            h.cleanup()
+
+    def test_running_clone_is_terminated_when_inflight_tree_exceeds_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The clone process is stopped during materialization, with bounded output pipes."""
+        _stub_private_ip_check(monkeypatch)
+        monkeypatch.setattr("skillspector.input_handler.INGEST_MAX_BYTES", 10)
+        popen_kwargs: list[dict[str, object]] = []
+
+        class GrowingProcess:
+            def __init__(self, command: list[str]) -> None:
+                clone_dir = Path(command[-1])
+                clone_dir.mkdir(parents=True)
+                (clone_dir / "pack.bin").write_bytes(b"x" * 11)
+                self.terminated = False
+
+            def poll(self) -> int | None:
+                return -15 if self.terminated else None
+
+            def wait(self, timeout: float | None = None) -> int:
+                return -15 if self.terminated else 0
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.terminated = True
+
+        processes: list[GrowingProcess] = []
+
+        def fake_popen(command: list[str], **kwargs: object) -> GrowingProcess:
+            process = GrowingProcess(command)
+            processes.append(process)
+            popen_kwargs.append(kwargs)
+            return process
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        handler = InputHandler()
+        try:
+            with pytest.raises(IngestLimitExceededError, match="Git clone"):
+                handler.resolve("https://github.com/foo/growing")
+            assert len(processes) == 1
+            assert processes[0].terminated is True
+            assert popen_kwargs == [
+                {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                    "shell": False,
+                }
+            ]
+            temp = handler.temp_dir_for_cleanup()
+            assert temp is not None
+            assert not (temp / "repo").exists()
+        finally:
+            handler.cleanup()
+
+    def test_transitive_clone_limit_is_typed_and_not_an_empty_directory(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An exhausted budget must short-circuit before DNS or subprocess work.
+        monkeypatch.setattr(
+            "skillspector.input_handler._is_private_ip",
+            lambda _host: pytest.fail("DNS accessed after budget exhaustion"),
+        )
+        budget = _TransitiveBudget(remaining_bytes=0)
+        h = InputHandler(transitive_budget=budget)
+        try:
+            with pytest.raises(TransitiveIngestTruncatedError) as raised:
+                h.resolve("https://github.com/foo/too-late")
+            assert raised.value.truncation.as_dict() == {
+                "code": "byte_budget_exhausted",
+                "source_type": "git",
+                "message": "Transitive git ingest truncated (byte_budget_exhausted)",
+            }
+            assert h.temp_dir_for_cleanup() is None
+            assert budget.reasons == [raised.value.truncation.message]
+        finally:
+            h.cleanup()
+
     def test_oversize_clone_rejected_and_cleaned_up(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         _stub_private_ip_check(monkeypatch)
         big = b"x" * (INGEST_MAX_BYTES + 1)
 
-        def fake_run(cmd, **kwargs):
+        def fake_popen(cmd, **kwargs):
             clone_dir = Path(cmd[-1])
             clone_dir.mkdir(parents=True, exist_ok=True)
             (clone_dir / "huge.bin").write_bytes(big)
-            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+            return _CompletedGitProcess()
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
         h = InputHandler()
         try:
@@ -390,3 +964,37 @@ class TestGitCloneBound:
             assert not (temp / "repo").exists()
         finally:
             h.cleanup()
+
+
+def test_transitive_download_limit_is_typed_without_materializing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_httpx_client(
+        monkeypatch,
+        lambda _request: pytest.fail("network accessed after byte budget exhaustion"),
+    )
+    budget = _TransitiveBudget(remaining_bytes=0)
+    h = InputHandler(transitive_budget=budget)
+    try:
+        with pytest.raises(TransitiveIngestTruncatedError) as raised:
+            h.resolve(f"https://{_ALLOWED_HOST}/skill.md")
+        assert raised.value.truncation.source_type == "download"
+        assert raised.value.truncation.code == "byte_budget_exhausted"
+        assert h.temp_dir_for_cleanup() is None
+    finally:
+        h.cleanup()
+
+
+def test_transitive_zip_limit_is_typed_without_empty_extract_dir(tmp_path: Path) -> None:
+    zip_path = tmp_path / "skill.zip"
+    _make_zip(zip_path, [("SKILL.md", b"# skill")])
+    budget = _TransitiveBudget(remaining_bytes=0)
+    h = InputHandler(transitive_budget=budget)
+    try:
+        with pytest.raises(TransitiveIngestTruncatedError) as raised:
+            h.resolve(str(zip_path))
+        assert raised.value.truncation.source_type == "zip"
+        assert raised.value.truncation.code == "byte_budget_exhausted"
+        assert h.temp_dir_for_cleanup() is None
+    finally:
+        h.cleanup()

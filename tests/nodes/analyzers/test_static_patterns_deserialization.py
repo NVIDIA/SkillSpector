@@ -123,7 +123,7 @@ class TestLedger:
             "static_patterns_deserialization"
         ]
 
-    def test_oversized_file_recorded_as_skipped(self):
+    def test_oversized_file_recorded_as_completed_after_window_scan(self):
         result = static_patterns_deserialization.node(
             {
                 "components": ["big.php"],
@@ -131,5 +131,5 @@ class TestLedger:
             }
         )
 
-        assert [event["outcome"] for event in result["inspection_ledger"]] == ["skipped"]
+        assert [event["outcome"] for event in result["inspection_ledger"]] == ["completed"]
         assert result["findings"] == []

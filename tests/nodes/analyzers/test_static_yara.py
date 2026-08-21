@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers import static_yara
 from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
 
@@ -299,13 +301,13 @@ class TestEdgeCases:
         state = {"components": ["ghost.txt"], "file_cache": {}, "yara_rules_dir": str(tmp_path)}
         assert static_yara.node(state)["findings"] == []
 
-    def test_oversized_file_skipped(self, tmp_path):
+    def test_oversized_file_scanned_as_raw_bytes(self, tmp_path):
         _write_rule(
             tmp_path, "rule_big", category="malware", severity="HIGH", strings={"a": "BIGMARKER"}
         )
         content = "BIGMARKER" + ("x" * MAX_FILE_CHARS)
         findings = _run(content, "big.txt", str(tmp_path))
-        assert findings == []
+        assert _has_rule(findings, "rule_big")
 
     def test_exact_character_limit_scanned(self, tmp_path):
         _write_rule(
@@ -583,6 +585,58 @@ class TestRuleCaching:
 
 
 class TestHelpers:
+    def test_rule_load_budget_does_not_charge_sibling_scheduler_delay(self, monkeypatch):
+        budget = static_yara._YaraRuleLoadBudget(
+            active_started_at=10.0,
+            active_limit_seconds=5.0,
+            workflow_started_at=100.0,
+            workflow_limit_seconds=60.0,
+        )
+        monkeypatch.setattr(static_yara.time, "thread_time", lambda: 10.01)
+        monkeypatch.setattr(static_yara.time, "monotonic", lambda: 106.0)
+
+        # Six wall-clock seconds in a parallel graph are acceptable when the
+        # rule-loading thread itself received only 10 ms of processing time.
+        static_yara._check_rule_load_budget(budget)
+
+    def test_rule_load_budget_retains_workflow_wall_deadline(self, monkeypatch):
+        budget = static_yara._YaraRuleLoadBudget(
+            active_started_at=10.0,
+            active_limit_seconds=5.0,
+            workflow_started_at=100.0,
+            workflow_limit_seconds=60.0,
+        )
+        monkeypatch.setattr(static_yara.time, "thread_time", lambda: 10.01)
+        monkeypatch.setattr(static_yara.time, "monotonic", lambda: 160.0)
+
+        with pytest.raises(static_yara._YaraRuleResourceLimitError) as raised:
+            static_yara._check_rule_load_budget(budget)
+
+        assert raised.value.reason == LedgerReason.RUNTIME_LIMIT
+        assert raised.value.metrics == {
+            "observed_seconds": 60.0,
+            "limit_seconds": 60.0,
+        }
+
+    def test_rule_load_budget_retains_active_processing_deadline(self, monkeypatch):
+        budget = static_yara._YaraRuleLoadBudget(
+            active_started_at=10.0,
+            active_limit_seconds=5.0,
+            workflow_started_at=100.0,
+            workflow_limit_seconds=60.0,
+        )
+        monkeypatch.setattr(static_yara.time, "thread_time", lambda: 15.0)
+        monkeypatch.setattr(static_yara.time, "monotonic", lambda: 101.0)
+
+        with pytest.raises(static_yara._YaraRuleResourceLimitError) as raised:
+            static_yara._check_rule_load_budget(budget)
+
+        assert raised.value.reason == LedgerReason.RUNTIME_LIMIT
+        assert raised.value.metrics == {
+            "observed_seconds": 5.0,
+            "limit_seconds": 5.0,
+        }
+
     def test_collect_rule_files_finds_yar(self, tmp_path):
         (tmp_path / "a.yar").write_text("rule a { condition: false }")
         (tmp_path / "b.yara").write_text("rule b { condition: false }")
@@ -601,6 +655,28 @@ class TestHelpers:
     def test_collect_rule_files_nonexistent_dir(self, tmp_path):
         files = static_yara._collect_rule_files(tmp_path / "nope")
         assert files == []
+
+    def test_collect_rule_files_has_one_aggregate_entry_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(static_yara, "MAX_YARA_RULE_DIRECTORY_ENTRIES", 2)
+        for index in range(3):
+            (tmp_path / f"rule-{index}.yar").write_text("rule x { condition: false }")
+
+        with pytest.raises(static_yara._YaraRuleResourceLimitError) as raised:
+            static_yara._collect_rule_files(tmp_path)
+
+        assert raised.value.reason == LedgerReason.ARTIFACT_COUNT_LIMIT
+        assert raised.value.metrics == {"observed_artifacts": 3, "limit_artifacts": 2}
+
+    def test_rule_source_read_is_bounded_before_hashing(self, tmp_path, monkeypatch):
+        rule = tmp_path / "large.yar"
+        rule.write_bytes(b"x" * 3)
+        monkeypatch.setattr(static_yara, "MAX_YARA_RULE_FILE_BYTES", 2)
+
+        with pytest.raises(static_yara._YaraRuleResourceLimitError) as raised:
+            static_yara._content_hash([rule])
+
+        assert raised.value.reason == LedgerReason.SIZE_LIMIT
+        assert raised.value.metrics == {"observed_bytes": 3, "limit_bytes": 2}
 
     def test_build_namespace_map(self, tmp_path):
         (tmp_path / "alpha.yar").write_text("")
@@ -742,6 +818,39 @@ class TestContentHashInvalidation:
 
 
 class TestInspectionLedgerResponse:
+    def test_rule_discovery_limit_marks_every_component_partial(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        builtin = tmp_path / "builtin"
+        extra = tmp_path / "extra"
+        builtin.mkdir()
+        extra.mkdir()
+        for index in range(2):
+            (extra / f"rule-{index}.yar").write_text("rule x { condition: false }")
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", builtin)
+        monkeypatch.setattr(static_yara, "MAX_YARA_RULE_FILES", 1)
+
+        result = static_yara.node(
+            {
+                "components": ["a.py", "b.py"],
+                "file_cache": {"a.py": "x", "b.py": "y"},
+                "yara_rules_dir": str(extra),
+            }
+        )
+
+        assert result["findings"] == []
+        assert [event["outcome"] for event in result["inspection_ledger"]] == [
+            "partial",
+            "partial",
+        ]
+        assert all(
+            event["reason_code"] == "artifact_count_limit"
+            and event["observed_artifacts"] == 2
+            and event["limit_artifacts"] == 1
+            for event in result["inspection_ledger"]
+        )
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
     def test_unavailable_rules_emit_an_analyzer_level_status(self, monkeypatch) -> None:
         monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: None)
 
@@ -767,14 +876,223 @@ class TestInspectionLedgerResponse:
         assert event["error_class"] == "RuntimeError"
         assert result["analyzer_status_events"][0]["status"] == "failed"
 
-    def test_character_size_limit_does_not_claim_a_byte_limit(self, monkeypatch) -> None:
-        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: object())
-        content = "😀" * (static_yara.MAX_FILE_CHARS + 1)
+    def test_character_size_limit_does_not_gate_raw_yara(self, monkeypatch) -> None:
+        class NoMatches:
+            def match(self, **_kwargs):
+                return []
+
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: NoMatches())
+        content = "😀" * (MAX_FILE_CHARS + 1)
 
         result = static_yara.node({"components": ["large.md"], "file_cache": {"large.md": content}})
 
         event = result["inspection_ledger"][0]
-        assert event["reason_code"] == "size_limit"
-        assert event["observed_characters"] == len(content)
-        assert event["observed_bytes"] == len(content.encode("utf-8"))
-        assert "limit_bytes" not in event
+        assert event["outcome"] == "completed"
+        assert "reason_code" not in event
+
+    def test_yara_output_is_stopped_inside_match_and_reported_partial(self, monkeypatch) -> None:
+        rules = static_yara.yara.compile(
+            source="\n".join(
+                f'rule r{index} {{ strings: $a = "MARK" condition: $a }}' for index in range(3)
+            )
+        )
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+        monkeypatch.setattr(static_yara, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        monkeypatch.setattr(static_yara, "MAX_FINDINGS_PER_ANALYZER", 2)
+
+        result = static_yara.node(
+            {"components": ["skill.txt"], "file_cache": {"skill.txt": "MARK"}}
+        )
+
+        assert len(result["findings"]) == 2
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "output_limit"
+        assert event["observed_findings"] == 3
+        assert event["limit_findings"] == 2
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_yara_timeout_is_nonfatal_incomplete_work(self, monkeypatch) -> None:
+        class TimedOutRules:
+            def match(self, **_kwargs):
+                raise static_yara.yara.TimeoutError("bounded timeout")
+
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: TimedOutRules())
+
+        result = static_yara.node(
+            {"components": ["skill.txt"], "file_cache": {"skill.txt": "content"}}
+        )
+
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "runtime_limit"
+        assert event["observed_seconds"] == event["limit_seconds"]
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_yara_uses_fast_match_mode_and_engine_timeout(self, monkeypatch) -> None:
+        calls = []
+
+        class RecordingRules:
+            def match(self, **kwargs):
+                calls.append(kwargs)
+                return []
+
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: RecordingRules())
+        result = static_yara.node(
+            {"components": ["skill.txt"], "file_cache": {"skill.txt": "content"}}
+        )
+
+        assert result["inspection_ledger"][0]["outcome"] == "completed"
+        assert calls[0]["fast"] is True
+        assert calls[0]["timeout"] == 30
+        assert callable(calls[0]["callback"])
+
+    def test_expired_shared_deadline_accounts_for_every_unstarted_path(self, monkeypatch) -> None:
+        class ExpiredBudget:
+            def remaining_seconds(self) -> float:
+                return 0.0
+
+        load_rules = MagicMock()
+        monkeypatch.setattr(static_yara, "_load_rules", load_rules)
+
+        result = static_yara.node(
+            {
+                "components": ["a.py", "b.py", "c.py"],
+                "file_cache": {"a.py": "a", "b.py": "b", "c.py": "c"},
+                "workflow_resource_budget": ExpiredBudget(),
+            }
+        )
+
+        load_rules.assert_not_called()
+        assert [event["path"] for event in result["inspection_ledger"]] == [
+            "a.py",
+            "b.py",
+            "c.py",
+        ]
+        assert all(
+            event["outcome"] == "partial" and event["reason_code"] == "runtime_limit"
+            for event in result["inspection_ledger"]
+        )
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_yara_uses_remaining_shared_deadline_for_each_component(self, monkeypatch) -> None:
+        class RemainingBudget:
+            def remaining_seconds(self) -> float:
+                return 4.2
+
+        calls: list[dict[str, object]] = []
+
+        class RecordingRules:
+            def match(self, **kwargs):
+                calls.append(kwargs)
+                return []
+
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: RecordingRules())
+        result = static_yara.node(
+            {
+                "components": ["skill.txt"],
+                "file_cache": {"skill.txt": "content"},
+                "transitive_traversal_state": RemainingBudget(),
+            }
+        )
+
+        assert result["inspection_ledger"][0]["outcome"] == "completed"
+        # yara-python accepts integer seconds, so the engine allowance is
+        # rounded down and never exceeds the exact shared deadline.
+        assert calls[0]["timeout"] == 4
+
+    def test_deadline_expiring_during_rule_load_takes_precedence_over_unavailable(
+        self, monkeypatch
+    ) -> None:
+        class ExpiringDuringLoad:
+            def __init__(self) -> None:
+                self.values = [2.0, 0.0]
+
+            def remaining_seconds(self) -> float:
+                if len(self.values) > 1:
+                    return self.values.pop(0)
+                return self.values[0]
+
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: None)
+
+        result = static_yara.node(
+            {
+                "components": ["a.py", "b.py"],
+                "file_cache": {"a.py": "a", "b.py": "b"},
+                "transitive_traversal_state": ExpiringDuringLoad(),
+            }
+        )
+
+        assert [event["path"] for event in result["inspection_ledger"]] == ["a.py", "b.py"]
+        assert all(event["reason_code"] == "runtime_limit" for event in result["inspection_ledger"])
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_yara_stops_new_components_when_shared_deadline_expires(self, monkeypatch) -> None:
+        class ExpiringBudget:
+            def __init__(self) -> None:
+                self.values = [5.0, 5.0, 5.0, 0.0]
+
+            def remaining_seconds(self) -> float:
+                if len(self.values) > 1:
+                    return self.values.pop(0)
+                return self.values[0]
+
+        calls: list[str] = []
+
+        class RecordingRules:
+            def match(self, **_kwargs):
+                calls.append("matched")
+                return []
+
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: RecordingRules())
+        result = static_yara.node(
+            {
+                "components": ["a.py", "b.py", "c.py"],
+                "file_cache": {"a.py": "a", "b.py": "b", "c.py": "c"},
+                "transitive_traversal_state": ExpiringBudget(),
+            }
+        )
+
+        assert calls == ["matched"]
+        assert result["inspection_ledger"][0]["path"] == "a.py"
+        assert result["inspection_ledger"][0]["outcome"] == "completed"
+        assert [event["path"] for event in result["inspection_ledger"][1:]] == ["b.py", "c.py"]
+        assert all(
+            event["reason_code"] == "runtime_limit" for event in result["inspection_ledger"][1:]
+        )
+
+    def test_yara_marks_no_match_result_partial_when_exact_deadline_elapsed(self) -> None:
+        class NoMatches:
+            def match(self, **_kwargs):
+                return []
+
+        clock_values = iter([10.0, 11.6])
+        matched = static_yara._match_file(
+            NoMatches(),  # type: ignore[arg-type]
+            b"content",
+            "skill.txt",
+            timeout_seconds=1.5,
+            clock=lambda: next(clock_values),
+        )
+
+        assert matched.findings == []
+        assert matched.reason == "runtime_limit"
+        assert matched.metrics == {
+            "observed_seconds": pytest.approx(1.6),
+            "limit_seconds": 1.5,
+        }
+
+    def test_yara_does_not_start_without_one_enforceable_engine_second(self) -> None:
+        match = MagicMock()
+        rules = MagicMock(match=match)
+
+        matched = static_yara._match_file(
+            rules,
+            b"content",
+            "skill.txt",
+            timeout_seconds=0.5,
+        )
+
+        match.assert_not_called()
+        assert matched.reason == "runtime_limit"
+        assert matched.metrics == {"observed_seconds": 0.0, "limit_seconds": 0.5}

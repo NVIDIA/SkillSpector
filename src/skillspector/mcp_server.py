@@ -144,7 +144,10 @@ async def run_scan(
         analysis_completeness = result.get("analysis_completeness") or {}
         entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
         safe_to_install = (
-            risk_score <= RISK_THRESHOLD and execution_successful and entirely_uninspected == 0
+            risk_score <= RISK_THRESHOLD
+            and execution_successful
+            and entirely_uninspected == 0
+            and bool(analysis_completeness.get("is_complete", True))
         )
         return {
             "target": target,

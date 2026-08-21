@@ -20,8 +20,9 @@ from __future__ import annotations
 from skillspector.nodes.analyzers import ANALYZER_NODE_IDS, ANALYZER_NODES
 
 # Expected analyzer node IDs per the workflow reference table.
-# Order: static (15), behavioral (2), mcp (3), semantic (3).
+# Order: artifact integrity (1), static (16), behavioral (2), mcp (3), semantic (3).
 EXPECTED_ANALYZER_NODE_IDS: list[str] = [
+    "artifact_integrity",
     "static_patterns_prompt_injection",
     "static_patterns_data_exfiltration",
     "static_patterns_privilege_escalation",
