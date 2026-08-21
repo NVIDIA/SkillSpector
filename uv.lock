@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -2680,6 +2680,7 @@ source = { editable = "." }
 dependencies = [
     { name = "boto3" },
     { name = "httpx" },
+    { name = "jsonschema-rs" },
     { name = "langchain-anthropic" },
     { name = "langchain-aws" },
     { name = "langchain-core" },
@@ -2721,6 +2722,7 @@ requires-dist = [
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.4.0" },
     { name = "hatchling", marker = "extra == 'dev'", specifier = ">=1.31.0" },
     { name = "httpx", specifier = ">=0.28.0" },
+    { name = "jsonschema-rs", specifier = ">=0.40.4" },
     { name = "langchain-anthropic", specifier = ">=1.4.5" },
     { name = "langchain-aws", specifier = ">=0.2.0" },
     { name = "langchain-core", specifier = ">=1.2.17" },

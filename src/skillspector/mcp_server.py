@@ -38,6 +38,7 @@ from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.suppression import effective_findings
 
+
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
