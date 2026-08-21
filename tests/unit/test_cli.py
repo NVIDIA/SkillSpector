@@ -264,6 +264,60 @@ def test_recursive_scan_exception_marks_combined_execution_as_failed(tmp_path: P
     assert payload["skills"][1] == {"name": "two", "error": "child scan crashed"}
 
 
+def test_recursive_scan_string_risk_score_counts_toward_exit_code(tmp_path: Path) -> None:
+    """Numeric-string risk_score values are coerced and affect aggregate exit code."""
+    s1 = SkillDirectory(path=tmp_path / "low", name="low", relative_path="low")
+    s2 = SkillDirectory(path=tmp_path / "high", name="high", relative_path="high")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+    output = tmp_path / "combined.json"
+
+    with patch(
+        "skillspector.cli.graph.invoke",
+        side_effect=[
+            {"report_body": '{"skill": {"name": "low"}}', "risk_score": "25"},
+            {"report_body": '{"skill": {"name": "high"}}', "risk_score": "75"},
+        ],
+    ):
+        with pytest.raises(typer.Exit) as exit_info:
+            _scan_multi_skill(
+                detection,
+                FormatChoice.json,
+                output,
+                no_llm=True,
+                yara_rules_dir=None,
+                verbose=False,
+            )
+
+    assert exit_info.value.exit_code == 1
+    payload = json.loads(output.read_text())
+    assert payload["max_risk_score"] == 75
+
+
+def test_recursive_scan_malformed_risk_score_falls_back_to_zero(tmp_path: Path) -> None:
+    """Non-numeric risk_score values fall back to 0 and do not raise."""
+    s1 = SkillDirectory(path=tmp_path / "bad", name="bad", relative_path="bad")
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=[s1], has_root_skill=False)
+    output = tmp_path / "combined.json"
+
+    with patch(
+        "skillspector.cli.graph.invoke",
+        return_value={"report_body": '{"skill": {"name": "bad"}}', "risk_score": "not-a-number"},
+    ):
+        _scan_multi_skill(
+            detection,
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            yara_rules_dir=None,
+            verbose=False,
+        )
+
+    payload = json.loads(output.read_text())
+    assert payload["max_risk_score"] == 0
+
+
 def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     """Benign context stays distinguishable without deleting deterministic CLI evidence."""
     (tmp_path / "references").mkdir()
