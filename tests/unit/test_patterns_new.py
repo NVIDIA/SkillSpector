@@ -88,6 +88,8 @@ class TestExcessiveAgency:
         "content",
         [
             pytest.param('tools: ["*"]', id="wildcard_tools"),
+            pytest.param("tools: *", id="wildcard_tools_bare"),
+            pytest.param("permissions: '*'", id="wildcard_permissions"),
             pytest.param("Allow access to all tools without restriction.", id="grant_all_tools"),
             pytest.param("This skill can execute arbitrary commands.", id="arbitrary_commands"),
             pytest.param(
@@ -102,6 +104,21 @@ class TestExcessiveAgency:
         findings = ea_mod.analyze(
             "This API has no restrictions on read-only access.", "docs.md", "markdown"
         )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                "For each tool:\n\n**Input Schema:**",
+                id="no_cross_heading_bridge",
+            ),
+            pytest.param("**API Coverage vs. Workflow Tools:**", id="no_bold_markdown_collision"),
+            pytest.param("Tools: **Read**, **Write**", id="no_bolded_named_tool_list"),
+        ],
+    )
+    def test_ea1_no_false_positive_on_markdown_bold_or_heading(self, content: str) -> None:
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
         assert not any(f.rule_id == "EA1" for f in findings)
 
     @pytest.mark.parametrize(
