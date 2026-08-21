@@ -35,7 +35,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.logging_config import get_logger
-from skillspector.models import Finding
+from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.state import (
     AnalyzerNodeResponse,
     SkillspectorState,
@@ -238,6 +238,7 @@ def _check_rp1(
                     category=_CATEGORY,
                     tags=list(_TAGS),
                     matched_text=full_match[:200],
+                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
                     explanation=(
                         "npx commands without a version suffix (e.g. @1.0.0) "
                         "create a rug-pull risk if the upstream server is "
@@ -272,6 +273,7 @@ def _check_rp1(
                     category=_CATEGORY,
                     tags=list(_TAGS),
                     matched_text=full_match[:200],
+                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
                     explanation=(
                         "uvx/uv tool run commands without ==version create a rug-pull risk."
                     ),
@@ -307,6 +309,7 @@ def _check_rp1(
                     category=_CATEGORY,
                     tags=list(_TAGS),
                     matched_text=full_match[:200],
+                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
                     explanation=(
                         "pip install without ==version installs the latest "
                         "release, which could include malicious changes."
@@ -333,6 +336,7 @@ def _check_rp1(
                     category=_CATEGORY,
                     tags=list(_TAGS),
                     matched_text=full_match[:200],
+                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
                     explanation=(
                         "Docker image references without a specific tag (:latest "
                         "is implicit) or digest (@sha256:...) can be silently "
@@ -367,6 +371,7 @@ def _check_rp1(
                 category=_CATEGORY,
                 tags=list(_TAGS),
                 matched_text=m.group(0)[:200],
+                match_fingerprint=compute_match_fingerprint("RP1", m.group(0)),
                 explanation=(
                     "MCP server references in the skill manifest without version "
                     "pinning are a rug-pull risk."
@@ -399,6 +404,7 @@ def _check_rp2(manifest: dict, budget: _RugPullBudget) -> None:
                     category=_CATEGORY,
                     tags=list(_TAGS),
                     matched_text=m.group(0)[:200],
+                    match_fingerprint=compute_match_fingerprint("RP2", m.group(0)),
                     explanation=(
                         "Language in the manifest suggests the skill may request "
                         "additional permissions or tools in future versions. This "

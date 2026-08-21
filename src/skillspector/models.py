@@ -21,7 +21,7 @@ import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
@@ -38,6 +38,12 @@ class Severity(StrEnum):
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
+
+
+def compute_match_fingerprint(rule_id: str, matched_text: str) -> str:
+    """Return the canonical SHA-256 identity for one rule-bound match."""
+    normalized = " ".join(matched_text.strip().split())
+    return sha256(f"{rule_id}\x1f{normalized}".encode()).hexdigest()
 
 
 @dataclass
@@ -72,8 +78,11 @@ class AnalyzerFinding:
     context: str | None = None
     matched_text: str | None = None
     evidence: dict[str, object] = field(default_factory=dict)
+    # Canonical rule+match digest; source binding is derived by ``Finding.fingerprint``.
+    match_fingerprint: str | None = None
+    complete_match: InitVar[str | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, complete_match: str | None) -> None:
         """Notify an optional runner-owned resource guard after construction.
 
         Static analyzers are trusted code, but the number of findings they
@@ -82,6 +91,8 @@ class AnalyzerFinding:
         private result list instead of waiting for that list to become large.
         Other analyzer families pay no cost beyond this single context lookup.
         """
+        if complete_match is not None:
+            self.match_fingerprint = compute_match_fingerprint(self.rule_id, complete_match)
         observer = _analyzer_finding_observer.get()
         if observer is not None:
             observer(self)
@@ -135,6 +146,7 @@ class Finding:
     source_identity: str | None = None
     source_digest: str | None = None
     evidence: dict[str, object] = field(default_factory=dict)
+    # Canonical unbound rule+match digest. Never replace it with a source-bound digest.
     match_fingerprint: str | None = None
     occurrences: list[dict[str, object]] = field(default_factory=list)
 
@@ -173,7 +185,11 @@ class Finding:
             else " ".join((self.matched_text or "").strip().split())
         )
         if not has_source_provenance:
-            return sha256(f"{self.rule_id}\x1f{normalized}".encode()).hexdigest()
+            return (
+                self.match_fingerprint
+                if self.match_fingerprint
+                else compute_match_fingerprint(self.rule_id, normalized)
+            )
         payload = {
             "rule_id": self.rule_id,
             "match": normalized,

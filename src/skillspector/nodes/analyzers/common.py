@@ -295,8 +295,13 @@ def resolve_call_name_typed(
     return plain
 
 
-def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
-    """Extract the source text for a given line range, truncated to 200 chars."""
+def get_complete_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
+    """Extract the complete source text for a given line range."""
     start = max(0, lineno - 1)
     end = end_lineno or lineno
-    return "\n".join(lines[start:end])[:200]
+    return "\n".join(lines[start:end])
+
+
+def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
+    """Extract a 200-character source preview for a given line range."""
+    return get_complete_source_segment(lines, lineno, end_lineno)[:200]

@@ -104,6 +104,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=get_context(content, match.start(), context_lines=5),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for substance, base_confidence in SUBSTANCE_PATTERNS:
@@ -128,6 +129,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         tags=tag,
                         context=context,
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
     return _deduplicate_findings(findings)
@@ -196,22 +198,8 @@ def _is_warning_context(context: str) -> bool:
 
 
 def _deduplicate_findings(findings: list[AnalyzerFinding]) -> list[AnalyzerFinding]:
-    seen: set[tuple[str, int]] = set()
-    unique: list[AnalyzerFinding] = []
-    for f in findings:
-        key = (f.location.file, f.location.start_line)
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
-        else:
-            for i, ex in enumerate(unique):
-                if (
-                    ex.location.file,
-                    ex.location.start_line,
-                ) == key and f.confidence > ex.confidence:
-                    unique[i] = f
-                    break
-    return unique
+    """Compact only exact same-location matches."""
+    return static_runner.deduplicate_analyzer_findings(findings)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

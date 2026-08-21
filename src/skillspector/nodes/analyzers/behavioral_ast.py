@@ -40,8 +40,8 @@ from skillspector.state import (
 )
 
 from .common import (
+    get_complete_source_segment,
     get_context_from_lines,
-    get_source_segment,
     resolve_call_name,
     resolve_dynamic_import_call,
 )
@@ -345,6 +345,7 @@ def _analyze_python(
         end_lineno: int | None,
         msg_override: str | None = None,
     ) -> None:
+        complete_match = get_complete_source_segment(lines, lineno, end_lineno)
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg_override or _RULE_MESSAGES[rule_id],
@@ -353,7 +354,8 @@ def _analyze_python(
             confidence=_RULE_CONFIDENCES[rule_id],
             tags=[_TAG],
             context=get_context_from_lines(lines, lineno),
-            matched_text=get_source_segment(lines, lineno, end_lineno),
+            matched_text=complete_match[:200],
+            complete_match=complete_match,
         )
         if budget is None:
             findings.append(finding)

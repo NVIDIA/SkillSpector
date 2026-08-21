@@ -34,6 +34,7 @@ from .whitespace_padding import (
     VERTICAL_HIGH_SEVERITY_LINES,
     ZERO_WIDTH_CHARS,
     detect_whitespace_padding,
+    padding_run_match_fingerprint,
 )
 
 logger = get_logger(__name__)
@@ -247,6 +248,14 @@ def _first_smuggled_tag_offset(content: str) -> int | None:
     return None
 
 
+def _tag_run_from(content: str, offset: int) -> str:
+    """Return the complete contiguous Unicode Tag run starting at *offset*."""
+    end = offset
+    while end < len(content) and _TAG_BLOCK[0] <= ord(content[end]) <= _TAG_BLOCK[1]:
+        end += 1
+    return content[offset:end]
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for prompt injection patterns (P1–P4, P9)."""
     findings: list[AnalyzerFinding] = []
@@ -272,6 +281,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     if file_type in ("markdown", "other"):
@@ -288,6 +298,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         tags=tag,
                         context=ctx(match.start()),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
     for pattern, confidence in P3_PATTERNS:
@@ -303,6 +314,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in P4_PATTERNS:
@@ -318,6 +330,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
 
@@ -328,6 +341,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag_offset = _first_smuggled_tag_offset(content)
     if tag_offset is not None:
         line_num = get_line_number(content, tag_offset)
+        complete_match = _tag_run_from(content, tag_offset)
         findings.append(
             AnalyzerFinding(
                 rule_id="P2",
@@ -338,6 +352,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 tags=tag,
                 context=ctx(tag_offset),
                 matched_text=repr(content[tag_offset : tag_offset + 40]),
+                complete_match=complete_match,
             )
         )
 
@@ -370,6 +385,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(run.start_offset),
                     matched_text=run.summary,
+                    match_fingerprint=padding_run_match_fingerprint(content, run),
                 )
             )
     return findings

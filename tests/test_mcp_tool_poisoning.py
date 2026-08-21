@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -29,6 +30,7 @@ from pydantic import BaseModel
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
+from skillspector.nodes.deduplicate import deduplicate
 
 # ---------------------------------------------------------------------------
 # Fixture directory path
@@ -241,6 +243,52 @@ node = mcp_tool_poisoning.node
 
 
 class TestTP1HiddenInstructions:
+    @pytest.mark.parametrize(
+        ("left", "right", "message_fragment"),
+        [
+            pytest.param(
+                "<!--" + "!" * 4092 + "first-->",
+                "<!--" + "!" * 4092 + "second-->",
+                "HTML comment",
+                id="html-comment",
+            ),
+            pytest.param(
+                "[//]: # (" + "!" * 4087 + "first)",
+                "[//]: # (" + "!" * 4087 + "second)",
+                "Markdown comment",
+                id="markdown-comment",
+            ),
+            pytest.param(
+                base64.b64encode(b"a" * 96 + b"first").decode(),
+                base64.b64encode(b"a" * 96 + b"second").decode(),
+                "Base64-encoded blob",
+                id="base64-blob",
+            ),
+        ],
+    )
+    def test_truncated_previews_preserve_distinct_full_match_identity(
+        self,
+        left: str,
+        right: str,
+        message_fragment: str,
+    ) -> None:
+        """Distinct TP1 payloads cannot collide merely because their previews match."""
+
+        def selected(text: str):
+            return next(
+                finding
+                for finding in mcp_tool_poisoning._check_tp1(text, "description")
+                if message_fragment in finding.message
+            )
+
+        findings = [selected(left), selected(right)]
+
+        assert findings[0].matched_text == findings[1].matched_text
+        assert len({finding.fingerprint() for finding in findings}) == 2
+        assert len(deduplicate(findings)) == 2
+        for finding, complete_match in zip(findings, (left, right), strict=True):
+            assert complete_match not in json.dumps(finding.to_dict(), sort_keys=True)
+
     def test_html_comment(self):
         """Description with HTML comment → TP1 finding, HIGH severity, confidence >= 0.90."""
         state: dict = {
@@ -393,6 +441,26 @@ class TestTP1HiddenInstructions:
 
 
 class TestP9WhitespacePadding:
+    def test_block_summary_uses_complete_padding_run_identity(self):
+        pad_line = "\u3000" * 79
+
+        def finding(tail: str):
+            final_line = ("\u3000" * 78) + tail
+            block = "a\n" + "\n".join([pad_line] * 14 + [final_line]) + "\nb"
+            findings = mcp_tool_poisoning._check_p9_padding(
+                block,
+                "description",
+            )
+            return next(item for item in findings if item.severity == "LOW")
+
+        first = finding("\u00a0")
+        second = finding("\u2000")
+        exact = finding("\u00a0")
+
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        assert len(deduplicate([first, exact])) == 1
+
     def test_padded_description_yields_p9(self):
         """Description padded with 100 spaces before an instruction → P9 naming the field."""
         state: dict = {
@@ -589,6 +657,72 @@ class TestP9WhitespacePadding:
 
 
 class TestTP2UnicodeDeception:
+    @pytest.mark.parametrize(
+        ("left", "right", "source_field", "is_identifier", "message_fragment"),
+        [
+            pytest.param(
+                "\u0430" + "a" * 4095 + "first",
+                "\u0430" + "a" * 4095 + "second",
+                "name",
+                True,
+                "Homoglyph characters",
+                id="homoglyph",
+            ),
+            pytest.param(
+                "\u202e" + "a" * 99 + "first",
+                "\u202e" + "a" * 99 + "second",
+                "description",
+                False,
+                "RTL/directional override",
+                id="rtl-override",
+            ),
+            pytest.param(
+                "\u00ad" + "a" * 4095 + "first",
+                "\u00ad" + "a" * 4095 + "second",
+                "name",
+                True,
+                "Invisible formatting",
+                id="invisible-formatting",
+            ),
+            pytest.param(
+                "\u03c3" + "a" * 4095 + "first",
+                "\u03c3" + "a" * 4095 + "second",
+                "name",
+                True,
+                "Mixed script",
+                id="mixed-script",
+            ),
+        ],
+    )
+    def test_truncated_previews_preserve_distinct_full_text_identity(
+        self,
+        left: str,
+        right: str,
+        source_field: str,
+        is_identifier: bool,
+        message_fragment: str,
+    ) -> None:
+        """Distinct TP2 inputs cannot collide merely because their previews match."""
+
+        def selected(text: str):
+            return next(
+                finding
+                for finding in mcp_tool_poisoning._check_tp2(
+                    text,
+                    source_field,
+                    is_identifier,
+                )
+                if message_fragment in finding.message
+            )
+
+        findings = [selected(left), selected(right)]
+
+        assert findings[0].matched_text == findings[1].matched_text
+        assert len({finding.fingerprint() for finding in findings}) == 2
+        assert len(deduplicate(findings)) == 2
+        for finding, complete_text in zip(findings, (left, right), strict=True):
+            assert complete_text not in json.dumps(finding.to_dict(), sort_keys=True)
+
     def test_homoglyph_in_name(self):
         """Name with Cyrillic 'а' (U+0430) → TP2 finding, confidence >= 0.90."""
         state: dict = {
