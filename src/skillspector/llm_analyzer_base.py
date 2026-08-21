@@ -35,9 +35,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
+import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
+from openai import APIStatusError
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from skillspector.inspection_ledger import (
@@ -69,7 +71,13 @@ API_CONNECTION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 STRUCTURED_RESPONSE_MAX_RETRIES = 3
 STRUCTURED_RESPONSE_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_RETRIES + 1
 STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS = API_CONNECTION_RETRY_DELAYS_SECONDS
-LLM_BATCH_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_RETRIES
+RATE_LIMIT_MAX_RETRIES = 5
+RATE_LIMIT_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0, 60.0, 60.0)
+RATE_LIMIT_MAX_DELAY_SECONDS = 120.0
+HTTP_TOO_MANY_REQUESTS = 429
+LLM_BATCH_MAX_ATTEMPTS = (
+    STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_RETRIES + RATE_LIMIT_MAX_RETRIES
+)
 
 
 class _StructuredResponseValidationError(Exception):
@@ -79,6 +87,82 @@ class _StructuredResponseValidationError(Exception):
 def _is_retryable_api_connection_error(exc: BaseException) -> bool:
     """Return whether *exc* is the narrowly supported transient provider failure."""
     return type(exc).__name__ == "APIConnectionError"
+
+
+def _is_retryable_rate_limit_error(exc: BaseException) -> bool:
+    """Return whether *exc* is a provider rate-limit (HTTP 429) rejection.
+
+    Provider SDKs name this exception ``RateLimitError`` (OpenAI, Anthropic and
+    the OpenAI-compatible endpoints reached through ``ChatOpenAI``); raw HTTP
+    clients surface it as a 429 status error instead.
+    """
+    if type(exc).__name__ == "RateLimitError":
+        return True
+    if isinstance(exc, (APIStatusError, httpx.HTTPStatusError)):
+        return exc.response.status_code == HTTP_TOO_MANY_REQUESTS
+    return False
+
+
+def _rate_limit_retry_after_seconds(exc: BaseException) -> float | None:
+    """Return the provider-requested ``Retry-After`` delay in seconds, if usable."""
+    if not isinstance(exc, (APIStatusError, httpx.HTTPStatusError)):
+        return None
+    header = exc.response.headers.get("retry-after")
+    if header is None:
+        return None
+    try:
+        seconds = float(header)
+    except ValueError:
+        # Retry-After may also be an HTTP-date; the schedule below covers it.
+        return None
+    if seconds <= 0:
+        return None
+    return min(seconds, RATE_LIMIT_MAX_DELAY_SECONDS)
+
+
+def _rate_limit_retry_delay(exc: BaseException, retries_used: int) -> float:
+    """Return the wait before the next attempt after a rate-limit rejection."""
+    scheduled = RATE_LIMIT_RETRY_DELAYS_SECONDS[retries_used]
+    requested = _rate_limit_retry_after_seconds(exc)
+    return max(scheduled, requested) if requested is not None else scheduled
+
+
+def _resolve_retry_delay(
+    exc: BaseException,
+    *,
+    attempt: int,
+    connection_retries: int,
+    rate_limit_retries: int,
+    uses_native_connection_retries: bool,
+) -> tuple[Literal["rate_limit", "connection"], float] | None:
+    """Return the retry kind and delay for *exc*, or ``None`` to fail the batch.
+
+    Rate-limit rejections are retried even when the chat model has native retry
+    support: native budgets back off in milliseconds, which a provider quota
+    ceiling outlasts.
+    """
+    if attempt == LLM_BATCH_MAX_ATTEMPTS:
+        return None
+    if _is_retryable_rate_limit_error(exc):
+        if rate_limit_retries >= len(RATE_LIMIT_RETRY_DELAYS_SECONDS):
+            return None
+        return "rate_limit", _rate_limit_retry_delay(exc, rate_limit_retries)
+    if (
+        not _is_retryable_api_connection_error(exc)
+        or uses_native_connection_retries
+        or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
+    ):
+        return None
+    return "connection", API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
+
+
+def _reason_for_batch_exception(exc: BaseException) -> LedgerReason:
+    """Return the ledger reason recorded for an unrecovered batch failure."""
+    if _is_retryable_rate_limit_error(exc):
+        return LedgerReason.LLM_RATE_LIMIT_RETRIES_EXHAUSTED
+    if _is_retryable_api_connection_error(exc):
+        return LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+    return LedgerReason.LLM_BATCH_FAILED
 
 
 def _uses_native_connection_retries(chat_model: object) -> bool:
@@ -100,9 +184,10 @@ def resolve_max_concurrency() -> int:
     Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
     providers (free tiers with a low RPM) can set it to ``1`` to serialize
     requests instead of bursting up to 10 in parallel — a burst that otherwise
-    guarantees 429s, and 429'd batches are dropped from the result (see the
-    analyzer fan-out below). Invalid values fall back to the default; values
-    below 1 are clamped to 1.
+    guarantees 429s. Rate-limited batches are retried with the bounded
+    schedule in the analyzer fan-out below, so serializing trades wall time
+    for fewer retries rather than deciding whether a batch is analyzed at all.
+    Invalid values fall back to the default; values below 1 are clamped to 1.
     """
     raw = os.environ.get("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "").strip()
     if not raw:
@@ -621,9 +706,10 @@ class LLMAnalyzerBase:
         return batch, self.parse_response(response, batch)
 
     def _invoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
-        """Run one batch with bounded retries for malformed output and connection failures."""
+        """Run one batch with bounded retries for malformed output, 429s and connection failures."""
         structured_retries = 0
         connection_retries = 0
+        rate_limit_retries = 0
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
                 return self._invoke_batch(batch, prompt)
@@ -644,22 +730,34 @@ class LLMAnalyzerBase:
                 )
                 time.sleep(delay)
             except Exception as exc:
-                if (
-                    not _is_retryable_api_connection_error(exc)
-                    or self._uses_native_connection_retries
-                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
-                    or attempt == LLM_BATCH_MAX_ATTEMPTS
-                ):
-                    raise
-                delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
-                connection_retries += 1
-                logger.warning(
-                    "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
-                    batch.file_label,
-                    delay,
-                    connection_retries,
-                    API_CONNECTION_MAX_RETRIES,
+                decision = _resolve_retry_delay(
+                    exc,
+                    attempt=attempt,
+                    connection_retries=connection_retries,
+                    rate_limit_retries=rate_limit_retries,
+                    uses_native_connection_retries=self._uses_native_connection_retries,
                 )
+                if decision is None:
+                    raise
+                kind, delay = decision
+                if kind == "rate_limit":
+                    rate_limit_retries += 1
+                    logger.warning(
+                        "LLM provider rate limited %s; retrying in %.2fs (%d/%d)",
+                        batch.file_label,
+                        delay,
+                        rate_limit_retries,
+                        RATE_LIMIT_MAX_RETRIES,
+                    )
+                else:
+                    connection_retries += 1
+                    logger.warning(
+                        "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
+                        batch.file_label,
+                        delay,
+                        connection_retries,
+                        API_CONNECTION_MAX_RETRIES,
+                    )
                 time.sleep(delay)
 
         raise AssertionError("bounded retry loop must return or raise")
@@ -686,9 +784,10 @@ class LLMAnalyzerBase:
         return batch, self.parse_response(response, batch)
 
     async def _ainvoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
-        """Asynchronously run one batch with bounded malformed-output and connection retries."""
+        """Asynchronously run one batch with bounded malformed-output, 429 and connection retries."""
         structured_retries = 0
         connection_retries = 0
+        rate_limit_retries = 0
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
                 return await self._ainvoke_batch(batch, prompt)
@@ -709,22 +808,34 @@ class LLMAnalyzerBase:
                 )
                 await asyncio.sleep(delay)
             except Exception as exc:
-                if (
-                    not _is_retryable_api_connection_error(exc)
-                    or self._uses_native_connection_retries
-                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
-                    or attempt == LLM_BATCH_MAX_ATTEMPTS
-                ):
-                    raise
-                delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
-                connection_retries += 1
-                logger.warning(
-                    "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
-                    batch.file_label,
-                    delay,
-                    connection_retries,
-                    API_CONNECTION_MAX_RETRIES,
+                decision = _resolve_retry_delay(
+                    exc,
+                    attempt=attempt,
+                    connection_retries=connection_retries,
+                    rate_limit_retries=rate_limit_retries,
+                    uses_native_connection_retries=self._uses_native_connection_retries,
                 )
+                if decision is None:
+                    raise
+                kind, delay = decision
+                if kind == "rate_limit":
+                    rate_limit_retries += 1
+                    logger.warning(
+                        "LLM provider rate limited %s; retrying in %.2fs (%d/%d)",
+                        batch.file_label,
+                        delay,
+                        rate_limit_retries,
+                        RATE_LIMIT_MAX_RETRIES,
+                    )
+                else:
+                    connection_retries += 1
+                    logger.warning(
+                        "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
+                        batch.file_label,
+                        delay,
+                        connection_retries,
+                        API_CONNECTION_MAX_RETRIES,
+                    )
                 await asyncio.sleep(delay)
 
         raise AssertionError("bounded retry loop must return or raise")
@@ -777,11 +888,7 @@ class LLMAnalyzerBase:
                     BatchFailure(
                         batch=batch,
                         error_class=type(exc).__name__,
-                        reason=(
-                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _is_retryable_api_connection_error(exc)
-                            else LedgerReason.LLM_BATCH_FAILED
-                        ),
+                        reason=_reason_for_batch_exception(exc),
                     )
                 )
         return outcome
@@ -810,12 +917,16 @@ class LLMAnalyzerBase:
         Anthropic chat models use their native three-retry policy instead;
         native retry timing remains provider-managed. Unrecovered errors cost
         only their own batch and are omitted from the result.
+        Rate-limit rejections (HTTP 429) receive five bounded retries (5s, 15s,
+        30s, then 60s twice, or the provider's ``Retry-After`` when it asks for
+        longer, capped at 120s) regardless of native retry support, because a
+        provider quota ceiling outlasts the sub-second native budget.
         Malformed structured responses (Pydantic ``ValidationError`` or CLI
         JSON parse failures) receive three bounded exponential-backoff retries
-        and are then isolated to their batch. A batch makes at most seven outer
-        chat-model invocations even when both
-        retry policies apply; native provider retries can make additional HTTP
-        requests within one invocation.
+        and are then isolated to their batch. A batch makes at most twelve
+        outer chat-model invocations even when all retry policies apply; native
+        provider retries can make additional HTTP requests within one
+        invocation.
         Callers can detect partial results by comparing the returned batches
         against the submitted ones.  Other ``ValueError`` instances and
         ``NotImplementedError`` signal misconfiguration rather than infra trouble
@@ -871,11 +982,7 @@ class LLMAnalyzerBase:
                     BatchFailure(
                         batch=batch,
                         error_class=type(result).__name__,
-                        reason=(
-                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _is_retryable_api_connection_error(result)
-                            else LedgerReason.LLM_BATCH_FAILED
-                        ),
+                        reason=_reason_for_batch_exception(result),
                     )
                 )
                 continue

@@ -25,12 +25,15 @@ import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
+from openai import RateLimitError as OpenAIRateLimitError
 from pydantic import ValidationError
 
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
     API_CONNECTION_MAX_RETRIES,
     DEFAULT_MAX_LLM_CONCURRENCY,
+    RATE_LIMIT_MAX_DELAY_SECONDS,
+    RATE_LIMIT_RETRY_DELAYS_SECONDS,
     Batch,
     BatchExecutionResult,
     BatchFailure,
@@ -209,6 +212,23 @@ def _structured_response_validation_error() -> ValidationError:
 
 class APIConnectionError(Exception):
     """Test double matching the provider exception name used by the retry policy."""
+
+
+class RateLimitError(Exception):
+    """Test double for a non-OpenAI provider SDK's rate-limit exception."""
+
+
+def _openai_rate_limit_error(retry_after: str | None = None) -> OpenAIRateLimitError:
+    """Build the HTTP 429 error the OpenAI-compatible clients raise."""
+    response = httpx.Response(
+        429,
+        headers={"retry-after": retry_after} if retry_after is not None else {},
+        request=httpx.Request("POST", "https://provider.test/v1/chat/completions"),
+    )
+    return OpenAIRateLimitError("rate limit reached", response=response, body=None)
+
+
+RATE_LIMIT_SLEEP_SCHEDULE = [((delay,), {}) for delay in RATE_LIMIT_RETRY_DELAYS_SECONDS]
 
 
 class _RawTextAnalyzer(LLMAnalyzerBase):
@@ -728,6 +748,107 @@ class TestRunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_rate_limit_error_recovers_with_bounded_backoff(self, sleep: MagicMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[_openai_rate_limit_error(), LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert len(outcome.successful) == 1
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+        sleep.assert_called_once_with(RATE_LIMIT_RETRY_DELAYS_SECONDS[0])
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_rate_limit_error_waits_for_provider_retry_after(self, sleep: MagicMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[_openai_rate_limit_error(retry_after="42"), LLMAnalysisResult(findings=[])]
+        )
+
+        analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        sleep.assert_called_once_with(42.0)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_rate_limit_retry_after_is_capped(self, sleep: MagicMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                _openai_rate_limit_error(retry_after="3600"),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        sleep.assert_called_once_with(RATE_LIMIT_MAX_DELAY_SECONDS)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_rate_limit_error_from_other_provider_sdk_is_retried(self, sleep: MagicMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[RateLimitError("429 too many requests"), LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert len(outcome.successful) == 1
+        sleep.assert_called_once_with(RATE_LIMIT_RETRY_DELAYS_SECONDS[0])
+
+    @patch(MOCK_PATCH_TARGET)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_native_openai_rate_limits_are_still_retried_by_coordinator(
+        self, sleep: MagicMock, get_chat_model: MagicMock
+    ) -> None:
+        """Native retry budgets back off in milliseconds, so 429s need the longer schedule."""
+        get_chat_model.return_value = ChatOpenAI(model=self.MODEL, api_key="sk-test")
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._invoke_batch = MagicMock(
+            side_effect=[
+                _openai_rate_limit_error(),
+                (Batch(file_path="a.py", content="code"), []),
+            ]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert len(outcome.successful) == 1
+        assert outcome.failures == []
+        sleep.assert_called_once_with(RATE_LIMIT_RETRY_DELAYS_SECONDS[0])
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_rate_limit_error_isolated_after_retry_schedule(self, sleep: MagicMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                *[_openai_rate_limit_error() for _ in RATE_LIMIT_RETRY_DELAYS_SECONDS],
+                _openai_rate_limit_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        outcome = analyzer.run_batches_detailed(
+            [
+                Batch(file_path="failed.py", content="code"),
+                Batch(file_path="clean.py", content="code"),
+            ]
+        )
+
+        assert [batch.file_path for batch, _ in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.reason) for failure in outcome.failures] == [
+            ("failed.py", LedgerReason.LLM_RATE_LIMIT_RETRIES_EXHAUSTED)
+        ]
+        assert sleep.call_args_list == RATE_LIMIT_SLEEP_SCHEDULE
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
     def test_structured_error_then_connection_errors_keeps_both_retry_policies(
         self, sleep: MagicMock
     ) -> None:
@@ -1040,6 +1161,67 @@ class TestARunBatches:
             ((1.0,), {}),
             ((2.0,), {}),
         ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_rate_limit_error_recovers_with_bounded_backoff(self, sleep: AsyncMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[_openai_rate_limit_error(retry_after="7"), LLMAnalysisResult(findings=[])]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert len(outcome.successful) == 1
+        assert outcome.failures == []
+        assert analyzer._structured_llm.ainvoke.call_count == 2
+        sleep.assert_awaited_once_with(7.0)
+
+    @patch(MOCK_PATCH_TARGET)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_native_openai_rate_limits_are_still_retried_by_coordinator(
+        self, sleep: AsyncMock, get_chat_model: MagicMock
+    ) -> None:
+        get_chat_model.return_value = ChatOpenAI(model=self.MODEL, api_key="sk-test")
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._ainvoke_batch = AsyncMock(
+            side_effect=[
+                _openai_rate_limit_error(),
+                (Batch(file_path="a.py", content="code"), []),
+            ]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert len(outcome.successful) == 1
+        assert outcome.failures == []
+        sleep.assert_awaited_once_with(RATE_LIMIT_RETRY_DELAYS_SECONDS[0])
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_rate_limit_error_isolated_after_retry_schedule(self, sleep: AsyncMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[
+                *[_openai_rate_limit_error() for _ in RATE_LIMIT_RETRY_DELAYS_SECONDS],
+                _openai_rate_limit_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        outcome = await analyzer.arun_batches_detailed(
+            [
+                Batch(file_path="failed.py", content="code"),
+                Batch(file_path="clean.py", content="code"),
+            ],
+            max_concurrency=1,
+        )
+
+        assert [batch.file_path for batch, _ in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.reason) for failure in outcome.failures] == [
+            ("failed.py", LedgerReason.LLM_RATE_LIMIT_RETRIES_EXHAUSTED)
+        ]
+        assert sleep.await_args_list == RATE_LIMIT_SLEEP_SCHEDULE
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)

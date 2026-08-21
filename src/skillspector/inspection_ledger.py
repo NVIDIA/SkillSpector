@@ -50,6 +50,7 @@ class LedgerReason(StrEnum):
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
+    LLM_RATE_LIMIT_RETRIES_EXHAUSTED = "llm_rate_limit_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     UNACCOUNTED_WORK = "unaccounted_work"
     FINDING_ACCOUNTING_ERROR = "finding_accounting_error"
@@ -95,6 +96,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "LLM returned a malformed structured response after bounded retries."
     ),
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
+    LedgerReason.LLM_RATE_LIMIT_RETRIES_EXHAUSTED: (
+        "LLM provider rate limit persisted after bounded retries."
+    ),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
     LedgerReason.FINDING_ACCOUNTING_ERROR: (

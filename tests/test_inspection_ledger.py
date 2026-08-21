@@ -75,6 +75,7 @@ def test_analyzer_status_for_events_summarizes_terminal_work() -> None:
         (LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID, LedgerOutcome.SKIPPED),
         (LedgerReason.LLM_BATCH_FAILED, LedgerOutcome.FAILED),
         (LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED, LedgerOutcome.FAILED),
+        (LedgerReason.LLM_RATE_LIMIT_RETRIES_EXHAUSTED, LedgerOutcome.FAILED),
     ],
 )
 def test_outcome_for_llm_batch_failure_preserves_failure_policy(
