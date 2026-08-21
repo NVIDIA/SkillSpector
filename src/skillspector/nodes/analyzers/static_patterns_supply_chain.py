@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -672,6 +673,107 @@ def _is_python_lockfile(file_path: str) -> bool:
     return "uv.lock" in lower_path or "poetry.lock" in lower_path
 
 
+def _normalize_npm_package_name(name: str) -> str:
+    """Normalize an npm package name.
+
+    Deliberately *not* ``_normalize_package_name``: that one folds ``_`` into ``-`` for PyPI,
+    where the two are the same project. On npm they are different packages — ``string_decoder``
+    and ``string-decoder`` both exist — so folding them would resolve a dependency against
+    another package's lockfile entry.
+    """
+    return name.strip().lower()
+
+
+def _is_npm_lockfile(file_path: str) -> bool:
+    lower_path = file_path.lower()
+    return lower_path.endswith(("package-lock.json", "npm-shrinkwrap.json"))
+
+
+def _npm_lock_line_index(content: str) -> dict[str, int]:
+    """Map each JSON key to the first line it appears on, in a single pass.
+
+    The obvious implementation — search the file once per package — is quadratic, because both
+    the search and the offset-to-line conversion restart from the top every time. On a 5000-entry
+    lockfile that cost 6.3s, and lockfiles that size are ordinary. One pass costs ~20ms.
+    """
+    index: dict[str, int] = {}
+    line = 1
+    pos = 0
+    for match in re.finditer(r'"((?:[^"\\]|\\.)*)"\s*:', content):
+        line += content.count("\n", pos, match.start())
+        pos = match.start()
+        index.setdefault(match.group(1), line)
+    return index
+
+
+def _npm_lock_entries(content: str) -> list[tuple[str, str, int, int]]:
+    """Extract (name, version, line, depth) for every install recorded in an npm lockfile.
+
+    Covers both layouts: ``lockfileVersion`` 2/3 keep every install under ``packages`` keyed by
+    install path, while version 1 nests ``dependencies``. The root entry (empty key) is the
+    project itself, not a dependency, and is skipped.
+
+    *depth* is 0 for a top-level install and grows with nesting, which is what tells a direct
+    dependency from a transitive one — the manifest's ``^1.2.3`` resolves to the top-level copy.
+
+    Deduplication is by name *and* version, never by name alone: npm installs the same package
+    at several versions routinely, nesting the odd ones out under their dependents. Keeping one
+    entry per name would drop the others silently, and the dropped copy is as installed — and as
+    exploitable — as the one that happened to be seen first.
+    """
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    line_index = _npm_lock_line_index(content)
+    entries: list[tuple[str, str, int, int]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(name: object, version: object, key: str, depth: int) -> None:
+        if not isinstance(name, str) or not name.strip():
+            return
+        if not isinstance(version, str) or not version.strip():
+            return
+        name, version = name.strip(), version.strip()
+        identity = (_normalize_npm_package_name(name), version)
+        if identity in seen:
+            return
+        seen.add(identity)
+        entries.append((name, version, line_index.get(key, 1), depth))
+
+    packages = data.get("packages")
+    if isinstance(packages, dict):
+        for path, entry in packages.items():
+            if not path or not isinstance(entry, dict):
+                continue
+            # "node_modules/a/node_modules/b" is package b installed under a: the name is the
+            # last segment, and "name" is only present for aliased installs.
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = path.split("node_modules/")[-1]
+            add(name, entry.get("version"), path, path.count("node_modules/") - 1)
+
+    def walk(tree: object, depth: int) -> None:
+        if not isinstance(tree, dict):
+            return
+        for name, entry in tree.items():
+            if not isinstance(entry, dict):
+                continue
+            add(name, entry.get("version"), name, depth)
+            walk(entry.get("dependencies"), depth + 1)
+
+    walk(data.get("dependencies"), 0)
+    return entries
+
+
+def _extract_packages_from_npm_lock(content: str) -> list[tuple[str, str | None, int]]:
+    """Extract exact package versions from an npm lockfile."""
+    return [(name, version, line) for name, version, line, _depth in _npm_lock_entries(content)]
+
+
 def _extract_packages_from_toml_lock(content: str) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
     try:
@@ -701,13 +803,14 @@ def _extract_packages_from_toml_lock(content: str) -> list[tuple[str, str | None
 def _apply_locked_versions(
     packages: list[tuple[str, str | None, int]],
     locked_versions: dict[str, str] | None,
+    normalize: Callable[[str], str] = _normalize_package_name,
 ) -> list[tuple[str, str | None, int]]:
     """Prefer lockfile versions for manifest dependencies without exact versions."""
     if not locked_versions:
         return packages
     resolved: list[tuple[str, str | None, int]] = []
     for name, version, line_num in packages:
-        locked_version = locked_versions.get(_normalize_package_name(name))
+        locked_version = locked_versions.get(normalize(name))
         resolved.append((name, version or locked_version, line_num))
     return resolved
 
@@ -727,6 +830,35 @@ def _collect_locked_versions(
         for name, version, _line_num in _extract_packages_from_toml_lock(content):
             if version:
                 locked_versions[_normalize_package_name(name)] = version
+    return locked_versions
+
+
+def _collect_npm_locked_versions(
+    file_cache: dict[str, str],
+    components: list[str],
+) -> dict[str, str]:
+    """Build package -> exact version map from npm lockfiles in the project.
+
+    Kept separate from the Python map: the two ecosystems share package names (``semver``,
+    ``packaging``, ``requests`` all exist in both), so a single map would resolve a PyPI
+    dependency against an npm version, and vice versa.
+    """
+    locked_versions: dict[str, str] = {}
+    depths: dict[str, int] = {}
+    for path in components:
+        if not _is_npm_lockfile(path):
+            continue
+        content = file_cache.get(path)
+        if not content:
+            continue
+        for name, version, _line_num, depth in _npm_lock_entries(content):
+            key = _normalize_npm_package_name(name)
+            # A manifest range names a *direct* dependency, so it resolves to the top-level
+            # install. Nested copies exist for other packages' constraints; answering with one
+            # would report a version this manifest never asked for.
+            if key not in depths or depth < depths[key]:
+                locked_versions[key] = version
+                depths[key] = depth
     return locked_versions
 
 
@@ -1032,6 +1164,7 @@ def _analyze_dependencies(
     content: str,
     file_path: str,
     locked_versions: dict[str, str] | None = None,
+    npm_locked_versions: dict[str, str] | None = None,
 ) -> list[AnalyzerFinding]:
     """Run SC4/SC5/SC6 checks on dependency files."""
     findings: list[AnalyzerFinding] = []
@@ -1039,11 +1172,12 @@ def _analyze_dependencies(
 
     lower_path = file_path.lower()
     is_lockfile = _is_python_lockfile(lower_path)
+    is_npm_lock = _is_npm_lockfile(lower_path)
     is_python_dep = (
         any(n in lower_path for n in ["requirements", "pyproject.toml", "setup.py", "pipfile"])
         or is_lockfile
     )
-    is_npm_dep = "package.json" in lower_path
+    is_npm_dep = "package.json" in lower_path or is_npm_lock
 
     if not is_python_dep and not is_npm_dep:
         return findings
@@ -1061,7 +1195,14 @@ def _analyze_dependencies(
         fallback_db = _FALLBACK_VULNERABLE_PYPI
         popular = _POPULAR_PYPI
     else:
-        packages = _extract_packages_from_package_json(content)
+        if is_npm_lock:
+            packages = _extract_packages_from_npm_lock(content)
+        else:
+            packages = _apply_locked_versions(
+                _extract_packages_from_package_json(content),
+                npm_locked_versions,
+                _normalize_npm_package_name,
+            )
         ecosystem = ECOSYSTEM_NPM
         fallback_db = _FALLBACK_VULNERABLE_NPM
         popular = _POPULAR_NPM
@@ -1409,6 +1550,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     components: list[str] = state.get("components") or []
     file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     locked_versions = _collect_locked_versions(file_cache, components)
+    npm_locked_versions = _collect_npm_locked_versions(file_cache, components)
     for path in components:
         lower_path = path.lower()
         is_dep_file = any(
@@ -1416,6 +1558,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             for n in [
                 "requirements",
                 "package.json",
+                "package-lock.json",
+                "npm-shrinkwrap.json",
                 "pyproject.toml",
                 "setup.py",
                 "pipfile",
@@ -1428,7 +1572,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         content = file_cache.get(path)
         if not content:
             continue
-        dep_findings = _analyze_dependencies(content, path, locked_versions)
+        dep_findings = _analyze_dependencies(content, path, locked_versions, npm_locked_versions)
         dependency_findings = [analyzer_finding_to_finding(af) for af in dep_findings]
         findings.extend(dependency_findings)
         record_extra_findings(
