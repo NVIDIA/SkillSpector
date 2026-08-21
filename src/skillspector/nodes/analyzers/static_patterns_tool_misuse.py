@@ -86,7 +86,7 @@ TM1_PATTERNS = [
     # Dangerous tool parameter patterns in instructions
     (
         r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|-rf)\b",
-        0.75,
+        0.8,
     ),
 ]
 

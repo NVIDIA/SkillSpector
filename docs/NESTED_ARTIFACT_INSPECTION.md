@@ -23,26 +23,45 @@ outer-file!/nested.zip!/scripts/setup.sh
 
 ## Cumulative bounds
 
-The following fixed limits apply to one outer container and every nested container below it:
+Archive inspection uses one shared budget for the whole skill bundle. Opening another outer
+container does not reset the member, expanded-byte, or time budget. The bundle scanner may pass a
+smaller remaining artifact or byte allowance, and its deadline always takes precedence.
 
-| Bound | Limit |
-|---|---:|
-| Container depth | 3 |
-| Members | 1,000 |
-| Declared/uncompressed content | 25 MiB |
-| Materialized member | 1 MiB |
-| Compression ratio | 100:1 |
-| Inspection wall time | 5 seconds |
+| Bound | Limit | Scope |
+|---|---:|---|
+| Container depth | 3 | One outer-to-inner provenance chain |
+| Members | 1,000 | All outer and recursively nested containers combined |
+| Expanded member bytes | 25 MiB | All outer and recursively nested containers combined |
+| Central directory | 4 MiB | Each container, checked before creating ZIP metadata objects |
+| Materialized member | 1,000,000 bytes | Each member |
+| Compression ratio | 100:1 | Each member |
+| Inspection wall time | 5 seconds | All outer and recursively nested containers combined |
+
+The 1,000-member and 25 MiB ceilings are also reduced to the bundle scanner's remaining
+10,000-artifact and 64 MiB canonical-byte budgets. Nested members therefore cannot obtain a fresh
+allowance after ordinary files have consumed part of the bundle budget.
+
+Before Python's ZIP reader is invoked, SkillSpector validates the terminal EOCD or ZIP64 records,
+the declared central-directory count and byte size, and the actual sequence of central-directory
+headers. This preflight prevents a forged entry count from causing an unbounded metadata list.
+Already-bounded outer bytes are reused from the bundle cache instead of being read a second time.
 
 These are resource-safety limits, not trust configuration. They are intentionally not user-managed
-allowlists.
+allowlists. See [Analysis Resource Bounds](ANALYSIS_RESOURCE_BOUNDS.md) for the enclosing bundle,
+parser, ledger, and finding ceilings.
 
 ## Failure and completeness behavior
 
 Malformed, encrypted, truncated, unreadable, unsafe-path, link, unsupported, and over-budget
-members are recorded as inspection-ledger exceptions. The scan continues safely when possible, but
-the analysis is marked incomplete. Outer and nested paths remain visible in terminal, JSON,
-Markdown, and SARIF output.
+members are recorded as inspection-ledger exceptions. Readable members retain their exact raw
+bytes and a local-only decoded view. Unreadable members retain an opaque inventory record with a
+`partial` or `failed` disposition; they are never represented as successfully analyzed.
+
+The scan continues safely when possible, but any relevant omitted or partially inspected content
+makes the analysis incomplete. A result that would otherwise be `SAFE` is reported as at least
+`CAUTION`; the MCP verdict sets `safe_to_install` to `false`. CLI users can make incomplete analysis
+a failing gate with `--fail-on-incomplete`. Inspection exceptions and their affected outer or nested
+paths are surfaced in terminal, JSON, Markdown, and SARIF output.
 
 ## SC9: Concealed Executable Artifact
 

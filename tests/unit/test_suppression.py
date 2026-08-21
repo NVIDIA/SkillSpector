@@ -111,13 +111,42 @@ def test_fingerprint_differs_on_field_change() -> None:
 
 
 def test_transitive_fingerprint_and_baseline_are_source_aware() -> None:
-    first = replace(_finding(), source_url="https://github.com/org/first", transitive_depth=1)
-    second = replace(_finding(), source_url="https://github.com/org/second", transitive_depth=1)
+    first_identity = f"external/{'a' * 64}"
+    second_identity = f"external/{'b' * 64}"
+    first = replace(
+        _finding(),
+        source_url="https://github.com/org/shared",
+        source_identity=first_identity,
+        source_digest=f"sha256:{'c' * 64}",
+        transitive_depth=1,
+    )
+    second = replace(
+        _finding(),
+        source_url="https://github.com/org/shared",
+        source_identity=second_identity,
+        source_digest=f"sha256:{'d' * 64}",
+        transitive_depth=1,
+    )
     assert _fingerprint(first) != _fingerprint(second)
+    assert _fingerprint(replace(first, source_url="https://mirror.example/first")) == _fingerprint(
+        first
+    )
+    assert first.fingerprint() != second.fingerprint()
+    assert replace(first, source_url="https://mirror.example/first").fingerprint() == (
+        first.fingerprint()
+    )
+    bound = replace(first, match_fingerprint=first.fingerprint())
+    assert bound.fingerprint() == first.fingerprint()
+    assert replace(bound, source_identity=second_identity).fingerprint() != first.fingerprint()
+    serialized = first.to_dict()
+    assert serialized["source_identity"] == first_identity
+    assert serialized["source_digest"] == f"sha256:{'c' * 64}"
+    assert serialized["occurrences"][0]["source_identity"] == first_identity
+    assert serialized["occurrences"][0]["source_digest"] == f"sha256:{'c' * 64}"
 
     file_cache = {
-        "https://github.com/org/first::skill-a/SKILL.md": SKILL_CONTENT,
-        "https://github.com/org/second::skill-a/SKILL.md": SKILL_CONTENT,
+        f"{first_identity}::skill-a/SKILL.md": SKILL_CONTENT,
+        f"{second_identity}::skill-a/SKILL.md": SKILL_CONTENT,
     }
     baseline = baseline_from_dict(
         build_baseline_dict([first], file_cache=file_cache, scanner_version=SCANNER_VERSION)
@@ -130,6 +159,72 @@ def test_transitive_fingerprint_and_baseline_are_source_aware() -> None:
     )
     assert kept == [second]
     assert [item.finding for item in suppressed] == [first]
+
+
+def test_root_glob_baseline_never_suppresses_transitive_finding() -> None:
+    identity = f"external/{'a' * 64}"
+    child = replace(
+        _finding(),
+        source_url="https://github.com/org/child",
+        source_identity=identity,
+        source_digest=f"sha256:{'b' * 64}",
+        transitive_depth=1,
+    )
+    baseline = Baseline(rules=[SuppressionRule(rule_id="SQP-*", reason="root-only")])
+
+    kept, suppressed = partition_findings(
+        [child],
+        baseline,
+        file_cache={f"{identity}::{child.file}": SKILL_CONTENT},
+        scanner_version=SCANNER_VERSION,
+    )
+
+    assert kept == [child]
+    assert suppressed == []
+
+
+def test_transitive_exact_baseline_requires_immutable_source_provenance() -> None:
+    legacy_child = replace(
+        _finding(), source_url="https://github.com/org/child", transitive_depth=1
+    )
+    baseline = Baseline(
+        fingerprints={_fingerprint(legacy_child): "legacy source"},
+        scanner_version=SCANNER_VERSION,
+    )
+
+    kept, suppressed = partition_findings(
+        [legacy_child],
+        baseline,
+        file_cache={f"{legacy_child.source_url}::{legacy_child.file}": SKILL_CONTENT},
+        scanner_version=SCANNER_VERSION,
+    )
+
+    assert kept == [legacy_child]
+    assert suppressed == []
+    with pytest.raises(ValueError, match="source_identity and source_digest"):
+        build_baseline_dict(
+            [legacy_child],
+            file_cache={f"{legacy_child.source_url}::{legacy_child.file}": SKILL_CONTENT},
+            scanner_version=SCANNER_VERSION,
+        )
+
+
+def test_transitive_fingerprint_does_not_borrow_same_named_root_content() -> None:
+    identity = f"external/{'a' * 64}"
+    child = replace(
+        _finding(),
+        source_identity=identity,
+        source_digest=f"sha256:{'b' * 64}",
+        source_url="https://github.com/org/child",
+        transitive_depth=1,
+    )
+
+    with pytest.raises(ValueError, match="source content missing"):
+        build_baseline_dict(
+            [child],
+            file_cache={child.file: SKILL_CONTENT},
+            scanner_version=SCANNER_VERSION,
+        )
 
 
 def test_fingerprint_canonical_encoding_avoids_delimiter_collision() -> None:
