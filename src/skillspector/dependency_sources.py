@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import configparser
 import re
+import shlex
 import tomllib
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -24,7 +25,7 @@ _URL_RE = re.compile(
     re.IGNORECASE,
 )
 _VARIABLE_RE = re.compile(
-    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+    r"(?<!\\)\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
 _ASSIGNMENT_WORD_RE = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)="
@@ -83,31 +84,45 @@ class SourceChange:
 class _HeredocRegion:
     target: str
     body: str
+    declaration_line: int
     start_line: int
     end_line: int
     expand_variables: bool
     complete: bool
 
 
-_HEREDOC_TARGET = r'(?P<target>"[^"]+"|\'[^\']+\'|[^\s;]+)'
-_HEREDOC_BARE_CHARACTERS = frozenset(
-    "-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:+/@%"
-)
-_HEREDOC_WORD = (
-    r"(?P<word>(?:\\[^\n]|'[^'\n]*'|\"(?:\\.|[^\"\\\n])*\"|[^\s;|&<>()'\"\\])+)(?=$|[\s;|&<>()])"
-)
-_HEREDOC_DELIMITER = _HEREDOC_WORD
-_SHELL_HEREDOC_OPERATOR = re.compile(rf"<<(?P<strip_tabs>-?)(?!<)\s*{_HEREDOC_DELIMITER}")
-_HEREDOC_HEADERS = (
-    re.compile(
-        rf"^\s*cat\b.*?(?<![<>])>(?!>)\s*{_HEREDOC_TARGET}\s*"
-        rf"<<(?P<strip_tabs>-?)\s*{_HEREDOC_DELIMITER}"
-    ),
-    re.compile(
-        rf"^\s*cat\b.*?<<(?P<strip_tabs>-?)\s*{_HEREDOC_DELIMITER}\s*"
-        rf"(?<![<>])>(?!>)\s*{_HEREDOC_TARGET}"
-    ),
-)
+@dataclass(frozen=True)
+class _ShellHeredocSpec:
+    """One statically bounded heredoc declaration on a shell command line."""
+
+    delimiter: str
+    strip_tabs: bool
+    expand_variables: bool
+    input_fd: int
+    segment: int
+    command_depth: int
+
+
+@dataclass(frozen=True)
+class _HeredocBody:
+    """The completed body associated with one ordered heredoc declaration."""
+
+    spec: _ShellHeredocSpec
+    body: str
+    start_line: int
+    end_line: int
+
+
+@dataclass(frozen=True)
+class _ShellWord:
+    """One statically tokenized shell word with its raw assignment shape."""
+
+    raw: str
+    value: str
+    assignment: tuple[str, str] | None
+
+
+_HEREDOC_WORD_BOUNDARIES = frozenset(";|&<>()")
 
 
 def _strip_shell_comment(value: str) -> str:
@@ -169,7 +184,7 @@ def _command_segment_body(segment: str, *, allow_case_arm: bool = False) -> str:
     if keyword:
         candidate = keyword.group("rest")
     if allow_case_arm:
-        case_arm = re.match(r"^[^)]*\)\s*(?P<rest>.+)$", candidate)
+        case_arm = re.match(r"^[A-Za-z0-9_.*?|/-]+\)\s*(?P<rest>.+)$", candidate)
         if case_arm:
             candidate = case_arm.group("rest")
     return candidate.strip()
@@ -202,13 +217,559 @@ def _leading_assignments(segment: str) -> tuple[list[tuple[str, str]], str]:
     return assignments, remainder
 
 
+def _assignment_from_word(word: str) -> tuple[str, str] | None:
+    """Return a static ``NAME=value`` operand."""
+    name, separator, value = word.partition("=")
+    if not separator or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+        return None
+    return name, value
+
+
+def _raw_shell_words(value: str) -> list[str] | None:
+    """Split shell words while retaining quoting and command substitutions."""
+    words: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    substitution_depth = 0
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if escaped:
+            current.append(character)
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            current.append(character)
+            escaped = True
+            index += 1
+            continue
+        if character in {'"', "'", "`"}:
+            quote = None if quote == character else character if quote is None else quote
+            current.append(character)
+            index += 1
+            continue
+        if quote is None and value[index : index + 2] == "$(":
+            current.extend(("$", "("))
+            substitution_depth += 1
+            index += 2
+            continue
+        if quote is None and substitution_depth and character == "(":
+            substitution_depth += 1
+        elif quote is None and substitution_depth and character == ")":
+            substitution_depth -= 1
+        if character.isspace() and quote is None and substitution_depth == 0:
+            if current:
+                words.append("".join(current))
+                current = []
+            index += 1
+            continue
+        current.append(character)
+        index += 1
+    if escaped or quote is not None or substitution_depth:
+        return None
+    if current:
+        words.append("".join(current))
+    return words
+
+
+def _shell_words(value: str) -> list[_ShellWord] | None:
+    """Tokenize one bounded segment without losing shell word boundaries."""
+    raw_words = _raw_shell_words(value)
+    if raw_words is None:
+        return None
+    words: list[_ShellWord] = []
+    for raw in raw_words:
+        assignment = _assignment_from_word(raw)
+        try:
+            normalized = shlex.split(raw, comments=False, posix=True)
+        except ValueError:
+            return None
+        token = normalized[0] if len(normalized) == 1 else raw
+        if re.search(r"(?:\\[$`]|'[^']*[$`][^']*')", raw):
+            # Quote removal must not turn a literal dollar/backtick into an
+            # expandable value when the destination is resolved later.
+            token = raw
+        words.append(_ShellWord(raw=raw, value=token, assignment=assignment))
+    return words
+
+
+_STATIC_REDIRECTION_TARGET = r"(?:'[^'\n]+'|\"[^\"$`\n]+\"|[-A-Za-z0-9_./:+@%=,]+)"
+_STATIC_SUBSHELL_REDIRECTIONS = re.compile(
+    rf"(?:\d*>&(?:\d+|-)|\d*>>?\s*{_STATIC_REDIRECTION_TARGET})"
+    rf"(?:\s*(?:\d*>&(?:\d+|-)|\d*>>?\s*{_STATIC_REDIRECTION_TARGET}))*\s*"
+)
+
+
+def _strip_outer_subshell(value: str) -> str:
+    """Strip bounded outer ``(...)`` wrappers around static command lists."""
+    candidate = value.strip()
+    for _ in range(8):
+        # ``((...))`` is arithmetic syntax in the supported shells, not two
+        # nested subshells. Requiring whitespace distinguishes ``( (...) )``.
+        if not candidate.startswith("(") or candidate.startswith("(("):
+            return candidate
+
+        quote: str | None = None
+        escaped = False
+        depth = 0
+        closing_index: int | None = None
+        for index, character in enumerate(candidate):
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and quote != "'":
+                escaped = True
+                continue
+            if character in {'"', "'", "`"}:
+                quote = None if quote == character else character if quote is None else quote
+                continue
+            if quote is not None:
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth < 0:
+                    return candidate
+                if depth == 0:
+                    closing_index = index
+                    break
+        if closing_index is None:
+            return candidate
+
+        tail = candidate[closing_index + 1 :].strip()
+        if tail and _STATIC_SUBSHELL_REDIRECTIONS.fullmatch(tail) is None:
+            return candidate
+
+        inner = candidate[1:closing_index].strip()
+        if inner.endswith(";") and not inner.endswith(r"\;"):
+            without_terminator = inner[:-1].rstrip()
+            if without_terminator.endswith(";"):
+                return candidate
+            inner = without_terminator
+        if not inner:
+            return candidate
+        candidate = inner
+    return candidate
+
+
+def _prepared_shell_segment(segment: str) -> str:
+    """Remove bounded control, prompt, and subshell wrappers from a segment."""
+    candidate = _command_segment_body(segment, allow_case_arm=True)
+    candidate = re.sub(r"^(?:[$>]\s+)", "", candidate)
+    return _strip_outer_subshell(candidate)
+
+
+def _persistent_environment_assignments(segment: str) -> list[tuple[str, str]]:
+    """Return assignments from an assignment-only or ``export`` command."""
+    words = _shell_words(_prepared_shell_segment(segment))
+    if not words:
+        return []
+
+    if words[0].value == "export" and words[0].assignment is None:
+        index = 1
+        if index < len(words) and words[index].value == "--":
+            index += 1
+        elif index < len(words) and words[index].value.startswith("-"):
+            return []
+        assignments: list[tuple[str, str]] = []
+        for word in words[index:]:
+            assignment = word.assignment or _assignment_from_word(word.value)
+            if assignment is not None:
+                assignments.append(assignment)
+            elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word.value) is None:
+                return []
+        return assignments
+
+    if any(word.assignment is None for word in words):
+        return []
+    return [word.assignment for word in words if word.assignment is not None]
+
+
+def _consume_assignment_words(
+    words: list[_ShellWord], index: int, *, utility_operands: bool = False
+) -> tuple[int, list[tuple[str, str]]]:
+    assignments: list[tuple[str, str]] = []
+    while index < len(words):
+        assignment = words[index].assignment
+        if utility_operands and assignment is None:
+            assignment = _assignment_from_word(words[index].value)
+        if assignment is None:
+            break
+        assignments.append(assignment)
+        index += 1
+    return index, assignments
+
+
+def _consume_env_wrapper(
+    words: list[_ShellWord], index: int
+) -> tuple[int, list[tuple[str, str]], bool, set[str]] | None:
+    """Consume a bounded subset of static ``env`` options and assignments."""
+    clear_environment = False
+    unset_names: set[str] = set()
+    while index < len(words) and words[index].value.startswith("-"):
+        option = words[index].value
+        if option == "--":
+            index += 1
+            break
+        if option in {"-i", "--ignore-environment"}:
+            clear_environment = True
+            index += 1
+            continue
+        if option in {"-u", "--unset"}:
+            if index + 1 >= len(words):
+                return None
+            unset_names.add(words[index + 1].value)
+            index += 2
+            continue
+        if option in {"-C", "--chdir", "--argv0"}:
+            if index + 1 >= len(words):
+                return None
+            index += 2
+            continue
+        if option.startswith("-u") and len(option) > 2:
+            unset_names.add(option[2:])
+            index += 1
+            continue
+        if option.startswith("--unset="):
+            unset_names.add(option.split("=", 1)[1])
+            index += 1
+            continue
+        if (
+            (option.startswith("-C") and len(option) > 2)
+            or option.startswith("--chdir=")
+            or option.startswith("--argv0=")
+        ):
+            index += 1
+            continue
+        return None
+    index, assignments = _consume_assignment_words(words, index, utility_operands=True)
+    return (index, assignments, clear_environment, unset_names) if index < len(words) else None
+
+
+def _consume_sudo_wrapper(words: list[_ShellWord], index: int) -> int | None:
+    """Consume static sudo execution options, rejecting informational modes."""
+    no_argument = {
+        "-E",
+        "-H",
+        "-S",
+        "-b",
+        "-n",
+        "--background",
+        "--non-interactive",
+        "--preserve-env",
+        "--set-home",
+        "--stdin",
+    }
+    with_argument = {
+        "-C",
+        "-D",
+        "-R",
+        "-T",
+        "-g",
+        "-h",
+        "-p",
+        "-r",
+        "-t",
+        "-u",
+        "--chdir",
+        "--chroot",
+        "--close-from",
+        "--group",
+        "--host",
+        "--prompt",
+        "--role",
+        "--type",
+        "--user",
+    }
+    while index < len(words) and words[index].value.startswith("-"):
+        option = words[index].value
+        if option == "--":
+            return index + 1
+        if option in no_argument or option.startswith("--preserve-env="):
+            index += 1
+            continue
+        if option in with_argument:
+            if index + 1 >= len(words):
+                return None
+            index += 2
+            continue
+        if re.match(r"^-[CDRTghprtu].+", option) or re.match(
+            r"^--(?:chdir|chroot|close-from|group|host|prompt|role|type|user)=.+", option
+        ):
+            index += 1
+            continue
+        return None
+    return index if index < len(words) else None
+
+
+def _consume_command_wrapper(words: list[_ShellWord], index: int) -> int | None:
+    """Consume execution-preserving options for the shell ``command`` builtin."""
+    while index < len(words) and words[index].value.startswith("-"):
+        option = words[index].value
+        if option == "--":
+            index += 1
+            break
+        if option == "-p":
+            index += 1
+            continue
+        return None
+    return index if index < len(words) else None
+
+
+def _normalize_executable_command(
+    segment: str,
+) -> tuple[list[str], list[tuple[str, str]]] | None:
+    """Normalize common static execution wrappers around one simple command."""
+    words = _shell_words(_prepared_shell_segment(segment))
+    if words is None:
+        return None
+    index, assignments = _consume_assignment_words(words, 0)
+
+    for _ in range(8):
+        if index >= len(words):
+            return [], assignments
+        wrapper = words[index].value
+        if wrapper == "env":
+            consumed = _consume_env_wrapper(words, index + 1)
+            if consumed is None:
+                return None
+            index, wrapper_assignments, clear_environment, unset_names = consumed
+            if clear_environment:
+                assignments.clear()
+            if unset_names:
+                assignments = [
+                    assignment for assignment in assignments if assignment[0] not in unset_names
+                ]
+            assignments.extend(wrapper_assignments)
+        elif wrapper == "sudo":
+            consumed_index = _consume_sudo_wrapper(words, index + 1)
+            if consumed_index is None:
+                return None
+            index = consumed_index
+            index, wrapper_assignments = _consume_assignment_words(
+                words, index, utility_operands=True
+            )
+            assignments.extend(wrapper_assignments)
+        elif wrapper == "command":
+            consumed_index = _consume_command_wrapper(words, index + 1)
+            if consumed_index is None:
+                return None
+            index = consumed_index
+        else:
+            break
+    else:
+        return None
+
+    if (
+        index >= len(words)
+        or re.fullmatch(r"(?:npm|yarn|pip3?|python3?|poetry|mvn|cargo)", words[index].value, re.I)
+        is None
+    ):
+        return None
+    return [word.value for word in words[index:]], assignments
+
+
+def _environment_source_details(name: str) -> tuple[str, str, str | None] | None:
+    normalized = name.upper()
+    if normalized == "NPM_CONFIG_REGISTRY":
+        return "npm", "replace", None
+    if normalized == "PIP_INDEX_URL":
+        return "pip", "replace", None
+    if normalized == "PIP_EXTRA_INDEX_URL":
+        return "pip", "add", None
+    cargo = re.fullmatch(r"CARGO_REGISTRIES_([A-Z0-9_]+)_INDEX", normalized)
+    if cargo:
+        return "cargo", "add", cargo.group(1).lower()
+    return None
+
+
+def _command_environment_ecosystem(command: list[str]) -> str | None:
+    if command and command[0].lower() == "npm":
+        return "npm"
+    if command and command[0].lower() in {"pip", "pip3"}:
+        return "pip"
+    if (
+        len(command) >= 3
+        and command[0].lower() in {"python", "python3"}
+        and command[1] == "-m"
+        and command[2].lower() in {"pip", "pip3"}
+    ):
+        return "pip"
+    if command and command[0].lower() == "cargo":
+        return "cargo"
+    return None
+
+
+def _command_destination(word: str) -> str | None:
+    """Keep one argv destination without inventing boundaries inside strings."""
+    if any(character.isspace() for character in word) and "$(" not in word and "`" not in word:
+        return None
+    return word
+
+
+def _command_source_specs(
+    command: list[str],
+) -> list[tuple[str, str, str, str | None, str]]:
+    """Return dependency-source changes from one normalized argv vector."""
+    if not command:
+        return []
+    lowered = [word.lower() for word in command]
+    specs: list[tuple[str, str, str, str | None, str]] = []
+
+    if len(command) >= 5 and lowered[:3] == ["npm", "config", "set"]:
+        key = command[3]
+        scope: str | None = None
+        if key.lower() == "registry":
+            pass
+        elif re.fullmatch(r"@[\w.-]+:registry", key, re.I):
+            scope = key.rsplit(":", 1)[0]
+        else:
+            return specs
+        destination = _command_destination(command[4])
+        if destination is not None:
+            specs.append(("npm", "replace", "npm config set", scope, destination))
+        return specs
+
+    if (
+        len(command) >= 5
+        and lowered[:3] == ["yarn", "config", "set"]
+        and lowered[3] in {"registry", "npmregistryserver"}
+    ):
+        destination = _command_destination(command[4])
+        if destination is not None:
+            specs.append(("yarn", "replace", "yarn config set", None, destination))
+        return specs
+
+    pip_args: list[str] | None = None
+    if lowered[0] in {"pip", "pip3"}:
+        pip_args = command[1:]
+    elif (
+        len(command) >= 3
+        and lowered[0] in {"python", "python3"}
+        and lowered[1] == "-m"
+        and lowered[2] in {"pip", "pip3"}
+    ):
+        pip_args = command[3:]
+    if pip_args is not None:
+        lowered_args = [word.lower() for word in pip_args]
+        if len(pip_args) >= 4 and lowered_args[:2] == ["config", "set"]:
+            key = lowered_args[2].removeprefix("global.")
+            destination = _command_destination(pip_args[3])
+            if destination is not None and key in {"index-url", "extra-index-url"}:
+                specs.append(
+                    (
+                        "pip",
+                        "add" if key == "extra-index-url" else "replace",
+                        "pip config set",
+                        None,
+                        destination,
+                    )
+                )
+            return specs
+        for index, argument in enumerate(pip_args):
+            lowered_argument = argument.lower()
+            option: str | None = None
+            option_destination: str | None = None
+            for candidate in ("--extra-index-url", "--index-url", "-i"):
+                if lowered_argument == candidate and index + 1 < len(pip_args):
+                    option = candidate
+                    option_destination = pip_args[index + 1]
+                    break
+                if lowered_argument.startswith(candidate + "="):
+                    option = candidate
+                    option_destination = argument.split("=", 1)[1]
+                    break
+            if option is None or option_destination is None:
+                continue
+            destination = _command_destination(option_destination)
+            if destination is not None:
+                extra = option == "--extra-index-url"
+                specs.append(
+                    (
+                        "pip",
+                        "add" if extra else "replace",
+                        "pip --extra-index-url" if extra else "pip --index-url",
+                        None,
+                        destination,
+                    )
+                )
+        return specs
+
+    if len(command) >= 5 and lowered[:3] == ["poetry", "source", "add"]:
+        index = 3
+        while index < len(command) and command[index].startswith("-"):
+            index += 1
+        if index + 1 < len(command):
+            destination = _command_destination(command[index + 1])
+            if destination is not None and re.fullmatch(r"[\w.-]+", command[index]):
+                specs.append(
+                    (
+                        "poetry",
+                        "add",
+                        "poetry source add",
+                        command[index],
+                        destination,
+                    )
+                )
+        return specs
+
+    if (
+        len(command) >= 4
+        and lowered[:2] == ["poetry", "config"]
+        and lowered[2].startswith("repositories.")
+    ):
+        scope = command[2].split(".", 1)[1]
+        destination = _command_destination(command[3])
+        if destination is not None and re.fullmatch(r"[\w.-]+", scope):
+            specs.append(("poetry", "add", "poetry config repositories", scope, destination))
+        return specs
+
+    if lowered[0] == "mvn":
+        prefix = "-Dmaven.repo.remote="
+        for argument in command[1:]:
+            if argument.lower().startswith(prefix.lower()):
+                destination = _command_destination(argument[len(prefix) :])
+                if destination is not None:
+                    specs.append(("maven", "replace", "Maven CLI repository", None, destination))
+        return specs
+
+    return specs
+
+
 def _normalize_heredoc_word(word: str) -> tuple[str, bool] | None:
     """Apply bounded shell quote removal to one static heredoc word."""
+    if not word or word.startswith("#"):
+        return None
     delimiter: list[str] = []
     quoted = False
     index = 0
     while index < len(word):
         character = word[index]
+        if character == "$" and index + 1 < len(word) and word[index + 1] == "(":
+            # The surrounding scanner deliberately fails open for command and
+            # arithmetic substitutions instead of accepting a partial prefix.
+            return None
+        if character == "$" and index + 1 < len(word) and word[index + 1] == "'":
+            # Support the common static subset of Bash ANSI-C quoting. Escape
+            # decoding is intentionally rejected rather than approximated.
+            end = word.find("'", index + 2)
+            if end < 0 or "\\" in word[index + 2 : end]:
+                return None
+            delimiter.append(word[index + 2 : end])
+            quoted = True
+            index = end + 1
+            continue
+        if character == "$" and index + 1 < len(word) and word[index + 1] == '"':
+            # Treat Bash locale quoting like ordinary quoting. A translated
+            # delimiter that no longer matches the literal terminator leaves the
+            # shell input incomplete, so masking the literal complete form is the
+            # conservative inert-data result.
+            quoted = True
+            index += 1
+            continue
         if character == "'":
             end = word.find("'", index + 1)
             if end < 0:
@@ -244,7 +805,7 @@ def _normalize_heredoc_word(word: str) -> tuple[str, bool] | None:
             quoted = True
             index += 2
             continue
-        if character not in _HEREDOC_BARE_CHARACTERS:
+        if character == "`" or character.isspace() or character in _HEREDOC_WORD_BOUNDARIES:
             return None
         delimiter.append(character)
         index += 1
@@ -369,7 +930,15 @@ def _literal_assignments(content: str) -> Assignments:
 def _resolve_value(value: str, assignments: Assignments, use_line: int) -> tuple[str, bool]:
     """Resolve simple variables from the latest literal assignment before use."""
     resolved = _strip_shell_comment(value).strip().strip(";,)")
-    if len(resolved) >= 2 and resolved[0] == resolved[-1] and resolved[0] in {'"', "'"}:
+    single_quoted = len(resolved) >= 2 and resolved[0] == resolved[-1] == "'"
+    if single_quoted:
+        literal = resolved[1:-1]
+        dynamic = bool("$" in literal or "`" in literal)
+        return (
+            "unresolved" if dynamic or not literal else literal,
+            not dynamic and bool(literal),
+        )
+    if len(resolved) >= 2 and resolved[0] == resolved[-1] == '"':
         resolved = resolved[1:-1]
 
     def replacement(match: re.Match[str]) -> str:
@@ -493,6 +1062,46 @@ def _add_change(
             matched_text=matched_text,
         )
     )
+
+
+def _add_environment_assignment_changes(
+    changes: list[SourceChange],
+    assignment_words: list[tuple[str, str]],
+    *,
+    file: str,
+    line: int,
+    matched_text: str,
+    assignments: Assignments,
+    required_ecosystem: str | None = None,
+) -> None:
+    """Add one finding for every supported dependency-source assignment."""
+    effective_reversed: list[tuple[str, str]] = []
+    seen_names: set[str] = set()
+    for name, raw_destination in reversed(assignment_words):
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        effective_reversed.append((name, raw_destination))
+
+    for name, raw_destination in reversed(effective_reversed):
+        details = _environment_source_details(name)
+        if details is None:
+            continue
+        ecosystem, operation, scope = details
+        if required_ecosystem is not None and ecosystem != required_ecosystem:
+            continue
+        _add_change(
+            changes,
+            ecosystem=ecosystem,
+            operation=operation,
+            surface="environment variable",
+            scope=scope,
+            raw_destination=raw_destination,
+            file=file,
+            line=line,
+            matched_text=matched_text,
+            assignments=assignments,
+        )
 
 
 def _parse_npmrc(
@@ -733,63 +1342,16 @@ def _parse_cargo(content: str, file: str, assignments: Assignments) -> list[Sour
     return changes
 
 
-def _heredocs(content: str) -> list[_HeredocRegion]:
-    """Return bounded, linearly parsed generated-configuration heredocs."""
-    lines = content.splitlines()
-    regions: list[_HeredocRegion] = []
-    index = 0
-    while index < len(lines):
-        match = next(
-            (
-                candidate
-                for pattern in _HEREDOC_HEADERS
-                if (candidate := pattern.search(lines[index])) is not None
-            ),
-            None,
-        )
-        if not match:
-            index += 1
-            continue
-        normalized_word = _normalize_heredoc_word(match.group("word"))
-        if normalized_word is None:
-            index += 1
-            continue
-        delimiter, quoted = normalized_word
-        strip_tabs = match.group("strip_tabs") == "-"
-        end = index + 1
-        while end < len(lines):
-            terminator = lines[end].lstrip("\t") if strip_tabs else lines[end]
-            if terminator == delimiter:
-                break
-            end += 1
-        complete = end < len(lines)
-        body_lines = lines[index + 1 : end]
-        if strip_tabs:
-            body_lines = [line.lstrip("\t") for line in body_lines]
-        regions.append(
-            _HeredocRegion(
-                target=match.group("target").strip("'\""),
-                body="\n".join(body_lines),
-                start_line=index + 2,
-                end_line=end + 1 if complete else len(lines),
-                expand_variables=not quoted,
-                complete=complete,
-            )
-        )
-        if not complete:
-            # An unmatched heredoc consumes the remaining shell input. Stopping
-            # here both reflects that ambiguity and prevents repeated O(n) scans.
-            break
-        index = end + 1
-    return regions
-
-
-def _shell_heredoc_specs(line: str) -> list[tuple[str, bool]]:
-    """Return unquoted heredoc delimiters declared by one shell command line."""
-    specs: list[tuple[str, bool]] = []
+def _redirection_word(line: str, start: int) -> tuple[str, int, bool]:
+    """Read one redirection word without accepting a static prefix."""
+    index = start
+    while index < len(line) and line[index].isspace():
+        index += 1
+    word_start = index
     quote: str | None = None
     escaped = False
-    index = 0
+    substitution_depth = 0
+    dynamic = False
     while index < len(line):
         character = line[index]
         if escaped:
@@ -800,52 +1362,419 @@ def _shell_heredoc_specs(line: str) -> list[tuple[str, bool]]:
             escaped = True
             index += 1
             continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if substitution_depth:
+            if character in {'"', "'"}:
+                quote = character
+            elif line[index : index + 2] == "$(":
+                substitution_depth += 1
+                index += 2
+                continue
+            elif character == "(":
+                substitution_depth += 1
+            elif character == ")":
+                substitution_depth -= 1
+            index += 1
+            continue
+        if line[index : index + 2] == "$(":
+            dynamic = True
+            substitution_depth = 1
+            index += 2
+            continue
+        if character == "`":
+            dynamic = True
+            quote = "`"
+            index += 1
+            continue
         if character in {'"', "'"}:
+            quote = character
+            index += 1
+            continue
+        if character.isspace() or character in _HEREDOC_WORD_BOUNDARIES:
+            break
+        index += 1
+    malformed = escaped or quote is not None or substitution_depth > 0
+    return line[word_start:index], index, dynamic or malformed
+
+
+def _arithmetic_end(line: str, start: int) -> int:
+    """Skip one balanced ``((...))`` or ``$((...))`` arithmetic expression."""
+    opener_length = 3 if line[start : start + 3] == "$((" else 2
+    depth = 2
+    index = start + opener_length
+    quote: str | None = None
+    escaped = False
+    while index < len(line) and depth:
+        character = line[index]
+        if escaped:
+            escaped = False
+        elif character == "\\" and quote != "'":
+            escaped = True
+        elif character in {'"', "'"}:
+            quote = None if quote == character else character if quote is None else quote
+        elif quote is None and character == "(":
+            depth += 1
+        elif quote is None and character == ")":
+            depth -= 1
+        index += 1
+    return index
+
+
+def _redirection_start(line: str, operator_index: int) -> int:
+    """Return the start of an adjacent shell IO number, if one exists."""
+    start = operator_index
+    while start > 0 and line[start - 1] in "0123456789":
+        start -= 1
+    if start > 0 and not (line[start - 1].isspace() or line[start - 1] in ";|&()"):
+        return operator_index
+    return start
+
+
+def _redirection_fd(line: str, operator_index: int, default: int) -> int:
+    """Return an adjacent shell IO number, or the operator's default fd."""
+    start = _redirection_start(line, operator_index)
+    if start == operator_index:
+        return default
+    normalized = line[start:operator_index].lstrip("0") or "0"
+    return int(normalized) if len(normalized) <= 6 else -1
+
+
+def _static_redirection_target(raw: str, dynamic: bool) -> str | None:
+    """Normalize one static output-redirection target without expanding it."""
+    if dynamic or not raw:
+        return None
+    try:
+        words = shlex.split(raw, comments=False, posix=True)
+    except ValueError:
+        return None
+    return words[0] if len(words) == 1 else None
+
+
+def _scan_shell_redirections(
+    line: str,
+) -> tuple[
+    list[_ShellHeredocSpec],
+    dict[tuple[int, int], str | None],
+    dict[tuple[int, int], int | None],
+    str,
+    bool,
+]:
+    """Scan heredoc and stdout-file redirects in one linear lexical pass."""
+    specs: list[_ShellHeredocSpec] = []
+    stdout_targets: dict[tuple[int, int], str | None] = {}
+    stdin_heredocs: dict[tuple[int, int], int | None] = {}
+    command_characters = list(line)
+    valid_heredocs = True
+    quote: str | None = None
+    escaped = False
+    segment = 0
+    command_depth = 0
+    return_quote: str | None = None
+    return_segment = 0
+    index = 0
+
+    def mask_command_redirection(start: int, end: int) -> None:
+        if command_depth == 0 and segment == 0:
+            command_characters[start:end] = [" "] * (end - start)
+
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote == '"' and line[index : index + 2] == "$(":
+            # A command substitution inside double quotes has its own shell
+            # grammar; heredoc bodies there remain data, not executable lines.
+            if command_depth == 0:
+                return_quote = quote
+                return_segment = segment
+                segment = 0
+            quote = None
+            command_depth += 1
+            index += 2
+            continue
+        if character in {'"', "'", "`"}:
             quote = None if quote == character else character if quote is None else quote
             index += 1
             continue
-        if quote is None and character == "#" and (index == 0 or line[index - 1].isspace()):
+        if quote is not None:
+            index += 1
+            continue
+        if character == "#" and (index == 0 or line[index - 1].isspace()):
             break
-        if (
-            quote is None
-            and line[index : index + 2] == "<<"
-            and (index == 0 or line[index - 1] != "<")
+        if line[index : index + 3] == "$((" or line[index : index + 2] == "((":
+            index = _arithmetic_end(line, index)
+            continue
+        if line[index : index + 2] == "$(":
+            if command_depth == 0:
+                return_quote = None
+                return_segment = segment
+                segment = 0
+            command_depth += 1
+            index += 2
+            continue
+        if command_depth and character == "(":
+            command_depth += 1
+            index += 1
+            continue
+        if command_depth and character == ")":
+            command_depth -= 1
+            index += 1
+            if command_depth == 0:
+                quote = return_quote
+                segment = return_segment
+                return_quote = None
+            continue
+        if character == "&" and line[index : index + 2] == "&>":
+            stdout_targets[(command_depth, segment)] = None
+            cursor = index + (3 if line[index : index + 3] == "&>>" else 2)
+            _, end, _ = _redirection_word(line, cursor)
+            mask_command_redirection(index, end)
+            index = end
+            continue
+        if character in ";|&":
+            pair = line[index : index + 2]
+            segment += 1
+            index += 2 if pair in {"&&", "||", "|&"} else 1
+            continue
+        if line[index : index + 2] == "<<" and (
+            (index == 0 or line[index - 1] != "<") and line[index : index + 3] != "<<<"
         ):
-            match = _SHELL_HEREDOC_OPERATOR.match(line, index)
-            if match:
-                normalized_word = _normalize_heredoc_word(match.group("word"))
-                if normalized_word is not None:
-                    delimiter, _ = normalized_word
-                    specs.append((delimiter, match.group("strip_tabs") == "-"))
-                index = match.end()
-                continue
+            cursor = index + 2
+            strip_tabs = cursor < len(line) and line[cursor] == "-"
+            if strip_tabs:
+                cursor += 1
+            raw_word, end, dynamic = _redirection_word(line, cursor)
+            partial_before_parenthesis = end < len(line) and line[end] == "("
+            normalized = (
+                None if dynamic or partial_before_parenthesis else _normalize_heredoc_word(raw_word)
+            )
+            if normalized is None:
+                valid_heredocs = False
+            else:
+                delimiter, quoted = normalized
+                input_fd = _redirection_fd(line, index, 0)
+                spec_index = len(specs)
+                specs.append(
+                    _ShellHeredocSpec(
+                        delimiter=delimiter,
+                        strip_tabs=strip_tabs,
+                        expand_variables=not quoted,
+                        input_fd=input_fd,
+                        segment=segment,
+                        command_depth=command_depth,
+                    )
+                )
+                if input_fd == 0:
+                    stdin_heredocs[(command_depth, segment)] = spec_index
+            mask_command_redirection(_redirection_start(line, index), end)
+            index = max(end, cursor)
+            continue
+        if character == ">" and (index == 0 or line[index - 1] not in "<>"):
+            cursor = index + (2 if line[index : index + 2] == ">>" else 1)
+            fd = _redirection_fd(line, index, 1)
+            supported_file_redirect = True
+            if cursor < len(line) and line[cursor] in "&|":
+                supported_file_redirect = False
+                cursor += 1
+            raw_target, end, dynamic = _redirection_word(line, cursor)
+            if fd == 1:
+                stdout_targets[(command_depth, segment)] = (
+                    _static_redirection_target(raw_target, dynamic)
+                    if supported_file_redirect
+                    else None
+                )
+            mask_command_redirection(_redirection_start(line, index), end)
+            index = max(end, cursor)
+            continue
+        if character == "<" and (index == 0 or line[index - 1] not in "<>"):
+            if line[index : index + 2] == "<<":
+                # Here-strings were excluded from the heredoc branch above.
+                cursor = index + 3
+            else:
+                cursor = index + (2 if line[index : index + 2] in {"<&", "<>"} else 1)
+            fd = _redirection_fd(line, index, 0)
+            raw_target, end, _ = _redirection_word(line, cursor)
+            if fd == 0:
+                stdin_heredocs[(command_depth, segment)] = None
+            elif fd == 1:
+                stdout_targets[(command_depth, segment)] = None
+            mask_command_redirection(_redirection_start(line, index), end)
+            index = max(end, cursor if raw_target else cursor)
+            continue
         index += 1
-    return specs
+    if not valid_heredocs:
+        specs = []
+        stdin_heredocs = {}
+    return specs, stdout_targets, stdin_heredocs, "".join(command_characters), valid_heredocs
+
+
+def _ordered_heredoc_bodies(
+    lines: list[str], header_index: int, specs: list[_ShellHeredocSpec]
+) -> tuple[list[_HeredocBody], int, bool]:
+    """Bind sequential heredoc bodies to their declarations in shell order."""
+    bodies: list[_HeredocBody] = []
+    body_index = header_index + 1
+    for spec in specs:
+        end = body_index
+        while end < len(lines):
+            terminator = lines[end].lstrip("\t") if spec.strip_tabs else lines[end]
+            if terminator == spec.delimiter:
+                break
+            end += 1
+        if end >= len(lines):
+            return bodies, len(lines), False
+        body_lines = lines[body_index:end]
+        if spec.strip_tabs:
+            body_lines = [line.lstrip("\t") for line in body_lines]
+        bodies.append(
+            _HeredocBody(
+                spec=spec,
+                body="\n".join(body_lines),
+                start_line=body_index + 1,
+                end_line=end + 1,
+            )
+        )
+        body_index = end + 1
+    return bodies, body_index, True
+
+
+def _cat_reads_stdin(command_text: str) -> bool:
+    """Return whether a bounded simple ``cat`` consumes its stdin."""
+    parts = _shell_parts(command_text)
+    if not parts:
+        return False
+    words = _shell_words(parts[0][1])
+    if not words or words[0].value != "cat":
+        return False
+
+    operands: list[_ShellWord] = []
+    parse_options = True
+    informational = {"--help", "--version"}
+    long_options = {
+        "--number-nonblank",
+        "--number",
+        "--show-all",
+        "--show-ends",
+        "--show-nonprinting",
+        "--show-tabs",
+        "--squeeze-blank",
+    }
+    for word in words[1:]:
+        value = word.value
+        if parse_options and value == "--":
+            parse_options = False
+            continue
+        if parse_options and value in informational:
+            return False
+        if parse_options and value in long_options:
+            continue
+        if parse_options and value.startswith("-") and value != "-":
+            if re.fullmatch(r"-[AbEenstTuv]+", value) is None:
+                return False
+            continue
+        operands.append(word)
+
+    if not operands:
+        return True
+    if any(word.value == "-" for word in operands):
+        return True
+    # A dynamic operand can still resolve to the conventional stdin marker.
+    return any("$" in word.raw or "`" in word.raw for word in operands)
+
+
+def _generated_cat_heredoc(
+    line: str,
+    command_text: str,
+    specs: list[_ShellHeredocSpec],
+    stdout_targets: dict[tuple[int, int], str | None],
+    stdin_heredocs: dict[tuple[int, int], int | None],
+) -> tuple[str, int] | None:
+    """Return the target and effective stdin heredoc for a simple ``cat``."""
+    if re.match(r"^\s*cat\b", line) is None or not _cat_reads_stdin(command_text):
+        return None
+    target = stdout_targets.get((0, 0))
+    if target is None:
+        return None
+    spec_index = stdin_heredocs.get((0, 0))
+    if spec_index is None or spec_index >= len(specs):
+        return None
+    return target, spec_index
+
+
+def _heredocs(content: str) -> list[_HeredocRegion]:
+    """Return generated-config heredocs using ordered, linear redirection scans."""
+    lines = content.splitlines()
+    regions: list[_HeredocRegion] = []
+    index = 0
+    while index < len(lines):
+        specs, stdout_targets, stdin_heredocs, command_text, valid = _scan_shell_redirections(
+            lines[index]
+        )
+        if not valid or not specs:
+            index += 1
+            continue
+        bodies, next_index, complete = _ordered_heredoc_bodies(lines, index, specs)
+        if not complete:
+            # Avoid repeated suffix scans; executable command parsing remains
+            # fail-open because the unmatched body is not added to data lines.
+            break
+        generated = _generated_cat_heredoc(
+            lines[index], command_text, specs, stdout_targets, stdin_heredocs
+        )
+        if generated is not None:
+            target, spec_index = generated
+            selected = bodies[spec_index]
+            regions.append(
+                _HeredocRegion(
+                    target=target,
+                    body=selected.body,
+                    declaration_line=index + 1,
+                    start_line=selected.start_line,
+                    end_line=selected.end_line,
+                    expand_variables=selected.spec.expand_variables,
+                    complete=True,
+                )
+            )
+        index = next_index
+    return regions
+
+
+def _shell_heredoc_specs(line: str) -> list[tuple[str, bool]]:
+    """Return ordered static heredoc delimiters declared by one shell line."""
+    specs, _, _, _, valid = _scan_shell_redirections(line)
+    if not valid:
+        return []
+    return [(spec.delimiter, spec.strip_tabs) for spec in specs]
 
 
 def _heredoc_data_lines(content: str) -> set[int]:
-    """Return all shell heredoc body and terminator lines in one bounded pass."""
+    """Return all complete shell heredoc body and terminator lines in one pass."""
     lines = content.splitlines()
     data_lines: set[int] = set()
     index = 0
     while index < len(lines):
-        specs = _shell_heredoc_specs(lines[index])
-        if not specs:
+        specs, _, _, _, valid = _scan_shell_redirections(lines[index])
+        if not valid or not specs:
             index += 1
             continue
-        body_index = index + 1
-        for delimiter, strip_tabs in specs:
-            end = body_index
-            while end < len(lines):
-                terminator = lines[end].lstrip("\t") if strip_tabs else lines[end]
-                if terminator == delimiter:
-                    break
-                end += 1
-            data_lines.update(range(body_index + 1, min(end + 2, len(lines) + 1)))
-            if end >= len(lines):
-                return data_lines
-            body_index = end + 1
-        index = body_index
+        bodies, next_index, complete = _ordered_heredoc_bodies(lines, index, specs)
+        for body in bodies:
+            data_lines.update(range(body.start_line, body.end_line + 1))
+        if not complete:
+            # Fail open for the unmatched body while retaining already completed
+            # bodies from earlier declarations on the same command line.
+            return data_lines
+        index = next_index
     return data_lines
 
 
@@ -855,7 +1784,7 @@ def _parse_generated_configs(
     changes: list[SourceChange] = []
     heredoc_data_lines = _heredoc_data_lines(content)
     for region in _heredocs(content):
-        if not region.complete or region.start_line - 1 in heredoc_data_lines:
+        if not region.complete or region.declaration_line in heredoc_data_lines:
             continue
         lower = region.target.lower()
         region_assignments = assignments if region.expand_variables else {}
@@ -922,6 +1851,8 @@ def _shell_parts(line: str) -> list[tuple[str | None, str]]:
     separator: str | None = None
     quote: str | None = None
     escaped = False
+    substitution_depth = 0
+    grouping_depth = 0
     index = 0
     while index < len(line):
         character = line[index]
@@ -935,16 +1866,39 @@ def _shell_parts(line: str) -> list[tuple[str | None, str]]:
             escaped = True
             index += 1
             continue
-        if character in {'"', "'"}:
+        if character in {'"', "'", "`"}:
             quote = None if quote == character else character if quote is None else quote
             current.append(character)
             index += 1
             continue
-        if quote is None and character == "#" and (not current or current[-1].isspace()):
+        if quote is None and line[index : index + 2] == "$(":
+            current.extend(("$", "("))
+            substitution_depth += 1
+            index += 2
+            continue
+        if quote is None and substitution_depth and character == "(":
+            substitution_depth += 1
+        elif quote is None and substitution_depth and character == ")":
+            substitution_depth -= 1
+        elif quote is None and character == "(":
+            grouping_depth += 1
+        elif quote is None and character == ")" and grouping_depth:
+            grouping_depth -= 1
+        if (
+            quote is None
+            and substitution_depth == 0
+            and character == "#"
+            and (not current or current[-1].isspace())
+        ):
             break
         pair = line[index : index + 2]
         delimiter = pair if pair in {"&&", "||", "|&"} else character
-        if quote is None and (character in {";", "|"} or pair in {"&&", "||", "|&"}):
+        if (
+            quote is None
+            and substitution_depth == 0
+            and grouping_depth == 0
+            and (character in {";", "|"} or pair in {"&&", "||", "|&"})
+        ):
             segment = "".join(current).strip()
             if segment:
                 parts.append((separator, segment))
@@ -962,170 +1916,57 @@ def _shell_parts(line: str) -> list[tuple[str | None, str]]:
 
 def _shell_segments(line: str) -> list[str]:
     """Split executable shell command lists without evaluating shell syntax."""
-    return [segment for _, segment in _shell_parts(line)]
+    segments: list[str] = []
+    for _, segment in _shell_parts(line):
+        unwrapped = _strip_outer_subshell(segment)
+        if unwrapped != segment:
+            segments.extend(_shell_segments(unwrapped))
+        else:
+            segments.append(segment)
+    return segments
 
 
 def _parse_commands(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
     changes: list[SourceChange] = []
     heredoc_data_lines = _heredoc_data_lines(content)
-    command_prefix = r"^\s*(?:[$>]\s+)?(?:(?:command|sudo)\s+)?"
-    patterns: tuple[tuple[str, str, str, str, re.Pattern[str]], ...] = (
-        (
-            "npm",
-            "replace",
-            "npm config set",
-            "scope",
-            re.compile(
-                command_prefix
-                + r"npm\s+config\s+set\s+(?P<scope>@[\w.-]+:)?registry\s+(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "yarn",
-            "replace",
-            "yarn config set",
-            "scope",
-            re.compile(
-                command_prefix
-                + r"yarn\s+config\s+set\s+(?:registry|npmRegistryServer)\s+(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "pip",
-            "replace",
-            "pip --index-url",
-            "none",
-            re.compile(
-                command_prefix
-                + r"(?:python(?:3)?\s+-m\s+)?pip(?:3)?\b[^\n]*?"
-                + r"(?:--index-url|-i)(?:=|\s+)(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "pip",
-            "add",
-            "pip --extra-index-url",
-            "none",
-            re.compile(
-                command_prefix
-                + r"(?:python(?:3)?\s+-m\s+)?pip(?:3)?\b[^\n]*?"
-                + r"--extra-index-url(?:=|\s+)(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "pip",
-            "replace",
-            "pip config set",
-            "none",
-            re.compile(
-                command_prefix
-                + r"pip(?:3)?\s+config\s+set\s+(?:global\.)?index-url\s+(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "pip",
-            "add",
-            "pip config set",
-            "none",
-            re.compile(
-                command_prefix
-                + r"pip(?:3)?\s+config\s+set\s+(?:global\.)?extra-index-url\s+(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "poetry",
-            "add",
-            "poetry source add",
-            "poetry",
-            re.compile(
-                command_prefix
-                + r"poetry\s+source\s+add(?:\s+--\S+)*\s+"
-                + r"(?P<scope>[\w.-]+)\s+(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "poetry",
-            "add",
-            "poetry config repositories",
-            "poetry",
-            re.compile(
-                command_prefix
-                + r"poetry\s+config\s+repositories\."
-                + r"(?P<scope>[\w.-]+)\s+(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-        (
-            "maven",
-            "replace",
-            "Maven CLI repository",
-            "none",
-            re.compile(
-                command_prefix + r"mvn\b[^\n]*?-Dmaven\.repo\.remote=(?P<dest>\S+)",
-                re.I,
-            ),
-        ),
-    )
     for line_number, line in enumerate(content.splitlines(), 1):
         if line_number in heredoc_data_lines:
             continue
         for segment in _shell_segments(line):
-            command_candidate = _command_segment_body(segment, allow_case_arm=True)
-            command_candidate = re.sub(r"^(?:[$>]\s+)", "", command_candidate)
-            _, command_candidate = _leading_assignments(command_candidate)
-            wrapper = re.match(r"^(?:command|sudo)\b\s*(?P<rest>.*)$", command_candidate)
-            if wrapper:
-                _, command_candidate = _leading_assignments(wrapper.group("rest"))
-            for ecosystem, operation, surface, scope_mode, pattern in patterns:
-                match = pattern.search(command_candidate)
-                if not match:
-                    continue
-                scope = match.groupdict().get("scope") if scope_mode != "none" else None
-                if scope:
-                    scope = scope.rstrip(":")
+            _add_environment_assignment_changes(
+                changes,
+                _persistent_environment_assignments(segment),
+                file=file,
+                line=line_number,
+                matched_text=line,
+                assignments=assignments,
+            )
+
+            normalized = _normalize_executable_command(segment)
+            if normalized is None:
+                continue
+            command_candidate, command_assignments = normalized
+            command_ecosystem = _command_environment_ecosystem(command_candidate)
+            if command_ecosystem is not None:
+                _add_environment_assignment_changes(
+                    changes,
+                    command_assignments,
+                    file=file,
+                    line=line_number,
+                    matched_text=line,
+                    assignments=assignments,
+                    required_ecosystem=command_ecosystem,
+                )
+            for ecosystem, operation, surface, scope, destination in _command_source_specs(
+                command_candidate
+            ):
                 _add_change(
                     changes,
                     ecosystem=ecosystem,
                     operation=operation,
                     surface=surface,
                     scope=scope,
-                    raw_destination=match.group("dest"),
-                    file=file,
-                    line=line_number,
-                    matched_text=line,
-                    assignments=assignments,
-                )
-
-            env_match = re.match(
-                r"\s*(?:export\s+)?(?P<name>NPM_CONFIG_REGISTRY|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|CARGO_REGISTRIES_[A-Za-z0-9_]+_INDEX)\s*=\s*(?P<dest>.+)$",
-                _command_segment_body(segment, allow_case_arm=True),
-                re.I,
-            )
-            if env_match:
-                name = env_match.group("name").upper()
-                if name == "NPM_CONFIG_REGISTRY":
-                    ecosystem, operation, scope = "npm", "replace", None
-                elif name == "PIP_INDEX_URL":
-                    ecosystem, operation, scope = "pip", "replace", None
-                elif name == "PIP_EXTRA_INDEX_URL":
-                    ecosystem, operation, scope = "pip", "add", None
-                else:
-                    ecosystem, operation = "cargo", "add"
-                    scope = name.removeprefix("CARGO_REGISTRIES_").removesuffix("_INDEX").lower()
-                _add_change(
-                    changes,
-                    ecosystem=ecosystem,
-                    operation=operation,
-                    surface="environment variable",
-                    scope=scope,
-                    raw_destination=env_match.group("dest"),
+                    raw_destination=destination,
                     file=file,
                     line=line_number,
                     matched_text=line,
