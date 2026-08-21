@@ -15,7 +15,12 @@
 
 """Tests for skillspector CLI (skillspector scan, --version)."""
 
+import ast
 import json
+import re
+import sys
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,10 +32,11 @@ import yaml
 from typer.testing import CliRunner
 
 from skillspector import __version__, cli, transitive
+from skillspector import cli as cli_module
 from skillspector.cli import FormatChoice, _scan_multi_skill, app
 from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory
-from skillspector.suppression import Baseline, SuppressionRule
+from skillspector.suppression import Baseline, SuppressedFinding, SuppressionRule
 
 runner = CliRunner()
 
@@ -268,7 +274,7 @@ def test_cli_scan_nonexistent_exits_2() -> None:
     """scan with nonexistent path exits with code 2."""
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])
     assert result.exit_code == 2
-    assert "Error" in result.output or "error" in result.output.lower()
+    assert "error" in result.output.lower()
 
 
 def test_cli_mcp_registry_routes_and_writes_json(tmp_path: Path) -> None:
@@ -792,6 +798,7 @@ def test_cli_scan_recursive_json_includes_full_skill_payload(
         ],
     )
     assert result.exit_code == 0
+    assert out_file.exists()
     payload = json.loads(out_file.read_text(encoding="utf-8"))
     assert payload["multi_skill"] is True
     assert payload["skill_count"] == 5
@@ -2354,3 +2361,374 @@ def test_scan_transitive_keeps_source_aware_component_coverage(monkeypatch) -> N
     assert body["analysis_completeness"]["coverage_percent"] == 100.0
     assert len(body["components"]) == 2
     assert {component["source_url"] for component in body["components"]} == {None, shared_dep}
+
+
+# --- Fatal diagnostics belong on stderr ---------------------------------------------------
+#
+# Anything driving the CLI from a script separates the two streams and parses stdout. A
+# diagnostic printed there is both lost as a diagnostic and corrupting as output. The cases
+# below enumerate every path that prints and then exits, so a new one cannot be added on the
+# wrong stream without a test turning red.
+
+FatalPath = tuple[list[str], AbstractContextManager[object]]
+
+
+@contextmanager
+def _all_of(*managers: AbstractContextManager[object]) -> Iterator[None]:
+    """Enter several patches as one context, so a case can state more than one."""
+    with ExitStack() as stack:
+        for manager in managers:
+            stack.enter_context(manager)
+        yield
+
+
+def _registry_payload(directory: Path) -> Path:
+    """A registry input that parses, so an argument check is what fails."""
+    payload = directory / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    return payload
+
+
+def _skill_dir(directory: Path) -> Path:
+    """A minimal skill directory the CLI accepts as an input path."""
+    skill = directory / "skill"
+    skill.mkdir(exist_ok=True)
+    (skill / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    return skill
+
+
+def _multi_skill(directory: Path) -> AbstractContextManager[object]:
+    """Take the multi-skill branch without building two real skill trees."""
+    return patch(
+        "skillspector.cli.detect_skills",
+        return_value=MultiSkillDetectionResult(
+            is_multi_skill=True,
+            skills=[
+                SkillDirectory(path=directory / "one", name="one", relative_path="one"),
+                SkillDirectory(path=directory / "two", name="two", relative_path="two"),
+            ],
+            has_root_skill=False,
+        ),
+    )
+
+
+def _scan_raises(exc: BaseException) -> AbstractContextManager[object]:
+    """Make the graph blow up, which is how the generic handlers are reached."""
+    return patch("skillspector.cli.graph.invoke", side_effect=exc)
+
+
+def _registry_flag_conflict(d: Path) -> FatalPath:
+    args = ["scan", str(_registry_payload(d)), "--mcp-registry", "--recursive"]
+    return args, nullcontext()
+
+
+def _invalid_transitive_prefix(d: Path) -> FatalPath:
+    args = [
+        "scan",
+        str(_skill_dir(d)),
+        "--no-llm",
+        "--transitive-allow-prefix",
+        "not-a-url",
+    ]
+    return args, nullcontext()
+
+
+def _registry_wrong_format(d: Path) -> FatalPath:
+    args = ["scan", str(_registry_payload(d)), "--mcp-registry", "--format", "markdown"]
+    return args, nullcontext()
+
+
+def _registry_scan_fails(d: Path) -> FatalPath:
+    args = ["scan", str(_registry_payload(d)), "--mcp-registry", "--format", "json"]
+    return args, patch(
+        "skillspector.cli.scan_registry", side_effect=RuntimeError("registry unreachable")
+    )
+
+
+def _symlinked_input(d: Path) -> FatalPath:
+    link = d / "linked-skill"
+    try:
+        link.symlink_to(_skill_dir(d), target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+    return ["scan", str(link), "--no-llm"], nullcontext()
+
+
+def _recursive_multi_skill_with_baseline(d: Path) -> FatalPath:
+    args = ["scan", str(_skill_dir(d)), "--recursive", "--baseline", str(d / "b.yaml"), "--no-llm"]
+    return args, _multi_skill(d)
+
+
+def _multi_skill_child_crashes(d: Path) -> FatalPath:
+    args = ["scan", str(_skill_dir(d)), "--recursive", "--no-llm"]
+    return args, _all_of(_multi_skill(d), _scan_raises(RuntimeError("child scan crashed")))
+
+
+def _scan_input_missing(d: Path) -> FatalPath:
+    args = ["scan", str(_skill_dir(d)), "--no-llm"]
+    return args, _scan_raises(FileNotFoundError("skill vanished"))
+
+
+def _scan_crashes(d: Path) -> FatalPath:
+    args = ["scan", str(_skill_dir(d)), "--no-llm"]
+    return args, _scan_raises(RuntimeError("scan crashed"))
+
+
+def _scan_crashes_verbose(d: Path) -> FatalPath:
+    args = ["scan", str(_skill_dir(d)), "--no-llm", "--verbose"]
+    return args, _scan_raises(RuntimeError("scan crashed"))
+
+
+def _baseline_input_missing(d: Path) -> FatalPath:
+    args = ["baseline", str(_skill_dir(d)), "--no-llm", "-o", str(d / "b.yaml")]
+    return args, _scan_raises(FileNotFoundError("baseline input missing"))
+
+
+def _baseline_crashes(d: Path) -> FatalPath:
+    args = ["baseline", str(_skill_dir(d)), "--no-llm", "-o", str(d / "b.yaml")]
+    return args, _scan_raises(RuntimeError("baseline crashed"))
+
+
+def _baseline_crashes_verbose(d: Path) -> FatalPath:
+    args = ["baseline", str(_skill_dir(d)), "--no-llm", "-o", str(d / "b.yaml"), "--verbose"]
+    return args, _scan_raises(RuntimeError("baseline crashed"))
+
+
+def _mcp_module_missing(d: Path) -> FatalPath:
+    return ["mcp"], patch.dict(sys.modules, {"skillspector.mcp_server": None})
+
+
+@pytest.mark.parametrize(
+    ("build", "needle"),
+    [
+        pytest.param(_registry_flag_conflict, "cannot be combined", id="registry-flag-conflict"),
+        pytest.param(
+            _invalid_transitive_prefix,
+            "invalid transitive prefix",
+            id="invalid-transitive-prefix",
+        ),
+        pytest.param(_registry_wrong_format, "supports only --format json", id="registry-format"),
+        pytest.param(_registry_scan_fails, "registry unreachable", id="registry-scan-fails"),
+        pytest.param(_symlinked_input, "Refusing to resolve", id="symlinked-input"),
+        pytest.param(
+            _recursive_multi_skill_with_baseline,
+            "not supported for recursive",
+            id="recursive-baseline",
+        ),
+        pytest.param(_multi_skill_child_crashes, "child scan crashed", id="multi-skill-child"),
+        pytest.param(_scan_input_missing, "skill vanished", id="scan-input-missing"),
+        pytest.param(_scan_crashes, "scan crashed", id="scan-crashes"),
+        pytest.param(_scan_crashes_verbose, "RuntimeError", id="scan-crashes-verbose"),
+        pytest.param(_baseline_input_missing, "baseline input missing", id="baseline-missing"),
+        pytest.param(_baseline_crashes, "baseline crashed", id="baseline-crashes"),
+        pytest.param(_baseline_crashes_verbose, "RuntimeError", id="baseline-verbose"),
+        pytest.param(_mcp_module_missing, "skillspector.mcp_server", id="mcp-module-missing"),
+    ],
+)
+def test_fatal_diagnostics_never_reach_stdout(
+    tmp_path: Path, build: Callable[[Path], FatalPath], needle: str
+) -> None:
+    """A path that prints and exits writes to stderr, leaving stdout machine-readable."""
+    args, ctx = build(tmp_path)
+
+    with ctx:
+        result = runner.invoke(app, args)
+
+    assert result.exit_code == 2
+    assert needle in result.stderr
+    assert needle not in result.stdout
+
+
+def test_cli_writes_no_error_styled_output_to_stdout() -> None:
+    """Guards new code: the invariant above regressed twice because nothing enforced it."""
+    tree = ast.parse(Path(cli_module.__file__).read_text(encoding="utf-8"))
+    offenders: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        target = node.func.value
+        if not isinstance(target, ast.Name) or target.id != "console":
+            continue
+        if node.func.attr == "print_exception":
+            offenders.append((node.lineno, "print_exception()"))
+        elif node.func.attr == "print":
+            text = " ".join(
+                part.value
+                for part in ast.walk(node)
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
+            if "[red]Error:" in text:
+                offenders.append((node.lineno, text[:60]))
+
+    assert offenders == [], f"error output must use err_console, found on stdout: {offenders}"
+
+
+def test_cli_scan_structured_skill_aisop_no_llm_reports_summary(tmp_path: Path) -> None:
+    """--no-llm JSON scan reports SSR-1 through the structured summary channel."""
+    (tmp_path / "workflow.aisop.json").write_text(
+        """
+[
+  {
+    "role": "system",
+    "content": {
+      "protocol": "AISOP V1",
+      "format": "workflow"
+    }
+  },
+  {
+    "role": "user",
+    "content": {
+      "aisop": {
+        "main": "graph TD"
+      },
+      "functions": {
+        "lookup": {"constraints": ["query"]}
+      }
+    }
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["issues"] == []
+    assert data["risk_assessment"]["score"] == 0
+    assert data["structured_summaries"][0]["id"] == "SSR-1"
+
+
+def _combined_json_counts(results: list[dict[str, Any]], tmp_path: Path) -> list[int]:
+    """Run a recursive JSON scan over stubbed results and return per-skill counts."""
+    skills = [
+        SkillDirectory(path=tmp_path / f"skill{i}", name=f"skill{i}", relative_path=f"skill{i}")
+        for i in range(1, len(results) + 1)
+    ]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills, has_root_skill=False)
+    out = tmp_path / "combined.json"
+
+    with patch("skillspector.cli.graph.invoke", side_effect=results):
+        _scan_multi_skill(
+            detection, FormatChoice.json, out, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    data = json.loads(out.read_text(encoding="utf-8"))
+    return [entry["finding_count"] for entry in data["skills"]]
+
+
+def test_cli_recursive_json_count_excludes_suppressed_findings(tmp_path: Path) -> None:
+    """Combined JSON counts the active findings, not the pre-partition set.
+
+    `report` returns `filtered_findings` as kept+suppressed and scores only the
+    kept subset, so counting `filtered_findings` made a fully suppressed
+    sub-skill report risk 0 alongside a non-zero finding count.
+    """
+    findings = [
+        Finding(rule_id="SQP-1", message="one"),
+        Finding(rule_id="SQP-2", message="two"),
+        Finding(rule_id="SQP-3", message="three"),
+    ]
+    fully_suppressed = {
+        "report_body": "{}",
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": list(findings),
+        "filtered_findings": list(findings),
+        "suppressed_findings": [
+            SuppressedFinding(finding=finding, reason="baselined") for finding in findings
+        ],
+    }
+    partly_suppressed = {
+        "report_body": "{}",
+        "risk_score": 20,
+        "risk_severity": "LOW",
+        "findings": list(findings),
+        "filtered_findings": list(findings),
+        "suppressed_findings": [
+            SuppressedFinding(finding=finding, reason="baselined") for finding in findings[:2]
+        ],
+    }
+
+    assert _combined_json_counts([fully_suppressed, partly_suppressed], tmp_path) == [0, 1]
+
+
+def test_cli_recursive_json_count_respects_an_empty_filtered_list(tmp_path: Path) -> None:
+    """Every-finding-filtered is reported as 0, not as the raw pre-filter count."""
+    result = {
+        "report_body": "{}",
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": [Finding(rule_id="SQP-1", message="one")],
+        "filtered_findings": [],
+        "suppressed_findings": [],
+    }
+
+    assert _combined_json_counts([result], tmp_path) == [0]
+
+
+def test_cli_recursive_summary_count_excludes_suppressed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The terminal summary's Findings column uses the same active count.
+
+    Pinned separately from the JSON path: the two call sites are independent
+    lines, so a regression in one is invisible to a test covering the other.
+    """
+    findings = [Finding(rule_id="SQP-1", message="one"), Finding(rule_id="SQP-2", message="two")]
+    result = {
+        "report_body": "# report",
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": list(findings),
+        "filtered_findings": list(findings),
+        "suppressed_findings": [
+            SuppressedFinding(finding=finding, reason="baselined") for finding in findings
+        ],
+    }
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True,
+        skills=[SkillDirectory(path=tmp_path / "solo", name="solo", relative_path="solo")],
+        has_root_skill=False,
+    )
+
+    with patch("skillspector.cli.graph.invoke", side_effect=[result]):
+        _scan_multi_skill(
+            detection, FormatChoice.terminal, None, no_llm=True, yara_rules_dir=None, verbose=False
+        )
+
+    summary = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    row = next(line for line in summary.splitlines() if line.strip().startswith("solo"))
+    assert row.split() == ["solo", "0", "LOW", "0", "successful"]
+
+
+def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> None:
+    """`skillspector baseline` fingerprints what the scan reported, not raw findings.
+
+    Closes a mutation survivor: reverting this call site to the old
+    `filtered_findings or findings` passed the entire suite, because nothing
+    drove the baseline command through an empty filtered list. An empty filtered
+    list means every finding was filtered out, so building a baseline from the
+    raw list would write fingerprints suppressing findings the scan never
+    reported, and would fail closed on the next run for no reason.
+    """
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    source = "---\nname: b\n---\nbody\n"
+    (skill / "SKILL.md").write_text(source, encoding="utf-8")
+    out = tmp_path / "baseline.yaml"
+
+    result = {
+        "findings": [Finding(rule_id="SQP-1", message="one", file="SKILL.md")],
+        "filtered_findings": [],
+        "suppressed_findings": [],
+        "file_cache": {"SKILL.md": source},
+        "risk_score": 0,
+    }
+
+    with patch("skillspector.cli.graph.invoke", return_value=result):
+        invocation = runner.invoke(app, ["baseline", str(skill), "-o", str(out), "--no-llm"])
+
+    assert invocation.exit_code == 0, invocation.output
+    written = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert written.get("fingerprints", []) == []
+    assert "0 suppressed finding(s)" in re.sub(r"\x1b\[[0-9;]*m", "", invocation.output)

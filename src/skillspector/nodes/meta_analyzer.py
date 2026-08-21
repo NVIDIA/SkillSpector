@@ -280,6 +280,7 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
                 explanation=getattr(f, "explanation", None),
                 code_snippet=getattr(f, "code_snippet", None) or f.context,
                 intent=None,
+                evidence=dict(f.evidence),
             )
         )
     logger.info(
@@ -317,6 +318,7 @@ def _passthrough_with_defaults(findings: list[Finding]) -> list[Finding]:
             explanation=getattr(f, "explanation", None),
             code_snippet=getattr(f, "code_snippet", None) or f.context,
             intent=None,
+            evidence=dict(f.evidence),
         )
         for f in findings
     ]
@@ -478,6 +480,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                             explanation=getattr(f, "explanation", None),
                             code_snippet=getattr(f, "code_snippet", None) or f.context,
                             intent=None,
+                            evidence=dict(f.evidence),
                         )
                     )
                 # MEDIUM/LOW: preserve existing behaviour (LLM may filter as false-positive).
@@ -502,6 +505,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                     explanation=expl,
                     code_snippet=getattr(f, "code_snippet", None) or f.context,
                     intent=None,
+                    evidence=dict(f.evidence),
                 )
             )
         return result
@@ -619,6 +623,52 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             ],
         }
 
+    # Findings derived from hidden or nested content remain local-only. They
+    # bypass prompt construction entirely and are preserved by deterministic
+    # fallback policy instead of being exposed to an external provider.
+    local_only_paths = {
+        str(metadata.get("path", ""))
+        for metadata in state.get("component_metadata", [])
+        if metadata.get("local_only") is True
+    }
+    local_only_findings = [
+        finding
+        for finding in findings
+        if finding.file in local_only_paths
+        or "local-only" in finding.tags
+        or finding.evidence.get("local_only") is True
+    ]
+    llm_findings = [finding for finding in findings if finding not in local_only_findings]
+
+    def local_only_events(filtered_local: list[Finding]) -> list[InspectionLedgerEvent]:
+        events: list[InspectionLedgerEvent] = []
+        by_file: dict[str, list[Finding]] = {}
+        for finding in filtered_local:
+            by_file.setdefault(finding.file, []).append(finding)
+        for path, path_findings in sorted(by_file.items()):
+            finding_ids = [finding.finding_id for finding in path_findings]
+            events.append(
+                ledger_event(
+                    analyzer_id="meta_analyzer",
+                    outcome=LedgerOutcome.COMPLETED,
+                    phase="meta",
+                    path=path,
+                    input_finding_ids=finding_ids,
+                    emitted_finding_ids=finding_ids,
+                )
+            )
+        return events
+
+    if not llm_findings:
+        filtered_local = _fallback_filtered(local_only_findings)
+        events = local_only_events(filtered_local)
+        return {
+            "findings": filtered_local,
+            "effective_finding_ids": [finding.finding_id for finding in filtered_local],
+            "inspection_ledger": events,
+            "analyzer_status_events": [analyzer_status_for_events("meta_analyzer", events)],
+        }
+
     file_cache: dict[str, str] = state.get("file_cache") or {}
     manifest: dict[str, object] = state.get("manifest") or {}
     model_config: dict[str, str] = state.get("model_config") or {}
@@ -629,7 +679,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     )
 
     metadata_text = _format_metadata(manifest)
-    files_with_findings = sorted({f.file for f in findings})
+    files_with_findings = sorted({f.file for f in llm_findings})
 
     analyzer: LLMMetaAnalyzer | None = None
     batches: list[Batch] = []
@@ -638,7 +688,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         # and recorded as a degraded LLM call (consistent with the semantic
         # analyzers) rather than crashing the whole graph.
         analyzer = LLMMetaAnalyzer(model=model)
-        batches = analyzer.get_batches(files_with_findings, file_cache, findings)
+        batches = analyzer.get_batches(files_with_findings, file_cache, llm_findings)
         batches = [batch for batch in batches if batch.findings]
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
@@ -681,10 +731,12 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             analysed_ids = {
                 finding.finding_id for batch, _ in batch_results for finding in batch.findings
             }
-            analysed = [finding for finding in findings if finding.finding_id in analysed_ids]
-            unanalysed = [finding for finding in findings if finding.finding_id not in analysed_ids]
+            analysed = [finding for finding in llm_findings if finding.finding_id in analysed_ids]
+            unanalysed = [
+                finding for finding in llm_findings if finding.finding_id not in analysed_ids
+            ]
         else:
-            analysed, unanalysed = findings, []
+            analysed, unanalysed = llm_findings, []
 
         filtered = analyzer.apply_filter(analysed, batch_results)
         if unanalysed:
@@ -697,6 +749,8 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 len({f.file for f in unanalysed}),
             )
             filtered.extend(_fallback_filtered(unanalysed))
+        filtered_local = _fallback_filtered(local_only_findings)
+        filtered.extend(filtered_local)
 
         logger.debug(
             "LLM filtering done: %d findings -> %d after filter",
@@ -704,6 +758,8 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(filtered),
         )
         ledger_events, status = _meta_ledger_response(batches, detailed, filtered)
+        ledger_events.extend(local_only_events(filtered_local))
+        status = analyzer_status_for_events("meta_analyzer", ledger_events)
         return {
             "findings": filtered,
             "effective_finding_ids": list(
@@ -741,6 +797,18 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 ),
                 filtered,
             )
+            ledger_events.extend(
+                local_only_events(
+                    [
+                        finding
+                        for finding in filtered
+                        if finding.file in local_only_paths
+                        or "local-only" in finding.tags
+                        or finding.evidence.get("local_only") is True
+                    ]
+                )
+            )
+            status = analyzer_status_for_events("meta_analyzer", ledger_events)
         else:
             ledger_events = []
             status = analyzer_status_event(analyzer_id="meta_analyzer", status="unavailable")

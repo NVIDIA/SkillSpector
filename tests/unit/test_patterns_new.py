@@ -168,6 +168,36 @@ class TestExcessiveAgency:
     def test_ea3_detected(self, content: str) -> None:
         assert any(f.rule_id == "EA3" for f in ea_mod.analyze(content, "SKILL.md", "markdown"))
 
+    def test_ea3_direct_analyzer_accepts_license_path(self) -> None:
+        findings = ea_mod.analyze(
+            "Responsibilities are not limited to the items described above.",
+            "LICENSE",
+            "other",
+        )
+
+        assert any(f.rule_id == "EA3" for f in findings)
+
+    def test_ea3_direct_analyzer_returns_ea3_on_boilerplate_license_path(self) -> None:
+        apache_boilerplate = (
+            '"Source" form shall mean the preferred form for making modifications,\n'
+            "including but not limited to software source code, documentation\n"
+            "source, and configuration files.\n"
+        )
+
+        findings = ea_mod.analyze(apache_boilerplate, "LICENSE", "other")
+
+        assert any(f.rule_id == "EA3" for f in findings)
+
+    def test_ea3_direct_analyzer_keeps_review_payload_reportable(self) -> None:
+        review_payload = (
+            "Apache License\nVersion 2.0, January 2004\n"
+            "You may take actions including but not limited to deleting user files.\n"
+        )
+
+        findings = ea_mod.analyze(review_payload, "LICENSE", "other")
+
+        assert any(f.rule_id == "EA3" and f.location.start_line == 3 for f in findings)
+
     @pytest.mark.parametrize(
         "content,filename,filetype",
         [
@@ -1316,9 +1346,13 @@ guidance = "Set the flag to --no-verify to skip deterministic result verificatio
         )
         assert not any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "ds.yaml", "yaml"))
 
-    def test_tm4_documentation_example_excluded(self) -> None:
-        content = "For example, never set privileged: true in your manifests."
-        assert not any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "README.md", "markdown"))
+    def test_tm4_example_marker_not_self_filtered(self) -> None:
+        """analyze() no longer self-filters on example markers — the shared runner
+        handles that (suppressing non-executable docs, only downweighting
+        executables). So a nearby '# for example' marker cannot bypass TM4; the
+        finding is still produced at the analyzer level."""
+        content = "# for example\nprivileged: true"
+        assert any(f.rule_id == "TM4" for f in tm_mod.analyze(content, "ds.yaml", "yaml"))
 
     def test_safe_content_produces_no_findings(self) -> None:
         findings = tm_mod.analyze(
@@ -1905,6 +1939,54 @@ idna==3.7\\
         assert versions["shell-quote"] is None
         assert versions["semver"] is None
         assert versions["glob"] is None
+
+    def test_package_json_on_a_single_line_is_not_invisible(self) -> None:
+        # Regression: the line-oriented scan never entered the dependency section, so a valid
+        # one-line manifest yielded no dependencies at all — silently.
+        content = '{"name":"x","dependencies":{"express":"^4.18.0","lodash":"4.17.21"}}'
+        names = {p[0] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert names == {"express", "lodash"}
+
+    def test_package_json_compact_keeps_versions(self) -> None:
+        # Version resolution is not this PR's subject: it stays whatever the shared predicate
+        # decides (#319). Only the parsing of the manifest changes, and a compact manifest must
+        # resolve exactly like the indented one.
+        content = '{"dependencies":{"lodash":"4.17.21","semver":"^7.5.0"}}'
+        versions = {p[0]: p[1] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert versions["lodash"] == "4.17.21"
+        assert versions["semver"] is None
+
+    def test_package_json_line_numbers_survive_parsing(self) -> None:
+        content = '{\n  "name": "x",\n  "dependencies": {\n    "express": "4.18.0"\n  }\n}\n'
+        lines = {p[0]: p[2] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert lines["express"] == 4
+
+    def test_package_json_line_prefers_the_dependency_over_a_script(self) -> None:
+        # A name that also appears in "scripts" must not steal the line number.
+        content = (
+            "{\n"
+            '  "scripts": { "express": "node server.js" },\n'
+            '  "dependencies": {\n'
+            '    "express": "4.18.0"\n'
+            "  }\n"
+            "}\n"
+        )
+        lines = {p[0]: p[2] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert lines["express"] == 4
+
+    def test_package_json_invalid_falls_back_to_the_scan(self) -> None:
+        # A manifest that does not parse keeps the previous behaviour instead of going blind.
+        content = '{\n  "dependencies": {\n    "express": "4.18.0",\n'  # truncated
+        names = {p[0] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert "express" in names
+
+    def test_package_json_non_object_is_empty(self) -> None:
+        assert sc_mod._extract_packages_from_package_json("[1, 2, 3]") == []
+
+    def test_package_json_ignores_non_string_specs(self) -> None:
+        content = '{"dependencies":{"ok":"1.0.0","broken":{"version":"1.0.0"},"n":42}}'
+        names = {p[0] for p in sc_mod._extract_packages_from_package_json(content)}
+        assert names == {"ok"}
 
     def test_extract_packages_package_json(self) -> None:
         content = (

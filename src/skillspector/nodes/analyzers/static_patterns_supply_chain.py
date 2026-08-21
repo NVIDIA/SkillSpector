@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: supply chain (SC1–SC8) and trigger analysis (TR1–TR3).
+"""Static patterns: supply chain (SC1–SC9) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
 SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
@@ -21,6 +21,7 @@ SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
 SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
+SC9: Concealed executable artifact — flags executables nested in document or hidden artifacts.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
 
 Node and analyze() in one module.
@@ -28,6 +29,7 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -547,8 +549,23 @@ def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | N
     return results
 
 
-def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | None, int]]:
-    """Extract (package_name, version_or_None, line_number) from package.json content."""
+_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+
+
+def _package_json_line(content: str, section: str, name: str) -> int:
+    """Best-effort line for a dependency entry, so findings keep pointing somewhere useful.
+
+    Parsing JSON loses positions, and the search starts at the section header so a name that
+    also appears in ``scripts`` does not win.
+    """
+    header = re.search(rf'"{re.escape(section)}"\s*:', content)
+    start = header.end() if header else 0
+    entry = re.compile(rf'"{re.escape(name)}"\s*:').search(content, start)
+    return get_line_number(content, entry.start()) if entry else 1
+
+
+def _extract_packages_from_package_json_scan(content: str) -> list[tuple[str, str | None, int]]:
+    """Line-oriented fallback, used only when the manifest is not valid JSON."""
     results: list[tuple[str, str | None, int]] = []
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
@@ -562,9 +579,34 @@ def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | N
         if in_deps:
             m = re.match(r'"([^"]+)"\s*:\s*"([^"]*)"', stripped)
             if m:
-                name = m.group(1)
-                version = _pinned_npm_version(m.group(2))
-                results.append((name, version, i))
+                results.append((m.group(1), _pinned_npm_version(m.group(2)), i))
+    return results
+
+
+def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | None, int]]:
+    """Extract (package_name, version_or_None, line_number) from package.json content.
+
+    package.json is JSON, so it is parsed as JSON. Scanning it line by line made the result
+    depend on formatting: a manifest written on a single line — which is valid, and what many
+    generators emit — never entered the dependency section at all and yielded *no* dependencies,
+    silently. The line-oriented scan remains as a fallback for manifests that do not parse.
+    """
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return _extract_packages_from_package_json_scan(content)
+    if not isinstance(data, dict):
+        return []
+    results: list[tuple[str, str | None, int]] = []
+    for section in _NPM_DEPENDENCY_SECTIONS:
+        deps = data.get(section)
+        if not isinstance(deps, dict):
+            continue
+        for name, spec in deps.items():
+            if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            line = _package_json_line(content, section, name)
+            results.append((name, _pinned_npm_version(spec), line))
     return results
 
 
@@ -1260,13 +1302,82 @@ def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
     return findings
 
 
+def _analyze_concealed_executables(
+    component_metadata: list[dict[str, object]],
+) -> list[Finding]:
+    """Emit SC9 for executable content concealed in a local-only artifact."""
+    findings: list[Finding] = []
+    for metadata in component_metadata:
+        if not metadata.get("concealed_executable"):
+            continue
+        path = str(metadata.get("path", ""))
+        if not path:
+            continue
+        outer_path = str(metadata.get("outer_path", path.split("!/", 1)[0]))
+        nested_path = str(
+            metadata.get("nested_path", path.split("!/", 1)[1] if "!/" in path else path)
+        )
+        container_type = str(metadata.get("container_type", "zip"))
+        raw_reasons = metadata.get("concealment_reasons", [])
+        concealment_reasons = (
+            [str(item) for item in raw_reasons] if isinstance(raw_reasons, list) else []
+        )
+        if not concealment_reasons:
+            if container_type in {"docx", "xlsx", "pptx"}:
+                concealment_reasons.append("document_container")
+            elif metadata.get("outer_hidden") or metadata.get("hidden"):
+                concealment_reasons.append("hidden_artifact")
+            else:
+                concealment_reasons.append("disguised_container")
+        concealment = concealment_reasons[0]
+        findings.append(
+            Finding(
+                rule_id="SC9",
+                message=(
+                    "Executable content is concealed inside a document, hidden, "
+                    "or disguised artifact."
+                ),
+                severity="HIGH",
+                confidence=1.0,
+                file=path,
+                start_line=1,
+                category="Supply Chain",
+                pattern="Concealed Executable Artifact",
+                finding=nested_path,
+                explanation=(
+                    "An executable nested in a document or hidden/disguised artifact can "
+                    "evade ordinary extension-based review while still being available to "
+                    "the skill at runtime."
+                ),
+                remediation=(
+                    "Review the artifact provenance and the reason executable content is "
+                    "packaged in this location; keep executable files explicit and directly "
+                    "reviewable."
+                ),
+                tags=["supply-chain", "concealed-executable", "local-only"],
+                matched_text=path,
+                evidence={
+                    "outer_path": outer_path,
+                    "nested_path": nested_path,
+                    "container_type": container_type,
+                    "container_ancestry": metadata.get("container_ancestry", [container_type]),
+                    "container_depth": metadata.get("container_depth", 1),
+                    "concealment": concealment,
+                    "concealment_reasons": concealment_reasons,
+                    "local_only": True,
+                },
+            )
+        )
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Graph node
 # ---------------------------------------------------------------------------
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Run supply_chain patterns (SC1–SC8) and trigger analysis (TR1–TR3)."""
+    """Run supply_chain patterns (SC1–SC9) and trigger analysis (TR1–TR3)."""
     # SC1–SC3 via static_runner
     response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
     findings = response["findings"]
@@ -1296,7 +1407,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     # SC4–SC6: dependency-level analysis on dependency files
     components: list[str] = state.get("components") or []
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     locked_versions = _collect_locked_versions(file_cache, components)
     for path in components:
         lower_path = path.lower()
@@ -1353,6 +1464,17 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 ],
                 f"{ANALYZER_ID}_bytecode",
             )
+
+    # SC9: executables concealed in document containers or hidden/disguised artifacts.
+    component_metadata: list[dict[str, object]] = state.get("component_metadata") or []
+    concealed_findings = _analyze_concealed_executables(component_metadata)
+    findings.extend(concealed_findings)
+    for finding_path in sorted({finding.file for finding in concealed_findings}):
+        record_extra_findings(
+            finding_path,
+            [finding for finding in concealed_findings if finding.file == finding_path],
+            f"{ANALYZER_ID}_concealed_executable",
+        )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     response["analyzer_status_events"] = [

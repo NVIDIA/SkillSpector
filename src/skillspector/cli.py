@@ -50,6 +50,7 @@ from skillspector.suppression import (
     build_baseline_dict,
     discover_baseline,
     dump_baseline,
+    effective_findings,
     load_baseline,
 )
 
@@ -447,13 +448,15 @@ def scan(
     """
     if mcp_registry:
         if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
-            console.print(
+            err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
                 "--recursive, --baseline, --show-suppressed, or --yara-rules-dir"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:
-            console.print("[red]Error:[/red] --mcp-registry currently supports only --format json")
+            err_console.print(
+                "[red]Error:[/red] --mcp-registry currently supports only --format json"
+            )
             raise typer.Exit(code=2)
         try:
             result = scan_registry(input_path)
@@ -468,7 +471,7 @@ def scan(
         except typer.Exit:
             raise
         except Exception as e:
-            console.print(f"[red]Error:[/red] {e}")
+            err_console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(code=2) from e
         return
 
@@ -480,21 +483,21 @@ def scan(
         try:
             resolved_path = validate_local_input_path(resolved_path)
         except ValueError as e:
-            console.print(f"[red]Error:[/red] {e}")
+            err_console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(code=2) from e
     try:
         transitive_allow_prefix, transitive_deny_prefix = transitive.normalize_prefixes(
             transitive_allow_prefix, transitive_deny_prefix
         )
     except ValueError as exc:
-        console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
+        err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
         raise typer.Exit(code=2) from exc
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
         if detection.is_multi_skill:
             if baseline is not None:
-                console.print(
+                err_console.print(
                     "[red]Error:[/red] --baseline is not supported for recursive "
                     "multi-skill scans; scan each sub-skill with its own baseline"
                 )
@@ -576,13 +579,13 @@ def scan(
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
-            console.print_exception()
+            err_console.print_exception()
         else:
-            console.print(f"[red]Error:[/red] {e}")
+            err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:
@@ -1107,7 +1110,7 @@ def _scan_multi_skill(
             severity = result.get("risk_severity") or "LOW"
             console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
-            console.print(f"         [red]Error:[/red] {e}\n")
+            err_console.print(f"         [red]Error:[/red] {e}\n")
             execution_failed = True
             results.append({"skill_name": skill.name, "error": str(e)})
 
@@ -1123,8 +1126,7 @@ def _scan_multi_skill(
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
-        filtered = result.get("filtered_findings") or result.get("findings")
-        finding_count = len(filtered) if isinstance(filtered, list) else 0
+        finding_count = len(effective_findings(result))
         execution = "failed" if result.get("execution_successful") is False else "successful"
         console.print(
             f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
@@ -1146,8 +1148,7 @@ def _scan_multi_skill(
                 combined_skills.append({"name": skill.name, "error": result["error"]})
             else:
                 payload = _recursive_json_payload(result) or {}
-                selected_findings = result.get("filtered_findings") or result.get("findings") or []
-                finding_count = len(selected_findings) if isinstance(selected_findings, list) else 0
+                finding_count = len(effective_findings(result))
                 entry = {
                     "name": skill.name,
                     "path": skill.relative_path,
@@ -1225,7 +1226,7 @@ def mcp(
 
         run_mcp(transport=transport.value, host=host, port=port)
     except ModuleNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
 
 
@@ -1285,7 +1286,7 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
-        findings = result.get("filtered_findings") or result.get("findings") or []
+        findings = effective_findings(result)
         data = build_baseline_dict(
             findings,
             reason=reason,
@@ -1299,13 +1300,13 @@ def baseline(
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     except Exception as e:
         if verbose:
-            console.print_exception()
+            err_console.print_exception()
         else:
-            console.print(f"[red]Error:[/red] {e}")
+            err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     finally:
         if result is not None:

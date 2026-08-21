@@ -592,6 +592,31 @@ class TestMetaAnalyzerPartialBatchFailure:
         assert completeness["ledger_exceptions"] == []
 
 
+def test_local_only_high_finding_never_constructs_llm_analyzer() -> None:
+    finding = Finding(
+        rule_id="SC9",
+        message="concealed executable",
+        finding_id="local-finding",
+        severity="HIGH",
+        file=".hidden.docx!/payload.sh",
+        tags=[],
+        evidence={"outer_path": ".hidden.docx"},
+    )
+    state = {
+        "findings": [finding],
+        "file_cache": {"SKILL.md": "sentinel-visible-content"},
+        "component_metadata": [{"path": ".hidden.docx!/payload.sh", "local_only": True}],
+        "use_llm": True,
+    }
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as analyzer_cls:
+        result = meta_analyzer(state)
+
+    analyzer_cls.assert_not_called()
+    assert result["effective_finding_ids"] == ["local-finding"]
+    assert result["findings"][0].severity == "HIGH"
+
+
 # ---------------------------------------------------------------------------
 # LLM-call telemetry + fail-closed construction (drives the report's
 # degradation signal).

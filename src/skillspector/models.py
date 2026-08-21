@@ -60,6 +60,7 @@ class AnalyzerFinding:
     tags: list[str] = field(default_factory=list)
     context: str | None = None
     matched_text: str | None = None
+    evidence: dict[str, object] = field(default_factory=dict)
 
 
 def _new_finding_id() -> str:
@@ -91,6 +92,7 @@ class Finding:
     matched_text: str | None = None
     transitive_depth: int = 0
     source_url: str | None = None
+    evidence: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dict representation (full finding shape)."""
@@ -114,6 +116,7 @@ class Finding:
             # Tags surface markers like "llm-unconfirmed" (a high-severity static
             # finding the LLM filter did not confirm but which is preserved anyway).
             "tags": list(self.tags),
+            "evidence": dict(self.evidence),
         }
         if self.transitive_depth:
             data["transitive_depth"] = self.transitive_depth
