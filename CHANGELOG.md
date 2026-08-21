@@ -2,6 +2,7 @@
 ### Features/Bug Fixes
 * Inspect hidden and nested ZIP-compatible artifacts under cumulative safety bounds.
 * Report HIGH SC9 findings for executables concealed in documents or hidden/disguised artifacts.
+* Report HIGH SC10 findings when package-manager configuration changes a dependency source trust boundary.
 ---
 ### 2.9.6 (Tuesday, August 18, 2026)
 ### Features/Bug Fixes

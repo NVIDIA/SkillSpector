@@ -95,6 +95,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SC7": "Code pulls a container image with signature or registry verification disabled (--disable-content-trust, DOCKER_CONTENT_TRUST=0, --insecure-registry). This accepts tampered or unverified images and is a container supply-chain risk.",
     "SC8": "Skill ships Python bytecode (__pycache__/ or .pyc/.pyo). Discovery skips these paths, so malicious bytecode can score SAFE while decoy sources look clean.",
     "SC9": "Executable content is concealed inside a document container or hidden/disguised artifact, where extension-based review can miss it.",
+    "SC10": "Package-manager configuration redirects dependency resolution away from a canonical default, adds another source, or uses an unresolved destination.",
     # Trigger Abuse
     "TR1": "Skill uses overly broad trigger patterns that match common words or phrases, causing it to activate in unintended contexts and potentially shadow other skills.",
     "TR2": "Skill trigger shadows a common built-in command or another skill's trigger, potentially intercepting requests meant for trusted functionality.",
@@ -195,6 +196,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SC7": PatternCategory.SUPPLY_CHAIN.value,
     "SC8": PatternCategory.SUPPLY_CHAIN.value,
     "SC9": PatternCategory.SUPPLY_CHAIN.value,
+    "SC10": PatternCategory.SUPPLY_CHAIN.value,
     "TR1": PatternCategory.TRIGGER_ABUSE.value,
     "TR2": PatternCategory.TRIGGER_ABUSE.value,
     "TR3": PatternCategory.TRIGGER_ABUSE.value,
@@ -282,6 +284,7 @@ PATTERN_NAMES: dict[str, str] = {
     "SC7": "Untrusted Container Image",
     "SC8": "Shipped Python Bytecode",
     "SC9": "Concealed Executable Artifact",
+    "SC10": "Dependency Source Redirection",
     "TR1": "Overly Broad Trigger",
     "TR2": "Shadow Command Trigger",
     "TR3": "Keyword Baiting Trigger",
@@ -378,6 +381,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SC7": "Keep image signature verification (Docker Content Trust / cosign) and registry TLS enabled. Pull only signed images from trusted registries; never disable content-trust or use insecure registries in skill code.",
     "SC8": "Do not ship __pycache__/ or .pyc/.pyo in skills. Delete bytecode before packaging; if presence is intentional for a lab fixture, quarantine it outside the skill install path.",
     "SC9": "Keep executable files explicit and directly reviewable. Review the artifact provenance and why executable content is packaged inside a document, hidden file, or disguised container.",
+    "SC10": "Review the destination and configuration scope as a dependency trust-boundary change, and keep the intended package source explicit and reviewable.",
     # Trigger Abuse
     "TR1": "Use specific, narrow trigger patterns that match only the skill's intended use case. Avoid single-word or common-phrase triggers.",
     "TR2": "Choose triggers that do not conflict with built-in commands or other skills. Prefix with a unique namespace if necessary.",

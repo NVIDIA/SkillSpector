@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: supply chain (SC1–SC9) and trigger analysis (TR1–TR3).
+"""Static patterns: supply chain (SC1–SC10) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
 SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
@@ -22,6 +22,7 @@ SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
 SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
 SC9: Concealed executable artifact — flags executables nested in document or hidden artifacts.
+SC10: Dependency source redirection — flags noncanonical package registries and indexes.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
 
 Node and analyze() in one module.
@@ -40,6 +41,7 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
+from skillspector.dependency_sources import analyze_dependency_sources
 from skillspector.inspection_ledger import LedgerOutcome, analyzer_status_for_events, ledger_event
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
@@ -1377,7 +1379,7 @@ def _analyze_concealed_executables(
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Run supply_chain patterns (SC1–SC9) and trigger analysis (TR1–TR3)."""
+    """Run supply_chain patterns (SC1–SC10) and trigger analysis (TR1–TR3)."""
     # SC1–SC3 via static_runner
     response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
     findings = response["findings"]
@@ -1474,6 +1476,20 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             finding_path,
             [finding for finding in concealed_findings if finding.file == finding_path],
             f"{ANALYZER_ID}_concealed_executable",
+        )
+
+    # SC10: deterministic dependency registry/source trust-boundary changes.
+    dependency_source_findings = analyze_dependency_sources(
+        components,
+        file_cache,
+        component_metadata,
+    )
+    findings.extend(dependency_source_findings)
+    for finding_path in sorted({finding.file for finding in dependency_source_findings}):
+        record_extra_findings(
+            finding_path,
+            [finding for finding in dependency_source_findings if finding.file == finding_path],
+            f"{ANALYZER_ID}_dependency_source",
         )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))

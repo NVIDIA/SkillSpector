@@ -35,6 +35,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from skillspector import __version__ as skillspector_version
+from skillspector.dependency_sources import redact_text
 from skillspector.inference_usage import sanitize_inference_usage
 from skillspector.inspection_ledger import AnalysisCompleteness
 from skillspector.llm_utils import is_llm_available
@@ -104,19 +105,24 @@ def _clean_text(value: str | None) -> str | None:
 
 def _sanitize_finding(finding: Finding) -> Finding:
     """Return a copy of *finding* with control/ANSI bytes stripped from text fields."""
+
+    def clean(value: str | None) -> str | None:
+        cleaned = _clean_text(value)
+        return redact_text(cleaned) if isinstance(cleaned, str) else cleaned
+
     evidence = {
-        _clean_text(str(key)) or "": _clean_text(value) if isinstance(value, str) else value
+        clean(str(key)) or "": clean(value) if isinstance(value, str) else value
         for key, value in finding.evidence.items()
     }
     return replace(
         finding,
-        message=_clean_text(finding.message) or "",
-        explanation=_clean_text(finding.explanation),
-        remediation=_clean_text(finding.remediation),
-        finding=_clean_text(finding.finding),
-        context=_clean_text(finding.context),
-        matched_text=_clean_text(finding.matched_text),
-        code_snippet=_clean_text(finding.code_snippet),
+        message=clean(finding.message) or "",
+        explanation=clean(finding.explanation),
+        remediation=clean(finding.remediation),
+        finding=clean(finding.finding),
+        context=clean(finding.context),
+        matched_text=clean(finding.matched_text),
+        code_snippet=clean(finding.code_snippet),
         evidence=evidence,
     )
 

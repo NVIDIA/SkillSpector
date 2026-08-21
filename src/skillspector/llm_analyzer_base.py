@@ -40,6 +40,7 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
@@ -505,7 +506,7 @@ class LLMAnalyzerBase:
         return llm, structured
 
     @property
-    def inference_usage(self) -> list[dict[str, object]]:
+    def inference_usage(self) -> list[InferenceUsageRecord]:
         """Provider-reported usage captured for this analyzer instance."""
         return list(self._usage_collector.snapshot())
 
