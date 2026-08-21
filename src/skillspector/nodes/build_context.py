@@ -549,12 +549,15 @@ def _parse_manifest(skill_dir: Path) -> dict[str, object]:
         manifest["permissions"] = (
             [str(p) for p in permissions] if isinstance(permissions, list) else []
         )
-        # `allowed-tools` (Agent Skills standard) — accept list or comma string.
+        # `allowed-tools` (Agent Skills standard) — accept list, comma string, or space-separated string.
         allowed_tools = data.get("allowed-tools", [])
         if isinstance(allowed_tools, list):
             manifest["allowed-tools"] = [str(t).strip() for t in allowed_tools if str(t).strip()]
         elif isinstance(allowed_tools, str):
-            manifest["allowed-tools"] = [t.strip() for t in allowed_tools.split(",") if t.strip()]
+            if "," in allowed_tools:
+                manifest["allowed-tools"] = [t.strip() for t in allowed_tools.split(",") if t.strip()]
+            else:
+                manifest["allowed-tools"] = [t.strip() for t in allowed_tools.split() if t.strip()]
         else:
             manifest["allowed-tools"] = []
         # Preserve parameter definitions as dicts so the MCP tool-poisoning

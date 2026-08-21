@@ -134,13 +134,16 @@ def _is_test_file(path: str) -> bool:
 def _normalize_allowed_tools(value: object) -> list[str]:
     """Coerce a manifest ``allowed-tools`` value into a list of tool names.
 
-    Accepts the list form (``[Bash, Read]``) and the comma-separated string
-    form (``"Bash, Read"``). Anything else yields an empty list.
+    Accepts the list form (``[Bash, Read]``), the comma-separated string
+    form (``"Bash, Read"``), and the space-separated string form
+    (``"Bash Read"``). Anything else yields an empty list.
     """
     if isinstance(value, list):
         return [str(t).strip() for t in value if str(t).strip()]
     if isinstance(value, str):
-        return [t.strip() for t in value.split(",") if t.strip()]
+        if "," in value:
+            return [t.strip() for t in value.split(",") if t.strip()]
+        return [t.strip() for t in value.split() if t.strip()]
     return []
 
 
