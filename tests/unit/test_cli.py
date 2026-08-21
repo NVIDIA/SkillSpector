@@ -264,6 +264,49 @@ def test_recursive_scan_exception_marks_combined_execution_as_failed(tmp_path: P
     assert payload["skills"][1] == {"name": "two", "error": "child scan crashed"}
 
 
+def test_recursive_scan_dispatches_dot_prefixed_child_skill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive dispatch scans bounded dot-prefixed children and excludes links and skips."""
+    for name in ("skill-a", "skill-b", ".review-helper"):
+        child = tmp_path / name
+        child.mkdir()
+        (child / "SKILL.md").write_text(f"---\nname: {name.lstrip('.')}\n---\n", encoding="utf-8")
+    skipped = tmp_path / ".git"
+    skipped.mkdir()
+    (skipped / "SKILL.md").write_text("---\nname: skipped\n---\n", encoding="utf-8")
+    linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+    linked_target.mkdir()
+    (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+    try:
+        (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    scanned_paths: list[str] = []
+
+    def fake_scan_skill(*, input_path: str, **_kwargs: object) -> dict[str, object]:
+        scanned_paths.append(input_path)
+        return {
+            "filtered_findings": [],
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "report_body": "{}",
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": True},
+        }
+
+    monkeypatch.setattr(cli_module, "_scan_skill", fake_scan_skill)
+    result = runner.invoke(app, ["scan", str(tmp_path), "--recursive", "--no-llm"])
+
+    assert result.exit_code == 0
+    assert scanned_paths == [
+        str(tmp_path / ".review-helper"),
+        str(tmp_path / "skill-a"),
+        str(tmp_path / "skill-b"),
+    ]
+
+
 def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     """Benign context stays distinguishable without deleting deterministic CLI evidence."""
     (tmp_path / "references").mkdir()

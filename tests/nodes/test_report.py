@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -1718,6 +1719,31 @@ def test_analyzer_partial_batch_failure_flows_through_to_report_degraded(
     # a multi-batch analyzer that silently lost coverage.
     assert meta["llm_degraded"] is True
     assert result["risk_recommendation"] == "CAUTION"
+
+
+def test_preflight_unavailable_log_does_not_claim_runtime_calls_failed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Preflight failure is logged without inventing zero attempted runtime calls."""
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda: (False, "not configured"),
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": False,
+        "llm_requested": True,
+    }
+
+    with caplog.at_level(logging.WARNING, logger="skillspector.nodes.report"):
+        report(state)
+
+    assert "unavailable during preflight" in caplog.text
+    assert "0/0" not in caplog.text
 
 
 def test_non_degraded_clean_scan_stays_safe() -> None:

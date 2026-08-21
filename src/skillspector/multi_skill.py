@@ -283,7 +283,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
                     continue
             except OSError as exc:
                 raise _read_error("multi_skill_directory_entry") from exc
-            if entry.name in _SKIP_DIRS or entry.name.startswith("."):
+            if entry.name in _SKIP_DIRS:
                 continue
 
             has_manifest = _has_skill_md(child, budget=budget)

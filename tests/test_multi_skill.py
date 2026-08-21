@@ -279,20 +279,41 @@ class TestDetectSkills:
         assert result.is_multi_skill is False
         assert len(result.skills) == 1
 
-    def test_hidden_directories_skipped(self, tmp_path: Path) -> None:
-        """Directories starting with '.' are not scanned for skills."""
+    def test_dot_prefixed_child_skill_is_discovered_with_explicit_skips(
+        self, tmp_path: Path
+    ) -> None:
+        """A dot-prefixed child skill is scanned without traversing explicit skips or links."""
         for name in ("skill-a", "skill-b"):
             sub = tmp_path / name
             sub.mkdir()
             (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
-        hidden = tmp_path / ".hidden-skill"
-        hidden.mkdir()
-        (hidden / "SKILL.md").write_text("---\nname: hidden\n---\n", encoding="utf-8")
+        dot_prefixed = tmp_path / ".review-helper"
+        dot_prefixed.mkdir()
+        (dot_prefixed / "SKILL.md").write_text("---\nname: review-helper\n---\n", encoding="utf-8")
+        skipped = tmp_path / ".git"
+        skipped.mkdir()
+        (skipped / "SKILL.md").write_text("---\nname: skipped\n---\n", encoding="utf-8")
+        linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+        linked_target.mkdir()
+        (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
         result = detect_skills(tmp_path)
+
         assert result.is_multi_skill is True
-        assert len(result.skills) == 2
-        names = {s.name for s in result.skills}
-        assert "hidden" not in names
+        assert [skill.relative_path for skill in result.skills] == [
+            ".review-helper",
+            "skill-a",
+            "skill-b",
+        ]
+        assert {skill.name for skill in result.skills} == {
+            "review-helper",
+            "skill-a",
+            "skill-b",
+        }
 
     def test_symlinked_skill_directory_is_skipped(self, tmp_path: Path) -> None:
         """Detection must not read a skill manifest through a directory symlink."""

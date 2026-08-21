@@ -16,6 +16,7 @@
 """Tests for the MCP server wrapper (run_scan core + scan_skill tool)."""
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,6 +28,7 @@ import pytest
 from skillspector import mcp_server
 from skillspector.mcp_server import run_scan
 from skillspector.models import Finding
+from skillspector.nodes.report import report
 from skillspector.providers import reset_provider, use_provider
 from skillspector.suppression import SuppressedFinding
 
@@ -43,7 +45,7 @@ async def test_run_scan_returns_structured_verdict(
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
     _write_skill(tmp_path)
 
-    result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
 
     assert result["target"] == str(tmp_path)
     assert isinstance(result["risk_score"], int)
@@ -67,6 +69,263 @@ async def test_run_scan_llm_accounting_is_honest_without_credentials(
     assert result["llm_available"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
+
+
+def _complete_zero_risk_graph_result() -> dict[str, object]:
+    """Return a complete graph verdict suitable for MCP safety-predicate tests."""
+    return {
+        "filtered_findings": [],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "risk_recommendation": "SAFE",
+        "execution_successful": True,
+        "analysis_completeness": {
+            "is_complete": True,
+            "status": "complete",
+            "entirely_uninspected_files": 0,
+        },
+        "report_body": "{}",
+    }
+
+
+async def test_requested_unavailable_llm_blocks_safe_to_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unmet requested analysis pass cannot produce an install-safe verdict."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        mcp_server.graph,
+        "ainvoke",
+        AsyncMock(return_value=_complete_zero_risk_graph_result()),
+    )
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+
+    assert verdict["llm_requested"] is True
+    assert verdict["llm_available"] is False
+    assert verdict["llm_used"] is False
+    assert verdict["scan_mode"] == "static-only"
+    assert verdict["risk_score"] == 0
+    assert verdict["safe_to_install"] is False
+    assert verdict["recommendation"] == "CAUTION"
+
+
+async def test_unrequested_llm_keeps_static_scan_eligible_for_safe_to_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit static-only scans retain the normal complete low-risk safety predicate."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        mcp_server.graph,
+        "ainvoke",
+        AsyncMock(return_value=_complete_zero_risk_graph_result()),
+    )
+
+    verdict = await run_scan("fixture", use_llm=False, output_format="json")
+
+    assert verdict["llm_requested"] is False
+    assert verdict["llm_available"] is False
+    assert verdict["llm_used"] is False
+    assert verdict["scan_mode"] == "static-only"
+    assert verdict["risk_score"] == 0
+    assert verdict["safe_to_install"] is True
+    assert verdict["recommendation"] == "SAFE"
+
+
+async def test_all_failed_runtime_llm_calls_block_safe_to_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful preflight cannot hide a requested LLM pass that failed at runtime."""
+    graph_result = _complete_zero_risk_graph_result()
+    graph_result["llm_call_log"] = [
+        {"node": "semantic_security_discovery", "ok": False, "error": "transport error"},
+        {"node": "semantic_quality_policy", "ok": False, "error": "invalid response"},
+    ]
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(
+        mcp_server.graph,
+        "ainvoke",
+        AsyncMock(return_value=graph_result),
+    )
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+
+    assert verdict["llm_requested"] is True
+    assert verdict["llm_available"] is True
+    assert verdict["llm_used"] is False
+    assert verdict["scan_mode"] == "static-only"
+    assert verdict["risk_score"] == 0
+    assert verdict["safe_to_install"] is False
+    assert verdict["recommendation"] == "CAUTION"
+
+
+async def test_partial_runtime_llm_failure_blocks_safe_to_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partially completed requested pass remains degraded and cannot be install-safe."""
+    graph_result = _complete_zero_risk_graph_result()
+    graph_result["llm_call_log"] = [
+        {"node": "semantic_security_discovery", "ok": True, "error": None},
+        {"node": "semantic_quality_policy", "ok": False, "error": "rate limited"},
+    ]
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(
+        mcp_server.graph,
+        "ainvoke",
+        AsyncMock(return_value=graph_result),
+    )
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+
+    assert verdict["llm_requested"] is True
+    assert verdict["llm_available"] is True
+    assert verdict["llm_used"] is True
+    assert verdict["scan_mode"] == "static+llm"
+    assert verdict["risk_score"] == 0
+    assert verdict["safe_to_install"] is False
+    assert verdict["recommendation"] == "CAUTION"
+
+
+async def test_successful_runtime_llm_calls_keep_complete_scan_install_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete low-risk pass remains eligible for an install-safe verdict."""
+    graph_result = _complete_zero_risk_graph_result()
+    graph_result["llm_call_log"] = [
+        {"node": "semantic_security_discovery", "ok": True, "error": None},
+        {"node": "semantic_quality_policy", "ok": True, "error": None},
+    ]
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(
+        mcp_server.graph,
+        "ainvoke",
+        AsyncMock(return_value=graph_result),
+    )
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+
+    assert verdict["llm_available"] is True
+    assert verdict["llm_used"] is True
+    assert verdict["scan_mode"] == "static+llm"
+    assert verdict["safe_to_install"] is True
+    assert verdict["recommendation"] == "SAFE"
+
+
+async def _render_complete_zero_risk_result(
+    state: dict[str, object], config: dict[str, object]
+) -> dict[str, object]:
+    """Render a canonical complete report from the wrapper-provided graph state."""
+    del config
+    return report(
+        {
+            **state,
+            "filtered_findings": [],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {"name": "mcp-test"},
+            "analysis_completeness": {
+                "is_complete": True,
+                "status": "complete",
+                "execution_successful": True,
+                "entirely_uninspected_files": 0,
+            },
+            "execution_successful": True,
+        }
+    )
+
+
+async def test_unavailable_requested_llm_aligns_embedded_json_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The embedded JSON report reflects requested-but-unavailable LLM analysis."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda: (False, "not configured"),
+    )
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    payload = json.loads(verdict["report"])
+
+    assert verdict["risk_score"] == payload["risk_assessment"]["score"] == 0
+    assert verdict["recommendation"] == payload["risk_assessment"]["recommendation"] == "CAUTION"
+    assert payload["metadata"]["llm_requested"] is True
+    assert payload["metadata"]["llm_available"] is False
+    assert payload["metadata"]["meta_analysis_applied"] is False
+    assert payload["metadata"]["filtering_mode"] == "heuristic"
+
+
+async def test_failed_meta_analysis_aligns_mcp_and_embedded_json_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP and its embedded report expose the same runtime availability."""
+    llm_call_log = [
+        {"node": "meta_analyzer", "ok": False, "error": "runtime failure"},
+    ]
+
+    async def render_failed_meta_analysis(
+        state: dict[str, object], config: dict[str, object]
+    ) -> dict[str, object]:
+        del config
+        completeness = {
+            "is_complete": True,
+            "status": "complete",
+            "execution_successful": True,
+            "entirely_uninspected_files": 0,
+        }
+        return {
+            **report(
+                {
+                    **state,
+                    "filtered_findings": [],
+                    "component_metadata": [],
+                    "has_executable_scripts": False,
+                    "manifest": {"name": "mcp-test"},
+                    "llm_call_log": llm_call_log,
+                    "analysis_completeness": completeness,
+                    "execution_successful": True,
+                }
+            ),
+            "llm_call_log": llm_call_log,
+            "analysis_completeness": completeness,
+        }
+
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda: (True, None),
+    )
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", render_failed_meta_analysis)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    payload = json.loads(verdict["report"])
+
+    assert verdict["llm_available"] is False
+    assert verdict["llm_available"] == payload["metadata"]["llm_available"]
+    assert verdict["llm_used"] is False
+    assert verdict["safe_to_install"] is False
+    assert verdict["recommendation"] == "CAUTION"
+
+
+async def test_explicit_static_only_keeps_embedded_json_report_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit static-only mode keeps its existing SAFE report and request metadata."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "not configured"))
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda: (False, "not configured"),
+    )
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
+
+    verdict = await run_scan("fixture", use_llm=False, output_format="json")
+    payload = json.loads(verdict["report"])
+
+    assert verdict["risk_score"] == payload["risk_assessment"]["score"] == 0
+    assert verdict["recommendation"] == payload["risk_assessment"]["recommendation"] == "SAFE"
+    assert payload["metadata"]["llm_requested"] is False
+    assert payload["metadata"]["meta_analysis_applied"] is False
 
 
 async def test_run_scan_reports_llm_available_with_credentials(
@@ -123,6 +382,7 @@ async def test_run_scan_uses_bound_provider_without_credentials(
                 "risk_severity": "LOW",
                 "risk_recommendation": "OK",
                 "report_body": "report",
+                "llm_call_log": [],
             }
 
     token = use_provider(_InjectedProvider())
