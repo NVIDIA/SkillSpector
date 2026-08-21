@@ -215,7 +215,7 @@ def _analyze_python_environment_reads(
         emitted.add(node_id)
         lineno = getattr(node, "lineno", 1)
         end_lineno = getattr(node, "end_lineno", None)
-        matched_text = ast.get_source_segment(content, node)
+        matched_text = ast.get_source_segment(content, node) or "os.environ"
         findings.append(
             AnalyzerFinding(
                 rule_id="E2",
@@ -225,7 +225,8 @@ def _analyze_python_environment_reads(
                 confidence=confidence,
                 tags=tag,
                 context=get_context_from_lines(lines, lineno),
-                matched_text=(matched_text or "os.environ")[:200],
+                matched_text=matched_text[:200],
+                complete_match=matched_text,
             )
         )
 
@@ -306,6 +307,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     e2_patterns = E2_PATTERNS
@@ -330,6 +332,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in E3_PATTERNS:
@@ -345,6 +348,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in E4_PATTERNS:
@@ -360,6 +364,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     # E5: cloud-storage exfiltration. Example filtering is delegated to the runner.
@@ -376,6 +381,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings

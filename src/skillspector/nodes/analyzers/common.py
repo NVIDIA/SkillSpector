@@ -23,6 +23,8 @@ from typing import Any
 from skillspector.models import Finding
 from skillspector.python_ast import build_import_aliases
 
+MAX_FINDING_CONTEXT_CHARS = 1_000
+
 
 def make_dummy_finding(analyzer_id: str) -> Finding:
     """Create a deterministic dummy finding for a stub analyzer."""
@@ -82,14 +84,38 @@ def get_context(content: str, match_start: int, context_lines: int = 3) -> str:
     match_line = content[:match_start].count("\n")
     start_line = max(0, match_line - context_lines)
     end_line = min(len(lines), match_line + context_lines + 1)
-    return "\n".join(lines[start_line:end_line])
+    selected_lines = lines[start_line:end_line]
+    if not selected_lines:
+        return ""
+    relative_line = min(match_line - start_line, len(selected_lines) - 1)
+    line_start = content.rfind("\n", 0, match_start) + 1
+    column = min(max(0, match_start - line_start), len(selected_lines[relative_line]))
+    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line]) + column
+    return _bounded_context("\n".join(selected_lines), anchor)
 
 
 def get_context_from_lines(lines: list[str], lineno: int, window: int = 3) -> str:
     """Extract surrounding lines given pre-split *lines* and a 1-based *lineno*."""
     start = max(0, lineno - 1 - window)
     end = min(len(lines), lineno + window)
-    return "\n".join(lines[start:end])
+    selected_lines = lines[start:end]
+    if not selected_lines:
+        return ""
+    relative_line = min(max(0, lineno - 1 - start), len(selected_lines) - 1)
+    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line])
+    return _bounded_context("\n".join(selected_lines), anchor)
+
+
+def _bounded_context(context: str, anchor: int) -> str:
+    """Return a bounded context window that retains the finding anchor."""
+    if len(context) <= MAX_FINDING_CONTEXT_CHARS:
+        return context
+    half_window = MAX_FINDING_CONTEXT_CHARS // 2
+    start = min(
+        max(0, anchor - half_window),
+        len(context) - MAX_FINDING_CONTEXT_CHARS,
+    )
+    return context[start : start + MAX_FINDING_CONTEXT_CHARS]
 
 
 def resolve_dotted_name(node: ast.expr) -> str | None:
@@ -287,8 +313,13 @@ def resolve_call_name_typed(
     return plain
 
 
-def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
-    """Extract the source text for a given line range, truncated to 200 chars."""
+def get_complete_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
+    """Extract the complete source text for a given line range."""
     start = max(0, lineno - 1)
     end = end_lineno or lineno
-    return "\n".join(lines[start:end])[:200]
+    return "\n".join(lines[start:end])
+
+
+def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
+    """Extract a 200-character source preview for a given line range."""
+    return get_complete_source_segment(lines, lineno, end_lineno)[:200]

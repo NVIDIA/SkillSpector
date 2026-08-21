@@ -48,6 +48,7 @@ from skillspector.nodes.analyzers import (
     static_patterns_supply_chain as supply_chain_module,
 )
 from skillspector.nodes.analyzers import static_runner
+from skillspector.nodes.deduplicate import deduplicate
 
 
 class TestRunStaticPatternsPromptInjection:
@@ -122,6 +123,29 @@ class TestRunStaticPatternsPromptInjection:
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
         assert any(f.rule_id == "P2" for f in findings)
 
+    def test_p2_unicode_tag_preview_uses_complete_run_identity(self):
+        def tags(value: str) -> str:
+            return "".join(chr(0xE0000 + ord(char)) for char in value)
+
+        shared = tags("a" * 40)
+
+        def finding(path: str, tail: str):
+            findings = static_runner.run_static_patterns(
+                {
+                    "components": [path],
+                    "file_cache": {path: shared + tags(tail)},
+                },
+                [prompt_injection_module],
+            )
+            return next(item for item in findings if item.rule_id == "P2")
+
+        first = finding("first.md", "first")
+        second = finding("second.md", "second")
+
+        assert first.matched_text == second.matched_text
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+
     def test_p2_unicode_tag_smuggling_detected_in_python_script(self):
         """Tag smuggling is caught even in a .py file, where the bidi/zero-width
         classes are gated out by file_type."""
@@ -191,6 +215,36 @@ class TestRunStaticPatternsPromptInjection:
 
 class TestRunStaticPatternsP9WhitespacePadding:
     """run_static_patterns with prompt_injection: P9 whitespace padding."""
+
+    def test_block_summary_uses_complete_padding_run_identity(self):
+        pad_line = "\u3000" * 79
+
+        def finding(path: str, tail: str):
+            final_line = ("\u3000" * 78) + tail
+            block = "a\n" + "\n".join([pad_line] * 14 + [final_line]) + "\nb"
+            findings = static_runner.run_static_patterns(
+                {
+                    "components": [path],
+                    "file_cache": {path: block},
+                },
+                [prompt_injection_module],
+            )
+            return next(
+                item for item in findings if item.rule_id == "P9" and item.severity == "LOW"
+            )
+
+        first = finding("first.txt", "\u00a0")
+        second = finding("second.txt", "\u2000")
+        exact = finding("exact.txt", "\u00a0")
+
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        compacted = deduplicate([first, exact])
+        assert len(compacted) == 1
+        assert {item["file"] for item in compacted[0].occurrences} == {
+            "first.txt",
+            "exact.txt",
+        }
 
     def test_vertical_gap_then_instruction_high_severity(self):
         """80 blank lines followed by a malicious instruction yields P9 HIGH."""
@@ -351,6 +405,26 @@ class TestRunStaticPatternsDataExfiltration:
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         e2 = [f for f in findings if f.rule_id == "E2"]
         assert len(e2) >= 3
+
+    def test_e2_long_ast_matches_preserve_distinct_full_source_identity(self):
+        """Long AST matches with equal previews remain distinct after final compaction."""
+        shared_keyword_prefix = "a" * 240
+        content = (
+            f"dict(os.environ, {shared_keyword_prefix}first=1)\n"
+            f"dict(os.environ, {shared_keyword_prefix}second=1)\n"
+        )
+        state = {
+            "components": ["script.py"],
+            "file_cache": {"script.py": content},
+        }
+
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [finding for finding in findings if finding.rule_id == "E2"]
+
+        assert len(e2) == 2
+        assert e2[0].matched_text == e2[1].matched_text
+        assert len({finding.fingerprint() for finding in e2}) == 2
+        assert len(deduplicate(e2)) == 2
 
     def test_e2_exponentiation_not_flagged(self):
         """Bare ``2 ** os.environ`` (exponentiation) must not be flagged as E2."""

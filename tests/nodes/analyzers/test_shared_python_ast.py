@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 import skillspector.python_ast as python_ast
@@ -16,7 +18,41 @@ from skillspector.nodes.analyzers import (
     static_patterns_output_handling,
 )
 from skillspector.nodes.build_context import build_context
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
+
+
+def test_long_output_flow_uses_complete_ast_source_identity() -> None:
+    def code(tail: str) -> str:
+        shared_arguments = "\n".join(f'        "{"a" * 80}",' for _ in range(5))
+        return (
+            "import subprocess\n"
+            "subprocess.run(\n"
+            "    [\n"
+            "        output,\n"
+            f"{shared_arguments}\n"
+            f'        "{tail}",\n'
+            "    ],\n"
+            "    shell=True,\n"
+            ")\n"
+        )
+
+    first_code = code("UNIQUE_FIRST_TAIL")
+    second_code = code("UNIQUE_SECOND_TAIL")
+    findings = static_patterns_output_handling.node(
+        {
+            "components": ["first.py", "second.py"],
+            "file_cache": {"first.py": first_code, "second.py": second_code},
+        }
+    )["findings"]
+    first = next(f for f in findings if f.rule_id == "OH1" and f.file == "first.py")
+    second = next(f for f in findings if f.rule_id == "OH1" and f.file == "second.py")
+
+    assert first.matched_text == second.matched_text
+    assert len(first.matched_text or "") == 200
+    assert first.fingerprint() != second.fingerprint()
+    assert len(deduplicate([first, second])) == 2
+    assert "UNIQUE_FIRST_TAIL" not in json.dumps(first.to_dict(), sort_keys=True)
 
 
 def test_preparsed_python_is_reused_by_all_ast_analyzers(tmp_path, monkeypatch) -> None:

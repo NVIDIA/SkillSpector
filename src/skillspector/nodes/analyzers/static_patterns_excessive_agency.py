@@ -181,6 +181,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in EA2_PATTERNS:
@@ -197,6 +198,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context_text,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in EA3_PATTERNS:
@@ -212,6 +214,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in EA4_PATTERNS:
@@ -227,6 +230,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings

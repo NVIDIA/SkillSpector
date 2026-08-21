@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from skillspector.models import Finding
 from skillspector.nodes.deduplicate import deduplicate
 
@@ -62,6 +64,63 @@ class TestSameFileDedup:
         result = deduplicate(findings)
         assert len(result) == 1
         assert result[0].confidence == 0.9
+
+    def test_keeps_most_severe_representative_and_all_occurrences(self) -> None:
+        """Severity outranks confidence when exact matches are compacted."""
+        critical = _finding(
+            file="critical.py",
+            start_line=7,
+            severity="CRITICAL",
+            confidence=0.2,
+        )
+        high = _finding(
+            file="high.py",
+            start_line=11,
+            severity="HIGH",
+            confidence=0.95,
+        )
+
+        result = deduplicate([high, critical])
+
+        assert len(result) == 1
+        assert result[0].severity == "CRITICAL"
+        assert result[0].confidence == 0.2
+        assert {
+            (occurrence["file"], occurrence["start_line"]) for occurrence in result[0].occurrences
+        } == {("critical.py", 7), ("high.py", 11)}
+
+    def test_equal_rank_representative_is_semantically_deterministic(self) -> None:
+        """Opaque finding IDs and input order do not select presentation fields."""
+
+        def candidates(*, reverse_ids: bool) -> tuple[Finding, Finding]:
+            first = _finding(file="same.py", start_line=5)
+            first.finding_id = "finding-z" if reverse_ids else "finding-a"
+            first.message = "Alpha presentation"
+            first.remediation = "Alpha remediation"
+            second = _finding(file="same.py", start_line=5)
+            second.finding_id = "finding-a" if reverse_ids else "finding-z"
+            second.message = "Beta presentation"
+            second.remediation = "Beta remediation"
+            return first, second
+
+        first_pair = candidates(reverse_ids=False)
+        second_pair = candidates(reverse_ids=True)
+        forward = deduplicate(list(first_pair))[0]
+        reverse = deduplicate(list(reversed(second_pair)))[0]
+
+        def semantic_fields(finding: Finding) -> tuple[object, ...]:
+            return (
+                finding.rule_id,
+                finding.file,
+                finding.start_line,
+                finding.severity,
+                finding.confidence,
+                finding.message,
+                finding.remediation,
+                finding.matched_text,
+            )
+
+        assert semantic_fields(forward) == semantic_fields(reverse)
 
     def test_different_rules_same_file_not_deduped(self) -> None:
         """Different rule_ids in same file are independent findings."""
@@ -228,6 +287,75 @@ class TestEdgeCases:
         result = deduplicate(findings)
         assert len(result) == 4
         assert [r.severity for r in result] == ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+
+    def test_tied_distinct_groups_have_input_independent_output_order(self) -> None:
+        first = _finding(file="same.py", start_line=5, matched_text="first match")
+        first.message = "Same presentation"
+        second = _finding(file="same.py", start_line=5, matched_text="second match")
+        second.message = "Same presentation"
+
+        forward = deduplicate([first, second])
+        reverse = deduplicate([second, first])
+
+        def output_identity(findings: list[Finding]) -> list[tuple[object, ...]]:
+            return [
+                (
+                    finding.rule_id,
+                    finding.file,
+                    finding.start_line,
+                    finding.message,
+                    finding.fingerprint(),
+                )
+                for finding in findings
+            ]
+
+        assert output_identity(forward) == output_identity(reverse)
+
+    def test_compaction_preserves_unbound_digest_across_source_rebinding(self) -> None:
+        base = _finding(file="same.py", start_line=5, matched_text="exact match")
+        base.match_fingerprint = base.fingerprint()
+        assert base.match_fingerprint is not None
+        first_source = replace(
+            base,
+            source_identity="external/first",
+            source_digest="sha256:" + "a" * 64,
+            transitive_depth=1,
+        )
+        first_duplicate = replace(first_source, file="other.py", start_line=9)
+
+        compacted = deduplicate([first_source, first_duplicate])[0]
+        rebound = replace(
+            compacted,
+            source_identity="external/second",
+            source_digest="sha256:" + "b" * 64,
+            occurrences=[],
+        )
+        fresh = replace(
+            base,
+            source_identity="external/second",
+            source_digest="sha256:" + "b" * 64,
+            transitive_depth=1,
+        )
+
+        assert compacted.match_fingerprint == base.match_fingerprint
+        assert rebound.fingerprint() == fresh.fingerprint()
+
+    def test_repeated_source_scoped_compaction_is_idempotent(self) -> None:
+        base = _finding(file="same.py", start_line=5, matched_text="exact match")
+        base.match_fingerprint = base.fingerprint()
+        source_finding = replace(
+            base,
+            source_identity="external/source",
+            source_digest="sha256:" + "a" * 64,
+            transitive_depth=1,
+        )
+        duplicate = replace(source_finding, file="other.py", start_line=9)
+
+        once = deduplicate([source_finding, duplicate])
+        twice = deduplicate(once)
+
+        assert once == twice
+        assert once[0].match_fingerprint == base.match_fingerprint
 
     def test_real_world_repetitive_skill(self) -> None:
         """Simulates a skill with subprocess in 5 files — should deduplicate to 1."""
