@@ -299,6 +299,9 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
     (tmp_path / ".git" / "objects" / "aa").mkdir(parents=True)
     (tmp_path / ".git" / "config").write_text("[core]", encoding="utf-8")
     (tmp_path / ".git" / "hooks" / "pre-commit").write_text("echo check", encoding="utf-8")
+    sample_hook = tmp_path / ".git" / "hooks" / "pre-commit.sample"
+    sample_hook.write_text("echo sample", encoding="utf-8")
+    sample_hook.chmod(0o755)
     (tmp_path / ".git" / "objects" / "aa" / "object").write_bytes(b"opaque")
 
     result = build_context({"skill_path": str(tmp_path)})
@@ -306,9 +309,15 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
     assert ".hidden.md" in result["components"]
     assert ".git/config" in result["components"]
     assert ".git/hooks/pre-commit" in result["components"]
+    assert ".git/hooks/pre-commit.sample" not in result["components"]
     assert ".git/objects/aa/object" not in result["components"]
     assert ".hidden.md" not in result["llm_file_cache"]
     assert ".git/config" not in result["llm_file_cache"]
+    assert any(
+        event["path"] == ".git/hooks/pre-commit.sample"
+        and event["reason_code"] == LedgerReason.VCS_METADATA
+        for event in result["inspection_ledger"]
+    )
 
 
 def test_primary_manifest_parsing_uses_bounded_cached_bytes(
