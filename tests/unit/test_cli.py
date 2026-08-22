@@ -198,6 +198,120 @@ def test_cli_fail_on_incomplete_exits_one_after_writing_report(
     assert output.exists()
 
 
+def test_cli_min_coverage_below_threshold_exits_three_after_writing_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A partially-blind scan gets its own CI exit code, separate from risk findings."""
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        "skillspector.cli.graph.invoke",
+        lambda state, config: {
+            "report_body": '{"analysis_completeness": {"coverage_percent": 50.0}}',
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": False, "coverage_percent": 50.0},
+            "risk_score": 90,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--min-coverage",
+            "80",
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert output.exists()
+
+
+def test_cli_min_coverage_satisfied_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Coverage at or above the threshold leaves a clean scan untouched."""
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        "skillspector.cli.graph.invoke",
+        lambda state, config: {
+            "report_body": '{"analysis_completeness": {"coverage_percent": 95.0}}',
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": True, "coverage_percent": 95.0},
+            "risk_score": 10,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--min-coverage",
+            "80",
+        ],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_cli_min_coverage_rejects_out_of_range_value(tmp_path: Path) -> None:
+    """An out-of-range threshold is a usage error, not a scan failure."""
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+
+    result = runner.invoke(app, ["scan", str(tmp_path), "--min-coverage", "150"])
+
+    assert result.exit_code == 2
+
+
+def test_multi_skill_min_coverage_exits_three_on_partial_aggregate(tmp_path: Path) -> None:
+    """The recursive aggregate honors the same coverage gate as single-skill scans."""
+    s1 = SkillDirectory(path=tmp_path / "one", name="one", relative_path="one")
+    s2 = SkillDirectory(path=tmp_path / "two", name="two", relative_path="two")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+    output = tmp_path / "combined.json"
+
+    with patch(
+        "skillspector.cli.graph.invoke",
+        side_effect=[
+            {
+                "report_body": '{"skill": {"name": "one"}}',
+                "risk_score": 0,
+                "analysis_completeness": {"is_complete": False, "status": "partial"},
+            },
+            {
+                "report_body": '{"skill": {"name": "two"}}',
+                "risk_score": 0,
+                "analysis_completeness": {"is_complete": False, "status": "partial"},
+            },
+        ],
+    ):
+        with pytest.raises(typer.Exit) as exit_info:
+            _scan_multi_skill(
+                detection,
+                FormatChoice.json,
+                output,
+                no_llm=True,
+                yara_rules_dir=None,
+                verbose=False,
+                min_coverage=80.0,
+            )
+
+    assert exit_info.value.exit_code == 3
+
+
 def test_recursive_scan_exits_two_after_writing_all_child_reports(tmp_path: Path) -> None:
     """Recursive mode aggregates child execution failures after producing output."""
     s1 = SkillDirectory(path=tmp_path / "one", name="one", relative_path="one")

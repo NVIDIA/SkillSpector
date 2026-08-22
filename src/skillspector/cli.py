@@ -494,6 +494,16 @@ def scan(
             help="Exit 1 when relevant analysis is partial or incomplete.",
         ),
     ] = False,
+    min_coverage: Annotated[
+        float | None,
+        typer.Option(
+            "--min-coverage",
+            help=(
+                "Exit 3 when inspection coverage falls below this percentage "
+                "(0 exclusive to 100 inclusive)."
+            ),
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -569,6 +579,10 @@ def scan(
             raise typer.Exit(code=2) from e
         return
 
+    if min_coverage is not None and not 0.0 < min_coverage <= 100.0:
+        err_console.print("[red]Error:[/red] --min-coverage must be greater than 0 and at most 100")
+        raise typer.Exit(code=2)
+
     if verbose:
         set_level("DEBUG")
 
@@ -617,6 +631,7 @@ def scan(
                 yara_dir=yara_dir,
                 verbose=verbose,
                 fail_on_incomplete=fail_on_incomplete,
+                min_coverage=min_coverage,
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
@@ -691,6 +706,22 @@ def scan(
         )
         if fail_on_incomplete and not is_complete:
             raise typer.Exit(code=1)
+        if min_coverage is not None:
+            raw_coverage = (
+                completeness_value.get("coverage_percent", 100.0)
+                if isinstance(completeness_value, dict)
+                else 100.0
+            )
+            try:
+                coverage = float(raw_coverage)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                coverage = 100.0
+            if coverage < min_coverage:
+                err_console.print(
+                    f"[yellow]Inspection coverage {coverage:g}% is below "
+                    f"--min-coverage {min_coverage:g}%; failing with exit code 3.[/yellow]"
+                )
+                raise typer.Exit(code=3)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
     except typer.Exit:
@@ -2064,6 +2095,7 @@ def _scan_multi_skill(
     yara_dir: str | None = None,
     verbose: bool = False,
     fail_on_incomplete: bool = False,
+    min_coverage: float | None = None,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
@@ -2381,6 +2413,17 @@ def _scan_multi_skill(
         raise typer.Exit(code=2)
     if fail_on_incomplete and analysis_incomplete:
         raise typer.Exit(code=1)
+    if min_coverage is not None:
+        try:
+            aggregate_coverage = float(aggregate_completeness.get("coverage_percent", 100.0))
+        except (TypeError, ValueError):
+            aggregate_coverage = 100.0
+        if aggregate_coverage < min_coverage:
+            err_console.print(
+                f"[yellow]Aggregate inspection coverage {aggregate_coverage:g}% is "
+                f"below --min-coverage {min_coverage:g}%; failing with exit code 3.[/yellow]"
+            )
+            raise typer.Exit(code=3)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
 
