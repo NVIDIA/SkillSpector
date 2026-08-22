@@ -2,6 +2,7 @@
 ### Features/Bug Fixes
 * Inspect hidden and nested ZIP-compatible artifacts under cumulative safety bounds.
 * Report HIGH SC9 findings for executables concealed in documents or hidden/disguised artifacts.
+* feat(cli): opt-in `--min-coverage` gate exits 3 when inspection coverage falls below a chosen percentage (#389)
 ---
 ### 2.9.6 (Tuesday, August 18, 2026)
 ### Features/Bug Fixes
