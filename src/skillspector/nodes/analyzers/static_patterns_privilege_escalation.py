@@ -263,6 +263,44 @@ def _is_access_token_documentation_noun(
     return True
 
 
+_CODE_FENCE_LINE = re.compile(r"^\s*```", re.MULTILINE)
+
+_PE3_PROSE_CODE_SHAPE = re.compile(
+    r"`"
+    r"|\b(?:open|read|write|append|exec|eval|load)\s*\("
+    r"|(?:^|\s)(?:cat|echo|curl|wget|rm|mv|cp)\s+(?:-{1,2}[\w-]+\s+)*[\"'~/.&|$]"
+    r"|[^\s=!<>]=[^=]"
+    r"|>>?"
+    r"|\b(?:import|subprocess|require)\b",
+    re.IGNORECASE,
+)
+
+_PE3_PROSE_FILE_TYPES = ("markdown", "text")
+
+
+def _line_inside_code_fence(content: str, position: int) -> bool:
+    """Return whether position sits inside a fenced code block."""
+    return len(_CODE_FENCE_LINE.findall(content[:position])) % 2 == 1
+
+
+def _is_pe3_prose_vocabulary_only(content: str, match: re.Match[str], file_type: str) -> bool:
+    """Return whether a PE3 match is credential vocabulary in non-executable prose.
+
+    A documentation sentence naming a credential concept carries different evidence
+    than the same token beside an access shape; only code-shaped lines keep HIGH.
+    """
+    if file_type not in _PE3_PROSE_FILE_TYPES:
+        return False
+    if _line_inside_code_fence(content, match.start()):
+        return False
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(content)
+    prose_line = _MARKDOWN_LINE_PREFIX.sub("", content[line_start:line_end].strip())
+    return _PE3_PROSE_CODE_SHAPE.search(prose_line) is None
+
+
 def _is_qualified_benign_access_requirement(
     content: str, match: re.Match[str], file_type: str
 ) -> bool:
@@ -347,14 +385,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     _is_negated_safety_constraint(content, match),
                 )
             )
+            prose_only = not contextual and _is_pe3_prose_vocabulary_only(content, match, file_type)
             finding_tags = list(tag)
-            if contextual:
+            if contextual or prose_only:
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
                     message="Credential Access",
-                    severity=Severity.HIGH,
+                    severity=Severity.LOW if prose_only else Severity.HIGH,
                     location=loc(line_num),
                     confidence=confidence,
                     tags=finding_tags,
