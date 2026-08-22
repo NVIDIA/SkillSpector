@@ -661,7 +661,10 @@ def _http_destination(handler: dict[str, object]) -> str:
     if normalized == "localhost" or normalized.endswith(".localhost"):
         return "loopback"
     try:
-        if ipaddress.ip_address(normalized).is_loopback:
+        address = ipaddress.ip_address(normalized)
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if address.is_loopback:
             return "loopback"
     except ValueError:
         pass

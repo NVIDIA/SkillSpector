@@ -285,7 +285,7 @@ def _destination_for_url(url: str | None) -> DestinationClass:
     if _is_numeric_loopback(normalized):
         return DestinationClass.LOOPBACK
     try:
-        address = ipaddress.ip_address(normalized)
+        address = _normalized_ip_address(normalized)
     except ValueError:
         return DestinationClass.PUBLIC_REMOTE
     if address.is_loopback:
@@ -539,7 +539,7 @@ def _destination_for_host(host: str | None) -> DestinationClass:
     if _is_numeric_loopback(value):
         return DestinationClass.LOOPBACK
     try:
-        address = ipaddress.ip_address(value)
+        address = _normalized_ip_address(value)
     except ValueError:
         return DestinationClass.PUBLIC_REMOTE
     if address.is_loopback:
@@ -555,6 +555,14 @@ def _is_numeric_loopback(value: str) -> bool:
     if not re.fullmatch(r"127(?:\.\d{1,3}){0,3}", value):
         return False
     return all(int(part) <= 255 for part in value.split("."))
+
+
+def _normalized_ip_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Normalize IPv4-mapped IPv6 consistently across supported Python patch releases."""
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
 
 
 _CURL_VALUE_OPTIONS: Final[frozenset[str]] = frozenset(

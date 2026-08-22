@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from unittest.mock import patch
 
 import pytest
@@ -887,11 +886,14 @@ def test_registration_cardinality_is_bounded_before_adversarial_cross_product() 
     groups = [{"matcher": f"Tool{index}", "hooks": [handler]} for index in range(2_049)]
     content = json.dumps({"hooks": {"PostToolUse": groups}})
 
-    started = time.perf_counter()
-    result = node(_state({path: content}))
-    elapsed = time.perf_counter() - started
+    with patch.object(
+        surface,
+        "_normalize_registration",
+        wraps=surface._normalize_registration,
+    ) as normalize:
+        result = node(_state({path: content}))
 
-    assert elapsed < 2.0
+    assert normalize.call_count == 2_048
     assert result["findings"] == []
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.FAILED
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.COMPONENT_LIMIT

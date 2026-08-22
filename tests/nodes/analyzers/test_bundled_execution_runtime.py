@@ -969,6 +969,16 @@ def test_bh1_medium_for_loopback_http_and_high_for_known_command_transport() -> 
             ]
         }
     )
+    mapped_loopback = _finding_for(
+        {
+            "PostToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [_handler("http", url="http://[::ffff:127.0.0.1]:8765/hook")],
+                }
+            ]
+        }
+    )
     outbound = _finding_for(
         {
             "PostToolUse": [
@@ -986,6 +996,7 @@ def test_bh1_medium_for_loopback_http_and_high_for_known_command_transport() -> 
     )
 
     assert loopback.severity == "MEDIUM"
+    assert mapped_loopback.severity == "MEDIUM"
     assert outbound.severity == "HIGH"
 
 
