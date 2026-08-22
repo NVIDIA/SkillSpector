@@ -24,12 +24,60 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **70 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **72 vulnerability patterns** across 18 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, MCP tool poisoning, and bundled execution surfaces
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
+- **Claude Code bundled-hook analysis**: Deterministic BH1 execution-surface inventory and correlated BH2 sensitive-data exfiltration detection
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
 - **Risk scoring**: 0-100 score with severity labels and clear recommendations
 - **Baseline / false-positive suppression**: Accept known findings via a glob-rule or fingerprint baseline so re-scans surface only *new* issues ([docs](docs/SUPPRESSION.md))
+
+## Claude Code Bundled Hooks
+
+SkillSpector recognizes supported Claude Code hook declarations by their runtime location and schema;
+it does not promote an arbitrary file merely because it contains a `hooks` key. BH1 and BH2 are
+deterministic structural findings and remain present with or without LLM analysis.
+
+| Finding | Meaning | Gate behavior |
+|---------|---------|---------------|
+| BH1 — Bundled Hook Execution Surface | One inventory finding per concrete hook document, including dormant or unmodeled declarations. Severity reflects the most capable handler in that document. | Does not independently force `DO_NOT_INSTALL`; review the declared activation and handlers. |
+| BH2 — Bundled Hook Data Exfiltration | A runnable hook has a correlated sensitive-source-to-outbound-sink chain within one handler and its bounded, bundle-resolvable entrypoints. | Unsuppressed BH2 is CRITICAL at confidence 1.0, sets a score floor of 51, produces `DO_NOT_INSTALL`, and exits 1. |
+
+Supported declaration sources are:
+
+- plugin-root `hooks/hooks.json`;
+- inline, referenced, or mixed `hooks` declarations in `.claude-plugin/plugin.json`;
+- effective plugin definitions in `.claude-plugin/marketplace.json`, including documented `strict`
+  merge/replacement behavior;
+- root `.claude/settings.json` and `.claude/settings.local.json` project settings;
+- hook frontmatter in documented root, project, plugin, and manifest-declared custom skill or command
+  locations; and
+- root project `.claude/agents/*.md` frontmatter while that project subagent runs.
+
+Classification is pinned to the documented Claude Code **2.1.238 semantics snapshot**. The snapshot
+is a static parsing and classification contract, not a claim that every installed Claude Code
+version executes every accepted shape. Actual activation still depends on plugin enablement, skill or
+command invocation, subagent execution, or workspace trust. User/managed settings and external
+runtime controls can change effective behavior outside the scanned artifact and are not treated as
+mitigations for bundled code.
+
+Analysis fails closed when an applicable hook document or runnable/reachable payload cannot be
+inspected—for example, because it is malformed, missing, oversized, binary, unresolved, outside
+traversal bounds, or uses an unmodeled reachable payload. SkillSpector preserves findings and the
+report, marks the analysis incomplete, and exits 2; that exit takes precedence even when BH2 is also
+present.
+
+Hook evidence contains sanitized scalar metadata and full chain digests, not raw commands, URLs,
+headers, secret values, prompts, tool payloads, or script excerpts. Exact baseline fingerprints bind
+the activation document and referenced chain, so a relevant mutation makes the finding active again.
+A reviewed baseline may suppress BH1 or BH2, but it cannot suppress an incomplete-analysis failure.
+
+This hooks-only scope does **not** implement BH3 permission-grant analysis. It also excludes
+plugin-root `settings.json` permission analysis, plugin-shipped agent hooks, user-level and managed
+settings outside the artifact, background monitors, plugin MCP/LSP servers, general `bin/` inventory,
+and complete interprocedural analysis of arbitrary programs. See the
+[approved design and threat model](docs/superpowers/specs/2026-08-20-bundled-hook-execution-surface-design.md)
+for the detailed contract.
 
 ## Quick Start
 
@@ -354,7 +402,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **70 vulnerability patterns** across 17 categories:
+SkillSpector detects **72 vulnerability patterns** across 18 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -512,6 +560,13 @@ SkillSpector detects **70 vulnerability patterns** across 17 categories:
 | TP3 | Parameter Description Injection | MEDIUM | Injection patterns in parameter definitions (overrides, system tokens, malicious defaults) |
 | TP4 | Description-Behavior Mismatch | MEDIUM | Declared tool description does not match actual code behavior (LLM-powered) |
 
+### Bundled Execution Surface (2 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| BH1 | Bundled Hook Execution Surface | LOW-HIGH | Inventories supported Claude Code hook declarations and their effective execution surface |
+| BH2 | Bundled Hook Data Exfiltration | CRITICAL | Correlates sensitive hook data, credentials, or files with a concrete outbound transport in one reachable handler chain |
+
 All detected patterns are listed in the tables above.
 
 ## Risk Scoring
@@ -628,7 +683,7 @@ SkillSpector is built to be driven by other tools (CI pipelines, install gates, 
 |------|---------|
 | `0` | Scan completed, `risk_score` ≤ 50 (recommendation `SAFE` or `CAUTION`) |
 | `1` | Scan completed, `risk_score` > 50 (recommendation `DO_NOT_INSTALL`) |
-| `2` | Error (bad input, unreadable source, internal failure) |
+| `2` | Analysis incomplete or failed (including bad input, unreadable/reachable hook payloads, or internal failure) |
 
 > The exit code collapses `SAFE` and `CAUTION` into `0`. To act differently on them (e.g. *warn* on `CAUTION` but *block* on `DO_NOT_INSTALL`), read the `recommendation` field from the JSON output rather than relying on the exit code.
 

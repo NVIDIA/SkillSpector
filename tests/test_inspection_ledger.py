@@ -159,3 +159,30 @@ def test_failed_event_includes_sanitized_failure_metadata_only_when_provided() -
 
     assert event["error_class"] == "PermissionError"
     assert event["stage"] == "read"
+
+
+@pytest.mark.parametrize(
+    "reason_value",
+    [
+        "invalid_configuration",
+        "depth_limit",
+        "component_limit",
+        "aggregate_budget",
+        "unmodeled_payload",
+    ],
+)
+def test_bundled_hook_failure_reasons_are_payload_free(reason_value: str) -> None:
+    """Bundled-hook failures use allowlisted messages without retaining payloads."""
+    reason = LedgerReason(reason_value)
+
+    event = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        phase="bundled_hook",
+        analyzer_id="bundled_execution_surface",
+        path="hooks/hooks.json",
+        reason=reason,
+    )
+
+    assert event["reason_code"] is reason
+    assert event["message"]
+    assert "secret-canary" not in str(event)

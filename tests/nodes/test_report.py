@@ -110,6 +110,16 @@ class TestComputeRiskScoreBasic:
         assert band == "HIGH"
         assert recommendation == "DO_NOT_INSTALL"
 
+    def test_correlated_bundled_hook_exfiltration_enforces_blocking_risk_floor(self) -> None:
+        """One BH2 independently blocks installation despite ordinary score rounding."""
+        findings = [_finding("BH2", "CRITICAL", confidence=1.0, file="hooks/hooks.json")]
+
+        score, band, recommendation = _compute_risk_score(findings, False)
+
+        assert score == 51
+        assert band == "HIGH"
+        assert recommendation == "DO_NOT_INSTALL"
+
     def test_unknown_severity_defaults_to_low_points(self) -> None:
         f = _finding("R1", "LOW")
         f.severity = ""

@@ -417,7 +417,7 @@ _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 # Some findings describe artifacts whose unanalyzed contents can execute. Their
 # presence must block installation even when ordinary confidence-weighted,
 # per-rule scoring would otherwise keep the aggregate below the CLI threshold.
-_RISK_SCORE_FLOORS_BY_RULE_ID = {"SC8": 51}
+_RISK_SCORE_FLOORS_BY_RULE_ID = {"SC8": 51, "BH2": 51}
 
 
 def _compute_risk_score(
