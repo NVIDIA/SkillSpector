@@ -22,6 +22,9 @@ from skillspector.nodes.analyzers.behavioral_ast import node as behavioral_ast_n
 from skillspector.nodes.analyzers.behavioral_taint_tracking import (
     node as behavioral_taint_tracking_node,
 )
+from skillspector.nodes.analyzers.bundled_execution_surface import (
+    node as bundled_execution_surface_node,
+)
 from skillspector.nodes.analyzers.mcp_least_privilege import node as mcp_least_privilege_node
 from skillspector.nodes.analyzers.mcp_rug_pull import node as mcp_rug_pull_node
 from skillspector.nodes.analyzers.mcp_tool_poisoning import node as mcp_tool_poisoning_node
@@ -102,6 +105,7 @@ ANALYZER_NODE_IDS: list[str] = [
     "static_patterns_ssrf",
     "static_patterns_deserialization",
     "static_yara",
+    "bundled_execution_surface",
     "behavioral_ast",
     "behavioral_taint_tracking",
     "mcp_least_privilege",
@@ -131,6 +135,7 @@ ANALYZER_NODES = {
     "static_patterns_ssrf": static_patterns_ssrf_node,
     "static_patterns_deserialization": static_patterns_deserialization_node,
     "static_yara": static_yara_node,
+    "bundled_execution_surface": bundled_execution_surface_node,
     "behavioral_ast": behavioral_ast_node,
     "behavioral_taint_tracking": behavioral_taint_tracking_node,
     "mcp_least_privilege": mcp_least_privilege_node,

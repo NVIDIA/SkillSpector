@@ -309,6 +309,17 @@ class TestP9PatternDefaults:
         assert pattern_defaults.get_remediation("P9").strip()
 
 
+@pytest.mark.parametrize("rule_id", ["BH1", "BH2"])
+def test_bundled_execution_pattern_defaults_are_complete(rule_id: str) -> None:
+    """Deterministic bundled-hook findings have complete report metadata."""
+    from skillspector.nodes.analyzers import pattern_defaults
+
+    assert pattern_defaults.get_category(rule_id) == "Bundled Execution Surface"
+    assert pattern_defaults.get_pattern_name(rule_id).strip()
+    assert pattern_defaults.get_explanation(rule_id).strip()
+    assert pattern_defaults.get_remediation(rule_id).strip()
+
+
 class TestRunStaticPatternsDataExfiltration:
     """run_static_patterns with data_exfiltration: E1, E2, E5."""
 

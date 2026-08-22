@@ -239,6 +239,9 @@ def _format_findings_for_prompt(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
+_STRUCTURAL_RULE_IDS = frozenset({"BH1", "BH2"})
+
+
 def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
     """Preserve deterministic findings and add defaults in --no-llm mode."""
     result: list[Finding] = []
@@ -315,6 +318,18 @@ def _passthrough_with_defaults(findings: list[Finding]) -> list[Finding]:
             occurrences=list(f.occurrences),
         )
         for f in findings
+    ]
+
+
+def _ordered_selected_findings(
+    original: list[Finding], *selected_groups: list[Finding]
+) -> list[Finding]:
+    """Return selected/enriched findings in their original deterministic order."""
+    selected_by_id = {finding.finding_id: finding for group in selected_groups for finding in group}
+    return [
+        selected_by_id[finding.finding_id]
+        for finding in original
+        if finding.finding_id in selected_by_id
     ]
 
 
@@ -698,8 +713,21 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             response["inference_usage"] = []
         return response
 
+    structural_findings = [
+        finding for finding in findings if finding.rule_id in _STRUCTURAL_RULE_IDS
+    ]
+    ordinary_findings = [
+        finding for finding in findings if finding.rule_id not in _STRUCTURAL_RULE_IDS
+    ]
+    structural_paths = {finding.file for finding in structural_findings}
+    filtered_structural = _passthrough_with_defaults(structural_findings)
+
     if state.get("use_llm", True) is False:
-        filtered = _fallback_filtered(findings)
+        filtered = _ordered_selected_findings(
+            findings,
+            _fallback_filtered(ordinary_findings),
+            filtered_structural,
+        )
         return {
             "findings": filtered,
             "effective_finding_ids": _effective_finding_ids(filtered),
@@ -724,23 +752,41 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         for metadata in state.get("component_metadata", []) or []
         if metadata.get("local_only") is True
     }
-    eligible_findings: list[Finding] = []
-    local_only_findings: list[Finding] = []
-    for finding in findings:
-        target = (
-            eligible_findings
-            if _is_llm_eligible(finding, file_cache, local_only_paths)
-            else local_only_findings
-        )
-        target.append(finding)
-    local_only_ids = {finding.finding_id for finding in local_only_findings}
+    structural_path_findings = [
+        finding for finding in ordinary_findings if finding.file in structural_paths
+    ]
+    provider_candidates = [
+        finding for finding in ordinary_findings if finding.file not in structural_paths
+    ]
+    filtered_structural_path = _fallback_filtered(structural_path_findings)
+    provider_excluded_paths = {
+        finding.file
+        for finding in provider_candidates
+        if not _is_llm_eligible(finding, file_cache, local_only_paths)
+    }
+    local_only_findings = [
+        finding for finding in provider_candidates if finding.file in provider_excluded_paths
+    ]
+    eligible_findings = [
+        finding for finding in provider_candidates if finding.file not in provider_excluded_paths
+    ]
+    local_only_ids = {
+        finding.finding_id
+        for finding in [*structural_findings, *structural_path_findings, *local_only_findings]
+    }
 
     if not eligible_findings:
         filtered_local = _fallback_filtered(local_only_findings)
-        events = _local_only_events(filtered_local)
+        filtered = _ordered_selected_findings(
+            findings,
+            filtered_local,
+            filtered_structural,
+            filtered_structural_path,
+        )
+        events = _local_only_events(filtered)
         return {
-            "findings": filtered_local,
-            "effective_finding_ids": _effective_finding_ids(filtered_local),
+            "findings": filtered,
+            "effective_finding_ids": _effective_finding_ids(filtered),
             "inspection_ledger": events,
             "analyzer_status_events": [analyzer_status_for_events("meta_analyzer", events)],
         }
@@ -830,7 +876,13 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             )
             filtered.extend(_fallback_filtered(unanalysed))
         filtered_local = _fallback_filtered(local_only_findings)
-        filtered.extend(filtered_local)
+        filtered = _ordered_selected_findings(
+            findings,
+            filtered,
+            filtered_local,
+            filtered_structural,
+            filtered_structural_path,
+        )
 
         logger.debug(
             "LLM filtering done: %d findings -> %d after filter",
@@ -838,7 +890,13 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(filtered),
         )
         ledger_events, status = _meta_ledger_response(batches, detailed, filtered)
-        ledger_events.extend(_local_only_events(filtered_local))
+        deterministic_filtered = _ordered_selected_findings(
+            findings,
+            filtered_local,
+            filtered_structural,
+            filtered_structural_path,
+        )
+        ledger_events.extend(_local_only_events(deterministic_filtered))
         status = analyzer_status_for_events("meta_analyzer", ledger_events)
         return {
             "findings": filtered,
