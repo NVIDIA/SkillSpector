@@ -42,7 +42,7 @@ ANALYZER_ID = "static_patterns_excessive_agency"
 
 # EA1: Unrestricted Tool Access
 EA1_PATTERNS = [
-    (r"(?:tools?|permissions?)\s*:\s*\[?\s*['\"]?\*['\"]?\s*\]?", 0.85),
+    (r"(?:tools?|permissions?)\s*:[ \t]*\[?[ \t]*['\"]?\*(?!\*|\w)['\"]?[ \t]*\]?", 0.85),
     (r"(?:allow|grant|enable)\s+(?:access\s+to\s+)?(?:all|any|every)\s+tools?", 0.8),
     (
         r"(?:no|without)\s+(?:tool|permission|access|capability)\s+(?:restrictions?|constraints?|limitations?)",

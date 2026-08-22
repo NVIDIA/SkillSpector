@@ -309,6 +309,48 @@ class TestP9PatternDefaults:
         assert pattern_defaults.get_remediation("P9").strip()
 
 
+class TestRunStaticPatternsExcessiveAgencyEA1:
+    """EA1_PATTERNS[0] must not match a blank-line gap or a markdown bold span."""
+
+    def test_ea1_multiline_gap_not_flagged(self):
+        """A blank-line gap between the colon and a bold heading is not a wildcard grant."""
+        state = {
+            "components": ["skill.md"],
+            "file_cache": {
+                "skill.md": "tool:\n\n**Input Schema:**",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_ea1_bold_span_not_flagged(self):
+        """The first '*' of a '**bold**' heading is not a wildcard grant."""
+        state = {
+            "components": ["skill.md"],
+            "file_cache": {
+                "skill.md": "**API Coverage vs. Workflow Tools:**",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content",
+        ['tools: "*"', "tools: [*]", "permissions: '*'"],
+        ids=["quoted_star", "bracket_star", "single_quoted_star"],
+    )
+    def test_ea1_real_wildcard_still_flagged(self, content: str):
+        """The three real wildcard-grant shapes still produce EA1, MEDIUM severity."""
+        state = {
+            "components": ["skill.md"],
+            "file_cache": {"skill.md": content},
+        }
+        findings = static_runner.run_static_patterns(state, [excessive_agency_module])
+        ea1 = [f for f in findings if f.rule_id == "EA1"]
+        assert len(ea1) >= 1
+        assert ea1[0].severity == "MEDIUM"
+
+
 class TestRunStaticPatternsDataExfiltration:
     """run_static_patterns with data_exfiltration: E1, E2, E5."""
 
