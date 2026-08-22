@@ -2,6 +2,7 @@
 ### Features/Bug Fixes
 * Inspect hidden and nested ZIP-compatible artifacts under cumulative safety bounds.
 * Report HIGH SC9 findings for executables concealed in documents or hidden/disguised artifacts.
+* fix(analyzers): skip text-signal analysis (AE3/AE4) for artifacts classified as binary or opaque (#413)
 ---
 ### 2.9.6 (Tuesday, August 18, 2026)
 ### Features/Bug Fixes
