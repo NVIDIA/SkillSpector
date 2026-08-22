@@ -846,10 +846,11 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             "inspection_ledger": ledger_events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                llm_call_record(
-                    "meta_analyzer",
-                    ok=bool(detailed.successful) or not detailed.failures,
-                )
+                # A record is ok only when every submitted batch succeeded. A
+                # partial batch failure (e.g. one file's batch 429'd while
+                # another's succeeded) is still lost coverage, so it must not
+                # read as ok=True just because some batches came back.
+                llm_call_record("meta_analyzer", ok=not detailed.failures)
             ],
             "inference_usage": analyzer.inference_usage,
         }

@@ -1118,7 +1118,14 @@ def _meta_from_json_report(state: SkillspectorState) -> dict:
 
 
 def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """use_llm requested + every LLM call failed -> llm_available False, llm_degraded True."""
+    """use_llm requested + every semantic-analyzer call failed -> llm_degraded True.
+
+    llm_available/meta_analysis_applied are about the provider and
+    meta_analyzer's OWN call specifically (see the meta_analysis_applied
+    tests below); none of these three failures is a meta_analyzer record,
+    so those two fields stay True here and the failure surfaces only via
+    llm_degraded / llm_calls_attempted / llm_calls_succeeded / llm_error.
+    """
     # Pre-flight reports available (binary/creds present); the failure is at runtime.
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
     state: SkillspectorState = {
@@ -1136,7 +1143,7 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     }
     meta = _meta_from_json_report(state)
     assert meta["llm_requested"] is True
-    assert meta["llm_available"] is False  # degraded -> not actually available
+    assert meta["llm_available"] is True  # provider ok; meta_analyzer never ran/failed
     assert meta["llm_degraded"] is True
     assert meta["llm_calls_attempted"] == 3
     assert meta["llm_calls_succeeded"] == 0
@@ -1145,8 +1152,13 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     assert "static analysis only" in meta["llm_error"]
 
 
-def test_report_not_degraded_when_some_calls_succeeded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At least one successful LLM call -> not degraded, llm_available stays True."""
+def test_report_degraded_when_some_calls_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dropped/throttled batch degrades the scan even though other calls succeeded.
+
+    A rate-limited provider can 429 one batch (e.g. the security-discovery
+    analyzer) while the rest of the fan-out succeeds; that is still a coverage
+    gap and must not read as a clean, fully-analyzed scan.
+    """
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
@@ -1161,10 +1173,106 @@ def test_report_not_degraded_when_some_calls_succeeded(monkeypatch: pytest.Monke
         ],
     }
     meta = _meta_from_json_report(state)
+    # Neither record is meta_analyzer, so llm_available/meta_analysis_applied
+    # are untouched by this coverage gap; llm_degraded is the signal for it.
     assert meta["llm_available"] is True
-    assert "llm_degraded" not in meta
+    assert meta["llm_degraded"] is True
     assert meta["llm_calls_attempted"] == 2
     assert meta["llm_calls_succeeded"] == 1
+    assert "1 of 2" in meta["llm_error"]
+
+
+def test_report_meta_analysis_applied_survives_other_analyzer_partial_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """meta_analyzer succeeding is independent of a different analyzer's coverage loss.
+
+    Regression for the reviewed gap: a semantic analyzer dropping a batch
+    forced meta_analysis_applied=False and llm_available=False even though
+    meta_analyzer's own call succeeded in full, which misstated two
+    independent contracts (meta-analysis ran vs. some coverage was lost) as
+    one boolean. Matches the reported 3/4 scenario: 3 calls succeed
+    (including meta_analyzer), 1 semantic-analyzer batch is dropped.
+    """
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_security_discovery", ok=False, error="429 rate limited"),
+            llm_call_record("semantic_developer_intent", ok=True),
+            llm_call_record("semantic_quality_policy", ok=True),
+            llm_call_record("meta_analyzer", ok=True),
+        ],
+    }
+    meta = _meta_from_json_report(state)
+    assert meta["meta_analysis_applied"] is True
+    assert meta["llm_available"] is True
+    assert "filtering_mode" not in meta
+    # The lost coverage is still visible, just not through these two fields.
+    assert meta["llm_degraded"] is True
+    assert meta["llm_calls_attempted"] == 4
+    assert meta["llm_calls_succeeded"] == 3
+
+
+def test_report_meta_analysis_not_applied_when_meta_analyzer_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """meta_analyzer's own failure still zeros meta_analysis_applied/llm_available.
+
+    This is the other half of the independent-contracts fix: the two fields
+    are not blind to meta_analyzer - they just ignore everyone ELSE.
+    """
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_security_discovery", ok=True),
+            llm_call_record("meta_analyzer", ok=False, error="claude empty stdout"),
+        ],
+    }
+    meta = _meta_from_json_report(state)
+    assert meta["meta_analysis_applied"] is False
+    assert meta["llm_available"] is False
+    assert meta["filtering_mode"] == "heuristic"
+
+
+def test_report_meta_analysis_not_applied_when_no_meta_analyzer_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty meta_analyzer_records list must not vacuously satisfy meta_analysis_applied.
+
+    meta_analyzer never runs when there are no findings to filter (it
+    short-circuits to not_applicable), so its records list is empty and
+    all([]) is True; a plain all(...) check with no non-empty guard reports
+    meta_analysis_applied=True with no meta-analyzer call ever made.
+    meta_analysis_applied now requires at least one record and all of them ok.
+    llm_available stays True: provider availability is a separate contract
+    from whether meta_analyzer had anything to do.
+    """
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [],
+    }
+    meta = _meta_from_json_report(state)
+    assert meta["meta_analysis_applied"] is False
+    assert meta["llm_available"] is True
+    assert meta["filtering_mode"] == "heuristic"
 
 
 def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1516,6 +1624,100 @@ def test_unavailable_provider_floors_recommendation_even_with_success_records(
     payload = json.loads(result["report_body"])
     assert payload["risk_assessment"]["recommendation"] == "CAUTION"
     assert payload["metadata"]["llm_available"] is False
+
+
+def test_partial_llm_failure_also_floors_recommendation_at_caution() -> None:
+    """A rate-limited provider dropping one batch must not read as a clean scan.
+
+    Matches the reported failure: llm_calls_attempted=4, llm_calls_succeeded=3
+    (one batch 429'd and was dropped), yet the report emitted a plain SAFE
+    verdict because only an all-calls-failed scan was treated as degraded.
+    """
+    state: SkillspectorState = {
+        "filtered_findings": [],  # static score 0 -> would be SAFE
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [
+            llm_call_record("semantic_security_discovery", ok=False, error="429 rate limited"),
+            llm_call_record("semantic_developer_intent", ok=True),
+            llm_call_record("semantic_quality_policy", ok=True),
+            llm_call_record("meta_analyzer", ok=True),
+        ],
+    }
+    result = report(state)
+    assert result["risk_score"] == 0  # score is left honest
+    assert result["risk_recommendation"] == "CAUTION"  # never SAFE on a partial pass
+
+
+def test_analyzer_partial_batch_failure_flows_through_to_report_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: an analyzer-level partial batch failure reaches the report as degraded.
+
+    Regression for the reviewed gap: llm_call_log records were built with
+    ``ok=bool(outcome.successful) or not outcome.failures``, so a batch
+    dropping while a sibling batch in the same analyzer succeeded still
+    recorded ok=True and the report never saw the coverage loss (the exact
+    two-file/one-429 case ``test_partial_batch_failure_records_llm_failure``
+    in test_semantic_developer_intent.py now pins). This drives the real
+    ``semantic_developer_intent`` node through a mocked partial-batch outcome
+    and feeds its ACTUAL llm_call_log output into report(), rather than
+    hand-constructing the log the way the report-only tests above do.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from skillspector.llm_analyzer_base import (
+        BatchExecutionResult,
+        BatchFailure,
+        LLMAnalyzerBase,
+    )
+    from skillspector.nodes.analyzers.semantic_developer_intent import node as di_node
+
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+
+    def _mock_get_chat_model(*_args: object, **_kwargs: object) -> MagicMock:
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = MagicMock()
+        return mock_llm
+
+    async def partially_succeeds(self: LLMAnalyzerBase, batches: list, **_kwargs: object) -> list:
+        successful = [(batches[0], [])]
+        self._last_batch_outcome = BatchExecutionResult(
+            successful=successful,
+            failures=[BatchFailure(batches[1], "TimeoutError")],
+        )
+        return successful
+
+    with (
+        patch("skillspector.llm_analyzer_base.get_chat_model", _mock_get_chat_model),
+        patch.object(LLMAnalyzerBase, "arun_batches", partially_succeeds),
+    ):
+        analyzer_result = di_node({"file_cache": {"first.py": "print(1)", "second.py": "print(2)"}})
+
+    # The analyzer's own record reflects the dropped batch...
+    assert analyzer_result["llm_call_log"] == [
+        {"node": "semantic_developer_intent", "ok": False, "error": None}
+    ]
+
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": analyzer_result["llm_call_log"],
+    }
+    result = report(state)
+    meta = json.loads(result["report_body"])["metadata"]
+
+    # ...and the report-level verdict reflects it too: never a plain SAFE on
+    # a multi-batch analyzer that silently lost coverage.
+    assert meta["llm_degraded"] is True
+    assert result["risk_recommendation"] == "CAUTION"
 
 
 def test_non_degraded_clean_scan_stays_safe() -> None:

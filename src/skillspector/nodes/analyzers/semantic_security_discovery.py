@@ -239,7 +239,11 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "inspection_ledger": all_events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                llm_call_record(ANALYZER_ID, ok=bool(outcome.successful) or not outcome.failures)
+                # A record is ok only when every submitted batch succeeded. A
+                # partial batch failure (e.g. one file's batch 429'd while
+                # another's succeeded) is still lost coverage, so it must not
+                # read as ok=True just because some batches came back.
+                llm_call_record(ANALYZER_ID, ok=not outcome.failures)
             ],
             "inference_usage": analyzer.inference_usage,
         }
