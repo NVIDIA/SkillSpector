@@ -399,6 +399,7 @@ class TestPE3TokenDocumentationSingularDirs:
     """
 
     def test_oauth_guidance_in_singular_reference_dir_not_flagged(self) -> None:
+        """Benign context is contextually triaged, not hard-dropped (see #393)."""
         findings = pe_module.analyze(
             "**OAuth 2.1**:\n"
             "- Use secure OAuth 2.1 with certificates from recognized authorities\n"
@@ -407,16 +408,21 @@ class TestPE3TokenDocumentationSingularDirs:
             "reference/mcp_best_practices.md",
             "markdown",
         )
-        assert not any(f.rule_id == "PE3" for f in findings)
+        pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
+        assert pe3
+        assert all("contextual-triage" in finding.tags for finding in pe3)
 
     def test_oauth_guidance_in_plural_references_dir_still_not_flagged(self) -> None:
-        """Regression check: the existing plural-directory case keeps working."""
+        """Regression check: the existing plural-directory case keeps working
+        (benign context is contextually triaged, not hard-dropped — see #393)."""
         findings = pe_module.analyze(
             "- Validate access tokens before processing requests\n",
             "references/mcp_best_practices.md",
             "markdown",
         )
-        assert not any(f.rule_id == "PE3" for f in findings)
+        pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
+        assert pe3
+        assert all("contextual-triage" in finding.tags for finding in pe3)
 
     def test_malicious_instruction_in_singular_reference_dir_still_flagged(self) -> None:
         """The directory-name fix must not create a new safe harbor for real instructions."""
