@@ -24,7 +24,12 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import cast
 
-from skillspector.artifacts import ContentKind, SecurityTextView, security_text_views
+from skillspector.artifacts import (
+    ContentKind,
+    SecurityTextView,
+    is_default_ignorable,
+    security_text_views,
+)
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -85,6 +90,7 @@ _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
+_ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
 
 
 def _normalize_license_line(line: str) -> str:
@@ -539,6 +545,7 @@ def _is_continuity_separator(character: str) -> bool:
         character.isspace()
         or character == "\u00ad"
         or character == "\ufffd"
+        or is_default_ignorable(character)
         or unicodedata.category(character) in {"Cf", "Cc"}
     )
 
@@ -599,10 +606,11 @@ def _continuity_views(
 
     Separator runs wider than the normal overlap can otherwise place two
     adjacent lexical tokens in different windows.  Retaining up to 8 KiB of
-    the original run preserves newlines and keeps every bounded-gap expression
-    bounded, while expressions that already accept an unbounded separator see
-    the same token sequence.  The source-line map is constructed per view, so
-    neither a whole-file normalized copy nor a whole-file offset table exists.
+    the original run preserves ASCII whitespace boundaries and newlines while
+    keeping every bounded-gap expression bounded.  Expressions that already
+    accept an unbounded separator see the same token sequence.  The source-line
+    map is constructed per view, so neither a whole-file normalized copy nor a
+    whole-file offset table exists.
     """
     separator_runs = list(_continuity_separator_runs(content, finding_budget))
     previous_left = 0
@@ -659,6 +667,10 @@ def _continuity_views(
                     text_parts.append("\n")
                     current_line += skipped_newlines
                     source_lines.append(current_line)
+                elif _ASCII_NON_NEWLINE_WHITESPACE.search(content, head_end, tail_start):
+                    # Never let truncation erase a real word boundary and turn
+                    # separated tokens into a normalized security match.
+                    text_parts.append(" ")
                 current_line = _append_projected_piece(
                     text_parts,
                     source_lines,

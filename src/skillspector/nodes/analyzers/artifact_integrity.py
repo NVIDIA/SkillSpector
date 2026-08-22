@@ -9,10 +9,12 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 
+from skillspector.artifacts import _letter_spacing_run_spans
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_for_events,
     ledger_event,
 )
@@ -34,6 +36,23 @@ _INSTRUCTION_SUFFIXES = (
 )
 _RUNTIME_CHECK_INTERVAL_CHARS = 4096
 _ALLOWED_FORMAT_CHARACTERS = frozenset({"\n", "\r", "\t"})
+_LETTER_SPACING_SECURITY_TERMS = (
+    "bypass",
+    "disregard",
+    "ignore",
+    "instructions",
+    "jailbreak",
+    "override",
+    "previousinstructions",
+    "restrictions",
+    "securityconstraints",
+    "silentlysend",
+    "sshkey",
+    "unfiltered",
+    "unrestricted",
+    "userdata",
+)
+_MAX_LETTER_SPACING_SECURITY_TERM = max(map(len, _LETTER_SPACING_SECURITY_TERMS))
 
 
 class _ArtifactIntegrityResourceLimitError(RuntimeError):
@@ -99,10 +118,41 @@ class _ArtifactIntegrityBudget:
         return len(self.findings) >= MAX_FINDINGS_PER_ANALYZER
 
 
+def _spacing_span_has_security_term(
+    content: str,
+    span: tuple[int, int],
+    budget: _ArtifactIntegrityBudget,
+) -> bool:
+    """Match security-relevant condensed terms without retaining the full run."""
+    overlap = ""
+    letters: list[str] = []
+    letter_characters = 0
+    for offset in range(*span):
+        if offset % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
+            budget.check_runtime()
+        character = content[offset]
+        if not character.isalpha():
+            continue
+        folded = character.casefold()
+        letters.append(folded)
+        letter_characters += len(folded)
+        if letter_characters < _RUNTIME_CHECK_INTERVAL_CHARS:
+            continue
+        block = overlap + "".join(letters)
+        if any(term in block for term in _LETTER_SPACING_SECURITY_TERMS):
+            return True
+        overlap = block[-(_MAX_LETTER_SPACING_SECURITY_TERM - 1) :]
+        letters.clear()
+        letter_characters = 0
+
+    block = overlap + "".join(letters)
+    return any(term in block for term in _LETTER_SPACING_SECURITY_TERMS)
+
+
 def _text_signals(
     content: str,
     budget: _ArtifactIntegrityBudget,
-) -> tuple[float, bool, int | None]:
+) -> tuple[float, bool, int | None, int | None]:
     """Derive Unicode and NUL signals with cooperative deadline checks.
 
     Only counters, a three-entry script set, and the first NUL line are kept;
@@ -113,6 +163,21 @@ def _text_signals(
     token_scripts: set[str] = set()
     line = 1
     first_nul_line: int | None = None
+    spacing_span = next(
+        (
+            span
+            for span in _letter_spacing_run_spans(
+                content,
+                budget.check_runtime,
+                require_consistent_separator_class=False,
+            )
+            if _spacing_span_has_security_term(content, span, budget)
+        ),
+        None,
+    )
+    first_spacing_line = (
+        content.count("\n", 0, spacing_span[0]) + 1 if spacing_span is not None else None
+    )
 
     for index, character in enumerate(content):
         if index % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
@@ -146,7 +211,7 @@ def _text_signals(
     budget.check_runtime()
     mixed_script = mixed_script or ("latin" in token_scripts and len(token_scripts) > 1)
     density = ignored_characters / len(content) if content else 0.0
-    return density, mixed_script, first_nul_line
+    return density, mixed_script, first_nul_line, first_spacing_line
 
 
 def _partial_limit_event(
@@ -241,6 +306,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         artifact: dict[str, object] = raw_artifact if isinstance(raw_artifact, dict) else {}
         finding_start = len(budget.findings)
         resource_limit: _ArtifactIntegrityResourceLimitError | None = None
+        first_spacing_line: int | None = None
         try:
             budget.check_runtime()
             if artifact.get("misleading_extension"):
@@ -269,7 +335,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=1.0,
                         )
                     )
-                format_density, mixed_script, first_nul_line = _text_signals(content, budget)
+                format_density, mixed_script, first_nul_line, first_spacing_line = _text_signals(
+                    content, budget
+                )
                 if artifact.get("contains_nul") and first_nul_line is not None:
                     budget.emit(
                         _finding(
@@ -291,6 +359,17 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=0.8,
                         )
                     )
+                if first_spacing_line is not None:
+                    budget.emit(
+                        _finding(
+                            "AE6",
+                            "Instruction text uses inter-character separators to evade pattern matching",
+                            path,
+                            severity="HIGH",
+                            confidence=0.9,
+                            line=first_spacing_line,
+                        )
+                    )
         except _ArtifactIntegrityResourceLimitError as exc:
             resource_limit = exc
 
@@ -308,8 +387,21 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 emitted_finding_ids=emitted_ids,
             )
         events.append(event)
+        if resource_limit is None and first_spacing_line is not None:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="artifact_interpretation",
+                    path=path,
+                    start_line=first_spacing_line,
+                    end_line=first_spacing_line,
+                    record_type=LedgerRecordType.SYSTEM,
+                    reason=LedgerReason.OBFUSCATED_INSTRUCTION_TEXT,
+                )
+            )
+    work_events = (event for event in events if event["record_type"] == LedgerRecordType.WORK_ITEM)
     return {
         "findings": budget.findings,
         "inspection_ledger": events,
-        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, events)],
+        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, work_events)],
     }
