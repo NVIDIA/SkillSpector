@@ -24,8 +24,9 @@ one stable interface.
 from __future__ import annotations
 
 import ast
+import time
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from threading import RLock
 from uuid import uuid4
@@ -157,10 +158,26 @@ def build_python_ast_cache(
     *,
     max_source_chars: int = MAX_PYTHON_AST_SOURCE_CHARS,
     max_cache_source_chars: int = MAX_PYTHON_AST_CACHE_SOURCE_CHARS,
+    clock: Callable[[], float] = time.monotonic,
+    started_at: float | None = None,
+    deadline: float | None = None,
+    runtime_limitations: list[tuple[str, float]] | None = None,
 ) -> PythonAstCache:
     """Preparse eligible Python files within one scan's aggregate cache budget."""
     cache: PythonAstCache = {}
     source_characters = 0
+    effective_started_at = clock() if started_at is None else started_at
+
+    def _expired(path: str) -> bool:
+        if deadline is None:
+            return False
+        now = clock()
+        if now < deadline:
+            return False
+        if runtime_limitations is not None and not runtime_limitations:
+            runtime_limitations.append((path, max(0.0, now - effective_started_at)))
+        return True
+
     for path in components:
         if not path.lower().endswith(".py"):
             continue
@@ -171,8 +188,12 @@ def build_python_ast_cache(
             or source_characters + len(content) > max_cache_source_chars
         ):
             continue
+        if _expired(path):
+            break
         cache[path] = parse_python_source(content, path)
         source_characters += len(content)
+        if _expired(path):
+            break
     return cache
 
 
@@ -182,6 +203,10 @@ def prewarm_python_ast_cache(
     *,
     max_source_chars: int = MAX_PYTHON_AST_SOURCE_CHARS,
     max_cache_source_chars: int = MAX_PYTHON_AST_CACHE_SOURCE_CHARS,
+    clock: Callable[[], float] = time.monotonic,
+    started_at: float | None = None,
+    deadline: float | None = None,
+    runtime_limitations: list[tuple[str, float]] | None = None,
 ) -> str | None:
     """Preparse one scan's eligible Python files and return its runtime cache key."""
     cache = build_python_ast_cache(
@@ -189,6 +214,10 @@ def prewarm_python_ast_cache(
         file_cache,
         max_source_chars=max_source_chars,
         max_cache_source_chars=max_cache_source_chars,
+        clock=clock,
+        started_at=started_at,
+        deadline=deadline,
+        runtime_limitations=runtime_limitations,
     )
     if not cache:
         return None

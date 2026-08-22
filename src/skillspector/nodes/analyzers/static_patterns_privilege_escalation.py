@@ -332,8 +332,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
+            finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
-                continue
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE2",
@@ -341,7 +342,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     severity=Severity.MEDIUM,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
                 )
@@ -350,14 +351,17 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
-            if _is_pe3_documentation_example(content, match, file_type, file_path):
-                continue
-            if _is_qualified_benign_access_requirement(content, match, file_type):
-                continue
-            if _is_read_only_passwd_volume_match(content, match):
-                continue
-            if _is_negated_safety_constraint(content, match):
-                continue
+            contextual = any(
+                (
+                    _is_pe3_documentation_example(content, match, file_type, file_path),
+                    _is_qualified_benign_access_requirement(content, match, file_type),
+                    _is_read_only_passwd_volume_match(content, match),
+                    _is_negated_safety_constraint(content, match),
+                )
+            )
+            finding_tags = list(tag)
+            if contextual:
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
@@ -365,7 +369,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     severity=Severity.HIGH,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
                 )
@@ -377,8 +381,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
+            finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
-                continue
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             if line_num in pe4_best and pe4_best[line_num].confidence >= confidence:
                 continue
             pe4_best[line_num] = AnalyzerFinding(
@@ -387,7 +392,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 severity=Severity.HIGH,
                 location=loc(line_num),
                 confidence=confidence,
-                tags=tag,
+                tags=finding_tags,
                 context=context,
                 matched_text=match.group(0)[:200],
             )
@@ -399,8 +404,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
+            finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
-                continue
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             if line_num in pe5_best and pe5_best[line_num].confidence >= confidence:
                 continue
             pe5_best[line_num] = AnalyzerFinding(
@@ -409,7 +415,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 severity=Severity.HIGH,
                 location=loc(line_num),
                 confidence=confidence,
-                tags=tag,
+                tags=finding_tags,
                 context=context,
                 matched_text=match.group(0)[:200],
             )

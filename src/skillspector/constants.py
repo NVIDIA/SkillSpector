@@ -31,6 +31,9 @@ RISK_THRESHOLD = 50
 # Maximum text-file size processed by static analyzers and lightweight
 # format recognizers.
 MAX_FILE_BYTES = 1_000_000
+# Static analysis supports complete per-artifact coverage through 16 MiB. Larger
+# files are read only to this bound and are reported as partial, never complete.
+MAX_ANALYZABLE_FILE_BYTES = 16 * 1024 * 1024
 
 # Default-model selection lives on each provider (see providers/<name>/provider.py
 # for ``DEFAULT_MODEL`` and ``SLOT_DEFAULTS``).  The active provider's

@@ -34,3 +34,16 @@ def test_finding_reducer_replaces_same_id_without_duplicating_payload() -> None:
     assert len(merged) == 1
     assert merged[0].finding_id == "finding-a"
     assert merged[0].message == "confirmed"
+
+
+def test_finding_serializes_structured_evidence() -> None:
+    finding = Finding(
+        rule_id="SC9",
+        message="concealed executable",
+        evidence={"outer_path": "archive.docx", "nested_path": "payload.sh"},
+    )
+
+    assert finding.to_dict()["evidence"] == {
+        "outer_path": "archive.docx",
+        "nested_path": "payload.sh",
+    }

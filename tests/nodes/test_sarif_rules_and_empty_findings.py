@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from skillspector.models import Finding
 from skillspector.nodes.report import _build_sarif
+from skillspector.sarif_models import validate_sarif_report
 from skillspector.suppression import SuppressedFinding
 
 
@@ -215,3 +216,85 @@ class TestSarifResultProperties:
         assert result["properties"]["finding"] == "credential leak"
         assert result["properties"]["explanation"] == "Credential material is exposed in output"
         assert result["properties"]["intent"] == "exposed_secret"
+
+
+def test_sarif_transitive_properties_validate() -> None:
+    """Transitive provenance lands in SARIF properties and still validates."""
+    finding = _make_finding("TR1", "Transitive Dependency")
+    finding.transitive_depth = 2
+    finding.source_url = "https://github.com/org/dep"
+    finding.source_identity = f"external/{'a' * 64}"
+    finding.source_digest = f"sha256:{'b' * 64}"
+    sarif = _build_sarif([finding])
+    validate_sarif_report(sarif)
+    result = sarif["runs"][0]["results"][0]
+    properties = result["properties"]
+    assert properties["transitiveDepth"] == 2
+    assert properties["sourceUrl"] == "https://github.com/org/dep"
+    assert properties["sourceIdentity"] == f"external/{'a' * 64}"
+    assert properties["sourceDigest"] == f"sha256:{'b' * 64}"
+
+
+def test_sarif_scopes_same_path_by_immutable_source_identity() -> None:
+    """Two children with the same path remain distinct in SARIF locations."""
+    shared_url = "https://github.com/org/shared"
+    first_identity = f"external/{'a' * 64}"
+    second_identity = f"external/{'b' * 64}"
+    first = _make_finding("TR1", "First dependency")
+    first.source_url = shared_url
+    first.source_identity = first_identity
+    first.source_digest = f"sha256:{'c' * 64}"
+    first.transitive_depth = 1
+    second = _make_finding("TR1", "Second dependency")
+    second.source_url = shared_url
+    second.source_identity = second_identity
+    second.source_digest = f"sha256:{'d' * 64}"
+    second.transitive_depth = 1
+
+    sarif = _build_sarif([first, second])
+    validate_sarif_report(sarif)
+    results = sarif["runs"][0]["results"]
+    locations = [
+        result["locations"][0]["physicalLocation"]["artifactLocation"] for result in results
+    ]
+
+    assert {location["uri"] for location in locations} == {
+        f"{first_identity}/tool.py",
+        f"{second_identity}/tool.py",
+    }
+    assert {result["properties"]["sourceIdentity"] for result in results} == {
+        first_identity,
+        second_identity,
+    }
+    assert {location["properties"]["sourceDigest"] for location in locations} == {
+        f"sha256:{'c' * 64}",
+        f"sha256:{'d' * 64}",
+    }
+
+
+def test_sarif_occurrence_preserves_its_source_provenance() -> None:
+    identity = f"external/{'e' * 64}"
+    finding = _make_finding("TR2", "Occurrence provenance")
+    finding.source_identity = identity
+    finding.source_digest = f"sha256:{'f' * 64}"
+    finding.source_url = "https://github.com/org/dep"
+    finding.transitive_depth = 2
+    finding.occurrences = [
+        {
+            "file": "nested/tool.py",
+            "start_line": 7,
+            "end_line": 8,
+            "source_identity": identity,
+            "source_digest": f"sha256:{'f' * 64}",
+            "source_url": finding.source_url,
+            "transitive_depth": 2,
+        }
+    ]
+
+    result = _build_sarif([finding])["runs"][0]["results"][0]
+
+    artifact = result["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert artifact["uri"] == f"{identity}/nested/tool.py"
+    assert artifact["properties"]["sourceIdentity"] == identity
+    assert result["properties"]["sourceDigest"] == f"sha256:{'f' * 64}"
+    assert result["properties"]["transitiveDepth"] == 2

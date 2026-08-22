@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from skillspector.nodes.analyzers import behavioral_ast
+from skillspector.state import WorkflowResourceBudget
 
 
 def _run(code: str, filename: str = "script.py") -> list:
@@ -545,3 +546,48 @@ class TestInspectionLedgerResponse:
         assert event["emitted_finding_ids"] == [
             finding.finding_id for finding in result["findings"]
         ]
+
+
+class TestResourceBounds:
+    def test_finding_caps_stop_construction_and_account_remaining_work(self, monkeypatch) -> None:
+        monkeypatch.setattr(behavioral_ast, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        monkeypatch.setattr(behavioral_ast, "MAX_FINDINGS_PER_ANALYZER", 3)
+        result = behavioral_ast.node(
+            {
+                "components": ["a.py", "b.py", "c.py"],
+                "file_cache": {
+                    "a.py": "\n".join(f'exec("{index}")' for index in range(4)),
+                    "b.py": 'exec("b1")\nexec("b2")',
+                    "c.py": 'exec("c")',
+                },
+            }
+        )
+
+        assert len(result["findings"]) == 3
+        assert [event["outcome"] for event in result["inspection_ledger"]] == [
+            "partial",
+            "partial",
+            "partial",
+        ]
+        assert result["inspection_ledger"][0]["observed_findings"] == 3
+        assert result["inspection_ledger"][0]["limit_findings"] == 2
+        assert result["inspection_ledger"][1]["observed_findings"] == 4
+        assert result["inspection_ledger"][1]["limit_findings"] == 3
+        assert result["inspection_ledger"][2]["emitted_finding_ids"] == []
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_expired_workflow_deadline_marks_every_python_target_partial(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["a.py", "b.py"],
+                "file_cache": {"a.py": 'exec("a")', "b.py": 'exec("b")'},
+                "workflow_resource_budget": WorkflowResourceBudget(max_seconds=0.0),
+            }
+        )
+
+        assert result["findings"] == []
+        assert [event["reason_code"] for event in result["inspection_ledger"]] == [
+            "runtime_limit",
+            "runtime_limit",
+        ]
+        assert all("observed_seconds" in event for event in result["inspection_ledger"])

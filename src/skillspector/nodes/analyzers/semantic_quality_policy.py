@@ -25,17 +25,40 @@ from __future__ import annotations
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
 from skillspector.inspection_ledger import LedgerReason, analyzer_status_event
 from skillspector.llm_analyzer_base import (
+    Batch,
     BatchExecutionResult,
     BatchFailure,
     LLMAnalyzerBase,
+    LLMRuntimeLimitError,
     ledger_events_for_batches,
 )
 from skillspector.llm_utils import run_async
 from skillspector.logging_config import get_logger
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState, llm_call_record
+from skillspector.state import (
+    AnalyzerNodeResponse,
+    SkillspectorState,
+    llm_call_record,
+    transitive_remaining_seconds,
+)
 
 ANALYZER_ID = "semantic_quality_policy"
 logger = get_logger(__name__)
+
+
+def _runtime_limited_outcome(paths: list[str], batches: list[Batch]) -> BatchExecutionResult:
+    """Return partial terminal evidence for every unstarted semantic target."""
+    planned = batches or [Batch(file_path=path, content="") for path in paths]
+    return BatchExecutionResult(
+        failures=[
+            BatchFailure(
+                batch=batch,
+                error_class=LLMRuntimeLimitError.__name__,
+                reason=LedgerReason.RUNTIME_LIMIT,
+            )
+            for batch in planned
+        ]
+    )
+
 
 ANALYZER_PROMPT = """\
 You are a quality and safety auditor for AI agent skills.  Your job is to
@@ -147,7 +170,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             ],
         }
 
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    llm_cache = state.get("llm_file_cache")
+    file_cache: dict[str, str] = (
+        llm_cache if isinstance(llm_cache, dict) else state.get("file_cache") or {}
+    )
     files = sorted(file_cache.keys())
     if not files:
         return {
@@ -168,9 +194,32 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
 
     analyzer: LLMAnalyzerBase | None = None
-    batches = []
+    batches: list[Batch] = []
+    shared_remaining = transitive_remaining_seconds(state)
+    if shared_remaining is not None and shared_remaining <= 0:
+        events, status = ledger_events_for_batches(
+            ANALYZER_ID,
+            _runtime_limited_outcome(files, batches),
+        )
+        return {
+            "findings": [],
+            "inspection_ledger": events,
+            "analyzer_status_events": [status],
+            "llm_call_log": [
+                llm_call_record(ANALYZER_ID, ok=False, error="shared runtime limit reached")
+            ],
+            "inference_usage": [],
+        }
+    timeout = (
+        (lambda: transitive_remaining_seconds(state)) if shared_remaining is not None else None
+    )
     try:
-        analyzer = LLMAnalyzerBase(base_prompt=ANALYZER_PROMPT, model=model, node=ANALYZER_ID)
+        analyzer = LLMAnalyzerBase(
+            base_prompt=ANALYZER_PROMPT,
+            model=model,
+            node=ANALYZER_ID,
+            timeout=timeout,
+        )
         batches = analyzer.get_batches(files, file_cache)
         results = run_async(analyzer.arun_batches(batches))
         outcome = getattr(analyzer, "_last_batch_outcome", BatchExecutionResult(successful=results))
@@ -182,11 +231,29 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             "inspection_ledger": events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                llm_call_record(ANALYZER_ID, ok=bool(outcome.successful) or not outcome.failures)
+                # A record is ok only when every submitted batch succeeded. A
+                # partial batch failure (e.g. one file's batch 429'd while
+                # another's succeeded) is still lost coverage, so it must not
+                # read as ok=True just because some batches came back.
+                llm_call_record(ANALYZER_ID, ok=not outcome.failures)
             ],
             "inference_usage": analyzer.inference_usage,
         }
     except Exception as exc:
+        if isinstance(exc, LLMRuntimeLimitError):
+            events, status = ledger_events_for_batches(
+                ANALYZER_ID,
+                _runtime_limited_outcome(files, batches),
+            )
+            return {
+                "findings": [],
+                "inspection_ledger": events,
+                "analyzer_status_events": [status],
+                "llm_call_log": [
+                    llm_call_record(ANALYZER_ID, ok=False, error="shared runtime limit reached")
+                ],
+                "inference_usage": analyzer.inference_usage if analyzer is not None else [],
+            }
         post_response_value_error = (
             isinstance(exc, ValueError) and analyzer is not None and analyzer.response_received
         )

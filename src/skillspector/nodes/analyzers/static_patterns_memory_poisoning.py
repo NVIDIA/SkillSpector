@@ -32,7 +32,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number, is_code_example
+from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -232,8 +232,6 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
-            if is_code_example(context_text):
-                continue
             findings.append(
                 AnalyzerFinding(
                     rule_id="MP3",

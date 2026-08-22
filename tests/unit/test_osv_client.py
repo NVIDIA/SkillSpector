@@ -22,9 +22,11 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers.osv_client import (
     ECOSYSTEM_NPM,
     ECOSYSTEM_PYPI,
+    OsvQueryBudget,
     VulnResult,
     _cache,
     _estimate_cvss_severity,
@@ -180,6 +182,9 @@ class TestQueryBatch:
             results = query_batch([("jinja2", "2.4.1")], ECOSYSTEM_PYPI)
 
         assert results == [[]]
+        assert any(
+            item.reason is LedgerReason.ANALYZER_RUNTIME_ERROR for item in results.limitations
+        )
 
     def test_timeout_returns_empty(self) -> None:
         mock_client = MagicMock()
@@ -193,6 +198,7 @@ class TestQueryBatch:
             results = query_batch([("lodash", "4.17.20")], ECOSYSTEM_NPM)
 
         assert results == [[]]
+        assert any(item.reason is LedgerReason.RUNTIME_LIMIT for item in results.limitations)
 
     def test_cache_hit_avoids_api_call(self) -> None:
         cached_vuln = VulnResult(vuln_id="CACHED-1", summary="cached", severity="HIGH", aliases=())
@@ -310,3 +316,169 @@ class TestQueryBatch:
             query_batch([("jinja2", "2.4.1")], ECOSYSTEM_PYPI)
 
         assert was_osv_reachable() is False
+
+
+class TestQueryResourceBounds:
+    """Attacker-controlled provider work stays under one aggregate budget."""
+
+    @staticmethod
+    def _client_for_batches(batch_payloads: list[dict]) -> MagicMock:
+        client = MagicMock()
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+        responses = []
+        for payload in batch_payloads:
+            response = MagicMock()
+            response.json.return_value = payload
+            response.raise_for_status = MagicMock()
+            responses.append(response)
+        client.post.side_effect = responses
+        return client
+
+    def test_packages_and_batches_are_capped_across_one_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_PACKAGES", 3)
+        monkeypatch.setattr(osv, "MAX_OSV_QUERIES_PER_BATCH", 2)
+        monkeypatch.setattr(osv, "MAX_OSV_QUERY_BATCHES", 2)
+        client = self._client_for_batches(
+            [
+                {"results": [{"vulns": []}, {"vulns": []}]},
+                {"results": [{"vulns": []}]},
+            ]
+        )
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch(
+                [(f"pkg-{index}", "1.0.0") for index in range(10)],
+                ECOSYSTEM_PYPI,
+            )
+
+        assert len(results) == 3
+        assert client.post.call_count == 2
+        assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in results.limitations)
+
+    def test_response_byte_cap_returns_partial_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_RESPONSE_BYTES", 8)
+        client = self._client_for_batches([{"results": [{"vulns": []}]}])
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert any(item.reason is LedgerReason.TOTAL_BYTES_LIMIT for item in results.limitations)
+
+    def test_real_httpx_streaming_path_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_RESPONSE_BYTES", 32)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"results": [{"vulns": []}], "padding": "x" * 128},
+                request=request,
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch([("requests", "2.31.0")], ECOSYSTEM_PYPI)
+
+        assert results == [[]]
+        assert any(item.reason is LedgerReason.TOTAL_BYTES_LIMIT for item in results.limitations)
+
+    def test_detail_requests_are_capped_without_hiding_vulnerability_ids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_DETAIL_REQUESTS", 1)
+        client = self._client_for_batches(
+            [{"results": [{"vulns": [{"id": "OSV-1"}, {"id": "OSV-2"}, {"id": "OSV-3"}]}]}]
+        )
+        detail = MagicMock()
+        detail.raise_for_status = MagicMock()
+        detail.json.return_value = {"id": "OSV-1", "summary": "first"}
+        client.get.return_value = detail
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch([("demo", "1.0.0")], ECOSYSTEM_PYPI)
+
+        assert [item.vuln_id for item in results[0]] == ["OSV-1", "OSV-2", "OSV-3"]
+        assert client.get.call_count == 1
+        assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in results.limitations)
+
+    def test_retained_vulnerability_results_are_capped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_RESULTS", 1)
+        monkeypatch.setattr(osv, "MAX_OSV_DETAIL_REQUESTS", 0)
+        client = self._client_for_batches(
+            [{"results": [{"vulns": [{"id": "OSV-1"}, {"id": "OSV-2"}]}]}]
+        )
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch([("demo", "1.0.0")], ECOSYSTEM_PYPI)
+
+        assert [item.vuln_id for item in results[0]] == ["OSV-1"]
+        assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in results.limitations)
+
+    def test_truncated_provider_result_is_not_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_VULNS_PER_PACKAGE", 1)
+        batch = {"results": [{"vulns": [{"id": "OSV-1"}, {"id": "OSV-2"}]}]}
+        client = self._client_for_batches([batch, batch])
+        detail = MagicMock()
+        detail.raise_for_status = MagicMock()
+        detail.json.return_value = {"id": "OSV-1", "summary": "first"}
+        client.get.return_value = detail
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            first = query_batch([("demo", "1.0.0")], ECOSYSTEM_PYPI)
+            second = query_batch([("demo", "1.0.0")], ECOSYSTEM_PYPI)
+
+        assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in first.limitations)
+        assert client.post.call_count == 2
+        assert second[0][0].vuln_id == "OSV-1"
+
+    def test_budget_is_shared_across_separate_manifest_queries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skillspector.nodes.analyzers.osv_client as osv
+
+        monkeypatch.setattr(osv, "MAX_OSV_PACKAGES", 4)
+        monkeypatch.setattr(osv, "MAX_OSV_QUERY_BATCHES", 1)
+        client = self._client_for_batches([{"results": [{"vulns": []}]}])
+        budget = OsvQueryBudget.create(timeout_seconds=10.0)
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            first = query_batch([("one", "1.0.0")], ECOSYSTEM_PYPI, budget=budget)
+            second = query_batch([("two", "1.0.0")], ECOSYSTEM_PYPI, budget=budget)
+            third = query_batch([("three", "1.0.0")], ECOSYSTEM_PYPI, budget=budget)
+
+        assert len(first) == 1
+        assert len(second) == 1
+        assert len(third) == 1
+        assert client.post.call_count == 1
+        assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in second.limitations)
+        assert any(item.reason is LedgerReason.OUTPUT_LIMIT for item in third.limitations)
+
+    def test_expired_shared_deadline_makes_no_provider_request(self) -> None:
+        client = self._client_for_batches([])
+        budget = OsvQueryBudget.create(timeout_seconds=0.0)
+
+        with patch("skillspector.nodes.analyzers.osv_client.httpx.Client", return_value=client):
+            results = query_batch([("demo", "1.0.0")], ECOSYSTEM_PYPI, budget=budget)
+
+        assert results == [[]]
+        assert client.post.call_count == 0
+        assert any(item.reason is LedgerReason.RUNTIME_LIMIT for item in results.limitations)

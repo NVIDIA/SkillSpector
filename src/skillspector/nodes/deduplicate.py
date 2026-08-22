@@ -1,31 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Cross-analyzer finding deduplication.
-
-Merges findings that represent the same conceptual issue observed multiple
-times — either within the same file or across files with identical patterns.
-
-Deduplication strategy:
-1. Same-file dedup: Same rule_id + same file + same matched_text
-   → keep highest confidence instance
-2. Cross-file consolidation: Same rule_id + same matched_text across files
-   → keep highest confidence instance
-"""
+"""Collision-resistant, occurrence-preserving finding compaction."""
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -33,72 +13,133 @@ from skillspector.models import Finding
 logger = get_logger(__name__)
 
 
-def _same_file_key(finding: Finding) -> tuple[str, str, str]:
-    """Build a deduplication key for same-file matches."""
-    matched = (finding.matched_text or "").strip()[:100]
-    return (finding.rule_id, finding.file, matched)
+def _occurrences(finding: Finding) -> list[dict[str, object]]:
+    if finding.occurrences:
+        return [dict(item) for item in finding.occurrences]
+    return [
+        {
+            "file": finding.file,
+            "start_line": finding.start_line,
+            "end_line": finding.end_line,
+            "source_url": finding.source_url,
+            "source_identity": finding.source_identity,
+            "source_digest": finding.source_digest,
+            "transitive_depth": finding.transitive_depth,
+        }
+    ]
 
 
-def _cross_file_key(finding: Finding) -> tuple[str, str]:
-    """Build a cross-file deduplication key from rule_id and normalized matched_text."""
-    matched = (finding.matched_text or "").strip()[:100]
-    return (finding.rule_id, matched)
+def _line(value: object, default: int) -> int:
+    return value if isinstance(value, int) else default
+
+
+def _finding_source_scope(finding: Finding) -> str:
+    """Return immutable provenance, including occurrence-only compatibility data."""
+    direct = finding.source_identity or finding.source_digest or finding.source_url
+    if direct:
+        return direct
+    for occurrence in finding.occurrences:
+        candidate = (
+            occurrence.get("source_identity")
+            or occurrence.get("source_digest")
+            or occurrence.get("source_url")
+        )
+        if candidate:
+            return str(candidate)
+    return ""
 
 
 def deduplicate(findings: list[Finding]) -> list[Finding]:
-    """Deduplicate a list of findings, returning a reduced list.
-
-    Two-pass deduplication:
-    1. Same-file: identical (rule_id, file, matched_text) → keep highest confidence
-    2. Cross-file: identical (rule_id, matched_text) across different files
-       → keep highest confidence representative
-
-    Findings without matched_text are never cross-file deduplicated (they lack
-    a reliable identity signal).
-    """
-    if not findings:
-        return []
-
-    original_count = len(findings)
-
-    # Pass 1: Same-file deduplication
-    same_file_best: dict[tuple[str, str, str], Finding] = {}
-    for f in findings:
-        key = _same_file_key(f)
-        existing = same_file_best.get(key)
-        if existing is None or f.confidence > existing.confidence:
-            same_file_best[key] = f
-
-    after_same_file = list(same_file_best.values())
-
-    # Pass 2: Cross-file deduplication (only for findings WITH matched_text)
-    cross_file_best: dict[tuple[str, str], Finding] = {}
-    no_text_findings: list[Finding] = []
-
-    for f in after_same_file:
-        matched = (f.matched_text or "").strip()
-        if not matched:
-            no_text_findings.append(f)
+    """Aggregate exact full-match duplicates while preserving every occurrence."""
+    groups: dict[tuple[str, str, str], list[Finding]] = {}
+    unique_without_match: list[Finding] = []
+    for finding in findings:
+        fingerprint = finding.fingerprint()
+        if fingerprint is None:
+            unique_without_match.append(finding)
             continue
-        key = _cross_file_key(f)
-        existing = cross_file_best.get(key)
-        if existing is None or f.confidence > existing.confidence:
-            cross_file_best[key] = f
+        source_scope = _finding_source_scope(finding)
+        groups.setdefault((source_scope, finding.rule_id, fingerprint), []).append(finding)
 
-    deduplicated = list(cross_file_best.values()) + no_text_findings
-
-    removed = original_count - len(deduplicated)
-    if removed > 0:
-        logger.info(
-            "Deduplication: %d → %d findings (%d duplicates removed)",
-            original_count,
-            len(deduplicated),
-            removed,
+    compacted: list[Finding] = []
+    for (_source_scope, _rule_id, fingerprint), group in groups.items():
+        representative = max(
+            group,
+            key=lambda item: (
+                item.confidence,
+                -item.start_line,
+                item.file,
+                item.finding_id,
+            ),
+        )
+        occurrences = {
+            (
+                str(occurrence.get("file", "")),
+                _line(occurrence.get("start_line"), 1),
+                occurrence.get("end_line"),
+                str(occurrence.get("source_identity") or finding.source_identity or ""),
+                str(occurrence.get("source_digest") or finding.source_digest or ""),
+                str(occurrence.get("source_url") or finding.source_url or ""),
+                _line(occurrence.get("transitive_depth"), finding.transitive_depth),
+            )
+            for finding in group
+            for occurrence in _occurrences(finding)
+        }
+        ordered_occurrences = [
+            {
+                "file": file,
+                "start_line": start,
+                "end_line": end,
+                **({"source_identity": source_identity} if source_identity else {}),
+                **({"source_digest": source_digest} if source_digest else {}),
+                **({"source_url": source_url} if source_url else {}),
+                **({"transitive_depth": transitive_depth} if transitive_depth else {}),
+            }
+            for (
+                file,
+                start,
+                end,
+                source_identity,
+                source_digest,
+                source_url,
+                transitive_depth,
+            ) in sorted(
+                occurrences,
+                key=lambda item: (
+                    item[3],
+                    item[4],
+                    item[5],
+                    item[6],
+                    item[0],
+                    item[1],
+                    _line(item[2], item[1]),
+                ),
+            )
+        ]
+        compacted.append(
+            replace(
+                representative,
+                match_fingerprint=fingerprint,
+                occurrences=ordered_occurrences,
+            )
         )
 
+    compacted.extend(unique_without_match)
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    deduplicated.sort(
-        key=lambda f: (severity_order.get(f.severity.upper(), 4), f.file, f.start_line)
+    compacted.sort(
+        key=lambda finding: (
+            severity_order.get(finding.severity.upper(), 4),
+            finding.file,
+            finding.start_line,
+            finding.rule_id,
+        )
     )
-
-    return deduplicated
+    removed = len(findings) - len(compacted)
+    if removed:
+        logger.info(
+            "Deduplication: %d -> %d findings (%d exact duplicates aggregated)",
+            len(findings),
+            len(compacted),
+            removed,
+        )
+    return compacted
