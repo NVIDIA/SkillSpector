@@ -86,7 +86,7 @@ PE3_PATTERNS = [
     (r"/etc/shadow", 0.95),
     (r"(?:password|credentials?|secrets?)\.(?:txt|json|yaml|yml|env)", 0.7),
     (r"(?:access_token|refresh_token|bearer_token|api_token)\.txt", 0.8),
-    (r"\.env(?:\.local|\.production|\.development)?(?:\s|$|['\"])", 0.6),
+    (r"(?<!\w)\.env(?:\.local|\.production|\.development)?(?:\s|$|['\"])", 0.6),
     (r"(?:keychain|keyring|gnome-keyring)", 0.7),
     (r"(?:Chrome|Firefox|Safari)/.*?(?:Cookies|Login Data|key4\.db)", 0.8),
     (r"read\s+(?:the\s+)?(?:ssh|private)\s+key", 0.8),
@@ -196,7 +196,19 @@ _PE3_ACCESS_TOKEN_NOUN_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
-    {"docs", "documentation", "procedures", "references", "examples", "guides"}
+    {
+        "docs",
+        "doc",
+        "documentation",
+        "procedures",
+        "procedure",
+        "references",
+        "reference",
+        "examples",
+        "example",
+        "guides",
+        "guide",
+    }
 )
 _MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
 
