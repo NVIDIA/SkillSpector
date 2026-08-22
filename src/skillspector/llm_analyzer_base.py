@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import weakref
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -103,12 +104,38 @@ def _uses_native_connection_retries(
     return False
 
 
+# One semaphore per event loop, per resolved limit. The analyzers are separate graph nodes that
+# the workflow fans out to in parallel, so a semaphore created inside one analyzer's fan-out
+# bounds that analyzer alone: with N analyzers the process puts N x limit requests on the wire.
+# Keying by loop keeps unrelated loops (tests, repeated CLI invocations) independent, and the
+# weak key lets the entry go when the loop does. Keying by limit as well means a caller that
+# resolves a different value gets its own semaphore instead of replacing one that other
+# coroutines are currently holding.
+_shared_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]
+] = weakref.WeakKeyDictionary()
+
+
+def _shared_semaphore(limit: int) -> asyncio.Semaphore:
+    """Return the process-wide semaphore for *limit* on the running loop."""
+    loop = asyncio.get_running_loop()
+    per_limit = _shared_semaphores.get(loop)
+    if per_limit is None:
+        per_limit = {}
+        _shared_semaphores[loop] = per_limit
+    semaphore = per_limit.get(limit)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(limit)
+        per_limit[limit] = semaphore
+    return semaphore
+
+
 def resolve_max_concurrency() -> int:
     """Resolve the LLM fan-out concurrency from ``SKILLSPECTOR_MAX_LLM_CONCURRENCY``.
 
     Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
     providers (free tiers with a low RPM) can set it to ``1`` to serialize
-    requests instead of bursting up to 10 in parallel — a burst that otherwise
+    requests across every analyzer instead of bursting up to 10 in parallel — a burst that otherwise
     guarantees 429s, and 429'd batches are dropped from the result (see the
     analyzer fan-out below). Invalid values fall back to the default; values
     below 1 are clamped to 1.
@@ -897,9 +924,14 @@ class LLMAnalyzerBase:
         **kwargs: object,
     ) -> BatchExecutionResult:
         """Execute batches concurrently and retain sanitized per-batch failures."""
+        # Resolved from the environment: share one semaphore across every analyzer on this
+        # loop, because that is what the variable promises. An explicit argument keeps its
+        # documented meaning and stays local to this call — callers that pass a number are
+        # asking for a fan-out width, not for a share of the process-wide budget.
         if max_concurrency is None:
-            max_concurrency = resolve_max_concurrency()
-        sem = asyncio.Semaphore(max_concurrency)
+            sem = _shared_semaphore(resolve_max_concurrency())
+        else:
+            sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
             async with sem:

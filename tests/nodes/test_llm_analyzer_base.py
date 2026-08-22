@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2669,3 +2670,84 @@ class TestTokenBudgetFunctions:
         out = get_max_output_tokens("unknown/model")
         assert inp == int(mocked_ctx * 0.75)
         assert out == int(mocked_ctx * 0.25)
+
+
+class TestConcurrencyIsGlobal:
+    """`SKILLSPECTOR_MAX_LLM_CONCURRENCY` must bound the whole process, not one analyzer.
+
+    The analyzers are separate LangGraph nodes and the graph fans out to them in parallel
+    (``workflow.add_edge("build_context", analyzer_id)`` for each). A semaphore created inside
+    one analyzer's fan-out therefore bounds only that analyzer: setting the variable to 1 still
+    puts N requests on the wire at once, which is exactly what a user on a rate-limited endpoint
+    set it to 1 to avoid.
+    """
+
+    MODEL = "gpt-4o-mini"
+
+    @staticmethod
+    def _counting_analyzer(peak: list[int], live: list[int]) -> LLMAnalyzerBase:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=TestConcurrencyIsGlobal.MODEL)
+
+        async def _invoke(*_args, **_kwargs):
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+            # Yield control so a second in-flight request has the chance to be observed. Without
+            # this the coroutine could complete before any other one starts, and the assertion
+            # would pass on a serialization the code does not actually provide.
+            await asyncio.sleep(0.02)
+            live[0] -= 1
+            return LLMAnalysisResult(findings=[])
+
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=_invoke)
+        return analyzer
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_two_analyzers_respect_one_global_slot(self, monkeypatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "1")
+        peak, live = [0], [0]
+        first = self._counting_analyzer(peak, live)
+        second = self._counting_analyzer(peak, live)
+        batches = [Batch(file_path="a.py", content="a"), Batch(file_path="b.py", content="b")]
+
+        await asyncio.gather(
+            first.arun_batches_detailed(list(batches)),
+            second.arun_batches_detailed(list(batches)),
+        )
+
+        assert peak[0] == 1, (
+            f"{peak[0]} requests were in flight with the limit set to 1: the bound is per "
+            "analyzer, so N analyzers issue N simultaneous requests"
+        )
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_limit_of_two_allows_two_across_analyzers(self, monkeypatch) -> None:
+        """The bound must be the ceiling, not a serialization: a knob that only ever means 1 is
+        as wrong as one that means nothing."""
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "2")
+        peak, live = [0], [0]
+        first = self._counting_analyzer(peak, live)
+        second = self._counting_analyzer(peak, live)
+        batches = [Batch(file_path="a.py", content="a"), Batch(file_path="b.py", content="b")]
+
+        await asyncio.gather(
+            first.arun_batches_detailed(list(batches)),
+            second.arun_batches_detailed(list(batches)),
+        )
+
+        assert peak[0] == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_explicit_argument_still_bounds_only_its_own_call(self, monkeypatch) -> None:
+        """An explicit ``max_concurrency`` keeps its documented meaning: it wins for that call.
+
+        Callers that pass a number are asking for a local fan-out width, not for a share of the
+        process-wide budget, and tests rely on that isolation.
+        """
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "1")
+        peak, live = [0], [0]
+        analyzer = self._counting_analyzer(peak, live)
+        batches = [Batch(file_path="a.py", content="a"), Batch(file_path="b.py", content="b")]
+
+        await analyzer.arun_batches_detailed(batches, max_concurrency=2)
+
+        assert peak[0] == 2
