@@ -349,6 +349,31 @@ def test_recursive_min_coverage_passes_when_all_children_and_aggregate_pass(
     )
 
 
+def test_recursive_min_coverage_fails_on_omitted_aggregate_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+    monkeypatch.setattr(
+        cli.graph, "invoke", lambda *_args, **_kwargs: _bounded_recursive_result("one")
+    )
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=90,
+        )
+
+    assert exit_info.value.exit_code == 1
+    assert json.loads(output.read_text(encoding="utf-8"))["analysis_completeness"][
+        "coverage_percent"
+    ] == pytest.approx(33.33)
+
+
 def test_recursive_scan_exits_two_after_writing_all_child_reports(tmp_path: Path) -> None:
     """Recursive mode aggregates child execution failures after producing output."""
     s1 = SkillDirectory(path=tmp_path / "one", name="one", relative_path="one")
