@@ -73,6 +73,25 @@ STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS = API_CONNECTION_RETRY_DELAYS_SECONDS
 LLM_BATCH_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_RETRIES
 
 
+def resolve_output_language() -> str | None:
+    """Return the configured language for human-readable LLM finding text."""
+    return os.environ.get("SKILLSPECTOR_OUTPUT_LANGUAGE", "").strip() or None
+
+
+def append_output_language_instruction(prompt: str) -> str:
+    """Append the optional output-language contract to an analyzer prompt."""
+    language = resolve_output_language()
+    if language is None:
+        return prompt
+    return (
+        f"{prompt}\n\n## Output language\n\n"
+        "Write human-readable finding text (including message, finding, explanation, "
+        f"remediation, and intent fields when present) in {language}. Keep rule IDs, "
+        "severity values, categories, file paths, code, and other machine-readable values "
+        "unchanged."
+    )
+
+
 class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
 
@@ -623,10 +642,12 @@ class LLMAnalyzerBase:
         Override in subclasses that need a custom prompt layout.
         """
         numbered = number_lines(batch.content, batch.start_line)
-        return BASE_ANALYSIS_PROMPT.format(
-            analyzer_prompt=self.base_prompt,
-            file_label=batch.file_label,
-            numbered_content=numbered,
+        return append_output_language_instruction(
+            BASE_ANALYSIS_PROMPT.format(
+                analyzer_prompt=self.base_prompt,
+                file_label=batch.file_label,
+                numbered_content=numbered,
+            )
         )
 
     def parse_response(self, response: object, batch: Batch) -> list[Finding]:

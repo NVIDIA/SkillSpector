@@ -919,6 +919,16 @@ class TestTP4DescriptionBehaviorMismatch:
 
 
 class TestTP4Fallbacks:
+    def test_configured_output_language_is_included(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "German")
+        _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        analyzer = mcp_tool_poisoning._TP4Analyzer(model="test-model")
+        prompt = analyzer.build_prompt(
+            mcp_tool_poisoning.Batch(file_path="script.py", content="Analyze this code")
+        )
+        assert "in German" in prompt
+        assert "Keep rule IDs" in prompt
+
     def test_skipped_no_llm(self):
         state = _make_state("mcp_mismatched_skill", use_llm=False)
         result = node(state)
