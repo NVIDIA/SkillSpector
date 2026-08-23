@@ -273,7 +273,8 @@ def test_cli_min_coverage_rejects_invalid_values(tmp_path: Path, value: str) -> 
     (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
     result = runner.invoke(app, ["scan", str(tmp_path), "--min-coverage", value])
     assert result.exit_code == 2
-    assert "--min-coverage" in result.output
+    plain_output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    assert "--min-coverage" in plain_output
 
 
 def test_cli_mcp_registry_rejects_min_coverage(tmp_path: Path) -> None:
