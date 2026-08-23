@@ -926,6 +926,7 @@ class _TP4Candidate:
     content: str
     start_line: int = 1
     end_line: int = 1
+    source_path: str | None = None
 
 
 _TP4_MARKDOWN_TYPES = frozenset({"markdown", "text"})
@@ -1243,7 +1244,14 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             if len(fences) == 1:
                 language, body, start_line, end_line = fences[0]
                 candidates.append(
-                    _TP4Candidate(f"{path}#fence-1", language, body, start_line, end_line)
+                    _TP4Candidate(
+                        f"{path}#fence-1",
+                        language,
+                        body,
+                        start_line,
+                        end_line,
+                        source_path=path,
+                    )
                 )
                 continue
             parts = [
@@ -1257,6 +1265,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     "\n\n".join(parts),
                     min(fence[2] for fence in fences),
                     max(fence[3] for fence in fences),
+                    source_path=path,
                 )
             )
 
@@ -1306,7 +1315,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         total_prompt_bytes = 0
         stop_planning = False
         for path_index, candidate in enumerate(candidates):
-            path = candidate.path
+            display_path = candidate.path
+            path = candidate.source_path or display_path
             dynamic_remaining = transitive_remaining_seconds(state)
             if dynamic_remaining is not None and dynamic_remaining <= 0:
                 add_partial_once(
@@ -1420,7 +1430,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     break
                 prompt = (
                     prefix
-                    + f"### {path} ({candidate.language})\n{chunk.content}"
+                    + f"### {display_path} ({candidate.language})\n{chunk.content}"
                     + _TP4_PROMPT_SUFFIX
                 )
                 if estimate_tokens(prompt) > batch_input_tokens:

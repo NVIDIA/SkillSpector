@@ -996,10 +996,15 @@ class TestTP4MarkdownFences:
             monkeypatch, [{"is_mismatch": False}, {"is_mismatch": False}]
         )
 
-        node(state)
+        result = node(state)
 
         assert "### tool.py (python)" in structured.prompts[0]
         assert "### guide.md#fence-1 (python)" in structured.prompts[1]
+        assert all(
+            event["path"] == "guide.md"
+            for event in result["inspection_ledger"]
+            if event["phase"] == "semantic" and event["path"].startswith("guide.md")
+        )
 
     def test_many_fences_in_one_file_use_one_bounded_candidate(
         self, monkeypatch: pytest.MonkeyPatch
