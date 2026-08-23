@@ -2258,6 +2258,8 @@ def _scan_multi_skill(
         omitted_skills=omitted_skill_count,
         limitations=aggregate_limitations,
     )
+    if _coverage_below_threshold({"analysis_completeness": aggregate_completeness}, min_coverage):
+        coverage_failed = True
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
 
     console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")

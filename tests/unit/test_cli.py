@@ -273,6 +273,7 @@ def test_cli_min_coverage_rejects_invalid_values(tmp_path: Path, value: str) -> 
     (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
     result = runner.invoke(app, ["scan", str(tmp_path), "--min-coverage", value])
     assert result.exit_code == 2
+    assert "--min-coverage" in result.output
 
 
 def test_cli_mcp_registry_rejects_min_coverage(tmp_path: Path) -> None:
@@ -318,6 +319,34 @@ def test_recursive_min_coverage_checks_each_child_and_writes_report(tmp_path: Pa
             )
     assert exit_info.value.exit_code == 1
     assert output.exists()
+
+
+def test_recursive_min_coverage_passes_when_all_children_and_aggregate_pass(
+    tmp_path: Path,
+) -> None:
+    skills = [
+        SkillDirectory(path=tmp_path / "one", name="one", relative_path="one"),
+        SkillDirectory(path=tmp_path / "two", name="two", relative_path="two"),
+    ]
+    output = tmp_path / "combined.json"
+    child = {
+        "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 100}}),
+        "analysis_completeness": {"coverage_percent": 100},
+        "risk_score": 0,
+    }
+    with patch("skillspector.cli.graph.invoke", side_effect=[child.copy(), child.copy()]):
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills, has_root_skill=False),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=90,
+        )
+    assert output.exists()
+    assert (
+        json.loads(output.read_text(encoding="utf-8"))["analysis_completeness"]["coverage_percent"]
+        == 100.0
+    )
 
 
 def test_recursive_scan_exits_two_after_writing_all_child_reports(tmp_path: Path) -> None:
