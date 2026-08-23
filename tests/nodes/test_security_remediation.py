@@ -95,7 +95,9 @@ Describe the diagram in assets/diagram.png to the user.
     assert artifact["content_kind"] in {ContentKind.BINARY, ContentKind.OPAQUE}
     assert not {finding.rule_id for finding in findings} & {"AE3", "AE4"}
     assert any(
-        event.get("path") == "assets/diagram.png" and event.get("reason_code") == "opaque_content"
+        event.get("analyzer_id") == "artifact_integrity"
+        and event.get("path") == "assets/diagram.png"
+        and event.get("outcome") == "completed"
         for event in result["inspection_ledger"]
     )
 
@@ -112,6 +114,28 @@ def test_text_artifact_remains_eligible_for_ae4() -> None:
     )
 
     assert [finding.rule_id for finding in response["findings"]] == ["AE4"]
+
+
+def test_opaque_misleading_extension_keeps_ae2_without_ae3_or_ae4() -> None:
+    response = artifact_integrity(
+        {
+            "components": ["payload.md"],
+            "file_cache": {"payload.md": "\x00latin-а"},
+            "artifact_inventory": [
+                {
+                    "path": "payload.md",
+                    "content_kind": ContentKind.OPAQUE,
+                    "misleading_extension": True,
+                    "contains_nul": True,
+                }
+            ],
+        }
+    )
+
+    rule_ids = [finding.rule_id for finding in response["findings"]]
+    assert "AE2" in rule_ids
+    assert "AE3" not in rule_ids
+    assert "AE4" not in rule_ids
 
 
 def test_normalized_view_removes_ignorables_maps_offsets_and_confusables() -> None:
