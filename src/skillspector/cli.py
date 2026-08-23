@@ -22,6 +22,7 @@ No business logic; workflow lives in the graph.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from copy import deepcopy
@@ -332,6 +333,28 @@ def _write_result(
             print(report_body)
 
 
+def _validate_min_coverage(value: float | None) -> float | None:
+    """Accept only finite percentage thresholds in the CLI's supported range."""
+    if value is not None and (not math.isfinite(value) or not 0 <= value <= 100):
+        raise typer.BadParameter("must be a finite number between 0 and 100")
+    return value
+
+
+def _coverage_below_threshold(result: dict[str, object], threshold: float | None) -> bool:
+    """Fail closed when an enabled threshold has no numeric canonical coverage."""
+    if threshold is None:
+        return False
+    completeness = result.get("analysis_completeness")
+    if not isinstance(completeness, dict):
+        return True
+    coverage = completeness.get("coverage_percent")
+    if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
+        return True
+    if not math.isfinite(float(coverage)):
+        return True
+    return float(coverage) < threshold
+
+
 def _recursive_json_payload(result: dict[str, object]) -> dict[str, object] | None:
     """Return parsed report_body when it is valid JSON object text."""
     raw_report_body = result.get("report_body")
@@ -494,6 +517,14 @@ def scan(
             help="Exit 1 when relevant analysis is partial or incomplete.",
         ),
     ] = False,
+    min_coverage: Annotated[
+        float | None,
+        typer.Option(
+            "--min-coverage",
+            help="Exit 1 when canonical analysis coverage is below this percentage (0-100).",
+            callback=_validate_min_coverage,
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -541,10 +572,17 @@ def scan(
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
     """
     if mcp_registry:
-        if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
+        if (
+            recursive
+            or baseline is not None
+            or show_suppressed
+            or yara_rules_dir is not None
+            or min_coverage is not None
+        ):
             err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
-                "--recursive, --baseline, --show-suppressed, or --yara-rules-dir"
+                "--recursive, --baseline, --show-suppressed, --yara-rules-dir, "
+                "or --min-coverage"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:
@@ -617,6 +655,7 @@ def scan(
                 yara_dir=yara_dir,
                 verbose=verbose,
                 fail_on_incomplete=fail_on_incomplete,
+                min_coverage=min_coverage,
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
@@ -690,6 +729,8 @@ def scan(
             else True
         )
         if fail_on_incomplete and not is_complete:
+            raise typer.Exit(code=1)
+        if _coverage_below_threshold(result, min_coverage):
             raise typer.Exit(code=1)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
@@ -2064,6 +2105,7 @@ def _scan_multi_skill(
     yara_dir: str | None = None,
     verbose: bool = False,
     fail_on_incomplete: bool = False,
+    min_coverage: float | None = None,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
@@ -2095,6 +2137,7 @@ def _scan_multi_skill(
     complete_skill_count = 0
     partial_skill_count = 0
     failed_skill_count = 0
+    coverage_failed = False
 
     for i, skill in enumerate(skills, 1):
         if i > _MULTI_SKILL_MAX_SKILLS:
@@ -2170,6 +2213,8 @@ def _scan_multi_skill(
             if child_failed:
                 execution_failed = True
                 failed_skill_count += 1
+            elif _coverage_below_threshold(result, min_coverage):
+                coverage_failed = True
             completeness_value = result.get("analysis_completeness")
             if (
                 not child_failed
@@ -2380,6 +2425,8 @@ def _scan_multi_skill(
     if execution_failed:
         raise typer.Exit(code=2)
     if fail_on_incomplete and analysis_incomplete:
+        raise typer.Exit(code=1)
+    if coverage_failed:
         raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
