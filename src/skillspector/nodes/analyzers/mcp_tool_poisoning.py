@@ -929,6 +929,24 @@ class _TP4Candidate:
 
 
 _TP4_MARKDOWN_TYPES = frozenset({"markdown", "text"})
+_TP4_MARKDOWN_EXECUTABLE_LABELS = {
+    "python": "python",
+    "py": "python",
+    "javascript": "javascript",
+    "js": "javascript",
+    "typescript": "typescript",
+    "ts": "typescript",
+    "shell": "shell",
+    "bash": "shell",
+    "sh": "shell",
+    "zsh": "shell",
+    "ruby": "ruby",
+    "rb": "ruby",
+    "go": "go",
+    "golang": "go",
+    "rust": "rust",
+    "rs": "rust",
+}
 _TP4_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*([^ \t]+)?[ \t]*$")
 _TP4_FENCE_CLOSE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
 
@@ -959,8 +977,9 @@ def _extract_tp4_markdown_fences(
         if closing is not None:
             delimiter, minimum_length, _label = active
             if closing.group(1)[0] == delimiter and len(closing.group(1)) >= minimum_length:
-                if active[2] in _TP4_EXECUTABLE_TYPES:
-                    accepted.append((active[2], "".join(body), body_start, line_number - 1))
+                language = _TP4_MARKDOWN_EXECUTABLE_LABELS.get(active[2])
+                if language is not None:
+                    accepted.append((language, "".join(body), body_start, line_number - 1))
                 active = None
                 body = []
                 continue
@@ -1192,41 +1211,54 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             and bool(content)
             and not content.isspace()
         ]
+        markdown_type_by_path = {
+            str(metadata.get("path")): str(metadata.get("type"))
+            for metadata in component_metadata
+            if isinstance(metadata, dict) and metadata.get("type") in _TP4_MARKDOWN_TYPES
+        }
         candidates = [
-            _TP4Candidate(path, executable_type_by_path[path], file_cache[path])
+            _TP4Candidate(
+                path,
+                executable_type_by_path[path],
+                file_cache[path],
+                1,
+                max(1, file_cache[path].count("\n") + 1),
+            )
             for path in executable_paths
         ]
+        markdown_truncated_paths: list[str] = []
         for path, content in file_cache.items():
-            metadata = next(
-                (
-                    item
-                    for item in component_metadata
-                    if isinstance(item, dict) and str(item.get("path")) == path
-                ),
-                None,
-            )
             if (
-                not isinstance(metadata, dict)
-                or metadata.get("type") not in _TP4_MARKDOWN_TYPES
+                markdown_type_by_path.get(path) is None
                 or not isinstance(content, str)
                 or not content.strip()
             ):
                 continue
-            for fence_index, (language, body, start_line, end_line) in enumerate(
-                _extract_tp4_markdown_fences(content), start=1
-            ):
-                if body.strip():
-                    candidates.append(
-                        _TP4Candidate(
-                            f"{path}#fence-{fence_index}",
-                            language,
-                            body,
-                            start_line,
-                            end_line,
-                        )
-                    )
-        if not candidates:
-            return result
+            _, _, overflow = _bounded_utf8_prefix(content, TP4_MAX_MARKDOWN_BYTES)
+            if overflow:
+                markdown_truncated_paths.append(path)
+            fences = [fence for fence in _extract_tp4_markdown_fences(content) if fence[1].strip()]
+            if not fences:
+                continue
+            if len(fences) == 1:
+                language, body, start_line, end_line = fences[0]
+                candidates.append(
+                    _TP4Candidate(f"{path}#fence-1", language, body, start_line, end_line)
+                )
+                continue
+            parts = [
+                f"### {path}#fence-{index} ({language})\n{body}"
+                for index, (language, body, _start_line, _end_line) in enumerate(fences, start=1)
+            ]
+            candidates.append(
+                _TP4Candidate(
+                    f"{path}#fence-1",
+                    "markdown-fenced-code",
+                    "\n\n".join(parts),
+                    min(fence[2] for fence in fences),
+                    max(fence[3] for fence in fences),
+                )
+            )
 
         partial_paths: set[str] = set()
 
@@ -1235,6 +1267,19 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             if path not in partial_paths:
                 result.ledger.append(event)
                 partial_paths.add(path)
+
+        for path in markdown_truncated_paths:
+            add_partial_once(
+                _tp4_partial_event(
+                    path,
+                    LedgerReason.SIZE_LIMIT,
+                    observed_bytes=TP4_MAX_MARKDOWN_BYTES + 1,
+                    limit_bytes=TP4_MAX_MARKDOWN_BYTES,
+                )
+            )
+
+        if not candidates:
+            return result
 
         if declaration_truncated:
             add_partial_once(
@@ -1337,7 +1382,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
 
             for chunk in _tp4_line_chunks(retained, code_token_budget):
                 chunk_start_line = candidate.start_line + chunk.start_line - 1
-                chunk_end_line = candidate.start_line + chunk.end_line - 1
+                chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
                 dynamic_remaining = transitive_remaining_seconds(state)
                 if dynamic_remaining is not None and dynamic_remaining <= 0:
                     add_partial_once(

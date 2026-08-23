@@ -953,6 +953,15 @@ class TestTP4MarkdownFences:
 
         assert fences == [("python", "print('accepted')\n", 11, 11)]
 
+    def test_common_markdown_executable_labels_are_normalized(self):
+        content = (
+            "```bash\necho accepted\n```\n"
+            "```py\nprint('accepted')\n```\n"
+            "```js\nconsole.log('accepted')\n```\n"
+        )
+        fences = mcp_tool_poisoning._extract_tp4_markdown_fences(content)
+        assert [fence[0] for fence in fences] == ["shell", "python", "javascript"]
+
     def test_markdown_boundary_is_32768_bytes(self):
         opening = "```python\n"
         closing = "\n```\n"
@@ -991,6 +1000,40 @@ class TestTP4MarkdownFences:
 
         assert "### tool.py (python)" in structured.prompts[0]
         assert "### guide.md#fence-1 (python)" in structured.prompts[1]
+
+    def test_many_fences_in_one_file_use_one_bounded_candidate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        body = "\n".join("```python\nprint('example')\n```" for _ in range(70))
+        state = {
+            "manifest": {"name": "bounded", "description": "Documentation only."},
+            "file_cache": {"guide.md": body},
+            "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+
+        node(state)
+
+        assert structured.calls == 1
+        assert "### guide.md#fence-70 (python)" in structured.prompts[0]
+
+    def test_markdown_overflow_is_recorded_as_partial(self):
+        content = ("padding\n" * 5000) + "```python\nprint('late')\n```\n"
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+            }
+        )
+        assert any(
+            event.get("path") == "guide.md"
+            and event.get("outcome") == LedgerOutcome.PARTIAL
+            and event.get("reason_code") == LedgerReason.SIZE_LIMIT
+            for event in result.ledger
+        )
 
     def test_no_applicable_markdown_keeps_clean_status(self, monkeypatch: pytest.MonkeyPatch):
         structured = _mock_tp4_structured_llm(monkeypatch, [])
