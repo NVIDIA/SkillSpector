@@ -9,6 +9,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 
+from skillspector.artifacts import ContentKind
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -269,28 +270,32 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                             confidence=1.0,
                         )
                     )
-                format_density, mixed_script, first_nul_line = _text_signals(content, budget)
-                if artifact.get("contains_nul") and first_nul_line is not None:
-                    budget.emit(
-                        _finding(
-                            "AE3",
-                            "Text artifact contains embedded NUL bytes",
-                            path,
-                            severity="HIGH",
-                            confidence=0.9,
-                            line=first_nul_line,
+                if artifact.get("content_kind") not in {
+                    ContentKind.BINARY,
+                    ContentKind.OPAQUE,
+                }:
+                    format_density, mixed_script, first_nul_line = _text_signals(content, budget)
+                    if artifact.get("contains_nul") and first_nul_line is not None:
+                        budget.emit(
+                            _finding(
+                                "AE3",
+                                "Text artifact contains embedded NUL bytes",
+                                path,
+                                severity="HIGH",
+                                confidence=0.9,
+                                line=first_nul_line,
+                            )
                         )
-                    )
-                if format_density >= 0.01 or mixed_script:
-                    budget.emit(
-                        _finding(
-                            "AE4",
-                            "Suspicious Unicode normalization or mixed-script content",
-                            path,
-                            severity="MEDIUM",
-                            confidence=0.8,
+                    if format_density >= 0.01 or mixed_script:
+                        budget.emit(
+                            _finding(
+                                "AE4",
+                                "Suspicious Unicode normalization or mixed-script content",
+                                path,
+                                severity="MEDIUM",
+                                confidence=0.8,
+                            )
                         )
-                    )
         except _ArtifactIntegrityResourceLimitError as exc:
             resource_limit = exc
 
