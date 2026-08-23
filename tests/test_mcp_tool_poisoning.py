@@ -197,10 +197,12 @@ class _FakeStructuredLLM:
     def __init__(self, responses: list[object]) -> None:
         self.responses = list(responses)
         self.calls = 0
+        self.prompts: list[str] = []
         self.response_schema: type[BaseModel] | None = None
 
-    def invoke_with_usage(self, _prompt: str, collector: object) -> object:
+    def invoke_with_usage(self, prompt: str, collector: object) -> object:
         self.calls += 1
+        self.prompts.append(prompt)
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
@@ -916,6 +918,95 @@ class TestTP4DescriptionBehaviorMismatch:
         result = node(state)
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) == 0
+
+
+class TestTP4MarkdownFences:
+    def test_markdown_only_fenced_python_reaches_tp4(self, monkeypatch: pytest.MonkeyPatch):
+        structured = _mock_tp4_structured_llm(
+            monkeypatch,
+            [
+                {
+                    "is_mismatch": True,
+                    "confidence": 0.9,
+                    "mismatched_capabilities": ["network access"],
+                }
+            ],
+        )
+
+        result = node(_make_state("tp4_markdown_fenced_code", use_llm=True))
+
+        assert structured.calls == 1
+        assert "### SKILL.md#fence-1 (python)" in structured.prompts[0]
+        assert [finding.rule_id for finding in result["findings"]].count("TP4") == 1
+        assert result["llm_call_log"][0]["ok"] is True
+
+    def test_fences_are_bounded_and_reject_false_positives(self):
+        content = (
+            "```\nprint('unlabeled')\n```\n"
+            "```html\n<script>output</script>\n```\n"
+            '```json\n{"data": true}\n```\n'
+            "~~~python\nprint('accepted')\n~~~\n"
+            "```python\nprint('unterminated')\n"
+        )
+
+        fences = mcp_tool_poisoning._extract_tp4_markdown_fences(content)
+
+        assert fences == [("python", "print('accepted')\n", 11, 11)]
+
+    def test_markdown_boundary_is_32768_bytes(self):
+        opening = "```python\n"
+        closing = "\n```\n"
+        exact = opening + ("x" * (32768 - len(opening) - len(closing))) + closing
+        over = opening + ("x" * 32768) + closing
+
+        fences = mcp_tool_poisoning._extract_tp4_markdown_fences(exact)
+        over_fences = mcp_tool_poisoning._extract_tp4_markdown_fences(over)
+
+        assert len(fences) == 1
+        assert len(fences[0][1].encode("utf-8")) == (32768 - len(opening) - len(closing) + 1)
+        assert over_fences == []
+        assert mcp_tool_poisoning.TP4_MAX_MARKDOWN_BYTES == 32768
+
+    def test_executable_candidates_precede_markdown_candidates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        state = {
+            "manifest": {"name": "bounded", "description": "Does local work."},
+            "file_cache": {
+                "tool.py": "print('local')\n",
+                "guide.md": "```python\nprint('documented')\n```\n",
+            },
+            "component_metadata": [
+                {"path": "tool.py", "type": "python"},
+                {"path": "guide.md", "type": "markdown"},
+            ],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+        structured = _mock_tp4_structured_llm(
+            monkeypatch, [{"is_mismatch": False}, {"is_mismatch": False}]
+        )
+
+        node(state)
+
+        assert "### tool.py (python)" in structured.prompts[0]
+        assert "### guide.md#fence-1 (python)" in structured.prompts[1]
+
+    def test_no_applicable_markdown_keeps_clean_status(self, monkeypatch: pytest.MonkeyPatch):
+        structured = _mock_tp4_structured_llm(monkeypatch, [])
+        result = node(
+            {
+                "manifest": {"name": "clean", "description": "Only documentation."},
+                "file_cache": {"guide.md": "```text\njust prose\n```\n"},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "use_llm": True,
+            }
+        )
+
+        assert structured.calls == 0
+        assert result["findings"] == []
+        assert result["analyzer_status_events"][0]["status"] == "completed"
+        assert result["analyzer_status_events"][0]["planned_work"]
 
 
 class TestTP4Fallbacks:
