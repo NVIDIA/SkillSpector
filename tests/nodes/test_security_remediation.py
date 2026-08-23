@@ -80,7 +80,7 @@ Describe the diagram in assets/diagram.png to the user.
         encoding="utf-8",
     )
     png = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAHElEQVQoz2NgGAWjYBSMglEwCkbBKBgFo2AUAAAHkgABfXRPtQAAAABJRU5ErkJggg=="
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
     )
     assets = tmp_path / "assets"
     assets.mkdir()
@@ -95,9 +95,17 @@ Describe the diagram in assets/diagram.png to the user.
     assert artifact["content_kind"] in {ContentKind.BINARY, ContentKind.OPAQUE}
     assert not {finding.rule_id for finding in findings} & {"AE3", "AE4"}
     assert any(
+        finding.rule_id == "AE1" and finding.file == "SKILL.md" for finding in result["findings"]
+    )
+    assert any(
         event.get("analyzer_id") == "artifact_integrity"
         and event.get("path") == "assets/diagram.png"
         and event.get("outcome") == "completed"
+        for event in result["inspection_ledger"]
+    )
+    assert any(
+        event.get("path") == "assets/diagram.png"
+        and event.get("reason_code") == LedgerReason.OPAQUE_CONTENT
         for event in result["inspection_ledger"]
     )
 
