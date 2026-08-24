@@ -66,9 +66,11 @@ _MANIFEST_COMPONENT_FIELDS: Final = frozenset(
         "experimental",
     }
 )
+# Settings-file hooks can load in never-trusted headless sessions. These labels
+# describe session scope rather than implying that permission grants were trusted.
 _PROJECT_SETTINGS: Final = {
-    ".claude/settings.json": ("project_settings", "project_trusted"),
-    ".claude/settings.local.json": ("project_local_settings", "project_trusted_local"),
+    ".claude/settings.json": ("project_settings", "project_session"),
+    ".claude/settings.local.json": ("project_local_settings", "project_local_session"),
 }
 _FRONTMATTER_DELIMITER: Final = re.compile(r"^(?:---|\.\.\.)[ \t]*$")
 _MAX_YAML_COLLECTION_DEPTH: Final = 64

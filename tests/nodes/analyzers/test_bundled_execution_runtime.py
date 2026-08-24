@@ -656,7 +656,7 @@ def test_user_config_shell_rejection_is_specific_to_plugin_sources() -> None:
         "PostToolUse",
         handler=_handler(command="echo ${user_config.endpoint}"),
         source_kind="project_settings",
-        activation_lifetime="project_trusted",
+        activation_lifetime="project_session",
     )
     plugin_option_registration = _normalize(
         "PostToolUse",

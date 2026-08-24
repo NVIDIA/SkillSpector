@@ -20,11 +20,15 @@ Plugin-root settings currently support only `agent` and `subagentStatusLine`; un
 ignored. Project `.claude/settings.json` is a separate runtime surface and its hook declarations are
 in scope, but its permission policy is not.
 
-The design also corrects two assumptions in issue #399:
+The design also corrects assumptions in issue #399:
 
-- Installation or workspace trust is the relevant user trust action. Once a hook is enabled, it
-  fires automatically without a separate approval for each event; the design does not claim that a
-  user is never prompted at all.
+- Plugin enablement or the interactive workspace-trust flow is normally the relevant user action.
+  Non-interactive `claude -p` and Agent SDK sessions with project settings enabled are an explicit
+  exception: they can load project hooks from a folder that has never been trusted. Once loaded, a
+  hook fires automatically without a separate approval for each event; the design does not claim
+  that a user is never prompted at all.
+- Headless loading of project hooks does not mean the folder is trusted. In a never-trusted folder,
+  shared-project `permissions.allow` and `permissions.additionalDirectories` grants remain inactive.
 - A command hook with `args` uses direct exec semantics. Its arguments are literal argv elements and
   must not be concatenated with `command` and reinterpreted as shell source.
 
@@ -84,8 +88,8 @@ The analyzer recognizes only root-aware runtime locations:
 | Plugin manifest inline | `.claude-plugin/plugin.json` whose `hooks` field is an event-map object | While plugin is enabled | Parse direct event map; accept a wrapped compatibility shape only when structurally unambiguous |
 | Plugin manifest reference | Manifest `hooks` string or mixed array of `./` paths and inline objects | While plugin is enabled | Resolve each path inside the same plugin root/cache namespace and deduplicate repeated targets |
 | Marketplace plugin definition | `.claude-plugin/marketplace.json` entry whose effective plugin definition declares inline or referenced `hooks` | While that marketplace plugin is enabled | Apply documented `strict` merge/replacement semantics and retain each plugin root |
-| Project settings | Root `.claude/settings.json` with a `hooks` object | Interactive after workspace trust; `-p`/SDK treats the folder as trusted | Classify as `project_settings`, never as plugin-installed settings |
-| Local project settings | Root `.claude/settings.local.json` with a `hooks` object | Same project, local scope | Scan if the artifact contains it; retain local-scope evidence |
+| Project settings | Root `.claude/settings.json` with a `hooks` object | Interactive through workspace trust; `-p`/SDK with project settings enabled also loads hooks from a never-trusted folder without granting trust | Classify as `project_settings` with `project_session` lifetime, never as plugin-installed settings |
+| Local project settings | Root `.claude/settings.local.json` with a `hooks` object | Same project, local scope; settings-file hooks follow the same headless loading exception | Scan if the artifact contains it; retain `project_local_session` evidence |
 | Skill frontmatter | Root/project/plugin skills, including manifest-declared custom skill directories, whose `SKILL.md` YAML frontmatter has `hooks` | From invocation through the rest of the session, or once when configured | Parse the hook map and record invocation-gated lifetime; lowercase `skill.md` is parser compatibility only and is labeled runtime-unconfirmed |
 | Command frontmatter | Project or plugin command Markdown, including manifest-declared custom command directories, whose YAML frontmatter has `hooks` | From command invocation through the rest of the session | Parse the same hook schema as skill frontmatter and record invocation-gated lifetime |
 | Project agent frontmatter | Root `.claude/agents/*.md` whose YAML frontmatter has `hooks` | While the project subagent runs | Parse as project-runtime hooks; plugin-shipped agent hooks remain rejected/out of scope |
@@ -127,9 +131,16 @@ concise while retaining per-handler identity for BH2.
 
 ### Trust, enablement, and external policy
 
-Findings describe the capability of the scanned artifact after the ordinary trust/enable action for
-that source. They record whether a plugin defaults disabled, a skill requires invocation, or project
-hooks require workspace trust. They do not claim that those conditions have already occurred.
+Findings describe the capability of the scanned artifact when the runtime loads that declaration
+source. They record whether a plugin defaults disabled or a skill requires invocation. Project
+settings hooks use trust-neutral `project_session` and `project_local_session` activation evidence:
+an interactive session follows workspace trust, but `claude -p` and Agent SDK sessions with project
+settings enabled load settings-file hooks even when the folder has never been trusted. This headless
+exception is not equivalent to trust and does not activate shared-project `permissions.allow` or
+`permissions.additionalDirectories` entries. The distinction follows Claude Code's
+[pre-trust behavior matrix](https://code.claude.com/docs/en/permissions#what-runs-before-you-trust-a-folder).
+Findings do not claim that any interactive trust, plugin enablement, or invocation condition has
+already occurred.
 
 User/managed settings, CLI overrides, `allowedHttpHookUrls`, `httpHookAllowedEnvVars`, and
 `disableAllHooks` can change effective runtime behavior outside the artifact. Those external controls
@@ -573,7 +584,9 @@ The deepest practical verification uses disposable fixtures and local-only captu
    `args` metacharacters remain literal.
 4. Capture an HTTP hook body at a loopback test server and compare its fields with the event-data
    table. No external endpoint or real secret is used.
-5. Exercise project-settings trust behavior in interactive and `-p` modes where automation permits.
+5. Exercise project-settings behavior in interactive and `-p` modes where automation permits,
+   proving separately that never-trusted headless sessions load hooks while shared-project allow
+   rules and additional directories remain inactive.
 6. Record exact CLI versions. Run the local 2.1.227 CLI and, if a safely isolated pinned 2.1.238
    runner is practical, repeat the version-sensitive cases there.
 

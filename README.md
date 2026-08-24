@@ -56,10 +56,14 @@ Supported declaration sources are:
 
 Classification is pinned to the documented Claude Code **2.1.238 semantics snapshot**. The snapshot
 is a static parsing and classification contract, not a claim that every installed Claude Code
-version executes every accepted shape. Actual activation still depends on plugin enablement, skill or
-command invocation, subagent execution, or workspace trust. User/managed settings and external
-runtime controls can change effective behavior outside the scanned artifact and are not treated as
-mitigations for bundled code.
+version executes every accepted shape. Actual activation still depends on the declaration source and
+session mode. Interactive project sessions use the workspace-trust flow, while non-interactive
+`claude -p` and Agent SDK sessions with project settings enabled can load project hooks from a folder
+that has never been trusted. That headless hook loading does not activate the shared project's
+`permissions.allow` or `permissions.additionalDirectories` grants. See Claude Code's
+[pre-trust behavior matrix](https://code.claude.com/docs/en/permissions#what-runs-before-you-trust-a-folder).
+User/managed settings and external runtime controls can change effective behavior outside the
+scanned artifact and are not treated as mitigations for bundled code.
 
 Analysis fails closed when an applicable hook document or runnable/reachable payload cannot be
 inspected—for example, because it is malformed, missing, oversized, binary, unresolved, outside

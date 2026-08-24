@@ -461,6 +461,8 @@ def _curl_operand_taints(
         marker = re.search(r"(?:^|=)[@<]([^;]+)", value)
         if marker is not None:
             file_value = marker.group(1)
+    elif option in {"-H", "--header", "--proxy-header"} and value.startswith("@"):
+        file_value = value[1:]
     if file_value and file_value != "-" and _sensitive_path(file_value, expand_shell=expand_shell):
         taints.append("sensitive_local_file")
     taints.extend(
@@ -614,6 +616,7 @@ _CURL_VALUE_OPTIONS: Final[frozenset[str]] = frozenset(
         "--max-filesize",
         "--max-redirs",
         "--max-time",
+        "--noproxy",
         "--oauth2-bearer",
         "--output",
         "--pass",
@@ -657,6 +660,7 @@ _CURL_SOURCE_OPTIONS: Final[frozenset[str]] = frozenset(
         "-T",
         "-H",
         "--header",
+        "--proxy-header",
         "-b",
         "--cookie",
         "--json",
@@ -892,6 +896,56 @@ def _assignment_taint(
     return (name, taint) if taint is not None else (name, "")
 
 
+def _curl_explicit_http_proxy_destination(
+    words: tuple[str, ...],
+) -> tuple[bool, bool, DestinationClass | None]:
+    """Return explicit-proxy presence, HTTP activity, and destination."""
+    configured = False
+    active_http_proxy = False
+    destination: DestinationClass | None = None
+    bypass_all = False
+    socks_options = {"--socks4", "--socks4a", "--socks5", "--socks5-hostname"}
+    index = 1
+    while index < len(words):
+        parsed_option = _curl_option_at(words, index)
+        if parsed_option is None:
+            index += 1
+            continue
+        option, value, index = parsed_option
+        if option == "--noproxy":
+            bypass_all = value.strip() == "*"
+            continue
+        if option in socks_options:
+            configured = True
+            active_http_proxy = False
+            destination = None
+            continue
+        if option not in {"-x", "--proxy", "--proxy1.0"}:
+            continue
+        configured = True
+        normalized = value.strip()
+        if not normalized:
+            active_http_proxy = False
+            destination = None
+            continue
+        if "$" in normalized or "%" in normalized:
+            active_http_proxy = True
+            destination = DestinationClass.DYNAMIC_UNKNOWN
+            continue
+        candidate = normalized if "://" in normalized else f"http://{normalized}"
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            active_http_proxy = True
+            destination = DestinationClass.DYNAMIC_UNKNOWN
+            continue
+        active_http_proxy = parsed.scheme.casefold() in {"http", "https"}
+        destination = _destination_for_host(parsed.hostname) if active_http_proxy else None
+    if bypass_all:
+        return True, False, None
+    return configured, active_http_proxy, destination
+
+
 def _curl_hit(
     words: tuple[str, ...],
     *,
@@ -919,7 +973,8 @@ def _curl_hit(
         one_static_origin = (
             bool(origins) and None not in origins and len(set(origins)) == 1 and not route_override
         )
-        sources: list[str] = []
+        origin_sources: list[str] = []
+        proxy_sources: list[str] = []
         index = 1
         while index < len(group):
             parsed_option = _curl_option_at(group, index)
@@ -929,7 +984,10 @@ def _curl_hit(
             option, value, index = parsed_option
             if option not in _CURL_SOURCE_OPTIONS:
                 continue
-            if value in {"-", "@-"} and option not in {"-H", "--header"}:
+            sources = proxy_sources if option == "--proxy-header" else origin_sources
+            if value in {"-", "@-"} and (
+                option not in {"-H", "--header", "--proxy-header"} or value == "@-"
+            ):
                 if stdin_taint is not None:
                     sources.append(stdin_taint)
                 continue
@@ -961,9 +1019,29 @@ def _curl_hit(
                 profile=profile,
                 include_sensitive_path=False,
             ):
-                sources.append(taint)
-            if sources:
-                return _SinkHit(sources[0], TransportKind.HTTP, destination)
+                origin_sources.append(taint)
+            if origin_sources:
+                return _SinkHit(origin_sources[0], TransportKind.HTTP, destination)
+        if proxy_sources:
+            configured, active_http_proxy, proxy_destination = (
+                _curl_explicit_http_proxy_destination(group)
+            )
+            if not configured:
+                return _SinkHit(
+                    proxy_sources[0],
+                    TransportKind.HTTP,
+                    outbound[0][1],
+                )
+            if (
+                active_http_proxy
+                and proxy_destination is not None
+                and proxy_destination is not DestinationClass.LOOPBACK
+            ):
+                return _SinkHit(
+                    proxy_sources[0],
+                    TransportKind.HTTP,
+                    proxy_destination,
+                )
     return None
 
 
@@ -1162,6 +1240,118 @@ def _option_aware_operands(
         else:
             index += 1
     return words[index:]
+
+
+def _ssh_data_bearing_option_values(
+    words: tuple[str, ...],
+    *,
+    value_options: frozenset[str],
+) -> tuple[str, ...]:
+    """Return leading SSH option values that are transmitted to the server."""
+    values: list[str] = []
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "--" or not word.startswith("-") or word == "-":
+            break
+        option, equals, inline_value = word.partition("=")
+        if option == "-l":
+            value = inline_value if equals else (words[index + 1] if index + 1 < len(words) else "")
+            if value:
+                values.append(value)
+            index += 1 if equals else 2
+            continue
+        if word.startswith("-l"):
+            values.append(word[2:])
+            index += 1
+            continue
+        if option == "-o":
+            value = inline_value if equals else (words[index + 1] if index + 1 < len(words) else "")
+            index += 1 if equals else 2
+        elif word.startswith("-o"):
+            value = word[2:].removeprefix("=")
+            index += 1
+        else:
+            if option in value_options:
+                index += 1 if equals else 2
+            elif any(
+                option.startswith(short) and len(option) > len(short)
+                for short in value_options
+                if short.startswith("-") and not short.startswith("--")
+            ):
+                index += 1
+            else:
+                index += 1
+            continue
+        user = re.fullmatch(r"(?i:user)(?:\s+|=)(.+)", value, re.DOTALL)
+        if user is not None:
+            values.append(user.group(1))
+    return tuple(dict.fromkeys(values))
+
+
+def _ssh_proxy_option_values(
+    words: tuple[str, ...],
+    *,
+    value_options: frozenset[str],
+    configuration_name: str,
+    short_option: str | None = None,
+) -> tuple[str, ...]:
+    """Return leading SSH proxy option values for one configuration key."""
+    values: list[str] = []
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "--" or not word.startswith("-") or word == "-":
+            break
+        option, equals, inline_value = word.partition("=")
+        if short_option is not None and option == short_option:
+            value = inline_value if equals else (words[index + 1] if index + 1 < len(words) else "")
+            if value:
+                values.append(value)
+            index += 1 if equals else 2
+            continue
+        if short_option is not None and word.startswith(short_option):
+            value = word[len(short_option) :].removeprefix("=")
+            if value:
+                values.append(value)
+            index += 1
+            continue
+        if option == "-o":
+            value = inline_value if equals else (words[index + 1] if index + 1 < len(words) else "")
+            index += 1 if equals else 2
+        elif word.startswith("-o"):
+            value = word[2:].removeprefix("=")
+            index += 1
+        else:
+            if option in value_options:
+                index += 1 if equals else 2
+            elif any(
+                option.startswith(short) and len(option) > len(short)
+                for short in value_options
+                if short.startswith("-") and not short.startswith("--")
+            ):
+                index += 1
+            else:
+                index += 1
+            continue
+        configured = re.fullmatch(
+            rf"(?i:{re.escape(configuration_name)})(?:\s+|=)(.+)",
+            value,
+            re.DOTALL,
+        )
+        if configured is not None:
+            values.append(configured.group(1))
+    return tuple(values)
+
+
+def _ssh_jump_host(value: str) -> str | None:
+    """Extract one ProxyJump hop's host without attributing its user to the target."""
+    candidate = value.strip().rsplit("@", 1)[-1]
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        return candidate[1:closing] if closing > 1 else None
+    host, separator, _port = candidate.rpartition(":")
+    return host if separator and host else candidate or None
 
 
 def _host_from_endpoint(value: str) -> str | None:
@@ -1497,23 +1687,108 @@ def _command_hit(
         sink_host = operands[0] if operands else None
         if executable == "socat":
             sink_host = _socat_remote_host(words)
+        if executable == "ssh":
+            for proxy_command in _ssh_proxy_option_values(
+                words,
+                value_options=value_options,
+                configuration_name="ProxyCommand",
+            ):
+                if proxy_command.strip().casefold() == "none":
+                    continue
+                proxy_hits = _analyze_shell(
+                    proxy_command,
+                    event_taint=None,
+                    profile=profile,
+                    variables=variables,
+                )
+                if proxy_hits:
+                    return proxy_hits[0]
+
+            jump_words = words
+            if expand_shell:
+                jump_words = _unwrap_shell_command(
+                    _shell_words(_mask_inert_shell_text(raw_segment))
+                )
+            for proxy_jump in _ssh_proxy_option_values(
+                jump_words,
+                value_options=value_options,
+                configuration_name="ProxyJump",
+                short_option="-J",
+            ):
+                for jump_hop in proxy_jump.split(","):
+                    jump_source = _value_taint(
+                        jump_hop,
+                        expand_shell=expand_shell,
+                        variables=variables,
+                        profile=profile,
+                        include_sensitive_path=False,
+                    )
+                    if jump_source is not None:
+                        jump_destination = _destination_for_host(_ssh_jump_host(jump_hop))
+                        if jump_destination is DestinationClass.LOOPBACK:
+                            continue
+                        return _SinkHit(
+                            jump_source,
+                            TransportKind.SSH,
+                            jump_destination,
+                        )
         source = stdin_taint
         if source is None and executable == "ssh":
+            source_words = words
+            if expand_shell:
+                source_words = _unwrap_shell_command(
+                    _shell_words(_mask_inert_shell_text(raw_segment))
+                )
+            source_values = (
+                *_option_aware_operands(source_words, value_options=value_options),
+                *_ssh_data_bearing_option_values(
+                    source_words,
+                    value_options=value_options,
+                ),
+            )
             source = next(
                 (
                     taint
-                    for value in operands[1:]
+                    for value in source_values
                     if (
                         taint := _value_taint(
                             value,
                             expand_shell=expand_shell,
                             variables=variables,
                             profile=profile,
+                            include_sensitive_path=False,
                         )
                     )
                 ),
                 None,
             )
+            if expand_shell:
+                if source is None:
+                    for substitution in re.finditer(
+                        r"\$\(([^()]*)\)", " ".join(source_values), re.DOTALL
+                    ):
+                        substitution_words = _unwrap_shell_command(
+                            _shell_words(substitution.group(1))
+                        )
+                        if (
+                            not substitution_words
+                            or _normalized_executable(substitution_words[0]) != "cat"
+                        ):
+                            continue
+                        _redirected, substitution_stdin_taint = _shell_stdin_redirection_taint(
+                            substitution_words,
+                            variables=variables,
+                            profile=profile,
+                        )
+                        source = _cat_output_taint(
+                            substitution_words,
+                            stdin_taint=substitution_stdin_taint,
+                            expand_shell=True,
+                            variables=variables,
+                            profile=profile,
+                        )
+                        if source is not None:
+                            break
         if source is None:
             return None
         return _SinkHit(
@@ -2795,6 +3070,689 @@ def _javascript_first_argument(arguments: str) -> str:
     return arguments.strip()
 
 
+_JAVASCRIPT_HTTP_METHOD_CALL: Final[str] = (
+    r"(?<![\w$.])(?:(?P<fetch>(?:(?:globalThis|global)\s*\.\s*)?fetch)|"
+    r"(?P<client>[A-Za-z_$][\w$]*)\s*(?:\?\.\s*|\.\s*)"
+    r"(?P<method>get|patch|post|put|delete|head|options|request|patchForm|postForm|putForm))"
+    r"\s*(?:\?\.\s*)?\("
+)
+_JAVASCRIPT_CALLABLE_CALL: Final[str] = r"(?<![\w$.])(?P<client>[A-Za-z_$][\w$]*)\s*(?:\?\.\s*)?\("
+_JAVASCRIPT_CLIENT_FACTORY_CALL: Final[str] = (
+    r"(?<![\w$.])(?P<client>[A-Za-z_$][\w$]*)\s*\.\s*"
+    r"(?P<factory>create|extend)\s*\("
+)
+
+
+def _javascript_unwrap_outer_parentheses(expression: str) -> str:
+    """Remove enclosing parentheses with one bounded linear scan."""
+    left = 0
+    right = len(expression)
+    while left < right and expression[left].isspace():
+        left += 1
+    while right > left and expression[right - 1].isspace():
+        right -= 1
+
+    quote: str | None = None
+    escaped = False
+    openings: list[int] = []
+    closing_for: dict[int, int] = {}
+    for index, character in enumerate(expression):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+        elif character == "(":
+            openings.append(index)
+        elif character == ")" and openings:
+            closing_for[openings.pop()] = index
+
+    while left < right and expression[left] == "(" and closing_for.get(left) == right - 1:
+        left += 1
+        right -= 1
+        while left < right and expression[left].isspace():
+            left += 1
+        while right > left and expression[right - 1].isspace():
+            right -= 1
+    return expression[left:right]
+
+
+def _javascript_http_client_expression(
+    expression: str,
+    aliases: dict[str, str],
+) -> str | None:
+    """Resolve an exact CommonJS axios/got expression or one-hop alias."""
+    value = _javascript_unwrap_outer_parentheses(expression)
+    required_client = re.fullmatch(
+        r"\(*\s*require\(\s*['\"](axios|got)['\"]\s*\)\s*\)*"
+        r"(?:\s*\.\s*default)?",
+        value,
+    )
+    if required_client is not None:
+        return required_client.group(1)
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", value):
+        return aliases.get(value)
+    return None
+
+
+def _javascript_contains_http_client_require(expression: str) -> bool:
+    masked = _mask_javascript_strings(expression)
+    for match in re.finditer(
+        r"(?<![\w$])require\(\s*['\"](?:axios|got)['\"]\s*\)",
+        expression,
+    ):
+        if masked[match.start()] != " ":
+            return True
+    return False
+
+
+def _javascript_known_nonclient_require_expression(expression: str) -> bool:
+    value = _javascript_unwrap_outer_parentheses(expression)
+    return bool(
+        re.fullmatch(
+            r"\(*\s*require\(\s*['\"]axios['\"]\s*\)\s*\)*"
+            r"\s*\.\s*mergeConfig",
+            value,
+        )
+    )
+
+
+def _javascript_http_client_factory_expression(
+    expression: str,
+    aliases: dict[str, str],
+) -> bool:
+    factory = re.fullmatch(
+        r"([A-Za-z_$][\w$]*)\s*\.\s*(create|extend)\s*\(.*\)",
+        expression.strip(),
+        re.DOTALL,
+    )
+    if factory is None:
+        return False
+    name, method = factory.groups()
+    return (aliases.get(name), method) in {("axios", "create"), ("got", "extend")}
+
+
+def _javascript_top_level_parts(value: str, separator: str = ",") -> tuple[str, ...] | None:
+    """Split JavaScript expressions at one top-level separator."""
+    start = 0
+    quote: str | None = None
+    escaped = False
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    parts: list[str] = []
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in ")]}":
+            if not stack or stack.pop() != pairs[character]:
+                return None
+        elif character == separator and not stack:
+            parts.append(value[start:index].strip())
+            start = index + 1
+    if quote is not None or stack:
+        return None
+    parts.append(value[start:].strip())
+    return tuple(parts)
+
+
+def _javascript_declaration_has_multiple_declarators(value: str) -> bool | None:
+    """Detect real declaration commas while respecting TS generics and regexes."""
+    quote: str | None = None
+    escaped = False
+    regex_literal = False
+    regex_character_class = False
+    can_start_regex = False
+    angle_depth = 0
+    angle_kind: str | None = None
+    angle_invalid = False
+    in_type_annotation = False
+    initializer_started = False
+    ambiguous_angle_operator = False
+    identifier: list[str] = []
+    new_callee_state = 0
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+
+    def finish_identifier() -> None:
+        nonlocal new_callee_state
+        if not identifier:
+            return
+        token = "".join(identifier)
+        identifier.clear()
+        if not initializer_started:
+            new_callee_state = 0
+        elif new_callee_state in {1, 3}:
+            new_callee_state = 2
+        elif token == "new":
+            new_callee_state = 1
+        else:
+            new_callee_state = 0
+
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+                can_start_regex = False
+            continue
+        if regex_literal:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "[":
+                regex_character_class = True
+            elif character == "]":
+                regex_character_class = False
+            elif character == "/" and not regex_character_class:
+                regex_literal = False
+                can_start_regex = False
+            continue
+        if not stack and not angle_depth and (character.isalnum() or character in "_$"):
+            identifier.append(character)
+            can_start_regex = False
+            continue
+        finish_identifier()
+        if character in {"'", '"', "`"}:
+            quote = character
+            new_callee_state = 0
+            continue
+        if character == "/" and can_start_regex:
+            regex_literal = True
+            regex_character_class = False
+            new_callee_state = 0
+            continue
+        if character in "([{":
+            stack.append(character)
+            can_start_regex = True
+            new_callee_state = 0
+            continue
+        if character in ")]}":
+            if not stack or stack.pop() != pairs[character]:
+                return None
+            can_start_regex = False
+            new_callee_state = 0
+            continue
+        if character.isspace():
+            continue
+        if stack:
+            new_callee_state = 0
+            if character == "/":
+                can_start_regex = True
+            else:
+                can_start_regex = character in "=(:,!&|?+-*%^~<>"
+            continue
+        if angle_depth:
+            new_callee_state = 0
+            if character == "<":
+                angle_depth += 1
+            elif character == ">":
+                angle_depth -= 1
+                if angle_depth == 0 and angle_invalid:
+                    return None
+                if angle_depth == 0 and angle_kind == "initializer":
+                    following = index + 1
+                    while following < len(value) and value[following].isspace():
+                        following += 1
+                    if following >= len(value) or value[following] != "(":
+                        return None
+                    angle_kind = None
+                elif angle_depth == 0:
+                    angle_kind = None
+            elif character == "=" and (index + 1 >= len(value) or value[index + 1] != ">"):
+                angle_invalid = True
+            can_start_regex = character in "=(:,!&|?+-*%^~<>"
+            continue
+        if character == ":" and not initializer_started:
+            in_type_annotation = True
+            new_callee_state = 0
+        elif character == "=" and not initializer_started:
+            if in_type_annotation and index + 1 < len(value) and value[index + 1] == ">":
+                can_start_regex = True
+                continue
+            initializer_started = True
+            in_type_annotation = False
+            new_callee_state = 0
+        elif character == "<":
+            if in_type_annotation:
+                angle_depth = 1
+                angle_kind = "type"
+                angle_invalid = False
+                can_start_regex = True
+                new_callee_state = 0
+                continue
+            if initializer_started and new_callee_state == 2:
+                angle_depth = 1
+                angle_kind = "initializer"
+                angle_invalid = False
+                can_start_regex = True
+                new_callee_state = 0
+                continue
+            if initializer_started:
+                ambiguous_angle_operator = True
+            new_callee_state = 0
+        if character == ",":
+            return True
+        if character == "." and new_callee_state == 2:
+            new_callee_state = 3
+        else:
+            new_callee_state = 0
+        if character == "/":
+            can_start_regex = True
+        else:
+            can_start_regex = character in "=(:,!&|?+-*%^~<>"
+    finish_identifier()
+    if quote is not None or regex_literal or stack or angle_depth:
+        return None
+    if ambiguous_angle_operator:
+        return None
+    return False
+
+
+def _javascript_object_properties(expression: str) -> dict[str, str] | None:
+    """Return effective last-key-wins properties for a static object literal."""
+    value = expression.strip()
+    if not (value.startswith("{") and value.endswith("}")):
+        return None
+    raw_properties = _javascript_top_level_parts(value[1:-1])
+    if raw_properties is None:
+        return None
+    properties: dict[str, str] = {}
+    for raw_property in raw_properties:
+        if not raw_property:
+            continue
+        if raw_property.startswith(("...", "[")):
+            return None
+        key_value = _javascript_top_level_parts(raw_property, ":")
+        if key_value is None or len(key_value) != 2:
+            return None
+        raw_key, raw_value = key_value
+        key = _javascript_literal(raw_key) or raw_key
+        if not re.fullmatch(r"[A-Za-z_$][\w$]*", key):
+            return None
+        properties[key] = raw_value
+    return properties
+
+
+_AXIOS_WIRE_FIELDS: Final[tuple[str, ...]] = ("data", "headers", "params", "auth")
+_AXIOS_UNSUPPORTED_ROUTING_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "adapter",
+        "beforeRedirect",
+        "httpAgent",
+        "httpsAgent",
+        "paramsSerializer",
+        "socketPath",
+        "transformRequest",
+        "transport",
+    }
+)
+_GOT_WIRE_FIELDS: Final[tuple[str, ...]] = (
+    "body",
+    "json",
+    "form",
+    "headers",
+    "searchParams",
+    "username",
+    "password",
+    "cookieJar",
+)
+_GOT_UNSUPPORTED_ROUTING_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "agent",
+        "createConnection",
+        "dnsLookup",
+        "hooks",
+        "lookup",
+        "prefixUrl",
+        "request",
+        "socketPath",
+    }
+)
+_JAVASCRIPT_MAX_WIRE_OBJECT_DEPTH: Final[int] = 32
+
+
+def _javascript_wire_expression(
+    properties: dict[str, str],
+    fields: tuple[str, ...],
+    *,
+    authorization_overridden: bool = False,
+) -> tuple[str, bool]:
+    values: list[str] = []
+    for field_name in fields:
+        if field_name not in properties:
+            continue
+        excluded_keys = (
+            frozenset({"authorization"})
+            if field_name == "headers" and authorization_overridden
+            else frozenset()
+        )
+        normalized, modeled = _javascript_effective_wire_value(
+            properties[field_name],
+            excluded_keys=excluded_keys,
+        )
+        if not modeled:
+            return "", False
+        if normalized:
+            values.append(normalized)
+    return "\n".join(values), True
+
+
+def _javascript_effective_wire_value(
+    expression: str,
+    *,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> tuple[str, bool]:
+    """Normalize bounded static wire objects with last-key-wins semantics."""
+    if not _javascript_wire_object_depth_within_limit(expression):
+        return "", False
+    return _javascript_effective_wire_value_bounded(
+        expression,
+        excluded_keys=excluded_keys,
+    )
+
+
+def _javascript_wire_object_depth_within_limit(expression: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for character in expression:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"', "`"}:
+            quote = character
+        elif character == "{":
+            depth += 1
+            if depth > _JAVASCRIPT_MAX_WIRE_OBJECT_DEPTH:
+                return False
+        elif character == "}":
+            depth -= 1
+    return True
+
+
+def _javascript_effective_wire_value_bounded(
+    expression: str,
+    *,
+    excluded_keys: frozenset[str] = frozenset(),
+) -> tuple[str, bool]:
+    """Walk a preflight-bounded object; rescans are capped by the depth limit."""
+    value = expression.strip()
+    if not (value.startswith("{") and value.endswith("}")):
+        return value, True
+    properties = _javascript_object_properties(value)
+    if properties is None:
+        return "", False
+    values: list[str] = []
+    for key, nested_value in properties.items():
+        if key.casefold() in excluded_keys:
+            continue
+        normalized, modeled = _javascript_effective_wire_value_bounded(nested_value)
+        if not modeled:
+            return "", False
+        if normalized:
+            values.append(normalized)
+    return "\n".join(values), True
+
+
+def _javascript_boolean(value: str) -> bool | None:
+    normalized = value.strip()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    return None
+
+
+def _javascript_axios_destination(url: str | None) -> DestinationClass:
+    """Classify HTTP(S) and Axios-absolute protocol-relative URLs."""
+    if url is not None and url.startswith("//"):
+        return _destination_for_url(f"http:{url}")
+    return _destination_for_url(url)
+
+
+def _javascript_axios_proxy_semantics(
+    expression: str,
+) -> tuple[DestinationClass | None, str, bool]:
+    """Return an explicit Axios proxy route and proxy-auth source."""
+    if expression.strip() == "false":
+        return None, "", True
+    properties = _javascript_object_properties(expression)
+    if properties is None or not set(properties) <= {
+        "auth",
+        "host",
+        "port",
+        "protocol",
+    }:
+        return None, "", False
+    host = _javascript_literal(properties.get("host", ""))
+    if host is None:
+        return None, "", False
+    if "protocol" in properties:
+        protocol = _javascript_literal(properties["protocol"])
+        if protocol not in {"http", "https", "http:", "https:"}:
+            return None, "", False
+    if "port" in properties:
+        port = properties["port"].strip()
+        port_literal = _javascript_literal(port)
+        if not re.fullmatch(r"\d+", port_literal if port_literal is not None else port):
+            return None, "", False
+    proxy_auth, auth_modeled = _javascript_effective_wire_value(properties.get("auth", ""))
+    if not auth_modeled:
+        return None, "", False
+    return _destination_for_host(host), proxy_auth, True
+
+
+def _javascript_axios_request_semantics(
+    url_expression: str,
+    properties: dict[str, str],
+) -> tuple[DestinationClass, str, bool]:
+    """Resolve a supported Axios request route and wire-bearing config."""
+    if set(properties) & _AXIOS_UNSUPPORTED_ROUTING_FIELDS:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    url = _javascript_literal(url_expression)
+    if url is None:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+
+    base_url: str | None = None
+    base_destination: DestinationClass | None = None
+    if "baseURL" in properties:
+        base_url = _javascript_literal(properties["baseURL"])
+        base_destination = _javascript_axios_destination(base_url)
+        if base_url is None or base_destination is DestinationClass.DYNAMIC_UNKNOWN:
+            return DestinationClass.DYNAMIC_UNKNOWN, "", False
+
+    allow_absolute_urls = True
+    if "allowAbsoluteUrls" in properties:
+        parsed_allow_absolute_urls = _javascript_boolean(properties["allowAbsoluteUrls"])
+        if parsed_allow_absolute_urls is None:
+            return DestinationClass.DYNAMIC_UNKNOWN, "", False
+        allow_absolute_urls = parsed_allow_absolute_urls
+
+    proxy_destination: DestinationClass | None = None
+    proxy_source = ""
+    if "proxy" in properties:
+        proxy_destination, proxy_source, proxy_modeled = _javascript_axios_proxy_semantics(
+            properties["proxy"]
+        )
+        if not proxy_modeled:
+            return DestinationClass.DYNAMIC_UNKNOWN, "", False
+
+    url_destination = _javascript_axios_destination(url)
+    url_is_absolute = url_destination is not DestinationClass.DYNAMIC_UNKNOWN
+    if base_destination is not None and (not url_is_absolute or not allow_absolute_urls):
+        destination = base_destination
+    elif url_is_absolute:
+        destination = url_destination
+    else:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    if proxy_destination is not None and destination is DestinationClass.LOOPBACK:
+        destination = proxy_destination
+
+    auth_properties = (
+        _javascript_object_properties(properties["auth"]) if "auth" in properties else None
+    )
+    wire_source, wire_modeled = _javascript_wire_expression(
+        properties,
+        _AXIOS_WIRE_FIELDS,
+        authorization_overridden=auth_properties is not None,
+    )
+    if not wire_modeled:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    source_expression = "\n".join(
+        value
+        for value in (
+            wire_source,
+            proxy_source,
+        )
+        if value
+    )
+    return destination, source_expression, True
+
+
+def _javascript_axios_callable_semantics(
+    arguments: str,
+) -> tuple[DestinationClass, str, bool]:
+    argument_parts = _javascript_top_level_parts(arguments)
+    if not argument_parts or not argument_parts[0] or len(argument_parts) > 2:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    direct_url = _javascript_literal(argument_parts[0])
+    if direct_url is not None:
+        if len(argument_parts) == 1:
+            properties: dict[str, str] = {}
+        else:
+            parsed_properties = _javascript_object_properties(argument_parts[1])
+            if parsed_properties is None:
+                return DestinationClass.DYNAMIC_UNKNOWN, "", False
+            properties = parsed_properties
+        return _javascript_axios_request_semantics(argument_parts[0], properties)
+    if len(argument_parts) != 1:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    object_properties = _javascript_object_properties(argument_parts[0])
+    if object_properties is None or "url" not in object_properties:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    return _javascript_axios_request_semantics(
+        object_properties["url"],
+        object_properties,
+    )
+
+
+def _javascript_got_callable_semantics(
+    arguments: str,
+) -> tuple[DestinationClass, str, bool]:
+    argument_parts = _javascript_top_level_parts(arguments)
+    if not argument_parts or not argument_parts[0] or len(argument_parts) > 2:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    url = _javascript_literal(argument_parts[0])
+    destination = _destination_for_url(url)
+    if url is None or destination is DestinationClass.DYNAMIC_UNKNOWN:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    if len(argument_parts) == 1:
+        properties: dict[str, str] = {}
+    else:
+        parsed_properties = _javascript_object_properties(argument_parts[1])
+        if parsed_properties is None:
+            return DestinationClass.DYNAMIC_UNKNOWN, "", False
+        properties = parsed_properties
+    if set(properties) & _GOT_UNSUPPORTED_ROUTING_FIELDS:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    wire_source, wire_modeled = _javascript_wire_expression(properties, _GOT_WIRE_FIELDS)
+    if not wire_modeled:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    return destination, wire_source, True
+
+
+def _javascript_callable_semantics(
+    arguments: str,
+    client_kind: str,
+) -> tuple[DestinationClass, str, bool]:
+    """Return client-specific destination/source semantics for callable clients."""
+    if client_kind == "axios":
+        return _javascript_axios_callable_semantics(arguments)
+    if client_kind == "got":
+        return _javascript_got_callable_semantics(arguments)
+    return DestinationClass.DYNAMIC_UNKNOWN, "", False
+
+
+def _javascript_method_semantics(
+    arguments: str,
+    *,
+    client_kind: str,
+    method: str,
+) -> tuple[DestinationClass, str, bool]:
+    """Return client-specific semantics for axios/got shortcut methods."""
+    argument_parts = _javascript_top_level_parts(arguments)
+    if not argument_parts or not argument_parts[0]:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    if client_kind == "got":
+        if method not in {"delete", "get", "head", "patch", "post", "put"}:
+            return DestinationClass.DYNAMIC_UNKNOWN, "", False
+        return _javascript_got_callable_semantics(arguments)
+    if client_kind != "axios":
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    if method == "request":
+        if len(argument_parts) != 1:
+            return DestinationClass.DYNAMIC_UNKNOWN, "", False
+        return _javascript_axios_callable_semantics(arguments)
+    if method not in {
+        "delete",
+        "get",
+        "head",
+        "options",
+        "patch",
+        "patchForm",
+        "post",
+        "postForm",
+        "put",
+        "putForm",
+    }:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+
+    body_expression = ""
+    config_index = 1
+    if method in {"patch", "patchForm", "post", "postForm", "put", "putForm"}:
+        if len(argument_parts) >= 2:
+            body_expression = argument_parts[1]
+        config_index = 2
+    if len(argument_parts) > config_index + 1:
+        return DestinationClass.DYNAMIC_UNKNOWN, "", False
+    properties: dict[str, str] = {}
+    if len(argument_parts) > config_index:
+        parsed_properties = _javascript_object_properties(argument_parts[config_index])
+        if parsed_properties is None:
+            return DestinationClass.DYNAMIC_UNKNOWN, "", False
+        properties = parsed_properties
+    destination, config_source, modeled = _javascript_axios_request_semantics(
+        argument_parts[0],
+        properties,
+    )
+    source_expression = "\n".join(value for value in (body_expression, config_source) if value)
+    return destination, source_expression, modeled
+
+
 def _javascript_call_arguments(statement: str, opening: int) -> str | None:
     quote: str | None = None
     escaped = False
@@ -2892,6 +3850,18 @@ def _javascript_is_unmodeled(source: str) -> bool:
         source,
     ):
         return True
+    unsupported_client_shapes = (
+        r"(?:const|let|var)\s*\{[^}\n]*\}\s*=\s*"
+        r"require\(\s*['\"](?:axios|got)['\"]\s*\)",
+        r"(?:\(\s*)?require\(\s*['\"](?:axios|got)['\"]\s*\)\s*"
+        r"(?:\)\s*)?(?:\.\s*default\s*)?\(",
+        r"require\(\s*['\"](?:axios|got)['\"]\s*\)\s*\.\s*"
+        r"(?:create|extend)\s*\(",
+    )
+    for pattern in unsupported_client_shapes:
+        for match in re.finditer(pattern, source):
+            if masked[match.start()] != " ":
+                return True
     for match in re.finditer(r"(?<![\w$])(?:import|require)\s*\(", masked):
         arguments = _javascript_call_arguments(source, match.end() - 1)
         literal = (
@@ -2917,6 +3887,84 @@ def _javascript_is_unmodeled(source: str) -> bool:
     return False
 
 
+def _javascript_statement_hits(
+    statement: str,
+    *,
+    start_line: int,
+    variables: dict[str, str],
+    http_client_aliases: dict[str, str],
+    event_taint: str | None,
+    profile: UserConfigProfile | None,
+) -> tuple[list[_SinkHit], bool]:
+    """Analyze one reachable statement against its pre-execution state."""
+    masked = _mask_javascript_strings(statement)
+    for factory_match in re.finditer(_JAVASCRIPT_CLIENT_FACTORY_CALL, masked):
+        factory_name = factory_match.group("client")
+        if (
+            http_client_aliases.get(factory_name),
+            factory_match.group("factory"),
+        ) in {("axios", "create"), ("got", "extend")}:
+            return [], True
+
+    hits: list[_SinkHit] = []
+    for match in re.finditer(_JAVASCRIPT_HTTP_METHOD_CALL, masked):
+        client_name = match.group("client")
+        if client_name is not None and client_name not in http_client_aliases:
+            continue
+        arguments = _javascript_call_arguments(statement, match.end() - 1)
+        if arguments is None:
+            return [], True
+        if client_name is None:
+            source_expression = arguments
+            destination = _destination_for_url(
+                _javascript_literal(_javascript_first_argument(arguments))
+            )
+            modeled = True
+        else:
+            destination, source_expression, modeled = _javascript_method_semantics(
+                arguments,
+                client_kind=http_client_aliases[client_name],
+                method=match.group("method"),
+            )
+        if not modeled:
+            return [], True
+        source_kind = _javascript_expr_taint(
+            source_expression,
+            variables=variables,
+            event_taint=event_taint,
+            profile=profile,
+        )
+        if source_kind is None or destination is DestinationClass.LOOPBACK:
+            continue
+        sink_line = start_line + statement[: match.start()].count("\n")
+        hits.append(_SinkHit(source_kind, TransportKind.HTTP, destination, sink_line))
+
+    for match in re.finditer(_JAVASCRIPT_CALLABLE_CALL, masked):
+        client_name = match.group("client")
+        if client_name not in http_client_aliases:
+            continue
+        arguments = _javascript_call_arguments(statement, match.end() - 1)
+        if arguments is None:
+            return [], True
+        destination, source_expression, modeled = _javascript_callable_semantics(
+            arguments,
+            http_client_aliases[client_name],
+        )
+        if not modeled:
+            return [], True
+        source_kind = _javascript_expr_taint(
+            source_expression,
+            variables=variables,
+            event_taint=event_taint,
+            profile=profile,
+        )
+        if source_kind is None or destination is DestinationClass.LOOPBACK:
+            continue
+        sink_line = start_line + statement[: match.start()].count("\n")
+        hits.append(_SinkHit(source_kind, TransportKind.HTTP, destination, sink_line))
+    return hits, False
+
+
 def _analyze_javascript_payload(
     content: str,
     *,
@@ -2927,23 +3975,112 @@ def _analyze_javascript_payload(
     if not valid or not _javascript_structure_valid(source) or _javascript_is_unmodeled(source):
         return [], True
     variables: dict[str, str] = {}
-    http_client_aliases = {"axios", "got"}
+    http_client_aliases: dict[str, str] = {}
     hits: list[_SinkHit] = []
     for statement, start_line in _javascript_statements(source):
+        declaration = re.match(
+            r"^(?:const|let|var)\s+(.*)$",
+            statement,
+            re.DOTALL,
+        )
+        if declaration is not None:
+            multiple_declarators = _javascript_declaration_has_multiple_declarators(
+                declaration.group(1)
+            )
+            if multiple_declarators is not False:
+                return [], True
         assignment = re.match(
             r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)"
             r"(?:\s*:\s*[^=;]+)?\s*=\s*(.*)$",
             statement,
             re.DOTALL,
         )
-        if assignment is not None:
-            name, expression = assignment.groups()
-            required_client = re.match(
-                r"^require\(\s*['\"](axios|got)['\"]\s*\)",
-                expression.strip(),
+        mutation = re.match(
+            r"^([A-Za-z_$][\w$]*)\s*"
+            r"(&&=|\|\|=|\?\?=|>>>=|<<=|>>=|\*\*=|[+\-*/%&|^]=|=(?!=|>))\s*(.*)$",
+            statement,
+            re.DOTALL,
+        )
+        rhs_expression = (
+            assignment.group(2)
+            if assignment is not None
+            else mutation.group(3)
+            if mutation is not None
+            else None
+        )
+        mutation_name = mutation.group(1) if mutation is not None else None
+        mutation_operator = mutation.group(2) if mutation is not None else None
+        previous_kind = (
+            http_client_aliases.get(mutation_name) if mutation_name is not None else None
+        )
+        rhs_reachable = not (mutation_operator in {"||=", "??="} and previous_kind is not None)
+
+        resolved_rhs_kind = (
+            _javascript_http_client_expression(rhs_expression, http_client_aliases)
+            if rhs_expression is not None
+            else None
+        )
+        if rhs_reachable and rhs_expression is not None:
+            if _javascript_http_client_factory_expression(
+                rhs_expression,
+                http_client_aliases,
+            ):
+                return [], True
+            if (
+                resolved_rhs_kind is None
+                and _javascript_contains_http_client_require(rhs_expression)
+                and not _javascript_known_nonclient_require_expression(rhs_expression)
+            ):
+                return [], True
+            if (
+                mutation_operator in {"&&=", "||=", "??="}
+                and previous_kind is None
+                and resolved_rhs_kind is not None
+            ):
+                return [], True
+
+        if rhs_reachable:
+            statement_hits, unmodeled = _javascript_statement_hits(
+                statement,
+                start_line=start_line,
+                variables=variables,
+                http_client_aliases=http_client_aliases,
+                event_taint=event_taint,
+                profile=profile,
             )
-            if required_client is not None:
-                http_client_aliases.add(name)
+            if unmodeled:
+                return [], True
+            hits.extend(statement_hits)
+
+        if assignment is not None:
+            alias_name = assignment.group(1)
+            if resolved_rhs_kind is None:
+                http_client_aliases.pop(alias_name, None)
+            else:
+                http_client_aliases[alias_name] = resolved_rhs_kind
+        elif mutation is not None and mutation_name is not None:
+            updated_kind: str | None
+            if mutation_operator in {"||=", "??="} and previous_kind is not None:
+                updated_kind = previous_kind
+            elif mutation_operator in {"=", "&&="}:
+                updated_kind = resolved_rhs_kind
+            else:
+                updated_kind = None
+            if updated_kind is None:
+                http_client_aliases.pop(mutation_name, None)
+            else:
+                http_client_aliases[mutation_name] = updated_kind
+
+        variable_assignment = assignment
+        if mutation is not None and mutation_operator == "=":
+            variable_assignment = mutation
+        if variable_assignment is not None:
+            name = variable_assignment.group(1)
+            expression = (
+                variable_assignment.group(2)
+                if variable_assignment is assignment
+                else variable_assignment.group(3)
+            )
             taint = _javascript_expr_taint(
                 expression,
                 variables=variables,
@@ -2954,34 +4091,6 @@ def _analyze_javascript_payload(
                 variables.pop(name, None)
             else:
                 variables[name] = taint
-        masked = _mask_javascript_strings(statement)
-        client_names = "|".join(
-            re.escape(name)
-            for name in sorted(http_client_aliases, key=lambda value: (-len(value), value))
-        )
-        for match in re.finditer(
-            rf"(?<![\w$])(?:fetch|(?:{client_names})\s*\.\s*"
-            r"(?:get|patch|post|put))\s*\(",
-            masked,
-        ):
-            arguments = _javascript_call_arguments(statement, match.end() - 1)
-            if arguments is None:
-                return [], True
-            source_kind = _javascript_expr_taint(
-                arguments,
-                variables=variables,
-                event_taint=event_taint,
-                profile=profile,
-            )
-            if source_kind is None:
-                continue
-            destination = _destination_for_url(
-                _javascript_literal(_javascript_first_argument(arguments))
-            )
-            if destination is DestinationClass.LOOPBACK:
-                continue
-            sink_line = start_line + statement[: match.start()].count("\n")
-            hits.append(_SinkHit(source_kind, TransportKind.HTTP, destination, sink_line))
     return hits, False
 
 
