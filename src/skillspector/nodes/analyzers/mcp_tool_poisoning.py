@@ -42,6 +42,7 @@ from skillspector.llm_analyzer_base import (
     Batch,
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
+    append_output_language_instruction,
     estimate_tokens,
 )
 from skillspector.model_info import get_max_input_tokens
@@ -895,7 +896,7 @@ class _TP4Analyzer(LLMAnalyzerBase):
 
     def build_prompt(self, batch: Batch, **_kwargs: object) -> str:
         """Use TP4's purpose-built prompt without the generic file wrapper."""
-        return batch.content
+        return append_output_language_instruction(batch.content)
 
     def parse_response(  # type: ignore[override]  # TP4 returns its typed assessment.
         self, response: object, _batch: Batch
