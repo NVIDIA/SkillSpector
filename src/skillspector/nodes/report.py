@@ -1489,8 +1489,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     skill_path = state.get("skill_path")
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
-    explicit_llm_request = state.get("llm_requested") is True
-    llm_requested = state.get("llm_requested", use_llm)
+    llm_requested = bool(state.get("llm_requested", use_llm))
     raw_llm_call_log = state.get("llm_call_log")
     llm_call_log: list[Mapping[str, object]] = (
         [record for record in raw_llm_call_log if isinstance(record, Mapping)]
@@ -1516,13 +1515,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
         analysis_completeness["is_complete"] = False
 
     _llm_used, semantic_runtime_complete = semantic_runtime_accounting(
-        enabled=bool(explicit_llm_request and use_llm),
+        enabled=bool(llm_requested and use_llm),
         result=state,
         discovered_modules=ANALYZER_MODULES,
     )
-    semantic_runtime_incomplete = bool(
-        explicit_llm_request and use_llm and not semantic_runtime_complete
-    )
+    semantic_runtime_incomplete = bool(llm_requested and use_llm and not semantic_runtime_complete)
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     provider_available, provider_error = is_llm_available()
     runtime_available = llm_runtime_available(
