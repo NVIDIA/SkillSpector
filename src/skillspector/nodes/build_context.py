@@ -269,8 +269,9 @@ def _walk_skill_files(
     """Walk skill files and record scan-scope exclusions.
 
     Skips profile-permitted generated trees and symlinks. Hidden artifacts are
-    inventoried normally. Within ``.git`` only configuration and hooks are
-    inspected; object/history storage remains a bounded scope boundary.
+    inventoried normally. Within ``.git`` only configuration and active hooks
+    are inspected; sample hooks and object/history storage remain outside the
+    bounded scope.
     """
     paths: list[str] = []
     exclusions: list[InspectionLedgerEvent] = []
@@ -508,14 +509,14 @@ def _walk_skill_files(
                     ),
                 )
                 continue
-            if normalized_root == ".git/hooks" and is_directory:
+            if normalized_root == ".git/hooks" and (is_directory or name.endswith(".sample")):
                 _append_bounded_ledger_event(
                     exclusions,
                     ledger_event(
                         outcome=LedgerOutcome.OUT_OF_SCOPE,
                         record_type=LedgerRecordType.SCOPE_BOUNDARY,
                         phase="discovery",
-                        path=f"{relative_path}/",
+                        path=f"{relative_path}/" if is_directory else relative_path,
                         reason=LedgerReason.VCS_METADATA,
                     ),
                 )
