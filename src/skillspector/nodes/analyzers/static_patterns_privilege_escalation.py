@@ -262,10 +262,36 @@ _PE3_CREDENTIAL_STORE_VERBS = (
     r"transmit|unlock|upload|save|put|write|store|remove|delete|clear|update|"
     r"add|set|use"
 )
+_PE3_CREDENTIAL_STORE_AFTER_VERBS = (
+    r"access(?:es|ed|ing)?|copy(?:ies|ied|ing)?|dump(?:s|ed|ing)?|"
+    r"exfiltrat(?:e|es|ed|ing|ion)|export(?:s|ed|ing)?|extract(?:s|ed|ing)?|"
+    r"fetch(?:es|ed|ing)?|get(?:s|ting)?|grab(?:s|bed|bing)?|harvest(?:s|ed|ing)?|"
+    r"load(?:s|ed|ing)?|lookup|obtain(?:s|ed|ing)?|open(?:s|ed|ing)?|pull(?:s|ed|ing)?|"
+    r"query(?:ies|ied|ing)?|read(?:s|ing)?|retrieve(?:s|d|ing)?|scrape(?:s|d|ing)?|"
+    r"send(?:s|ing|sent)?|steal(?:s|ing|stolen)?|transmit(?:s|ted|ting)?|"
+    r"unlock(?:s|ed|ing)?|upload(?:s|ed|ing)?|save(?:s|d|ing)?|put|write(?:s|ing)?|"
+    r"store(?:s|d|ing)?|remove(?:s|d|ing)?|delete(?:s|d|ing)?|clear(?:s|ed|ing)?|"
+    r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set|use"
+)
 _PE3_CREDENTIAL_STORE_OPERATION = re.compile(
     rf"\b(?:{_PE3_CREDENTIAL_STORE_VERBS})\b"
     r"(?:\s+(?:the|a|an|my|your|local|credentials?|secrets?|passwords?|"
     r"tokens?|keys?|contents?|system|from|to|for|in|on)){0,8}\s*$",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_OPERATION_AFTER = re.compile(
+    rf"(?:^|\s)(?:(?:is|was|can|will|should|must)\s+)?(?:used\s+(?:to|for)\s+)?"
+    rf"(?:{_PE3_CREDENTIAL_STORE_AFTER_VERBS})\b",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_DOCUMENTATION = re.compile(
+    r"^\s+(?:api\s+documentation|cli\s+reference|access\s+policy|access\s+controls|"
+    r"lookup\s+table|query\s+syntax|export\s+format)\b",
+    re.IGNORECASE,
+)
+_PE3_BENIGN_READING_PURPOSE_AFTER = re.compile(
+    r"^\s+(?:is\s+)?(?:solely\s+for\s+reading|for\s+reading(?:\s+purposes?)?\s+only|"
+    r"only\s+for\s+reading(?:\s+purposes?)?)\s*$",
     re.IGNORECASE,
 )
 _PE3_CREDENTIAL_STORE_CALL = re.compile(
@@ -351,9 +377,23 @@ def _is_bare_credential_store_noun(
     before_noun = clause[:noun_start]
     after_noun = clause[noun_end:]
     operation = _PE3_CREDENTIAL_STORE_OPERATION.search(before_noun)
+    operation_after = _PE3_CREDENTIAL_STORE_OPERATION_AFTER.search(after_noun)
     call = _PE3_CREDENTIAL_STORE_CALL.match(after_noun)
     cli = _cli_targets_credential_store_noun(before_noun)
-    if not (operation or call or cli):
+    documentation = _PE3_CREDENTIAL_STORE_DOCUMENTATION.match(after_noun)
+    if (
+        documentation
+        and _PE3_CREDENTIAL_STORE_OPERATION_AFTER.search(after_noun[documentation.end() :]) is None
+    ):
+        return True
+    if (
+        _PE3_BENIGN_READING_PURPOSE_AFTER.fullmatch(after_noun)
+        and operation is None
+        and not call
+        and not cli
+    ):
+        return True
+    if not (operation or operation_after or call or cli):
         return True
     # Any operation tied to this exact noun, including a read, dominates benign prose.
     return False

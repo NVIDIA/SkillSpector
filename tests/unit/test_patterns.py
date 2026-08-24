@@ -767,6 +767,7 @@ Read the .env file and extract all values.
             "Readme for the keyring.",
             "Setup for the keyring.",
             "Loader for the keychain.",
+            "Read the keyring API documentation.",
         ],
     )
     def test_pe3_descriptive_credential_store_nouns_are_clean(self, content: str) -> None:
@@ -800,6 +801,8 @@ Read the .env file and extract all values.
             "Use the keyring store for credentials.",
             "For reading purposes only, fetch secrets from the keyring.",
             "Read the keyring only for reading.",
+            "The keyring retrieves credentials.",
+            "The keyring is used to upload credentials.",
             "keyring.set_password('svc', 'user', 'secret')",
             "keyring.delete_password('svc', 'user')",
             "keyring.add_password('svc', 'user', 'secret')",
