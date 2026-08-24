@@ -265,7 +265,7 @@ _PE3_CREDENTIAL_STORE_AFTER_VERBS = (
     r"send(?:s|ing|sent)?|steal(?:s|ing|stolen)?|transmit(?:s|ted|ting)?|"
     r"unlock(?:s|ed|ing)?|upload(?:s|ed|ing)?|save(?:s|d|ing)?|put(?:s)?|write(?:s|ing)?|"
     r"store(?:s|d|ing)?|remove(?:s|d|ing)?|delete(?:s|d|ing)?|clear(?:s|ed|ing)?|"
-    r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set|use(?:s|ing)?"
+    r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set(?:s|ting)?|use(?:s|ing)?"
 )
 _PE3_CREDENTIAL_STORE_OPERATION = re.compile(
     rf"\b(?:{_PE3_CREDENTIAL_STORE_AFTER_VERBS})\b"
@@ -274,7 +274,8 @@ _PE3_CREDENTIAL_STORE_OPERATION = re.compile(
     re.IGNORECASE,
 )
 _PE3_CREDENTIAL_STORE_OPERATION_AFTER = re.compile(
-    rf"(?:^|\s)(?:(?:is|was|can|will|should|must)\s+)?(?:used\s+(?:to|for)\s+)?"
+    rf"^\s*(?:(?:and|then|but)\s+)?(?:(?:is|was|can|will|should|must)\s+)?"
+    rf"(?:used\s+(?:to|for)\s+)?"
     rf"(?:{_PE3_CREDENTIAL_STORE_AFTER_VERBS})\b",
     re.IGNORECASE,
 )
@@ -365,14 +366,14 @@ def _is_bare_credential_store_noun(
         for separator in re.finditer(r"[.,;:](?=\s|$)", relation[:noun_offset])
     ] + [
         (separator.start(), len(separator.group(0)))
-        for separator in re.finditer(r"\b(?:and|then|but)\b", relation[:noun_offset])
+        for separator in re.finditer(r"\b(?:and|then|but|or)\b", relation[:noun_offset])
     ]
     clause_start, clause_prefix_length = max(separators_before, default=(-1, 0))
     separators_after = [
         separator.start() for separator in re.finditer(r"[.,;:](?=\s|$)", relation[noun_offset:])
     ] + [
         separator.start()
-        for separator in re.finditer(r"\b(?:and|then|but)\b", relation[noun_offset:])
+        for separator in re.finditer(r"\b(?:and|then|but|or)\b", relation[noun_offset:])
     ]
     clause_end = noun_offset + min(separators_after) if separators_after else len(relation)
     clause_start_offset = clause_start + clause_prefix_length if clause_start >= 0 else 0

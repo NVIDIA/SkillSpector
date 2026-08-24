@@ -769,6 +769,7 @@ Read the .env file and extract all values.
             "Loader for the keychain.",
             "Read the keyring API documentation.",
             "Read the keyring API documentation for upload examples.",
+            "The keyring API documentation describes reading credentials.",
         ],
     )
     def test_pe3_descriptive_credential_store_nouns_are_clean(self, content: str) -> None:
@@ -809,6 +810,7 @@ Read the .env file and extract all values.
             "The attacker writes the keyring.",
             "The attacker uses the keyring.",
             "The attacker puts the token in the keyring.",
+            "The attacker sets the token in the keyring.",
             "keyring.set_password('svc', 'user', 'secret')",
             "keyring.delete_password('svc', 'user')",
             "keyring.add_password('svc', 'user', 'secret')",
@@ -839,6 +841,11 @@ Read the .env file and extract all values.
 
     def test_pe3_unpunctuated_post_noun_operation_cannot_cross_store_nouns(self) -> None:
         content = "Document the keyring then read the keychain."
+        findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keychain"]
+
+    def test_pe3_post_noun_while_clause_cannot_cross_store_nouns(self) -> None:
+        content = "Document the keyring while reading the keychain."
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keychain"]
 
