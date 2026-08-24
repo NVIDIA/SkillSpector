@@ -524,6 +524,27 @@ async def test_unavailable_requested_llm_aligns_embedded_json_report(
     assert payload["metadata"]["filtering_mode"] == "heuristic"
 
 
+async def test_empty_runtime_telemetry_aligns_mcp_and_embedded_json_caution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful preflight cannot leave the embedded report fail-open."""
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda: (True, None),
+    )
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", _render_complete_zero_risk_result)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    payload = json.loads(verdict["report"])
+
+    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["safe_to_install"] is False
+    assert payload["risk_assessment"]["recommendation"] == "CAUTION"
+    assert payload["metadata"]["llm_degraded"] is True
+    assert "runtime telemetry was incomplete" in payload["metadata"]["llm_error"]
+
+
 async def test_failed_meta_analysis_aligns_mcp_and_embedded_json_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

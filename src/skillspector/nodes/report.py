@@ -41,6 +41,7 @@ from skillspector.inspection_ledger import MAX_FINDING_OUTPUT_RECORDS, AnalysisC
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
+from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.nodes.deduplicate import deduplicate
 from skillspector.python_ast import clear_python_ast_cache
 from skillspector.sarif_models import (
@@ -61,6 +62,7 @@ from skillspector.sarif_models import (
     SarifTool,
     validate_sarif_report,
 )
+from skillspector.semantic_runtime import semantic_runtime_accounting
 from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 
@@ -1075,11 +1077,12 @@ def _build_metadata(
     transitive_bytes_scanned: int | None = None,
     transitive_truncation_reasons: Sequence[str] | None = None,
     llm_execution_enabled: bool | None = None,
+    semantic_runtime_incomplete: bool = False,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
     provider_available, llm_error = is_llm_available()
-    attempted, succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
     # batch. A missing record means meta_analyzer never ran (e.g. there were
@@ -1138,7 +1141,7 @@ def _build_metadata(
             "LLM analysis was requested but unavailable during preflight; "
             "results reflect static analysis only."
         )
-    elif degraded:
+    elif call_log_degraded:
         meta["llm_degraded"] = True
         reasons = sorted(
             {str(r.get("error")) for r in llm_call_log if not r.get("ok") and r.get("error")}
@@ -1148,6 +1151,12 @@ def _build_metadata(
         meta["llm_error"] = (
             f"LLM analysis was requested but {failed} of {attempted} LLM call(s) failed; "
             f"results reflect static analysis only for the affected batch(es).{detail}"
+        )
+    elif semantic_runtime_incomplete:
+        meta["llm_degraded"] = True
+        meta["llm_error"] = (
+            "LLM analysis was requested but semantic runtime telemetry was incomplete; "
+            "results may reflect static analysis only."
         )
     elif use_llm and not provider_available:
         meta["llm_error"] = llm_error
@@ -1181,6 +1190,7 @@ def _format_json(
     transitive_truncation_reasons: Sequence[str] | None = None,
     structured_summaries: list[dict[str, object]] | None = None,
     llm_execution_enabled: bool | None = None,
+    semantic_runtime_incomplete: bool = False,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1223,6 +1233,7 @@ def _format_json(
             transitive_bytes_scanned,
             transitive_truncation_reasons,
             llm_execution_enabled,
+            semantic_runtime_incomplete,
         ),
         "execution_successful": execution_successful,
     }
@@ -1474,8 +1485,15 @@ def report(state: SkillspectorState) -> dict[str, object]:
     skill_path = state.get("skill_path")
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
+    explicit_llm_request = state.get("llm_requested") is True
     llm_requested = state.get("llm_requested", use_llm)
-    llm_call_log = state.get("llm_call_log") or []
+    raw_llm_call_log = state.get("llm_call_log")
+    llm_call_log: list[Mapping[str, object]] = (
+        list(raw_llm_call_log)
+        if isinstance(raw_llm_call_log, list)
+        and all(isinstance(record, Mapping) for record in raw_llm_call_log)
+        else []
+    )
     inference_usage = state.get("inference_usage") or []
     transitive_targets_scanned = state.get("transitive_targets_scanned")
     transitive_bytes_scanned = state.get("transitive_bytes_scanned")
@@ -1494,6 +1512,14 @@ def report(state: SkillspectorState) -> dict[str, object]:
         analysis_completeness["limitations"] = limitations
         analysis_completeness["is_complete"] = False
 
+    _llm_used, semantic_runtime_complete = semantic_runtime_accounting(
+        enabled=bool(explicit_llm_request and use_llm),
+        result=state,
+        discovered_modules=ANALYZER_MODULES,
+    )
+    semantic_runtime_incomplete = bool(
+        explicit_llm_request and use_llm and not semantic_runtime_complete
+    )
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     provider_available, provider_error = is_llm_available()
     has_recorded_failure = any(not r.get("ok") for r in llm_call_log)
@@ -1503,7 +1529,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
         and not provider_available
         and (has_recorded_failure or unavailable_before_execution)
     )
-    degraded = degraded or provider_unavailable or unavailable_before_execution
+    degraded = (
+        degraded
+        or provider_unavailable
+        or unavailable_before_execution
+        or semantic_runtime_incomplete
+    )
     degraded_notice = _llm_degradation_notice(llm_requested, llm_call_log)
     if unavailable_before_execution:
         degraded_notice = (
@@ -1515,9 +1546,19 @@ def report(state: SkillspectorState) -> dict[str, object]:
             "LLM analysis was requested but the configured provider was unavailable"
             f" ({provider_error or 'unknown reason'}); results may reflect static analysis only."
         )
+    elif semantic_runtime_incomplete and degraded_notice is None:
+        degraded_notice = (
+            "LLM analysis was requested but semantic runtime telemetry was incomplete; "
+            "results may reflect static analysis only."
+        )
     if unavailable_before_execution:
         logger.warning(
             "LLM stage unavailable during preflight; report reflects static analysis only"
+        )
+    elif semantic_runtime_incomplete:
+        logger.warning(
+            "LLM stage degraded: semantic runtime telemetry was incomplete; "
+            "report may reflect static analysis only"
         )
     elif degraded:
         logger.warning(
@@ -1627,6 +1668,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             transitive_truncation_reasons=transitive_truncation_reasons,
             structured_summaries=structured_summaries,
             llm_execution_enabled=use_llm,
+            semantic_runtime_incomplete=semantic_runtime_incomplete,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(

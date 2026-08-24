@@ -1751,6 +1751,115 @@ def test_degraded_scan_floors_recommendation_at_caution() -> None:
     assert result["risk_recommendation"] == "CAUTION"  # but never SAFE when degraded
 
 
+def test_explicit_requested_llm_with_missing_telemetry_degrades_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A requested semantic pass needs verified runtime evidence before JSON can say SAFE."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+        "llm_call_log": [],
+        "analyzer_status_events": [],
+    }
+
+    result = report(state)
+    payload = json.loads(result["report_body"])
+
+    assert result["risk_recommendation"] == "CAUTION"
+    assert payload["risk_assessment"]["recommendation"] == "CAUTION"
+    assert payload["metadata"]["llm_degraded"] is True
+    assert "runtime telemetry was incomplete" in payload["metadata"]["llm_error"]
+
+
+def test_explicit_requested_llm_with_invalid_call_telemetry_degrades_without_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed runtime evidence cannot bypass the floor or break report rendering."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+        "llm_call_log": ["invalid"],  # type: ignore[list-item]
+        "analyzer_status_events": [],
+    }
+
+    result = report(state)
+    payload = json.loads(result["report_body"])
+
+    assert result["risk_recommendation"] == "CAUTION"
+    assert payload["metadata"]["llm_degraded"] is True
+    assert "runtime telemetry was incomplete" in payload["metadata"]["llm_error"]
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "markdown", "sarif"])
+def test_explicit_requested_llm_with_missing_telemetry_warns_every_report_surface(
+    output_format: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Human-readable and SARIF reports expose the shared semantic coverage gap."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": output_format,
+        "use_llm": True,
+        "llm_requested": True,
+        "llm_call_log": [],
+        "analyzer_status_events": [],
+    }
+
+    result = report(state)
+
+    assert result["risk_recommendation"] == "CAUTION"
+    assert "runtime telemetry was incomplete" in result["report_body"]
+    if output_format == "sarif":
+        notification = result["sarif_report"]["runs"][0]["invocations"][0][
+            "toolExecutionNotifications"
+        ][0]
+        assert notification["level"] == "warning"
+
+
+def test_explicit_all_not_applicable_semantic_pass_stays_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified no-work statuses are complete without claiming any LLM calls."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": True,
+        "llm_call_log": [],
+        "analyzer_status_events": [
+            {"analyzer_id": "semantic_developer_intent", "status": "not_applicable"},
+            {"analyzer_id": "semantic_quality_policy", "status": "not_applicable"},
+            {"analyzer_id": "semantic_security_discovery", "status": "not_applicable"},
+        ],
+    }
+
+    result = report(state)
+    metadata = json.loads(result["report_body"])["metadata"]
+
+    assert result["risk_recommendation"] == "SAFE"
+    assert "llm_degraded" not in metadata
+
+
 def test_unavailable_provider_floors_recommendation_even_with_success_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

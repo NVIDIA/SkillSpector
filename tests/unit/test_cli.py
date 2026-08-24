@@ -110,6 +110,14 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         assert provider in result.output
 
 
+@pytest.mark.parametrize(("no_llm", "expected"), [(False, True), (True, False)])
+def test_scan_state_records_explicit_llm_request_intent(no_llm: bool, expected: bool) -> None:
+    """Report finalization can distinguish real CLI intent from legacy direct calls."""
+    state = cli._scan_state("skill", FormatChoice.json, no_llm)
+
+    assert state["llm_requested"] is expected
+
+
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
     """scan with local directory runs graph and prints report."""
     (tmp_path / "SKILL.md").write_text("---\nname: scan-test\n---\n# Safe", encoding="utf-8")
