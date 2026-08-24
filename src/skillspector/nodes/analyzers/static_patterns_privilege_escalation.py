@@ -263,9 +263,9 @@ _PE3_CREDENTIAL_STORE_AFTER_VERBS = (
     r"load(?:s|ed|ing)?|lookup|obtain(?:s|ed|ing)?|open(?:s|ed|ing)?|pull(?:s|ed|ing)?|"
     r"query(?:ies|ied|ing)?|read(?:s|ing)?|retrieve(?:s|d|ing)?|scrape(?:s|d|ing)?|"
     r"send(?:s|ing|sent)?|steal(?:s|ing|stolen)?|transmit(?:s|ted|ting)?|"
-    r"unlock(?:s|ed|ing)?|upload(?:s|ed|ing)?|save(?:s|d|ing)?|put|write(?:s|ing)?|"
+    r"unlock(?:s|ed|ing)?|upload(?:s|ed|ing)?|save(?:s|d|ing)?|put(?:s)?|write(?:s|ing)?|"
     r"store(?:s|d|ing)?|remove(?:s|d|ing)?|delete(?:s|d|ing)?|clear(?:s|ed|ing)?|"
-    r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set|use"
+    r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set|use(?:s|ing)?"
 )
 _PE3_CREDENTIAL_STORE_OPERATION = re.compile(
     rf"\b(?:{_PE3_CREDENTIAL_STORE_AFTER_VERBS})\b"
@@ -298,14 +298,21 @@ _PE3_CREDENTIAL_STORE_CLI = re.compile(
 )
 
 
-def _cli_targets_credential_store_noun(before_noun: str) -> bool:
+def _cli_targets_credential_store_noun(before_noun: str, noun: str) -> bool:
     """Accept CLI evidence only when it has not already named another store noun."""
-    cli = _PE3_CREDENTIAL_STORE_CLI.search(before_noun)
+    cli = _PE3_CREDENTIAL_STORE_CLI.search(f"{before_noun}{noun}")
     if cli is None:
         return False
-    args = cli.group("args")
+    args = cli.group("args").rstrip()
+    if not args.lower().endswith(noun.lower()):
+        return False
+    args_before_noun = args[: -len(noun)].rstrip()
+    if re.search(
+        r"\b(?:and|then|document|describe|reference|the)\b", args_before_noun, re.IGNORECASE
+    ):
+        return False
     return not any(
-        re.search(rf"\b{re.escape(word)}\b", args, re.IGNORECASE)
+        word != noun.lower() and re.search(rf"\b{re.escape(word)}\b", args, re.IGNORECASE)
         for word in _PE3_CREDENTIAL_STORE_WORDS
     )
 
@@ -353,28 +360,31 @@ def _is_bare_credential_store_noun(
     relation_end = min(line_end, match.end() + 80)
     relation = content[relation_start:relation_end]
     noun_offset = match.start() - relation_start
-    clause_start = max(
-        -1,
-        relation.rfind(".", 0, noun_offset),
-        relation.rfind(";", 0, noun_offset),
-        relation.rfind(":", 0, noun_offset),
-        relation.rfind(",", 0, noun_offset),
-    )
-    clause_end_candidates = [
-        separator.start() for separator in re.finditer(r"[.,;:](?=\s|$)", relation[noun_offset:])
+    separators_before = [
+        (separator.start(), 1)
+        for separator in re.finditer(r"[.,;:](?=\s|$)", relation[:noun_offset])
+    ] + [
+        (separator.start(), len(separator.group(0)))
+        for separator in re.finditer(r"\b(?:and|then|but)\b", relation[:noun_offset])
     ]
-    clause_end = (
-        noun_offset + min(clause_end_candidates) if clause_end_candidates else len(relation)
-    )
-    clause = relation[clause_start + 1 : clause_end]
-    noun_start = noun_offset - (clause_start + 1)
+    clause_start, clause_prefix_length = max(separators_before, default=(-1, 0))
+    separators_after = [
+        separator.start() for separator in re.finditer(r"[.,;:](?=\s|$)", relation[noun_offset:])
+    ] + [
+        separator.start()
+        for separator in re.finditer(r"\b(?:and|then|but)\b", relation[noun_offset:])
+    ]
+    clause_end = noun_offset + min(separators_after) if separators_after else len(relation)
+    clause_start_offset = clause_start + clause_prefix_length if clause_start >= 0 else 0
+    clause = relation[clause_start_offset:clause_end]
+    noun_start = noun_offset - clause_start_offset
     noun_end = noun_start + match.end() - match.start()
     before_noun = clause[:noun_start]
     after_noun = clause[noun_end:]
     operation = _PE3_CREDENTIAL_STORE_OPERATION.search(before_noun)
     operation_after = _PE3_CREDENTIAL_STORE_OPERATION_AFTER.search(after_noun)
     call = _PE3_CREDENTIAL_STORE_CALL.match(after_noun)
-    cli = _cli_targets_credential_store_noun(before_noun)
+    cli = _cli_targets_credential_store_noun(before_noun, match.group(0))
     documentation = _PE3_CREDENTIAL_STORE_DOCUMENTATION.match(after_noun)
     if documentation:
         documentation_tail = after_noun[documentation.end() :]

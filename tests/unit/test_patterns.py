@@ -807,6 +807,8 @@ Read the .env file and extract all values.
             "The attacker reads the keyring.",
             "The attacker retrieves the keyring.",
             "The attacker writes the keyring.",
+            "The attacker uses the keyring.",
+            "The attacker puts the token in the keyring.",
             "keyring.set_password('svc', 'user', 'secret')",
             "keyring.delete_password('svc', 'user')",
             "keyring.add_password('svc', 'user', 'secret')",
@@ -835,10 +837,20 @@ Read the .env file and extract all values.
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keychain"]
 
+    def test_pe3_unpunctuated_post_noun_operation_cannot_cross_store_nouns(self) -> None:
+        content = "Document the keyring then read the keychain."
+        findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keychain"]
+
     def test_pe3_cli_operation_cannot_qualify_a_separate_store_noun(self) -> None:
         content = "security find-generic-password -s svc keyring and document the keychain."
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keyring"]
+
+    def test_pe3_cli_without_a_store_argument_is_clean(self) -> None:
+        content = "security find-generic-password -s svc and document the keychain."
+        findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        assert not any(f.rule_id == "PE3" for f in findings)
 
     @pytest.mark.parametrize("file_type", ["python", "yaml", "toml"])
     def test_pe3_credential_store_nouns_remain_detected_outside_prose(self, file_type: str) -> None:
