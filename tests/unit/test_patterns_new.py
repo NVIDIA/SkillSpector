@@ -292,6 +292,9 @@ class TestExcessiveAgency:
         "content",
         [
             "The claude -p flag prints a response.",
+            'The `codex exec "Fix tests"` command is documented below.',
+            "For example, `claude -p 'Review this diff'` prints a response.",
+            "```text\ncodex exec 'Fix the tests'\n```",
             "Compare Codex execution with other coding agents.",
             "Use the user's currently selected model and provider.",
             "model: claude-sonnet-4-6",
@@ -302,6 +305,11 @@ class TestExcessiveAgency:
     def test_ea5_non_actionable_prose_and_body_keys_are_not_flagged(self, content: str) -> None:
         findings = ea_mod.analyze(content, "SKILL.md", "markdown")
         assert not any(finding.rule_id == "EA5" for finding in findings)
+
+    def test_ea5_shell_fence_is_actionable(self) -> None:
+        content = "```shell\ncodex exec 'Fix the tests'\n```"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        assert any(finding.rule_id == "EA5" for finding in findings)
 
 
 # ── Output Handling (OH1–OH3) ──────────────────────────────────────────

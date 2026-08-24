@@ -168,6 +168,13 @@ _EA5_IMPERATIVE_PREFIX = re.compile(
     r"^(?:run|execute|invoke|call)(?:[ \t]+the)?(?:[ \t]+command)?[ \t]*:?[ \t]+",
     re.IGNORECASE,
 )
+_EA5_INLINE_DIRECTIVE_PREFIX = re.compile(
+    r"^(?:(?:[-*+]|\d+[.)])[ \t]+)?"
+    r"(?:run|execute|invoke|call)(?:[ \t]+the)?(?:[ \t]+command)?[ \t]*:?[ \t]*$",
+    re.IGNORECASE,
+)
+_EA5_FENCE = re.compile(r"^[ \t]*(?P<marker>`{3,}|~{3,})[ \t]*(?P<language>[\w+-]*)")
+_EA5_SHELL_FENCE_LANGUAGES = {"bash", "console", "sh", "shell", "zsh"}
 _EA5_MODEL_VALUE = re.compile(
     r"^(?:claude|gpt|gemini|deepseek|kimi|glm|minimax|mistral|llama)"
     r"(?:$|[-_./:0-9])",
@@ -247,6 +254,21 @@ def _command_span(line: str) -> tuple[int, int] | None:
     return None
 
 
+def _inline_command_span(line: str, inline: re.Match[str]) -> tuple[int, int] | None:
+    """Return an inline model-switch command only when prose directs its execution."""
+    if _EA5_INLINE_DIRECTIVE_PREFIX.match(line[: inline.start()]) is None:
+        return None
+    command = inline.group("command").strip()
+    if not _is_model_switch_command(command):
+        return None
+    command_offset = (
+        inline.start("command")
+        + len(inline.group("command"))
+        - len(inline.group("command").lstrip())
+    )
+    return command_offset, command_offset + len(command)
+
+
 def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
     """Detect declarative model pins and actionable coding-CLI model switches."""
     findings: list[AnalyzerFinding] = []
@@ -282,21 +304,35 @@ def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
 
     seen: set[tuple[int, int]] = set()
     cursor = body_start
+    fence_marker: str | None = None
+    fence_language = ""
     for line in content[body_start:].splitlines(keepends=True):
         line_text = line.rstrip("\r\n")
+        fence = _EA5_FENCE.match(line_text)
+        if fence is not None:
+            marker = fence.group("marker")
+            if fence_marker is None:
+                fence_marker = marker[0]
+                fence_language = fence.group("language").lower()
+            elif marker[0] == fence_marker:
+                fence_marker = None
+                fence_language = ""
+            cursor += len(line)
+            continue
+
         candidates: list[tuple[int, int]] = []
-        direct = _command_span(line_text)
-        if direct is not None:
-            candidates.append(direct)
+        if (
+            fence_marker is None
+            or fence_language in _EA5_SHELL_FENCE_LANGUAGES
+            or not fence_language
+        ):
+            direct = _command_span(line_text)
+            if direct is not None:
+                candidates.append(direct)
         for inline in _EA5_INLINE_CODE.finditer(line_text):
-            command = inline.group("command").strip()
-            if _is_model_switch_command(command):
-                command_offset = (
-                    inline.start("command")
-                    + len(inline.group("command"))
-                    - len(inline.group("command").lstrip())
-                )
-                candidates.append((command_offset, command_offset + len(command)))
+            command_span = _inline_command_span(line_text, inline)
+            if command_span is not None:
+                candidates.append(command_span)
 
         for line_start, line_end in candidates:
             absolute = (cursor + line_start, cursor + line_end)
