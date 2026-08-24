@@ -443,7 +443,8 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   Assert each lexically valid entry has a completeness-neutral
   `directory_existence_static_unknown` diagnostic because the pure helper does not call `stat`.
   Lexically normalize interior `.`/`..`: `child/../docs` stays project-local and
-  `child/../../docs` becomes external. A Windows drive root such as `C:\\` or `C:/` emits a
+  `child/../../docs` becomes external. Only ASCII `[A-Za-z]:` prefixes are Windows drives; a drive
+  root such as `C:\\` or `C:/` emits a
   conditional CRITICAL whole-root grant; a lexically sensitive Windows absolute path such as
   `C:\\Users\\x\\.ssh` emits a conditional HIGH sensitive-directory grant. Windows separator-only
   backslash forms resolve to the current drive root and are conditional CRITICAL. Other Windows
@@ -451,10 +452,16 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   conditional MEDIUM external-directory grant unless sensitive. One-component UNC-like forms such
   as `\\server` or `//server` resolve drive-root-relative and are conditional MEDIUM unless
   sensitive. Recognize both separator spellings and attach the completeness-affecting
-  `platform_dependent_path` diagnostic. Drive-relative or malformed UNC ambiguity with no provable
-  resolved scope emits that diagnostic without guessing a grant. Empty, NUL, malformed-home, and
-  environment-variable forms are `invalid_path`. Table-test `sensitive_additional_directory` in the
-  grant-kind allowlist.
+  `platform_dependent_path` diagnostic. Extended `\\?\\C:\\` drive roots are conditional CRITICAL;
+  extended drive tails and `\\?\\UNC\\server\\share` are conditional MEDIUM unless sensitive. Bare
+  `\\.\\` is a conditional CRITICAL current-drive-root form. Other device/reserved namespaces such
+  as `\\.\\PIPE`, `\\?\\Volume{...}`, `\\?\\GLOBALROOT`, bare/incomplete `\\?\\...`, and
+  `\\??\\...` emit only `platform_dependent_path`, with no existence diagnostic or guessed grant.
+  Non-ASCII colon prefixes such as `é:/docs`, `中:/docs`, and `Ｃ:/docs` are ordinary
+  project-relative paths with only the neutral existence diagnostic. Drive-relative or malformed
+  UNC ambiguity with no provable resolved scope emits the platform diagnostic without guessing a
+  grant. Empty, NUL, malformed-home, and environment-variable forms are `invalid_path`. Table-test
+  `sensitive_additional_directory` in the grant-kind allowlist.
 
 - [ ] **Step 4: Add and implement known ignored grammar tests**
 
@@ -1146,7 +1153,8 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   - bare WebFetch, `domain:*`, literal/wildcard domain, and unsupported `WebFetch(*)` spellings; and
   - `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized interior-parent, Windows drive
     root, separator-only backslash root, sensitive absolute, ordinary absolute-drive, complete
-    backslash/forward-slash UNC, one-component UNC-like, malformed UNC, and drive-relative
+    backslash/forward-slash UNC, one-component UNC-like, extended drive/UNC roots and tails, bare and
+    unsupported device namespaces, non-ASCII colon-relative, malformed UNC, and drive-relative
     additional-directory spellings.
 
   Capture only safe debug/status lines. Never run a destructive command and never transmit a canary.

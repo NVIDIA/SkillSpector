@@ -435,12 +435,18 @@ directory; it never resolves a symlink or exposes the path:
 | `~` or `~/` | Whole-home CRITICAL |
 | `~/child` | External/home directory, MEDIUM unless sensitive |
 | Any sensitive external/home/absolute directory such as `~/.ssh` | HIGH `sensitive_additional_directory` |
-| Windows drive root such as `C:\\` or `C:/` | Conditional whole-root CRITICAL plus completeness-affecting `platform_dependent_path` |
+| Windows ASCII drive root such as `C:\\` or `C:/` | Conditional whole-root CRITICAL plus completeness-affecting `platform_dependent_path` |
 | Windows separator-only backslash form such as `\` or `\\` | Conditional current-drive-root CRITICAL plus completeness-affecting `platform_dependent_path` |
 | Lexically sensitive Windows absolute path such as `C:\\Users\\x\\.ssh` | Conditional sensitive-directory HIGH plus completeness-affecting `platform_dependent_path` |
-| Complete Windows UNC form with non-empty server and share, using `\\server\\share` or `//server/share` separators | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| Complete ordinary Windows UNC form with non-empty non-reserved server and share, using `\\server\\share` or `//server/share` separators | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
 | One-component UNC-like form such as `\\server` or `//server` | Conditional drive-root-relative external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
-| Other Windows absolute drive form | Conditional external MEDIUM plus completeness-affecting `platform_dependent_path` |
+| Extended ASCII-drive root `\\?\\C:\\` or `//?/C:/` | Conditional whole-root CRITICAL plus completeness-affecting `platform_dependent_path` |
+| Extended ASCII-drive path `\\?\\C:\\docs` or `//?/C:/docs` | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| Extended UNC `\\?\\UNC\\server\\share` or `//?/UNC/server/share` | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| Bare device namespace `\\.\\` or `//./` | Conditional current-drive-root CRITICAL plus completeness-affecting `platform_dependent_path` |
+| Other Windows absolute ASCII-drive form | Conditional external MEDIUM plus completeness-affecting `platform_dependent_path` |
+| Other reserved/device namespace such as `\\.\\PIPE`, `\\?\\Volume{...}`, `\\?\\GLOBALROOT`, bare/incomplete `\\?\\...`, or `\\??\\...` | Completeness-affecting `platform_dependent_path`; no grant or existence diagnostic is guessed |
+| Non-ASCII colon prefix such as `é:/docs`, `中:/docs`, or `Ｃ:/docs` | Ordinary project-relative path after lexical normalization; no grant plus completeness-neutral existence diagnostic |
 | Drive-relative, malformed UNC, or otherwise platform-ambiguous form with no provable resolved scope | Completeness-affecting `platform_dependent_path`; no grant is guessed |
 | Empty, NUL-bearing, malformed home, or environment-variable form | Completeness-affecting `invalid_path` |
 
@@ -451,8 +457,8 @@ Each otherwise valid or conditionally external entry gets at most one completene
 `directory_existence_static_unknown` diagnostic; runtime absence does not turn a lexical grant into
 a static safe result. Exact tests cover `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized
 interior parents, Windows drive-root and separator-only roots, sensitive absolute, ordinary
-absolute-drive, complete backslash/forward-slash UNC, one-component UNC-like, malformed UNC, and
-drive-relative forms.
+absolute-drive, complete backslash/forward-slash UNC, one-component UNC-like, extended drive/UNC,
+reserved device namespaces, non-ASCII colon-relative, malformed UNC, and drive-relative forms.
 
 ### Network, execution, and MCP rules
 
