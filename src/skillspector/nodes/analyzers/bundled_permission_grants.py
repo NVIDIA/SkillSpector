@@ -40,6 +40,89 @@ _RECOGNIZED_KEYS: Final = frozenset(
 )
 _RULE_KEYS: Final = frozenset({"allow", "ask", "deny", "additionalDirectories"})
 _SEVERITY_RANK: Final = {"MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+GRANT_KIND_ALLOWLIST: Final = frozenset(
+    {
+        "permission_mode_bypass",
+        "permission_mode_accept_edits",
+        "tool_wide_execution",
+        "scoped_execution",
+        "tool_wide_read",
+        "root_or_home_wide_read",
+        "sensitive_read",
+        "external_read",
+        "tool_wide_edit",
+        "root_or_home_wide_edit",
+        "sensitive_edit",
+        "broad_external_edit",
+        "scoped_edit",
+        "tool_wide_write",
+        "broad_notebook_edit",
+        "broad_multi_edit",
+        "filesystem_enumeration",
+        "filesystem_search",
+        "code_intelligence",
+        "all_domain_fetch",
+        "scoped_domain_fetch",
+        "network_search",
+        "mcp_server_wide",
+        "mcp_exact_tool",
+        "mcp_partial_tool",
+        "root_or_home_additional_directory",
+        "sensitive_additional_directory",
+        "external_additional_directory",
+        "external_content_upload",
+        "skill_invocation",
+        "autonomous_workflow",
+        "workspace_boundary_change",
+        "approval_gate_transition",
+    }
+)
+
+_SHELL_TOOLS: Final = frozenset({"Bash", "PowerShell", "Monitor"})
+_FILESYSTEM_TOOLS: Final = frozenset(
+    {"Read", "Edit", "Write", "NotebookEdit", "MultiEdit", "Glob", "Grep", "LSP"}
+)
+_BARE_EXTERNAL_UPLOAD_TOOLS: Final = frozenset({"Artifact", "ShareOnboardingGuide"})
+_KNOWN_NON_GRANT_TOOLS: Final = frozenset(
+    {
+        "Agent",
+        "AskUserQuestion",
+        "Cd",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "EndConversation",
+        "EnterPlanMode",
+        "ExitWorktree",
+        "ListAgents",
+        "ListMcpResourcesTool",
+        "PushNotification",
+        "ReadMcpResourceDirTool",
+        "ReadMcpResourceTool",
+        "RemoteTrigger",
+        "ReportFindings",
+        "ScheduleWakeup",
+        "SendMessage",
+        "SendUserFile",
+        "SendUserMessage",
+        "Task",
+        "TaskCreate",
+        "TaskGet",
+        "TaskList",
+        "TaskOutput",
+        "TaskStop",
+        "TaskUpdate",
+        "TodoWrite",
+        "ToolSearch",
+        "WaitForMcpServers",
+    }
+)
+_BARE_ROUTE_GRANTS: Final = {
+    "Workflow": ("autonomous_workflow", "HIGH"),
+    "EnterWorktree": ("workspace_boundary_change", "HIGH"),
+    "ExitPlanMode": ("approval_gate_transition", "MEDIUM"),
+}
+_WHOLE_PERMISSION_PATHS: Final = frozenset({"//", "//**", "//**/*", "~", "~/", "~/**", "~/**/*"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +175,39 @@ class PermissionAnalysis:
     grants: tuple[PermissionGrant, ...]
     diagnostics: tuple[PermissionDiagnostic, ...]
     aggregate_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedRule:
+    tool: str
+    specifier: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PathClassification:
+    scope: str
+    normalized: str
+    broad: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _AllowCandidate:
+    grant: PermissionGrant
+    tool_identifier: str
+    original_tool_identifier: str
+    normalized_identity: str
+    mcp_server: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Restriction:
+    tool_identifier: str
+    original_tool_identifier: str
+    normalized_identity: str
+    tool_glob: bool
+    tool_wide: bool
+    mcp_server: str | None
+    source_line: int
 
 
 def _digest(domain: str, value: bytes) -> str:
@@ -164,6 +280,319 @@ def _rule_context(source_kind: str) -> tuple[str, str, str]:
     )
 
 
+def _valid_tool_identifier(value: str, *, allow_glob: bool) -> bool:
+    if not value or not value.isascii():
+        return False
+    for character in value:
+        if character.isalnum() or character in {"_", "-"}:
+            continue
+        if allow_glob and character == "*":
+            continue
+        return False
+    return True
+
+
+def _parse_permission_rule(rule: str) -> _ParsedRule | None:
+    """Parse the closed bare-or-single-specifier grammar without retaining input."""
+    opening = rule.find("(")
+    if opening < 0:
+        if ")" in rule or not _valid_tool_identifier(rule, allow_glob=True):
+            return None
+        return _ParsedRule(rule, None)
+    if opening == 0 or not rule.endswith(")"):
+        return None
+    tool = rule[:opening]
+    specifier = rule[opening + 1 : -1]
+    if (
+        not specifier
+        or "(" in specifier
+        or ")" in specifier
+        or not _valid_tool_identifier(tool, allow_glob=False)
+    ):
+        return None
+    return _ParsedRule(tool, specifier)
+
+
+def _sensitive_path(parts: tuple[str, ...]) -> bool:
+    lowered = tuple(part.casefold() for part in parts if part not in {"", ".", "*", "**"})
+    joined = "/".join(lowered)
+    sensitive_segments = {
+        ".agents",
+        ".anthropic",
+        ".aws",
+        ".azure",
+        ".bash_history",
+        ".claude",
+        ".codex",
+        ".config/gcloud",
+        ".cursor",
+        ".docker",
+        ".env",
+        ".git-credentials",
+        ".kube",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".ssh",
+        ".zsh_history",
+        "credentials",
+        "credentials.json",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+        "kubeconfig",
+    }
+    if any(part in sensitive_segments or part.startswith(".env.") for part in lowered):
+        return True
+    for part in lowered:
+        words = part.replace("-", "_").replace(".", "_").split("_")
+        if any(
+            word in {"credential", "credentials", "secret", "secrets", "token", "tokens"}
+            for word in words
+        ):
+            return True
+    credential_stores = (".config/gcloud", ".config/gh", ".config/glab")
+    if any(joined == store or joined.startswith(f"{store}/") for store in credential_stores):
+        return True
+    if any(part.endswith((".key", ".pem")) for part in lowered):
+        return True
+    return any(marker in joined for marker in ("/secret", "/token", "/credentials"))
+
+
+def _classify_path_specifier(specifier: str) -> _PathClassification:
+    if (
+        not specifier
+        or "\0" in specifier
+        or "\\" in specifier
+        or specifier.startswith("$")
+        or (len(specifier) >= 2 and specifier[0].isalpha() and specifier[1] == ":")
+        or (specifier.startswith("~") and specifier != "~" and not specifier.startswith("~/"))
+        or specifier.startswith("///")
+        or ("//" in specifier and not specifier.startswith("//"))
+    ):
+        return _PathClassification("invalid", "invalid", False)
+
+    if specifier in _WHOLE_PERMISSION_PATHS:
+        scope = "root" if specifier.startswith("//") else "home"
+        return _PathClassification(scope, specifier, True)
+
+    anchor = "project"
+    remainder = specifier
+    prefix = ""
+    if specifier.startswith("//"):
+        anchor = "external"
+        remainder = specifier[2:]
+        prefix = "//"
+    elif specifier == "~" or specifier.startswith("~/"):
+        anchor = "external"
+        remainder = specifier[2:] if specifier.startswith("~/") else ""
+        prefix = "~/"
+    elif specifier.startswith("/"):
+        remainder = specifier[1:]
+        prefix = "/"
+    else:
+        while remainder.startswith("../"):
+            anchor = "external"
+            prefix += "../"
+            remainder = remainder[3:]
+        if remainder == "..":
+            anchor = "external"
+            prefix += ".."
+            remainder = ""
+        elif remainder.startswith("./"):
+            remainder = remainder[2:]
+        elif remainder == ".":
+            remainder = ""
+
+    if "//" in remainder:
+        return _PathClassification("invalid", "invalid", False)
+    raw_parts = tuple(part for part in remainder.split("/") if part)
+    if any(part == ".." for part in raw_parts):
+        return _PathClassification("invalid", "invalid", False)
+    if _sensitive_path(raw_parts):
+        normalized = f"{prefix}{'/'.join(raw_parts)}"
+        return _PathClassification("sensitive", normalized, False)
+
+    normalized = f"{prefix}{'/'.join(raw_parts)}"
+    broad = bool(
+        anchor == "external"
+        and (
+            (raw_parts and raw_parts[-1] in {"*", "**"})
+            or normalized.endswith("/**")
+            or normalized.endswith("/**/*")
+        )
+    )
+    return _PathClassification(anchor, normalized, broad)
+
+
+def _normalize_bash_specifier(specifier: str) -> str:
+    if specifier.endswith(":*"):
+        return f"{specifier[:-2]} *"
+    return specifier
+
+
+def _valid_domain_pattern(value: str) -> str | None:
+    if not value or not value.isascii():
+        return None
+    normalized = value[:-1] if value.endswith(".") else value
+    if not normalized or len(normalized) > 253 or normalized.endswith("."):
+        return None
+    labels = normalized.split(".")
+    for label in labels:
+        if not label or len(label) > 63 or label.startswith("-") or label.endswith("-"):
+            return None
+        if any(not (character.isalnum() or character in {"-", "*"}) for character in label):
+            return None
+    return normalized.lower()
+
+
+def _mcp_classification(tool: str) -> tuple[str, str, str] | None:
+    parts = tool.split("__")
+    if len(parts) not in {2, 3} or parts[0] != "mcp":
+        return None
+    server = parts[1]
+    if not _valid_tool_identifier(server, allow_glob=False):
+        return None
+    if len(parts) == 2:
+        return "mcp_server_wide", "HIGH", f"mcp__{server}__*"
+    mcp_tool = parts[2]
+    if not _valid_tool_identifier(mcp_tool, allow_glob=True):
+        return None
+    if mcp_tool == "*":
+        return "mcp_server_wide", "HIGH", f"mcp__{server}__*"
+    if "*" in mcp_tool:
+        return "mcp_partial_tool", "MEDIUM", tool
+    return "mcp_exact_tool", "MEDIUM", tool
+
+
+def _normalized_rule_identity(parsed: _ParsedRule) -> tuple[str, str]:
+    tool = "powershell" if parsed.tool.casefold() == "powershell" else parsed.tool
+    specifier = parsed.specifier
+    if tool == "Monitor" and specifier is not None:
+        tool = "Bash"
+    if tool in {"Bash", "powershell", "Monitor"}:
+        if specifier is None or specifier == "*":
+            return tool, f"{tool}(*)"
+        normalized_specifier = _normalize_bash_specifier(specifier)
+        if tool == "powershell":
+            normalized_specifier = normalized_specifier.casefold()
+        return tool, f"{tool}({normalized_specifier})"
+    if tool == "WebFetch" and specifier is not None and specifier.startswith("domain:"):
+        domain = _valid_domain_pattern(specifier[7:])
+        if domain is not None:
+            return tool, f"WebFetch(domain:{domain})"
+    if specifier is None and tool.startswith("mcp__"):
+        mcp = _mcp_classification(tool)
+        if mcp is not None:
+            return tool, mcp[2]
+    identity = tool if specifier is None else f"{tool}({specifier})"
+    return tool, identity
+
+
+def _classify_restriction(
+    rule: str, *, key: str, source_line: int
+) -> tuple[_Restriction | None, PermissionDiagnostic, bool]:
+    parsed = _parse_permission_rule(rule)
+    if parsed is None:
+        return (
+            None,
+            _diagnostic("unknown_rule", True, source_line, identity=f"{key}:{rule}"),
+            False,
+        )
+    tool_identifier, normalized_identity = _normalized_rule_identity(parsed)
+    original_tool = "powershell" if parsed.tool.casefold() == "powershell" else parsed.tool
+    mcp = _mcp_classification(parsed.tool) if parsed.specifier is None else None
+    mcp_server = (
+        parsed.tool.split("__")[1] if mcp is not None and mcp[0] == "mcp_server_wide" else None
+    )
+    tool_wide = (
+        parsed.specifier is None
+        or (original_tool in {"Bash", "powershell", "Monitor"} and parsed.specifier == "*")
+        or (original_tool == "WebFetch" and parsed.specifier == "domain:*")
+    )
+    restriction = _Restriction(
+        tool_identifier=tool_identifier,
+        original_tool_identifier=original_tool,
+        normalized_identity=normalized_identity,
+        tool_glob=parsed.specifier is None and "*" in parsed.tool,
+        tool_wide=tool_wide,
+        mcp_server=mcp_server,
+        source_line=source_line,
+    )
+    diagnostic = _diagnostic(
+        "restrictive_rule", False, source_line, identity=f"{key}:{normalized_identity}"
+    )
+    return restriction, diagnostic, True
+
+
+def _literal_index(value: str, literal: str, start: int, end: int) -> int:
+    prefix = [0] * len(literal)
+    matched = 0
+    for index in range(1, len(literal)):
+        while matched and literal[index] != literal[matched]:
+            matched = prefix[matched - 1]
+        if literal[index] == literal[matched]:
+            matched += 1
+            prefix[index] = matched
+
+    matched = 0
+    for index in range(start, end):
+        while matched and value[index] != literal[matched]:
+            matched = prefix[matched - 1]
+        if value[index] == literal[matched]:
+            matched += 1
+            if matched == len(literal):
+                return index - len(literal) + 1
+    return -1
+
+
+def _bounded_glob_match(pattern: str, value: str) -> bool:
+    if "*" not in pattern:
+        return pattern == value
+    segments = tuple(segment for segment in pattern.split("*") if segment)
+    if not segments:
+        return True
+
+    start = 0
+    end = len(value)
+    first_segment = 0
+    last_segment = len(segments)
+    if not pattern.startswith("*"):
+        leading = segments[0]
+        if not value.startswith(leading):
+            return False
+        start = len(leading)
+        first_segment = 1
+    if not pattern.endswith("*"):
+        trailing = segments[-1]
+        if not value.endswith(trailing):
+            return False
+        end -= len(trailing)
+        last_segment -= 1
+    if start > end:
+        return False
+    for literal in segments[first_segment:last_segment]:
+        found = _literal_index(value, literal, start, end)
+        if found < 0:
+            return False
+        start = found + len(literal)
+    return start <= end
+
+
+def _restriction_covers(candidate: _AllowCandidate, restriction: _Restriction) -> bool:
+    if restriction.normalized_identity == candidate.normalized_identity:
+        return True
+    if restriction.tool_glob:
+        return _bounded_glob_match(restriction.tool_identifier, candidate.tool_identifier)
+    if restriction.mcp_server is not None and restriction.mcp_server == candidate.mcp_server:
+        return True
+    return restriction.tool_wide and (
+        restriction.tool_identifier == candidate.tool_identifier
+        or restriction.original_tool_identifier == candidate.original_tool_identifier
+    )
+
+
 def _diagnostic(
     kind: str,
     affects_completeness: bool,
@@ -191,8 +620,12 @@ def _grant(
     source_line: int,
     *,
     identity: str,
+    mode_context: bool = False,
 ) -> PermissionGrant:
-    activation_requirement, interface_applicability, tracking_status = _mode_context(source_kind)
+    if grant_kind not in GRANT_KIND_ALLOWLIST:
+        raise ValueError("unsupported permission grant kind")
+    context = _mode_context(source_kind) if mode_context else _rule_context(source_kind)
+    activation_requirement, interface_applicability, tracking_status = context
     blocking_critical = severity == "CRITICAL"
     safe = {
         "grant_kind": grant_kind,
@@ -213,6 +646,384 @@ def _grant(
         grant_digest=_digest("grant.v1", _canonical_bytes(safe)),
         source_line=source_line,
     )
+
+
+def _allow_grant_candidate(
+    parsed: _ParsedRule,
+    grant_kind: str,
+    severity: str,
+    source_kind: str,
+    source_line: int,
+    *,
+    identity: str | None = None,
+) -> _AllowCandidate:
+    tool_identifier, normalized_identity = _normalized_rule_identity(parsed)
+    original_tool = "powershell" if parsed.tool.casefold() == "powershell" else parsed.tool
+    mcp = _mcp_classification(parsed.tool) if parsed.specifier is None else None
+    mcp_server = parsed.tool.split("__")[1] if mcp is not None else None
+    safe_identity = normalized_identity if identity is None else identity
+    return _AllowCandidate(
+        _grant(grant_kind, severity, source_kind, source_line, identity=safe_identity),
+        tool_identifier,
+        original_tool,
+        normalized_identity,
+        mcp_server,
+    )
+
+
+def _classify_allow_rule(
+    rule: str,
+    *,
+    source_kind: str,
+    source_line: int,
+) -> tuple[_AllowCandidate | None, PermissionDiagnostic | None, bool]:
+    parsed = _parse_permission_rule(rule)
+    if parsed is None:
+        return (
+            None,
+            _diagnostic("unknown_rule", True, source_line, identity=rule),
+            False,
+        )
+
+    tool = parsed.tool
+    specifier = parsed.specifier
+    if tool.casefold() == "powershell":
+        tool = "PowerShell"
+        parsed = _ParsedRule(tool, specifier)
+
+    if tool.startswith("mcp__"):
+        if specifier is not None:
+            return (
+                None,
+                _diagnostic("unknown_rule", True, source_line, identity=rule),
+                False,
+            )
+        mcp = _mcp_classification(tool)
+        if mcp is not None:
+            grant_kind, severity, identity = mcp
+            return (
+                _allow_grant_candidate(
+                    parsed,
+                    grant_kind,
+                    severity,
+                    source_kind,
+                    source_line,
+                    identity=identity,
+                ),
+                None,
+                True,
+            )
+        if tool == "mcp__*":
+            return (
+                None,
+                _diagnostic("ignored_allow_rule_glob", False, source_line, identity=tool),
+                True,
+            )
+        return None, _diagnostic("unknown_rule", True, source_line, identity=rule), False
+
+    if specifier is None and "*" in tool:
+        return (
+            None,
+            _diagnostic("ignored_allow_rule_glob", False, source_line, identity=tool),
+            True,
+        )
+
+    if tool in _SHELL_TOOLS:
+        if specifier in {None, "*"}:
+            return (
+                _allow_grant_candidate(
+                    parsed, "tool_wide_execution", "CRITICAL", source_kind, source_line
+                ),
+                None,
+                True,
+            )
+        return (
+            _allow_grant_candidate(parsed, "scoped_execution", "MEDIUM", source_kind, source_line),
+            None,
+            True,
+        )
+
+    if tool in _FILESYSTEM_TOOLS:
+        bare_grants = {
+            "Read": ("tool_wide_read", "CRITICAL"),
+            "Edit": ("tool_wide_edit", "CRITICAL"),
+            "Write": ("tool_wide_write", "CRITICAL"),
+            "NotebookEdit": ("broad_notebook_edit", "HIGH"),
+            "MultiEdit": ("broad_multi_edit", "HIGH"),
+            "Glob": ("filesystem_enumeration", "MEDIUM"),
+            "Grep": ("filesystem_search", "MEDIUM"),
+            "LSP": ("code_intelligence", "MEDIUM"),
+        }
+        if specifier is None:
+            grant_kind, severity = bare_grants[tool]
+            return (
+                _allow_grant_candidate(parsed, grant_kind, severity, source_kind, source_line),
+                None,
+                True,
+            )
+        if tool in {"Grep", "LSP"}:
+            return (
+                None,
+                _diagnostic("runtime_uncertain_rule", True, source_line, identity=rule),
+                False,
+            )
+        if tool not in {"Read", "Edit"}:
+            return (
+                None,
+                _diagnostic("ignored_path_qualifier", False, source_line, identity=rule),
+                True,
+            )
+        path = _classify_path_specifier(specifier)
+        if path.scope == "invalid":
+            return None, _diagnostic("unknown_rule", True, source_line, identity=rule), False
+        if tool == "Read":
+            if path.scope in {"root", "home"}:
+                kind, severity = "root_or_home_wide_read", "CRITICAL"
+            elif path.scope == "sensitive":
+                kind, severity = "sensitive_read", "HIGH"
+            elif path.scope == "external":
+                kind, severity = "external_read", "MEDIUM"
+            else:
+                return None, None, True
+        elif path.scope in {"root", "home"}:
+            kind, severity = "root_or_home_wide_edit", "CRITICAL"
+        elif path.scope == "sensitive":
+            kind, severity = "sensitive_edit", "HIGH"
+        elif path.broad:
+            kind, severity = "broad_external_edit", "HIGH"
+        else:
+            kind, severity = "scoped_edit", "MEDIUM"
+        return (
+            _allow_grant_candidate(parsed, kind, severity, source_kind, source_line),
+            None,
+            True,
+        )
+
+    if tool == "WebFetch":
+        if specifier is None:
+            return (
+                _allow_grant_candidate(
+                    parsed, "all_domain_fetch", "HIGH", source_kind, source_line
+                ),
+                None,
+                True,
+            )
+        if specifier == "*":
+            return (
+                None,
+                _diagnostic("unsupported_allow_specifier", False, source_line, identity=rule),
+                True,
+            )
+        if not specifier.startswith("domain:"):
+            return None, _diagnostic("unknown_rule", True, source_line, identity=rule), False
+        domain = _valid_domain_pattern(specifier[7:])
+        if domain is None:
+            return None, _diagnostic("unknown_rule", True, source_line, identity=rule), False
+        kind, severity = (
+            ("all_domain_fetch", "HIGH") if domain == "*" else ("scoped_domain_fetch", "MEDIUM")
+        )
+        normalized = _ParsedRule(tool, f"domain:{domain}")
+        return (
+            _allow_grant_candidate(normalized, kind, severity, source_kind, source_line),
+            None,
+            True,
+        )
+
+    if tool == "WebSearch":
+        if specifier is not None:
+            return (
+                None,
+                _diagnostic("unsupported_allow_specifier", False, source_line, identity=rule),
+                True,
+            )
+        return (
+            _allow_grant_candidate(parsed, "network_search", "MEDIUM", source_kind, source_line),
+            None,
+            True,
+        )
+
+    if tool in _BARE_EXTERNAL_UPLOAD_TOOLS:
+        if specifier is not None:
+            return (
+                None,
+                _diagnostic("unsupported_allow_specifier", False, source_line, identity=rule),
+                True,
+            )
+        return (
+            _allow_grant_candidate(
+                parsed, "external_content_upload", "HIGH", source_kind, source_line
+            ),
+            None,
+            True,
+        )
+
+    if tool == "Skill":
+        return (
+            _allow_grant_candidate(parsed, "skill_invocation", "MEDIUM", source_kind, source_line),
+            None,
+            True,
+        )
+
+    if tool in _BARE_ROUTE_GRANTS:
+        if specifier is not None:
+            return (
+                None,
+                _diagnostic("unsupported_allow_specifier", False, source_line, identity=rule),
+                True,
+            )
+        kind, severity = _BARE_ROUTE_GRANTS[tool]
+        return (
+            _allow_grant_candidate(parsed, kind, severity, source_kind, source_line),
+            None,
+            True,
+        )
+
+    if tool in _KNOWN_NON_GRANT_TOOLS:
+        kind = "known_non_grant_tool" if specifier is None else "unsupported_allow_specifier"
+        return None, _diagnostic(kind, False, source_line, identity=rule), True
+    return None, _diagnostic("unknown_rule", True, source_line, identity=rule), False
+
+
+def _collapse_lexical_parts(value: str, *, clamp_root: bool = False) -> tuple[str, ...]:
+    collapsed: list[str] = []
+    for part in value.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if collapsed and collapsed[-1] != "..":
+                collapsed.pop()
+            elif not clamp_root:
+                collapsed.append(part)
+            continue
+        collapsed.append(part)
+    return tuple(collapsed)
+
+
+def _contains_windows_environment_variable(value: str) -> bool:
+    opening = value.find("%")
+    while opening >= 0:
+        closing = value.find("%", opening + 1)
+        if closing < 0:
+            return False
+        if closing > opening + 1:
+            return True
+        opening = value.find("%", closing + 1)
+    return False
+
+
+def _classify_additional_directory(
+    value: str,
+    *,
+    source_kind: str,
+    source_line: int,
+) -> tuple[PermissionGrant | None, tuple[PermissionDiagnostic, ...], bool]:
+    if (
+        not value
+        or "\0" in value
+        or "$" in value
+        or _contains_windows_environment_variable(value)
+        or (value.startswith("~") and value != "~" and not value.startswith("~/"))
+    ):
+        return (
+            None,
+            (_diagnostic("invalid_path", True, source_line, identity=value),),
+            False,
+        )
+
+    is_drive = len(value) >= 2 and value[0].isalpha() and value[1] == ":"
+    is_unc = value.startswith("\\\\")
+    if is_drive or is_unc:
+        if is_drive:
+            remainder = value[2:]
+            if not remainder.startswith(("/", "\\")):
+                return (
+                    None,
+                    (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
+                    False,
+                )
+            normalized_remainder = remainder.replace("\\", "/")
+            parts = _collapse_lexical_parts(normalized_remainder, clamp_root=True)
+            identity = f"drive:{value[0].upper()}:/{'/'.join(parts)}"
+            if not parts:
+                grant_kind, severity = "root_or_home_additional_directory", "CRITICAL"
+            elif _sensitive_path(parts):
+                grant_kind, severity = "sensitive_additional_directory", "HIGH"
+            else:
+                grant_kind, severity = "external_additional_directory", "MEDIUM"
+        else:
+            normalized_remainder = value.replace("\\", "/").lstrip("/")
+            parts = _collapse_lexical_parts(normalized_remainder, clamp_root=True)
+            identity = f"unc:/{'/'.join(parts)}"
+            grant_kind, severity = "external_additional_directory", "MEDIUM"
+            if _sensitive_path(parts):
+                grant_kind, severity = "sensitive_additional_directory", "HIGH"
+        grant = _grant(
+            grant_kind,
+            severity,
+            source_kind,
+            source_line,
+            identity=f"additional:{identity}",
+        )
+        return (
+            grant,
+            (
+                _diagnostic("platform_dependent_path", True, source_line, identity=identity),
+                _diagnostic(
+                    "directory_existence_static_unknown", False, source_line, identity=identity
+                ),
+            ),
+            True,
+        )
+
+    if "\\" in value:
+        return (
+            None,
+            (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
+            False,
+        )
+
+    posix_grant_kind: str | None
+    posix_severity: str | None
+    if all(character == "/" for character in value):
+        normalized = "/"
+        posix_grant_kind, posix_severity = "root_or_home_additional_directory", "CRITICAL"
+    elif value in {"~", "~/"}:
+        normalized = "~/"
+        posix_grant_kind, posix_severity = "root_or_home_additional_directory", "CRITICAL"
+    else:
+        home = value.startswith("~/")
+        absolute = value.startswith("/")
+        lexical_value = value[2:] if home else value.lstrip("/") if absolute else value
+        parts = _collapse_lexical_parts(lexical_value, clamp_root=absolute)
+        external = home or absolute or bool(parts and parts[0] == "..")
+        normalized = (("~/" if home else "/" if absolute else "") + "/".join(parts)) or "."
+        if (home or absolute) and not parts:
+            posix_grant_kind, posix_severity = (
+                "root_or_home_additional_directory",
+                "CRITICAL",
+            )
+        elif not external:
+            posix_grant_kind = posix_severity = None
+        elif _sensitive_path(parts):
+            posix_grant_kind, posix_severity = "sensitive_additional_directory", "HIGH"
+        else:
+            posix_grant_kind, posix_severity = "external_additional_directory", "MEDIUM"
+
+    posix_grant = (
+        None
+        if posix_grant_kind is None or posix_severity is None
+        else _grant(
+            posix_grant_kind,
+            posix_severity,
+            source_kind,
+            source_line,
+            identity=f"additional:{normalized}",
+        )
+    )
+    diagnostic = _diagnostic(
+        "directory_existence_static_unknown", False, source_line, identity=normalized
+    )
+    return posix_grant, (diagnostic,), True
 
 
 def _validate_digest(digest: str) -> None:
@@ -311,6 +1122,9 @@ def analyze_permission_grants(
 
     grants: list[PermissionGrant] = []
     diagnostics: list[PermissionDiagnostic] = []
+    allow_candidates: list[_AllowCandidate] = []
+    deny_restrictions: list[_Restriction] = []
+    ask_restrictions: list[_Restriction] = []
     has_valid_content = not permissions
     bypass_declared = False
     bypass_disabled = False
@@ -339,14 +1153,46 @@ def analyze_permission_grants(
                 has_valid_content = True
                 continue
             for item_index, item in enumerate(value):
-                diagnostics.append(
-                    _diagnostic(
-                        "unknown_rule",
-                        True,
-                        _line_for_rule(source_lines, key, item_index),
-                        identity=f"{key}:{_safe_identity(item)}",
+                item_line = _line_for_rule(source_lines, key, item_index)
+                if not isinstance(item, str):
+                    diagnostics.append(
+                        _diagnostic(
+                            "wrong_type",
+                            True,
+                            item_line,
+                            identity=f"{key}:{_safe_identity(item)}",
+                        )
                     )
+                    continue
+                if key == "additionalDirectories":
+                    grant, directory_diagnostics, valid = _classify_additional_directory(
+                        item, source_kind=source_kind, source_line=item_line
+                    )
+                    has_valid_content = has_valid_content or valid
+                    if grant is not None:
+                        grants.append(grant)
+                    diagnostics.extend(directory_diagnostics)
+                    continue
+                if key == "allow":
+                    candidate, diagnostic, valid = _classify_allow_rule(
+                        item, source_kind=source_kind, source_line=item_line
+                    )
+                    has_valid_content = has_valid_content or valid
+                    if candidate is not None:
+                        allow_candidates.append(candidate)
+                    if diagnostic is not None:
+                        diagnostics.append(diagnostic)
+                    continue
+                restriction, diagnostic, valid = _classify_restriction(
+                    item, key=key, source_line=item_line
                 )
+                has_valid_content = has_valid_content or valid
+                diagnostics.append(diagnostic)
+                if restriction is not None:
+                    if key == "deny":
+                        deny_restrictions.append(restriction)
+                    else:
+                        ask_restrictions.append(restriction)
             continue
 
         line = _line_for_key(source_lines, key)
@@ -362,7 +1208,12 @@ def analyze_permission_grants(
                 has_valid_content = True
                 grants.append(
                     _grant(
-                        "permission_mode_accept_edits", "MEDIUM", source_kind, line, identity=key
+                        "permission_mode_accept_edits",
+                        "MEDIUM",
+                        source_kind,
+                        line,
+                        identity=key,
+                        mode_context=True,
                     )
                 )
             elif value in {"default", "plan", "dontAsk"}:
@@ -406,19 +1257,58 @@ def analyze_permission_grants(
         else:
             has_valid_content = True
 
+    global_restriction = any(
+        restriction.tool_glob and restriction.tool_identifier == "*"
+        for restriction in (*deny_restrictions, *ask_restrictions)
+    )
     if bypass_declared and not bypass_disabled:
-        grants.append(
-            _grant(
-                "permission_mode_bypass",
-                "CRITICAL",
-                source_kind,
-                bypass_line,
-                identity="defaultMode",
+        if global_restriction:
+            diagnostics.append(
+                _diagnostic(
+                    "bypass_global_restriction",
+                    False,
+                    bypass_line,
+                    identity="global_restriction",
+                )
             )
-        )
+        else:
+            grants.append(
+                _grant(
+                    "permission_mode_bypass",
+                    "CRITICAL",
+                    source_kind,
+                    bypass_line,
+                    identity="defaultMode",
+                    mode_context=True,
+                )
+            )
 
-    unique_grants = {grant.grant_digest: grant for grant in grants}
-    unique_diagnostics = {diagnostic.diagnostic_digest: diagnostic for diagnostic in diagnostics}
+    for candidate in allow_candidates:
+        if any(
+            _restriction_covers(candidate, restriction)
+            for restriction in (*deny_restrictions, *ask_restrictions)
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "mitigated_allow",
+                    False,
+                    candidate.grant.source_line,
+                    identity=candidate.normalized_identity,
+                )
+            )
+        else:
+            grants.append(candidate.grant)
+
+    unique_grants: dict[str, PermissionGrant] = {}
+    for grant in grants:
+        previous = unique_grants.get(grant.grant_digest)
+        if previous is None or grant.source_line < previous.source_line:
+            unique_grants[grant.grant_digest] = grant
+    unique_diagnostics: dict[str, PermissionDiagnostic] = {}
+    for diagnostic in diagnostics:
+        previous_diagnostic = unique_diagnostics.get(diagnostic.diagnostic_digest)
+        if previous_diagnostic is None or diagnostic.source_line < previous_diagnostic.source_line:
+            unique_diagnostics[diagnostic.diagnostic_digest] = diagnostic
     sorted_grants = tuple(
         sorted(unique_grants.values(), key=lambda item: (item.grant_digest, item.source_line))
     )
