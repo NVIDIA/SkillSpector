@@ -407,6 +407,11 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
     filesystem-root/home CRITICAL, sensitive external/home HIGH, other parent/absolute external
     MEDIUM, project/current-directory silent, invalid path diagnostic, and static-unknown existence.
 
+  Sensitive markers use ASCII case normalization and complete path-segment or
+  ASCII-alphanumeric-token boundaries. Add negative tests proving `tokenizer.py`, `tokenization.md`,
+  and `secretariat.md` remain ordinary paths while exact and punctuation-delimited secret/token
+  material stays sensitive.
+
   Keep raw strings inside those call frames. Hash with a domain separator before constructing a
   returned frozen record. Do not use an unbounded regular expression; use one bounded split at the
   first `(` and require the last character to be `)`.
@@ -440,11 +445,16 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   Lexically normalize interior `.`/`..`: `child/../docs` stays project-local and
   `child/../../docs` becomes external. A Windows drive root such as `C:\\` or `C:/` emits a
   conditional CRITICAL whole-root grant; a lexically sensitive Windows absolute path such as
-  `C:\\Users\\x\\.ssh` emits a conditional HIGH sensitive-directory grant; other Windows absolute
-  drive and UNC forms emit a conditional MEDIUM external-directory grant. Each also emits the
-  completeness-affecting `platform_dependent_path` diagnostic. Drive-relative ambiguity emits that
-  diagnostic without guessing a grant. Empty, NUL, malformed-home, and environment-variable forms
-  are `invalid_path`. Table-test `sensitive_additional_directory` in the grant-kind allowlist.
+  `C:\\Users\\x\\.ssh` emits a conditional HIGH sensitive-directory grant. Windows separator-only
+  backslash forms resolve to the current drive root and are conditional CRITICAL. Other Windows
+  absolute drive forms and complete UNC forms with non-empty server/share components emit a
+  conditional MEDIUM external-directory grant unless sensitive. One-component UNC-like forms such
+  as `\\server` or `//server` resolve drive-root-relative and are conditional MEDIUM unless
+  sensitive. Recognize both separator spellings and attach the completeness-affecting
+  `platform_dependent_path` diagnostic. Drive-relative or malformed UNC ambiguity with no provable
+  resolved scope emits that diagnostic without guessing a grant. Empty, NUL, malformed-home, and
+  environment-variable forms are `invalid_path`. Table-test `sensitive_additional_directory` in the
+  grant-kind allowlist.
 
 - [ ] **Step 4: Add and implement known ignored grammar tests**
 
@@ -496,7 +506,8 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   - `Bash(ls:*)` versus `Bash(ls *)`, and bare Bash versus `Bash(*)`;
   - scoped `Monitor(command)` versus equivalent Bash ask/deny command rules, while a bare Monitor
     allow retains its separate WebSocket-bearing capability under a Bash-only restriction;
-  - PowerShell case-insensitive tool/command spelling;
+  - PowerShell ASCII-case-insensitive tool/command spelling, with non-ASCII code points remaining
+    exact rather than using Unicode full case folding;
   - WebFetch domain case and terminal-dot normalization, including an identical normalized wildcard
     domain pattern;
   - `deny: ["*"]`, `ask: ["B*"]`, and `deny: ["mcp__*"]` neutralizing matching allow candidates;
@@ -518,7 +529,8 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
 - [ ] **Step 6: Implement conservative same-document precedence**
 
   Normalize proven runtime-equivalent identities in all three lists before mitigation: bare Bash
-  equals `Bash(*)`; `Bash(ls:*)` equals `Bash(ls *)`; PowerShell matching is case-insensitive;
+  equals `Bash(*)`; `Bash(ls:*)` equals `Bash(ls *)`; PowerShell matching is ASCII
+  case-insensitive while non-ASCII remains exact;
   WebFetch domain patterns are case-insensitive with one trailing root dot removed; and bare MCP
   server equals its `__*` spelling. Apply deny before ask. Suppress an allow only for an identical
   normalized rule, a bare same-tool selector, or a valid bounded ask/deny tool-name glob that
@@ -526,6 +538,13 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   other specifier-glob subsumption. After parsing the restrictive lists, neutralize bypass only when
   either list contains the exact valid global selector `*`; retain bypass for every narrower rule or
   glob. Emit `bypass_global_restriction` for that exact same-document mitigation.
+
+  Index exact, bare, and MCP-server-wide restrictions before coverage and compile each distinct
+  tool-name glob once. Before matching one distinct glob to one distinct candidate tool identifier,
+  charge `len(glob) + len(tool_identifier)` against the exact 8,388,608-character document budget.
+  Exceeding it is an atomic permission `COMPONENT_LIMIT` failure. Add a real near-1-MB unique-pattern
+  cross-product regression that asserts the deterministic limit outcome, not a wall-clock threshold,
+  plus a probe proving the bounded path no longer takes tens of seconds.
 
 - [ ] **Step 7: Run GREEN and commit**
 
@@ -561,7 +580,8 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
 
   Count one structural item per permission-object key, including unknown keys, plus one per raw list
   entry in `allow`, `ask`, `deny`, and `additionalDirectories`. Test an object with `allow` and
-  `defaultMode` keys plus 2,046 raw allow entries: exactly 2,048 items is accepted. Add one entry:
+  `defaultMode` keys plus 2,046 raw allow entries: exactly 2,048 items is accepted by the structural
+  budget (use a shape that remains below the separate precedence matcher-work budget). Add one entry:
   2,049 returns FAILED with `LedgerReason.COMPONENT_LIMIT`, no grants, no diagnostics, and no
   aggregate digest. Also test 2,048 unique unknown keys (within the resource limit, at most one
   diagnostic per key) and a sub-megabyte object with 20,000 unique unknown keys (atomic
@@ -1125,8 +1145,9 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   - bare/server-wide, exact-tool, and partial-tool MCP spellings;
   - bare WebFetch, `domain:*`, literal/wildcard domain, and unsupported `WebFetch(*)` spellings; and
   - `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized interior-parent, Windows drive
-    root, sensitive absolute, ordinary absolute-drive/UNC, and drive-relative additional-directory
-    spellings.
+    root, separator-only backslash root, sensitive absolute, ordinary absolute-drive, complete
+    backslash/forward-slash UNC, one-component UNC-like, malformed UNC, and drive-relative
+    additional-directory spellings.
 
   Capture only safe debug/status lines. Never run a destructive command and never transmit a canary.
   If login/model access permits, add benign reads/writes inside a disposable directory to test actual

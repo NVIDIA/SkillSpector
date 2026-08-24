@@ -277,9 +277,18 @@ top-level key in `permissions`, including an unknown key, plus one item for ever
 diagnostic construction, or duplicate removal. A total of 2,048 is accepted; 2,049 is an atomic
 permission-subanalysis `COMPONENT_LIMIT` failure with no grants, diagnostics, or aggregate digest.
 An unknown key produces at most one diagnostic for that key; its nested value is never recursively
-expanded into diagnostics. This single budget therefore bounds work and diagnostic fan-out even for
+expanded into diagnostics. This structural budget bounds validation and diagnostic fan-out even for
 a sub-megabyte object containing thousands of unique unknown siblings. File size and binary bounds
 remain the existing `MAX_FILE_CHARS` and NUL checks in the shared settings parser.
+
+Validated exact, bare, and MCP-server-wide restrictions are indexed rather than crossed against
+every allow. Each distinct ask/deny tool-name glob is compiled once. Glob coverage uses a separate
+deterministic per-document budget of **8,388,608 charged characters**: before matching one distinct
+glob against one distinct candidate tool identifier, charge the sum of their character lengths. If
+the next match would exceed the budget, permission analysis fails atomically with
+`COMPONENT_LIMIT`, no grants, diagnostics, or aggregate. A 2,048-item document is accepted by the
+structural budget but remains subject to this matcher-work bound. This prevents a valid sub-megabyte
+cross product from becoming a CPU denial of service without imposing wall-clock-dependent behavior.
 
 Exact duplicate list entries are collapsed after validation. Semantic classifications, counts,
 maximum severity, blocking status, and diagnostic ordering are stable under list reordering and
@@ -405,8 +414,10 @@ narrow project Read is silent; sensitive Read/Edit is HIGH.
 
 The sensitive-path classifier is a closed, tested set covering agent configuration, shell history,
 SSH/private keys, cloud credentials, Kubernetes, Docker, package-manager credentials, Git
-credentials, `.env`/secret/token material, and equivalent home-scoped credential stores. Evidence
-reports `sensitive_path`, never the matched path.
+credentials, `.env`/secret/token material, and equivalent home-scoped credential stores. Closed
+markers use ASCII case normalization and match complete path segments or ASCII-alphanumeric token
+boundaries inside a filename; they do not match ordinary continuations such as `tokenizer.py`,
+`tokenization.md`, or `secretariat.md`. Evidence reports `sensitive_path`, never the matched path.
 
 ### Additional-directory paths
 
@@ -425,9 +436,12 @@ directory; it never resolves a symlink or exposes the path:
 | `~/child` | External/home directory, MEDIUM unless sensitive |
 | Any sensitive external/home/absolute directory such as `~/.ssh` | HIGH `sensitive_additional_directory` |
 | Windows drive root such as `C:\\` or `C:/` | Conditional whole-root CRITICAL plus completeness-affecting `platform_dependent_path` |
+| Windows separator-only backslash form such as `\` or `\\` | Conditional current-drive-root CRITICAL plus completeness-affecting `platform_dependent_path` |
 | Lexically sensitive Windows absolute path such as `C:\\Users\\x\\.ssh` | Conditional sensitive-directory HIGH plus completeness-affecting `platform_dependent_path` |
-| Other Windows absolute drive or UNC form | Conditional external MEDIUM plus completeness-affecting `platform_dependent_path` |
-| Drive-relative or otherwise platform-ambiguous form with no provable external scope | Completeness-affecting `platform_dependent_path`; no grant is guessed |
+| Complete Windows UNC form with non-empty server and share, using `\\server\\share` or `//server/share` separators | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| One-component UNC-like form such as `\\server` or `//server` | Conditional drive-root-relative external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| Other Windows absolute drive form | Conditional external MEDIUM plus completeness-affecting `platform_dependent_path` |
+| Drive-relative, malformed UNC, or otherwise platform-ambiguous form with no provable resolved scope | Completeness-affecting `platform_dependent_path`; no grant is guessed |
 | Empty, NUL-bearing, malformed home, or environment-variable form | Completeness-affecting `invalid_path` |
 
 The pure analyzer lexically collapses `.` and `..` segments but does not call `stat`, resolve a
@@ -436,7 +450,8 @@ symlink, or pick a target operating system. Thus `child/../docs` is project-loca
 Each otherwise valid or conditionally external entry gets at most one completeness-neutral
 `directory_existence_static_unknown` diagnostic; runtime absence does not turn a lexical grant into
 a static safe result. Exact tests cover `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized
-interior parents, Windows drive-root, sensitive absolute, ordinary absolute-drive/UNC, and
+interior parents, Windows drive-root and separator-only roots, sensitive absolute, ordinary
+absolute-drive, complete backslash/forward-slash UNC, one-component UNC-like, malformed UNC, and
 drive-relative forms.
 
 ### Network, execution, and MCP rules
@@ -495,16 +510,17 @@ Before exact mitigation comparison, normalize only proven 2.1.241 runtime-equiva
   `Bash(ls *)`;
 - a scoped `Monitor(command)` allow compares against the equivalent Bash command identity for
   ask/deny precedence, while bare Monitor keeps its distinct WebSocket-bearing identity;
-- PowerShell tool/command matching is case-insensitive; and
+- PowerShell tool/command matching is ASCII case-insensitive; non-ASCII code points remain exact
+  because the pinned runtime evidence does not establish Unicode full case folding; and
 - WebFetch domain patterns are ASCII case-insensitive and wildcard-aware, and one terminal DNS root
   dot is removed, so
   `WebFetch(domain:EXAMPLE.com.)` equals `WebFetch(domain:example.com)`.
 
 The same normalization applies to allow, ask, and deny before comparison. An identical normalized
 WebFetch wildcard pattern can mitigate its matching allow, but the scanner does not prove
-subsumption between distinct domain patterns. Normalization does not authorize Unicode hostname
-folding, path case folding, MCP case folding, command parsing beyond the proven Bash/PowerShell
-rules, or path/specifier wildcard-subsumption guesses.
+subsumption between distinct domain patterns. Normalization does not authorize Unicode hostname or
+PowerShell full case folding, path case folding, MCP case folding, command parsing beyond the proven
+Bash/PowerShell rules, or path/specifier wildcard-subsumption guesses.
 
 `permissions.disableBypassPermissionsMode: "disable"` in the same physical document does
 neutralize that document's `defaultMode: "bypassPermissions"`. Both remain part of aggregate
@@ -767,6 +783,8 @@ Implementation follows red-green-refactor in the accompanying plan.
 - duplicate list values and reorder-stable semantic projections while physical aggregate identity changes;
 - exact 2,048 structural-item boundary, including permission keys and raw list entries, and
   2,049-item atomic permission-subanalysis failure;
+- exact 8,388,608-character precedence matcher-work boundary, compiled-glob reuse, and an
+  adversarial distinct-rule cross product that fails atomically without a wall-clock oracle;
 - allow-only wildcard diagnostics versus ask/deny wildcard mitigation, including `deny: ["*"]`;
 - bare/server-wide, exact-tool, and partial-tool-glob MCP forms;
 - proven Bash, PowerShell, and WebFetch equivalence normalization with conservative negative cases;
