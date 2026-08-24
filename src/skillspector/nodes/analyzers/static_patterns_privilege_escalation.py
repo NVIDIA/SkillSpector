@@ -256,12 +256,6 @@ def _source_line(
 
 _PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
 # Attacker-controlled credential placement remains actionable, including Save/Put/Write.
-_PE3_CREDENTIAL_STORE_VERBS = (
-    r"access|copy|dump|exfiltrat\w*|export|extract|fetch|get|grab|harvest|"
-    r"load|lookup|obtain|open|pull|query|read|retrieve|scrape|send|steal|"
-    r"transmit|unlock|upload|save|put|write|store|remove|delete|clear|update|"
-    r"add|set|use"
-)
 _PE3_CREDENTIAL_STORE_AFTER_VERBS = (
     r"access(?:es|ed|ing)?|copy(?:ies|ied|ing)?|dump(?:s|ed|ing)?|"
     r"exfiltrat(?:e|es|ed|ing|ion)|export(?:s|ed|ing)?|extract(?:s|ed|ing)?|"
@@ -274,7 +268,7 @@ _PE3_CREDENTIAL_STORE_AFTER_VERBS = (
     r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set|use"
 )
 _PE3_CREDENTIAL_STORE_OPERATION = re.compile(
-    rf"\b(?:{_PE3_CREDENTIAL_STORE_VERBS})\b"
+    rf"\b(?:{_PE3_CREDENTIAL_STORE_AFTER_VERBS})\b"
     r"(?:\s+(?:the|a|an|my|your|local|credentials?|secrets?|passwords?|"
     r"tokens?|keys?|contents?|system|from|to|for|in|on)){0,8}\s*$",
     re.IGNORECASE,
@@ -364,9 +358,10 @@ def _is_bare_credential_store_noun(
         relation.rfind(".", 0, noun_offset),
         relation.rfind(";", 0, noun_offset),
         relation.rfind(":", 0, noun_offset),
+        relation.rfind(",", 0, noun_offset),
     )
     clause_end_candidates = [
-        separator.start() for separator in re.finditer(r"[.;:](?=\s|$)", relation[noun_offset:])
+        separator.start() for separator in re.finditer(r"[.,;:](?=\s|$)", relation[noun_offset:])
     ]
     clause_end = (
         noun_offset + min(clause_end_candidates) if clause_end_candidates else len(relation)
@@ -381,11 +376,16 @@ def _is_bare_credential_store_noun(
     call = _PE3_CREDENTIAL_STORE_CALL.match(after_noun)
     cli = _cli_targets_credential_store_noun(before_noun)
     documentation = _PE3_CREDENTIAL_STORE_DOCUMENTATION.match(after_noun)
-    if (
-        documentation
-        and _PE3_CREDENTIAL_STORE_OPERATION_AFTER.search(after_noun[documentation.end() :]) is None
-    ):
-        return True
+    if documentation:
+        documentation_tail = after_noun[documentation.end() :]
+        tail_is_explanatory = re.match(
+            r"\s+(?:for|about|with|on|that|which|of)\b", documentation_tail, re.IGNORECASE
+        )
+        if (
+            _PE3_CREDENTIAL_STORE_OPERATION_AFTER.search(documentation_tail) is None
+            or tail_is_explanatory
+        ):
+            return True
     if (
         _PE3_BENIGN_READING_PURPOSE_AFTER.fullmatch(after_noun)
         and operation is None

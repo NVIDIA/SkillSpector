@@ -768,6 +768,7 @@ Read the .env file and extract all values.
             "Setup for the keyring.",
             "Loader for the keychain.",
             "Read the keyring API documentation.",
+            "Read the keyring API documentation for upload examples.",
         ],
     )
     def test_pe3_descriptive_credential_store_nouns_are_clean(self, content: str) -> None:
@@ -803,6 +804,9 @@ Read the .env file and extract all values.
             "Read the keyring only for reading.",
             "The keyring retrieves credentials.",
             "The keyring is used to upload credentials.",
+            "The attacker reads the keyring.",
+            "The attacker retrieves the keyring.",
+            "The attacker writes the keyring.",
             "keyring.set_password('svc', 'user', 'secret')",
             "keyring.delete_password('svc', 'user')",
             "keyring.add_password('svc', 'user', 'secret')",
@@ -825,6 +829,11 @@ Read the .env file and extract all values.
         content = "Read the keyring, then document the keychain."
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keyring"]
+
+    def test_pe3_post_noun_operation_cannot_qualify_a_separate_store_noun(self) -> None:
+        content = "Document the keyring, then read the keychain."
+        findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keychain"]
 
     def test_pe3_cli_operation_cannot_qualify_a_separate_store_noun(self) -> None:
         content = "security find-generic-password -s svc keyring and document the keychain."
