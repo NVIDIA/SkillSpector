@@ -23,6 +23,7 @@ from skillspector.models import Finding
 _EVIDENCE_SCHEMA: Final = "skillspector.bundled_permission.v1"
 _SEMANTICS_SNAPSHOT: Final = "2.1.241"
 MAX_PERMISSION_STRUCTURAL_ITEMS_PER_DOCUMENT: Final = 2048
+MAX_PERMISSION_GLOB_MATCH_CHARS_PER_DOCUMENT: Final = 8_388_608
 
 _SHA256_DIGEST: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SUPPORTED_SOURCE_KINDS: Final = frozenset({"project_settings", "project_local_settings"})
@@ -210,6 +211,30 @@ class _Restriction:
     source_line: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CompiledLiteral:
+    value: str
+    prefix: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompiledToolGlob:
+    character_count: int
+    exact_literal: str | None
+    leading_wildcard: bool
+    trailing_wildcard: bool
+    segments: tuple[_CompiledLiteral, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RestrictionIndex:
+    exact_identities: frozenset[str]
+    tool_wide_identifiers: frozenset[str]
+    original_tool_wide_identifiers: frozenset[str]
+    mcp_servers: frozenset[str]
+    tool_globs: tuple[_CompiledToolGlob, ...]
+
+
 def _digest(domain: str, value: bytes) -> str:
     payload = _EVIDENCE_SCHEMA.encode() + b"\0" + domain.encode() + b"\0" + value
     return f"sha256:{sha256(payload).hexdigest()}"
@@ -313,8 +338,31 @@ def _parse_permission_rule(rule: str) -> _ParsedRule | None:
     return _ParsedRule(tool, specifier)
 
 
+def _ascii_lower(value: str) -> str:
+    return "".join(
+        chr(ord(character) + 32) if "A" <= character <= "Z" else character for character in value
+    )
+
+
+def _has_sensitive_ascii_token(value: str) -> bool:
+    sensitive_tokens = {"credential", "credentials", "secret", "secrets", "token", "tokens"}
+    token_start: int | None = None
+    for index, character in enumerate(value):
+        is_ascii_alphanumeric = (
+            "a" <= character <= "z" or "A" <= character <= "Z" or "0" <= character <= "9"
+        )
+        if is_ascii_alphanumeric:
+            if token_start is None:
+                token_start = index
+        elif token_start is not None:
+            if value[token_start:index] in sensitive_tokens:
+                return True
+            token_start = None
+    return token_start is not None and value[token_start:] in sensitive_tokens
+
+
 def _sensitive_path(parts: tuple[str, ...]) -> bool:
-    lowered = tuple(part.casefold() for part in parts if part not in {"", ".", "*", "**"})
+    lowered = tuple(_ascii_lower(part) for part in parts if part not in {"", ".", "*", "**"})
     joined = "/".join(lowered)
     sensitive_segments = {
         ".agents",
@@ -345,19 +393,14 @@ def _sensitive_path(parts: tuple[str, ...]) -> bool:
     }
     if any(part in sensitive_segments or part.startswith(".env.") for part in lowered):
         return True
-    for part in lowered:
-        words = part.replace("-", "_").replace(".", "_").split("_")
-        if any(
-            word in {"credential", "credentials", "secret", "secrets", "token", "tokens"}
-            for word in words
-        ):
-            return True
+    if any(_has_sensitive_ascii_token(part) for part in lowered):
+        return True
     credential_stores = (".config/gcloud", ".config/gh", ".config/glab")
     if any(joined == store or joined.startswith(f"{store}/") for store in credential_stores):
         return True
     if any(part.endswith((".key", ".pem")) for part in lowered):
         return True
-    return any(marker in joined for marker in ("/secret", "/token", "/credentials"))
+    return False
 
 
 def _classify_path_specifier(specifier: str) -> _PathClassification:
@@ -467,7 +510,7 @@ def _mcp_classification(tool: str) -> tuple[str, str, str] | None:
 
 
 def _normalized_rule_identity(parsed: _ParsedRule) -> tuple[str, str]:
-    tool = "powershell" if parsed.tool.casefold() == "powershell" else parsed.tool
+    tool = "powershell" if _ascii_lower(parsed.tool) == "powershell" else parsed.tool
     specifier = parsed.specifier
     if tool == "Monitor" and specifier is not None:
         tool = "Bash"
@@ -476,7 +519,7 @@ def _normalized_rule_identity(parsed: _ParsedRule) -> tuple[str, str]:
             return tool, f"{tool}(*)"
         normalized_specifier = _normalize_bash_specifier(specifier)
         if tool == "powershell":
-            normalized_specifier = normalized_specifier.casefold()
+            normalized_specifier = _ascii_lower(normalized_specifier)
         return tool, f"{tool}({normalized_specifier})"
     if tool == "WebFetch":
         if specifier is None:
@@ -504,7 +547,7 @@ def _classify_restriction(
             False,
         )
     tool_identifier, normalized_identity = _normalized_rule_identity(parsed)
-    original_tool = "powershell" if parsed.tool.casefold() == "powershell" else parsed.tool
+    original_tool = "powershell" if _ascii_lower(parsed.tool) == "powershell" else parsed.tool
     mcp = _mcp_classification(parsed.tool) if parsed.specifier is None else None
     mcp_server = (
         parsed.tool.split("__")[1] if mcp is not None and mcp[0] == "mcp_server_wide" else None
@@ -529,31 +572,47 @@ def _classify_restriction(
     return restriction, diagnostic, True
 
 
-def _literal_index(value: str, literal: str, start: int, end: int) -> int:
-    prefix = [0] * len(literal)
+def _compile_literal(value: str) -> _CompiledLiteral:
+    prefix = [0] * len(value)
     matched = 0
-    for index in range(1, len(literal)):
-        while matched and literal[index] != literal[matched]:
+    for index in range(1, len(value)):
+        while matched and value[index] != value[matched]:
             matched = prefix[matched - 1]
-        if literal[index] == literal[matched]:
+        if value[index] == value[matched]:
             matched += 1
             prefix[index] = matched
+    return _CompiledLiteral(value, tuple(prefix))
 
+
+def _literal_index(value: str, literal: _CompiledLiteral, start: int, end: int) -> int:
     matched = 0
     for index in range(start, end):
-        while matched and value[index] != literal[matched]:
-            matched = prefix[matched - 1]
-        if value[index] == literal[matched]:
+        while matched and value[index] != literal.value[matched]:
+            matched = literal.prefix[matched - 1]
+        if value[index] == literal.value[matched]:
             matched += 1
-            if matched == len(literal):
-                return index - len(literal) + 1
+            if matched == len(literal.value):
+                return index - len(literal.value) + 1
     return -1
 
 
-def _bounded_glob_match(pattern: str, value: str) -> bool:
+def _compile_tool_glob(pattern: str) -> _CompiledToolGlob:
     if "*" not in pattern:
-        return pattern == value
-    segments = tuple(segment for segment in pattern.split("*") if segment)
+        return _CompiledToolGlob(len(pattern), pattern, False, False, ())
+    segments = tuple(_compile_literal(segment) for segment in pattern.split("*") if segment)
+    return _CompiledToolGlob(
+        len(pattern),
+        None,
+        pattern.startswith("*"),
+        pattern.endswith("*"),
+        segments,
+    )
+
+
+def _match_compiled_tool_glob(compiled: _CompiledToolGlob, value: str) -> bool:
+    if compiled.exact_literal is not None:
+        return compiled.exact_literal == value
+    segments = compiled.segments
     if not segments:
         return True
 
@@ -561,14 +620,14 @@ def _bounded_glob_match(pattern: str, value: str) -> bool:
     end = len(value)
     first_segment = 0
     last_segment = len(segments)
-    if not pattern.startswith("*"):
-        leading = segments[0]
+    if not compiled.leading_wildcard:
+        leading = segments[0].value
         if not value.startswith(leading):
             return False
         start = len(leading)
         first_segment = 1
-    if not pattern.endswith("*"):
-        trailing = segments[-1]
+    if not compiled.trailing_wildcard:
+        trailing = segments[-1].value
         if not value.endswith(trailing):
             return False
         end -= len(trailing)
@@ -579,21 +638,12 @@ def _bounded_glob_match(pattern: str, value: str) -> bool:
         found = _literal_index(value, literal, start, end)
         if found < 0:
             return False
-        start = found + len(literal)
+        start = found + len(literal.value)
     return start <= end
 
 
-def _restriction_covers(candidate: _AllowCandidate, restriction: _Restriction) -> bool:
-    if restriction.normalized_identity == candidate.normalized_identity:
-        return True
-    if restriction.tool_glob:
-        return _bounded_glob_match(restriction.tool_identifier, candidate.tool_identifier)
-    if restriction.mcp_server is not None and restriction.mcp_server == candidate.mcp_server:
-        return True
-    return restriction.tool_wide and (
-        restriction.tool_identifier == candidate.tool_identifier
-        or restriction.original_tool_identifier == candidate.original_tool_identifier
-    )
+def _bounded_glob_match(pattern: str, value: str) -> bool:
+    return _match_compiled_tool_glob(_compile_tool_glob(pattern), value)
 
 
 def _deduplicate_allow_candidates(
@@ -643,6 +693,87 @@ def _deduplicate_restrictions(
         if previous is None or restriction.source_line < previous.source_line:
             unique[semantic_identity] = restriction
     return tuple(unique.values())
+
+
+def _index_restrictions(restrictions: tuple[_Restriction, ...]) -> _RestrictionIndex:
+    glob_patterns = sorted(
+        {
+            restriction.tool_identifier
+            for restriction in restrictions
+            if restriction.tool_glob and restriction.mcp_server is None
+        }
+    )
+    return _RestrictionIndex(
+        exact_identities=frozenset(restriction.normalized_identity for restriction in restrictions),
+        tool_wide_identifiers=frozenset(
+            restriction.tool_identifier
+            for restriction in restrictions
+            if restriction.tool_wide
+            and not restriction.tool_glob
+            and restriction.mcp_server is None
+        ),
+        original_tool_wide_identifiers=frozenset(
+            restriction.original_tool_identifier
+            for restriction in restrictions
+            if restriction.tool_wide
+            and not restriction.tool_glob
+            and restriction.mcp_server is None
+        ),
+        mcp_servers=frozenset(
+            restriction.mcp_server
+            for restriction in restrictions
+            if restriction.mcp_server is not None
+        ),
+        tool_globs=tuple(_compile_tool_glob(pattern) for pattern in glob_patterns),
+    )
+
+
+def _indexed_coverage_without_globs(
+    candidate: _AllowCandidate,
+    restriction_index: _RestrictionIndex,
+) -> bool:
+    return (
+        candidate.normalized_identity in restriction_index.exact_identities
+        or (
+            candidate.mcp_server is not None
+            and candidate.mcp_server in restriction_index.mcp_servers
+        )
+        or candidate.tool_identifier in restriction_index.tool_wide_identifiers
+        or candidate.original_tool_identifier in restriction_index.original_tool_wide_identifiers
+    )
+
+
+def _indexed_restriction_coverage(
+    candidates: tuple[_AllowCandidate, ...],
+    restrictions: tuple[_Restriction, ...],
+) -> tuple[bool, ...] | None:
+    restriction_index = _index_restrictions(restrictions)
+    indexed_coverage = tuple(
+        _indexed_coverage_without_globs(candidate, restriction_index) for candidate in candidates
+    )
+    unmatched_tool_identifiers = tuple(
+        sorted(
+            {
+                candidate.tool_identifier
+                for candidate, covered in zip(candidates, indexed_coverage, strict=True)
+                if not covered
+            }
+        )
+    )
+    glob_covered_identifiers: set[str] = set()
+    charged_characters = 0
+    for compiled in restriction_index.tool_globs:
+        for tool_identifier in unmatched_tool_identifiers:
+            charge = compiled.character_count + len(tool_identifier)
+            if charged_characters + charge > MAX_PERMISSION_GLOB_MATCH_CHARS_PER_DOCUMENT:
+                return None
+            charged_characters += charge
+            if _match_compiled_tool_glob(compiled, tool_identifier):
+                glob_covered_identifiers.add(tool_identifier)
+    return tuple(
+        covered or candidate.tool_identifier in glob_covered_identifiers
+        for candidate, covered in zip(candidates, indexed_coverage, strict=True)
+    )
 
 
 def _diagnostic(
@@ -710,7 +841,7 @@ def _allow_grant_candidate(
     identity: str | None = None,
 ) -> _AllowCandidate:
     tool_identifier, normalized_identity = _normalized_rule_identity(parsed)
-    original_tool = "powershell" if parsed.tool.casefold() == "powershell" else parsed.tool
+    original_tool = "powershell" if _ascii_lower(parsed.tool) == "powershell" else parsed.tool
     mcp = _mcp_classification(parsed.tool) if parsed.specifier is None else None
     mcp_server = parsed.tool.split("__")[1] if mcp is not None else None
     safe_identity = normalized_identity if identity is None else identity
@@ -739,7 +870,7 @@ def _classify_allow_rule(
 
     tool = parsed.tool
     specifier = parsed.specifier
-    if tool.casefold() == "powershell":
+    if _ascii_lower(tool) == "powershell":
         tool = "PowerShell"
         parsed = _ParsedRule(tool, specifier)
 
@@ -983,8 +1114,11 @@ def _classify_additional_directory(
         )
 
     is_drive = len(value) >= 2 and value[0].isalpha() and value[1] == ":"
-    is_unc = value.startswith("\\\\")
-    if is_drive or is_unc:
+    is_backslash_root = all(character == "\\" for character in value)
+    is_unc = (value.startswith("\\\\") or value.startswith("//")) and not all(
+        character == "/" for character in value
+    )
+    if is_drive or is_backslash_root or is_unc:
         if is_drive:
             remainder = value[2:]
             if not remainder.startswith(("/", "\\")):
@@ -1002,9 +1136,35 @@ def _classify_additional_directory(
                 grant_kind, severity = "sensitive_additional_directory", "HIGH"
             else:
                 grant_kind, severity = "external_additional_directory", "MEDIUM"
+        elif is_backslash_root:
+            identity = "drive-current:/"
+            grant_kind, severity = "root_or_home_additional_directory", "CRITICAL"
         else:
-            normalized_remainder = value.replace("\\", "/").lstrip("/")
-            parts = _collapse_lexical_parts(normalized_remainder, clamp_root=True)
+            normalized_remainder = value[2:].replace("\\", "/")
+            trimmed_remainder = normalized_remainder.rstrip("/")
+            if (
+                not trimmed_remainder
+                or normalized_remainder.startswith("/")
+                or "//" in trimmed_remainder
+            ):
+                return (
+                    None,
+                    (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
+                    False,
+                )
+            raw_parts = tuple(trimmed_remainder.split("/"))
+            anchor_size = min(2, len(raw_parts))
+            if any(part in {".", ".."} for part in raw_parts[:anchor_size]):
+                return (
+                    None,
+                    (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
+                    False,
+                )
+            if len(raw_parts) == 1:
+                parts = raw_parts
+            else:
+                normalized_tail = _collapse_lexical_parts("/".join(raw_parts[2:]), clamp_root=True)
+                parts = (*raw_parts[:2], *normalized_tail)
             identity = f"unc:/{'/'.join(parts)}"
             grant_kind, severity = "external_additional_directory", "MEDIUM"
             if _sensitive_path(parts):
@@ -1311,6 +1471,18 @@ def analyze_permission_grants(
 
     validated_candidates = _deduplicate_allow_candidates(allow_candidates)
     validated_restrictions = _deduplicate_restrictions((*deny_restrictions, *ask_restrictions))
+    restriction_coverage = _indexed_restriction_coverage(
+        validated_candidates, validated_restrictions
+    )
+    if restriction_coverage is None:
+        return PermissionAnalysis(
+            True,
+            LedgerOutcome.FAILED,
+            LedgerReason.COMPONENT_LIMIT,
+            (),
+            (),
+            None,
+        )
 
     global_restriction = any(
         restriction.tool_glob and restriction.tool_identifier == "*"
@@ -1338,10 +1510,8 @@ def analyze_permission_grants(
                 )
             )
 
-    for candidate in validated_candidates:
-        if any(
-            _restriction_covers(candidate, restriction) for restriction in validated_restrictions
-        ):
+    for candidate, mitigated in zip(validated_candidates, restriction_coverage, strict=True):
+        if mitigated:
             diagnostics.append(
                 _diagnostic(
                     "mitigated_allow",

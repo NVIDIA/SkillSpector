@@ -485,9 +485,20 @@ def test_additional_directory_posix_semantics(
     [
         ("C:\\", "root_or_home_additional_directory", "CRITICAL", True),
         ("C:/", "root_or_home_additional_directory", "CRITICAL", True),
+        ("\\", "root_or_home_additional_directory", "CRITICAL", True),
+        (r"\\", "root_or_home_additional_directory", "CRITICAL", True),
         (r"C:\Users\x\.ssh", "sensitive_additional_directory", "HIGH", False),
         ("C:/Users/x/docs", "external_additional_directory", "MEDIUM", False),
         (r"\\server\share", "external_additional_directory", "MEDIUM", False),
+        ("//server/share", "external_additional_directory", "MEDIUM", False),
+        (r"\\server", "external_additional_directory", "MEDIUM", False),
+        ("//server", "external_additional_directory", "MEDIUM", False),
+        (r"\\secret", "sensitive_additional_directory", "HIGH", False),
+        (r"\\server\share\.ssh", "sensitive_additional_directory", "HIGH", False),
+        (r"\\server\.ssh\..", "sensitive_additional_directory", "HIGH", False),
+        ("//server/.ssh/..", "sensitive_additional_directory", "HIGH", False),
+        (r"\\server\share\..\..", "external_additional_directory", "MEDIUM", False),
+        ("//server/share/../..", "external_additional_directory", "MEDIUM", False),
     ],
 )
 def test_additional_directory_windows_absolute_is_conditional(
@@ -504,6 +515,31 @@ def test_additional_directory_windows_absolute_is_conditional(
         "platform_dependent_path",
         "directory_existence_static_unknown",
     }
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        r"\server",
+        r"\\server\\share",
+        "//server//share",
+        r"\\\server\share",
+        "///server/share",
+        r"\\server\..\share",
+        "//server/../share",
+        r"\\.\share",
+        "//./share",
+    ],
+)
+def test_additional_directory_malformed_windows_scope_is_not_guessed(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert result.outcome is LedgerOutcome.FAILED
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert result.grants == ()
+    assert [(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics] == [
+        ("platform_dependent_path", True)
+    ]
 
 
 def test_additional_directory_drive_relative_does_not_guess_scope() -> None:
@@ -894,6 +930,39 @@ def test_sensitive_read_categories_are_high(rule: str) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "Read(src/tokenizer.py)",
+        "Read(docs/tokenization.md)",
+        "Read(docs/secretariat.md)",
+        "Read(docs/ſecret.md)",
+    ],
+)
+def test_sensitive_markers_do_not_match_ascii_alphanumeric_continuations(rule: str) -> None:
+    result = _analyze({"allow": [rule]})
+
+    assert result.outcome is LedgerOutcome.COMPLETED
+    assert result.grants == ()
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "Read(config/token)",
+        "Read(config/API-TOKEN.txt)",
+        "Read(config/my_secret_backup.json)",
+        "Read(~/.SSH/ID_RSA)",
+    ],
+)
+def test_sensitive_markers_match_complete_or_punctuation_delimited_tokens(rule: str) -> None:
+    result = _analyze({"allow": [rule]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("sensitive_read", "HIGH")
+    ]
+
+
 def test_pinned_2_1_241_multiedit_fixture_remains_broad_edit() -> None:
     pinned_canonical_edit_tools = "Edit MultiEdit NotebookEdit Write"
 
@@ -1151,27 +1220,28 @@ def test_hostile_tool_glob_near_miss_scales_linearly() -> None:
 def test_duplicate_restrictions_are_deduplicated_before_large_candidate_coverage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert hasattr(permission_grants, "_compile_tool_glob")
+    assert hasattr(permission_grants, "_match_compiled_tool_glob")
     duplicate_count = 1_000
     server = "a" * 500_000
     deny_rule = "*Z*"
-    coverage_calls = 0
-    restriction_line = 0
-    original_restriction_covers = permission_grants._restriction_covers
+    compile_calls = 0
+    match_calls = 0
+    original_compile = permission_grants._compile_tool_glob
+    original_match = permission_grants._match_compiled_tool_glob
 
-    def counting_restriction_covers(
-        candidate: permission_grants._AllowCandidate,
-        restriction: permission_grants._Restriction,
-    ) -> bool:
-        nonlocal coverage_calls, restriction_line
-        coverage_calls += 1
-        restriction_line = restriction.source_line
-        return original_restriction_covers(candidate, restriction)
+    def counting_compile(pattern: str) -> permission_grants._CompiledToolGlob:
+        nonlocal compile_calls
+        compile_calls += 1
+        return original_compile(pattern)
 
-    monkeypatch.setattr(
-        permission_grants,
-        "_restriction_covers",
-        counting_restriction_covers,
-    )
+    def counting_match(compiled: permission_grants._CompiledToolGlob, value: str) -> bool:
+        nonlocal match_calls
+        match_calls += 1
+        return original_match(compiled, value)
+
+    monkeypatch.setattr(permission_grants, "_compile_tool_glob", counting_compile)
+    monkeypatch.setattr(permission_grants, "_match_compiled_tool_glob", counting_match)
     result = analyze_permission_grants(
         {
             "permissions": {
@@ -1189,30 +1259,25 @@ def test_duplicate_restrictions_are_deduplicated_before_large_candidate_coverage
         ),
     )
 
-    assert coverage_calls == 1
-    assert restriction_line == 3
+    assert compile_calls == 1
+    assert match_calls == 1
     assert [grant.grant_kind for grant in result.grants] == ["mcp_exact_tool"]
+    assert [diagnostic.source_line for diagnostic in result.diagnostics] == [3]
 
 
 def test_duplicate_allow_candidates_are_deduplicated_before_coverage_with_earliest_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    coverage_calls = 0
-    original_restriction_covers = permission_grants._restriction_covers
+    assert hasattr(permission_grants, "_match_compiled_tool_glob")
+    match_calls = 0
+    original_match = permission_grants._match_compiled_tool_glob
 
-    def counting_restriction_covers(
-        candidate: permission_grants._AllowCandidate,
-        restriction: permission_grants._Restriction,
-    ) -> bool:
-        nonlocal coverage_calls
-        coverage_calls += 1
-        return original_restriction_covers(candidate, restriction)
+    def counting_match(compiled: permission_grants._CompiledToolGlob, value: str) -> bool:
+        nonlocal match_calls
+        match_calls += 1
+        return original_match(compiled, value)
 
-    monkeypatch.setattr(
-        permission_grants,
-        "_restriction_covers",
-        counting_restriction_covers,
-    )
+    monkeypatch.setattr(permission_grants, "_match_compiled_tool_glob", counting_match)
     result = analyze_permission_grants(
         {
             "permissions": {
@@ -1230,10 +1295,119 @@ def test_duplicate_allow_candidates_are_deduplicated_before_coverage_with_earlie
         ),
     )
 
-    assert coverage_calls == 1
+    assert match_calls == 1
     assert [(grant.grant_kind, grant.source_line) for grant in result.grants] == [
         ("scoped_execution", 3)
     ]
+
+
+def test_indexed_restrictions_avoid_glob_matching_for_proven_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert hasattr(permission_grants, "_match_compiled_tool_glob")
+    match_calls = 0
+    original_match = permission_grants._match_compiled_tool_glob
+
+    def counting_match(compiled: permission_grants._CompiledToolGlob, value: str) -> bool:
+        nonlocal match_calls
+        match_calls += 1
+        return original_match(compiled, value)
+
+    monkeypatch.setattr(permission_grants, "_match_compiled_tool_glob", counting_match)
+    result = _analyze(
+        {
+            "allow": [
+                "Bash(echo hi)",
+                "WebFetch(domain:docs.example)",
+                "mcp__files__read",
+            ],
+            "deny": ["Z*", "Bash(echo hi)", "WebFetch", "mcp__files"],
+        }
+    )
+
+    assert result.grants == ()
+    assert match_calls == 0
+
+
+def test_glob_match_budget_accepts_exact_limit_and_rejects_next_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert permission_grants.MAX_PERMISSION_GLOB_MATCH_CHARS_PER_DOCUMENT == 8_388_608
+    candidate = "mcp__s__t"
+    glob = "Z*"
+    exact_charge = len(candidate) + len(glob)
+
+    monkeypatch.setattr(
+        permission_grants,
+        "MAX_PERMISSION_GLOB_MATCH_CHARS_PER_DOCUMENT",
+        exact_charge,
+    )
+    accepted = _analyze({"allow": [candidate], "deny": [glob]})
+
+    monkeypatch.setattr(
+        permission_grants,
+        "MAX_PERMISSION_GLOB_MATCH_CHARS_PER_DOCUMENT",
+        exact_charge - 1,
+    )
+    rejected = _analyze({"allow": [candidate], "deny": [glob]})
+
+    assert [grant.grant_kind for grant in accepted.grants] == ["mcp_exact_tool"]
+    assert rejected.outcome is LedgerOutcome.FAILED
+    assert rejected.reason is LedgerReason.COMPONENT_LIMIT
+    assert rejected.grants == ()
+    assert rejected.diagnostics == ()
+    assert rejected.aggregate_digest is None
+
+
+def test_near_megabyte_unique_glob_cross_product_hits_atomic_deterministic_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert hasattr(permission_grants, "_compile_tool_glob")
+    assert hasattr(permission_grants, "_match_compiled_tool_glob")
+    rule_count = 200
+    rule_width = 2_400
+
+    def padded_rule(prefix: str, suffix: str) -> str:
+        return f"{prefix}{'a' * (rule_width - len(prefix) - len(suffix))}{suffix}"
+
+    allow = [padded_rule(f"mcp__s{index:03d}", "__tool") for index in range(rule_count)]
+    deny = [padded_rule(f"Z{index:03d}", "*X") for index in range(rule_count)]
+    permissions = {"allow": allow, "deny": deny}
+    encoded_size = len(json.dumps({"permissions": permissions}, separators=(",", ":")))
+    charge = rule_width * 2
+    expected_matches = permission_grants.MAX_PERMISSION_GLOB_MATCH_CHARS_PER_DOCUMENT // charge
+    compile_calls = 0
+    match_calls = 0
+    original_compile = permission_grants._compile_tool_glob
+    original_match = permission_grants._match_compiled_tool_glob
+
+    def counting_compile(pattern: str) -> permission_grants._CompiledToolGlob:
+        nonlocal compile_calls
+        compile_calls += 1
+        return original_compile(pattern)
+
+    def counting_match(compiled: permission_grants._CompiledToolGlob, value: str) -> bool:
+        nonlocal match_calls
+        match_calls += 1
+        return original_match(compiled, value)
+
+    monkeypatch.setattr(permission_grants, "_compile_tool_glob", counting_compile)
+    monkeypatch.setattr(permission_grants, "_match_compiled_tool_glob", counting_match)
+
+    first = _analyze(permissions)
+    first_counts = (compile_calls, match_calls)
+    compile_calls = match_calls = 0
+    second = _analyze({"allow": list(reversed(allow)), "deny": list(reversed(deny))})
+    second_counts = (compile_calls, match_calls)
+
+    assert 900_000 <= encoded_size < 1_000_000
+    assert first == second
+    assert first.outcome is LedgerOutcome.FAILED
+    assert first.reason is LedgerReason.COMPONENT_LIMIT
+    assert first.grants == ()
+    assert first.diagnostics == ()
+    assert first.aggregate_digest is None
+    assert first_counts == second_counts == (rule_count, expected_matches)
 
 
 def test_equivalent_mcp_server_candidates_have_order_stable_normalized_glob_coverage() -> None:
@@ -1326,6 +1500,24 @@ def test_powershell_tool_glob_remains_case_sensitive_after_identifier_normalizat
 
     assert matched.grants == ()
     assert [grant.grant_kind for grant in unmatched.grants] == ["scoped_execution"]
+
+
+def test_powershell_command_normalization_folds_ascii_only() -> None:
+    ascii_equivalent = _analyze(
+        {
+            "allow": ["PowerShell(WRITE-ß)"],
+            "deny": ["powershell(write-ß)"],
+        }
+    )
+    unicode_distinct = _analyze(
+        {
+            "allow": ["PowerShell(WRITE-ß)"],
+            "deny": ["powershell(write-ss)"],
+        }
+    )
+
+    assert ascii_equivalent.grants == ()
+    assert [grant.grant_kind for grant in unicode_distinct.grants] == ["scoped_execution"]
 
 
 @pytest.mark.parametrize("directory", ["~/.config/gcloud", "~/.config/gh", "~/.config/glab"])
