@@ -222,11 +222,19 @@ class _StructuredAgentCLIModel:
     ``complete()``, then parses and validates the response into *schema*.
     """
 
-    def __init__(self, provider: object, model: str, max_output_tokens: int, schema: type) -> None:
+    def __init__(
+        self,
+        provider: object,
+        model: str,
+        max_output_tokens: int,
+        schema: type,
+        timeout: float | None = None,
+    ) -> None:
         self._provider = provider
         self._model = model
         self._max_output_tokens = max_output_tokens
         self._schema = schema
+        self._timeout = timeout
 
     def _augment(self, prompt: str) -> str:
         schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
@@ -243,6 +251,7 @@ class _StructuredAgentCLIModel:
             self._augment(prompt),
             model=self._model,
             max_output_tokens=self._max_output_tokens,
+            timeout=self._timeout,
         )
 
     def invoke(self, prompt: str) -> object:
@@ -282,10 +291,13 @@ class AgentCLIChatModel:
     message rather than a confusing ``AttributeError``.
     """
 
-    def __init__(self, provider: object, model: str, max_output_tokens: int) -> None:
+    def __init__(
+        self, provider: object, model: str, max_output_tokens: int, timeout: float | None = None
+    ) -> None:
         self._provider = provider
         self._model = model
         self._max_output_tokens = max_output_tokens
+        self._timeout = timeout
 
     def batch(self, *args: object, **kwargs: object) -> NoReturn:
         raise NotImplementedError(
@@ -304,6 +316,7 @@ class AgentCLIChatModel:
             prompt,
             model=self._model,
             max_output_tokens=self._max_output_tokens,
+            timeout=self._timeout,
         )
         return _AgentCLIMessage(text)
 
@@ -312,11 +325,13 @@ class AgentCLIChatModel:
 
     def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
         return _StructuredAgentCLIModel(
-            self._provider, self._model, self._max_output_tokens, schema
+            self._provider, self._model, self._max_output_tokens, schema, self._timeout
         )
 
 
-def get_chat_model(model: str | None = None) -> BaseChatModel | AgentCLIChatModel:
+def get_chat_model(
+    model: str | None = None, *, timeout: float | None = None
+) -> BaseChatModel | AgentCLIChatModel:
     """Return a chat model for the active provider.
 
     For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) this
@@ -339,6 +354,7 @@ def get_chat_model(model: str | None = None) -> BaseChatModel | AgentCLIChatMode
             provider,
             resolved_model,
             get_max_output_tokens(resolved_model),
+            timeout,
         )
         register_chat_model_provider(chat_model, provider)
         return chat_model
@@ -347,7 +363,7 @@ def get_chat_model(model: str | None = None) -> BaseChatModel | AgentCLIChatMode
     chat_model, effective_provider = create_chat_model_with_provider(
         model=model,
         max_tokens=get_max_output_tokens(model),
-        timeout=120,
+        timeout=timeout if timeout is not None else 120,
     )
     register_chat_model_provider(chat_model, effective_provider)
     return chat_model
@@ -409,6 +425,7 @@ def chat_completion(
     usage_collector: InferenceUsageCollector | None = None,
     node: str = "chat_completion",
     request_kind: str = "chat_completion",
+    timeout: float | None = None,
 ) -> str:
     """Request a single chat completion and return the assistant content.
 
@@ -419,7 +436,7 @@ def chat_completion(
     which normalise content blocks to a single string) and falls back to
     ``.content`` for the CLI adapter's ``_AgentCLIMessage``.
     """
-    chat_model = get_chat_model(model=model)
+    chat_model = get_chat_model(model=model, timeout=timeout)
     active_provider = get_active_provider()
     resolved_model = str(
         model

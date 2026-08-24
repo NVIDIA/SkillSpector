@@ -135,15 +135,24 @@ class TestNvBuildProvider:
     @pytest.mark.parametrize(
         ("model", "context_length"),
         [
-            ("z-ai/glm-5.2", 1_000_000),
-            ("z-ai/glm-5.1", 205_000),
+            ("z-ai/glm-5.2", 202_749),
             ("moonshotai/kimi-k2.6", 256_000),
         ],
     )
     def test_nv_build_reported_model_metadata(self, model: str, context_length: int) -> None:
         provider = NvBuildProvider()
         assert provider.get_context_length(model) == context_length
-        assert provider.get_max_output_tokens(model) is None
+
+    def test_glm_declares_both_limits(self) -> None:
+        """max_output_tokens is optional, and its absence is not neutral.
+
+        Without it the output budget is derived as a percentage of the context
+        window, which is what produced a 250_000-token request against an
+        endpoint accepting 202_749 combined.
+        """
+        provider = NvBuildProvider()
+        assert provider.get_context_length("z-ai/glm-5.2") == 202_749
+        assert provider.get_max_output_tokens("z-ai/glm-5.2") == 32_768
 
     @pytest.mark.parametrize("model", ["glm-5.2", "z-ai/glm-5.2 "])
     def test_nv_build_model_near_match_stays_unresolved(self, model: str) -> None:
@@ -170,11 +179,20 @@ class TestNvBuildProvider:
         assert llm.max_tokens == 123
         assert str(llm.openai_api_base).rstrip("/") == BUILD_BASE_URL.rstrip("/")
 
-    def test_metadata_known_model_from_bundled_yaml(self) -> None:
-        """deepseek-v4-flash ships in nv_build/model_registry.yaml."""
+    def test_metadata_drops_end_of_life_model(self) -> None:
+        """deepseek-v4-flash reached end of life and returns 410 Gone.
+
+        Keeping it is worse than omitting it: an entry with a 1_000_000 window
+        makes model_info budget 250_000 output tokens, rejected on every call.
+        Absent, the conservative default applies instead.
+        """
         provider = NvBuildProvider()
-        assert provider.get_context_length("deepseek-ai/deepseek-v4-flash") == 1_000_000
-        assert provider.get_max_output_tokens("deepseek-ai/deepseek-v4-flash") == 128_000
+        assert provider.get_context_length("deepseek-ai/deepseek-v4-flash") is None
+
+    def test_default_model_is_in_the_bundled_registry(self) -> None:
+        """The invariant test_constants asserts, checked at the source too."""
+        provider = NvBuildProvider()
+        assert provider.get_context_length(NvBuildProvider.DEFAULT_MODEL) is not None
 
     def test_metadata_unknown_model_returns_none(self) -> None:
         provider = NvBuildProvider()
@@ -190,12 +208,9 @@ class TestNvBuildProvider:
         # Env override applies to every slot.
         assert NvBuildProvider().resolve_model("meta_analyzer") == "user/override"
 
-    def test_resolve_model_meta_analyzer_uses_slot_override(self) -> None:
-        # meta_analyzer is upgraded to deepseek-v4-pro on NvBuild.
-        assert (
-            NvBuildProvider().resolve_model("meta_analyzer")
-            == NvBuildProvider.SLOT_DEFAULTS["meta_analyzer"]
-        )
+    def test_resolve_model_meta_analyzer_falls_back_to_default(self) -> None:
+        # The former override named deepseek-v4-pro, absent from the catalogue.
+        assert NvBuildProvider().resolve_model("meta_analyzer") == NvBuildProvider.DEFAULT_MODEL
 
     def test_resolve_model_unknown_slot_falls_to_default(self) -> None:
         # Slots without an explicit override inherit DEFAULT_MODEL.

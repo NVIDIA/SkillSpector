@@ -334,6 +334,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             elif run.kind == "horizontal":
                 confidence = 0.7
                 severity = Severity.MEDIUM
+            elif run.kind == "repetition":
+                confidence = 0.8
+                severity = Severity.MEDIUM
             else:  # "block" or "ratio"
                 confidence = 0.4
                 severity = Severity.LOW

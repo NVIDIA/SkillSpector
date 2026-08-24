@@ -32,7 +32,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number, is_code_example
+from .common import get_context, get_line_number
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -86,7 +86,7 @@ TM1_PATTERNS = [
     # Dangerous tool parameter patterns in instructions
     (
         r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|-rf)\b",
-        0.75,
+        0.8,
     ),
 ]
 
@@ -192,6 +192,11 @@ _SAFE_DOCKERFILE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"rm\s+-rf\s+/root/\.cache", re.IGNORECASE),
 )
 
+_SAFE_CACHE_CLEANUP_RE = re.compile(
+    r"\brm\s+-rf\s+(?P<quote>['\"]?)(?P<path>(?:\$?\{?HOME\}?|~)/\.cache/[^\s;&|'\"]+)(?P=quote)(?:\s*(?:$|[;&|]))",
+    re.IGNORECASE,
+)
+
 # Dockerfile context indicators (nearby keywords that signal Dockerfile content)
 _DOCKERFILE_CONTEXT_RE = re.compile(
     r"\b(?:FROM|RUN|WORKDIR|COPY|ADD|ENV|EXPOSE|ENTRYPOINT|CMD|USER|HEALTHCHECK|ARG)\s",
@@ -208,6 +213,29 @@ def _is_safe_dockerfile_idiom(context: str, matched_text: str) -> bool:
     if not _DOCKERFILE_CONTEXT_RE.search(context):
         return False
     return any(p.search(matched_text) or p.search(context) for p in _SAFE_DOCKERFILE_PATTERNS)
+
+
+def _is_safe_cache_cleanup(matched_text: str) -> bool:
+    """Return True for scoped cleanup of a tool-owned user cache path."""
+    match = _SAFE_CACHE_CLEANUP_RE.fullmatch(matched_text)
+    if not match:
+        return False
+    parts = match.group("path").split("/")
+    lowered_parts = [part.lower() for part in parts]
+    cache_index = lowered_parts.index(".cache")
+    cache_parts = parts[cache_index + 1 :]
+    return bool(cache_parts) and not any(
+        part in ("", ".", "..") or "*" in part for part in cache_parts
+    )
+
+
+def _line_containing(content: str, start: int, end: int) -> str:
+    """Return the full line containing a regex match."""
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end == -1:
+        line_end = len(content)
+    return content[line_start:line_end]
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -227,9 +255,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
+            matched_line = _line_containing(content, match.start(), match.end())
 
-            if _is_safe_container_command(context_text) or _is_safe_dockerfile_idiom(
-                context_text, matched
+            if (
+                _is_safe_container_command(context_text)
+                or _is_safe_dockerfile_idiom(context_text, matched)
+                or _is_safe_cache_cleanup(matched_line)
             ):
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
@@ -291,13 +322,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
-    # TM4: privileged K8s workload. Filtered through is_code_example() because
-    # privileged/hostPath fields commonly appear in SKILL.md docs and examples.
+    # TM4: privileged K8s workload. Example filtering is delegated to the runner.
     for pattern, confidence in TM4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            context_text = ctx(match.start())
-            if is_code_example(context_text):
-                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -307,7 +334,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     location=loc(line_num),
                     confidence=confidence,
                     tags=tag,
-                    context=context_text,
+                    context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
                 )
             )

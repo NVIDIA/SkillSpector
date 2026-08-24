@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for meta_analyzer heuristic fallback filter (--no-llm mode)."""
+"""Tests for fail-closed meta_analyzer fallback behavior."""
 
 from __future__ import annotations
 
@@ -47,20 +47,20 @@ def _finding(
     )
 
 
-class TestConfidenceThreshold:
-    """Findings below confidence threshold are dropped (unless high severity)."""
+class TestConfidencePreservation:
+    """Fallback preserves deterministic findings at every confidence."""
 
-    def test_low_confidence_low_severity_dropped(self) -> None:
-        """LOW severity finding with confidence 0.3 is below threshold and dropped."""
+    def test_low_confidence_low_severity_retained(self) -> None:
+        """LOW-severity deterministic findings remain visible."""
         findings = [_finding(confidence=0.3, severity="LOW")]
         result = _fallback_filtered(findings)
-        assert len(result) == 0
+        assert len(result) == 1
 
-    def test_low_confidence_medium_severity_dropped(self) -> None:
-        """MEDIUM severity finding with confidence 0.3 is dropped."""
+    def test_low_confidence_medium_severity_retained(self) -> None:
+        """MEDIUM-severity deterministic findings remain visible."""
         findings = [_finding(confidence=0.3, severity="MEDIUM")]
         result = _fallback_filtered(findings)
-        assert len(result) == 0
+        assert len(result) == 1
 
     def test_at_threshold_kept(self) -> None:
         """Finding with confidence exactly 0.4 is kept (>= 0.4)."""
@@ -75,8 +75,8 @@ class TestConfidenceThreshold:
         assert len(result) == 1
 
 
-class TestSeverityFloor:
-    """HIGH and CRITICAL findings are never dropped on confidence alone."""
+class TestSeverityPreservation:
+    """Fallback preserves deterministic findings across all severities."""
 
     def test_critical_below_threshold_retained(self) -> None:
         """CRITICAL finding at 0.35 confidence is retained (severity floor)."""
@@ -92,11 +92,11 @@ class TestSeverityFloor:
         assert len(result) == 1
         assert result[0].severity == "HIGH"
 
-    def test_low_severity_below_threshold_still_dropped(self) -> None:
-        """LOW finding at 0.2 confidence is still dropped (no severity protection)."""
+    def test_low_severity_below_threshold_retained(self) -> None:
+        """LOW findings are retained even at low confidence."""
         findings = [_finding(confidence=0.2, severity="LOW")]
         result = _fallback_filtered(findings)
-        assert len(result) == 0
+        assert len(result) == 1
 
     def test_none_severity_treated_as_low(self) -> None:
         """Finding with None severity does not crash — treated as LOW."""
@@ -104,18 +104,18 @@ class TestSeverityFloor:
         result = _fallback_filtered(findings)
         assert len(result) == 1
 
-    def test_none_severity_below_threshold_dropped(self) -> None:
-        """None severity at low confidence is dropped (no severity floor protection)."""
+    def test_none_severity_below_threshold_retained(self) -> None:
+        """Missing severity does not cause a deterministic finding to disappear."""
         findings = [_finding(confidence=0.3, severity=None)]
         result = _fallback_filtered(findings)
-        assert len(result) == 0
+        assert len(result) == 1
 
 
-class TestCodeExampleFiltering:
-    """Findings in code example context are downweighted, not hard-dropped."""
+class TestCodeExamplePreservation:
+    """Attacker-controlled example framing cannot downweight findings."""
 
-    def test_fenced_code_block_context_downweighted(self) -> None:
-        """Finding whose context contains ``` gets confidence halved."""
+    def test_fenced_code_block_context_preserves_confidence(self) -> None:
+        """Fenced-code framing leaves deterministic confidence unchanged."""
         findings = [
             _finding(
                 context="```bash\ncurl -k https://api.example.com\n```",
@@ -124,10 +124,10 @@ class TestCodeExampleFiltering:
         ]
         result = _fallback_filtered(findings)
         assert len(result) == 1
-        assert result[0].confidence == 0.4
+        assert result[0].confidence == 0.8
 
-    def test_example_keyword_context_downweighted(self) -> None:
-        """Finding whose context contains 'example:' gets downweighted."""
+    def test_example_keyword_context_preserves_confidence(self) -> None:
+        """Example-keyword framing leaves deterministic confidence unchanged."""
         findings = [
             _finding(
                 context="Example: how to use subprocess\nsubprocess.run(cmd)",
@@ -136,10 +136,10 @@ class TestCodeExampleFiltering:
         ]
         result = _fallback_filtered(findings)
         assert len(result) == 1
-        assert result[0].confidence == 0.4
+        assert result[0].confidence == 0.8
 
-    def test_code_example_low_confidence_low_severity_dropped(self) -> None:
-        """LOW severity finding at 0.6 conf in code-example context: 0.6*0.5=0.3 < 0.4, dropped."""
+    def test_code_example_low_confidence_low_severity_retained(self) -> None:
+        """Example framing cannot remove a LOW-severity finding."""
         findings = [
             _finding(
                 context="```\ncurl -k https://api.example.com\n```",
@@ -148,7 +148,8 @@ class TestCodeExampleFiltering:
             )
         ]
         result = _fallback_filtered(findings)
-        assert len(result) == 0
+        assert len(result) == 1
+        assert result[0].confidence == 0.6
 
     def test_code_example_high_severity_retained(self) -> None:
         """HIGH severity finding in code-example context at low conf: retained by severity floor."""
@@ -180,22 +181,22 @@ class TestCodeExampleFiltering:
         assert len(result) == 1
 
 
-class TestCombinedFiltering:
-    """Both filters work together."""
+class TestCombinedFallback:
+    """Mixed deterministic findings all survive fallback."""
 
-    def test_mixed_findings_filtered(self) -> None:
-        """Mix of low-confidence, code-example, and genuine findings."""
+    def test_mixed_findings_retained(self) -> None:
+        """Confidence, framing, and severity do not remove findings."""
         findings = [
-            _finding(confidence=0.2, severity="LOW"),  # dropped: low conf + low sev
+            _finding(confidence=0.2, severity="LOW"),
             _finding(
                 confidence=0.8,
                 context="```\ncurl -k https://example.com\n```",
-            ),  # kept but downweighted (HIGH severity protects)
-            _finding(confidence=0.8),  # kept: genuine finding
-            _finding(confidence=0.6),  # kept: above threshold, normal context
+            ),
+            _finding(confidence=0.8),
+            _finding(confidence=0.6),
         ]
         result = _fallback_filtered(findings)
-        assert len(result) == 3
+        assert len(result) == 4
 
     def test_remediation_applied(self) -> None:
         """Kept findings get default remediation if none set."""
@@ -229,6 +230,29 @@ class TestLLMFailurePassthrough:
         result = _passthrough_with_defaults(findings)
         assert len(result) == 1
         assert result[0].remediation is not None
+
+    def test_fallback_and_passthrough_preserve_security_metadata(self) -> None:
+        original = Finding(
+            rule_id="TM1",
+            message="deterministic",
+            severity="MEDIUM",
+            confidence=0.2,
+            file="tool.py",
+            start_line=3,
+            intent="malicious",
+            evidence={"source": "static", "local_only": True},
+            match_fingerprint="sha256:deterministic",
+            occurrences=[{"file": "tool.py", "start_line": 3, "end_line": 3}],
+        )
+
+        for clone in (
+            _fallback_filtered([original])[0],
+            _passthrough_with_defaults([original])[0],
+        ):
+            assert clone.intent == original.intent
+            assert clone.evidence == original.evidence
+            assert clone.match_fingerprint == original.match_fingerprint
+            assert clone.occurrences == original.occurrences
 
     def test_meta_analyzer_llm_failure_uses_passthrough(self) -> None:
         """When LLM call raises, meta_analyzer passes all findings through."""

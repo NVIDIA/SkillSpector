@@ -159,15 +159,17 @@ _PE3_SAFE_ACCESS_TOKEN_NAVIGATION = re.compile(
     r"(?P<target>access\s+tokens?)\s*[`.)]*\s*$",
     re.IGNORECASE,
 )
-_PE3_TOKEN_LIFECYCLE_CONTEXT = re.compile(
-    r"\b(?:expires?|expiry|lifespan|refresh[ _-]?token|oauth|bearer|token endpoint|"
-    r"renew(?:ed|al|ing)?|revoked)\b"
-    r"|grant_type\s*=\s*client_credentials|(?:^|\W)401(?:\W|$)",
-    re.IGNORECASE,
-)
 _PE3_TOKEN_ACTION_CONTEXT = re.compile(
-    r"\b(?:steal|exfiltrat\w*|dump|harvest|scrape|upload|transmit|send|copy|extract)\b"
-    r"|\b(?:read|open|load)\b[^\n]{0,80}\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
+    r"\b(?:steal(?:s|ing|en)?|exfiltrat(?:e|es|ed|ing|ion)|dump(?:s|ed|ing)?|"
+    r"harvest(?:s|ed|ing)?|scrap(?:e|es|ed|ing)|upload(?:s|ed|ing)?|"
+    r"transmit(?:s|ted|ting)?|send(?:s|ing)?|sent|cop(?:y|ies|ied|ying)|"
+    r"extract(?:s|ed|ing|ion)?|forward(?:s|ed|ing)?|leak(?:s|ed|ing)?|"
+    r"share(?:s|d|ing)?|expose(?:s|d|ing)?)\b"
+    r"|\bpost(?:s|ed|ing)?\b[^\n]{0,80}"
+    r"\b(?:it|them|(?:the\s+)?(?:access|refresh|bearer|api)[ _-]?tokens?)\b"
+    r"[^\n]{0,40}\bto\b"
+    r"|\b(?:read(?:s|ing)?|open(?:s|ed|ing)?|load(?:s|ed|ing)?)\b[^\n]{0,80}"
+    r"\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
     re.IGNORECASE,
 )
 _PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
@@ -178,21 +180,25 @@ _PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
     r"\b(?:read|open|load|copy|upload|transmit)\b",
     re.IGNORECASE,
 )
-_PE3_ACCESS_TOKEN_NOUN_MODIFIER = re.compile(
-    r"\b(?:an?|the|new|resulting|stored|ssa|actor|oauth|bearer|glean|user)\s+$",
+_PE3_ACCESS_TOKEN_DIRECTIVE_PREFIX = re.compile(
+    r"\b(?:please|always|silently|then|next|must|should|shall|can|could|will|may|to)\s*$"
+    r"|\b(?:need(?:s)?|try|attempt)\s+to\s*$"
+    r"|^\s*(?:the\s+|an?\s+)?(?:\w+[ -]+){0,2}"
+    r"(?:agents?|assistants?|tools?|skills?|scripts?|users?|clients?|applications?|"
+    r"attackers?|we|you|they|i)\s*$"
+    r"|^\s*(?:go|navigate)\b.*[,;]\s*$",
     re.IGNORECASE,
 )
-_PE3_ACCESS_TOKEN_LIFESPAN_PREFIX = re.compile(
-    r"\s*(?:[-*|>#`]+\s*)*(?:\*{0,2}lifespan\s*:\s*\*{0,2}\s*)?",
+_PE3_ACCESS_TOKEN_NOUN_SUFFIX = re.compile(
+    r"\s*(?:$|[|,.;:)]|(?:are|were|is|was|expire\w*|remain\w*|contain\w*|"
+    r"include\w*|provide\w*|represent\w*|identify\w*|authenticate\w*|authorize\w*|"
+    r"issued|returned|accepted|rejected|revoked|stored|used|tied|associated)\b)",
     re.IGNORECASE,
 )
-_PE3_ACCESS_TOKEN_LIFESPAN_SUFFIX = re.compile(
-    r"\s*(?:~?\d|expires?|is\s+(?:valid|used)|lasts?\b)",
-    re.IGNORECASE,
-)
-_PE3_TOKEN_LIFECYCLE_DOCUMENTATION_DIRS = frozenset(
+_PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
     {"docs", "documentation", "procedures", "references", "examples", "guides"}
 )
+_MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
 
 
 def _source_line(content: str, match: re.Match[str]) -> str:
@@ -204,30 +210,35 @@ def _source_line(content: str, match: re.Match[str]) -> str:
     return content[line_start:line_end]
 
 
-def _is_access_token_lifecycle_noun(
+def _is_access_token_documentation_noun(
     content: str,
     match: re.Match[str],
     file_type: str,
     file_path: str,
 ) -> bool:
-    """Return True for a bounded OAuth ``access token`` noun in documentation.
+    """Return True for a bounded ``access token`` compound noun in documentation.
 
     PE3's generic ``access … tokens?`` rule cannot distinguish the verb
-    "access tokens" from the OAuth compound noun "access token". Suppress only
-    noun-shaped matches with nearby lifecycle evidence, and fail closed when
-    the context contains credential actions or sensitive sources.
+    "access tokens" from the OAuth compound noun "access token". A bare
+    singular match is necessarily noun-shaped: the verb form requires a
+    determiner (for example, "access the token"). Plural matches remain
+    ambiguous, so suppress them only when they are not governed by an
+    imperative/modal prefix, or when a line-leading match has noun syntax.
+
+    Any credential action or sensitive source in the bounded context vetoes
+    suppression. This keeps malicious instructions actionable even when they
+    are placed in documentation or next to otherwise benign OAuth prose.
     """
     if file_type not in {"markdown", "text"}:
         return False
     normalized_parts = file_path.replace("\\", "/").lower().split("/")
-    if not any(part in _PE3_TOKEN_LIFECYCLE_DOCUMENTATION_DIRS for part in normalized_parts):
+    if not any(part in _PE3_TOKEN_DOCUMENTATION_DIRS for part in normalized_parts):
         return False
-    if match.group(0).lower() not in {"access token", "access tokens"}:
+    matched_text = match.group(0).lower()
+    if matched_text not in {"access token", "access tokens"}:
         return False
 
     context = get_context(content, match.start())
-    if not _PE3_TOKEN_LIFECYCLE_CONTEXT.search(context):
-        return False
     if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
         return False
 
@@ -235,15 +246,21 @@ def _is_access_token_lifecycle_noun(
     line_start = content.rfind("\n", 0, match.start()) + 1
     relative_start = match.start() - line_start
     relative_end = match.end() - line_start
-    prefix = line[:relative_start]
+    prefix = _MARKDOWN_LINE_PREFIX.sub("", line[:relative_start])
     suffix = line[relative_end:]
 
-    has_noun_modifier = _PE3_ACCESS_TOKEN_NOUN_MODIFIER.search(prefix) is not None
-    is_lifecycle_subject = bool(
-        _PE3_ACCESS_TOKEN_LIFESPAN_PREFIX.fullmatch(prefix)
-        and _PE3_ACCESS_TOKEN_LIFESPAN_SUFFIX.match(suffix)
-    )
-    return has_noun_modifier or is_lifecycle_subject
+    cell_prefix = prefix.rsplit("|", 1)[-1]
+    clause_start = max(cell_prefix.rfind(separator) for separator in ".;:")
+    clause_prefix = cell_prefix[clause_start + 1 :]
+    if _PE3_ACCESS_TOKEN_DIRECTIVE_PREFIX.search(
+        cell_prefix
+    ) or _PE3_ACCESS_TOKEN_DIRECTIVE_PREFIX.search(clause_prefix):
+        return False
+    if matched_text == "access token":
+        return True
+    if not clause_prefix.strip():
+        return _PE3_ACCESS_TOKEN_NOUN_SUFFIX.match(suffix) is not None
+    return True
 
 
 def _is_qualified_benign_access_requirement(
@@ -303,8 +320,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
+            finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
-                continue
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE2",
@@ -312,7 +330,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     severity=Severity.MEDIUM,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
                 )
@@ -321,12 +339,17 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
-            if _is_pe3_documentation_example(content, match, file_type, file_path):
-                continue
-            if _is_qualified_benign_access_requirement(content, match, file_type):
-                continue
-            if _is_read_only_passwd_volume_match(content, match):
-                continue
+            contextual = any(
+                (
+                    _is_pe3_documentation_example(content, match, file_type, file_path),
+                    _is_qualified_benign_access_requirement(content, match, file_type),
+                    _is_read_only_passwd_volume_match(content, match),
+                    _is_negated_safety_constraint(content, match),
+                )
+            )
+            finding_tags = list(tag)
+            if contextual:
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
@@ -334,7 +357,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     severity=Severity.HIGH,
                     location=loc(line_num),
                     confidence=confidence,
-                    tags=tag,
+                    tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
                 )
@@ -346,8 +369,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
+            finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
-                continue
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             if line_num in pe4_best and pe4_best[line_num].confidence >= confidence:
                 continue
             pe4_best[line_num] = AnalyzerFinding(
@@ -356,7 +380,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 severity=Severity.HIGH,
                 location=loc(line_num),
                 confidence=confidence,
-                tags=tag,
+                tags=finding_tags,
                 context=context,
                 matched_text=match.group(0)[:200],
             )
@@ -368,8 +392,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
+            finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
-                continue
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             if line_num in pe5_best and pe5_best[line_num].confidence >= confidence:
                 continue
             pe5_best[line_num] = AnalyzerFinding(
@@ -378,7 +403,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 severity=Severity.HIGH,
                 location=loc(line_num),
                 confidence=confidence,
-                tags=tag,
+                tags=finding_tags,
                 context=context,
                 matched_text=match.group(0)[:200],
             )
@@ -439,7 +464,28 @@ def _is_pe3_documentation_example(
         if navigation.span("target") == match_span:
             return True
 
-    return _is_access_token_lifecycle_noun(content, match, file_type, file_path)
+    return _is_access_token_documentation_noun(content, match, file_type, file_path)
+
+
+def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+    """Return True when a privilege-escalation phrase is forbidden in policy prose."""
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    local_start = match.start() - line_start
+    phrase = line[local_start : local_start + len(match.group(0))]
+    escaped = re.escape(phrase.strip())
+    if not escaped:
+        return False
+    clause_start = max(line.rfind(sep, 0, local_start) for sep in ".;:")
+    prefix = line[clause_start + 1 : local_start]
+    safe_gap = r"(?:(?:ever|again|directly|intentionally|explicitly|attempt\s+to|try\s+to)\s+){0,2}"
+    negation = r"(?:must\s+not|do\s+not|don't|never|should\s+not)\s+"
+    return (
+        re.search(negation + safe_gap + escaped + r"$", prefix + phrase, re.IGNORECASE) is not None
+    )
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

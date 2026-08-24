@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from skillspector.nodes.analyzers.artifact_integrity import node as artifact_integrity_node
 from skillspector.nodes.analyzers.behavioral_ast import node as behavioral_ast_node
 from skillspector.nodes.analyzers.behavioral_taint_tracking import (
     node as behavioral_taint_tracking_node,
@@ -41,6 +42,9 @@ from skillspector.nodes.analyzers.static_patterns_anti_refusal import (
 )
 from skillspector.nodes.analyzers.static_patterns_data_exfiltration import (
     node as static_patterns_data_exfiltration_node,
+)
+from skillspector.nodes.analyzers.static_patterns_deserialization import (
+    node as static_patterns_deserialization_node,
 )
 from skillspector.nodes.analyzers.static_patterns_excessive_agency import (
     node as static_patterns_excessive_agency_node,
@@ -76,8 +80,12 @@ from skillspector.nodes.analyzers.static_patterns_tool_misuse import (
     node as static_patterns_tool_misuse_node,
 )
 from skillspector.nodes.analyzers.static_yara import node as static_yara_node
+from skillspector.nodes.analyzers.structured_skill_roles import (
+    node as structured_skill_roles_node,
+)
 
 ANALYZER_NODE_IDS: list[str] = [
+    "artifact_integrity",
     "static_patterns_prompt_injection",
     "static_patterns_data_exfiltration",
     "static_patterns_privilege_escalation",
@@ -92,18 +100,21 @@ ANALYZER_NODE_IDS: list[str] = [
     "static_patterns_agent_snooping",
     "static_patterns_anti_refusal",
     "static_patterns_ssrf",
+    "static_patterns_deserialization",
     "static_yara",
     "behavioral_ast",
     "behavioral_taint_tracking",
     "mcp_least_privilege",
     "mcp_tool_poisoning",
     "mcp_rug_pull",
+    "structured_skill_roles",
     "semantic_security_discovery",
     "semantic_developer_intent",
     "semantic_quality_policy",
 ]
 
 ANALYZER_NODES = {
+    "artifact_integrity": artifact_integrity_node,
     "static_patterns_prompt_injection": static_patterns_prompt_injection_node,
     "static_patterns_data_exfiltration": static_patterns_data_exfiltration_node,
     "static_patterns_privilege_escalation": static_patterns_privilege_escalation_node,
@@ -118,12 +129,14 @@ ANALYZER_NODES = {
     "static_patterns_agent_snooping": static_patterns_agent_snooping_node,
     "static_patterns_anti_refusal": static_patterns_anti_refusal_node,
     "static_patterns_ssrf": static_patterns_ssrf_node,
+    "static_patterns_deserialization": static_patterns_deserialization_node,
     "static_yara": static_yara_node,
     "behavioral_ast": behavioral_ast_node,
     "behavioral_taint_tracking": behavioral_taint_tracking_node,
     "mcp_least_privilege": mcp_least_privilege_node,
     "mcp_tool_poisoning": mcp_tool_poisoning_node,
     "mcp_rug_pull": mcp_rug_pull_node,
+    "structured_skill_roles": structured_skill_roles_node,
     "semantic_security_discovery": semantic_security_discovery_node,
     "semantic_developer_intent": semantic_developer_intent_node,
     "semantic_quality_policy": semantic_quality_policy_node,

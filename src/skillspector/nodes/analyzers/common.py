@@ -58,8 +58,15 @@ _CODE_EXAMPLE_INDICATORS: tuple[str, ...] = (
 )
 
 
-def is_code_example(context: str) -> bool:
-    """Return True when the context appears to be a code example or documentation snippet."""
+def is_code_example(context: str, *, path: str = "") -> bool:
+    """Return True when the context appears to be a code example or documentation snippet.
+
+    SKILL.md is the primary attack surface and is never treated as a code example:
+    an attacker can place a documentation-style phrase (``for example``, a fenced
+    code block, ...) a few lines from an injected instruction to suppress the finding.
+    """
+    if path.replace("\\", "/").lower().endswith("skill.md"):
+        return False
     ctx_lower = context.lower()
     return any(ind in ctx_lower for ind in _CODE_EXAMPLE_INDICATORS)
 

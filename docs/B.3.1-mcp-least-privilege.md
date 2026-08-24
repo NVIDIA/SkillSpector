@@ -117,10 +117,13 @@ hiding its true behavior. This is the strongest indicator of deceptive intent
 among the LP rules -- the skill is actively performing operations it claims not
 to need.
 
-**Example:** A skill declares `permissions: [read]` but its code contains
-`httpx.post(...)`. LP1 fires for the undeclared `network` capability.
+**Example:** An Agent Skills `SKILL.md` declares `allowed-tools: Read` but its
+code contains `httpx.post(...)`. LP1 fires for the undeclared `network`
+capability.
 
-**Remediation:** Add the missing permission to SKILL.md, or remove the code
+**Remediation:** For Agent Skills `SKILL.md`, add a tool that covers the missing
+capability to the `allowed-tools` frontmatter field. For MCP server manifests,
+add the missing capability to the `permissions` list. Otherwise, remove the code
 that requires it.
 
 ---

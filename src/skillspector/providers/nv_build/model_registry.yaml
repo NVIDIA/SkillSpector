@@ -15,22 +15,27 @@
 
 models:
   # NVIDIA-curated NIMs on build.nvidia.com.
+  # 202749 e' il tetto COMBINATO ingresso+uscita che l'endpoint impone, ed e' riportato
+  # alla lettera nel 400 che restituisce quando lo si supera. Dichiarando la finestra
+  # nominale di 1000000, model_info calcolava un budget d'uscita di 250000 token
+  # (ctx * (1 - MAX_INPUT_TOKENS_PCT)) e OGNI chiamata falliva:
+  #   "This model configuration accepts at most 202749 combined input and output tokens.
+  #    However, your request has 1249 input tokens and asks for 250000 output tokens"
+  # Una finestra sovrastimata non degrada con grazia: azzera lo stadio LLM. Sottostimare
+  # e' sicuro, sovrastimare no.
   "z-ai/glm-5.2":
-    context_length: 1000000
-
-  "z-ai/glm-5.1":
-    context_length: 205000
+    context_length: 202749
+    max_output_tokens: 32768
 
   "moonshotai/kimi-k2.6":
     context_length: 256000
 
-  "deepseek-ai/deepseek-v4-pro":
-    context_length: 1000000
-    max_output_tokens: 128000
-
-  "deepseek-ai/deepseek-v4-flash":
-    context_length: 1000000
-    max_output_tokens: 128000
+  # deepseek-v4-flash e' a fine vita dal 2026-08-07 e risponde 410 Gone; il successore
+  # servito e' deepseek-v4-flash-0731. I limiti qui sotto sono prudenti: non sono stati
+  # sondati, e una finestra sottostimata e' il verso sicuro in cui sbagliare.
+  "deepseek-ai/deepseek-v4-flash-0731":
+    context_length: 128000
+    max_output_tokens: 16384
 
   "openai/gpt-oss-120b":
     context_length: 128000
