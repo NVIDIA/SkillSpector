@@ -243,6 +243,21 @@ node = mcp_tool_poisoning.node
 
 
 class TestTP1HiddenInstructions:
+    def test_data_uris_use_the_complete_token_and_do_not_hide_adjacent_base64(self) -> None:
+        """Distinct data-URI payloads and adjacent standalone base64 remain distinct findings."""
+        first = "data:text/plain;base64,QUFBQUFBQUE="
+        second = "data:text/plain;base64,QkJCQkJCQkI="
+        adjacent = base64.b64encode(b"adjacent standalone payload " * 3).decode()
+
+        findings = mcp_tool_poisoning._check_tp1(f"{first} {second} {adjacent}", "description")
+        data_uris = [finding for finding in findings if "Data URI" in finding.message]
+        base64_blobs = [finding for finding in findings if "Base64-encoded blob" in finding.message]
+
+        assert len(data_uris) == 2
+        assert len({finding.fingerprint() for finding in data_uris}) == 2
+        assert len(deduplicate(data_uris)) == 2
+        assert len(base64_blobs) == 1
+
     @pytest.mark.parametrize(
         ("left", "right", "message_fragment"),
         [

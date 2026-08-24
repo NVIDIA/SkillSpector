@@ -233,8 +233,10 @@ _ZERO_WIDTH_RE = re.compile("[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]+\\S")
 # Base64 blobs (>=50 chars) — checked AFTER data URI to avoid double-counting
 _BASE64_RE = re.compile(r"[A-Za-z0-9+/]{50,}={0,2}")
 
-# Data URI prefix
-_DATA_URI_RE = re.compile(r"data:text/[^;]+;base64,")
+# Data URIs retain the complete supported base64 token for identity and range
+# accounting. The token ends at its first delimiter so adjacent standalone
+# base64 remains independently detectable.
+_DATA_URI_RE = re.compile(r"data:text/[^;\s\"'<>]+;base64,[A-Za-z0-9+/=_-]*")
 
 
 def _check_tp1(
@@ -361,8 +363,7 @@ def _check_tp1(
     for m in _BASE64_RE.finditer(text):
         # Check if this match overlaps with a data URI range
         overlaps = any(
-            m.start() >= uri_start and m.end() <= uri_end + 200
-            for uri_start, uri_end in data_uri_ranges
+            m.start() < uri_end and m.end() > uri_start for uri_start, uri_end in data_uri_ranges
         )
         if overlaps:
             continue

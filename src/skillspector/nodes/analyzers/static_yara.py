@@ -550,6 +550,39 @@ def _match_instances_fingerprint(
     return digest.hexdigest()
 
 
+def _conservative_match_fingerprint(
+    rule_id: str,
+    match: yara.Match,
+    instances: list[tuple[str, object]],
+    file_path: str,
+) -> str:
+    """Identify a matched rule without retaining or hashing its raw payload."""
+    digest = hashlib.sha256()
+    digest.update(b"skillspector-yara-fallback-v1\x00")
+
+    def update_framed(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    update_framed(rule_id.encode("utf-8", errors="surrogatepass"))
+    update_framed(str(match.namespace).encode("utf-8", errors="surrogatepass"))
+    update_framed(str(match.rule).encode("utf-8", errors="surrogatepass"))
+    update_framed(file_path.encode("utf-8", errors="surrogatepass"))
+    records = sorted(
+        (
+            identifier,
+            int(getattr(instance, "offset", 0)),
+            max(0, int(getattr(instance, "matched_length", 0))),
+        )
+        for identifier, instance in instances
+    )
+    for identifier, offset, matched_length in records:
+        update_framed(identifier.encode("utf-8", errors="surrogatepass"))
+        digest.update(offset.to_bytes(8, "big", signed=True))
+        digest.update(matched_length.to_bytes(8, "big", signed=False))
+    return f"fallback-sha256:{digest.hexdigest()}"
+
+
 def _line_number_from_byte_offset(data: bytes, offset: int) -> int:
     """Return the 1-based line number for a YARA byte offset in *data*."""
     return data[:offset].count(b"\n") + 1
@@ -723,6 +756,7 @@ def _match_file(
             continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(instances)
+        fingerprint_limit: _YaraFingerprintLimitError | None = None
         try:
             match_fingerprint = _match_instances_fingerprint(
                 rule_id,
@@ -731,14 +765,10 @@ def _match_file(
                 fingerprint_budget,
             )
         except _YaraFingerprintLimitError as exc:
-            return _YaraFileResult(
-                findings=findings,
-                reason=LedgerReason.SIZE_LIMIT,
-                metrics={
-                    "observed_bytes": exc.observed_bytes,
-                    "limit_bytes": exc.limit_bytes,
-                },
+            match_fingerprint = _conservative_match_fingerprint(
+                rule_id, match, instances, file_path
             )
+            fingerprint_limit = exc
         start_line = _cached_line_number(data, first_offset, line_cache)
 
         findings.append(
@@ -754,6 +784,15 @@ def _match_file(
                 match_fingerprint=match_fingerprint,
             )
         )
+        if fingerprint_limit is not None:
+            return _YaraFileResult(
+                findings=findings,
+                reason=LedgerReason.SIZE_LIMIT,
+                metrics={
+                    "observed_bytes": fingerprint_limit.observed_bytes,
+                    "limit_bytes": fingerprint_limit.limit_bytes,
+                },
+            )
     finished_at = clock()
     if finished_at >= deadline:
         return _YaraFileResult(
@@ -1003,6 +1042,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 path=path,
                 reason=matched.reason,
                 emitted_finding_ids=[finding.finding_id for finding in path_findings],
+                observed_bytes=(
+                    int(metrics["observed_bytes"]) if "observed_bytes" in metrics else None
+                ),
+                limit_bytes=(int(metrics["limit_bytes"]) if "limit_bytes" in metrics else None),
                 observed_findings=(
                     int(metrics["observed_findings"]) if "observed_findings" in metrics else None
                 ),

@@ -34,6 +34,15 @@ def _run(code: str, filename: str = "script.py") -> list:
 
 
 class TestExecDetection:
+    def test_same_line_exec_calls_keep_exact_node_identities(self) -> None:
+        """Separate AST calls on one line must not compact as one whole-line match."""
+        findings = _run('exec("first_payload_alpha"); exec("second_payload_beta")')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 2
+        assert len(deduplicate(ast1)) == 2
+
     def test_exec_produces_ast1(self):
         findings = _run('exec("print(1)")')
         ast1 = [f for f in findings if f.rule_id == "AST1"]
