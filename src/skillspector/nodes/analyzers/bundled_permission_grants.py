@@ -124,6 +124,22 @@ _BARE_ROUTE_GRANTS: Final = {
     "ExitPlanMode": ("approval_gate_transition", "MEDIUM"),
 }
 _WHOLE_PERMISSION_PATHS: Final = frozenset({"//", "//**", "//**/*", "~", "~/", "~/**", "~/**/*"})
+_ECMASCRIPT_TRIM_CHARACTERS: Final = frozenset(
+    chr(code_point)
+    for code_point in (
+        *range(0x0009, 0x000E),
+        0x0020,
+        0x00A0,
+        0x1680,
+        *range(0x2000, 0x200B),
+        0x2028,
+        0x2029,
+        0x202F,
+        0x205F,
+        0x3000,
+        0xFEFF,
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,9 +377,9 @@ def _has_sensitive_ascii_token(value: str) -> bool:
     return token_start is not None and value[token_start:] in sensitive_tokens
 
 
-def _sensitive_path(parts: tuple[str, ...]) -> bool:
-    lowered = tuple(_ascii_lower(part) for part in parts if part not in {"", ".", "*", "**"})
-    joined = "/".join(lowered)
+def _sensitive_path(parts: tuple[str, ...], *, credential_pair_start: int = 0) -> bool:
+    literal_lowered = tuple(_ascii_lower(part) for part in parts)
+    lowered = tuple(part for part in literal_lowered if part not in {"", ".", "*", "**"})
     sensitive_segments = {
         ".agents",
         ".anthropic",
@@ -395,8 +411,11 @@ def _sensitive_path(parts: tuple[str, ...]) -> bool:
         return True
     if any(_has_sensitive_ascii_token(part) for part in lowered):
         return True
-    credential_stores = (".config/gcloud", ".config/gh", ".config/glab")
-    if any(joined == store or joined.startswith(f"{store}/") for store in credential_stores):
+    credential_store_names = {"gcloud", "gh", "glab"}
+    if any(
+        literal_lowered[index] == ".config" and literal_lowered[index + 1] in credential_store_names
+        for index in range(credential_pair_start, len(literal_lowered) - 1)
+    ):
         return True
     if any(part.endswith((".key", ".pem")) for part in lowered):
         return True
@@ -1082,16 +1101,14 @@ def _collapse_lexical_parts(value: str, *, clamp_root: bool = False) -> tuple[st
     return tuple(collapsed)
 
 
-def _contains_windows_environment_variable(value: str) -> bool:
-    opening = value.find("%")
-    while opening >= 0:
-        closing = value.find("%", opening + 1)
-        if closing < 0:
-            return False
-        if closing > opening + 1:
-            return True
-        opening = value.find("%", closing + 1)
-    return False
+def _ecmascript_trim(value: str) -> str:
+    start = 0
+    end = len(value)
+    while start < end and value[start] in _ECMASCRIPT_TRIM_CHARACTERS:
+        start += 1
+    while end > start and value[end - 1] in _ECMASCRIPT_TRIM_CHARACTERS:
+        end -= 1
+    return value[start:end]
 
 
 def _has_ascii_drive_prefix(value: str) -> bool:
@@ -1100,19 +1117,103 @@ def _has_ascii_drive_prefix(value: str) -> bool:
     )
 
 
-def _normalize_unc_parts(value: str, *, minimum_components: int) -> tuple[str, ...] | None:
+def _is_unicode_scalar(character: str) -> bool:
+    code_point = ord(character)
+    return not 0xD800 <= code_point <= 0xDFFF
+
+
+def _valid_unc_server(value: str) -> bool:
+    forbidden = frozenset('\\/:*?"<>|,')
+    return (
+        bool(value)
+        and value not in {".", ".."}
+        and all(
+            _is_unicode_scalar(character)
+            and not ord(character) <= 0x1F
+            and ord(character) != 0x7F
+            and not character.isspace()
+            and character not in forbidden
+            for character in value
+        )
+    )
+
+
+def _valid_unc_share(value: str) -> bool:
+    forbidden = frozenset('"\\/[]:|<>+=;,*?')
+    utf16_units = sum(1 if ord(character) <= 0xFFFF else 2 for character in value)
+    return (
+        bool(value)
+        and value not in {".", ".."}
+        and utf16_units <= 80
+        and all(
+            _is_unicode_scalar(character)
+            and not ord(character) <= 0x1F
+            and character not in forbidden
+            for character in value
+        )
+    )
+
+
+def _normalize_win32_tail_parts(value: str) -> tuple[str, ...]:
+    collapsed: list[str] = []
+    trailing_separator = value.endswith("/")
+    raw_parts = value.split("/")
+    final_index = len(raw_parts) - 1
+    for index, part in enumerate(raw_parts):
+        if not part:
+            continue
+        if part == ".":
+            continue
+        if part == "..":
+            if collapsed:
+                collapsed.pop()
+            continue
+
+        is_final = index == final_index and not trailing_separator
+        normalized = part
+        if is_final:
+            normalized = normalized.rstrip(" ")
+            if normalized == ".":
+                continue
+            if normalized == "..":
+                if collapsed:
+                    collapsed.pop()
+                continue
+            normalized = normalized.rstrip(" .")
+            if not normalized:
+                continue
+        else:
+            terminal_dot_count = len(normalized) - len(normalized.rstrip("."))
+            if terminal_dot_count == 1:
+                normalized = normalized[:-1]
+        if normalized:
+            collapsed.append(normalized)
+    return tuple(collapsed)
+
+
+def _normalize_unc_parts(
+    value: str, *, minimum_components: int, win32_tail: bool
+) -> tuple[str, ...] | None:
     trimmed = value.rstrip("/")
     if not trimmed or value.startswith("/") or "//" in trimmed:
         return None
     raw_parts = tuple(trimmed.split("/"))
     if len(raw_parts) < minimum_components:
         return None
-    anchor_size = min(2, len(raw_parts))
-    if any(part in {".", ".."} for part in raw_parts[:anchor_size]):
+    if not _valid_unc_server(raw_parts[0]):
         return None
     if len(raw_parts) == 1:
         return raw_parts
-    normalized_tail = _collapse_lexical_parts("/".join(raw_parts[2:]), clamp_root=True)
+    if not _valid_unc_share(raw_parts[1]):
+        return None
+    tail = "/".join(raw_parts[2:])
+    if len(raw_parts) > 2 and value.endswith("/"):
+        tail += "/"
+    normalized_tail = (
+        _normalize_win32_tail_parts(tail)
+        if win32_tail
+        else tuple(part for part in tail.split("/") if part)
+    )
     return (*raw_parts[:2], *normalized_tail)
 
 
@@ -1131,12 +1232,13 @@ def _conditional_windows_directory(
     parts: tuple[str, ...],
     *,
     whole_root: bool,
+    credential_pair_start: int = 0,
     source_kind: str,
     source_line: int,
 ) -> tuple[PermissionGrant | None, tuple[PermissionDiagnostic, ...], bool]:
     if whole_root:
         grant_kind, severity = "root_or_home_additional_directory", "CRITICAL"
-    elif _sensitive_path(parts):
+    elif _sensitive_path(parts, credential_pair_start=credential_pair_start):
         grant_kind, severity = "sensitive_additional_directory", "HIGH"
     else:
         grant_kind, severity = "external_additional_directory", "MEDIUM"
@@ -1165,13 +1267,8 @@ def _classify_additional_directory(
     source_kind: str,
     source_line: int,
 ) -> tuple[PermissionGrant | None, tuple[PermissionDiagnostic, ...], bool]:
-    if (
-        not value
-        or "\0" in value
-        or "$" in value
-        or _contains_windows_environment_variable(value)
-        or (value.startswith("~") and value != "~" and not value.startswith("~/"))
-    ):
+    value = _ecmascript_trim(value)
+    if "\0" in value:
         return (
             None,
             (_diagnostic("invalid_path", True, source_line, identity=value),),
@@ -1180,6 +1277,8 @@ def _classify_additional_directory(
 
     normalized_windows = value.replace("\\", "/")
     if normalized_windows == "/??" or normalized_windows.startswith("/??/"):
+        return _platform_dependent_directory(value, source_line=source_line)
+    if normalized_windows == "//??" or normalized_windows.startswith("//??/"):
         return _platform_dependent_directory(value, source_line=source_line)
 
     if normalized_windows == "//?" or normalized_windows.startswith("//?/"):
@@ -1190,7 +1289,7 @@ def _classify_additional_directory(
             remainder = extended[2:]
             if not remainder.startswith("/"):
                 return _platform_dependent_directory(value, source_line=source_line)
-            extended_drive_parts = _collapse_lexical_parts(remainder, clamp_root=True)
+            extended_drive_parts = tuple(part for part in remainder.split("/") if part)
             identity = f"drive:{extended[0].upper()}:/{'/'.join(extended_drive_parts)}"
             return _conditional_windows_directory(
                 identity,
@@ -1199,14 +1298,17 @@ def _classify_additional_directory(
                 source_kind=source_kind,
                 source_line=source_line,
             )
-        if extended.startswith("UNC/"):
-            extended_unc_parts = _normalize_unc_parts(extended[4:], minimum_components=2)
+        if len(extended) >= 4 and _ascii_lower(extended[:3]) == "unc" and extended[3] == "/":
+            extended_unc_parts = _normalize_unc_parts(
+                extended[4:], minimum_components=2, win32_tail=False
+            )
             if extended_unc_parts is not None:
                 identity = f"unc:/{'/'.join(extended_unc_parts)}"
                 return _conditional_windows_directory(
                     identity,
                     extended_unc_parts,
                     whole_root=False,
+                    credential_pair_start=1,
                     source_kind=source_kind,
                     source_line=source_line,
                 )
@@ -1224,7 +1326,7 @@ def _classify_additional_directory(
         return _platform_dependent_directory(value, source_line=source_line)
 
     is_drive = _has_ascii_drive_prefix(value)
-    is_backslash_root = all(character == "\\" for character in value)
+    is_backslash_root = bool(value) and all(character == "\\" for character in value)
     is_unc = (value.startswith("\\\\") or value.startswith("//")) and not all(
         character == "/" for character in value
     )
@@ -1234,7 +1336,7 @@ def _classify_additional_directory(
             if not remainder.startswith(("/", "\\")):
                 return _platform_dependent_directory(value, source_line=source_line)
             normalized_remainder = remainder.replace("\\", "/")
-            drive_parts = _collapse_lexical_parts(normalized_remainder, clamp_root=True)
+            drive_parts = _normalize_win32_tail_parts(normalized_remainder)
             identity = f"drive:{value[0].upper()}:/{'/'.join(drive_parts)}"
             return _conditional_windows_directory(
                 identity,
@@ -1253,7 +1355,9 @@ def _classify_additional_directory(
             )
         else:
             normalized_remainder = value[2:].replace("\\", "/")
-            unc_parts = _normalize_unc_parts(normalized_remainder, minimum_components=1)
+            unc_parts = _normalize_unc_parts(
+                normalized_remainder, minimum_components=1, win32_tail=True
+            )
             if unc_parts is None:
                 return _platform_dependent_directory(value, source_line=source_line)
             identity = f"unc:/{'/'.join(unc_parts)}"
@@ -1261,6 +1365,7 @@ def _classify_additional_directory(
                 identity,
                 unc_parts,
                 whole_root=False,
+                credential_pair_start=1,
                 source_kind=source_kind,
                 source_line=source_line,
             )
@@ -1270,7 +1375,7 @@ def _classify_additional_directory(
 
     posix_grant_kind: str | None
     posix_severity: str | None
-    if all(character == "/" for character in value):
+    if value and all(character == "/" for character in value):
         normalized = "/"
         posix_grant_kind, posix_severity = "root_or_home_additional_directory", "CRITICAL"
     elif value in {"~", "~/"}:

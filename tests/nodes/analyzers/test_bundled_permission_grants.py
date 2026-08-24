@@ -633,6 +633,380 @@ def test_reserved_windows_namespace_separator_spellings_deduplicate(
 @pytest.mark.parametrize(
     "directory",
     [
+        "//server/C$",
+        "//server/ADMIN$",
+        "//server/IPC$",
+        "//server/share%",
+        "//server/share name/tail",
+        "//server/share\u0085name/tail",
+        "//server/sh\u00a0are/tail",
+        "//server/share\x7fname/tail",
+        "//server/%",
+        "//%/share",
+        "//服务器/資料",
+        "//😀/share",
+        "//ser\u180ever/share",
+        "//srv[1]+x/share",
+        "//srv.example/share.with.periods",
+        "//srv-name/share-name",
+        "//?/UnC/server/C$",
+        r"\\?\uNc\server\ADMIN$",
+    ],
+)
+def test_valid_unc_server_and_share_matrix_is_conditional(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert result.outcome is LedgerOutcome.PARTIAL
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("external_additional_directory", "MEDIUM")
+    ]
+    assert {(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics} == {
+        ("platform_dependent_path", True),
+        ("directory_existence_static_unknown", False),
+    }
+
+
+@pytest.mark.parametrize(
+    "share",
+    ["a" * 80, "😀" * 40],
+)
+def test_unc_share_accepts_eighty_utf16_code_units(share: str) -> None:
+    ordinary = _analyze({"additionalDirectories": [f"//server/{share}"]})
+    extended = _analyze({"additionalDirectories": [f"//?/UNC/server/{share}"]})
+
+    assert [grant.grant_kind for grant in ordinary.grants] == ["external_additional_directory"]
+    assert [grant.grant_kind for grant in extended.grants] == ["external_additional_directory"]
+
+
+@pytest.mark.parametrize(
+    "share",
+    ["a" * 81, "😀" * 41, "a" * 79 + "😀"],
+)
+def test_unc_share_rejects_more_than_eighty_utf16_code_units(share: str) -> None:
+    for directory in (f"//server/{share}", f"//?/UNC/server/{share}"):
+        result = _analyze({"additionalDirectories": [directory]})
+
+        assert result.outcome is LedgerOutcome.FAILED
+        assert result.grants == ()
+        assert [
+            (item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics
+        ] == [("platform_dependent_path", True)]
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        "",
+        ".",
+        "..",
+        "bad:name",
+        "bad*name",
+        "bad?name",
+        'bad"name',
+        "bad<name",
+        "bad>name",
+        "bad|name",
+        "bad,name",
+        "bad\x1fname",
+        "bad\x7fname",
+        "bad name",
+        "bad\u00a0name",
+        "bad\ud800name",
+    ],
+)
+def test_invalid_unc_server_predicate_is_platform_only(server: str) -> None:
+    for prefix in ("//", "//?/UNC/"):
+        result = _analyze({"additionalDirectories": [f"{prefix}{server}/share"]})
+
+        assert result.outcome is LedgerOutcome.FAILED
+        assert result.grants == ()
+        assert [
+            (item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics
+        ] == [("platform_dependent_path", True)]
+
+
+@pytest.mark.parametrize(
+    "share",
+    [
+        "",
+        ".",
+        "..",
+        'bad"name',
+        "bad[name",
+        "bad]name",
+        "bad:name",
+        "bad|name",
+        "bad<name",
+        "bad>name",
+        "bad+name",
+        "bad=name",
+        "bad;name",
+        "bad,name",
+        "bad*name",
+        "bad?name",
+        "bad\x1fname",
+        "bad\ud800name",
+    ],
+)
+def test_invalid_unc_share_predicate_is_platform_only(share: str) -> None:
+    suffix = f"{share}/tail" if share else "/tail"
+    for prefix in ("//server/", "//?/UNC/server/"):
+        result = _analyze({"additionalDirectories": [prefix + suffix]})
+
+        assert result.outcome is LedgerOutcome.FAILED
+        assert result.grants == ()
+        assert [
+            (item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics
+        ] == [("platform_dependent_path", True)]
+
+
+def test_extended_unc_token_is_ascii_insensitive_and_separator_equivalent() -> None:
+    canonical = _analyze({"additionalDirectories": ["//?/UNC/server/C$"]})
+    variants = _analyze(
+        {
+            "additionalDirectories": [
+                r"\\?\UnC\server\C$",
+                "//?/uNc/server/C$",
+                "//?/UNC/server/C$",
+            ]
+        }
+    )
+
+    assert variants == canonical
+
+
+def test_only_extended_unc_namespace_token_is_ascii_insensitive() -> None:
+    result = _analyze({"additionalDirectories": ["//?/UNC/server/share", "//?/unc/SERVER/share"]})
+
+    assert len(result.grants) == 2
+    assert len(result.diagnostics) == 4
+
+
+@pytest.mark.parametrize(
+    ("variant", "canonical"),
+    [
+        ("\u00a0C:/\ufeff", "C:/"),
+        ("\ufeff//server/share\u00a0", "//server/share"),
+        ("\t//?/UnC/server/share\n", "//?/UNC/server/share"),
+        ("\u2000//./\u2029", "//./"),
+        ("\ufeff//??/C:/docs\u00a0", "//??/C:/docs"),
+    ],
+)
+def test_ecmascript_trim_precedes_every_directory_route(variant: str, canonical: str) -> None:
+    assert _analyze({"additionalDirectories": [variant]}) == _analyze(
+        {"additionalDirectories": [canonical]}
+    )
+
+
+def test_ordinary_unc_separator_spellings_and_admin_share_deduplicate() -> None:
+    canonical = _analyze({"additionalDirectories": ["//server/ADMIN$"]})
+    variants = _analyze(
+        {"additionalDirectories": [r"\\server\ADMIN$", "//server/ADMIN$", "//server/ADMIN$"]}
+    )
+
+    assert variants == canonical
+
+
+def test_malformed_unc_canary_never_leaves_safe_records() -> None:
+    canary = "CANARY-unc-anchor"
+    result = _analyze({"additionalDirectories": [f"//{canary}?/share"]})
+
+    assert result.outcome is LedgerOutcome.FAILED
+    assert result.grants == ()
+    assert canary not in repr(result)
+    assert build_bh3_finding(result, source_path=".claude/settings.json") is None
+
+
+@pytest.mark.parametrize(
+    ("variant", "canonical"),
+    [
+        ("C:/.ssh.", "C:/.ssh"),
+        (r"C:\.ssh.", "C:/.ssh"),
+        ("C:/.ssh ", "C:/.ssh"),
+        ("C:/.ssh./child", "C:/.ssh/child"),
+        ("C:/folder./child", "C:/folder/child"),
+        ("C:/docs... ", "C:/docs"),
+        ("C:/docs. .", "C:/docs"),
+        ("C:/. .", "C:/"),
+        ("C:/foo/.. ", "C:/"),
+        ("C:/...", "C:/"),
+        ("//server/share/.ssh.", "//server/share/.ssh"),
+        ("//server/share/folder./child", "//server/share/folder/child"),
+        ("//server/share/foo/.. ", "//server/share"),
+        ("//server/share/...", "//server/share"),
+    ],
+)
+def test_ordinary_win32_tail_normalizes_to_canonical_identity(variant: str, canonical: str) -> None:
+    assert _analyze({"additionalDirectories": [variant]}) == _analyze(
+        {"additionalDirectories": [canonical]}
+    )
+
+
+def test_ordinary_drive_trailing_separator_preserves_multi_dot_component() -> None:
+    result = _analyze({"additionalDirectories": ["C:/.../"]})
+
+    assert [
+        (grant.grant_kind, grant.severity, grant.blocking_critical) for grant in result.grants
+    ] == [("external_additional_directory", "MEDIUM", False)]
+    assert result != _analyze({"additionalDirectories": ["C:/"]})
+
+
+def test_ordinary_unc_trailing_separator_preserves_multi_dot_tail() -> None:
+    canonical = _analyze({"additionalDirectories": ["//server/share"]})
+    combined = _analyze({"additionalDirectories": ["//server/share/.../", "//server/share"]})
+
+    assert len(combined.grants) == 2
+    assert len(combined.diagnostics) == 4
+    assert combined != canonical
+
+
+def test_ordinary_win32_earlier_multi_dot_run_remains_literal() -> None:
+    result = _analyze({"additionalDirectories": ["C:/folder../child", "C:/folder/child"]})
+
+    assert len(result.grants) == 2
+    assert len(result.diagnostics) == 4
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "//?/C:/.ssh.",
+        "//?/C:/.ssh /child",
+        "//?/C:/foo/.. /child",
+        "//?/UNC/server/share/.ssh.",
+        "//?/UNC/server/share/.ssh /child",
+    ],
+)
+def test_extended_windows_tail_does_not_receive_win32_trimming(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("external_additional_directory", "MEDIUM")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("directory", "expected_kind", "expected_severity"),
+    [
+        ("//?/C:/foo/..", "external_additional_directory", "MEDIUM"),
+        ("//?/C:/./", "external_additional_directory", "MEDIUM"),
+        ("//?/C:/.ssh/..", "sensitive_additional_directory", "HIGH"),
+        (
+            "//?/UNC/server/share/.ssh/..",
+            "sensitive_additional_directory",
+            "HIGH",
+        ),
+    ],
+)
+def test_extended_windows_current_and_parent_components_remain_literal(
+    directory: str, expected_kind: str, expected_severity: str
+) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        (expected_kind, expected_severity)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("literal", "collapsed"),
+    [
+        ("//?/C:/foo/..", "//?/C:/"),
+        ("//?/UNC/server/share/foo/..", "//?/UNC/server/share"),
+        ("//?/UNC/server/share/./", "//?/UNC/server/share"),
+    ],
+)
+def test_extended_literal_dot_components_do_not_deduplicate(literal: str, collapsed: str) -> None:
+    result = _analyze({"additionalDirectories": [literal, collapsed]})
+
+    assert len(result.grants) == 2
+    assert len(result.diagnostics) == 4
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "//server./share/docs",
+        "//server/share./docs",
+        "//server/share /docs",
+        "//server/.ssh./docs",
+        "//?/UNC/server./share/docs",
+        "//?/UNC/server/share./docs",
+    ],
+)
+def test_unc_server_and_share_anchors_are_never_win32_trimmed(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("external_additional_directory", "MEDIUM")
+    ]
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "~/x/.config/gcloud/cache",
+        "../x/.config/gh/cache",
+        "/opt/x/.config/glab/cache",
+        "C:/Users/x/.config/gcloud/cache",
+        "C:/Users/x/.CONFIG/GH/cache",
+        "//server/.config/gh",
+        "//server/share/x/.config/glab/cache",
+        "//?/uNc/server/.config/gcloud",
+        r"\\server\share\x\.config\gh\cache",
+    ],
+)
+def test_credential_store_pair_is_sensitive_as_adjacent_subsequence(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("sensitive_additional_directory", "HIGH")
+    ]
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "C:/.configuration/gcloud",
+        "C:/.config/gclouding",
+        "C:/.config/x/gh",
+        "//server/.configuration/gcloud",
+        "//server/.config/gclouding",
+        "//server/.config/x/gh",
+        "//.config/gh",
+        "//?/UNC/.config/gh",
+    ],
+)
+def test_ordinary_credential_store_near_matches_are_not_sensitive(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("external_additional_directory", "MEDIUM")
+    ]
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "~/.config/*/gh",
+        "C:/.config/*/gh",
+        "//server/share/.config/*/gh",
+        "//?/UNC/server/share/.config/*/gh",
+        "//?/C:/.config/./gh",
+    ],
+)
+def test_credential_store_pair_does_not_skip_literal_components(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("external_additional_directory", "MEDIUM")
+    ]
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
         r"\\.\PIPE",
         "//./PIPE",
         r"\\.\PhysicalDrive0",
@@ -659,6 +1033,10 @@ def test_reserved_windows_namespace_separator_spellings_deduplicate(
         "//?/UNC/server//share",
         r"\??\C:\docs",
         "/??/C:/docs",
+        r"\\??\C:\docs",
+        "//??/C:/docs",
+        r"\\??",
+        "//??",
     ],
 )
 def test_unsupported_windows_reserved_namespace_does_not_guess_scope(directory: str) -> None:
@@ -672,8 +1050,8 @@ def test_unsupported_windows_reserved_namespace_does_not_guess_scope(directory: 
     ]
 
 
-@pytest.mark.parametrize("directory", ["", "bad\0path", "~someone/docs", "$HOME/docs"])
-def test_invalid_additional_directory_fails_closed(directory: str) -> None:
+def test_nul_additional_directory_fails_closed() -> None:
+    directory = "bad\0path"
     result = _analyze({"additionalDirectories": [directory]})
 
     assert result.outcome is LedgerOutcome.FAILED
@@ -682,6 +1060,114 @@ def test_invalid_additional_directory_fails_closed(directory: str) -> None:
     assert [(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics] == [
         ("invalid_path", True)
     ]
+
+
+_ECMASCRIPT_TRIM_CHARACTERS = tuple(
+    chr(code_point)
+    for code_point in (
+        *range(0x0009, 0x000E),
+        0x0020,
+        0x00A0,
+        0x1680,
+        *range(0x2000, 0x200B),
+        0x2028,
+        0x2029,
+        0x202F,
+        0x205F,
+        0x3000,
+        0xFEFF,
+    )
+)
+
+
+@pytest.mark.parametrize("character", _ECMASCRIPT_TRIM_CHARACTERS)
+def test_exact_ecmascript_trim_character_is_applied_before_directory_routing(
+    character: str,
+) -> None:
+    canonical = _analyze({"additionalDirectories": ["../docs"]})
+    surrounded = _analyze({"additionalDirectories": [f"{character}../docs{character}"]})
+
+    assert surrounded == canonical
+
+
+@pytest.mark.parametrize("character", ["\u001c", "\u001d", "\u001e", "\u001f", "\u0085", "\u180e"])
+def test_non_ecmascript_whitespace_is_not_trimmed(character: str) -> None:
+    result = _analyze({"additionalDirectories": [f"{character}../docs{character}", "../docs"]})
+
+    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
+        ("external_additional_directory", "MEDIUM")
+    ]
+    assert [item.diagnostic_kind for item in result.diagnostics] == [
+        "directory_existence_static_unknown",
+        "directory_existence_static_unknown",
+    ]
+
+
+@pytest.mark.parametrize(
+    "directory",
+    ["", "\t\n ", "\u00a0", "\u1680\u2007\u2029", "\ufeff"],
+)
+def test_empty_or_trimmed_empty_directory_is_canonical_project_base(directory: str) -> None:
+    canonical = _analyze({"additionalDirectories": ["."]})
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert result == canonical
+    assert result.outcome is LedgerOutcome.COMPLETED
+    assert result.grants == ()
+    assert [(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics] == [
+        ("directory_existence_static_unknown", False)
+    ]
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "~user",
+        "~user/docs",
+        "$HOME",
+        "${HOME}",
+        "$Env:USERPROFILE",
+        "%USERPROFILE%",
+        "!TEMP!",
+        "$Recycle.Bin",
+        "100%done",
+    ],
+)
+def test_env_like_and_non_special_tilde_directories_are_literal(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert result.outcome is LedgerOutcome.COMPLETED
+    assert result.reason is None
+    assert result.grants == ()
+    assert [(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics] == [
+        ("directory_existence_static_unknown", False)
+    ]
+
+
+def test_trimmed_lexically_normalized_directories_deduplicate_to_canonical_identity() -> None:
+    canonical = _analyze({"additionalDirectories": ["../docs"]})
+    variants = _analyze(
+        {
+            "additionalDirectories": [
+                "\t../child/../docs\ufeff",
+                "../docs",
+                "\u00a0../docs\u2029",
+            ]
+        }
+    )
+
+    assert variants == canonical
+
+
+def test_trimmed_directory_canary_never_leaves_safe_records() -> None:
+    canary = "CANARY-trim-$%-suffix"
+    result = _analyze({"additionalDirectories": [f"\ufeff../{canary}\u00a0"]})
+
+    assert [grant.grant_kind for grant in result.grants] == ["external_additional_directory"]
+    assert canary not in repr(result)
+    finding = build_bh3_finding(result, source_path=".claude/settings.json")
+    assert finding is not None
+    assert canary not in repr(finding)
 
 
 @pytest.mark.parametrize(
@@ -1564,13 +2050,13 @@ def test_semantically_tool_wide_restriction_covers_scoped_allow(allow: str, deny
     assert "mitigated_allow" in {item.diagnostic_kind for item in result.diagnostics}
 
 
-def test_windows_environment_variable_directory_is_invalid() -> None:
+def test_paired_percent_directory_is_literal() -> None:
     result = _analyze({"additionalDirectories": ["%USERPROFILE%/docs"]})
 
-    assert result.outcome is LedgerOutcome.FAILED
+    assert result.outcome is LedgerOutcome.COMPLETED
     assert result.grants == ()
     assert [(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics] == [
-        ("invalid_path", True)
+        ("directory_existence_static_unknown", False)
     ]
 
 
