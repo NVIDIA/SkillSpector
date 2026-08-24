@@ -442,25 +442,34 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   `~/.ssh` is sensitive HIGH, `../docs` is external MEDIUM, and `./subdir` is within-project silent.
   Assert each lexically valid entry has a completeness-neutral
   `directory_existence_static_unknown` diagnostic because the pure helper does not call `stat`.
+
+  Before every route, apply exactly ECMAScript `String.trim()` using the closed code-point set in the
+  design. Table-test ASCII whitespace, NBSP, BOM, and the non-trimmed U+001C-U+001F/U+0085/U+180E
+  boundaries. Empty/whitespace-only becomes canonical project/base `.` with no grant and the neutral
+  existence diagnostic. Only exact `~` and `~/...` use home expansion. Treat `$HOME`, `${HOME}`,
+  `$Env:...`, `%USERPROFILE%`, `!TEMP!`, `$Recycle.Bin`, `100%done`, and `~user` as literal paths;
+  there is no environment interpolation or blanket `$`/`%` rejection.
+
   Lexically normalize interior `.`/`..`: `child/../docs` stays project-local and
-  `child/../../docs` becomes external. Only ASCII `[A-Za-z]:` prefixes are Windows drives; a drive
-  root such as `C:\\` or `C:/` emits a
-  conditional CRITICAL whole-root grant; a lexically sensitive Windows absolute path such as
-  `C:\\Users\\x\\.ssh` emits a conditional HIGH sensitive-directory grant. Windows separator-only
-  backslash forms resolve to the current drive root and are conditional CRITICAL. Other Windows
-  absolute drive forms and complete UNC forms with non-empty server/share components emit a
-  conditional MEDIUM external-directory grant unless sensitive. One-component UNC-like forms such
-  as `\\server` or `//server` resolve drive-root-relative and are conditional MEDIUM unless
-  sensitive. Recognize both separator spellings and attach the completeness-affecting
-  `platform_dependent_path` diagnostic. Extended `\\?\\C:\\` drive roots are conditional CRITICAL;
-  extended drive tails and `\\?\\UNC\\server\\share` are conditional MEDIUM unless sensitive. Bare
-  `\\.\\` is a conditional CRITICAL current-drive-root form. Other device/reserved namespaces such
-  as `\\.\\PIPE`, `\\?\\Volume{...}`, `\\?\\GLOBALROOT`, bare/incomplete `\\?\\...`, and
-  `\\??\\...` emit only `platform_dependent_path`, with no existence diagnostic or guessed grant.
-  Non-ASCII colon prefixes such as `é:/docs`, `中:/docs`, and `Ｃ:/docs` are ordinary
-  project-relative paths with only the neutral existence diagnostic. Drive-relative or malformed
-  UNC ambiguity with no provable resolved scope emits the platform diagnostic without guessing a
-  grant. Empty, NUL, malformed-home, and environment-variable forms are `invalid_path`. Table-test
+  `child/../../docs` becomes external. Only ASCII `[A-Za-z]:` prefixes are Windows drives. Cover
+  drive and separator-only roots (CRITICAL), scoped drive tails (MEDIUM/HIGH), complete and
+  one-component ordinary UNC, extended drive/UNC with ASCII-insensitive `UNC` namespace token, bare
+  device root, unsupported reserved/device namespaces, non-ASCII colon-relative paths, and malformed
+  UNC. Dispatch both single-root `/??/...` and malformed two-leading `//??/...` NT namespace forms
+  before ordinary UNC. Unsupported or malformed platform forms emit only `platform_dependent_path`,
+  without a grant or existence diagnostic.
+
+  Implement the exact server/share predicates and UTF-16 share length from the design. Accept legal
+  administrative shares such as `C$`, `ADMIN$`, and `IPC$`, `%`, and Unicode; reject reserved,
+  control, surrogate, wildcard, and forbidden-anchor forms. Normalize ordinary Win32 tail components
+  with the documented trailing-space/dot and root-clamping rules, but never trim extended `\\?\\`
+  paths or UNC anchors. Test `.ssh.`/`.ssh ` sensitivity, `C:/foo/.. ` and `C:/...` root escalation,
+  `C:/.../` scoped behavior, and UNC anchor preservation.
+
+  Table-test `.config/{gcloud,gh,glab}` as adjacent sensitive component subsequences anywhere in a
+  drive/home path and from the UNC share onward, never using the server component. Thus
+  `//server/.config/gh` is HIGH while `//.config/gh` is ordinary. Include negative
+  `.configuration/gcloud`, `.config/gclouding`, and `.config/x/gh` cases. Table-test
   `sensitive_additional_directory` in the grant-kind allowlist.
 
 - [ ] **Step 4: Add and implement known ignored grammar tests**
@@ -1154,8 +1163,10 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   - `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized interior-parent, Windows drive
     root, separator-only backslash root, sensitive absolute, ordinary absolute-drive, complete
     backslash/forward-slash UNC, one-component UNC-like, extended drive/UNC roots and tails, bare and
-    unsupported device namespaces, non-ASCII colon-relative, malformed UNC, and drive-relative
-    additional-directory spellings.
+    unsupported device namespaces, mixed-case extended UNC, administrative shares, Win32 trailing
+    dot/space, exact ECMAScript-trim boundaries, literal env-like/tilde values, sensitive credential
+    subsequences, non-ASCII colon-relative, malformed UNC, and drive-relative additional-directory
+    spellings.
 
   Capture only safe debug/status lines. Never run a destructive command and never transmit a canary.
   If login/model access permits, add benign reads/writes inside a disposable directory to test actual

@@ -424,7 +424,19 @@ boundaries inside a filename; they do not match ordinary continuations such as `
 `additionalDirectories` uses add-directory filesystem-path semantics, not permission-rule pattern
 anchors. In particular, `/tmp` is an absolute external directory and is not the project-relative
 `Edit(/tmp/**)` spelling. Classification is lexical and relative to the project/runtime starting
-directory; it never resolves a symlink or exposes the path:
+directory; it never resolves a symlink or exposes the path.
+
+Pinned 2.1.241 first applies ECMAScript `String.trim()` to the entire entry. The exact trimmed set is
+U+0009-U+000D, U+0020, U+00A0, U+1680, U+2000-U+200A, U+2028-U+2029, U+202F, U+205F, U+3000, and
+U+FEFF. U+001C-U+001F, U+0085, and U+180E are not trimmed; Python's unrestricted `str.strip()` is
+therefore forbidden. Empty or whitespace-only input resolves to the project/base directory: it emits
+no grant, one completeness-neutral `directory_existence_static_unknown`, and canonical identity `.`.
+Only exact `~` and `~/...` use home semantics. `~user`, `$HOME`, `${HOME}`, `$Env:USERPROFILE`,
+`%USERPROFILE%`, `!TEMP!`, `$Recycle.Bin`, and `100%done` are literal paths because this runtime does
+not interpolate environment variables. Canonical identity and deduplication use the trimmed,
+lexically normalized value.
+
+The general classification is:
 
 | Shape | Treatment |
 |---|---|
@@ -438,27 +450,47 @@ directory; it never resolves a symlink or exposes the path:
 | Windows ASCII drive root such as `C:\\` or `C:/` | Conditional whole-root CRITICAL plus completeness-affecting `platform_dependent_path` |
 | Windows separator-only backslash form such as `\` or `\\` | Conditional current-drive-root CRITICAL plus completeness-affecting `platform_dependent_path` |
 | Lexically sensitive Windows absolute path such as `C:\\Users\\x\\.ssh` | Conditional sensitive-directory HIGH plus completeness-affecting `platform_dependent_path` |
-| Complete ordinary Windows UNC form with non-empty non-reserved server and share, using `\\server\\share` or `//server/share` separators | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
-| One-component UNC-like form such as `\\server` or `//server` | Conditional drive-root-relative external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| Valid complete ordinary Windows UNC using `\\server\\share` or `//server/share` | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| Valid one-component UNC-like form such as `\\server` or `//server` | Conditional drive-root-relative external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
 | Extended ASCII-drive root `\\?\\C:\\` or `//?/C:/` | Conditional whole-root CRITICAL plus completeness-affecting `platform_dependent_path` |
 | Extended ASCII-drive path `\\?\\C:\\docs` or `//?/C:/docs` | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
-| Extended UNC `\\?\\UNC\\server\\share` or `//?/UNC/server/share` | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path` |
+| Extended UNC `\\?\\UNC\\server\\share` or `//?/UnC/server/share` | Conditional external MEDIUM unless sensitive, plus completeness-affecting `platform_dependent_path`; only the `UNC` namespace token is ASCII-case-insensitive |
 | Bare device namespace `\\.\\` or `//./` | Conditional current-drive-root CRITICAL plus completeness-affecting `platform_dependent_path` |
 | Other Windows absolute ASCII-drive form | Conditional external MEDIUM plus completeness-affecting `platform_dependent_path` |
 | Other reserved/device namespace such as `\\.\\PIPE`, `\\?\\Volume{...}`, `\\?\\GLOBALROOT`, bare/incomplete `\\?\\...`, or `\\??\\...` | Completeness-affecting `platform_dependent_path`; no grant or existence diagnostic is guessed |
 | Non-ASCII colon prefix such as `é:/docs`, `中:/docs`, or `Ｃ:/docs` | Ordinary project-relative path after lexical normalization; no grant plus completeness-neutral existence diagnostic |
 | Drive-relative, malformed UNC, or otherwise platform-ambiguous form with no provable resolved scope | Completeness-affecting `platform_dependent_path`; no grant is guessed |
-| Empty, NUL-bearing, malformed home, or environment-variable form | Completeness-affecting `invalid_path` |
+| NUL-bearing value | Completeness-affecting `invalid_path` |
 
-The pure analyzer lexically collapses `.` and `..` segments but does not call `stat`, resolve a
+The pure analyzer collapses lexical `.` and `..` segments but does not call `stat`, resolve a
 symlink, or pick a target operating system. Thus `child/../docs` is project-local while
-`child/../../docs` remains external. Existence and directory type are always `static_unknown`.
-Each otherwise valid or conditionally external entry gets at most one completeness-neutral
-`directory_existence_static_unknown` diagnostic; runtime absence does not turn a lexical grant into
-a static safe result. Exact tests cover `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized
-interior parents, Windows drive-root and separator-only roots, sensitive absolute, ordinary
-absolute-drive, complete backslash/forward-slash UNC, one-component UNC-like, extended drive/UNC,
-reserved device namespaces, non-ASCII colon-relative, malformed UNC, and drive-relative forms.
+`child/../../docs` remains external. For ordinary ASCII-drive and ordinary UNC tails only, it also
+models Win32 component normalization: exact `.`/`..` are applied; one terminal dot is removed from
+an earlier component only when the terminal-dot run has length one; and the final component of an
+input without a trailing separator loses trailing U+0020, then applies `.`/`..`, otherwise loses
+trailing U+0020 and periods and drops an empty result. Traversal clamps at the drive or UNC-share
+root. Extended `\\?\\` paths do not receive this trimming. Consequently ordinary `.ssh.` and
+`.ssh ` normalize to sensitive `.ssh`, `C:/foo/.. ` becomes a CRITICAL drive root, `C:/...` becomes
+a CRITICAL root, and `C:/.../` retains its literal component and remains MEDIUM.
+
+Ordinary and extended UNC dispatch happens after reserved `//?/`, `//./`, `/??/`, and malformed
+two-leading `//??/` namespaces are recognized; both NT-namespace spellings produce platform-only,
+no-existence results. Exactly two leading separators are required for ordinary UNC. A server is a nonempty Unicode scalar
+string excluding surrogates, U+0000-U+001F, U+007F, Unicode whitespace, `\\ / : * ? " < > | ,`, and
+exact `.`/`..`. A share is 1-80 UTF-16 code units and excludes surrogates, U+0000-U+001F,
+`" \\ / [ ] : | < > + = ; , * ?`, and exact `.`/`..`. `$`, `%`, periods, spaces where permitted,
+and other Unicode remain literal, so `C$`, `ADMIN$`, and `IPC$` are valid shares. Server/share
+anchors are never trimmed or removed by tail traversal. A malformed or reserved anchor emits only
+`platform_dependent_path`, with no guessed grant or existence diagnostic.
+
+Sensitive credential-store pairs such as `.config/gcloud`, `.config/gh`, and `.config/glab` match as
+adjacent normalized component subsequences anywhere after the UNC server component (the share may
+participate), but not
+`.configuration/gcloud`, `.config/gclouding`, or `.config/x/gh`. Existence and directory type remain
+`static_unknown`. Each otherwise valid or conditionally external entry gets at most one
+completeness-neutral `directory_existence_static_unknown`; runtime absence does not turn a lexical
+grant into a safe result. Reserved/device and malformed UNC forms intentionally receive no existence
+diagnostic.
 
 ### Network, execution, and MCP rules
 
