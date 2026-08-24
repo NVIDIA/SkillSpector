@@ -316,6 +316,35 @@ def test_cli_scan_required_table_keeps_malicious_pe3(tmp_path: Path) -> None:
     assert any(issue["id"] == "PE3" for issue in issues)
 
 
+def test_cli_keyring_access_can_be_suppressed_by_baseline(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: keyring-access\ndescription: test\n---\n\n"
+        "Use the keyring CLI to export credentials.\n",
+        encoding="utf-8",
+    )
+    baseline = tmp_path / "baseline.yaml"
+    generated = runner.invoke(app, ["baseline", str(skill), "--no-llm", "--output", str(baseline)])
+    assert generated.exit_code == 0, generated.output
+    result = runner.invoke(
+        app,
+        ["scan", str(skill), "--format", "json", "--no-llm", "--baseline", str(baseline)],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["suppressed_count"] >= 1
+    assert any(issue["id"] == "PE3" for issue in payload["suppressed"])
+
+
+def test_cli_keyring_fixture_reproduction_is_clean() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "pe3_bare_keyring"
+    result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert not any(issue["id"] == "PE3" for issue in payload["issues"])
+
+
 def test_cli_scan_nonexistent_exits_2() -> None:
     """scan with nonexistent path exits with code 2."""
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])

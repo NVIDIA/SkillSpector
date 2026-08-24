@@ -18,10 +18,18 @@
 from __future__ import annotations
 
 import ast
+import re
 from typing import Any
 
 from skillspector.models import Finding
 from skillspector.python_ast import build_import_aliases
+
+# Keep the analyzer and runner fence walkers lexically aligned without sharing
+# their state machines, since they consume different coordinate systems.
+MARKDOWN_FENCE_OPEN = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[^\r\n]*$")
+MARKDOWN_FENCE_CLOSE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
+LOGICAL_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+LINE_BREAK_CHARS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 
 
 def make_dummy_finding(analyzer_id: str) -> Finding:

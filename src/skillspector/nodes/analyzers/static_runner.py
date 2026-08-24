@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
+from array import array
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import cast
@@ -42,6 +43,11 @@ from skillspector.python_ast import (
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 
+from .common import (
+    LINE_BREAK_CHARS,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+)
 from .pattern_defaults import get_category, get_explanation, get_pattern_name, get_remediation
 
 logger = get_logger(__name__)
@@ -85,6 +91,75 @@ _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
+
+
+def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
+    stripped = line.rstrip(LINE_BREAK_CHARS)
+    closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+    if active is not None:
+        if closing and closing.group(1)[0] == active[0] and len(closing.group(1)) >= active[1]:
+            return None
+        return active
+    opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped)
+    if opening:
+        marker = opening.group(1)
+        return marker[0], len(marker)
+    return None
+
+
+def _markdown_fence_states(
+    content: str, offsets: tuple[int, ...]
+) -> tuple[dict[int, tuple[str, int] | None], dict[int, tuple[str, int, str, int]]]:
+    states: dict[int, tuple[str, int] | None] = {}
+    transitions: dict[int, tuple[str, int, str, int]] = {}
+    active: tuple[str, int] | None = None
+    offset_index = 0
+    content_offset = 0
+    for line in content.splitlines(keepends=True):
+        line_end = content_offset + len(line)
+        complete = line.endswith(tuple(LINE_BREAK_CHARS))
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped) if complete else None
+        closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped) if complete else None
+        while offset_index < len(offsets) and offsets[offset_index] < line_end:
+            offset = offsets[offset_index]
+            states[offset] = active
+            if offset > content_offset:
+                if active is None and opening is not None:
+                    marker = opening.group(1)
+                    transitions[offset] = (marker[0], len(marker), "open", line_end)
+                elif (
+                    active is not None
+                    and closing is not None
+                    and closing.group(1)[0] == active[0]
+                    and len(closing.group(1)) >= active[1]
+                ):
+                    marker = closing.group(1)
+                    transitions[offset] = (marker[0], len(marker), "close", line_end)
+            offset_index += 1
+        if not complete:
+            break
+        active = _advance_markdown_fence(active, line)
+        content_offset = line_end
+        while offset_index < len(offsets) and offsets[offset_index] == line_end:
+            states[offsets[offset_index]] = active
+            offset_index += 1
+    while offset_index < len(offsets):
+        states[offsets[offset_index]] = active
+        offset_index += 1
+    return states, transitions
+
+
+def _window_view_with_markdown_context(
+    view: SecurityTextView, prefix_length: int
+) -> SecurityTextView:
+    if prefix_length == 0:
+        return view
+    if view.source_offsets is None:
+        offsets = array("I", (max(0, offset - prefix_length) for offset in range(len(view.text))))
+    else:
+        offsets = array("I", (max(0, offset - prefix_length) for offset in view.source_offsets))
+    return SecurityTextView(view.name, view.text, offsets)
 
 
 def _normalize_license_line(line: str) -> str:
@@ -790,6 +865,12 @@ def _scan_all_views_detailed(
     if modules_for_windows:
         step = SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS
         window_line = 1
+        window_starts = tuple(range(0, max(1, len(content)), step))
+        fence_states, fence_transitions = (
+            _markdown_fence_states(content, window_starts)
+            if _infer_file_type(path) in {"markdown", "text"}
+            else ({}, {})
+        )
         for start in range(0, max(1, len(content)), step):
             now = time.monotonic()
             if now >= deadline:
@@ -803,7 +884,16 @@ def _scan_all_views_detailed(
                 )
             end = min(len(content), start + SECURITY_VIEW_WINDOW_CHARS)
             raw_window = content[start:end]
-            for full_view in security_text_views(raw_window):
+            fence = fence_states.get(start)
+            transition = fence_transitions.get(start)
+            if fence is not None:
+                context_prefix = fence[0] * fence[1] + "\n"
+            elif transition is not None and transition[3] <= end:
+                context_prefix = transition[0] * transition[1] + "\n"
+            else:
+                context_prefix = ""
+            for full_view in security_text_views(context_prefix + raw_window):
+                full_view = _window_view_with_markdown_context(full_view, len(context_prefix))
                 for view in _bounded_view_slices(full_view):
                     try:
                         finding_budget.check_runtime()

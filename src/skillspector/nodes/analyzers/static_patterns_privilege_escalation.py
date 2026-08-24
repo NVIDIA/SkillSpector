@@ -19,13 +19,21 @@ from __future__ import annotations
 
 import re
 import sys
+from bisect import bisect_right
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+    get_context,
+    get_line_number,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -213,6 +221,28 @@ _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
 _MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
 
 
+def _source_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    starts = [0]
+    ends: list[int] = []
+    for separator in LOGICAL_LINE_BREAK.finditer(content):
+        ends.append(separator.start())
+        starts.append(separator.end())
+    ends.append(len(content))
+    return tuple(starts), tuple(ends)
+
+
+def _source_line_bounds(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> tuple[int, int]:
+    if line_starts is None or line_ends is None:
+        line_starts, line_ends = _source_line_metadata(content)
+    index = bisect_right(line_starts, match.start()) - 1
+    return line_starts[index], line_ends[index]
+
+
 def _source_line(content: str, match: re.Match[str]) -> str:
     """Return only the source line containing *match*."""
     line_start = content.rfind("\n", 0, match.start()) + 1
@@ -220,6 +250,91 @@ def _source_line(content: str, match: re.Match[str]) -> str:
     if line_end < 0:
         line_end = len(content)
     return content[line_start:line_end]
+
+
+_PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
+# Attacker-controlled credential placement remains actionable, including Save/Put/Write.
+_PE3_CREDENTIAL_STORE_HIGH_RISK = re.compile(
+    r"\b(?:dump|exfiltrat\w*|export|harvest|scrape|send|steal|transmit|upload)\w*\b",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_OPERATION = re.compile(
+    r"\b(?:access|copy|dump|exfiltrat\w*|export|extract|fetch|get|grab|harvest|"
+    r"load|lookup|obtain|open|pull|query|read|retrieve|scrape|send|steal|"
+    r"transmit|unlock|upload|save|put|write|store|remove|delete|clear|update|"
+    r"add|set)\w*\b(?:\s+(?:the|a|an|my|your|local|credentials?|secrets?|"
+    r"passwords?|tokens?|keys?|contents?|system|from|to|for|in|on)){0,8}\s+"
+    r"(?:keychain|keyring|gnome-keyring)\b"
+    r"|\b(?:keychain|keyring|gnome-keyring)\b[^.;:]{0,80}\b(?:copy|dump|"
+    r"exfiltrat\w*|export|extract|fetch|get|grab|harvest|load|lookup|obtain|"
+    r"open|pull|query|read|retrieve|scrape|send|steal|transmit|unlock|upload|"
+    r"save|put|write|store|remove|delete|clear|update|add|set)\w*\b"
+    r"|\b(?:keychain|keyring|gnome-keyring)\b[._](?:add|clear|delete|"
+    r"get|remove|save|set|store|update|write)\w*\b",
+    re.IGNORECASE,
+)
+_PE3_BENIGN_READING_PURPOSE = re.compile(
+    r"\b(?:only\s+for\s+reading(?:\s+purposes?)?|for\s+reading(?:\s+purposes?)?\s+only|solely\s+for\s+reading)\b",
+    re.IGNORECASE,
+)
+
+
+def _markdown_fence_ranges(content: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    active: tuple[str, int, int] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+        if active is not None:
+            if closing and closing.group(1)[0] == active[0] and len(closing.group(1)) >= active[1]:
+                ranges.append((active[2], offset))
+                active = None
+        else:
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped)
+            if opening:
+                marker = opening.group(1)
+                active = (marker[0], len(marker), offset + len(line))
+        offset += len(line)
+    if active is not None:
+        ranges.append((active[2], len(content)))
+    return ranges
+
+
+def _is_bare_credential_store_noun(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    fence_ranges: list[tuple[int, int]] | None = None,
+) -> bool:
+    """Suppress only descriptive credential-store nouns in prose."""
+    if file_type not in {"markdown", "text"}:
+        return False
+    if match.group(0).lower() not in _PE3_CREDENTIAL_STORE_WORDS:
+        return False
+    ranges = _markdown_fence_ranges(content) if fence_ranges is None else fence_ranges
+    if any(start <= match.start() < end for start, end in ranges):
+        return False
+    line_start, line_end = _source_line_bounds(content, match)
+    clause_start = max(
+        line_start - 1,
+        content.rfind(".", line_start, match.start()),
+        content.rfind(";", line_start, match.start()),
+        content.rfind(":", line_start, match.start()),
+    )
+    clause_end_candidates = [content.find(mark, match.end(), line_end) for mark in ".;:"]
+    clause_end = min((value for value in clause_end_candidates if value >= 0), default=line_end)
+    clause = content[clause_start + 1 : clause_end]
+    if not _PE3_CREDENTIAL_STORE_OPERATION.search(clause):
+        return True
+    if _PE3_CREDENTIAL_STORE_HIGH_RISK.search(clause):
+        return False
+    benign = _PE3_BENIGN_READING_PURPOSE.search(clause)
+    if benign and not re.search(
+        r"\b(?:use|call|invoke)\b", clause[: benign.start()], re.IGNORECASE
+    ):
+        return True
+    return False
 
 
 def _is_access_token_documentation_noun(
@@ -306,6 +421,7 @@ def _is_qualified_benign_access_requirement(
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
+    fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -349,6 +465,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in PE3_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            if _is_bare_credential_store_noun(content, match, file_type, fence_ranges):
+                continue
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
             contextual = any(
