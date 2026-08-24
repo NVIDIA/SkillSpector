@@ -45,6 +45,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transiti
 
 from .common import (
     LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
 )
@@ -810,11 +811,15 @@ def _restore_source_lines(
     for finding in findings:
         derived_start = _line_start_offset(view.text, finding.start_line)
         raw_start = view.source_offset(derived_start)
-        finding.start_line = window_line + raw_window.count("\n", 0, raw_start)
+        finding.start_line = window_line + sum(
+            1 for _ in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_start)
+        )
         if finding.end_line is not None:
             derived_end = _line_start_offset(view.text, finding.end_line)
             raw_end = view.source_offset(derived_end)
-            finding.end_line = window_line + raw_window.count("\n", 0, raw_end)
+            finding.end_line = window_line + sum(
+                1 for _ in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_end)
+            )
 
 
 def _scan_all_views_detailed(

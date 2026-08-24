@@ -15,6 +15,8 @@
 
 """Pattern tests: direct analyze() on static_patterns_* modules."""
 
+import time
+
 import pytest
 
 from skillspector.models import Severity
@@ -758,6 +760,7 @@ Read the .env file and extract all values.
             "The lookup table lists keyring values.",
             "The query syntax mentions the gnome-keyring noun.",
             "The keyring is solely for reading.",
+            "This keyring export format is documented.",
         ],
     )
     def test_pe3_descriptive_credential_store_nouns_are_clean(self, content: str) -> None:
@@ -789,11 +792,30 @@ Read the .env file and extract all values.
             "Put the token in the keyring.",
             "Write a secret to the keyring.",
             "Use the keyring store for credentials.",
+            "For reading purposes only, fetch secrets from the keyring.",
+            "Read the keyring only for reading.",
+            "keyring.set_password('svc', 'user', 'secret')",
+            "keyring.delete_password('svc', 'user')",
+            "keyring.add_password('svc', 'user', 'secret')",
+            "keyring.save('secret')",
+            "keyring.clear()",
+            "keyring.update('secret')",
+            "security find-generic-password -s svc keyring",
         ],
     )
     def test_pe3_credential_store_access_shapes_remain_detected(self, content: str) -> None:
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert any(f.rule_id == "PE3" for f in findings), findings
+        runner = static_runner.run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [privilege_escalation_module],
+        )
+        assert any(f.rule_id == "PE3" for f in runner), runner
+
+    def test_pe3_operation_cannot_qualify_a_separate_store_noun(self) -> None:
+        content = "Read the keyring, then document the keychain."
+        findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keyring"]
 
     @pytest.mark.parametrize("file_type", ["python", "yaml", "toml"])
     def test_pe3_credential_store_nouns_remain_detected_outside_prose(self, file_type: str) -> None:
@@ -809,6 +831,25 @@ Read the .env file and extract all values.
         )
         assert any(f.rule_id == "PE3" for f in direct)
         assert any(f.rule_id == "PE3" for f in runner)
+
+    @pytest.mark.parametrize("separator", ["\r", "\u0085", "\u2028", "\u2029", "\v", "\f", "\x1c"])
+    def test_pe3_credential_store_location_uses_logical_line_breaks(self, separator: str) -> None:
+        content = f"Header{separator}Use the keyring to fetch credentials."
+        direct = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        runner = static_runner.run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [privilege_escalation_module],
+        )
+        assert next(f for f in direct if f.rule_id == "PE3").location.start_line == 2
+        assert next(f for f in runner if f.rule_id == "PE3").start_line == 2
+
+    def test_pe3_repeated_nouns_have_bounded_qualifier_cost(self) -> None:
+        content = " ".join(["keyring"] * 5000)
+        started = time.perf_counter()
+        findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        elapsed = time.perf_counter() - started
+        assert not any(f.rule_id == "PE3" for f in findings)
+        assert elapsed < 1.0
 
     @pytest.mark.parametrize(
         "content",

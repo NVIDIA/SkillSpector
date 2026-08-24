@@ -258,20 +258,25 @@ _PE3_CREDENTIAL_STORE_HIGH_RISK = re.compile(
     r"\b(?:dump|exfiltrat\w*|export|harvest|scrape|send|steal|transmit|upload)\w*\b",
     re.IGNORECASE,
 )
-_PE3_CREDENTIAL_STORE_OPERATION = re.compile(
-    r"\b(?:access|copy|dump|exfiltrat\w*|export|extract|fetch|get|grab|harvest|"
+_PE3_CREDENTIAL_STORE_VERBS = (
+    r"access|copy|dump|exfiltrat\w*|export|extract|fetch|get|grab|harvest|"
     r"load|lookup|obtain|open|pull|query|read|retrieve|scrape|send|steal|"
     r"transmit|unlock|upload|save|put|write|store|remove|delete|clear|update|"
-    r"add|set)\w*\b(?:\s+(?:the|a|an|my|your|local|credentials?|secrets?|"
-    r"passwords?|tokens?|keys?|contents?|system|from|to|for|in|on)){0,8}\s+"
-    r"(?:keychain|keyring|gnome-keyring)\b"
-    r"|\b(?:keychain|keyring|gnome-keyring)\b[^.;:]{0,80}\b(?:copy|dump|"
-    r"exfiltrat\w*|export|extract|fetch|get|grab|harvest|load|lookup|obtain|"
-    r"open|pull|query|read|retrieve|scrape|send|steal|transmit|unlock|upload|"
-    r"save|put|write|store|remove|delete|clear|update|add|set)\w*\b"
-    r"|\b(?:keychain|keyring|gnome-keyring)\b[._](?:add|clear|delete|"
-    r"get|remove|save|set|store|update|write)\w*\b",
+    r"add|set|use"
+)
+_PE3_CREDENTIAL_STORE_OPERATION = re.compile(
+    rf"\b(?:{_PE3_CREDENTIAL_STORE_VERBS})\w*\b"
+    r"(?:\s+(?:the|a|an|my|your|local|credentials?|secrets?|passwords?|"
+    r"tokens?|keys?|contents?|system|from|to|for|in|on)){0,8}\s*$",
     re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_CALL = re.compile(
+    r"\s*[.]\s*(?:add|clear|delete|get|remove|save|set|store|update|write)"
+    r"\w*\s*(?=\()",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_CLI = re.compile(
+    r"\b(?:security\s+)?find-generic-password\b[^.;:\n]*$", re.IGNORECASE
 )
 _PE3_BENIGN_READING_PURPOSE = re.compile(
     r"\b(?:only\s+for\s+reading(?:\s+purposes?)?|for\s+reading(?:\s+purposes?)?\s+only|solely\s+for\s+reading)\b",
@@ -306,6 +311,8 @@ def _is_bare_credential_store_noun(
     match: re.Match[str],
     file_type: str,
     fence_ranges: list[tuple[int, int]] | None = None,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
 ) -> bool:
     """Suppress only descriptive credential-store nouns in prose."""
     if file_type not in {"markdown", "text"}:
@@ -315,25 +322,34 @@ def _is_bare_credential_store_noun(
     ranges = _markdown_fence_ranges(content) if fence_ranges is None else fence_ranges
     if any(start <= match.start() < end for start, end in ranges):
         return False
-    line_start, line_end = _source_line_bounds(content, match)
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    relation_start = max(line_start, match.start() - 80)
+    relation_end = min(line_end, match.end() + 80)
+    relation = content[relation_start:relation_end]
+    noun_offset = match.start() - relation_start
     clause_start = max(
-        line_start - 1,
-        content.rfind(".", line_start, match.start()),
-        content.rfind(";", line_start, match.start()),
-        content.rfind(":", line_start, match.start()),
+        -1,
+        relation.rfind(".", 0, noun_offset),
+        relation.rfind(";", 0, noun_offset),
+        relation.rfind(":", 0, noun_offset),
     )
-    clause_end_candidates = [content.find(mark, match.end(), line_end) for mark in ".;:"]
-    clause_end = min((value for value in clause_end_candidates if value >= 0), default=line_end)
-    clause = content[clause_start + 1 : clause_end]
-    if not _PE3_CREDENTIAL_STORE_OPERATION.search(clause):
+    clause_end_candidates = [
+        separator.start() for separator in re.finditer(r"[.;:](?=\s|$)", relation[noun_offset:])
+    ]
+    clause_end = (
+        noun_offset + min(clause_end_candidates) if clause_end_candidates else len(relation)
+    )
+    clause = relation[clause_start + 1 : clause_end]
+    noun_start = noun_offset - (clause_start + 1)
+    noun_end = noun_start + match.end() - match.start()
+    before_noun = clause[:noun_start]
+    after_noun = clause[noun_end:]
+    operation = _PE3_CREDENTIAL_STORE_OPERATION.search(before_noun)
+    call = _PE3_CREDENTIAL_STORE_CALL.match(after_noun)
+    cli = _PE3_CREDENTIAL_STORE_CLI.search(before_noun)
+    if not (operation or call or cli):
         return True
-    if _PE3_CREDENTIAL_STORE_HIGH_RISK.search(clause):
-        return False
-    benign = _PE3_BENIGN_READING_PURPOSE.search(clause)
-    if benign and not re.search(
-        r"\b(?:use|call|invoke)\b", clause[: benign.start()], re.IGNORECASE
-    ):
-        return True
+    # Any operation tied to this exact noun, including a read, dominates benign prose.
     return False
 
 
@@ -421,6 +437,7 @@ def _is_qualified_benign_access_requirement(
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
+    line_starts, line_ends = _source_line_metadata(content)
     fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
 
     def loc(ln: int) -> Location:
@@ -465,9 +482,11 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in PE3_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            if _is_bare_credential_store_noun(content, match, file_type, fence_ranges):
+            if _is_bare_credential_store_noun(
+                content, match, file_type, fence_ranges, line_starts, line_ends
+            ):
                 continue
-            line_num = get_line_number(content, match.start())
+            line_num = bisect_right(line_starts, match.start())
             context = get_context(content, match.start())
             contextual = any(
                 (
