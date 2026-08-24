@@ -376,11 +376,13 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
       ]
   ```
 
-  Add separate silent controls for narrow in-project Read and exact `Bash(npx prettier:*)`. Assert
-  `WebFetch(*)` is a completeness-neutral `unsupported_allow_specifier` diagnostic rather than an
-  all-domain equivalent. Boundary-test WebFetch's 253-character total and 63-character label limits,
-  valid ASCII/punycode and wildcard labels, terminal-dot normalization, and invalid schemes,
-  user-info, ports, paths, whitespace, empty labels, `?`, and non-ASCII input.
+  Add a silent control for narrow in-project Read. Assert exact `Bash(npx prettier:*)` and its pinned
+  whitespace spelling are MEDIUM `scoped_execution`: `npx` can fetch packages and load executable
+  configuration or plugins, so it is not a safe-wrapper exception. Assert `WebFetch(*)` is a
+  completeness-neutral `unsupported_allow_specifier` diagnostic rather than an all-domain
+  equivalent. Boundary-test WebFetch's 253-character total and 63-character label limits, valid
+  ASCII/punycode and wildcard labels, terminal-dot normalization, and invalid schemes, user-info,
+  ports, paths, whitespace, empty labels, `?`, and non-ASCII input.
 
 - [ ] **Step 2: Verify RED on unimplemented grant rules**
 
@@ -419,30 +421,40 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   the Bash execution classifier. Route Artifact/ShareOnboardingGuide to HIGH
   `external_content_upload`, Workflow to HIGH `autonomous_workflow`, EnterWorktree to HIGH
   `workspace_boundary_change`, Skill to MEDIUM `skill_invocation`, and ExitPlanMode to MEDIUM
-  `approval_gate_transition`. Route bare Grep/Glob/LSP to their distinct MEDIUM filesystem tokens;
-  path-qualified forms are completeness-neutral `ignored_path_qualifier` diagnostics because
-  2.1.241 uses `Read(...)` for that approval. Only accept the documented scoped Skill form among the
+  `approval_gate_transition`. Route bare Grep/Glob/LSP to their distinct MEDIUM filesystem tokens.
+  Path-qualified Glob is a completeness-neutral `ignored_path_qualifier` diagnostic because 2.1.241
+  uses `Read(...)` for that approval; path-qualified Grep/LSP are completeness-affecting
+  `runtime_uncertain_rule` diagnostics because their pinned handling is not established. Only accept
+  the documented scoped Skill form among the
   generic routes. Table-test every exact name and severity, and add an exhaustiveness assertion that
-  each known name appears in exactly one route. Include feature-gated `SendUserMessage` in the
-  known-non-grant route and table-test its bare and scoped allow diagnostics plus valid ask/deny
-  forms, so enabling `--brief` cannot turn a canonical tool into an unknown-rule failure.
+  each known name appears in exactly one route. Include feature-gated `SendUserMessage` and pinned
+  `ReadMcpResourceDirTool` in the known-non-grant route and table-test their bare and scoped allow
+  diagnostics plus valid ask/deny forms, so feature availability cannot turn a canonical tool into
+  an unknown-rule failure.
 
   Add a dedicated additional-directory table proving that it does not reuse permission-rule anchor
   semantics: `/tmp` is absolute external MEDIUM, `//` and `~` are whole-root/home CRITICAL,
   `~/.ssh` is sensitive HIGH, `../docs` is external MEDIUM, and `./subdir` is within-project silent.
   Assert each lexically valid entry has a completeness-neutral
   `directory_existence_static_unknown` diagnostic because the pure helper does not call `stat`.
-  Assert empty, NUL, UNC, drive, malformed-home, environment-variable, and interior-parent forms
-  are `invalid_path`; table-test `sensitive_additional_directory` in the grant-kind allowlist.
+  Lexically normalize interior `.`/`..`: `child/../docs` stays project-local and
+  `child/../../docs` becomes external. A Windows drive root such as `C:\\` or `C:/` emits a
+  conditional CRITICAL whole-root grant; a lexically sensitive Windows absolute path such as
+  `C:\\Users\\x\\.ssh` emits a conditional HIGH sensitive-directory grant; other Windows absolute
+  drive and UNC forms emit a conditional MEDIUM external-directory grant. Each also emits the
+  completeness-affecting `platform_dependent_path` diagnostic. Drive-relative ambiguity emits that
+  diagnostic without guessing a grant. Empty, NUL, malformed-home, and environment-variable forms
+  are `invalid_path`. Table-test `sensitive_additional_directory` in the grant-kind allowlist.
 
 - [ ] **Step 4: Add and implement known ignored grammar tests**
 
   In `allow`, test `*`, `B*`, and `mcp__*` as ignored known diagnostics, not grants. Test
-  path-qualified Write/NotebookEdit/MultiEdit/Grep/Glob/LSP, duplicate rules, and list permutation.
+  path-qualified Write/NotebookEdit/MultiEdit/Glob, duplicate rules, and list permutation.
   They must produce stable semantic diagnostics or silent output without degrading completeness.
   Assert bare Write is CRITICAL, bare NotebookEdit/MultiEdit are HIGH, and bare Grep/Glob/LSP are
-  MEDIUM. Lock bare MultiEdit with a pinned-2.1.241 fixture/probe assertion that it remains in the
-  binary's canonical edit/write set. Test
+  MEDIUM. Assert path-qualified Grep/LSP instead produce completeness-affecting
+  `runtime_uncertain_rule`. Lock bare MultiEdit with a pinned-2.1.241 fixture/probe assertion that it
+  remains in the binary's canonical edit/write set. Test
   `UnknownTool(*)`, malformed delimiters, traversal, UNC, drive, NUL, and unknown MCP shapes as
   completeness-affecting.
 
@@ -482,6 +494,8 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   Add focused allow-versus-ask/deny cases for all proven equivalences and selectors:
 
   - `Bash(ls:*)` versus `Bash(ls *)`, and bare Bash versus `Bash(*)`;
+  - scoped `Monitor(command)` versus equivalent Bash ask/deny command rules, while a bare Monitor
+    allow retains its separate WebSocket-bearing capability under a Bash-only restriction;
   - PowerShell case-insensitive tool/command spelling;
   - WebFetch domain case and terminal-dot normalization, including an identical normalized wildcard
     domain pattern;
@@ -1046,10 +1060,11 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
 - [ ] **Step 4: Run the benign and positive calibration sets**
 
   The benign set must include restrictive-only settings, auto in project/local scope, narrow project
-  Read, the exact prettier rule, tracked-looking local content without provenance claims, and
-  settings-like nested/plugin files. The positive set must include every CRITICAL/HIGH/MEDIUM class,
-  same-document mitigation, mixed validity, direct/ZIP/nested-ZIP, and Case B/C. Require zero
-  unexpected BH3 on the benign set and the expected class on every positive fixture.
+  Read, tracked-looking local content without provenance claims, and settings-like nested/plugin
+  files. The positive set must include the exact prettier rule as MEDIUM `scoped_execution`, every
+  CRITICAL/HIGH/MEDIUM class, same-document mitigation, mixed validity, direct/ZIP/nested-ZIP, and
+  Case B/C. Require zero unexpected BH3 on the benign set and the expected class on every positive
+  fixture.
 
   If a named catalog is unavailable, write `unavailable` plus the checked path in the PR verification
   notes. Do not reuse issue #399's historical counts as a fresh result.
@@ -1109,7 +1124,9 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   - feature-gated `SendUserMessage` recognition with `--brief` enabled;
   - bare/server-wide, exact-tool, and partial-tool MCP spellings;
   - bare WebFetch, `domain:*`, literal/wildcard domain, and unsupported `WebFetch(*)` spellings; and
-  - `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, and `./subdir` additional-directory spellings.
+  - `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized interior-parent, Windows drive
+    root, sensitive absolute, ordinary absolute-drive/UNC, and drive-relative additional-directory
+    spellings.
 
   Capture only safe debug/status lines. Never run a destructive command and never transmit a canary.
   If login/model access permits, add benign reads/writes inside a disposable directory to test actual

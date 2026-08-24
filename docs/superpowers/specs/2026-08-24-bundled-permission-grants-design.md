@@ -314,7 +314,8 @@ specifier:
 
 The exact known-non-grant set is `Agent`, `AskUserQuestion`, `Cd`, `CronCreate`, `CronDelete`,
 `CronList`, `EndConversation`, `EnterPlanMode`, `ExitWorktree`, `ListAgents`,
-`ListMcpResourcesTool`, `PushNotification`, `ReadMcpResourceTool`, `RemoteTrigger`,
+`ListMcpResourcesTool`, `PushNotification`, `ReadMcpResourceDirTool`, `ReadMcpResourceTool`,
+`RemoteTrigger`,
 `ReportFindings`, `ScheduleWakeup`, `SendMessage`, `SendUserFile`, `SendUserMessage`, `Task`,
 `TaskCreate`, `TaskGet`, `TaskList`, `TaskOutput`, `TaskStop`, `TaskUpdate`, `TodoWrite`, `ToolSearch`,
 and `WaitForMcpServers`. These names are known non-grants because an allow declaration does not
@@ -340,6 +341,9 @@ fail if a name belongs to zero or multiple routes.
 - The equivalent `PowerShell` and `PowerShell(*)` forms are tool-wide execution grants.
 - In `allow`, an unanchored tool-name glob is not a grant. `*`, `B*`, and `mcp__*` are ignored known
   diagnostics, not BH3 grants.
+- The ignored allow-glob diagnostic is completeness-neutral because 2.1.241 deterministically skips
+  those unanchored forms with a startup warning; the scanner is not guessing whether they grant
+  access. A future or otherwise unknown allow grammar remains completeness-affecting.
 - In `ask` and `deny`, tool-name globs are valid precedence selectors. They are matched with bounded,
   case-sensitive glob semantics against the normalized tool identifier. Thus `deny: ["*"]`
   neutralizes every ordinary allow candidate, `ask: ["B*"]` neutralizes Bash candidates, and
@@ -365,11 +369,14 @@ diagnostics. Their bare forms are explicit grants: bare `Write` is CRITICAL, bar
 bare `MultiEdit` are HIGH broad-write grants, and bare `Glob` is MEDIUM filesystem-enumeration
 capability. No path specifier is inferred for those bare forms.
 
-Bare `Grep` and bare `LSP` are MEDIUM broad filesystem search/intelligence grants. Path-qualified
-`Grep`, `Glob`, and `LSP` are known ignored diagnostics in 2.1.241 because external path approval is
-expressed with `Read(...)`; the scanner does not reinterpret their specifiers. Bare MultiEdit remains
-recognized because the pinned 2.1.241 executable includes it in its canonical edit/write tool sets,
-despite its omission from the evolving public tools table. A pinned probe locks this behavior.
+Bare `Grep` and bare `LSP` are MEDIUM broad filesystem search/intelligence grants. A path-qualified
+`Glob` is a known ignored diagnostic in 2.1.241 because external path approval is expressed with
+`Read(...)`; the scanner does not reinterpret its specifier. The pinned runtime and official
+permission contract do not establish equivalent ignored behavior for path-qualified `Grep` or `LSP`,
+so those forms produce a completeness-affecting `runtime_uncertain_rule` diagnostic and no grant.
+Bare MultiEdit remains recognized because the pinned 2.1.241 executable includes it in its canonical
+edit/write tool sets, despite its omission from the evolving public tools table. A pinned probe locks
+this behavior.
 
 Path scope is classified without exposing the path:
 
@@ -410,19 +417,27 @@ directory; it never resolves a symlink or exposes the path:
 
 | Shape | Treatment |
 |---|---|
-| `.`, `./`, a plain relative child, or `./child` | Already within the project boundary; silent |
-| One or more leading `../` segments | External directory, MEDIUM unless sensitive |
+| `.`, `./`, a plain relative child, `./child`, or a lexically normalized relative path that remains inside the project | Already within the project boundary; silent |
+| A relative path whose lexical normalization retains leading `../` segments | External directory, MEDIUM unless sensitive |
 | `/absolute` other than the whole root | External directory, MEDIUM unless sensitive |
 | `/`, `//`, or equivalent separator-only filesystem root | Whole-root CRITICAL |
 | `~` or `~/` | Whole-home CRITICAL |
 | `~/child` | External/home directory, MEDIUM unless sensitive |
 | Any sensitive external/home/absolute directory such as `~/.ssh` | HIGH `sensitive_additional_directory` |
-| Empty, NUL-bearing, UNC, drive-qualified, malformed home, environment-variable, or interior-parent form | Completeness-affecting `invalid_path` |
+| Windows drive root such as `C:\\` or `C:/` | Conditional whole-root CRITICAL plus completeness-affecting `platform_dependent_path` |
+| Lexically sensitive Windows absolute path such as `C:\\Users\\x\\.ssh` | Conditional sensitive-directory HIGH plus completeness-affecting `platform_dependent_path` |
+| Other Windows absolute drive or UNC form | Conditional external MEDIUM plus completeness-affecting `platform_dependent_path` |
+| Drive-relative or otherwise platform-ambiguous form with no provable external scope | Completeness-affecting `platform_dependent_path`; no grant is guessed |
+| Empty, NUL-bearing, malformed home, or environment-variable form | Completeness-affecting `invalid_path` |
 
-The pure analyzer does not call `stat`, so existence and directory type are always
-`static_unknown`. Each otherwise valid entry gets at most one completeness-neutral
+The pure analyzer lexically collapses `.` and `..` segments but does not call `stat`, resolve a
+symlink, or pick a target operating system. Thus `child/../docs` is project-local while
+`child/../../docs` remains external. Existence and directory type are always `static_unknown`.
+Each otherwise valid or conditionally external entry gets at most one completeness-neutral
 `directory_existence_static_unknown` diagnostic; runtime absence does not turn a lexical grant into
-a static safe result. Exact tests cover `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, and `./subdir`.
+a static safe result. Exact tests cover `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, `./subdir`, normalized
+interior parents, Windows drive-root, sensitive absolute, ordinary absolute-drive/UNC, and
+drive-relative forms.
 
 ### Network, execution, and MCP rules
 
@@ -438,13 +453,17 @@ a static safe result. Exact tests cover `/tmp`, `//`, `~`, `~/.ssh`, `../docs`, 
   scanner performs no Unicode conversion.
 - Bare `WebSearch` is MEDIUM because it permits network search but not an arbitrary caller-selected
   fetch destination.
-- Bare or non-formatter `Bash`/`PowerShell`/`Monitor` command scope is classified according to the
+- Bare or scoped `Bash`/`PowerShell`/`Monitor` command scope is classified according to the
   matrix below. Monitor inherits Bash command-pattern normalization and severity because it runs a
   shell command; its bare form also admits its WebSocket source and is CRITICAL.
-- The sole initial silent execution control is the documented benign rule
-  `Bash(npx prettier:*)` and its 2.1.241 whitespace spelling. There is no substring-based
-  "formatter" heuristic. Other formatters can be added only with tests and runtime-compatible
-  grammar evidence.
+- For precedence, a scoped Monitor command uses the Bash permission family: an equivalent scoped or
+  bare Bash ask/deny rule covers the command portion. A bare Monitor allow remains distinct because
+  it also admits the Monitor WebSocket source; a Bash restriction alone does not neutralize that
+  separate capability.
+- Every valid scoped `Bash`, `PowerShell`, or `Monitor` allow is MEDIUM `scoped_execution`,
+  including `Bash(npx prettier:*)` and its 2.1.241 whitespace spelling. `npx` can fetch packages and
+  load executable configuration or plugins, so there is no execution safe-list or substring-based
+  "formatter" exception.
 - A bare literal MCP server or literal-server wildcard is HIGH; a literal exact or partial-glob MCP
   tool is MEDIUM.
 
@@ -474,6 +493,8 @@ Before exact mitigation comparison, normalize only proven 2.1.241 runtime-equiva
 - bare `Bash` equals `Bash(*)`;
 - the legacy Bash prefix separator and whitespace spelling are equivalent, so `Bash(ls:*)` equals
   `Bash(ls *)`;
+- a scoped `Monitor(command)` allow compares against the equivalent Bash command identity for
+  ask/deny precedence, while bare Monitor keeps its distinct WebSocket-bearing identity;
 - PowerShell tool/command matching is case-insensitive; and
 - WebFetch domain patterns are ASCII case-insensitive and wildcard-aware, and one terminal DNS root
   dot is removed, so
@@ -557,8 +578,8 @@ forms and precedence are applied.
 |---|---|
 | CRITICAL | `bypassPermissions`; tool-wide Bash/PowerShell/Monitor; bare or filesystem-root/home-wide `Read` or `Edit`; bare tool-wide `Write`; filesystem-root/home `additionalDirectories` |
 | HIGH | Sensitive-path read/edit/additional directory; bare `NotebookEdit`; bare `MultiEdit`; broad external write; all-domain fetch; broad literal MCP-server capability; external upload/publish; Workflow; EnterWorktree |
-| MEDIUM | Scoped execution other than the silent prettier control; scoped network; scoped write/edit; bare `Glob`/`Grep`/`LSP`; exact/partial MCP tool; external additional directory; `acceptEdits`; Skill; ExitPlanMode |
-| Silent | Narrow in-project read; exact `Bash(npx prettier:*)`; restrictive ask/deny; default/manual/plan/dontAsk; project/local auto |
+| MEDIUM | Scoped execution; scoped network; scoped write/edit; bare `Glob`/`Grep`/`LSP`; exact/partial MCP tool; external additional directory; `acceptEdits`; Skill; ExitPlanMode |
+| Silent | Narrow in-project read; restrictive ask/deny; default/manual/plan/dontAsk; project/local auto |
 
 `blocking_critical` is `True` if and only if at least one effective CRITICAL grant remains after
 same-document mitigation. HIGH and MEDIUM BH3 findings do not set it. The boolean is independent of
@@ -667,7 +688,8 @@ Diagnostic kinds are also closed and contain no user value. The initial set is
 `auto_ignored`, `legacy_manual`, `bypass_disabled`,
 `bypass_global_restriction`, `auto_disabled`,
 `skip_dangerous_prompt_ignored`, `local_skip_dangerous_prompt_declared`, `ignored_allow_rule_glob`,
-`ignored_path_qualifier`, `unsupported_allow_specifier`, `known_non_grant_tool`, `restrictive_rule`, `mitigated_allow`,
+`ignored_path_qualifier`, `runtime_uncertain_rule`, `unsupported_allow_specifier`,
+`known_non_grant_tool`, `restrictive_rule`, `mitigated_allow`, `platform_dependent_path`,
 `directory_existence_static_unknown`, `unknown_permission_key`, `unknown_mode`, `unknown_rule`,
 `wrong_type`, and `invalid_path`.
 
@@ -806,8 +828,8 @@ BH3 is ready to remain on the dependent draft PR only when all of the following 
 2. Case C produces BH1/BH2/BH3 from the mixed artifact; the settings file has one producer owner.
 3. `Bash(*)`, bare Bash, root/home read/edit, root/home additional directories, and unmitigated
    bypass mode set `blocking_critical: true` and score at least 51 when unsuppressed.
-4. Project/local auto, dontAsk alone, restrictive rules, narrow project read, and the exact prettier
-   control do not emit BH3.
+4. Project/local auto, dontAsk alone, restrictive rules, and narrow project read do not emit BH3;
+   scoped execution such as the exact prettier rule emits MEDIUM BH3.
 5. Shared trust, local provenance, and interface uncertainty are explicit; no report claims the
    permission was active, installed, or used.
 6. Malformed siblings preserve independently valid analysis as PARTIAL. Atomic shared-JSON failures
