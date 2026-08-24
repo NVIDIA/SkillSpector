@@ -81,13 +81,13 @@ def is_code_example(context: str, *, path: str = "") -> bool:
 
 def get_line_number(content: str, offset: int) -> int:
     """Return the 1-based line number for a character offset in *content*."""
-    return content[:offset].count("\n") + 1
+    return sum(1 for _ in LOGICAL_LINE_BREAK.finditer(content, 0, offset)) + 1
 
 
 def get_context(content: str, match_start: int, context_lines: int = 3) -> str:
     """Extract surrounding lines from *content* around the match at *match_start* (char offset)."""
     lines = content.splitlines()
-    match_line = content[:match_start].count("\n")
+    match_line = get_line_number(content, match_start) - 1
     start_line = max(0, match_line - context_lines)
     end_line = min(len(lines), match_line + context_lines + 1)
     return "\n".join(lines[start_line:end_line])

@@ -761,6 +761,12 @@ Read the .env file and extract all values.
             "The query syntax mentions the gnome-keyring noun.",
             "The keyring is solely for reading.",
             "This keyring export format is documented.",
+            "See the README for the keyring.",
+            "Settings for the keyring are documented below.",
+            "This document is used for the keyring.",
+            "Readme for the keyring.",
+            "Setup for the keyring.",
+            "Loader for the keychain.",
         ],
     )
     def test_pe3_descriptive_credential_store_nouns_are_clean(self, content: str) -> None:
@@ -832,9 +838,31 @@ Read the .env file and extract all values.
         assert any(f.rule_id == "PE3" for f in direct)
         assert any(f.rule_id == "PE3" for f in runner)
 
+    def test_pe3_credential_store_fence_context_survives_a_window(self) -> None:
+        body = "x\n" * (static_runner.SECURITY_VIEW_WINDOW_CHARS // 2 + 2_000)
+        content = f"```python\n{body}keyring.get_password('svc', 'user')\n```\n"
+        runner = static_runner.run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [privilege_escalation_module],
+        )
+        pe3 = [finding for finding in runner if finding.rule_id == "PE3"]
+        assert len(pe3) == 1
+
+    def test_runner_restores_logical_lines_across_windows(self) -> None:
+        separator = "\u2028"
+        content = ("x" * 99 + separator) * 2_600 + "Use the keyring to fetch credentials."
+        direct = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        runner = static_runner.run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [privilege_escalation_module],
+        )
+        direct_line = next(f for f in direct if f.rule_id == "PE3").location.start_line
+        runner_line = next(f for f in runner if f.rule_id == "PE3").start_line
+        assert direct_line == runner_line == 2_601
+
     @pytest.mark.parametrize("separator", ["\r", "\u0085", "\u2028", "\u2029", "\v", "\f", "\x1c"])
     def test_pe3_credential_store_location_uses_logical_line_breaks(self, separator: str) -> None:
-        content = f"Header{separator}Use the keyring to fetch credentials."
+        content = f"Header{separator}Use the keyring to fetch credentials.{separator}Tail"
         direct = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         runner = static_runner.run_static_patterns(
             {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},

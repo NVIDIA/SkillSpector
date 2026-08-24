@@ -793,10 +793,10 @@ def _line_start_offset(text: str, line_number: int) -> int:
         return 0
     offset = 0
     for _ in range(line_number - 1):
-        newline = text.find("\n", offset)
-        if newline < 0:
+        separator = LOGICAL_LINE_BREAK.search(text, offset)
+        if separator is None:
             return len(text)
-        offset = newline + 1
+        offset = separator.end()
     return offset
 
 
@@ -930,7 +930,12 @@ def _scan_all_views_detailed(
                         )
             if end == len(content):
                 break
-            window_line += content.count("\n", start, min(len(content), start + step))
+            window_line += sum(
+                1
+                for _ in LOGICAL_LINE_BREAK.finditer(
+                    content, start, min(len(content), start + step)
+                )
+            )
 
         # Raw windows intentionally remain small, but a separator wider than
         # their overlap can split a lexical expression even though the

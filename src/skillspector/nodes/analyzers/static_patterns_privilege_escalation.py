@@ -243,21 +243,19 @@ def _source_line_bounds(
     return line_starts[index], line_ends[index]
 
 
-def _source_line(content: str, match: re.Match[str]) -> str:
+def _source_line(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> str:
     """Return only the source line containing *match*."""
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end < 0:
-        line_end = len(content)
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
     return content[line_start:line_end]
 
 
 _PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
 # Attacker-controlled credential placement remains actionable, including Save/Put/Write.
-_PE3_CREDENTIAL_STORE_HIGH_RISK = re.compile(
-    r"\b(?:dump|exfiltrat\w*|export|harvest|scrape|send|steal|transmit|upload)\w*\b",
-    re.IGNORECASE,
-)
 _PE3_CREDENTIAL_STORE_VERBS = (
     r"access|copy|dump|exfiltrat\w*|export|extract|fetch|get|grab|harvest|"
     r"load|lookup|obtain|open|pull|query|read|retrieve|scrape|send|steal|"
@@ -265,7 +263,7 @@ _PE3_CREDENTIAL_STORE_VERBS = (
     r"add|set|use"
 )
 _PE3_CREDENTIAL_STORE_OPERATION = re.compile(
-    rf"\b(?:{_PE3_CREDENTIAL_STORE_VERBS})\w*\b"
+    rf"\b(?:{_PE3_CREDENTIAL_STORE_VERBS})\b"
     r"(?:\s+(?:the|a|an|my|your|local|credentials?|secrets?|passwords?|"
     r"tokens?|keys?|contents?|system|from|to|for|in|on)){0,8}\s*$",
     re.IGNORECASE,
@@ -277,10 +275,6 @@ _PE3_CREDENTIAL_STORE_CALL = re.compile(
 )
 _PE3_CREDENTIAL_STORE_CLI = re.compile(
     r"\b(?:security\s+)?find-generic-password\b[^.;:\n]*$", re.IGNORECASE
-)
-_PE3_BENIGN_READING_PURPOSE = re.compile(
-    r"\b(?:only\s+for\s+reading(?:\s+purposes?)?|for\s+reading(?:\s+purposes?)?\s+only|solely\s+for\s+reading)\b",
-    re.IGNORECASE,
 )
 
 
@@ -358,6 +352,8 @@ def _is_access_token_documentation_noun(
     match: re.Match[str],
     file_type: str,
     file_path: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
 ) -> bool:
     """Return True for a bounded ``access token`` compound noun in documentation.
 
@@ -385,8 +381,8 @@ def _is_access_token_documentation_noun(
     if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
         return False
 
-    line = _source_line(content, match)
-    line_start = content.rfind("\n", 0, match.start()) + 1
+    line = _source_line(content, match, line_starts, line_ends)
+    line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
     relative_start = match.start() - line_start
     relative_end = match.end() - line_start
     prefix = _MARKDOWN_LINE_PREFIX.sub("", line[:relative_start])
@@ -407,7 +403,11 @@ def _is_access_token_documentation_noun(
 
 
 def _is_qualified_benign_access_requirement(
-    content: str, match: re.Match[str], file_type: str
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
 ) -> bool:
     """Suppress only the reviewed GTL requirement row in its exact table."""
     if file_type != "markdown" or match.group(0) != "access credential":
@@ -490,10 +490,14 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context = get_context(content, match.start())
             contextual = any(
                 (
-                    _is_pe3_documentation_example(content, match, file_type, file_path),
-                    _is_qualified_benign_access_requirement(content, match, file_type),
+                    _is_pe3_documentation_example(
+                        content, match, file_type, file_path, line_starts, line_ends
+                    ),
+                    _is_qualified_benign_access_requirement(
+                        content, match, file_type, line_starts, line_ends
+                    ),
                     _is_read_only_passwd_volume_match(content, match),
-                    _is_negated_safety_constraint(content, match),
+                    _is_negated_safety_constraint(content, match, line_starts, line_ends),
                 )
             )
             finding_tags = list(tag)
@@ -590,6 +594,8 @@ def _is_pe3_documentation_example(
     match: re.Match[str],
     file_type: str,
     file_path: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
 ) -> bool:
     """Filter reviewed, position-bound access-token documentation forms.
 
@@ -605,23 +611,27 @@ def _is_pe3_documentation_example(
     if match.group(0).lower() not in {"access token", "access tokens"}:
         return False
 
-    line = _source_line(content, match)
+    line = _source_line(content, match, line_starts, line_ends)
     navigation = _PE3_SAFE_ACCESS_TOKEN_NAVIGATION.search(line)
     if navigation is not None:
-        line_start = content.rfind("\n", 0, match.start()) + 1
+        line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
         match_span = (match.start() - line_start, match.end() - line_start)
         if navigation.span("target") == match_span:
             return True
 
-    return _is_access_token_documentation_noun(content, match, file_type, file_path)
+    return _is_access_token_documentation_noun(
+        content, match, file_type, file_path, line_starts, line_ends
+    )
 
 
-def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+def _is_negated_safety_constraint(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
     """Return True when a privilege-escalation phrase is forbidden in policy prose."""
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(content)
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
     line = content[line_start:line_end]
     local_start = match.start() - line_start
     phrase = line[local_start : local_start + len(match.group(0))]
