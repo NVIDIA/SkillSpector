@@ -553,6 +553,125 @@ def test_additional_directory_drive_relative_does_not_guess_scope() -> None:
     ]
 
 
+@pytest.mark.parametrize("directory", ["é:/", "é:/docs", "中:/docs", "Ｃ:/docs"])
+def test_non_ascii_colon_prefix_is_project_relative(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert result.outcome is LedgerOutcome.COMPLETED
+    assert result.reason is None
+    assert result.grants == ()
+    assert [(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics] == [
+        ("directory_existence_static_unknown", False)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("directory", "grant_kind", "severity", "blocking"),
+    [
+        (r"\\?\C:" + "\\", "root_or_home_additional_directory", "CRITICAL", True),
+        ("//?/C:/", "root_or_home_additional_directory", "CRITICAL", True),
+        (r"\\?\C:\docs", "external_additional_directory", "MEDIUM", False),
+        ("//?/C:/docs", "external_additional_directory", "MEDIUM", False),
+        (r"\\?\C:\Users\x\.ssh", "sensitive_additional_directory", "HIGH", False),
+        ("//?/C:/Users/x/.ssh", "sensitive_additional_directory", "HIGH", False),
+        (r"\\?\UNC\server\share", "external_additional_directory", "MEDIUM", False),
+        ("//?/UNC/server/share", "external_additional_directory", "MEDIUM", False),
+        (
+            r"\\?\UNC\server\share\.ssh",
+            "sensitive_additional_directory",
+            "HIGH",
+            False,
+        ),
+        (
+            "//?/UNC/server/share/.ssh",
+            "sensitive_additional_directory",
+            "HIGH",
+            False,
+        ),
+        (r"\\.", "root_or_home_additional_directory", "CRITICAL", True),
+        (r"\\." + "\\", "root_or_home_additional_directory", "CRITICAL", True),
+        ("//.", "root_or_home_additional_directory", "CRITICAL", True),
+        ("//./", "root_or_home_additional_directory", "CRITICAL", True),
+    ],
+)
+def test_reserved_windows_namespace_directory_is_conditional(
+    directory: str, grant_kind: str, severity: str, blocking: bool
+) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert result.outcome is LedgerOutcome.PARTIAL
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert [
+        (grant.grant_kind, grant.severity, grant.blocking_critical) for grant in result.grants
+    ] == [(grant_kind, severity, blocking)]
+    assert {(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics} == {
+        ("platform_dependent_path", True),
+        ("directory_existence_static_unknown", False),
+    }
+
+
+@pytest.mark.parametrize(
+    ("backslash", "forward"),
+    [
+        (r"\\?\C:" + "\\", "//?/C:/"),
+        (r"\\?\C:\docs", "//?/C:/docs"),
+        (r"\\?\UNC\server\share", "//?/UNC/server/share"),
+        (r"\\." + "\\", "//./"),
+    ],
+)
+def test_reserved_windows_namespace_separator_spellings_deduplicate(
+    backslash: str, forward: str
+) -> None:
+    individual = _analyze({"additionalDirectories": [backslash]})
+    combined = _analyze({"additionalDirectories": [forward, backslash, forward]})
+
+    assert combined.grants == individual.grants
+    assert combined.diagnostics == individual.diagnostics
+    assert combined.aggregate_digest == individual.aggregate_digest
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        r"\\.\PIPE",
+        "//./PIPE",
+        r"\\.\PhysicalDrive0",
+        "//./PhysicalDrive0",
+        r"\\.\C:",
+        "//./C:",
+        r"\\?\Volume{abc}",
+        "//?/Volume{abc}",
+        r"\\?\GLOBALROOT\Device",
+        "//?/GLOBALROOT/Device",
+        r"\\?",
+        r"\\?" + "\\",
+        "//?",
+        "//?/",
+        r"\\?\C:",
+        "//?/C:",
+        r"\\?\UNC",
+        "//?/UNC",
+        r"\\?\UNC\server",
+        "//?/UNC/server",
+        r"\\?\UNC\server\..\share",
+        "//?/UNC/server/../share",
+        r"\\?\UNC\server\\share",
+        "//?/UNC/server//share",
+        r"\??\C:\docs",
+        "/??/C:/docs",
+    ],
+)
+def test_unsupported_windows_reserved_namespace_does_not_guess_scope(directory: str) -> None:
+    result = _analyze({"additionalDirectories": [directory]})
+
+    assert result.outcome is LedgerOutcome.FAILED
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert result.grants == ()
+    assert [(item.diagnostic_kind, item.affects_completeness) for item in result.diagnostics] == [
+        ("platform_dependent_path", True)
+    ]
+
+
 @pytest.mark.parametrize("directory", ["", "bad\0path", "~someone/docs", "$HOME/docs"])
 def test_invalid_additional_directory_fails_closed(directory: str) -> None:
     result = _analyze({"additionalDirectories": [directory]})

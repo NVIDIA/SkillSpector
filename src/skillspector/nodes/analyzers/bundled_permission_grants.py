@@ -1094,6 +1094,71 @@ def _contains_windows_environment_variable(value: str) -> bool:
     return False
 
 
+def _has_ascii_drive_prefix(value: str) -> bool:
+    return (
+        len(value) >= 2 and ("A" <= value[0] <= "Z" or "a" <= value[0] <= "z") and value[1] == ":"
+    )
+
+
+def _normalize_unc_parts(value: str, *, minimum_components: int) -> tuple[str, ...] | None:
+    trimmed = value.rstrip("/")
+    if not trimmed or value.startswith("/") or "//" in trimmed:
+        return None
+    raw_parts = tuple(trimmed.split("/"))
+    if len(raw_parts) < minimum_components:
+        return None
+    anchor_size = min(2, len(raw_parts))
+    if any(part in {".", ".."} for part in raw_parts[:anchor_size]):
+        return None
+    if len(raw_parts) == 1:
+        return raw_parts
+    normalized_tail = _collapse_lexical_parts("/".join(raw_parts[2:]), clamp_root=True)
+    return (*raw_parts[:2], *normalized_tail)
+
+
+def _platform_dependent_directory(
+    identity: str, *, source_line: int
+) -> tuple[PermissionGrant | None, tuple[PermissionDiagnostic, ...], bool]:
+    return (
+        None,
+        (_diagnostic("platform_dependent_path", True, source_line, identity=identity),),
+        False,
+    )
+
+
+def _conditional_windows_directory(
+    identity: str,
+    parts: tuple[str, ...],
+    *,
+    whole_root: bool,
+    source_kind: str,
+    source_line: int,
+) -> tuple[PermissionGrant | None, tuple[PermissionDiagnostic, ...], bool]:
+    if whole_root:
+        grant_kind, severity = "root_or_home_additional_directory", "CRITICAL"
+    elif _sensitive_path(parts):
+        grant_kind, severity = "sensitive_additional_directory", "HIGH"
+    else:
+        grant_kind, severity = "external_additional_directory", "MEDIUM"
+    grant = _grant(
+        grant_kind,
+        severity,
+        source_kind,
+        source_line,
+        identity=f"additional:{identity}",
+    )
+    return (
+        grant,
+        (
+            _diagnostic("platform_dependent_path", True, source_line, identity=identity),
+            _diagnostic(
+                "directory_existence_static_unknown", False, source_line, identity=identity
+            ),
+        ),
+        True,
+    )
+
+
 def _classify_additional_directory(
     value: str,
     *,
@@ -1113,7 +1178,52 @@ def _classify_additional_directory(
             False,
         )
 
-    is_drive = len(value) >= 2 and value[0].isalpha() and value[1] == ":"
+    normalized_windows = value.replace("\\", "/")
+    if normalized_windows == "/??" or normalized_windows.startswith("/??/"):
+        return _platform_dependent_directory(value, source_line=source_line)
+
+    if normalized_windows == "//?" or normalized_windows.startswith("//?/"):
+        if normalized_windows == "//?":
+            return _platform_dependent_directory(value, source_line=source_line)
+        extended = normalized_windows[4:]
+        if _has_ascii_drive_prefix(extended):
+            remainder = extended[2:]
+            if not remainder.startswith("/"):
+                return _platform_dependent_directory(value, source_line=source_line)
+            extended_drive_parts = _collapse_lexical_parts(remainder, clamp_root=True)
+            identity = f"drive:{extended[0].upper()}:/{'/'.join(extended_drive_parts)}"
+            return _conditional_windows_directory(
+                identity,
+                extended_drive_parts,
+                whole_root=not extended_drive_parts,
+                source_kind=source_kind,
+                source_line=source_line,
+            )
+        if extended.startswith("UNC/"):
+            extended_unc_parts = _normalize_unc_parts(extended[4:], minimum_components=2)
+            if extended_unc_parts is not None:
+                identity = f"unc:/{'/'.join(extended_unc_parts)}"
+                return _conditional_windows_directory(
+                    identity,
+                    extended_unc_parts,
+                    whole_root=False,
+                    source_kind=source_kind,
+                    source_line=source_line,
+                )
+        return _platform_dependent_directory(value, source_line=source_line)
+
+    if normalized_windows == "//." or normalized_windows == "//./":
+        return _conditional_windows_directory(
+            "drive-current:/",
+            (),
+            whole_root=True,
+            source_kind=source_kind,
+            source_line=source_line,
+        )
+    if normalized_windows.startswith("//./"):
+        return _platform_dependent_directory(value, source_line=source_line)
+
+    is_drive = _has_ascii_drive_prefix(value)
     is_backslash_root = all(character == "\\" for character in value)
     is_unc = (value.startswith("\\\\") or value.startswith("//")) and not all(
         character == "/" for character in value
@@ -1122,77 +1232,41 @@ def _classify_additional_directory(
         if is_drive:
             remainder = value[2:]
             if not remainder.startswith(("/", "\\")):
-                return (
-                    None,
-                    (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
-                    False,
-                )
+                return _platform_dependent_directory(value, source_line=source_line)
             normalized_remainder = remainder.replace("\\", "/")
-            parts = _collapse_lexical_parts(normalized_remainder, clamp_root=True)
-            identity = f"drive:{value[0].upper()}:/{'/'.join(parts)}"
-            if not parts:
-                grant_kind, severity = "root_or_home_additional_directory", "CRITICAL"
-            elif _sensitive_path(parts):
-                grant_kind, severity = "sensitive_additional_directory", "HIGH"
-            else:
-                grant_kind, severity = "external_additional_directory", "MEDIUM"
+            drive_parts = _collapse_lexical_parts(normalized_remainder, clamp_root=True)
+            identity = f"drive:{value[0].upper()}:/{'/'.join(drive_parts)}"
+            return _conditional_windows_directory(
+                identity,
+                drive_parts,
+                whole_root=not drive_parts,
+                source_kind=source_kind,
+                source_line=source_line,
+            )
         elif is_backslash_root:
-            identity = "drive-current:/"
-            grant_kind, severity = "root_or_home_additional_directory", "CRITICAL"
+            return _conditional_windows_directory(
+                "drive-current:/",
+                (),
+                whole_root=True,
+                source_kind=source_kind,
+                source_line=source_line,
+            )
         else:
             normalized_remainder = value[2:].replace("\\", "/")
-            trimmed_remainder = normalized_remainder.rstrip("/")
-            if (
-                not trimmed_remainder
-                or normalized_remainder.startswith("/")
-                or "//" in trimmed_remainder
-            ):
-                return (
-                    None,
-                    (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
-                    False,
-                )
-            raw_parts = tuple(trimmed_remainder.split("/"))
-            anchor_size = min(2, len(raw_parts))
-            if any(part in {".", ".."} for part in raw_parts[:anchor_size]):
-                return (
-                    None,
-                    (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
-                    False,
-                )
-            if len(raw_parts) == 1:
-                parts = raw_parts
-            else:
-                normalized_tail = _collapse_lexical_parts("/".join(raw_parts[2:]), clamp_root=True)
-                parts = (*raw_parts[:2], *normalized_tail)
-            identity = f"unc:/{'/'.join(parts)}"
-            grant_kind, severity = "external_additional_directory", "MEDIUM"
-            if _sensitive_path(parts):
-                grant_kind, severity = "sensitive_additional_directory", "HIGH"
-        grant = _grant(
-            grant_kind,
-            severity,
-            source_kind,
-            source_line,
-            identity=f"additional:{identity}",
-        )
-        return (
-            grant,
-            (
-                _diagnostic("platform_dependent_path", True, source_line, identity=identity),
-                _diagnostic(
-                    "directory_existence_static_unknown", False, source_line, identity=identity
-                ),
-            ),
-            True,
-        )
+            unc_parts = _normalize_unc_parts(normalized_remainder, minimum_components=1)
+            if unc_parts is None:
+                return _platform_dependent_directory(value, source_line=source_line)
+            identity = f"unc:/{'/'.join(unc_parts)}"
+            return _conditional_windows_directory(
+                identity,
+                unc_parts,
+                whole_root=False,
+                source_kind=source_kind,
+                source_line=source_line,
+            )
 
     if "\\" in value:
-        return (
-            None,
-            (_diagnostic("platform_dependent_path", True, source_line, identity=value),),
-            False,
-        )
+        return _platform_dependent_directory(value, source_line=source_line)
 
     posix_grant_kind: str | None
     posix_severity: str | None
