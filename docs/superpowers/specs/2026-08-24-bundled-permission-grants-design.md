@@ -517,8 +517,7 @@ BH3, and the applicable prompt-control diagnostic participates in the aggregate 
 | `default` | No finding | Ordinary approval behavior |
 | `manual` | No finding; legacy alias diagnostic | Treated as the default/manual approval posture |
 | `plan` | No finding | Read-oriented planning posture |
-| `delegate` | No finding; experimental coordination diagnostic | Coordination mode is not a permission grant |
-| any other value | Completeness-affecting diagnostic | Future/invalid mode is not guessed |
+| `delegate` or any other value | Completeness-affecting diagnostic | Not a valid 2.1.241 `permissions.defaultMode`; future/invalid modes are not guessed |
 
 The table classifies only the artifact declaration. CLI flags, managed settings, user settings,
 host-managed settings, account eligibility, UI opt-ins, and platform restrictions can override or
@@ -559,7 +558,7 @@ forms and precedence are applied.
 | CRITICAL | `bypassPermissions`; tool-wide Bash/PowerShell/Monitor; bare or filesystem-root/home-wide `Read` or `Edit`; bare tool-wide `Write`; filesystem-root/home `additionalDirectories` |
 | HIGH | Sensitive-path read/edit/additional directory; bare `NotebookEdit`; bare `MultiEdit`; broad external write; all-domain fetch; broad literal MCP-server capability; external upload/publish; Workflow; EnterWorktree |
 | MEDIUM | Scoped execution other than the silent prettier control; scoped network; scoped write/edit; bare `Glob`/`Grep`/`LSP`; exact/partial MCP tool; external additional directory; `acceptEdits`; Skill; ExitPlanMode |
-| Silent | Narrow in-project read; exact `Bash(npx prettier:*)`; restrictive ask/deny; default/manual/plan/dontAsk; project/local auto; delegate |
+| Silent | Narrow in-project read; exact `Bash(npx prettier:*)`; restrictive ask/deny; default/manual/plan/dontAsk; project/local auto |
 
 `blocking_critical` is `True` if and only if at least one effective CRITICAL grant remains after
 same-document mitigation. HIGH and MEDIUM BH3 findings do not set it. The boolean is independent of
@@ -665,7 +664,7 @@ tokens from closed enums. The fixed values are:
 - `runtime_status`: `external_unknown`
 
 Diagnostic kinds are also closed and contain no user value. The initial set is
-`auto_ignored`, `legacy_manual`, `delegate_non_grant`, `bypass_disabled`,
+`auto_ignored`, `legacy_manual`, `bypass_disabled`,
 `bypass_global_restriction`, `auto_disabled`,
 `skip_dangerous_prompt_ignored`, `local_skip_dangerous_prompt_declared`, `ignored_allow_rule_glob`,
 `ignored_path_qualifier`, `unsupported_allow_specifier`, `known_non_grant_tool`, `restrictive_rule`, `mitigated_allow`,

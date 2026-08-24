@@ -132,7 +132,7 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
 
   import pytest
 
-  from skillspector.inspection_ledger import LedgerOutcome
+  from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
   from skillspector.nodes.analyzers.bundled_permission_grants import (
       PermissionAnalysis,
       PermissionSourceLines,
@@ -165,12 +165,20 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
       assert build_bh3_finding(result, source_path=".claude/settings.json") is None
 
 
-  @pytest.mark.parametrize("mode", ["default", "manual", "plan", "dontAsk", "delegate", "auto"])
+  @pytest.mark.parametrize("mode", ["default", "manual", "plan", "dontAsk", "auto"])
   def test_non_grant_modes_are_silent(mode: str) -> None:
       result = _analyze({"defaultMode": mode})
       assert result.outcome is LedgerOutcome.COMPLETED
       assert result.grants == ()
       assert build_bh3_finding(result, source_path=".claude/settings.json") is None
+
+
+  def test_delegate_is_not_a_valid_pinned_default_mode() -> None:
+      result = _analyze({"defaultMode": "delegate"})
+      assert result.outcome is LedgerOutcome.FAILED
+      assert result.reason is LedgerReason.INVALID_CONFIGURATION
+      assert result.grants == ()
+      assert {item.diagnostic_kind for item in result.diagnostics} == {"unknown_mode"}
 
 
   def test_records_are_frozen() -> None:
@@ -256,8 +264,9 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   tuple index and fall back to `permissions_line`; unknown-key diagnostics use
   `permission_key_lines` in mapping iteration order. No raw value is retained with a line.
   Recognize the eight keys in the design. Implement mode outcomes exactly: bypass CRITICAL,
-  acceptEdits MEDIUM, auto known-ignored, default/manual/plan/dontAsk/delegate silent, and unknown
-  mode completeness-affecting. Populate shared/local activation and tracking classifications from
+  acceptEdits MEDIUM, auto known-ignored, default/manual/plan/dontAsk silent, and every other value,
+  including `delegate`, completeness-affecting. Populate shared/local activation and tracking
+  classifications from
   `source_kind`; reject any other source kind with `ValueError` because discovery owns source scope.
 
 - [ ] **Step 4: Add focused mode positives and mitigations**
@@ -869,7 +878,8 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
 - [ ] **Step 1: Add issue #399 Case B/C graph fixtures**
 
   Extend `_case_files` with permission-only Case B and mixed Case C. Parameterize direct directory
-  and ZIP input. Add a nested-ZIP case using the existing archive materializer. Assert:
+  and ZIP input. Add a small test-only nested-ZIP materializer—the existing helper covers direct
+  directories and ZIPs only—and use it for a genuine outer-ZIP containing inner-ZIP bytes. Assert:
 
   - Case B emits one BH3;
   - Case C emits BH1, BH2, and BH3;
@@ -1183,9 +1193,19 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
 
 - [ ] **Step 7: Attempt Docker and live-provider verification with explicit boundaries**
 
-  Run `make docker-smoke` only when `docker info` succeeds. Run live provider tests only when
-  their named credentials and supported models are available. Record daemon, credential, model,
-  authentication, cost, and UI blockers exactly; do not convert an unavailable check into a pass.
+  Run `make docker-smoke` only when `docker info` succeeds. The smoke script builds an image, writes
+  two reports, and performs a live GitHub fetch. Redirect its mounted report directory to an explicit
+  temporary directory and record GitHub reachability as an external dependency:
+
+  ```bash
+  BH3_DOCKER_REPORT_PARENT=$(mktemp -d)
+  SKILLSPECTOR_REPO_DIR="$BH3_DOCKER_REPORT_PARENT" make docker-smoke
+  ```
+
+  Preserve the reports until their JSON and expected components are checked, then remove only that
+  explicitly created directory. Run live provider tests only when their named credentials and
+  supported models are available. Record daemon, network, credential, model, authentication, cost,
+  and UI blockers exactly; do not convert an unavailable check into a pass.
 
 - [ ] **Step 8: Inspect the final Git and PR state**
 
