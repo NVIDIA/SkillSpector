@@ -38,7 +38,7 @@ from skillspector.graph import graph
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
-from skillspector.semantic_runtime import semantic_runtime_accounting
+from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
 
 if TYPE_CHECKING:
@@ -59,18 +59,11 @@ def _llm_runtime_accounting(*, enabled: bool, result: Mapping[str, object]) -> t
 
 
 def _llm_runtime_available(*, preflight_available: bool, result: Mapping[str, object]) -> bool:
-    """Apply the report contract for provider and meta-analysis availability."""
-    if not preflight_available:
-        return False
-    call_log = result.get("llm_call_log")
-    if not isinstance(call_log, list):
-        return True
-    meta_analyzer_records = [
-        record
-        for record in call_log
-        if isinstance(record, Mapping) and record.get("node") == "meta_analyzer"
-    ]
-    return all(bool(record.get("ok")) for record in meta_analyzer_records)
+    """Apply shared provider and meta-analysis runtime availability."""
+    return llm_runtime_available(
+        preflight_available=preflight_available,
+        result=result,
+    )
 
 
 def _is_local_target(target: str) -> bool:

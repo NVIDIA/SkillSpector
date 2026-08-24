@@ -545,6 +545,59 @@ async def test_empty_runtime_telemetry_aligns_mcp_and_embedded_json_caution(
     assert "runtime telemetry was incomplete" in payload["metadata"]["llm_error"]
 
 
+async def test_malformed_runtime_telemetry_preserves_failed_meta_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed siblings cannot erase valid failed meta-analysis evidence."""
+    llm_call_log: list[object] = [
+        {"node": "meta_analyzer", "ok": False, "error": "runtime failure"},
+        "malformed-record",
+    ]
+
+    async def render_mixed_telemetry(
+        state: dict[str, object], config: dict[str, object]
+    ) -> dict[str, object]:
+        del config
+        completeness = {
+            "is_complete": True,
+            "status": "complete",
+            "execution_successful": True,
+            "entirely_uninspected_files": 0,
+        }
+        return {
+            **report(
+                {
+                    **state,
+                    "filtered_findings": [],
+                    "component_metadata": [],
+                    "has_executable_scripts": False,
+                    "manifest": {"name": "mcp-test"},
+                    "llm_call_log": llm_call_log,  # type: ignore[typeddict-item]
+                    "analysis_completeness": completeness,
+                    "execution_successful": True,
+                }
+            ),
+            "llm_call_log": llm_call_log,
+            "analysis_completeness": completeness,
+        }
+
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda: (True, None),
+    )
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", render_mixed_telemetry)
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+    payload = json.loads(verdict["report"])
+
+    assert verdict["llm_available"] is False
+    assert payload["metadata"]["llm_available"] is False
+    assert verdict["recommendation"] == "CAUTION"
+    assert payload["risk_assessment"]["recommendation"] == "CAUTION"
+    assert verdict["safe_to_install"] is False
+
+
 async def test_failed_meta_analysis_aligns_mcp_and_embedded_json_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

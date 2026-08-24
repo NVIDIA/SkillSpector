@@ -62,7 +62,7 @@ from skillspector.sarif_models import (
     SarifTool,
     validate_sarif_report,
 )
-from skillspector.semantic_runtime import semantic_runtime_accounting
+from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 
@@ -1078,6 +1078,7 @@ def _build_metadata(
     transitive_truncation_reasons: Sequence[str] | None = None,
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
+    runtime_available: bool | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
@@ -1097,6 +1098,9 @@ def _build_metadata(
     # all (the no-findings path) - require at least one record, and that
     # record must have succeeded.
     meta_analyzer_succeeded = bool(meta_analyzer_records) and meta_analyzer_ok
+    effective_runtime_available = (
+        provider_available and meta_analyzer_ok if runtime_available is None else runtime_available
+    )
 
     # meta_analysis_applied / llm_available answer different questions.
     # llm_available is provider availability: the binary/credentials were
@@ -1122,9 +1126,7 @@ def _build_metadata(
         "llm_requested": use_llm,
         # llm_available reflects runtime truth: the binary/credentials were
         # available AND meta_analyzer's own call (if it ran) succeeded.
-        "llm_available": (
-            provider_available and meta_analyzer_ok and not unavailable_before_execution
-        ),
+        "llm_available": (effective_runtime_available and not unavailable_before_execution),
         "meta_analysis_applied": meta_analysis_applied,
         # A list (including an empty list) makes observability explicit. Empty
         # means the provider/transport supplied no counters; it is never an
@@ -1191,6 +1193,7 @@ def _format_json(
     structured_summaries: list[dict[str, object]] | None = None,
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
+    runtime_available: bool | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1234,6 +1237,7 @@ def _format_json(
             transitive_truncation_reasons,
             llm_execution_enabled,
             semantic_runtime_incomplete,
+            runtime_available,
         ),
         "execution_successful": execution_successful,
     }
@@ -1489,9 +1493,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
     llm_requested = state.get("llm_requested", use_llm)
     raw_llm_call_log = state.get("llm_call_log")
     llm_call_log: list[Mapping[str, object]] = (
-        list(raw_llm_call_log)
+        [record for record in raw_llm_call_log if isinstance(record, Mapping)]
         if isinstance(raw_llm_call_log, list)
-        and all(isinstance(record, Mapping) for record in raw_llm_call_log)
         else []
     )
     inference_usage = state.get("inference_usage") or []
@@ -1522,6 +1525,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
     )
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     provider_available, provider_error = is_llm_available()
+    runtime_available = llm_runtime_available(
+        preflight_available=provider_available,
+        result=state,
+    )
     has_recorded_failure = any(not r.get("ok") for r in llm_call_log)
     unavailable_before_execution = bool(llm_requested and not use_llm)
     provider_unavailable = bool(
@@ -1669,6 +1676,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             structured_summaries=structured_summaries,
             llm_execution_enabled=use_llm,
             semantic_runtime_incomplete=semantic_runtime_incomplete,
+            runtime_available=runtime_available,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(

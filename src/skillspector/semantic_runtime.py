@@ -48,6 +48,25 @@ def _has_effective_findings(result: Mapping[str, object]) -> bool:
     return isinstance(filtered_findings, list) and bool(filtered_findings)
 
 
+def llm_runtime_available(
+    *,
+    preflight_available: bool,
+    result: Mapping[str, object],
+) -> bool:
+    """Return provider availability after applying meta-analysis runtime evidence."""
+    if not preflight_available:
+        return False
+    call_log = result.get("llm_call_log")
+    if not isinstance(call_log, list):
+        return True
+    meta_analyzer_records = [
+        record
+        for record in call_log
+        if isinstance(record, Mapping) and record.get("node") == "meta_analyzer"
+    ]
+    return all(bool(record.get("ok")) for record in meta_analyzer_records)
+
+
 def semantic_runtime_accounting(
     *,
     enabled: bool,
