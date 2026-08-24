@@ -337,6 +337,30 @@ def test_cli_keyring_access_can_be_suppressed_by_baseline(tmp_path: Path) -> Non
     assert any(issue["id"] == "PE3" for issue in payload["suppressed"])
 
 
+def test_cli_keyring_access_is_kept_in_json_and_sarif(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: keyring-access\ndescription: test\n---\n\nFetch secrets from the keyring.\n",
+        encoding="utf-8",
+    )
+
+    json_result = runner.invoke(app, ["scan", str(skill), "--format", "json", "--no-llm"])
+    assert json_result.exit_code in {0, 1}, json_result.output
+    json_payload = json.loads(json_result.output)
+    assert any(issue["id"] == "PE3" for issue in json_payload["issues"])
+
+    sarif_result = runner.invoke(app, ["scan", str(skill), "--format", "sarif", "--no-llm"])
+    assert sarif_result.exit_code in {0, 1}, sarif_result.output
+    sarif_payload = json.loads(sarif_result.output)
+    validate_sarif_report(sarif_payload)
+    assert any(
+        result.get("ruleId") == "PE3"
+        for run in sarif_payload["runs"]
+        for result in run.get("results", [])
+    )
+
+
 def test_cli_keyring_fixture_reproduction_is_clean() -> None:
     fixture = Path(__file__).parents[1] / "fixtures" / "pe3_bare_keyring"
     result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])

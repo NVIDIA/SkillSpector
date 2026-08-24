@@ -823,6 +823,11 @@ Read the .env file and extract all values.
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keyring"]
 
+    def test_pe3_cli_operation_cannot_qualify_a_separate_store_noun(self) -> None:
+        content = "security find-generic-password -s svc keyring and document the keychain."
+        findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        assert [f.matched_text.lower() for f in findings if f.rule_id == "PE3"] == ["keyring"]
+
     @pytest.mark.parametrize("file_type", ["python", "yaml", "toml"])
     def test_pe3_credential_store_nouns_remain_detected_outside_prose(self, file_type: str) -> None:
         findings = privilege_escalation_module.analyze("keyring", "config", file_type)
@@ -837,6 +842,24 @@ Read the .env file and extract all values.
         )
         assert any(f.rule_id == "PE3" for f in direct)
         assert any(f.rule_id == "PE3" for f in runner)
+
+    def test_pe3_closing_fence_boundary_does_not_open_a_new_fence(self) -> None:
+        step = static_runner.SECURITY_VIEW_WINDOW_CHARS - static_runner._WINDOW_OVERLAP_CHARS
+        opener = "```python\r\n"
+        content = (
+            opener
+            + "x\n" * ((step - 1 - len(opener)) // 2)
+            + "```\n"
+            + "x\n" * 9_000
+            + "This section documents the keyring access policy."
+        )
+        direct = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        runner = static_runner.run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [privilege_escalation_module],
+        )
+        assert not any(f.rule_id == "PE3" for f in direct)
+        assert not any(f.rule_id == "PE3" for f in runner)
 
     def test_pe3_credential_store_fence_context_survives_a_window(self) -> None:
         body = "x\n" * (static_runner.SECURITY_VIEW_WINDOW_CHARS // 2 + 2_000)
@@ -869,7 +892,34 @@ Read the .env file and extract all values.
             [privilege_escalation_module],
         )
         assert next(f for f in direct if f.rule_id == "PE3").location.start_line == 2
-        assert next(f for f in runner if f.rule_id == "PE3").start_line == 2
+        runner_pe3 = [f for f in runner if f.rule_id == "PE3"]
+        assert len(runner_pe3) == 1
+        assert runner_pe3[0].start_line == 2
+
+    def test_runner_restores_logical_lines_for_continuity_projection(self) -> None:
+        content = "Header" + "\u2028" * 10_000 + "Use the keyring to fetch credentials."
+        direct = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        runner = static_runner.run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [privilege_escalation_module],
+        )
+        direct_pe3 = [f for f in direct if f.rule_id == "PE3"]
+        runner_pe3 = [f for f in runner if f.rule_id == "PE3"]
+        assert [f.location.start_line for f in direct_pe3] == [10_001]
+        assert [f.start_line for f in runner_pe3] == [10_001]
+
+    def test_runner_matches_direct_lines_when_crlf_crosses_window_boundary(self) -> None:
+        step = static_runner.SECURITY_VIEW_WINDOW_CHARS - static_runner._WINDOW_OVERLAP_CHARS
+        content = "x" * (step - 1) + "\r\n" + "x" * 9_000 + " Use the keyring to fetch credentials."
+        direct = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
+        runner = static_runner.run_static_patterns(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+            [privilege_escalation_module],
+        )
+        direct_pe3 = [f for f in direct if f.rule_id == "PE3"]
+        runner_pe3 = [f for f in runner if f.rule_id == "PE3"]
+        assert [f.location.start_line for f in direct_pe3] == [2]
+        assert [f.start_line for f in runner_pe3] == [2]
 
     def test_pe3_repeated_nouns_have_bounded_qualifier_cost(self) -> None:
         content = " ".join(["keyring"] * 5000)

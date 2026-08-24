@@ -274,8 +274,20 @@ _PE3_CREDENTIAL_STORE_CALL = re.compile(
     re.IGNORECASE,
 )
 _PE3_CREDENTIAL_STORE_CLI = re.compile(
-    r"\b(?:security\s+)?find-generic-password\b[^.;:\n]*$", re.IGNORECASE
+    r"\b(?:security\s+)?find-generic-password\b(?P<args>[^.;:\n]*)$", re.IGNORECASE
 )
+
+
+def _cli_targets_credential_store_noun(before_noun: str) -> bool:
+    """Accept CLI evidence only when it has not already named another store noun."""
+    cli = _PE3_CREDENTIAL_STORE_CLI.search(before_noun)
+    if cli is None:
+        return False
+    args = cli.group("args")
+    return not any(
+        re.search(rf"\b{re.escape(word)}\b", args, re.IGNORECASE)
+        for word in _PE3_CREDENTIAL_STORE_WORDS
+    )
 
 
 def _markdown_fence_ranges(content: str) -> list[tuple[int, int]]:
@@ -340,7 +352,7 @@ def _is_bare_credential_store_noun(
     after_noun = clause[noun_end:]
     operation = _PE3_CREDENTIAL_STORE_OPERATION.search(before_noun)
     call = _PE3_CREDENTIAL_STORE_CALL.match(after_noun)
-    cli = _PE3_CREDENTIAL_STORE_CLI.search(before_noun)
+    cli = _cli_targets_credential_store_noun(before_noun)
     if not (operation or call or cli):
         return True
     # Any operation tied to this exact noun, including a read, dominates benign prose.
