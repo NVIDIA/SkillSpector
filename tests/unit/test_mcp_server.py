@@ -16,6 +16,7 @@
 """Tests for the MCP server wrapper (run_scan core + scan_skill tool)."""
 
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -26,7 +27,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skillspector import mcp_server
-from skillspector.mcp_server import run_scan
+from skillspector.graph import graph as workflow_graph
+from skillspector.mcp_server import _llm_runtime_accounting, run_scan
 from skillspector.models import Finding
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.report import report
@@ -88,6 +90,262 @@ def _complete_zero_risk_graph_result() -> dict[str, object]:
         },
         "report_body": "{}",
     }
+
+
+def test_empty_llm_telemetry_is_not_a_complete_requested_pass() -> None:
+    """Empty telemetry cannot prove that a requested semantic pass ran."""
+    assert _llm_runtime_accounting(enabled=True, result={"llm_call_log": []}) == (False, False)
+
+
+def test_all_not_applicable_semantic_statuses_are_complete_without_llm_use() -> None:
+    """A real no-work pass is complete only when every semantic node says so."""
+    result = {
+        "llm_call_log": [],
+        "analyzer_status_events": [
+            {"analyzer_id": "semantic_security_discovery", "status": "not_applicable"},
+            {"analyzer_id": "semantic_developer_intent", "status": "not_applicable"},
+            {"analyzer_id": "semantic_quality_policy", "status": "not_applicable"},
+        ],
+    }
+
+    assert _llm_runtime_accounting(enabled=True, result=result) == (False, True)
+
+
+def test_effective_findings_require_successful_meta_analyzer_telemetry() -> None:
+    """Meta-analysis is required when effective findings gave it work to do."""
+    result = {
+        "effective_finding_ids": ["finding-1"],
+        "analyzer_status_events": [
+            {"analyzer_id": "semantic_security_discovery", "status": "completed"},
+            {"analyzer_id": "semantic_developer_intent", "status": "completed"},
+            {"analyzer_id": "semantic_quality_policy", "status": "completed"},
+        ],
+        "llm_call_log": [
+            {"node": "semantic_security_discovery", "ok": True, "error": None},
+            {"node": "semantic_developer_intent", "ok": True, "error": None},
+            {"node": "semantic_quality_policy", "ok": True, "error": None},
+        ],
+    }
+
+    assert _llm_runtime_accounting(enabled=True, result=result) == (True, False)
+
+
+def test_completed_semantic_analyzer_requires_its_own_successful_telemetry() -> None:
+    """A completed semantic status cannot stand in for its missing call record."""
+    result = {
+        "effective_finding_ids": ["finding-1"],
+        "analyzer_status_events": [
+            {"analyzer_id": "semantic_security_discovery", "status": "completed"},
+            {"analyzer_id": "semantic_developer_intent", "status": "completed"},
+            {"analyzer_id": "semantic_quality_policy", "status": "completed"},
+        ],
+        "llm_call_log": [
+            {"node": "semantic_security_discovery", "ok": True, "error": None},
+            {"node": "semantic_quality_policy", "ok": True, "error": None},
+            {"node": "meta_analyzer", "ok": True, "error": None},
+        ],
+    }
+
+    assert _llm_runtime_accounting(enabled=True, result=result) == (True, False)
+
+
+def _fully_accounted_semantic_result() -> dict[str, object]:
+    """Return hand-authored complete semantic telemetry for validation tests."""
+    return {
+        "effective_finding_ids": ["finding-1"],
+        "analyzer_status_events": [
+            {"analyzer_id": "semantic_security_discovery", "status": "completed"},
+            {"analyzer_id": "semantic_developer_intent", "status": "completed"},
+            {"analyzer_id": "semantic_quality_policy", "status": "completed"},
+        ],
+        "llm_call_log": [
+            {"node": "semantic_security_discovery", "ok": True, "error": None},
+            {"node": "semantic_developer_intent", "ok": True, "error": None},
+            {"node": "semantic_quality_policy", "ok": True, "error": None},
+            {"node": "meta_analyzer", "ok": True, "error": None},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "malformed_status",
+    [
+        {"analyzer_id": [], "status": "completed"},
+        {"analyzer_id": {}, "status": "completed"},
+        {"status": "completed"},
+        {"analyzer_id": "semantic_security_discovery"},
+        {"analyzer_id": "semantic_security_discovery", "status": None},
+        {"analyzer_id": "semantic_security_discovery", "status": []},
+        [],
+    ],
+    ids=[
+        "list-analyzer-id",
+        "mapping-analyzer-id",
+        "missing-analyzer-id",
+        "missing-status",
+        "none-status",
+        "list-status",
+        "non-mapping-event",
+    ],
+)
+def test_malformed_analyzer_status_event_is_incomplete_without_crashing(
+    malformed_status: object,
+) -> None:
+    """Malformed global or semantic status evidence cannot be silently discarded."""
+    result = _fully_accounted_semantic_result()
+    result["analyzer_status_events"].append(malformed_status)  # type: ignore[index]
+
+    assert _llm_runtime_accounting(enabled=True, result=result) == (True, False)
+
+
+def test_duplicate_semantic_status_evidence_is_incomplete() -> None:
+    """Each semantic analyzer must produce exactly one terminal status."""
+    result = _fully_accounted_semantic_result()
+    result["analyzer_status_events"].append(  # type: ignore[index]
+        {"analyzer_id": "semantic_security_discovery", "status": "completed"}
+    )
+
+    assert _llm_runtime_accounting(enabled=True, result=result) == (True, False)
+
+
+def test_not_applicable_status_cannot_have_successful_semantic_telemetry() -> None:
+    """A no-work terminal status conflicts with a successful call for that node."""
+    result = _fully_accounted_semantic_result()
+    result["analyzer_status_events"][0]["status"] = "not_applicable"  # type: ignore[index]
+
+    assert _llm_runtime_accounting(enabled=True, result=result) == (True, False)
+
+
+async def test_all_not_applicable_semantic_pass_remains_install_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit no-work statuses are complete without claiming an LLM call."""
+    graph_result = _complete_zero_risk_graph_result()
+    graph_result["llm_call_log"] = []
+    graph_result["analyzer_status_events"] = [
+        {"analyzer_id": "semantic_security_discovery", "status": "not_applicable"},
+        {"analyzer_id": "semantic_developer_intent", "status": "not_applicable"},
+        {"analyzer_id": "semantic_quality_policy", "status": "not_applicable"},
+    ]
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=graph_result))
+
+    verdict = await run_scan("fixture", use_llm=True, output_format="json")
+
+    assert verdict["llm_used"] is False
+    assert verdict["scan_mode"] == "static-only"
+    assert verdict["safe_to_install"] is True
+    assert verdict["recommendation"] == "SAFE"
+
+
+def test_static_only_graph_keeps_semantic_nodes_without_constructing_a_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Static graph execution skips semantic model construction but keeps nodes wired."""
+    capability_probes = 0
+
+    class _CapabilityProvider:
+        DEFAULT_MODEL = "test-model"
+        SLOT_DEFAULTS = {"meta_analyzer": "test-model"}
+
+        def get_context_length(self, model: str) -> int | None:
+            return 4096 if model == "test-model" else None
+
+        def get_max_output_tokens(self, model: str) -> int | None:
+            return 128 if model == "test-model" else None
+
+        def resolve_model(self, slot: str = "default") -> str:
+            del slot
+            return "test-model"
+
+        def resolve_credentials(self) -> tuple[str, str | None] | None:
+            return None
+
+        def create_chat_model(
+            self,
+            model: str,
+            *,
+            max_tokens: int,
+            timeout: float | None = 120,
+        ) -> object:
+            nonlocal capability_probes
+            del model, max_tokens, timeout
+            capability_probes += 1
+            return object()
+
+    semantic_model_factory = MagicMock(
+        side_effect=AssertionError("static-only semantic nodes must not construct a chat model")
+    )
+    monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", semantic_model_factory)
+    token = use_provider(_CapabilityProvider())
+    _write_skill(tmp_path)
+    try:
+        result = workflow_graph.invoke(
+            {"skill_path": str(tmp_path), "use_llm": False, "output_format": "json"}
+        )
+    finally:
+        reset_provider(token)
+
+    assert capability_probes > 0
+    semantic_model_factory.assert_not_called()
+    assert json.loads(result["report_body"])["metadata"]["llm_available"] is True
+    semantic_statuses = {
+        status["analyzer_id"]: status["status"]
+        for status in result["analyzer_status_events"]
+        if status["analyzer_id"].startswith("semantic_")  # type: ignore[index]
+    }
+    assert semantic_statuses == {
+        "semantic_security_discovery": "disabled",
+        "semantic_developer_intent": "disabled",
+        "semantic_quality_policy": "disabled",
+    }
+
+
+async def test_late_provider_binding_cannot_claim_a_complete_semantic_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graph built without credentials keeps semantic nodes for a later provider."""
+    _write_skill(tmp_path)
+    graph_module = importlib.import_module("skillspector.graph")
+    monkeypatch.setattr(
+        graph_module,
+        "is_llm_available",
+        lambda: (False, "not configured"),
+        raising=False,
+    )
+    late_bound_graph = graph_module.create_graph()
+
+    def transport_failure(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("simulated late-bound provider failure")
+
+    captured: dict[str, object] = {}
+
+    async def invoke_real_graph(
+        state: dict[str, object], config: dict[str, object]
+    ) -> dict[str, object]:
+        captured["result"] = await late_bound_graph.ainvoke(state, config=config)
+        return captured["result"]  # type: ignore[return-value]
+
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", transport_failure)
+    monkeypatch.setattr(mcp_server, "graph", SimpleNamespace(ainvoke=invoke_real_graph))
+
+    verdict = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+    graph_result = captured["result"]
+
+    statuses = {
+        status["analyzer_id"]: status["status"]
+        for status in graph_result["analyzer_status_events"]  # type: ignore[index]
+        if status["analyzer_id"].startswith("semantic_")  # type: ignore[index]
+    }
+    assert statuses == {
+        "semantic_security_discovery": "unavailable",
+        "semantic_developer_intent": "unavailable",
+        "semantic_quality_policy": "unavailable",
+    }
+    assert verdict["scan_mode"] == "static-only"
+    assert verdict["safe_to_install"] is False
+    assert verdict["recommendation"] != "SAFE"
 
 
 async def test_requested_unavailable_llm_blocks_safe_to_install(
@@ -193,9 +451,17 @@ async def test_successful_runtime_llm_calls_keep_complete_scan_install_eligible(
 ) -> None:
     """A complete low-risk pass remains eligible for an install-safe verdict."""
     graph_result = _complete_zero_risk_graph_result()
+    graph_result["effective_finding_ids"] = ["finding-1"]
+    graph_result["analyzer_status_events"] = [
+        {"analyzer_id": "semantic_security_discovery", "status": "completed"},
+        {"analyzer_id": "semantic_developer_intent", "status": "completed"},
+        {"analyzer_id": "semantic_quality_policy", "status": "completed"},
+    ]
     graph_result["llm_call_log"] = [
         {"node": "semantic_security_discovery", "ok": True, "error": None},
+        {"node": "semantic_developer_intent", "ok": True, "error": None},
         {"node": "semantic_quality_policy", "ok": True, "error": None},
+        {"node": "meta_analyzer", "ok": True, "error": None},
     ]
     monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
     monkeypatch.setattr(
@@ -380,10 +646,10 @@ async def test_run_scan_openai_fallback_builds_matching_graph_model_config(
     assert captured["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
-async def test_run_scan_uses_bound_provider_without_credentials(
+async def test_run_scan_reports_missing_telemetry_for_bound_provider_without_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An injected provider can own the LLM client without exposing raw credentials."""
+    """A bound provider alone cannot make an empty semantic pass look used."""
 
     class _InjectedProvider:
         DEFAULT_MODEL = "injected-default"
@@ -433,8 +699,9 @@ async def test_run_scan_uses_bound_provider_without_credentials(
 
     assert result["llm_available"] is True
     assert result["llm_requested"] is True
-    assert result["llm_used"] is True
-    assert result["scan_mode"] == "static+llm"
+    assert result["llm_used"] is False
+    assert result["scan_mode"] == "static-only"
+    assert result["safe_to_install"] is False
 
 
 async def test_run_scan_disables_llm_for_unavailable_bound_provider(

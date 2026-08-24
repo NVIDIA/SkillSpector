@@ -37,6 +37,7 @@ from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
+from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.suppression import effective_findings
 
 if TYPE_CHECKING:
@@ -46,23 +47,96 @@ logger = get_logger(__name__)
 
 VALID_FORMATS = ("json", "markdown", "sarif", "terminal")
 
+_SEMANTIC_ANALYZER_IDS = frozenset(
+    analyzer_id
+    for analyzer_id, module in ANALYZER_MODULES.items()
+    if getattr(module, "requires_api_key", False)
+)
+
+
+def _successful_llm_record(record: object) -> bool:
+    """Return whether ``record`` is a well-formed successful LLM call."""
+    return (
+        isinstance(record, Mapping)
+        and isinstance(record.get("node"), str)
+        and bool(record.get("node"))
+        and record.get("ok") is True
+        and record.get("error") is None
+    )
+
+
+def _has_effective_findings(result: Mapping[str, object]) -> bool:
+    """Return whether meta-analysis had effective findings to process."""
+    effective_ids = result.get("effective_finding_ids")
+    if isinstance(effective_ids, list):
+        return bool(effective_ids)
+    filtered_findings = result.get("filtered_findings")
+    return isinstance(filtered_findings, list) and bool(filtered_findings)
+
 
 def _llm_runtime_accounting(*, enabled: bool, result: Mapping[str, object]) -> tuple[bool, bool]:
     """Return ``(used, complete)`` for an enabled LLM pass.
 
-    Missing or empty telemetry means no call was applicable, matching the graph
-    report's existing no-attempt semantics. For a non-empty log, at least one
-    successful call proves use, while every record must be well formed and
-    successful for the requested pass to be complete.
+    A requested pass is complete only when every credential-gated semantic
+    analyzer explicitly reports either ``completed`` with successful telemetry
+    or ``not_applicable``. Empty telemetry never proves use. Meta-analysis
+    additionally needs a successful record when effective findings exist.
     """
     if not enabled:
         return False, False
-    call_log = result.get("llm_call_log")
-    if not isinstance(call_log, list) or not call_log:
-        return True, True
-    records = [record for record in call_log if isinstance(record, Mapping)]
-    used = any(record.get("ok") is True for record in records)
-    complete = len(records) == len(call_log) and all(record.get("ok") is True for record in records)
+    raw_call_log = result.get("llm_call_log", [])
+    if not isinstance(raw_call_log, list):
+        return False, False
+    used = any(_successful_llm_record(record) for record in raw_call_log)
+    if not all(_successful_llm_record(record) for record in raw_call_log):
+        return used, False
+
+    raw_statuses = result.get("analyzer_status_events")
+    if not isinstance(raw_statuses, list):
+        return used, False
+    statuses_by_analyzer: dict[str, list[str]] = {}
+    for status in raw_statuses:
+        if not isinstance(status, Mapping):
+            return used, False
+        analyzer_id = status.get("analyzer_id")
+        analyzer_status = status.get("status")
+        if (
+            not isinstance(analyzer_id, str)
+            or not analyzer_id
+            or not isinstance(analyzer_status, str)
+            or not analyzer_status
+        ):
+            return used, False
+        if analyzer_id in _SEMANTIC_ANALYZER_IDS:
+            statuses_by_analyzer.setdefault(analyzer_id, []).append(analyzer_status)
+
+    for analyzer_id in _SEMANTIC_ANALYZER_IDS:
+        statuses = statuses_by_analyzer.get(analyzer_id)
+        if statuses is None or len(statuses) != 1:
+            return used, False
+        status = statuses[0]
+        if status == "completed":
+            if not any(
+                _successful_llm_record(record) and record.get("node") == analyzer_id
+                for record in raw_call_log
+            ):
+                return used, False
+        elif status == "not_applicable":
+            if any(
+                _successful_llm_record(record) and record.get("node") == analyzer_id
+                for record in raw_call_log
+            ):
+                return used, False
+        else:
+            return used, False
+
+    if _has_effective_findings(result) and not any(
+        _successful_llm_record(record) and record.get("node") == "meta_analyzer"
+        for record in raw_call_log
+    ):
+        return used, False
+
+    complete = True
     return used, complete
 
 
