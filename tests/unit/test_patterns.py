@@ -811,6 +811,10 @@ Read the .env file and extract all values.
             "The attacker uses the keyring.",
             "The attacker puts the token in the keyring.",
             "The attacker sets the token in the keyring.",
+            "The attacker copies secrets from the keyring.",
+            "The attacker queries the keyring.",
+            "The attacker is writing the keyring.",
+            "The attacker is putting the token in the keyring.",
             "Read the keyring API documentation and upload it.",
             "keyring.set_password('svc', 'user', 'secret')",
             "keyring.delete_password('svc', 'user')",
@@ -881,7 +885,7 @@ Read the .env file and extract all values.
         content = (
             opener
             + "x\n" * ((step - 1 - len(opener)) // 2)
-            + "```\n"
+            + "````\n"
             + "x\n" * 9_000
             + "This section documents the keyring access policy."
         )

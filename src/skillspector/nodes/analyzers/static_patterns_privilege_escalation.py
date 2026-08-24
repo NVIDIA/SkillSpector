@@ -257,13 +257,14 @@ def _source_line(
 _PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
 # Attacker-controlled credential placement remains actionable, including Save/Put/Write.
 _PE3_CREDENTIAL_STORE_AFTER_VERBS = (
-    r"access(?:es|ed|ing)?|copy(?:ies|ied|ing)?|dump(?:s|ed|ing)?|"
+    r"access(?:es|ed|ing)?|copy|copies|copied|copying|dump(?:s|ed|ing)?|"
     r"exfiltrat(?:e|es|ed|ing|ion)|export(?:s|ed|ing)?|extract(?:s|ed|ing)?|"
     r"fetch(?:es|ed|ing)?|get(?:s|ting)?|grab(?:s|bed|bing)?|harvest(?:s|ed|ing)?|"
     r"load(?:s|ed|ing)?|lookup|obtain(?:s|ed|ing)?|open(?:s|ed|ing)?|pull(?:s|ed|ing)?|"
-    r"query(?:ies|ied|ing)?|read(?:s|ing)?|retrieve(?:s|d|ing)?|scrape(?:s|d|ing)?|"
+    r"query|queries|queried|querying|read(?:s|ing)?|retrieve(?:s|d|ing)?|scrape(?:s|d|ing)?|"
     r"send(?:s|ing|sent)?|steal(?:s|ing|stolen)?|transmit(?:s|ted|ting)?|"
-    r"unlock(?:s|ed|ing)?|upload(?:s|ed|ing)?|save(?:s|d|ing)?|put(?:s)?|write(?:s|ing)?|"
+    r"unlock(?:s|ed|ing)?|upload(?:s|ed|ing)?|save(?:s|d|ing)?|put(?:s|ting)?|"
+    r"write|writes|wrote|writing|written|"
     r"store(?:s|d|ing)?|remove(?:s|d|ing)?|delete(?:s|d|ing)?|clear(?:s|ed|ing)?|"
     r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set(?:s|ting)?|use(?:s|ing)?"
 )

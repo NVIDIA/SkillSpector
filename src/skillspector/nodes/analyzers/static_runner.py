@@ -111,9 +111,9 @@ def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[
 
 def _markdown_fence_states(
     content: str, offsets: tuple[int, ...]
-) -> tuple[dict[int, tuple[str, int] | None], dict[int, tuple[str, int, str, int]]]:
+) -> tuple[dict[int, tuple[str, int] | None], dict[int, tuple[str, int, str, int, int]]]:
     states: dict[int, tuple[str, int] | None] = {}
-    transitions: dict[int, tuple[str, int, str, int]] = {}
+    transitions: dict[int, tuple[str, int, str, int, int]] = {}
     active: tuple[str, int] | None = None
     offset_index = 0
     content_offset = 0
@@ -129,7 +129,7 @@ def _markdown_fence_states(
             if offset > content_offset:
                 if active is None and opening is not None:
                     marker = opening.group(1)
-                    transitions[offset] = (marker[0], len(marker), "open", line_end)
+                    transitions[offset] = (marker[0], len(marker), "open", line_end, content_offset)
                 elif (
                     active is not None
                     and closing is not None
@@ -137,7 +137,13 @@ def _markdown_fence_states(
                     and len(closing.group(1)) >= active[1]
                 ):
                     marker = closing.group(1)
-                    transitions[offset] = (marker[0], len(marker), "close", line_end)
+                    transitions[offset] = (
+                        marker[0],
+                        len(marker),
+                        "close",
+                        line_end,
+                        content_offset,
+                    )
             offset_index += 1
         if not complete:
             break
@@ -908,7 +914,8 @@ def _scan_all_views_detailed(
             fence = fence_states.get(start)
             transition = fence_transitions.get(start)
             if transition is not None and transition[2] == "close" and transition[3] <= end:
-                context_prefix = ""
+                closing_prefix = content[transition[4] : start]
+                context_prefix = transition[0] * transition[1] + "\n" + closing_prefix
             elif fence is not None:
                 context_prefix = fence[0] * fence[1] + "\n"
             elif transition is not None and transition[3] <= end:
