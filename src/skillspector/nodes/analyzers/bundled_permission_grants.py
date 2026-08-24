@@ -104,7 +104,8 @@ def _canonical_bytes(value: Mapping[str, object]) -> bytes:
 
 
 def _identity_digest(domain: str, value: str) -> str:
-    return _digest(f"identity.{domain}", value.encode())
+    canonical_json_string = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    return _digest(f"identity.{domain}", canonical_json_string.encode("ascii"))
 
 
 def _safe_line(candidate: object, fallback: int) -> int:

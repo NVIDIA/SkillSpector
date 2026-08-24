@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import FrozenInstanceError
 
@@ -147,6 +148,65 @@ def test_unknown_mode_is_incomplete_and_fails_without_valid_sibling(mode: str) -
         ("unknown_mode", True)
     ]
     assert mode not in repr(result)
+
+
+@pytest.mark.parametrize("surrogate_escape", (r"\ud800", r"\udc00"))
+@pytest.mark.parametrize(
+    ("path", "document_template", "diagnostic_kind"),
+    [
+        (
+            "unknown_key",
+            r'{"permissions":{"CANARY-prefix-%s-suffix":null}}',
+            "unknown_permission_key",
+        ),
+        (
+            "unknown_mode",
+            r'{"permissions":{"defaultMode":"CANARY-prefix-%s-suffix"}}',
+            "unknown_mode",
+        ),
+        (
+            "deferred_rule",
+            r'{"permissions":{"allow":["CANARY-prefix-%s-suffix"]}}',
+            "unknown_rule",
+        ),
+    ],
+)
+def test_json_loaded_unpaired_surrogates_fail_closed_without_leaking(
+    surrogate_escape: str,
+    path: str,
+    document_template: str,
+    diagnostic_kind: str,
+) -> None:
+    raw = json.loads(document_template % surrogate_escape)
+    permissions = raw["permissions"]
+    assert isinstance(permissions, dict)
+    if path == "unknown_key":
+        canary = next(iter(permissions))
+    elif path == "unknown_mode":
+        canary = permissions["defaultMode"]
+    else:
+        canary = permissions["allow"][0]
+    assert isinstance(canary, str)
+
+    try:
+        result = analyze_permission_grants(
+            raw,
+            source_kind="project_settings",
+            content_digest="sha256:" + "1" * 64,
+            source_identity_digest="sha256:" + "2" * 64,
+            source_lines=PermissionSourceLines(),
+        )
+    except Exception as exc:
+        assert canary not in str(exc)
+        assert canary not in repr(exc)
+        pytest.fail("unpaired JSON surrogate must not raise")
+
+    assert result.outcome is LedgerOutcome.FAILED
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert [item.diagnostic_kind for item in result.diagnostics] == [diagnostic_kind]
+    assert canary not in repr(result)
+    finding = build_bh3_finding(result, source_path=".claude/settings.json")
+    assert finding is None
 
 
 def test_same_document_disable_neutralizes_bypass() -> None:
