@@ -62,7 +62,11 @@ from skillspector.sarif_models import (
     SarifTool,
     validate_sarif_report,
 )
-from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
+from skillspector.semantic_runtime import (
+    llm_runtime_available,
+    semantic_runtime_accounting,
+    successful_llm_record,
+)
 from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 
@@ -1049,7 +1053,7 @@ def _llm_runtime_status(
     pass is degraded too, not just a total one.
     """
     attempted = len(llm_call_log)
-    succeeded = sum(1 for r in llm_call_log if r.get("ok"))
+    succeeded = sum(1 for record in llm_call_log if successful_llm_record(record))
     degraded = bool(use_llm and attempted > 0 and succeeded < attempted)
     return attempted, succeeded, degraded
 
@@ -1091,7 +1095,7 @@ def _build_metadata(
     # vacuously ok for llm_available (provider/runtime truth). When it does
     # run it always emits exactly one record.
     meta_analyzer_records = [r for r in llm_call_log if r.get("node") == "meta_analyzer"]
-    meta_analyzer_ok = all(bool(r.get("ok")) for r in meta_analyzer_records)
+    meta_analyzer_ok = all(successful_llm_record(record) for record in meta_analyzer_records)
     # meta_analysis_applied is stricter: "did meta-analysis actually run"
     # cannot be satisfied vacuously. all([]) is True on an empty list, so
     # meta_analyzer_ok alone is also True when meta_analyzer made no call at
@@ -1146,7 +1150,11 @@ def _build_metadata(
     elif call_log_degraded:
         meta["llm_degraded"] = True
         reasons = sorted(
-            {str(r.get("error")) for r in llm_call_log if not r.get("ok") and r.get("error")}
+            {
+                str(record.get("error"))
+                for record in llm_call_log
+                if not successful_llm_record(record) and record.get("error")
+            }
         )
         detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
         failed = attempted - succeeded
@@ -1488,8 +1496,9 @@ def report(state: SkillspectorState) -> dict[str, object]:
     manifest = state.get("manifest") or {}
     skill_path = state.get("skill_path")
     output_format = state.get("output_format") or "sarif"
-    use_llm = state.get("use_llm", True)
-    llm_requested = bool(state.get("llm_requested", use_llm))
+    use_llm = state.get("use_llm") is not False
+    raw_llm_requested = state.get("llm_requested")
+    llm_requested = raw_llm_requested if isinstance(raw_llm_requested, bool) else use_llm
     raw_llm_call_log = state.get("llm_call_log")
     llm_call_log: list[Mapping[str, object]] = (
         [record for record in raw_llm_call_log if isinstance(record, Mapping)]
@@ -1526,7 +1535,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         preflight_available=provider_available,
         result=state,
     )
-    has_recorded_failure = any(not r.get("ok") for r in llm_call_log)
+    has_recorded_failure = any(not successful_llm_record(record) for record in llm_call_log)
     unavailable_before_execution = bool(llm_requested and not use_llm)
     provider_unavailable = bool(
         llm_requested

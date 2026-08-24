@@ -1816,6 +1816,81 @@ def test_use_llm_fallback_with_missing_telemetry_degrades_json(
     assert "runtime telemetry was incomplete" in payload["metadata"]["llm_error"]
 
 
+@pytest.mark.parametrize("malformed_request", [None, "false"])
+def test_malformed_llm_request_intent_falls_back_to_enabled_llm(
+    malformed_request: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-boolean request metadata cannot override enabled semantic analysis."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_requested": malformed_request,  # type: ignore[typeddict-item]
+        "llm_call_log": [],
+        "analyzer_status_events": [],
+    }
+
+    result = report(state)
+    payload = json.loads(result["report_body"])
+
+    assert result["risk_recommendation"] == "CAUTION"
+    assert payload["metadata"]["llm_requested"] is True
+    assert payload["metadata"]["llm_degraded"] is True
+
+
+def test_truthy_malformed_request_intent_cannot_override_static_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-boolean request value inherits an explicit static-only execution mode."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": False,
+        "llm_requested": "true",  # type: ignore[typeddict-item]
+        "llm_call_log": [],
+    }
+
+    result = report(state)
+    payload = json.loads(result["report_body"])
+
+    assert result["risk_recommendation"] == "SAFE"
+    assert payload["metadata"]["llm_requested"] is False
+    assert "llm_degraded" not in payload["metadata"]
+
+
+def test_malformed_use_llm_value_cannot_opt_out_of_semantic_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the literal boolean False selects static-only execution."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": None,  # type: ignore[typeddict-item]
+        "llm_call_log": [],
+        "analyzer_status_events": [],
+    }
+
+    result = report(state)
+    payload = json.loads(result["report_body"])
+
+    assert result["risk_recommendation"] == "CAUTION"
+    assert payload["metadata"]["llm_requested"] is True
+    assert payload["metadata"]["llm_degraded"] is True
+
+
 def test_explicit_requested_llm_with_invalid_call_telemetry_degrades_without_crashing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

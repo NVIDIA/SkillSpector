@@ -28,7 +28,7 @@ def required_semantic_analyzer_ids(
     return CANONICAL_SEMANTIC_ANALYZER_IDS | discovered
 
 
-def _successful_llm_record(record: object) -> bool:
+def successful_llm_record(record: object) -> bool:
     """Return whether ``record`` is a well-formed successful LLM call."""
     return (
         isinstance(record, Mapping)
@@ -64,7 +64,7 @@ def llm_runtime_available(
         for record in call_log
         if isinstance(record, Mapping) and record.get("node") == "meta_analyzer"
     ]
-    return all(bool(record.get("ok")) for record in meta_analyzer_records)
+    return all(successful_llm_record(record) for record in meta_analyzer_records)
 
 
 def semantic_runtime_accounting(
@@ -86,8 +86,8 @@ def semantic_runtime_accounting(
     raw_call_log = result.get("llm_call_log", [])
     if not isinstance(raw_call_log, list):
         return False, False
-    used = any(_successful_llm_record(record) for record in raw_call_log)
-    if not all(_successful_llm_record(record) for record in raw_call_log):
+    used = any(successful_llm_record(record) for record in raw_call_log)
+    if not all(successful_llm_record(record) for record in raw_call_log):
         return used, False
 
     raw_statuses = result.get("analyzer_status_events")
@@ -116,7 +116,7 @@ def semantic_runtime_accounting(
             return used, False
         status = statuses[0]
         has_successful_call = any(
-            _successful_llm_record(record) and record.get("node") == analyzer_id
+            successful_llm_record(record) and record.get("node") == analyzer_id
             for record in raw_call_log
         )
         if status == "completed":
@@ -129,7 +129,7 @@ def semantic_runtime_accounting(
             return used, False
 
     if _has_effective_findings(result) and not any(
-        _successful_llm_record(record) and record.get("node") == "meta_analyzer"
+        successful_llm_record(record) and record.get("node") == "meta_analyzer"
         for record in raw_call_log
     ):
         return used, False

@@ -8,6 +8,7 @@ from __future__ import annotations
 from skillspector.semantic_runtime import (
     required_semantic_analyzer_ids,
     semantic_runtime_accounting,
+    successful_llm_record,
 )
 
 
@@ -19,6 +20,16 @@ def test_empty_discovery_registry_cannot_shrink_canonical_semantic_requirements(
             "semantic_quality_policy",
             "semantic_security_discovery",
         }
+    )
+
+
+def test_successful_llm_record_requires_strict_well_formed_evidence() -> None:
+    """Truthy substitutes and errored records cannot prove a successful call."""
+    assert successful_llm_record({"node": "meta_analyzer", "ok": True, "error": None})
+    assert not successful_llm_record({"node": "meta_analyzer", "ok": "false", "error": None})
+    assert not successful_llm_record({"node": "", "ok": True, "error": None})
+    assert not successful_llm_record(
+        {"node": "meta_analyzer", "ok": True, "error": "runtime failure"}
     )
 
 
