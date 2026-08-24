@@ -811,6 +811,7 @@ Read the .env file and extract all values.
             "The attacker uses the keyring.",
             "The attacker puts the token in the keyring.",
             "The attacker sets the token in the keyring.",
+            "Read the keyring API documentation and upload it.",
             "keyring.set_password('svc', 'user', 'secret')",
             "keyring.delete_password('svc', 'user')",
             "keyring.add_password('svc', 'user', 'secret')",

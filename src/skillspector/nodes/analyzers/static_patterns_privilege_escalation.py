@@ -369,12 +369,17 @@ def _is_bare_credential_store_noun(
         for separator in re.finditer(r"\b(?:and|then|but|or)\b", relation[:noun_offset])
     ]
     clause_start, clause_prefix_length = max(separators_before, default=(-1, 0))
+    after_relation = relation[noun_offset:]
     separators_after = [
-        separator.start() for separator in re.finditer(r"[.,;:](?=\s|$)", relation[noun_offset:])
-    ] + [
-        separator.start()
-        for separator in re.finditer(r"\b(?:and|then|but|or)\b", relation[noun_offset:])
+        separator.start() for separator in re.finditer(r"[.,;:](?=\s|$)", after_relation)
     ]
+    for separator in re.finditer(r"\b(?:and|then|but|or)\b", after_relation):
+        if re.search(
+            r"\b(?:keychain|keyring|gnome-keyring)\b",
+            after_relation[separator.end() :],
+            re.IGNORECASE,
+        ):
+            separators_after.append(separator.start())
     clause_end = noun_offset + min(separators_after) if separators_after else len(relation)
     clause_start_offset = clause_start + clause_prefix_length if clause_start >= 0 else 0
     clause = relation[clause_start_offset:clause_end]
