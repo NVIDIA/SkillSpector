@@ -71,11 +71,23 @@ STRUCTURED_RESPONSE_MAX_RETRIES = 3
 STRUCTURED_RESPONSE_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_RETRIES + 1
 STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS = API_CONNECTION_RETRY_DELAYS_SECONDS
 LLM_BATCH_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_RETRIES
+OUTPUT_LANGUAGE_MAX_LENGTH = 64
 
 
 def resolve_output_language() -> str | None:
     """Return the configured language for human-readable LLM finding text."""
-    return os.environ.get("SKILLSPECTOR_OUTPUT_LANGUAGE", "").strip() or None
+    raw_language = os.environ.get("SKILLSPECTOR_OUTPUT_LANGUAGE", "")
+    language = raw_language.strip()
+    if not language:
+        return None
+    if (
+        "\r" in raw_language
+        or "\n" in raw_language
+        or len(language) > OUTPUT_LANGUAGE_MAX_LENGTH
+        or not all(character.isalnum() or character in " -_" for character in language)
+    ):
+        return None
+    return language
 
 
 def append_output_language_instruction(prompt: str) -> str:
