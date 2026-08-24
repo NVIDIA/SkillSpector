@@ -12,6 +12,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+import skillspector.nodes.analyzers.bundled_permission_grants as permission_grants
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers.bundled_permission_grants import (
     GRANT_KIND_ALLOWLIST,
@@ -693,6 +694,39 @@ def test_webfetch_domain_label_length_boundaries() -> None:
     assert rejected.outcome is LedgerOutcome.FAILED
 
 
+def test_webfetch_all_domain_spellings_share_one_identity_and_earliest_line() -> None:
+    result = analyze_permission_grants(
+        {"permissions": {"allow": ["WebFetch", "WebFetch(domain:*)", "WebFetch(domain:*.)"]}},
+        source_kind="project_settings",
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(
+            permissions_line=2,
+            allow_lines=(12, 3, 8),
+        ),
+    )
+
+    assert result.outcome is LedgerOutcome.COMPLETED
+    assert [(grant.grant_kind, grant.source_line) for grant in result.grants] == [
+        ("all_domain_fetch", 3)
+    ]
+
+
+def test_terminal_dot_all_domain_restriction_mitigates_scoped_webfetch() -> None:
+    result = _analyze(
+        {
+            "allow": ["WebFetch(domain:docs.example)"],
+            "deny": ["WebFetch(domain:*.)"],
+        }
+    )
+
+    assert result.grants == ()
+    assert {item.diagnostic_kind for item in result.diagnostics} == {
+        "restrictive_rule",
+        "mitigated_allow",
+    }
+
+
 @pytest.mark.parametrize(
     "domain",
     ["xn--bcher-kva.example", "*.example.com", "example.*", "a*b.example", "EXAMPLE.com."],
@@ -1112,6 +1146,113 @@ def test_hostile_tool_glob_near_miss_scales_linearly() -> None:
     large = duration(12_000)
 
     assert large < small * 8 + 0.02
+
+
+def test_duplicate_restrictions_are_deduplicated_before_large_candidate_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duplicate_count = 1_000
+    server = "a" * 500_000
+    deny_rule = "*Z*"
+    coverage_calls = 0
+    restriction_line = 0
+    original_restriction_covers = permission_grants._restriction_covers
+
+    def counting_restriction_covers(
+        candidate: permission_grants._AllowCandidate,
+        restriction: permission_grants._Restriction,
+    ) -> bool:
+        nonlocal coverage_calls, restriction_line
+        coverage_calls += 1
+        restriction_line = restriction.source_line
+        return original_restriction_covers(candidate, restriction)
+
+    monkeypatch.setattr(
+        permission_grants,
+        "_restriction_covers",
+        counting_restriction_covers,
+    )
+    result = analyze_permission_grants(
+        {
+            "permissions": {
+                "allow": [f"mcp__{server}__read"],
+                "deny": [deny_rule] * duplicate_count,
+            }
+        },
+        source_kind="project_settings",
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(
+            permissions_line=2,
+            allow_lines=(4,),
+            deny_lines=tuple(range(duplicate_count + 2, 2, -1)),
+        ),
+    )
+
+    assert coverage_calls == 1
+    assert restriction_line == 3
+    assert [grant.grant_kind for grant in result.grants] == ["mcp_exact_tool"]
+
+
+def test_duplicate_allow_candidates_are_deduplicated_before_coverage_with_earliest_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coverage_calls = 0
+    original_restriction_covers = permission_grants._restriction_covers
+
+    def counting_restriction_covers(
+        candidate: permission_grants._AllowCandidate,
+        restriction: permission_grants._Restriction,
+    ) -> bool:
+        nonlocal coverage_calls
+        coverage_calls += 1
+        return original_restriction_covers(candidate, restriction)
+
+    monkeypatch.setattr(
+        permission_grants,
+        "_restriction_covers",
+        counting_restriction_covers,
+    )
+    result = analyze_permission_grants(
+        {
+            "permissions": {
+                "allow": ["Bash(ls:*)", "Bash(ls *)", "Bash(ls:*)"],
+                "deny": ["Z*"],
+            }
+        },
+        source_kind="project_settings",
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(
+            permissions_line=2,
+            allow_lines=(12, 3, 8),
+            deny_lines=(5,),
+        ),
+    )
+
+    assert coverage_calls == 1
+    assert [(grant.grant_kind, grant.source_line) for grant in result.grants] == [
+        ("scoped_execution", 3)
+    ]
+
+
+def test_equivalent_mcp_server_candidates_have_order_stable_normalized_glob_coverage() -> None:
+    bare_first = _analyze(
+        {
+            "allow": ["mcp__files", "mcp__files__*"],
+            "deny": ["mcp__files_*"],
+        }
+    )
+    wildcard_first = _analyze(
+        {
+            "allow": ["mcp__files__*", "mcp__files"],
+            "deny": ["mcp__files_*"],
+        }
+    )
+
+    assert bare_first.grants == wildcard_first.grants == ()
+    assert bare_first.diagnostics == wildcard_first.diagnostics
+    assert bare_first.aggregate_digest == wildcard_first.aggregate_digest
 
 
 @pytest.mark.parametrize(

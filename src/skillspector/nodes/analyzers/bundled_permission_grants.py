@@ -478,14 +478,17 @@ def _normalized_rule_identity(parsed: _ParsedRule) -> tuple[str, str]:
         if tool == "powershell":
             normalized_specifier = normalized_specifier.casefold()
         return tool, f"{tool}({normalized_specifier})"
-    if tool == "WebFetch" and specifier is not None and specifier.startswith("domain:"):
-        domain = _valid_domain_pattern(specifier[7:])
-        if domain is not None:
-            return tool, f"WebFetch(domain:{domain})"
+    if tool == "WebFetch":
+        if specifier is None:
+            return tool, "WebFetch(domain:*)"
+        if specifier.startswith("domain:"):
+            domain = _valid_domain_pattern(specifier[7:])
+            if domain is not None:
+                return tool, f"WebFetch(domain:{domain})"
     if specifier is None and tool.startswith("mcp__"):
         mcp = _mcp_classification(tool)
         if mcp is not None:
-            return tool, mcp[2]
+            return mcp[2], mcp[2]
     identity = tool if specifier is None else f"{tool}({specifier})"
     return tool, identity
 
@@ -506,11 +509,11 @@ def _classify_restriction(
     mcp_server = (
         parsed.tool.split("__")[1] if mcp is not None and mcp[0] == "mcp_server_wide" else None
     )
-    tool_wide = (
-        parsed.specifier is None
-        or (original_tool in {"Bash", "powershell", "Monitor"} and parsed.specifier == "*")
-        or (original_tool == "WebFetch" and parsed.specifier == "domain:*")
-    )
+    tool_wide = parsed.specifier is None or normalized_identity in {
+        "Bash(*)",
+        "powershell(*)",
+        "WebFetch(domain:*)",
+    }
     restriction = _Restriction(
         tool_identifier=tool_identifier,
         original_tool_identifier=original_tool,
@@ -591,6 +594,55 @@ def _restriction_covers(candidate: _AllowCandidate, restriction: _Restriction) -
         restriction.tool_identifier == candidate.tool_identifier
         or restriction.original_tool_identifier == candidate.original_tool_identifier
     )
+
+
+def _deduplicate_allow_candidates(
+    candidates: list[_AllowCandidate],
+) -> tuple[_AllowCandidate, ...]:
+    unique: dict[tuple[str, ...], _AllowCandidate] = {}
+    for candidate in candidates:
+        semantic_identity: tuple[str, ...]
+        if candidate.mcp_server is not None:
+            semantic_identity = (
+                "mcp",
+                candidate.normalized_identity,
+                candidate.mcp_server,
+            )
+        else:
+            semantic_identity = (
+                "rule",
+                candidate.normalized_identity,
+                candidate.tool_identifier,
+                candidate.original_tool_identifier,
+            )
+        previous = unique.get(semantic_identity)
+        if previous is None or candidate.grant.source_line < previous.grant.source_line:
+            unique[semantic_identity] = candidate
+    return tuple(unique.values())
+
+
+def _deduplicate_restrictions(
+    restrictions: tuple[_Restriction, ...],
+) -> tuple[_Restriction, ...]:
+    unique: dict[tuple[str, ...], _Restriction] = {}
+    for restriction in restrictions:
+        semantic_identity: tuple[str, ...]
+        if restriction.mcp_server is not None:
+            semantic_identity = ("mcp_server", restriction.mcp_server)
+        elif restriction.tool_glob:
+            semantic_identity = ("tool_glob", restriction.tool_identifier)
+        else:
+            semantic_identity = (
+                "rule",
+                restriction.normalized_identity,
+                restriction.tool_identifier,
+                restriction.original_tool_identifier,
+                "wide" if restriction.tool_wide else "exact",
+            )
+        previous = unique.get(semantic_identity)
+        if previous is None or restriction.source_line < previous.source_line:
+            unique[semantic_identity] = restriction
+    return tuple(unique.values())
 
 
 def _diagnostic(
@@ -1257,9 +1309,12 @@ def analyze_permission_grants(
         else:
             has_valid_content = True
 
+    validated_candidates = _deduplicate_allow_candidates(allow_candidates)
+    validated_restrictions = _deduplicate_restrictions((*deny_restrictions, *ask_restrictions))
+
     global_restriction = any(
         restriction.tool_glob and restriction.tool_identifier == "*"
-        for restriction in (*deny_restrictions, *ask_restrictions)
+        for restriction in validated_restrictions
     )
     if bypass_declared and not bypass_disabled:
         if global_restriction:
@@ -1283,10 +1338,9 @@ def analyze_permission_grants(
                 )
             )
 
-    for candidate in allow_candidates:
+    for candidate in validated_candidates:
         if any(
-            _restriction_covers(candidate, restriction)
-            for restriction in (*deny_restrictions, *ask_restrictions)
+            _restriction_covers(candidate, restriction) for restriction in validated_restrictions
         ):
             diagnostics.append(
                 _diagnostic(
