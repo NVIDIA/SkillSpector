@@ -719,6 +719,153 @@ def test_neighboring_archive_cannot_corroborate_literal_bang_directory_member() 
     assert result["inspection_ledger"] == []
 
 
+def test_neighboring_archive_cannot_claim_missing_settings_from_literal_bang_manifest() -> None:
+    """An ordinary bang-directory manifest cannot borrow a neighboring archive namespace."""
+    container = "vendor.zip"
+    manifest_path = "vendor.zip!/.claude-plugin/plugin.json"
+    settings_path = "vendor.zip!/.claude/settings.json"
+    state = _state(
+        {
+            container: "",
+            manifest_path: _manifest_json(hooks="./.claude/settings.json"),
+        }
+    )
+    state["component_metadata"] = [
+        {
+            "path": container,
+            "type": "zip",
+            "container_type": "zip",
+            "container_ancestry": ["zip"],
+            "local_only": True,
+        },
+        {"path": manifest_path, "type": "json", "hidden": True, "local_only": True},
+    ]
+
+    result = node(state)
+
+    assert result["findings"] == []
+    assert [
+        (event["path"], event["phase"], event["outcome"], event["reason_code"])
+        for event in result["inspection_ledger"]
+    ] == [
+        (
+            settings_path,
+            "bundled_hook",
+            LedgerOutcome.FAILED,
+            LedgerReason.MISSING_FILE_CACHE,
+        )
+    ]
+
+
+def test_unrelated_archive_member_cannot_validate_literal_bang_manifest_reference() -> None:
+    """Only the referring manifest, not an unrelated member, can prove settings ownership."""
+    container = "vendor.zip"
+    unrelated = "vendor.zip!/unrelated.txt"
+    manifest_path = "vendor.zip!/.claude-plugin/plugin.json"
+    settings_path = "vendor.zip!/.claude/settings.json"
+    state = _state(
+        {
+            container: "",
+            unrelated: "ordinary member",
+            manifest_path: _manifest_json(hooks="./.claude/settings.json"),
+        }
+    )
+    state["component_metadata"] = [
+        {
+            "path": container,
+            "type": "zip",
+            "container_type": "zip",
+            "container_ancestry": ["zip"],
+            "local_only": True,
+        },
+        {
+            "path": unrelated,
+            "type": "text",
+            "outer_path": container,
+            "nested_path": "unrelated.txt",
+            "container_type": "zip",
+            "container_ancestry": ["zip"],
+            "container_depth": 1,
+            "local_only": True,
+        },
+        {"path": manifest_path, "type": "json", "hidden": True, "local_only": True},
+    ]
+
+    result = node(state)
+
+    assert result["findings"] == []
+    assert [
+        (event["path"], event["phase"], event["outcome"], event["reason_code"])
+        for event in result["inspection_ledger"]
+    ] == [
+        (
+            settings_path,
+            "bundled_hook",
+            LedgerOutcome.FAILED,
+            LedgerReason.MISSING_FILE_CACHE,
+        )
+    ]
+
+
+def test_nested_archive_member_manifest_can_claim_its_missing_settings_reference() -> None:
+    """Validated member provenance preserves settings ownership for an absent sibling."""
+    outer = "outer.zip"
+    inner = "outer.zip!/inner.zip"
+    manifest_path = "outer.zip!/inner.zip!/.claude-plugin/plugin.json"
+    settings_path = "outer.zip!/inner.zip!/.claude/settings.json"
+    state = _state(
+        {
+            outer: "",
+            inner: "",
+            manifest_path: _manifest_json(hooks="./.claude/settings.json"),
+        }
+    )
+    state["component_metadata"] = [
+        {
+            "path": outer,
+            "type": "zip",
+            "container_type": "zip",
+            "container_ancestry": ["zip"],
+            "local_only": True,
+        },
+        {
+            "path": inner,
+            "type": "zip",
+            "outer_path": outer,
+            "nested_path": "inner.zip",
+            "container_type": "zip",
+            "container_ancestry": ["zip"],
+            "container_depth": 1,
+            "local_only": True,
+        },
+        {
+            "path": manifest_path,
+            "type": "json",
+            "outer_path": outer,
+            "nested_path": "inner.zip!/.claude-plugin/plugin.json",
+            "container_type": "zip",
+            "container_ancestry": ["zip", "zip"],
+            "container_depth": 2,
+            "local_only": True,
+        },
+    ]
+
+    result = node(state)
+
+    assert result["findings"] == []
+    assert [
+        (event["path"], event["phase"], event["outcome"], event["reason_code"])
+        for event in result["inspection_ledger"]
+    ] == [
+        (
+            settings_path,
+            "bundled_settings",
+            LedgerOutcome.FAILED,
+            LedgerReason.MISSING_FILE_CACHE,
+        )
+    ]
+
+
 def test_nested_archive_settings_require_and_accept_container_cache_provenance() -> None:
     """Every archive boundary is corroborated by its retained container cache key."""
     outer = "outer.zip"

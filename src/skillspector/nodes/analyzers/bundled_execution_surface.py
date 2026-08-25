@@ -1352,13 +1352,26 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     }
     component_metadata_supplied = "component_metadata" in state
 
-    def archive_namespace_is_corroborated(path: str) -> bool:
+    def archive_namespace_is_corroborated(
+        path: str, *, referring_paths: set[str] | None = None
+    ) -> bool:
         if "!/" not in path:
             return True
         if path in archive_member_metadata_paths:
             return True
         if path in component_metadata_paths:
             return False
+        if component_metadata_supplied:
+            namespace = _namespace(path)
+            return (
+                namespace in archive_container_metadata_paths
+                and referring_paths is not None
+                and any(
+                    referring_path in archive_member_metadata_paths
+                    and _namespace(referring_path) == namespace
+                    for referring_path in referring_paths
+                )
+            )
         segments = path.split("!/")
         namespace_prefixes: list[str] = []
         prefix = segments[0]
@@ -1366,15 +1379,14 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         for segment in segments[1:-1]:
             prefix = f"{prefix}!/{segment}"
             namespace_prefixes.append(prefix)
-        corroborating_paths = (
-            archive_container_metadata_paths if component_metadata_supplied else known_path_set
-        )
         return bool(namespace_prefixes) and all(
-            prefix in corroborating_paths for prefix in namespace_prefixes
+            prefix in known_path_set for prefix in namespace_prefixes
         )
 
-    def project_settings_metadata(path: str) -> tuple[str, str] | None:
-        if not archive_namespace_is_corroborated(path):
+    def project_settings_metadata(
+        path: str, *, referring_paths: set[str] | None = None
+    ) -> tuple[str, str] | None:
+        if not archive_namespace_is_corroborated(path, referring_paths=referring_paths):
             return None
         _namespace_value, member_parts = _path_parts(path)
         if len(member_parts) != 2:
@@ -1851,9 +1863,19 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     ) -> None:
         """Inventory every distinct execution root for one physical hook document."""
         settings_work = settings_work_by_path.get(reference_path)
+        referring_paths = (
+            {_manifest_path(root) for root in activation_roots}
+            if source_kind == "plugin_manifest_reference"
+            else set()
+        )
         if (
             settings_work is None
-            and (settings := project_settings_metadata(reference_path)) is not None
+            and (
+                settings := project_settings_metadata(
+                    reference_path, referring_paths=referring_paths
+                )
+            )
+            is not None
         ):
             settings_work = _SettingsWork(
                 source_path=reference_path,
