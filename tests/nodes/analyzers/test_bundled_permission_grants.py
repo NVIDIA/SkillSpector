@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+from hashlib import sha256
 
 import pytest
 
@@ -22,6 +23,28 @@ from skillspector.nodes.analyzers.bundled_permission_grants import (
     analyze_permission_grants,
     build_bh3_finding,
 )
+
+_ALLOWED_BH3_EVIDENCE = {
+    "schema",
+    "claude_semantics_snapshot",
+    "source_kind",
+    "declaration_status",
+    "artifact_effect_status",
+    "activation_requirement",
+    "interface_applicability",
+    "tracking_status",
+    "runtime_status",
+    "grant_count",
+    "critical_grant_count",
+    "high_grant_count",
+    "medium_grant_count",
+    "grant_kinds",
+    "diagnostic_count",
+    "diagnostic_kinds",
+    "max_severity",
+    "blocking_critical",
+    "aggregate_digest",
+}
 
 
 def _analyze(permissions: object, *, source_kind: str = "project_settings") -> PermissionAnalysis:
@@ -2156,3 +2179,468 @@ def test_exact_cloud_credential_store_directory_is_sensitive(directory: str) -> 
     assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
         ("sensitive_additional_directory", "HIGH")
     ]
+
+
+def test_valid_grant_with_wrong_type_sibling_is_partial() -> None:
+    result = _analyze({"allow": ["Bash"], "defaultMode": 7})
+
+    assert result.outcome is LedgerOutcome.PARTIAL
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert [grant.grant_kind for grant in result.grants] == ["tool_wide_execution"]
+    assert [diagnostic.diagnostic_kind for diagnostic in result.diagnostics] == ["wrong_type"]
+
+
+def test_all_unknown_or_invalid_supplied_values_fail_without_a_grant() -> None:
+    result = _analyze(
+        {
+            "futurePermission": {"nested": ["CANARY"]},
+            "allow": [7],
+            "defaultMode": "future-mode",
+        }
+    )
+
+    assert result.outcome is LedgerOutcome.FAILED
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert result.grants == ()
+    assert build_bh3_finding(result, source_path=".claude/settings.json") is None
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        {"ask": ["Bash"]},
+        {"deny": ["Read"]},
+        {"ask": ["Bash"], "deny": ["Read"]},
+    ],
+)
+def test_valid_restriction_only_sections_are_completed_without_a_finding(
+    permissions: dict[str, list[str]],
+) -> None:
+    result = _analyze(permissions)
+
+    assert result.outcome is LedgerOutcome.COMPLETED
+    assert result.reason is None
+    assert result.grants == ()
+    assert build_bh3_finding(result, source_path=".claude/settings.json") is None
+
+
+def test_exact_structural_item_boundary_accepts_raw_entries_before_deduplication() -> None:
+    result = _analyze(
+        {
+            "allow": ["Bash(echo bounded)"] * 2046,
+            "defaultMode": "default",
+        }
+    )
+
+    assert result.outcome is LedgerOutcome.COMPLETED
+    assert result.reason is None
+    assert len(result.grants) == 1
+    assert result.aggregate_digest is not None
+
+
+def test_next_raw_entry_above_structural_item_boundary_fails_atomically() -> None:
+    result = _analyze(
+        {
+            "allow": ["Bash(echo bounded)"] * 2047,
+            "defaultMode": "default",
+        }
+    )
+
+    assert result == PermissionAnalysis(
+        True,
+        LedgerOutcome.FAILED,
+        LedgerReason.COMPONENT_LIMIT,
+        (),
+        (),
+        None,
+    )
+
+
+def test_every_recognized_raw_list_entry_counts_toward_the_structural_limit() -> None:
+    accepted = _analyze(
+        {
+            "allow": [7] * 511,
+            "ask": [7] * 511,
+            "deny": [7] * 511,
+            "additionalDirectories": [7] * 511,
+        }
+    )
+    rejected = _analyze(
+        {
+            "allow": [7] * 512,
+            "ask": [7] * 511,
+            "deny": [7] * 511,
+            "additionalDirectories": [7] * 511,
+        }
+    )
+
+    assert accepted.outcome is LedgerOutcome.FAILED
+    assert accepted.reason is LedgerReason.INVALID_CONFIGURATION
+    assert accepted.aggregate_digest is not None
+    assert rejected == PermissionAnalysis(
+        True,
+        LedgerOutcome.FAILED,
+        LedgerReason.COMPONENT_LIMIT,
+        (),
+        (),
+        None,
+    )
+
+
+def test_2048_unique_unknown_keys_stay_within_the_structural_limit() -> None:
+    result = _analyze({f"unknown-{index}": None for index in range(2048)})
+
+    assert result.outcome is LedgerOutcome.FAILED
+    assert result.reason is LedgerReason.INVALID_CONFIGURATION
+    assert len(result.diagnostics) == 2048
+    assert result.aggregate_digest is not None
+
+
+def test_20000_unique_unknown_keys_fail_before_diagnostic_construction() -> None:
+    result = _analyze({f"unknown-{index}": None for index in range(20_000)})
+
+    assert result == PermissionAnalysis(
+        True,
+        LedgerOutcome.FAILED,
+        LedgerReason.COMPONENT_LIMIT,
+        (),
+        (),
+        None,
+    )
+
+
+def test_nested_unknown_value_counts_once_and_never_expands_diagnostics() -> None:
+    result = _analyze(
+        {
+            "futurePermission": {
+                f"nested-{index}": [index, {"deeper": [index]}] for index in range(20_000)
+            },
+            "allow": ["Bash(echo bounded)"],
+        }
+    )
+
+    assert result.outcome is LedgerOutcome.PARTIAL
+    assert len(result.grants) == 1
+    assert [diagnostic.diagnostic_kind for diagnostic in result.diagnostics] == [
+        "unknown_permission_key"
+    ]
+
+
+def test_bh3_evidence_is_exact_flat_safe_and_never_serializes_canaries() -> None:
+    canaries = [
+        "/tmp/CANARY-secret-path",
+        "CANARY-secret.example",
+        "CANARY_mcp_server",
+        "**CANARY-markdown**",
+        "CANARY-control-\x01",
+        "CANARY-unicode-雪",
+    ]
+    result = _analyze(
+        {
+            "allow": [
+                f"WebFetch(domain:{canaries[1]})",
+                f"mcp__{canaries[2]}__read",
+                f"Bash(echo {canaries[3]})",
+                f"Bash(echo {canaries[4]})",
+                f"Bash(echo {canaries[5]})",
+            ],
+            "additionalDirectories": [canaries[0]],
+        }
+    )
+
+    finding = build_bh3_finding(result, source_path=".claude/settings.json")
+    assert finding is not None
+    assert set(finding.evidence) == _ALLOWED_BH3_EVIDENCE
+    assert all(isinstance(value, (str, int, bool)) for value in finding.evidence.values())
+    assert finding.evidence["schema"] == "skillspector.bundled_permission.v1"
+    assert finding.evidence["claude_semantics_snapshot"] == "2.1.241"
+    assert finding.evidence["runtime_status"] == "external_unknown"
+    assert finding.finding == finding.matched_text == finding.evidence["aggregate_digest"]
+
+    serialized = json.dumps(finding.to_dict(), ensure_ascii=True, sort_keys=True)
+    for canary in canaries:
+        assert canary not in serialized
+        assert json.dumps(canary, ensure_ascii=True)[1:-1] not in serialized
+
+
+def test_aggregate_uses_exact_domain_prefix_and_real_mitigated_count() -> None:
+    result = _analyze(
+        {
+            "allow": ["Bash(echo one)", "Bash(echo two)"],
+            "deny": ["Bash"],
+        }
+    )
+    payload = {
+        "schema": "skillspector.bundled_permission.v1",
+        "claude_semantics_snapshot": "2.1.241",
+        "source_kind": "project_settings",
+        "source_identity_digest": "sha256:" + "2" * 64,
+        "content_digest": "sha256:" + "1" * 64,
+        "grant_digests": [],
+        "diagnostic_digests": sorted(
+            diagnostic.diagnostic_digest for diagnostic in result.diagnostics
+        ),
+        "mitigated_allow_count": 2,
+        "max_severity": "LOW",
+        "blocking_critical": False,
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode()
+    expected = (
+        "sha256:"
+        + sha256(b"skillspector.bundled_permission.aggregate.v1\0" + canonical).hexdigest()
+    )
+
+    assert result.grants == ()
+    assert [diagnostic.diagnostic_kind for diagnostic in result.diagnostics].count(
+        "mitigated_allow"
+    ) == 2
+    assert result.aggregate_digest == expected
+
+
+def test_physical_content_source_identity_and_source_kind_mutate_aggregate() -> None:
+    def analyze_with(
+        *, content_digest: str, source_identity_digest: str, source_kind: str
+    ) -> PermissionAnalysis:
+        return analyze_permission_grants(
+            {"permissions": {"allow": ["Bash(echo stable)"]}},
+            source_kind=source_kind,
+            content_digest=content_digest,
+            source_identity_digest=source_identity_digest,
+            source_lines=PermissionSourceLines(permissions_line=2, allow_lines=(3,)),
+        )
+
+    baseline = analyze_with(
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_kind="project_settings",
+    )
+    variants = [
+        analyze_with(
+            content_digest="sha256:" + "3" * 64,
+            source_identity_digest="sha256:" + "2" * 64,
+            source_kind="project_settings",
+        ),
+        analyze_with(
+            content_digest="sha256:" + "1" * 64,
+            source_identity_digest="sha256:" + "4" * 64,
+            source_kind="project_settings",
+        ),
+        analyze_with(
+            content_digest="sha256:" + "1" * 64,
+            source_identity_digest="sha256:" + "2" * 64,
+            source_kind="project_local_settings",
+        ),
+    ]
+
+    assert all(variant.aggregate_digest != baseline.aggregate_digest for variant in variants)
+
+
+def test_semantic_projection_is_stable_while_physical_aggregate_changes() -> None:
+    first = analyze_permission_grants(
+        {"permissions": {"allow": ["Bash(echo stable)"]}},
+        source_kind="project_settings",
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(allow_lines=(11,)),
+    )
+    reordered_duplicate = analyze_permission_grants(
+        {
+            "permissions": {
+                "defaultMode": "default",
+                "allow": ["Bash(echo stable)", "Bash(echo stable)"],
+            }
+        },
+        source_kind="project_settings",
+        content_digest="sha256:" + "3" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(allow_lines=(30, 31)),
+    )
+
+    assert [grant.grant_kind for grant in reordered_duplicate.grants] == [
+        grant.grant_kind for grant in first.grants
+    ]
+    assert [grant.severity for grant in reordered_duplicate.grants] == [
+        grant.severity for grant in first.grants
+    ]
+    assert reordered_duplicate.aggregate_digest != first.aggregate_digest
+
+
+@pytest.mark.parametrize("digest_parameter", ["content_digest", "source_identity_digest"])
+def test_malformed_input_digest_raises_constant_non_echoing_error(digest_parameter: str) -> None:
+    canary = "sha256:CANARY-not-a-digest"
+    arguments = {
+        "source_kind": "project_settings",
+        "content_digest": "sha256:" + "1" * 64,
+        "source_identity_digest": "sha256:" + "2" * 64,
+        "source_lines": PermissionSourceLines(),
+    }
+    arguments[digest_parameter] = canary
+
+    with pytest.raises(ValueError) as exc_info:
+        analyze_permission_grants({"permissions": {}}, **arguments)  # type: ignore[arg-type]
+
+    assert str(exc_info.value) == "invalid SHA-256 digest"
+    assert canary not in str(exc_info.value)
+
+
+def test_duplicate_diagnostic_retains_minimum_source_line() -> None:
+    result = analyze_permission_grants(
+        {"permissions": {"allow": ["FutureTool", "FutureTool"]}},
+        source_kind="project_settings",
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(permissions_line=20, allow_lines=(19, 7)),
+    )
+
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].source_line == 7
+
+
+def test_bh3_uses_earliest_reportable_line_and_fixed_count_only_metadata() -> None:
+    result = analyze_permission_grants(
+        {"permissions": {"allow": ["Read(src/input.txt)", "Workflow", "Bash"]}},
+        source_kind="project_settings",
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(permissions_line=1, allow_lines=(2, 7, 11)),
+    )
+
+    finding = build_bh3_finding(result, source_path=".claude/settings.json")
+    assert finding is not None
+    assert finding.rule_id == "BH3"
+    assert finding.category == "Bundled Execution Surface"
+    assert finding.pattern == "Bundled Permission Grant"
+    assert finding.severity == "CRITICAL"
+    assert finding.confidence == 1.0
+    assert finding.file == ".claude/settings.json"
+    assert finding.start_line == 7
+    assert finding.message == (
+        "Bundled settings declare 2 permission grant(s) with maximum CRITICAL severity."
+    )
+    assert finding.explanation == (
+        "The artifact declares a permission capability subject to external policy."
+    )
+    assert finding.remediation == (
+        "Review bundled project permission settings before trusting the artifact."
+    )
+    assert finding.tags == ["bundled-execution-surface", "structural"]
+
+
+@pytest.mark.parametrize(
+    ("permissions_line", "allow_lines", "expected_start"),
+    [(17, (), 17), (0, (), 1), (17, (False,), 17)],
+)
+def test_bh3_source_line_falls_back_to_permissions_then_line_one(
+    permissions_line: int, allow_lines: tuple[int | bool, ...], expected_start: int
+) -> None:
+    result = analyze_permission_grants(
+        {"permissions": {"allow": ["Bash"]}},
+        source_kind="project_settings",
+        content_digest="sha256:" + "1" * 64,
+        source_identity_digest="sha256:" + "2" * 64,
+        source_lines=PermissionSourceLines(
+            permissions_line=permissions_line,
+            allow_lines=allow_lines,  # type: ignore[arg-type]
+        ),
+    )
+
+    finding = build_bh3_finding(result, source_path=".claude/settings.json")
+    assert finding is not None
+    assert finding.start_line == expected_start
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("grant_kind", "CANARY-grant-kind"),
+        ("severity", "CANARY-severity"),
+        ("activation_requirement", "CANARY-activation"),
+        ("interface_applicability", "CANARY-interface"),
+        ("tracking_status", "CANARY-tracking"),
+        ("blocking_critical", "CANARY-blocking"),
+        ("grant_digest", "sha256:CANARY-grant-digest"),
+        ("source_line", 0),
+        ("grant_kind", []),
+        ("severity", []),
+        ("activation_requirement", []),
+        ("interface_applicability", []),
+        ("tracking_status", []),
+    ],
+)
+def test_builder_rejects_invalid_grant_records_without_echoing(field: str, invalid: object) -> None:
+    result = _analyze({"allow": ["Bash"]})
+    grant = replace(result.grants[0], **{field: invalid})
+    malformed = replace(result, grants=(grant,))
+
+    with pytest.raises(ValueError) as exc_info:
+        build_bh3_finding(malformed, source_path=".claude/settings.json")
+
+    assert str(exc_info.value) == "invalid permission analysis"
+    assert "CANARY" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("diagnostic_kind", "CANARY-diagnostic-kind"),
+        ("affects_completeness", "CANARY-completeness"),
+        ("diagnostic_digest", "sha256:CANARY-diagnostic-digest"),
+        ("source_line", 0),
+        ("diagnostic_kind", []),
+    ],
+)
+def test_builder_rejects_invalid_diagnostic_records_without_echoing(
+    field: str, invalid: object
+) -> None:
+    result = _analyze({"allow": ["Bash", "FutureTool"]})
+    diagnostic = replace(result.diagnostics[0], **{field: invalid})
+    malformed = replace(result, diagnostics=(diagnostic,))
+
+    with pytest.raises(ValueError) as exc_info:
+        build_bh3_finding(malformed, source_path=".claude/settings.json")
+
+    assert str(exc_info.value) == "invalid permission analysis"
+    assert "CANARY" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"aggregate_digest": "sha256:CANARY-aggregate-digest"},
+        {"aggregate_digest": None},
+        {"applicable": False},
+        {"outcome": LedgerOutcome.FAILED},
+        {"reason": LedgerReason.COMPONENT_LIMIT},
+    ],
+)
+def test_builder_rejects_inconsistent_analysis_without_echoing(
+    mutation: dict[str, object],
+) -> None:
+    malformed = replace(_analyze({"allow": ["Bash"]}), **mutation)
+
+    with pytest.raises(ValueError) as exc_info:
+        build_bh3_finding(malformed, source_path=".claude/settings.json")
+
+    assert str(exc_info.value) == "invalid permission analysis"
+    assert "CANARY" not in str(exc_info.value)
+
+
+def test_builder_returns_none_before_emitting_any_data_when_no_grant_remains() -> None:
+    malformed_but_nonreportable = PermissionAnalysis(
+        False,
+        None,
+        None,
+        (),
+        (),
+        "CANARY-unused-aggregate",
+    )
+
+    assert (
+        build_bh3_finding(
+            malformed_but_nonreportable,
+            source_path=".claude/settings.json",
+        )
+        is None
+    )

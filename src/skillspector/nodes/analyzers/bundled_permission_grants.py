@@ -27,6 +27,7 @@ MAX_PERMISSION_GLOB_MATCH_CHARS_PER_DOCUMENT: Final = 8_388_608
 
 _SHA256_DIGEST: Final = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SUPPORTED_SOURCE_KINDS: Final = frozenset({"project_settings", "project_local_settings"})
+_AGGREGATE_PREFIX: Final = b"skillspector.bundled_permission.aggregate.v1\0"
 _RECOGNIZED_KEYS: Final = frozenset(
     {
         "allow",
@@ -78,6 +79,76 @@ GRANT_KIND_ALLOWLIST: Final = frozenset(
         "approval_gate_transition",
     }
 )
+_GRANT_SEVERITY_BY_KIND: Final = {
+    "permission_mode_bypass": "CRITICAL",
+    "permission_mode_accept_edits": "MEDIUM",
+    "tool_wide_execution": "CRITICAL",
+    "scoped_execution": "MEDIUM",
+    "tool_wide_read": "CRITICAL",
+    "root_or_home_wide_read": "CRITICAL",
+    "sensitive_read": "HIGH",
+    "external_read": "MEDIUM",
+    "tool_wide_edit": "CRITICAL",
+    "root_or_home_wide_edit": "CRITICAL",
+    "sensitive_edit": "HIGH",
+    "broad_external_edit": "HIGH",
+    "scoped_edit": "MEDIUM",
+    "tool_wide_write": "CRITICAL",
+    "broad_notebook_edit": "HIGH",
+    "broad_multi_edit": "HIGH",
+    "filesystem_enumeration": "MEDIUM",
+    "filesystem_search": "MEDIUM",
+    "code_intelligence": "MEDIUM",
+    "all_domain_fetch": "HIGH",
+    "scoped_domain_fetch": "MEDIUM",
+    "network_search": "MEDIUM",
+    "mcp_server_wide": "HIGH",
+    "mcp_exact_tool": "MEDIUM",
+    "mcp_partial_tool": "MEDIUM",
+    "root_or_home_additional_directory": "CRITICAL",
+    "sensitive_additional_directory": "HIGH",
+    "external_additional_directory": "MEDIUM",
+    "external_content_upload": "HIGH",
+    "skill_invocation": "MEDIUM",
+    "autonomous_workflow": "HIGH",
+    "workspace_boundary_change": "HIGH",
+    "approval_gate_transition": "MEDIUM",
+}
+_MODE_GRANT_KINDS: Final = frozenset({"permission_mode_bypass", "permission_mode_accept_edits"})
+_DIAGNOSTIC_COMPLETENESS: Final = {
+    "auto_ignored": False,
+    "legacy_manual": False,
+    "bypass_disabled": False,
+    "bypass_global_restriction": False,
+    "auto_disabled": False,
+    "skip_dangerous_prompt_ignored": False,
+    "local_skip_dangerous_prompt_declared": False,
+    "ignored_allow_rule_glob": False,
+    "ignored_path_qualifier": False,
+    "runtime_uncertain_rule": True,
+    "unsupported_allow_specifier": False,
+    "known_non_grant_tool": False,
+    "restrictive_rule": False,
+    "mitigated_allow": False,
+    "platform_dependent_path": True,
+    "directory_existence_static_unknown": False,
+    "unknown_permission_key": True,
+    "unknown_mode": True,
+    "unknown_rule": True,
+    "wrong_type": True,
+    "invalid_path": True,
+}
+_GRANT_ACTIVATION_REQUIREMENTS: Final = frozenset(
+    {
+        "workspace_trust",
+        "local_provenance_and_session_policy",
+        "interface_and_external_policy",
+    }
+)
+_GRANT_INTERFACE_APPLICABILITY: Final = frozenset(
+    {"claude_code_settings_consumers", "permission_mode_interface_dependent"}
+)
+_GRANT_TRACKING_STATUS: Final = frozenset({"not_applicable", "unknown"})
 
 _SHELL_TOOLS: Final = frozenset({"Bash", "PowerShell", "Monitor"})
 _FILESYSTEM_TOOLS: Final = frozenset(
@@ -802,6 +873,8 @@ def _diagnostic(
     *,
     identity: str,
 ) -> PermissionDiagnostic:
+    if _DIAGNOSTIC_COMPLETENESS.get(kind) is not affects_completeness:
+        raise ValueError("unsupported permission diagnostic")
     safe = {
         "diagnostic_kind": kind,
         "affects_completeness": affects_completeness,
@@ -824,7 +897,7 @@ def _grant(
     identity: str,
     mode_context: bool = False,
 ) -> PermissionGrant:
-    if grant_kind not in GRANT_KIND_ALLOWLIST:
+    if _GRANT_SEVERITY_BY_KIND.get(grant_kind) != severity:
         raise ValueError("unsupported permission grant kind")
     context = _mode_context(source_kind) if mode_context else _rule_context(source_kind)
     activation_requirement, interface_applicability, tracking_status = context
@@ -1455,6 +1528,7 @@ def _aggregate_digest(
     source_identity_digest: str,
     grants: tuple[PermissionGrant, ...],
     diagnostics: tuple[PermissionDiagnostic, ...],
+    mitigated_allow_count: int,
 ) -> str:
     max_severity = max(
         (grant.severity for grant in grants), key=_SEVERITY_RANK.__getitem__, default="LOW"
@@ -1467,11 +1541,12 @@ def _aggregate_digest(
         "content_digest": content_digest,
         "grant_digests": sorted(grant.grant_digest for grant in grants),
         "diagnostic_digests": sorted(diagnostic.diagnostic_digest for diagnostic in diagnostics),
-        "mitigated_allow_count": 0,
+        "mitigated_allow_count": mitigated_allow_count,
         "max_severity": max_severity,
         "blocking_critical": any(grant.blocking_critical for grant in grants),
     }
-    return _digest("aggregate.v1", _canonical_bytes(safe))
+    payload = _AGGREGATE_PREFIX + _canonical_bytes(safe)
+    return f"sha256:{sha256(payload).hexdigest()}"
 
 
 def analyze_permission_grants(
@@ -1689,8 +1764,10 @@ def analyze_permission_grants(
                 )
             )
 
+    mitigated_allow_count = 0
     for candidate, mitigated in zip(validated_candidates, restriction_coverage, strict=True):
         if mitigated:
+            mitigated_allow_count += 1
             diagnostics.append(
                 _diagnostic(
                     "mitigated_allow",
@@ -1731,25 +1808,132 @@ def analyze_permission_grants(
         source_identity_digest=source_identity_digest,
         grants=sorted_grants,
         diagnostics=sorted_diagnostics,
+        mitigated_allow_count=mitigated_allow_count,
     )
     return PermissionAnalysis(
         True, outcome, reason, sorted_grants, sorted_diagnostics, aggregate_digest
     )
 
 
+def _is_full_digest(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_DIGEST.fullmatch(value) is not None
+
+
+def _is_positive_source_line(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _valid_reportable_grant(grant: object) -> bool:
+    if not isinstance(grant, PermissionGrant):
+        return False
+    if not all(
+        type(value) is str
+        for value in (
+            grant.grant_kind,
+            grant.severity,
+            grant.activation_requirement,
+            grant.interface_applicability,
+            grant.tracking_status,
+        )
+    ):
+        return False
+    if _GRANT_SEVERITY_BY_KIND.get(grant.grant_kind) != grant.severity:
+        return False
+    if grant.activation_requirement not in _GRANT_ACTIVATION_REQUIREMENTS:
+        return False
+    if grant.interface_applicability not in _GRANT_INTERFACE_APPLICABILITY:
+        return False
+    if grant.tracking_status not in _GRANT_TRACKING_STATUS:
+        return False
+    if not isinstance(grant.blocking_critical, bool):
+        return False
+    if grant.blocking_critical is not (grant.severity == "CRITICAL"):
+        return False
+    if not _is_full_digest(grant.grant_digest):
+        return False
+    if not _is_positive_source_line(grant.source_line):
+        return False
+
+    if grant.grant_kind in _MODE_GRANT_KINDS:
+        return (
+            grant.activation_requirement == "interface_and_external_policy"
+            and grant.interface_applicability == "permission_mode_interface_dependent"
+        )
+    expected_activation = (
+        "workspace_trust"
+        if grant.tracking_status == "not_applicable"
+        else "local_provenance_and_session_policy"
+    )
+    return (
+        grant.activation_requirement == expected_activation
+        and grant.interface_applicability == "claude_code_settings_consumers"
+    )
+
+
+def _valid_reportable_diagnostic(diagnostic: object) -> bool:
+    if not isinstance(diagnostic, PermissionDiagnostic):
+        return False
+    if type(diagnostic.diagnostic_kind) is not str:
+        return False
+    if not isinstance(diagnostic.affects_completeness, bool):
+        return False
+    if (
+        _DIAGNOSTIC_COMPLETENESS.get(diagnostic.diagnostic_kind)
+        is not diagnostic.affects_completeness
+    ):
+        return False
+    return _is_full_digest(diagnostic.diagnostic_digest) and _is_positive_source_line(
+        diagnostic.source_line
+    )
+
+
+def _validated_finding_source_kind(analysis: PermissionAnalysis) -> str:
+    """Validate an internal analysis before projecting any report-visible data."""
+    if analysis.applicable is not True:
+        raise ValueError("invalid permission analysis")
+    if not isinstance(analysis.grants, tuple) or not isinstance(analysis.diagnostics, tuple):
+        raise ValueError("invalid permission analysis")
+    if not all(_valid_reportable_grant(grant) for grant in analysis.grants):
+        raise ValueError("invalid permission analysis")
+    if not all(_valid_reportable_diagnostic(diagnostic) for diagnostic in analysis.diagnostics):
+        raise ValueError("invalid permission analysis")
+    if not _is_full_digest(analysis.aggregate_digest):
+        raise ValueError("invalid permission analysis")
+    if len({grant.grant_digest for grant in analysis.grants}) != len(analysis.grants):
+        raise ValueError("invalid permission analysis")
+    if len({item.diagnostic_digest for item in analysis.diagnostics}) != len(analysis.diagnostics):
+        raise ValueError("invalid permission analysis")
+
+    incomplete = any(item.affects_completeness for item in analysis.diagnostics)
+    expected_outcome = LedgerOutcome.PARTIAL if incomplete else LedgerOutcome.COMPLETED
+    expected_reason = LedgerReason.INVALID_CONFIGURATION if incomplete else None
+    if analysis.outcome is not expected_outcome or analysis.reason is not expected_reason:
+        raise ValueError("invalid permission analysis")
+
+    tracking_statuses = {grant.tracking_status for grant in analysis.grants}
+    if tracking_statuses == {"not_applicable"}:
+        return "project_settings"
+    if tracking_statuses == {"unknown"}:
+        return "project_local_settings"
+    raise ValueError("invalid permission analysis")
+
+
 def build_bh3_finding(analysis: PermissionAnalysis, *, source_path: str) -> Finding | None:
     """Build one structurally safe BH3 finding for retained reportable grants."""
-    if not analysis.grants or analysis.aggregate_digest is None:
+    if not isinstance(analysis, PermissionAnalysis):
+        raise ValueError("invalid permission analysis")
+    if not analysis.grants:
         return None
+    if not isinstance(source_path, str):
+        raise ValueError("invalid permission analysis")
+    source_kind = _validated_finding_source_kind(analysis)
     max_severity = max(
         (grant.severity for grant in analysis.grants), key=_SEVERITY_RANK.__getitem__
     )
     evidence: dict[str, object] = {
         "schema": _EVIDENCE_SCHEMA,
         "claude_semantics_snapshot": _SEMANTICS_SNAPSHOT,
-        "source_kind": "project_settings"
-        if all(grant.tracking_status == "not_applicable" for grant in analysis.grants)
-        else "project_local_settings",
+        "source_kind": source_kind,
         "declaration_status": "declared",
         "artifact_effect_status": "conditional",
         "activation_requirement": ",".join(
