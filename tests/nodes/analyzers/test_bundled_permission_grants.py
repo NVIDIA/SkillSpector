@@ -871,9 +871,13 @@ def test_ordinary_win32_earlier_multi_dot_run_remains_literal() -> None:
 @pytest.mark.parametrize(
     "directory",
     [
+        "//?/C:/...",
+        "//?/C:/.../",
         "//?/C:/.ssh.",
         "//?/C:/.ssh /child",
         "//?/C:/foo/.. /child",
+        "//?/UNC/server/share/...",
+        "//?/UNC/server/share/.../",
         "//?/UNC/server/share/.ssh.",
         "//?/UNC/server/share/.ssh /child",
     ],
@@ -887,41 +891,62 @@ def test_extended_windows_tail_does_not_receive_win32_trimming(directory: str) -
 
 
 @pytest.mark.parametrize(
-    ("directory", "expected_kind", "expected_severity"),
+    ("directory", "expected_kind", "expected_severity", "expected_blocking"),
     [
-        ("//?/C:/foo/..", "external_additional_directory", "MEDIUM"),
-        ("//?/C:/./", "external_additional_directory", "MEDIUM"),
-        ("//?/C:/.ssh/..", "sensitive_additional_directory", "HIGH"),
+        ("//?/C:/foo/..", "root_or_home_additional_directory", "CRITICAL", True),
+        ("//?/C:/./", "root_or_home_additional_directory", "CRITICAL", True),
+        ("//?/C:/../../", "root_or_home_additional_directory", "CRITICAL", True),
+        ("//?/C:/.ssh/..", "root_or_home_additional_directory", "CRITICAL", True),
+        ("//?/C:/.config/./gh", "sensitive_additional_directory", "HIGH", False),
         (
             "//?/UNC/server/share/.ssh/..",
+            "external_additional_directory",
+            "MEDIUM",
+            False,
+        ),
+        (
+            "//?/UNC/server/share/../../",
+            "external_additional_directory",
+            "MEDIUM",
+            False,
+        ),
+        (
+            "//?/UNC/server/share/.config/./gh",
             "sensitive_additional_directory",
             "HIGH",
+            False,
         ),
     ],
 )
-def test_extended_windows_current_and_parent_components_remain_literal(
-    directory: str, expected_kind: str, expected_severity: str
+def test_extended_windows_exact_current_and_parent_components_are_collapsed(
+    directory: str, expected_kind: str, expected_severity: str, expected_blocking: bool
 ) -> None:
     result = _analyze({"additionalDirectories": [directory]})
 
-    assert [(grant.grant_kind, grant.severity) for grant in result.grants] == [
-        (expected_kind, expected_severity)
-    ]
+    assert [
+        (grant.grant_kind, grant.severity, grant.blocking_critical) for grant in result.grants
+    ] == [(expected_kind, expected_severity, expected_blocking)]
 
 
 @pytest.mark.parametrize(
-    ("literal", "collapsed"),
+    ("variant", "canonical"),
     [
         ("//?/C:/foo/..", "//?/C:/"),
+        ("//?/C:/../../", "C:/"),
+        (r"\\?\C:\foo\..", "C:/"),
         ("//?/UNC/server/share/foo/..", "//?/UNC/server/share"),
-        ("//?/UNC/server/share/./", "//?/UNC/server/share"),
+        ("//?/UNC/server/share/../../", "//server/share"),
+        (r"\\?\UNC\server\share\foo\..", "//server/share"),
+        ("//?/UNC/server/share/./", "//server/share"),
     ],
 )
-def test_extended_literal_dot_components_do_not_deduplicate(literal: str, collapsed: str) -> None:
-    result = _analyze({"additionalDirectories": [literal, collapsed]})
+def test_extended_lexical_normalization_deduplicates_with_canonical_identity(
+    variant: str, canonical: str
+) -> None:
+    expected = _analyze({"additionalDirectories": [canonical]})
+    result = _analyze({"additionalDirectories": [variant, canonical, variant]})
 
-    assert len(result.grants) == 2
-    assert len(result.diagnostics) == 4
+    assert result == expected
 
 
 @pytest.mark.parametrize(
@@ -993,7 +1018,6 @@ def test_ordinary_credential_store_near_matches_are_not_sensitive(directory: str
         "C:/.config/*/gh",
         "//server/share/.config/*/gh",
         "//?/UNC/server/share/.config/*/gh",
-        "//?/C:/.config/./gh",
     ],
 )
 def test_credential_store_pair_does_not_skip_literal_components(directory: str) -> None:

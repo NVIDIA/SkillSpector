@@ -1212,7 +1212,7 @@ def _normalize_unc_parts(
     normalized_tail = (
         _normalize_win32_tail_parts(tail)
         if win32_tail
-        else tuple(part for part in tail.split("/") if part)
+        else _collapse_lexical_parts(tail, clamp_root=True)
     )
     return (*raw_parts[:2], *normalized_tail)
 
@@ -1289,7 +1289,7 @@ def _classify_additional_directory(
             remainder = extended[2:]
             if not remainder.startswith("/"):
                 return _platform_dependent_directory(value, source_line=source_line)
-            extended_drive_parts = tuple(part for part in remainder.split("/") if part)
+            extended_drive_parts = _collapse_lexical_parts(remainder, clamp_root=True)
             identity = f"drive:{extended[0].upper()}:/{'/'.join(extended_drive_parts)}"
             return _conditional_windows_directory(
                 identity,
