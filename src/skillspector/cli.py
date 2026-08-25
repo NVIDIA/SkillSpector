@@ -294,6 +294,7 @@ def _scan_state(
         "input_path": input_path,
         "output_format": format.value,
         "use_llm": not no_llm,
+        "llm_requested": not no_llm,
     }
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir

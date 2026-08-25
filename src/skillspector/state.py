@@ -288,6 +288,10 @@ class SkillspectorState(TypedDict, total=False):
     # and the semantic_* analyzers) return immediately without calling the LLM.
     # Each such node checks use_llm itself; there is no graph-level routing.
     use_llm: bool
+    # Optional caller intent when preflight disables execution before the graph.
+    # Report generation uses this to distinguish unavailable requested analysis from an
+    # explicit static-only scan while analyzers continue to honor use_llm.
+    llm_requested: bool
 
     # Risk: report node sets these from risk_score
     risk_severity: str
