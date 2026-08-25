@@ -42,6 +42,7 @@ from skillspector.state import (
 )
 
 ANALYZER_ID = "semantic_quality_policy"
+requires_api_key = True
 logger = get_logger(__name__)
 
 
