@@ -78,6 +78,7 @@ _PROJECT_SETTINGS: Final = {
     ".claude/settings.json": ("project_settings", "project_session"),
     ".claude/settings.local.json": ("project_local_settings", "project_local_session"),
 }
+_ARCHIVE_CONTAINER_TYPES: Final = frozenset({"docx", "pptx", "xlsx", "zip"})
 _FRONTMATTER_DELIMITER: Final = re.compile(r"^(?:---|\.\.\.)[ \t]*$")
 _MAX_YAML_COLLECTION_DEPTH: Final = 64
 _MAX_YAML_NODES: Final = 2048
@@ -180,7 +181,11 @@ class MarketplaceEntry:
 
 
 def _digest(domain: str, value: str) -> str:
-    payload = f"skillspector.bundled_hook.v1\0{domain}\0{value}".encode()
+    return _digest_bytes(domain, value.encode("utf-8"))
+
+
+def _digest_bytes(domain: str, value: bytes) -> str:
+    payload = f"skillspector.bundled_hook.v1\0{domain}\0".encode() + value
     return f"sha256:{sha256(payload).hexdigest()}"
 
 
@@ -213,6 +218,24 @@ def _load_json(content: str) -> dict[str, object]:
     if not isinstance(raw, dict):
         raise InvalidHookConfigurationError("JSON root must be an object")
     return cast(dict[str, object], raw)
+
+
+def _canonical_settings_bytes(content: str, raw_content: bytes | None) -> bytes:
+    """Return canonical UTF-8 bytes or reject a lossy/mismatched text projection."""
+    if len(content) > MAX_FILE_CHARS:
+        raise HookConfigurationSizeLimitError(len(content))
+    if raw_content is None:
+        try:
+            return content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise BinaryHookConfigurationError("settings text is not UTF-8") from exc
+    try:
+        decoded = raw_content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BinaryHookConfigurationError("settings bytes are not UTF-8") from exc
+    if decoded != content:
+        raise InvalidHookConfigurationError("settings text does not match canonical bytes")
+    return raw_content
 
 
 def _validate_yaml_before_construction(frontmatter: str) -> None:
@@ -1278,8 +1301,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Discover supported hook documents from deterministic cache state only."""
     component_paths = cast(list[str], state.get("components") or [])
     cache = cast(dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {})
+    raw_cache = cast(dict[str, bytes], state.get("raw_file_cache") or {})
     paths = list(dict.fromkeys(component_paths))
-    known_paths = list(dict.fromkeys([*paths, *cache]))
+    known_paths = list(dict.fromkeys([*paths, *cache, *raw_cache]))
     known_path_set = set(known_paths)
     cache_path_set = set(cache)
     manifest_limited_paths = {
@@ -1300,7 +1324,37 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     def candidates_for_root(root: str) -> list[str]:
         return root_candidate_index.get(_path_parts(root), [])
 
+    component_metadata = state.get("component_metadata", []) or []
+    archive_metadata_paths = {
+        str(item.get("path", ""))
+        for item in component_metadata
+        if isinstance(item.get("container_type"), str)
+        and item.get("container_type") in _ARCHIVE_CONTAINER_TYPES
+    }
+    component_metadata_supplied = "component_metadata" in state
+
+    def archive_namespace_is_corroborated(path: str) -> bool:
+        if "!/" not in path:
+            return True
+        if path in archive_metadata_paths:
+            return True
+        segments = path.split("!/")
+        namespace_prefixes: list[str] = []
+        prefix = segments[0]
+        namespace_prefixes.append(prefix)
+        for segment in segments[1:-1]:
+            prefix = f"{prefix}!/{segment}"
+            namespace_prefixes.append(prefix)
+        corroborating_paths = (
+            archive_metadata_paths if component_metadata_supplied else known_path_set
+        )
+        return bool(namespace_prefixes) and all(
+            prefix in corroborating_paths for prefix in namespace_prefixes
+        )
+
     def project_settings_metadata(path: str) -> tuple[str, str] | None:
+        if not archive_namespace_is_corroborated(path):
+            return None
         _namespace_value, member_parts = _path_parts(path)
         if len(member_parts) != 2:
             return None
@@ -1395,6 +1449,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             continue
 
         try:
+            canonical_content = _canonical_settings_bytes(content, raw_cache.get(path))
             raw = _load_json(content)
         except (InvalidHookConfigurationError, TypeError) as exc:
             settings_work_by_path[path] = _SettingsWork(
@@ -1409,7 +1464,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             )
             continue
 
-        content_digest = _digest("content", content)
+        content_digest = _digest_bytes("content", canonical_content)
         syntax_root = _json_root_node(content)
         permission_source_lines = _permission_source_lines(raw, syntax_root)
         permission_analysis = analyze_permission_grants(
