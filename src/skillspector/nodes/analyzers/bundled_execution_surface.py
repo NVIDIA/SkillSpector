@@ -1325,19 +1325,40 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         return root_candidate_index.get(_path_parts(root), [])
 
     component_metadata = state.get("component_metadata", []) or []
-    archive_metadata_paths = {
-        str(item.get("path", ""))
+    component_metadata_paths = {
+        item["path"] for item in component_metadata if isinstance(item.get("path"), str)
+    }
+    archive_metadata = [
+        item
         for item in component_metadata
         if isinstance(item.get("container_type"), str)
         and item.get("container_type") in _ARCHIVE_CONTAINER_TYPES
+    ]
+    archive_container_metadata_paths = {
+        str(item.get("path", ""))
+        for item in archive_metadata
+        if item.get("type") in _ARCHIVE_CONTAINER_TYPES
+    }
+    archive_member_metadata_paths = {
+        str(item.get("path", ""))
+        for item in archive_metadata
+        if isinstance(item.get("path"), str)
+        and isinstance(item.get("outer_path"), str)
+        and isinstance(item.get("nested_path"), str)
+        and isinstance(item.get("container_depth"), int)
+        and not isinstance(item.get("container_depth"), bool)
+        and cast(int, item["container_depth"]) > 0
+        and item["path"] == f"{item['outer_path']}!/{item['nested_path']}"
     }
     component_metadata_supplied = "component_metadata" in state
 
     def archive_namespace_is_corroborated(path: str) -> bool:
         if "!/" not in path:
             return True
-        if path in archive_metadata_paths:
+        if path in archive_member_metadata_paths:
             return True
+        if path in component_metadata_paths:
+            return False
         segments = path.split("!/")
         namespace_prefixes: list[str] = []
         prefix = segments[0]
@@ -1346,7 +1367,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             prefix = f"{prefix}!/{segment}"
             namespace_prefixes.append(prefix)
         corroborating_paths = (
-            archive_metadata_paths if component_metadata_supplied else known_path_set
+            archive_container_metadata_paths if component_metadata_supplied else known_path_set
         )
         return bool(namespace_prefixes) and all(
             prefix in corroborating_paths for prefix in namespace_prefixes

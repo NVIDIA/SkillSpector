@@ -665,6 +665,60 @@ def test_filesystem_metadata_cannot_corroborate_archive_looking_bang_directory()
     assert result["inspection_ledger"] == []
 
 
+def test_outer_archive_metadata_cannot_corroborate_its_own_literal_bang_path() -> None:
+    """A ZIP stored in a literal bang directory is a container, not a virtual member."""
+    path = "vendor!/.claude/settings.json"
+    raw = b"PK\x05\x06" + (b"\x00" * 18)
+    state = _state({path: raw.decode("utf-8")})
+    state["raw_file_cache"] = {path: raw}
+    state["component_metadata"] = [
+        {
+            "path": path,
+            "type": "zip",
+            "lines": 0,
+            "executable": False,
+            "size_bytes": len(raw),
+            "container_type": "zip",
+            "container_ancestry": ["zip"],
+            "hidden": True,
+            "disguised": True,
+            "local_only": True,
+        }
+    ]
+
+    result = node(state)
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"] == []
+
+
+def test_neighboring_archive_cannot_corroborate_literal_bang_directory_member() -> None:
+    """A real archive prefix cannot activate a distinct ordinary path that resembles a member."""
+    container = "vendor.zip"
+    path = "vendor.zip!/.claude/settings.json"
+    state = _state(
+        {
+            container: "",
+            path: json.dumps({"permissions": {"allow": ["Workflow"]}}),
+        }
+    )
+    state["component_metadata"] = [
+        {
+            "path": container,
+            "type": "zip",
+            "container_type": "zip",
+            "container_ancestry": ["zip"],
+            "local_only": True,
+        },
+        {"path": path, "type": "json", "hidden": True, "local_only": True},
+    ]
+
+    result = node(state)
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"] == []
+
+
 def test_nested_archive_settings_require_and_accept_container_cache_provenance() -> None:
     """Every archive boundary is corroborated by its retained container cache key."""
     outer = "outer.zip"
