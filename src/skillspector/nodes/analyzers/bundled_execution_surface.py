@@ -982,10 +982,226 @@ def _path_parts(path: str) -> tuple[str, tuple[str, ...]]:
     return namespace, tuple(part for part in member.split("/") if part)
 
 
-def _permission_source_identity_digest(path: str) -> str:
-    """Hash the full normalized cache identity, including every archive namespace."""
-    payload = b"skillspector.bundled_permission.source.v1\0" + path.encode("utf-8")
-    return f"sha256:{sha256(payload).hexdigest()}"
+def _permission_source_identity_digest(hops: tuple[tuple[str, str], ...]) -> str:
+    """Hash a sanitized typed projection of opaque physical provenance hops."""
+    projected_hops: list[dict[str, str]] = []
+    for kind, locator in hops:
+        locator_payload = json.dumps(
+            {"kind": kind, "locator": locator},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        locator_digest = (
+            "sha256:"
+            + sha256(b"skillspector.bundled_permission.locator.v1\0" + locator_payload).hexdigest()
+        )
+        projected_hops.append({"kind": kind, "locator_digest": locator_digest})
+    source_payload = json.dumps(
+        {
+            "schema": "skillspector.bundled_permission.provenance.v1",
+            "hops": projected_hops,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return (
+        "sha256:"
+        + sha256(b"skillspector.bundled_permission.source.v2\0" + source_payload).hexdigest()
+    )
+
+
+def _metadata_rows_by_path(
+    component_metadata: list[dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
+    rows_by_path: dict[str, list[dict[str, object]]] = {}
+    for row in component_metadata:
+        path = row.get("path")
+        if isinstance(path, str):
+            rows_by_path.setdefault(path, []).append(row)
+    return rows_by_path
+
+
+def _direct_permission_provenance_hops(
+    path: str, rows_by_path: dict[str, list[dict[str, object]]]
+) -> tuple[tuple[str, str], ...]:
+    rows = rows_by_path.get(path, [])
+    if len(rows) != 1:
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    row = rows[0]
+    if row.get("type") != "json":
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    provenance_fields = {
+        "outer_path",
+        "nested_path",
+        "container_type",
+        "container_ancestry",
+        "container_depth",
+    }
+    if provenance_fields.isdisjoint(row):
+        return (("filesystem", path),)
+    depth = row.get("container_depth")
+    if not (
+        row.get("outer_path") == path
+        and row.get("nested_path") == path
+        and row.get("container_type") == "filesystem"
+        and row.get("container_ancestry") == ["filesystem"]
+        and isinstance(depth, int)
+        and not isinstance(depth, bool)
+        and depth == 0
+    ):
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    return (("filesystem", path),)
+
+
+def _archive_permission_provenance_hops(
+    path: str,
+    *,
+    component_paths: set[str],
+    local_cache_paths: set[str],
+    raw_cache_paths: set[str],
+    rows_by_path: dict[str, list[dict[str, object]]],
+) -> tuple[tuple[str, str], ...]:
+    target_rows = rows_by_path.get(path, [])
+    if len(target_rows) != 1:
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    target = target_rows[0]
+    outer_path = target.get("outer_path")
+    nested_path = target.get("nested_path")
+    ancestry_value = target.get("container_ancestry")
+    depth = target.get("container_depth")
+    if not (
+        isinstance(outer_path, str)
+        and bool(outer_path)
+        and isinstance(nested_path, str)
+        and bool(nested_path)
+        and isinstance(ancestry_value, list)
+        and isinstance(depth, int)
+        and not isinstance(depth, bool)
+        and depth > 0
+    ):
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    ancestry = tuple(ancestry_value)
+    segments = tuple(nested_path.split("!/"))
+    if (
+        len(segments) != depth
+        or len(ancestry) != depth
+        or any(not segment for segment in segments)
+        or any(
+            not isinstance(container_type, str) or container_type not in _ARCHIVE_CONTAINER_TYPES
+            for container_type in ancestry
+        )
+        or target.get("container_type") != ancestry[-1]
+        or target.get("type") != "json"
+        or target.get("local_only") is not True
+        or path != f"{outer_path}!/{nested_path}"
+    ):
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+
+    prefixes = [outer_path]
+    prefixes.extend(f"{outer_path}!/{'!/'.join(segments[:index])}" for index in range(1, depth + 1))
+    for prefix in prefixes:
+        if (
+            prefix not in component_paths
+            or prefix not in local_cache_paths
+            or prefix not in raw_cache_paths
+        ):
+            raise InvalidHookConfigurationError("invalid permission source provenance")
+
+    outer_rows = rows_by_path.get(outer_path, [])
+    if len(outer_rows) != 1:
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    outer = outer_rows[0]
+    outer_depth = outer.get("container_depth")
+    if not (
+        outer.get("type") == ancestry[0]
+        and outer.get("container_type") == ancestry[0]
+        and outer.get("container_ancestry") == [ancestry[0]]
+        and outer.get("local_only") is True
+        and "outer_path" not in outer
+        and "nested_path" not in outer
+        and (
+            "container_depth" not in outer
+            or isinstance(outer_depth, int)
+            and not isinstance(outer_depth, bool)
+            and outer_depth == 0
+        )
+    ):
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+
+    for index, prefix in enumerate(prefixes[1:], start=1):
+        prefix_rows = rows_by_path.get(prefix, [])
+        if len(prefix_rows) != 1:
+            raise InvalidHookConfigurationError("invalid permission source provenance")
+        row = prefix_rows[0]
+        expected_type = ancestry[index] if index < depth else "json"
+        row_depth = row.get("container_depth")
+        if not (
+            row.get("type") == expected_type
+            and row.get("outer_path") == outer_path
+            and row.get("nested_path") == "!/".join(segments[:index])
+            and isinstance(row_depth, int)
+            and not isinstance(row_depth, bool)
+            and row_depth == index
+            and row.get("container_ancestry") == list(ancestry[:index])
+            and row.get("container_type") == ancestry[index - 1]
+            and row.get("local_only") is True
+        ):
+            raise InvalidHookConfigurationError("invalid permission source provenance")
+
+    return (
+        ("filesystem", outer_path),
+        *(("archive_member", segment) for segment in segments),
+    )
+
+
+def _fallback_permission_provenance_hops(
+    path: str, *, cache_paths: set[str]
+) -> tuple[tuple[str, str], ...]:
+    segments = tuple(path.split("!/"))
+    if any(not segment for segment in segments):
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    if len(segments) == 1:
+        return (("filesystem", path),)
+    prefix = segments[0]
+    if prefix not in cache_paths:
+        raise InvalidHookConfigurationError("invalid permission source provenance")
+    for segment in segments[1:-1]:
+        prefix = f"{prefix}!/{segment}"
+        if prefix not in cache_paths:
+            raise InvalidHookConfigurationError("invalid permission source provenance")
+    return (
+        ("filesystem", segments[0]),
+        *(("archive_member", segment) for segment in segments[1:]),
+    )
+
+
+def _claims_archive_member(row: dict[str, object], path: str) -> bool:
+    """Distinguish member-like metadata from filesystem and outer-container rows."""
+    depth = row.get("container_depth")
+    filesystem_only = (
+        row.get("outer_path") == path
+        and row.get("nested_path") == path
+        and row.get("container_type") == "filesystem"
+        and row.get("container_ancestry") == ["filesystem"]
+        and isinstance(depth, int)
+        and not isinstance(depth, bool)
+        and depth == 0
+    )
+    if filesystem_only:
+        return False
+    if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
+        return True
+    outer_path = row.get("outer_path")
+    nested_path = row.get("nested_path")
+    return (
+        isinstance(outer_path, str)
+        and bool(outer_path)
+        and isinstance(nested_path, str)
+        and bool(nested_path)
+        and path == f"{outer_path}!/{nested_path}"
+    )
 
 
 def _is_within_root(path: str, root: str) -> bool:
@@ -1351,64 +1567,61 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     def candidates_for_root(root: str) -> list[str]:
         return root_candidate_index.get(_path_parts(root), [])
 
-    component_metadata = state.get("component_metadata", []) or []
-    component_metadata_paths = {
-        item["path"] for item in component_metadata if isinstance(item.get("path"), str)
-    }
-    archive_metadata = [
-        item
-        for item in component_metadata
-        if isinstance(item.get("container_type"), str)
-        and item.get("container_type") in _ARCHIVE_CONTAINER_TYPES
-    ]
-    archive_container_metadata_paths = {
-        str(item.get("path", ""))
-        for item in archive_metadata
-        if item.get("type") in _ARCHIVE_CONTAINER_TYPES
-    }
-    archive_member_metadata_paths = {
-        str(item.get("path", ""))
-        for item in archive_metadata
-        if isinstance(item.get("path"), str)
-        and isinstance(item.get("outer_path"), str)
-        and isinstance(item.get("nested_path"), str)
-        and isinstance(item.get("container_depth"), int)
-        and not isinstance(item.get("container_depth"), bool)
-        and cast(int, item["container_depth"]) > 0
-        and item["path"] == f"{item['outer_path']}!/{item['nested_path']}"
-    }
+    component_metadata = cast(list[dict[str, object]], state.get("component_metadata", []) or [])
+    metadata_rows_by_path = _metadata_rows_by_path(component_metadata)
     component_metadata_supplied = "component_metadata" in state
+    component_path_set = set(paths)
+    local_cache_path_set = set(cache)
+    raw_cache_path_set = set(raw_cache)
+    content_cache_path_set = local_cache_path_set | raw_cache_path_set
+
+    def archive_provenance_hops(path: str) -> tuple[tuple[str, str], ...]:
+        return _archive_permission_provenance_hops(
+            path,
+            component_paths=component_path_set,
+            local_cache_paths=local_cache_path_set,
+            raw_cache_paths=raw_cache_path_set,
+            rows_by_path=metadata_rows_by_path,
+        )
+
+    def permission_provenance_hops(path: str) -> tuple[tuple[str, str], ...]:
+        if not component_metadata_supplied:
+            return _fallback_permission_provenance_hops(path, cache_paths=content_cache_path_set)
+        if "!/" in path:
+            return archive_provenance_hops(path)
+        return _direct_permission_provenance_hops(path, metadata_rows_by_path)
 
     def archive_namespace_is_corroborated(
         path: str, *, referring_paths: set[str] | None = None
     ) -> bool:
         if "!/" not in path:
             return True
-        if path in archive_member_metadata_paths:
+        if not component_metadata_supplied:
+            try:
+                _fallback_permission_provenance_hops(path, cache_paths=content_cache_path_set)
+            except InvalidHookConfigurationError:
+                return False
             return True
-        if path in component_metadata_paths:
-            return False
-        if component_metadata_supplied:
-            namespace = _namespace(path)
-            return (
-                namespace in archive_container_metadata_paths
-                and referring_paths is not None
-                and any(
-                    referring_path in archive_member_metadata_paths
-                    and _namespace(referring_path) == namespace
-                    for referring_path in referring_paths
-                )
-            )
-        segments = path.split("!/")
-        namespace_prefixes: list[str] = []
-        prefix = segments[0]
-        namespace_prefixes.append(prefix)
-        for segment in segments[1:-1]:
-            prefix = f"{prefix}!/{segment}"
-            namespace_prefixes.append(prefix)
-        return bool(namespace_prefixes) and all(
-            prefix in known_path_set for prefix in namespace_prefixes
-        )
+
+        target_rows = metadata_rows_by_path.get(path, [])
+        if target_rows:
+            try:
+                archive_provenance_hops(path)
+            except InvalidHookConfigurationError:
+                return any(_claims_archive_member(row, path) for row in target_rows)
+            return True
+        if path in known_path_set:
+            return True
+        namespace = _namespace(path)
+        for referring_path in referring_paths or ():
+            if _namespace(referring_path) != namespace:
+                continue
+            try:
+                archive_provenance_hops(referring_path)
+            except InvalidHookConfigurationError:
+                continue
+            return True
+        return False
 
     def project_settings_metadata(
         path: str, *, referring_paths: set[str] | None = None
@@ -1494,13 +1707,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             continue
 
         content = cache.get(path)
-        source_identity_digest = _permission_source_identity_digest(path)
         if content is None:
             settings_work_by_path[path] = _SettingsWork(
                 source_path=path,
                 source_kind=settings[0],
                 content_digest=_digest("content", ""),
-                source_identity_digest=source_identity_digest,
+                source_identity_digest="",
                 raw=None,
                 parse_error=KeyError(path),
                 permission_analysis=None,
@@ -1516,7 +1728,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 source_path=path,
                 source_kind=settings[0],
                 content_digest=_digest("content", ""),
-                source_identity_digest=source_identity_digest,
+                source_identity_digest="",
                 raw=None,
                 parse_error=exc,
                 permission_analysis=None,
@@ -1529,13 +1741,30 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             _json_root_node(content) if _json_location_recovery_allowed(content, raw) else None
         )
         permission_source_lines = _permission_source_lines(raw, syntax_root)
-        permission_analysis = analyze_permission_grants(
-            raw,
-            source_kind=settings[0],
-            content_digest=content_digest,
-            source_identity_digest=source_identity_digest,
-            source_lines=permission_source_lines,
-        )
+        source_identity_digest = ""
+        if "permissions" not in raw:
+            permission_analysis = PermissionAnalysis(False, None, None, (), (), None)
+        else:
+            try:
+                provenance_hops = permission_provenance_hops(path)
+            except InvalidHookConfigurationError:
+                permission_analysis = PermissionAnalysis(
+                    True,
+                    LedgerOutcome.FAILED,
+                    LedgerReason.INVALID_CONFIGURATION,
+                    (),
+                    (),
+                    None,
+                )
+            else:
+                source_identity_digest = _permission_source_identity_digest(provenance_hops)
+                permission_analysis = analyze_permission_grants(
+                    raw,
+                    source_kind=settings[0],
+                    content_digest=content_digest,
+                    source_identity_digest=source_identity_digest,
+                    source_lines=permission_source_lines,
+                )
         settings_work_by_path[path] = _SettingsWork(
             source_path=path,
             source_kind=settings[0],
@@ -1910,7 +2139,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 source_path=reference_path,
                 source_kind=settings[0],
                 content_digest=_digest("content", ""),
-                source_identity_digest=_permission_source_identity_digest(reference_path),
+                source_identity_digest="",
                 raw=None,
                 parse_error=KeyError(reference_path),
                 permission_analysis=None,
