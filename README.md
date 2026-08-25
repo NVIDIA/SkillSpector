@@ -590,8 +590,6 @@ SkillSpector detects the vulnerability patterns listed below:
 | BH2 | Bundled Hook Data Exfiltration | CRITICAL | Correlates sensitive hook data, credentials, or files with a concrete outbound transport in one reachable handler chain |
 | BH3 | Bundled Permission Grant | MEDIUM-CRITICAL | Classifies conditional permission capabilities declared in supported Claude Code project settings without retaining raw grant values |
 
-All detected patterns are listed in the tables above.
-
 ## Risk Scoring
 
 ### Score Calculation
