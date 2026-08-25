@@ -24,7 +24,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **73 vulnerability patterns** across 18 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, MCP tool poisoning, and bundled execution surfaces
+- **Broad vulnerability coverage**: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, MCP tool poisoning, and bundled execution surfaces
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Claude Code bundled hook and permission analysis**: Deterministic BH1 execution-surface inventory, correlated BH2 sensitive-data exfiltration detection, and BH3 project permission-grant classification
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
@@ -65,12 +65,18 @@ BH1 and BH2 classification is pinned to the documented Claude Code **2.1.238 sem
 BH3 is pinned to **2.1.241**. These snapshots are static parsing and classification contracts, not
 claims that an installed Claude Code version loads or enforces every accepted declaration. A BH3
 finding proves only that the artifact declares a classified grant. Runtime activation still depends
-on workspace trust, whether a local settings file belongs to the current user and checkout, the
-Claude interface and session mode, and user, managed, command-line, and other external policy.
+on provenance and trust. Capability-granting `permissions.allow` rules and
+`permissions.additionalDirectories` entries in shared `.claude/settings.json` wait for workspace
+trust. `.claude/settings.local.json` normally applies without that trust step only when Claude treats
+it as user-local, such as an untracked file or one outside Git. A Git-tracked local file or symlinked
+`.claude` directory is repository-supplied and trust-gated. Activation also depends on the Claude
+interface and session mode and on user, managed, command-line, and other external policy.
 SkillSpector cannot infer those facts from the artifact, so BH3 records activation, provenance,
 runtime, and interface uncertainty instead of labeling a declaration as an observed runtime grant.
-See Claude Code's [settings scopes](https://code.claude.com/docs/en/settings#settings-files),
-[permission rules](https://code.claude.com/docs/en/permissions), and
+See Claude Code's
+[settings scopes](https://code.claude.com/docs/en/settings#settings-files),
+[project grant trust](https://code.claude.com/docs/en/permissions#project-allow-rules-and-workspace-trust),
+[local settings trust](https://code.claude.com/docs/en/permissions#when-your-local-settings-file-needs-trust), and
 [permission modes](https://code.claude.com/docs/en/permission-modes).
 
 Analysis fails closed when an applicable hook, permission document, or runnable/reachable payload
@@ -418,7 +424,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **73 vulnerability patterns** across 18 categories:
+SkillSpector detects the vulnerability patterns listed below:
 
 ### Prompt Injection (6 patterns)
 
