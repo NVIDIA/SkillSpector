@@ -743,7 +743,7 @@ def _assert_terminal_evidence(
 
 
 def _assert_permission_canaries_absent(projection: str) -> None:
-    assert "CANARY" not in projection
+    assert "canary" not in projection.casefold()
     for canary in _PERMISSION_CANARIES:
         assert canary not in projection
         assert json.dumps(canary, ensure_ascii=True)[1:-1] not in projection
@@ -751,8 +751,13 @@ def _assert_permission_canaries_absent(projection: str) -> None:
 
 @pytest.mark.parametrize(
     "transformed",
-    [r"\*\*CANARY-markdown\*\*", "CANARY-control-"],
-    ids=["markdown-escaped", "control-stripped"],
+    [
+        r"\*\*CANARY-markdown\*\*",
+        "CANARY-control-",
+        "canary-secret.example",
+        "canary_mcp_server",
+    ],
+    ids=["markdown-escaped", "control-stripped", "domain-lowercased", "mcp-lowercased"],
 )
 def test_permission_canary_assertion_rejects_sanitizer_transforms(transformed: str) -> None:
     with pytest.raises(AssertionError):
