@@ -309,13 +309,24 @@ class TestP9PatternDefaults:
         assert pattern_defaults.get_remediation("P9").strip()
 
 
-@pytest.mark.parametrize("rule_id", ["BH1", "BH2"])
-def test_bundled_execution_pattern_defaults_are_complete(rule_id: str) -> None:
-    """Deterministic bundled-hook findings have complete report metadata."""
+@pytest.mark.parametrize(
+    ("rule_id", "pattern_name"),
+    [
+        ("BH1", "Bundled Hook Execution Surface"),
+        ("BH2", "Bundled Hook Data Exfiltration"),
+        ("BH3", "Bundled Permission Grant"),
+    ],
+)
+def test_bundled_execution_pattern_defaults_are_complete(rule_id: str, pattern_name: str) -> None:
+    """Deterministic bundled-surface findings have complete report metadata."""
     from skillspector.nodes.analyzers import pattern_defaults
 
+    assert rule_id in pattern_defaults.DEFAULT_EXPLANATIONS
+    assert rule_id in pattern_defaults.RULE_ID_TO_CATEGORY
+    assert rule_id in pattern_defaults.PATTERN_NAMES
+    assert rule_id in pattern_defaults.DEFAULT_REMEDIATIONS
     assert pattern_defaults.get_category(rule_id) == "Bundled Execution Surface"
-    assert pattern_defaults.get_pattern_name(rule_id).strip()
+    assert pattern_defaults.get_pattern_name(rule_id) == pattern_name
     assert pattern_defaults.get_explanation(rule_id).strip()
     assert pattern_defaults.get_remediation(rule_id).strip()
 

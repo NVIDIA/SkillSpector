@@ -68,3 +68,9 @@ class TestAnalyzerRegistry:
         """ANALYZER_NODES has no entries beyond ANALYZER_NODE_IDS."""
         for node_id in ANALYZER_NODES:
             assert node_id in ANALYZER_NODE_IDS, f"Extra ANALYZER_NODES entry: {node_id}"
+
+    def test_permission_grants_extend_the_existing_bundled_surface_node(self) -> None:
+        """BH3 must not add a second analyzer node for the same settings document."""
+        assert ANALYZER_NODE_IDS.count("bundled_execution_surface") == 1
+        assert "bundled_permission_grants" not in ANALYZER_NODE_IDS
+        assert "bundled_permission_grants" not in ANALYZER_NODES

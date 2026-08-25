@@ -240,7 +240,7 @@ def _format_findings_for_prompt(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-_STRUCTURAL_RULE_IDS = frozenset({"BH1", "BH2"})
+_STRUCTURAL_RULE_IDS = frozenset({"BH1", "BH2", "BH3"})
 
 
 def _fallback_filtered(findings: list[Finding]) -> list[Finding]:

@@ -1065,6 +1065,163 @@ def test_no_llm_structural_finding_bypasses_confidence_filter() -> None:
     assert [finding.finding_id for finding in result["findings"]] == ["bh1-structural"]
 
 
+def _permission_structural_finding(*, confidence: float = 0.1) -> Finding:
+    return Finding(
+        rule_id="BH3",
+        message="bundled permission grant",
+        finding_id="bh3-structural",
+        severity="LOW",
+        confidence=confidence,
+        file=".claude/settings.json",
+        tags=["structural"],
+        evidence={"blocking_critical": False},
+    )
+
+
+def test_structural_permission_finding_never_constructs_llm_analyzer() -> None:
+    """BH3 is provider-local even without relying on a local-only metadata tag."""
+    structural = _permission_structural_finding()
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as analyzer_cls:
+        result = meta_analyzer(
+            {
+                "findings": [structural],
+                "file_cache": {".claude/settings.json": "raw-permission-canary"},
+                "use_llm": True,
+            }
+        )
+
+    analyzer_cls.assert_not_called()
+    assert [finding.finding_id for finding in result["findings"]] == ["bh3-structural"]
+    assert result["effective_finding_ids"] == ["bh3-structural"]
+    assert "llm-unconfirmed" not in result["findings"][0].tags
+    assert result["analyzer_status_events"][0]["status"] == "completed"
+
+
+def test_no_llm_structural_permission_finding_bypasses_confidence_filter() -> None:
+    """Deterministic BH3 survives below the ordinary no-LLM confidence threshold."""
+    result = meta_analyzer(
+        {"findings": [_permission_structural_finding(confidence=0.01)], "use_llm": False}
+    )
+
+    assert [finding.finding_id for finding in result["findings"]] == ["bh3-structural"]
+    assert "llm-unconfirmed" not in result["findings"][0].tags
+
+
+def test_structural_permission_finding_is_partitioned_before_provider_rejection() -> None:
+    """A rejection can annotate ordinary work but never reaches or annotates BH3."""
+    structural = _permission_structural_finding(confidence=1.0)
+    ordinary = _lineage_finding("ordinary", "ordinary.py", 1)
+    batch = Batch(file_path="ordinary.py", content="ordinary", findings=[ordinary])
+
+    with (
+        patch(MOCK_PATCH_TARGET, _mock_get_chat_model),
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]) as get_batches,
+        patch.object(
+            LLMMetaAnalyzer,
+            "arun_batches",
+            new_callable=AsyncMock,
+            return_value=[(batch, [])],
+        ),
+    ):
+        result = meta_analyzer(
+            {
+                "findings": [structural, ordinary],
+                "file_cache": {
+                    ".claude/settings.json": "raw-permission-canary",
+                    "ordinary.py": "ordinary",
+                },
+                "manifest": {},
+                "model_config": {},
+                "use_llm": True,
+            }
+        )
+
+    assert get_batches.call_args.args[2] == [ordinary]
+    assert [finding.finding_id for finding in result["findings"]] == [
+        "bh3-structural",
+        "ordinary",
+    ]
+    assert "llm-unconfirmed" not in result["findings"][0].tags
+    assert "llm-unconfirmed" in result["findings"][1].tags
+    assert result["effective_finding_ids"] == ["bh3-structural", "ordinary"]
+
+
+def test_structural_permission_path_keeps_companion_findings_provider_local() -> None:
+    """A BH3 settings document and every finding on it stay out of provider batches."""
+    structural = _permission_structural_finding(confidence=1.0)
+    companion = Finding(
+        rule_id="E1",
+        message="network syntax",
+        finding_id="settings-companion",
+        severity="MEDIUM",
+        confidence=0.9,
+        file=".claude/settings.json",
+        start_line=2,
+    )
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as analyzer_cls:
+        result = meta_analyzer(
+            {
+                "findings": [structural, companion],
+                "file_cache": {".claude/settings.json": "raw-permission-canary"},
+                "use_llm": True,
+            }
+        )
+
+    analyzer_cls.assert_not_called()
+    assert [finding.finding_id for finding in result["findings"]] == [
+        "bh3-structural",
+        "settings-companion",
+    ]
+    assert all("llm-unconfirmed" not in finding.tags for finding in result["findings"])
+    assert len(result["inspection_ledger"]) == 1
+    assert result["inspection_ledger"][0]["emitted_finding_ids"] == [
+        "bh3-structural",
+        "settings-companion",
+    ]
+
+
+def test_structural_permission_lineage_survives_provider_failure() -> None:
+    """BH3 remains effective and provider-local when separate provider work fails."""
+    structural = _permission_structural_finding(confidence=1.0)
+    ordinary = _lineage_finding("ordinary", "ordinary.py", 1)
+    batch = Batch(file_path="ordinary.py", content="ordinary", findings=[ordinary])
+
+    with (
+        patch(MOCK_PATCH_TARGET, _mock_get_chat_model),
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]),
+        patch.object(
+            LLMMetaAnalyzer,
+            "arun_batches",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("provider unavailable"),
+        ),
+    ):
+        result = meta_analyzer(
+            {
+                "findings": [structural, ordinary],
+                "file_cache": {
+                    ".claude/settings.json": "raw-permission-canary",
+                    "ordinary.py": "ordinary",
+                },
+                "manifest": {},
+                "model_config": {},
+                "use_llm": True,
+            }
+        )
+
+    assert [finding.finding_id for finding in result["findings"]] == [
+        "bh3-structural",
+        "ordinary",
+    ]
+    assert result["effective_finding_ids"] == ["bh3-structural", "ordinary"]
+    assert "llm-unconfirmed" not in result["findings"][0].tags
+    assert result["inspection_ledger"][0]["path"] == ".claude/settings.json"
+    assert result["inspection_ledger"][0]["emitted_finding_ids"] == ["bh3-structural"]
+    assert result["analyzer_status_events"][0]["status"] == "unavailable"
+
+
 # ---------------------------------------------------------------------------
 # LLM-call telemetry + fail-closed construction (drives the report's
 # degradation signal).

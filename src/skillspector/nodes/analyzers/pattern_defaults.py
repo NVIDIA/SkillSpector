@@ -98,6 +98,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SC9": "Executable content is concealed inside a document container or hidden/disguised artifact, where extension-based review can miss it.",
     "BH1": "The artifact declares Claude Code hooks that can run automatically when runtime events fire. Review the activation scope and handler behavior before enabling the artifact.",
     "BH2": "A bundled hook contains a correlated path from sensitive runtime data to an outbound transport. Enabling the artifact can disclose prompts, tool data, credentials, or local files.",
+    "BH3": "The artifact declares Claude Code permission grants that can broaden tool or permission-mode access when the artifact is trusted. Review every effective grant before enabling the artifact.",
     # Trigger Abuse
     "TR1": "Skill uses overly broad trigger patterns that match common words or phrases, causing it to activate in unintended contexts and potentially shadow other skills.",
     "TR2": "Skill trigger shadows a common built-in command or another skill's trigger, potentially intercepting requests meant for trusted functionality.",
@@ -200,6 +201,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SC9": PatternCategory.SUPPLY_CHAIN.value,
     "BH1": PatternCategory.BUNDLED_EXECUTION_SURFACE.value,
     "BH2": PatternCategory.BUNDLED_EXECUTION_SURFACE.value,
+    "BH3": PatternCategory.BUNDLED_EXECUTION_SURFACE.value,
     "TR1": PatternCategory.TRIGGER_ABUSE.value,
     "TR2": PatternCategory.TRIGGER_ABUSE.value,
     "TR3": PatternCategory.TRIGGER_ABUSE.value,
@@ -289,6 +291,7 @@ PATTERN_NAMES: dict[str, str] = {
     "SC9": "Concealed Executable Artifact",
     "BH1": "Bundled Hook Execution Surface",
     "BH2": "Bundled Hook Data Exfiltration",
+    "BH3": "Bundled Permission Grant",
     "TR1": "Overly Broad Trigger",
     "TR2": "Shadow Command Trigger",
     "TR3": "Keyword Baiting Trigger",
@@ -387,6 +390,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SC9": "Keep executable files explicit and directly reviewable. Review the artifact provenance and why executable content is packaged inside a document, hidden file, or disguised container.",
     "BH1": "Inspect every declared hook, narrow its event and matcher scope, and remove handlers that are not essential. Do not enable the artifact until its automatic execution behavior is trusted.",
     "BH2": "Remove the sensitive source-to-outbound-sink flow. Never forward hook event input, prompt or tool data, credentials, or sensitive files to an external destination.",
+    "BH3": "Remove grants that are not essential, replace broad rules with narrowly scoped permissions, and avoid bypass permission modes. Do not trust the artifact until every effective grant is justified.",
     # Trigger Abuse
     "TR1": "Use specific, narrow trigger patterns that match only the skill's intended use case. Avoid single-word or common-phrase triggers.",
     "TR2": "Choose triggers that do not conflict with built-in commands or other skills. Prefix with a unique namespace if necessary.",

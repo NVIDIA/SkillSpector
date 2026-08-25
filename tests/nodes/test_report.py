@@ -120,6 +120,63 @@ class TestComputeRiskScoreBasic:
         assert band == "HIGH"
         assert recommendation == "DO_NOT_INSTALL"
 
+    @pytest.mark.parametrize(
+        "severity,confidence", [("CRITICAL", 1.0), ("LOW", 1.0), ("LOW", 0.001)]
+    )
+    def test_blocking_permission_grant_enforces_strict_boolean_risk_floor(
+        self, severity: str, confidence: float
+    ) -> None:
+        finding = _finding("BH3", severity, confidence=confidence, file=".claude/settings.json")
+        finding.evidence = {"blocking_critical": True}
+
+        assert _compute_risk_score([finding], False) == (51, "HIGH", "DO_NOT_INSTALL")
+
+    @pytest.mark.parametrize(
+        ("marker", "severity", "expected_score"),
+        [
+            (False, "CRITICAL", 50),
+            ("true", "LOW", 5),
+            (1, "HIGH", 25),
+            (None, "MEDIUM", 10),
+        ],
+    )
+    def test_permission_floor_rejects_non_true_markers(
+        self, marker: object, severity: str, expected_score: int
+    ) -> None:
+        finding = _finding("BH3", severity, file=".claude/settings.json")
+        if marker is not None:
+            finding.evidence = {"blocking_critical": marker}
+
+        assert _compute_risk_score([finding], False)[0] == expected_score
+
+    def test_zero_confidence_blocking_permission_grant_does_not_floor(self) -> None:
+        finding = _finding("BH3", "CRITICAL", confidence=0.0, file=".claude/settings.json")
+        finding.evidence = {"blocking_critical": True}
+
+        assert _compute_risk_score([finding], False) == (0, "LOW", "SAFE")
+
+    def test_blocking_marker_does_not_affect_non_bh3_findings(self) -> None:
+        finding = _finding("R1", "LOW", file="ordinary.py")
+        finding.evidence = {"blocking_critical": True}
+
+        assert _compute_risk_score([finding], False)[0] == 5
+
+    def test_blocking_permission_floor_inspects_occurrences_beyond_scoring_cap(self) -> None:
+        findings = [
+            _finding("BH3", "LOW", confidence=0.01, file=f"settings-{index}.json")
+            for index in range(4)
+        ]
+        findings[-1].evidence = {"blocking_critical": True}
+
+        assert _compute_risk_score(findings, False) == (51, "HIGH", "DO_NOT_INSTALL")
+
+    def test_blocking_permission_floor_does_not_lower_an_ordinary_higher_score(self) -> None:
+        blocking = _finding("BH3", "LOW", confidence=0.01, file=".claude/settings.json")
+        blocking.evidence = {"blocking_critical": True}
+        findings = [blocking, _finding("R1", "CRITICAL"), _finding("R2", "HIGH")]
+
+        assert _compute_risk_score(findings, False)[0] == 75
+
     def test_unknown_severity_defaults_to_low_points(self) -> None:
         f = _finding("R1", "LOW")
         f.severity = ""
@@ -901,6 +958,34 @@ def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     assert suppressed_result["properties"]["intent"] == "command_execution"
     assert suppressed_result["properties"]["tags"] == ["critical", "injection"]
     assert len(result["suppressed_findings"]) == 1
+
+
+def test_report_baseline_suppresses_blocking_permission_floor() -> None:
+    """A suppressed BH3 remains auditable without contributing points or its floor."""
+    baseline = Baseline(rules=[SuppressionRule(rule_id="BH3", reason="accepted grant")])
+    blocking = _finding("BH3", "CRITICAL", file=".claude/settings.json")
+    blocking.evidence = {"blocking_critical": True}
+    state: SkillspectorState = {
+        "filtered_findings": [blocking],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": baseline,
+    }
+
+    result = report(state)
+    payload = json.loads(result["report_body"])
+
+    assert result["risk_score"] == 0
+    assert result["risk_severity"] == "LOW"
+    assert result["risk_recommendation"] == "SAFE"
+    assert result["filtered_findings"] == []
+    assert len(result["suppressed_findings"]) == 1
+    assert payload["issues"] == []
+    assert payload["suppressed_count"] == 1
+    assert payload["suppressed"][0]["id"] == "BH3"
 
 
 def test_report_baseline_keeps_unmatched_finding() -> None:
