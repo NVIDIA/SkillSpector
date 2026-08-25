@@ -115,15 +115,15 @@ the member path inside its current namespace has exactly two components:
 | `example/.claude/settings.json` | none | No |
 | `plugin/.claude/settings.json` | none | No |
 
-The same exact-root rule applies independently inside every real archive namespace:
+The same exact-root rule applies independently inside every validated real archive namespace:
 
 - `bundle.zip!/.claude/settings.json` is applicable.
 - `outer.zip!/inner.zip!/.claude/settings.local.json` is applicable at the nested archive root.
 - `bundle.zip!/example/.claude/settings.json` is not applicable.
 - A suffix lookalike such as `bundle.zip!/settings.json` is not applicable.
 
-Archive namespace boundaries are identity boundaries. A document in one namespace cannot acquire a
-role, mitigation, or grant from another namespace.
+Archive namespace boundaries are typed identity boundaries, not bare `!/` substrings. A document in
+one namespace cannot acquire a role, mitigation, or grant from another namespace.
 
 The applicability rule is independent of the JSON content. A root settings document with a
 `permissions` key is applicable to BH3 whether or not it declares hooks. A root settings document
@@ -145,21 +145,79 @@ The parsed mapping is passed independently to:
 The permission helper never opens files, reads Git state, resolves symlinks, parses JSON, mutates
 graph state, or emits ledger rows. The existing dynamic analyzer registry is unchanged.
 
-The surface also performs source-location recovery from the cached JSON syntax tree. This is not a
-second semantic JSON load: it produces only a frozen, sanitized `PermissionSourceLines` record of
-positive line numbers for permission-key positions and known list indexes. `permission_key_lines`
-aligns with the parsed mapping's insertion order, so an unknown-key diagnostic can recover its line
-without retaining that key. No JSON value or unknown key name crosses the record boundary. If
-location recovery cannot identify an entry, its line falls back to the enclosing
-`permissions` line, then line 1. Location recovery cannot turn otherwise valid JSON into a failed
-permission analysis.
+The surface also performs optional source-location recovery from the cached JSON syntax tree. This
+is not a second semantic JSON load: it produces only a frozen, sanitized `PermissionSourceLines`
+record of positive line numbers for permission-key positions and known list indexes.
+`permission_key_lines` aligns with the parsed mapping's insertion order, so an unknown-key
+diagnostic can recover its line without retaining that key. No JSON value or unknown key name
+crosses the record boundary.
 
-Before calling the pure helper, the surface also hashes the normalized physical cache path,
-including every archive namespace, as SHA-256 over
-`b"skillspector.bundled_permission.source.v1\0" + normalized_cache_path.encode("utf-8")`. It passes
-only that full `sha256:` source-identity digest plus the full content digest. Identical settings
-bytes at two physical/cache identities therefore produce distinct BH3 aggregate identities without
-placing a raw path inside the helper records or evidence.
+Location composition is separately bounded before PyYAML runs. A document may contain at most
+256,000 characters and 4,096 scheduled JSON-location nodes for this optional step. Schedule and
+charge the root exactly once. Expanding a mapping schedules and charges exactly
+`2 * len(mapping)` child nodes (one key and one value each); expanding a sequence schedules and
+charges exactly `len(sequence)` child nodes; a scalar was already charged when scheduled and adds no
+descendants. Traverse the already parsed mapping iteratively and reject before extending the pending
+stack when total scheduled nodes would exceed 4,096. If either limit is exceeded, do not call
+`yaml.compose`: semantic analysis continues and lines fall back to the enclosing `permissions` line,
+then line 1. Skipped or failed location recovery leaves outcome, reason, completeness, and
+grant/diagnostic kinds, identities, digests, and counts unchanged; only recovered `source_line`
+fields and the resulting finding `start_line` may fall back.
+
+Before calling the pure helper, the surface constructs a typed physical-provenance identity rather
+than hashing an ambiguous rendered `!/` cache key. Direct settings use one filesystem hop. Archive
+settings use one opaque filesystem hop plus one ordered archive-member hop per validated boundary;
+the filesystem locator is never split on literal `!/`. Thus a real `vendor.zip` containing
+`archive.zip` and a literal directory `vendor.zip!` containing `archive.zip` remain distinct even
+when both render as `vendor.zip!/archive.zip!/.claude/settings.json`.
+
+Each ephemeral hop locator is first canonicalized as compact, sorted, ASCII JSON containing only
+`kind` (`filesystem` or `archive_member`) and `locator`, then hashed with
+`b"skillspector.bundled_permission.locator.v1\0"`. The final sanitized projection contains schema
+`skillspector.bundled_permission.provenance.v1` plus the ordered hop kinds and full locator digests.
+It is canonicalized with `sort_keys=True`, compact separators, `ensure_ascii=True`, ASCII encoded,
+and hashed with `b"skillspector.bundled_permission.source.v2\0"`. Only that final full `sha256:`
+source-identity digest and the content digest cross into the pure helper. Hop locators and the typed
+projection never enter permission-helper records, diagnostics, errors, or aggregate evidence; the
+normal source path remains separately available only as `Finding.file` and the ledger path.
+
+When component metadata is present, provenance validation is fail-closed and order-independent.
+Direct `.claude/settings*.json` accepts exactly one of two metadata shapes: an ordinary filesystem
+row with none of `outer_path`, `nested_path`, `container_type`, `container_ancestry`, or
+`container_depth`; or a coherent executable filesystem-only row with
+`outer_path == nested_path == path`, `container_type == "filesystem"`,
+`container_ancestry == ["filesystem"]`, and non-boolean `container_depth == 0`. Both shapes produce
+one opaque filesystem hop. Archive targets select one exact archive-member record and reject
+duplicates; require string `outer_path`/`nested_path`, a positive non-boolean
+`container_depth`, a closed archive-only ancestry whose length equals depth, `container_type` equal
+to its final ancestry member, exact `path == outer_path + "!/" + nested_path`, and exactly
+`container_depth` non-empty nested boundary segments. Treat `outer_path` as one opaque filesystem
+locator.
+
+For exact chain validation, let `O = outer_path`, `S = nested_path.split("!/")`,
+`A = tuple(container_ancestry)`, and `d = container_depth`; require `len(S) == len(A) == d` with no
+empty `S` segment. Define `P0 = O` and
+`Pi = O + "!/" + "!/".join(S[:i])` for `1 <= i <= d`. With metadata present, every `P0..Pd` must
+exist in `components`, `local_file_cache`, and `raw_file_cache`. `P0` has exactly one archive row
+whose `path` is `P0`, whose `type` and `container_type` both equal `A[0]`, whose
+`container_ancestry == [A[0]]`, and whose `local_only` is exactly `true`; it has no archive-member
+`outer_path` or `nested_path` and no positive `container_depth`. Each `Pi` row has exact
+`path=Pi`, `outer_path=O`, prefix `nested_path`, `container_depth=i`,
+`container_ancestry=list(A[:i])`, `container_type=A[i-1]`, and `local_only=true`; for `i < d`, its
+`type` is the next container `A[i]`, while `Pd` is the final JSON member. Metadata list order and
+non-identity size/line/concealment fields do not affect identity. A coherent direct filesystem row,
+including the executable filesystem-only depth-0 shape, still produces one opaque filesystem hop.
+
+Malformed or incomplete archive provenance does not fall back to the rendered path: a
+permission-bearing document gets an INVALID_CONFIGURATION permission subanalysis, while an
+independently valid hook section may still make the combined row PARTIAL. An ordinary filesystem
+metadata row at an archive-looking path is a literal directory and remains excluded. When component
+metadata is entirely absent, compatibility fallback is allowed only if every rendered archive-prefix
+key exists in the union of local text and raw-byte caches; missing or ambiguous prefixes are
+rejected. After that validation, split the legacy rendered path into
+`segments = path.split("!/")`: provenance is `filesystem(segments[0])` followed by one ordered
+`archive_member(segment)` hop for every remaining segment. A direct path with no separator is one
+`filesystem(path)` hop. The complete rendered archive path is never treated as a single locator.
 
 `handled_paths` is not permission ownership. In particular, a permissions-only settings path must
 not be skipped if a manifest later references it as a hook document. Hook roles are evaluated from

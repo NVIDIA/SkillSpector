@@ -750,14 +750,49 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   once. Recover a `PermissionSourceLines` record from the already-cached JSON syntax tree using only
   key-order/list indexes and positive line numbers; unknown names and JSON values must not enter that
   record. Align `permission_key_lines` with parsed-mapping insertion order and known list-line tuples
-  with their raw entry indexes. Compute the existing content digest once. Compute
-  `source_identity_digest` as full SHA-256
-  over `b"skillspector.bundled_permission.source.v1\0"` plus the UTF-8 encoding of the normalized
-  cache-key path, including the complete `outer.zip!/inner.zip!/member` namespace for archives. Pass
-  only the two full digests, mapping, and sanitized lines to `analyze_permission_grants`; never pass
-  the raw source path into the analysis helper. The separate finding builder receives it only as
-  `Finding.file`, never as evidence or aggregate input. Do not add permissions-only paths to
-  `handled_paths`.
+  with their raw entry indexes.
+
+  Before PyYAML composition, enforce the exact optional-location bounds from the design: 256,000
+  characters and 4,096 total scheduled JSON nodes. Charge the root once; mapping expansion charges
+  `2 * len(mapping)` key/value children; sequence expansion charges `len(sequence)` entries; scalars
+  add no descendants. Count iteratively from the retained mapping and reject before extending a
+  stack beyond the total scheduled bound. If either bound is exceeded, do not compose;
+  use normal permission-line/line-1 fallback without changing semantic outcome. Test 100,000-entry
+  unrelated and nested collections and a 900 KiB scalar, and assert `yaml.compose` is never called on
+  skipped inputs. For separation from permission cardinality, use `allow=["Workflow"]` plus 2,046
+  unknown scalar keys: 2,048 permission items but 4,098 location nodes must skip composition and
+  retain BH3; one more unknown key must still produce the existing 2,049-item `COMPONENT_LIMIT`.
+
+  Compute the existing content digest once. Compute `source_identity_digest` from the exact typed
+  provenance-v1 hop chain in the design, not the rendered cache path. Hash each opaque filesystem or
+  archive-member locator with the locator-v1 domain, then hash the ordered kind+digest projection
+  with `b"skillspector.bundled_permission.source.v2\0"`. Handle a direct ordinary metadata row as a
+  one-filesystem-hop branch. Validate archive component metadata exactly and
+  fail closed without rendered-path fallback when present provenance is duplicate, malformed,
+  incomplete, or inconsistent. Preserve the documented metadata-absent compatibility path only when
+  every rendered archive-prefix key exists in the union of local text and raw-byte caches. Add
+  metadata-order invariance tests and duplicate/depth/ancestry/concatenation failures; require the
+  exact outer-container ancestry/local-only/no-member-provenance shape; with valid hooks, malformed
+  permission provenance must produce one PARTIAL settings row retaining BH1/BH2.
+  Replace the existing target-only shaped nested-provenance fixture with the complete real
+  outer/intermediate/final metadata and cache chain required by this contract.
+
+  Lock the chain formula from the design in tests: opaque `O=outer_path`, boundary segments `S`,
+  ancestry `A`, depth `d`, and every prefix `Pi` must appear in components plus both local/raw caches
+  with exact order-independent prefix metadata. Test direct ordinary and executable depth-0
+  filesystem rows, top-level archive, nested archive, literal-bang opaque outer paths, reordered
+  unrelated rows, duplicate prefix/target rows, missing local/raw prefix keys, wrong type/depth,
+  ancestry prefix, container type, concatenation, and local-only flags.
+
+  Pass only the two full digests, mapping, and sanitized lines to `analyze_permission_grants`; never
+  pass raw paths or hop locators into the analysis helper. The separate finding builder receives the
+  source path only as `Finding.file`, never as evidence or aggregate input. Add a real build-context
+  collision regression proving `vendor.zip -> archive.zip` and literal directory `vendor.zip! ->
+  archive.zip` render the same cache key but receive distinct source/aggregate identities. For the
+  metadata-absent compatibility branch, validate every rendered prefix and then derive the typed
+  chain as one `filesystem(path.split("!/")[0])` hop followed by an ordered `archive_member` hop for
+  each remaining segment; a no-separator path is one filesystem hop, never one rendered-archive
+  locator. Do not add permissions-only paths to `handled_paths`.
 
 - [ ] **Step 4: Refactor hooks to consume the retained mapping**
 
