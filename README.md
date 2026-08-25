@@ -96,10 +96,7 @@ failure.
 
 This scope excludes plugin-root `settings.json` permissions, plugin-shipped agent hooks, user-level
 and managed settings outside the artifact, background monitors, plugin MCP/LSP servers, general
-`bin/` inventory, and complete interprocedural analysis of arbitrary programs. See the approved
-[hook design](docs/superpowers/specs/2026-08-20-bundled-hook-execution-surface-design.md) and
-[permission design](docs/superpowers/specs/2026-08-24-bundled-permission-grants-design.md) for the
-detailed contracts.
+and complete interprocedural analysis of arbitrary programs.
 
 ## Quick Start
 
