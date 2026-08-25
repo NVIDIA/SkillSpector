@@ -645,14 +645,19 @@ def _assert_structured_evidence(
     digest_key: str = "chain_digest",
     schema: str = "skillspector.bundled_hook.v1",
     require_all_keys: bool = False,
+    require_closed_scalar_types: bool = False,
 ) -> str:
     if require_all_keys:
         assert set(evidence) == allowed_keys
     else:
         assert set(evidence) <= allowed_keys
-    assert all(
-        value is None or isinstance(value, str | int | float | bool) for value in evidence.values()
-    )
+    if require_closed_scalar_types:
+        assert all(type(value) in (str, int, bool) for value in evidence.values())
+    else:
+        assert all(
+            value is None or isinstance(value, str | int | float | bool)
+            for value in evidence.values()
+        )
     digest = evidence.get(digest_key)
     assert isinstance(digest, str)
     assert _DIGEST_RE.fullmatch(digest)
@@ -738,9 +743,39 @@ def _assert_terminal_evidence(
 
 
 def _assert_permission_canaries_absent(projection: str) -> None:
+    assert "CANARY" not in projection
     for canary in _PERMISSION_CANARIES:
         assert canary not in projection
         assert json.dumps(canary, ensure_ascii=True)[1:-1] not in projection
+
+
+@pytest.mark.parametrize(
+    "transformed",
+    [r"\*\*CANARY-markdown\*\*", "CANARY-control-"],
+    ids=["markdown-escaped", "control-stripped"],
+)
+def test_permission_canary_assertion_rejects_sanitizer_transforms(transformed: str) -> None:
+    with pytest.raises(AssertionError):
+        _assert_permission_canaries_absent(transformed)
+
+
+@pytest.mark.parametrize("invalid", [None, 1.5], ids=["none", "float"])
+def test_structured_bh3_evidence_rejects_non_closed_scalar_types(invalid: object) -> None:
+    evidence = {
+        "schema": "skillspector.bundled_permission.v1",
+        "aggregate_digest": "sha256:" + "1" * 64,
+        "invalid": invalid,
+    }
+    with pytest.raises(AssertionError):
+        _assert_structured_evidence(
+            evidence,
+            projection=json.dumps(evidence, sort_keys=True),
+            allowed_keys=set(evidence),
+            digest_key="aggregate_digest",
+            schema="skillspector.bundled_permission.v1",
+            require_all_keys=True,
+            require_closed_scalar_types=True,
+        )
 
 
 @pytest.mark.parametrize("output_format", ["json", "markdown", "sarif", "terminal"])
@@ -854,6 +889,7 @@ def test_cli_bh3_renderer_contract_across_real_input_forms(
             digest_key="aggregate_digest",
             schema="skillspector.bundled_permission.v1",
             require_all_keys=True,
+            require_closed_scalar_types=True,
         )
         assert issue["finding"] == digest
         assert issue["evidence"]["tracking_status"] == "unknown"
@@ -878,6 +914,7 @@ def test_cli_bh3_renderer_contract_across_real_input_forms(
             digest_key="aggregate_digest",
             schema="skillspector.bundled_permission.v1",
             require_all_keys=True,
+            require_closed_scalar_types=True,
         )
         assert properties["finding"] == digest
     elif output_format == "markdown":
@@ -1196,9 +1233,8 @@ def test_cli_bh3_baseline_tracks_physical_bytes_and_nested_archive_identity(
     tmp_path: Path,
 ) -> None:
     initial_permissions = {
-        "allow": ["Workflow"],
+        "allow": ["Bash"],
         "defaultMode": "bypassPermissions",
-        "disableBypassPermissionsMode": "disable",
     }
     initial_content = _permission_document(initial_permissions)
     initial_files = _skill_files(extra={_PROJECT_SETTINGS_PATH: initial_content})
@@ -1215,7 +1251,9 @@ def test_cli_bh3_baseline_tracks_physical_bytes_and_nested_archive_identity(
     preflight_bh3 = _rule_findings(preflight, "BH3")
     assert len(preflight_bh3) == 1
     assert preflight_bh3[0].file == initial_path
-    assert preflight_bh3[0].evidence["blocking_critical"] is False
+    assert preflight_bh3[0].evidence["blocking_critical"] is True
+    assert int(preflight["risk_score"]) >= 51
+    assert preflight["risk_recommendation"] == "DO_NOT_INSTALL"
     initial_semantic_projection = dict(preflight_bh3[0].evidence)
     initial_aggregate = initial_semantic_projection.pop("aggregate_digest")
     assert _DIGEST_RE.fullmatch(str(initial_aggregate))
@@ -1249,46 +1287,90 @@ def test_cli_bh3_baseline_tracks_physical_bytes_and_nested_archive_identity(
     assert unchanged.returncode == 0, unchanged.stderr or unchanged.stdout
     unchanged_payload = json.loads(unchanged_report.read_text(encoding="utf-8"))
     assert unchanged_payload["risk_assessment"]["score"] == 0
+    assert unchanged_payload["risk_assessment"]["recommendation"] == "SAFE"
+    assert unchanged_payload["execution_successful"] is True
     assert not any(item["id"] == "BH3" for item in unchanged_payload["issues"])
     suppressed = [item for item in unchanged_payload["suppressed"] if item["id"] == "BH3"]
     assert len(suppressed) == 1
     assert suppressed[0]["location"]["file"] == initial_path
+    assert suppressed[0]["evidence"]["blocking_critical"] is True
 
     reordered_permissions = {
-        "disableBypassPermissionsMode": "disable",
         "defaultMode": "bypassPermissions",
-        "allow": ["Workflow"],
+        "allow": ["Bash"],
     }
     variants = [
         (
             "effective-grant",
-            _permission_document({**initial_permissions, "allow": ["Bash"]}),
+            _permission_document({**initial_permissions, "allow": ["Read"]}),
             "inner.zip",
             False,
+            "permission_mode_bypass,tool_wide_read",
+            2,
+            "",
         ),
         (
             "disable-control",
             _permission_document(
                 {
-                    "allow": ["Workflow"],
+                    "allow": ["Bash"],
                     "defaultMode": "bypassPermissions",
+                    "disableBypassPermissionsMode": "disable",
                 }
             ),
             "inner.zip",
             False,
+            "tool_wide_execution",
+            1,
+            "bypass_disabled",
         ),
-        ("whitespace", _permission_document(initial_permissions, indent=4), "inner.zip", True),
-        ("reordered", _permission_document(reordered_permissions), "inner.zip", True),
         (
-            "duplicate",
-            _permission_document({**initial_permissions, "allow": ["Workflow", "Workflow"]}),
+            "whitespace",
+            _permission_document(initial_permissions, indent=4),
             "inner.zip",
             True,
+            "permission_mode_bypass,tool_wide_execution",
+            2,
+            "",
         ),
-        ("moved-member", initial_content, "moved.zip", True),
+        (
+            "reordered",
+            _permission_document(reordered_permissions),
+            "inner.zip",
+            True,
+            "permission_mode_bypass,tool_wide_execution",
+            2,
+            "",
+        ),
+        (
+            "duplicate",
+            _permission_document({**initial_permissions, "allow": ["Bash", "Bash"]}),
+            "inner.zip",
+            True,
+            "permission_mode_bypass,tool_wide_execution",
+            2,
+            "",
+        ),
+        (
+            "moved-member",
+            initial_content,
+            "moved.zip",
+            True,
+            "permission_mode_bypass,tool_wide_execution",
+            2,
+            "",
+        ),
     ]
 
-    for name, content, inner_name, semantic_stable in variants:
+    for (
+        name,
+        content,
+        inner_name,
+        semantic_stable,
+        expected_grant_kinds,
+        expected_grant_count,
+        expected_diagnostic_kinds,
+    ) in variants:
         assert name == "moved-member" or content != initial_content
         _write_nested_archive(
             target,
@@ -1308,18 +1390,28 @@ def test_cli_bh3_baseline_tracks_physical_bytes_and_nested_archive_identity(
             "--no-llm",
         )
         payload = json.loads(output.read_text(encoding="utf-8"))
-        expected_exit = 1 if payload["risk_assessment"]["score"] > 50 else 0
-        assert completed.returncode == expected_exit, completed.stderr or completed.stdout
+        assert completed.returncode == 1, completed.stderr or completed.stdout
+        assert payload["risk_assessment"]["score"] >= 51
+        assert payload["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+        assert payload["execution_successful"] is True
         active = [item for item in payload["issues"] if item["id"] == "BH3"]
         assert len(active) == 1
         issue = active[0]
         expected_inner = "moved.zip" if name == "moved-member" else "inner.zip"
         assert issue["location"]["file"] == f"{expected_inner}!/{_PROJECT_SETTINGS_PATH}"
         assert issue["evidence"]["aggregate_digest"] != initial_aggregate
+        assert issue["evidence"]["blocking_critical"] is True
+        assert issue["evidence"]["grant_kinds"] == expected_grant_kinds
+        assert issue["evidence"]["grant_count"] == expected_grant_count
+        assert issue["evidence"]["diagnostic_kinds"] == expected_diagnostic_kinds
+        assert issue["evidence"]["diagnostic_count"] == int(bool(expected_diagnostic_kinds))
+        assert issue["evidence"]["max_severity"] == "CRITICAL"
+        semantic_projection = dict(issue["evidence"])
+        semantic_projection.pop("aggregate_digest")
         if semantic_stable:
-            semantic_projection = dict(issue["evidence"])
-            semantic_projection.pop("aggregate_digest")
             assert semantic_projection == initial_semantic_projection
+        else:
+            assert semantic_projection != initial_semantic_projection
 
 
 def test_near_one_megabyte_adversarial_hook_config_stays_bounded(tmp_path: Path) -> None:
