@@ -79,9 +79,7 @@ A reviewed baseline may suppress BH1 or BH2, but it cannot suppress an incomplet
 This hooks-only scope does **not** implement BH3 permission-grant analysis. It also excludes
 plugin-root `settings.json` permission analysis, plugin-shipped agent hooks, user-level and managed
 settings outside the artifact, background monitors, plugin MCP/LSP servers, general `bin/` inventory,
-and complete interprocedural analysis of arbitrary programs. See the
-[approved design and threat model](docs/superpowers/specs/2026-08-20-bundled-hook-execution-surface-design.md)
-for the detailed contract.
+and complete interprocedural analysis of arbitrary programs.
 
 ## Quick Start
 
