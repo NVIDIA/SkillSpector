@@ -82,6 +82,8 @@ _ARCHIVE_CONTAINER_TYPES: Final = frozenset({"docx", "pptx", "xlsx", "zip"})
 _FRONTMATTER_DELIMITER: Final = re.compile(r"^(?:---|\.\.\.)[ \t]*$")
 _MAX_YAML_COLLECTION_DEPTH: Final = 64
 _MAX_YAML_NODES: Final = 2048
+_MAX_JSON_LOCATION_CHARS: Final = 256_000
+_MAX_JSON_LOCATION_NODES: Final = 4_096
 _MAX_REGISTRATIONS_PER_DOCUMENT: Final = 2048
 _MAX_HOOK_STRUCTURE_ITEMS: Final = 8192
 
@@ -514,6 +516,31 @@ def _json_root_node(content: str) -> yaml.MappingNode | None:
     except (yaml.YAMLError, RecursionError):
         return None
     return root if isinstance(root, yaml.MappingNode) else None
+
+
+def _json_location_recovery_allowed(content: str, raw: object) -> bool:
+    """Preflight optional JSON location composition with exact scheduled-node bounds."""
+    if len(content) > _MAX_JSON_LOCATION_CHARS:
+        return False
+
+    scheduled_nodes = 1
+    pending: list[object] = [raw]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            descendant_count = 2 * len(current)
+            if scheduled_nodes + descendant_count > _MAX_JSON_LOCATION_NODES:
+                return False
+            scheduled_nodes += descendant_count
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            descendant_count = len(current)
+            if scheduled_nodes + descendant_count > _MAX_JSON_LOCATION_NODES:
+                return False
+            scheduled_nodes += descendant_count
+            pending.extend(current)
+    return True
 
 
 def _node_line(node: yaml.Node | None, fallback: int = 1) -> int:
@@ -1498,7 +1525,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             continue
 
         content_digest = _digest_bytes("content", canonical_content)
-        syntax_root = _json_root_node(content)
+        syntax_root = (
+            _json_root_node(content) if _json_location_recovery_allowed(content, raw) else None
+        )
         permission_source_lines = _permission_source_lines(raw, syntax_root)
         permission_analysis = analyze_permission_grants(
             raw,

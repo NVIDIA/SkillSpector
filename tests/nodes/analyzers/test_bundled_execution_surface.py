@@ -1315,6 +1315,127 @@ def test_permission_source_lines_retain_only_present_closed_key_locations() -> N
     assert "future-canary-key" not in repr(source_lines)
 
 
+def test_location_recovery_node_gate_skips_large_unrelated_collection() -> None:
+    """Optional locations cannot traverse a large unrelated collection after semantic parsing."""
+    path = ".claude/settings.json"
+    content = json.dumps(
+        {
+            "permissions": {"allow": ["Workflow"]},
+            "unrelated": [0] * 100_000,
+        },
+        separators=(",", ":"),
+    )
+    assert len(content) < 256_000
+
+    with patch.object(
+        surface.yaml,
+        "compose",
+        side_effect=AssertionError("bounded location recovery must skip composition"),
+    ) as compose:
+        result = node(_state({path: content}))
+
+    assert compose.call_count == 0
+    assert [finding.rule_id for finding in result["findings"]] == ["BH3"]
+    assert result["findings"][0].start_line == 1
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_location_recovery_preflight_accepts_exact_scheduled_node_limit() -> None:
+    """The root is charged once and the 4,096th scheduled location node remains allowed."""
+    exact = {"items": [None] * 4_093}
+    over = {"items": [None] * 4_094}
+
+    assert surface._json_location_recovery_allowed(json.dumps(exact), exact) is True
+    assert surface._json_location_recovery_allowed(json.dumps(over), over) is False
+
+
+def test_location_recovery_node_gate_preserves_nested_unknown_permission_semantics() -> None:
+    """A huge unknown value stays one invalid permission sibling while BH3 survives."""
+    path = ".claude/settings.json"
+    content = json.dumps(
+        {
+            "permissions": {
+                "allow": ["Workflow"],
+                "futurePermission": [0] * 100_000,
+            }
+        },
+        separators=(",", ":"),
+    )
+    assert len(content) < 256_000
+
+    with patch.object(
+        surface.yaml,
+        "compose",
+        side_effect=AssertionError("bounded location recovery must skip composition"),
+    ) as compose:
+        result = node(_state({path: content}))
+
+    assert compose.call_count == 0
+    assert [finding.rule_id for finding in result["findings"]] == ["BH3"]
+    assert result["findings"][0].evidence["diagnostic_kinds"] == "unknown_permission_key"
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.INVALID_CONFIGURATION
+
+
+def test_location_recovery_character_gate_skips_near_megabyte_scalar() -> None:
+    """Location composition has a tighter character ceiling than semantic settings parsing."""
+    path = ".claude/settings.json"
+    content = json.dumps(
+        {
+            "permissions": {"allow": ["Workflow"]},
+            "unrelated": "x" * (900 * 1024),
+        },
+        separators=(",", ":"),
+    )
+    assert 900_000 < len(content) < surface.MAX_FILE_CHARS
+
+    with patch.object(
+        surface.yaml,
+        "compose",
+        side_effect=AssertionError("bounded location recovery must skip composition"),
+    ) as compose:
+        result = node(_state({path: content}))
+
+    assert compose.call_count == 0
+    assert [finding.rule_id for finding in result["findings"]] == ["BH3"]
+    assert result["findings"][0].start_line == 1
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_location_and_permission_item_limits_remain_independent() -> None:
+    """The 4,096-node location gate cannot replace the 2,048-item semantic permission gate."""
+    path = ".claude/settings.json"
+    assert surface._MAX_JSON_LOCATION_CHARS == 256_000
+    assert surface._MAX_JSON_LOCATION_NODES == 4_096
+
+    accepted_permissions = {
+        "allow": ["Workflow"],
+        **{f"unknown-{index}": None for index in range(2_046)},
+    }
+    rejected_permissions = {**accepted_permissions, "unknown-over-limit": None}
+
+    with patch.object(
+        surface.yaml,
+        "compose",
+        side_effect=AssertionError("bounded location recovery must skip composition"),
+    ) as compose:
+        accepted = node(
+            _state({path: json.dumps({"permissions": accepted_permissions}, separators=(",", ":"))})
+        )
+        rejected = node(
+            _state({path: json.dumps({"permissions": rejected_permissions}, separators=(",", ":"))})
+        )
+
+    assert compose.call_count == 0
+    assert [finding.rule_id for finding in accepted["findings"]] == ["BH3"]
+    assert accepted["findings"][0].start_line == 1
+    assert accepted["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert accepted["inspection_ledger"][0]["reason_code"] is LedgerReason.INVALID_CONFIGURATION
+    assert rejected["findings"] == []
+    assert rejected["inspection_ledger"][0]["outcome"] is LedgerOutcome.FAILED
+    assert rejected["inspection_ledger"][0]["reason_code"] is LedgerReason.COMPONENT_LIMIT
+
+
 def test_permission_source_location_and_identity_never_disclose_canaries() -> None:
     """Raw rule, path, and unknown-key canaries stay behind the safe helper boundary."""
     path = ".claude/settings.local.json"
