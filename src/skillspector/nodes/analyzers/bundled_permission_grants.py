@@ -1490,8 +1490,8 @@ def _classify_additional_directory(
     return posix_grant, (diagnostic,), True
 
 
-def _validate_digest(digest: str) -> None:
-    if not _SHA256_DIGEST.fullmatch(digest):
+def _validate_digest(digest: object) -> None:
+    if not isinstance(digest, str) or not _SHA256_DIGEST.fullmatch(digest):
         raise ValueError("invalid SHA-256 digest")
 
 

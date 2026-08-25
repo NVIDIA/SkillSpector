@@ -2485,6 +2485,26 @@ def test_malformed_input_digest_raises_constant_non_echoing_error(digest_paramet
     assert canary not in str(exc_info.value)
 
 
+@pytest.mark.parametrize("digest_parameter", ["content_digest", "source_identity_digest"])
+@pytest.mark.parametrize("invalid", [None, ["CANARY-digest"], 7, True])
+def test_non_string_input_digest_raises_constant_non_echoing_error(
+    digest_parameter: str, invalid: object
+) -> None:
+    arguments = {
+        "source_kind": "project_settings",
+        "content_digest": "sha256:" + "1" * 64,
+        "source_identity_digest": "sha256:" + "2" * 64,
+        "source_lines": PermissionSourceLines(),
+    }
+    arguments[digest_parameter] = invalid
+
+    with pytest.raises(ValueError) as exc_info:
+        analyze_permission_grants({"permissions": {}}, **arguments)  # type: ignore[arg-type]
+
+    assert str(exc_info.value) == "invalid SHA-256 digest"
+    assert "CANARY" not in str(exc_info.value)
+
+
 def test_duplicate_diagnostic_retains_minimum_source_line() -> None:
     result = analyze_permission_grants(
         {"permissions": {"allow": ["FutureTool", "FutureTool"]}},
@@ -2562,6 +2582,7 @@ def test_bh3_source_line_falls_back_to_permissions_then_line_one(
         ("blocking_critical", "CANARY-blocking"),
         ("grant_digest", "sha256:CANARY-grant-digest"),
         ("source_line", 0),
+        ("grant_digest", []),
         ("grant_kind", []),
         ("severity", []),
         ("activation_requirement", []),
@@ -2589,6 +2610,7 @@ def test_builder_rejects_invalid_grant_records_without_echoing(field: str, inval
         ("diagnostic_digest", "sha256:CANARY-diagnostic-digest"),
         ("source_line", 0),
         ("diagnostic_kind", []),
+        ("diagnostic_digest", []),
     ],
 )
 def test_builder_rejects_invalid_diagnostic_records_without_echoing(
@@ -2610,6 +2632,7 @@ def test_builder_rejects_invalid_diagnostic_records_without_echoing(
     [
         {"aggregate_digest": "sha256:CANARY-aggregate-digest"},
         {"aggregate_digest": None},
+        {"aggregate_digest": []},
         {"applicable": False},
         {"outcome": LedgerOutcome.FAILED},
         {"reason": LedgerReason.COMPONENT_LIMIT},
