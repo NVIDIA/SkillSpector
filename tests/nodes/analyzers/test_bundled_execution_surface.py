@@ -114,6 +114,20 @@ def _zip_bytes(members: dict[str, bytes]) -> bytes:
     return payload.getvalue()
 
 
+def _nested_settings_container_bytes(container_type: str, settings_content: bytes) -> bytes:
+    marker_by_type = {
+        "docx": "word/document.xml",
+        "xlsx": "xl/workbook.xml",
+        "pptx": "ppt/presentation.xml",
+    }
+    members = {".claude/settings.json": settings_content}
+    marker = marker_by_type.get(container_type)
+    if marker is not None:
+        members["[Content_Types].xml"] = b"<Types/>"
+        members[marker] = b"<document/>"
+    return _zip_bytes(members)
+
+
 def _complete_archive_settings_state(
     *,
     outer_path: str,
@@ -142,7 +156,7 @@ def _complete_archive_settings_state(
         metadata.append(
             {
                 "path": prefix,
-                "type": ancestry[index] if index < len(ancestry) else "json",
+                "type": "zip" if index < len(ancestry) else "json",
                 "outer_path": outer_path,
                 "nested_path": "!/".join(member_segments[:index]),
                 "container_type": ancestry[index - 1],
@@ -1186,6 +1200,33 @@ def test_archive_permission_provenance_fails_closed(case: str) -> None:
     )
 
 
+def test_archive_permission_provenance_rejects_logical_type_on_physical_prefix() -> None:
+    """A nested Office member remains physically ZIP in its intermediate metadata row."""
+    content = json.dumps({"permissions": {"allow": ["Workflow"]}})
+    state, path = _complete_archive_settings_state(
+        outer_path="outer.zip",
+        member_segments=["inner.docx", ".claude/settings.json"],
+        ancestry=["zip", "docx"],
+        content=content,
+    )
+    metadata = state["component_metadata"]
+    assert isinstance(metadata, list)
+    prefix = "outer.zip!/inner.docx"
+    prefix_row = next(row for row in metadata if row["path"] == prefix)
+    prefix_row["type"] = "docx"
+
+    result = node(state)
+
+    assert result["findings"] == []
+    events = [event for event in result["inspection_ledger"] if event["path"] == path]
+    assert len(events) == 1
+    assert (events[0]["phase"], events[0]["outcome"], events[0]["reason_code"]) == (
+        "bundled_settings",
+        LedgerOutcome.FAILED,
+        LedgerReason.INVALID_CONFIGURATION,
+    )
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -1350,6 +1391,50 @@ def test_real_build_context_archive_collision_has_distinct_typed_permission_iden
     )
     assert real_bh3.file == literal_bh3.file == target
     assert real_bh3.matched_text != literal_bh3.matched_text
+
+
+@pytest.mark.parametrize("inner_type", ["zip", "docx", "xlsx", "pptx"])
+def test_real_build_context_nested_container_uses_physical_zip_prefix_type(
+    tmp_path: Path, inner_type: str
+) -> None:
+    """Nested ZIP-compatible members retain physical type while ancestry stays logical."""
+    content = json.dumps({"permissions": {"allow": ["Workflow"]}}).encode("utf-8")
+    inner_name = f"inner.{inner_type}"
+    root = tmp_path / inner_type
+    root.mkdir()
+    (root / "SKILL.md").write_text(f"# Nested {inner_type}\n", encoding="utf-8")
+    (root / "outer.zip").write_bytes(
+        _zip_bytes({inner_name: _nested_settings_container_bytes(inner_type, content)})
+    )
+
+    context = build_context({"skill_path": str(root)})
+    prefix = f"outer.zip!/{inner_name}"
+    target = f"{prefix}!/.claude/settings.json"
+    metadata = {row["path"]: row for row in context["component_metadata"]}
+    assert metadata[prefix]["type"] == "zip"
+    assert metadata[target]["container_ancestry"] == ["zip", inner_type]
+
+    with patch.object(
+        surface, "analyze_permission_grants", wraps=surface.analyze_permission_grants
+    ) as analyze:
+        result = node(context)  # type: ignore[arg-type]
+
+    assert [(finding.rule_id, finding.file) for finding in result["findings"]] == [("BH3", target)]
+    assert analyze.call_args.kwargs["source_identity_digest"] == (
+        _expected_permission_source_digest(
+            [
+                ("filesystem", "outer.zip"),
+                ("archive_member", inner_name),
+                ("archive_member", ".claude/settings.json"),
+            ]
+        )
+    )
+    target_events = [event for event in result["inspection_ledger"] if event["path"] == target]
+    assert len(target_events) == 1
+    assert (target_events[0]["phase"], target_events[0]["outcome"]) == (
+        "bundled_settings",
+        LedgerOutcome.COMPLETED,
+    )
 
 
 def test_metadata_absent_archive_fallback_uses_typed_prefix_chain() -> None:

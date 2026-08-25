@@ -204,9 +204,12 @@ whose `path` is `P0`, whose `type` and `container_type` both equal `A[0]`, whose
 `outer_path` or `nested_path` and no positive `container_depth`. Each `Pi` row has exact
 `path=Pi`, `outer_path=O`, prefix `nested_path`, `container_depth=i`,
 `container_ancestry=list(A[:i])`, `container_type=A[i-1]`, and `local_only=true`; for `i < d`, its
-`type` is the next container `A[i]`, while `Pd` is the final JSON member. Metadata list order and
-non-identity size/line/concealment fields do not affect identity. A coherent direct filesystem row,
-including the executable filesystem-only depth-0 shape, still produces one opaque filesystem hop.
+physical nested-archive `type` is `zip`, while `Pd` is the final JSON member. The producer records a
+recursively expandable member's ZIP signature in `Pi.type`; the logical next container `A[i]`
+remains bound by `P(i+1).container_ancestry == list(A[:i+1])` and
+`P(i+1).container_type == A[i]`. Metadata list order and non-identity
+size/line/concealment fields do not affect identity. A coherent direct filesystem row, including
+the executable filesystem-only depth-0 shape, still produces one opaque filesystem hop.
 
 Malformed or incomplete archive provenance does not fall back to the rendered path: a
 permission-bearing document gets an INVALID_CONFIGURATION permission subanalysis, while an

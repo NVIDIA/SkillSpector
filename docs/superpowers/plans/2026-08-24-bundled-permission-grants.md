@@ -782,7 +782,10 @@ that exposes a genuine generic defect must be reviewed before expanding that bou
   with exact order-independent prefix metadata. Test direct ordinary and executable depth-0
   filesystem rows, top-level archive, nested archive, literal-bang opaque outer paths, reordered
   unrelated rows, duplicate prefix/target rows, missing local/raw prefix keys, wrong type/depth,
-  ancestry prefix, container type, concatenation, and local-only flags.
+  ancestry prefix, container type, concatenation, and local-only flags. Require every intermediate
+  `Pi` for `i < d` to use the producer's physical nested-archive `type="zip"`; bind its logical next
+  container `A[i]` through the following row's exact ancestry prefix and `container_type=A[i]`.
+  Cover real nested DOCX, XLSX, PPTX, and ZIP settings roots from `build_context`.
 
   Pass only the two full digests, mapping, and sanitized lines to `analyze_permission_grants`; never
   pass raw paths or hop locators into the analysis helper. The separate finding builder receives the

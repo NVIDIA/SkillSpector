@@ -1135,7 +1135,7 @@ def _archive_permission_provenance_hops(
         if len(prefix_rows) != 1:
             raise InvalidHookConfigurationError("invalid permission source provenance")
         row = prefix_rows[0]
-        expected_type = ancestry[index] if index < depth else "json"
+        expected_type = "zip" if index < depth else "json"
         row_depth = row.get("container_depth")
         if not (
             row.get("type") == expected_type
