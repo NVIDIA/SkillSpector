@@ -44,6 +44,12 @@ from .bundled_hook_runtime import (
 from .bundled_hook_runtime import (
     normalize_registration as _normalize_registration,
 )
+from .bundled_permission_grants import (
+    PermissionAnalysis,
+    PermissionSourceLines,
+    analyze_permission_grants,
+    build_bh3_finding,
+)
 from .static_runner import MAX_FILE_CHARS
 
 ANALYZER_ID: Final = "bundled_execution_surface"
@@ -133,6 +139,20 @@ class HookDocument:
     registrations: tuple[HookRegistration, ...]
     flow_inputs: tuple[HandlerFlowInput, ...] = field(repr=False)
     runtime_status: str = "declared_unclassified"
+
+
+@dataclass(frozen=True)
+class _SettingsWork:
+    """One parse-once project settings document and its safe permission result."""
+
+    source_path: str
+    source_kind: str
+    content_digest: str
+    source_identity_digest: str
+    raw: dict[str, object] | None
+    parse_error: BaseException | None
+    permission_analysis: PermissionAnalysis | None
+    permission_source_lines: PermissionSourceLines
 
 
 @dataclass(frozen=True)
@@ -473,12 +493,92 @@ def _json_root_node(content: str) -> yaml.MappingNode | None:
     return root if isinstance(root, yaml.MappingNode) else None
 
 
-def _json_handler_lines(content: str) -> tuple[int, ...]:
-    """Locate handler declarations under a JSON document's top-level hook map."""
-    root = _json_root_node(content)
+def _node_line(node: yaml.Node | None, fallback: int = 1) -> int:
+    """Return one positive parser location without retaining its source value."""
+    if node is None:
+        return max(1, fallback)
+    line = cast(int, node.start_mark.line) + 1
+    return line if line > 0 else max(1, fallback)
+
+
+def _mapping_key_line(node: yaml.MappingNode | None, key: str, fallback: int = 1) -> int:
+    if node is not None:
+        for key_node, _value_node in node.value:
+            if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
+                return _node_line(key_node, fallback)
+    return max(1, fallback)
+
+
+def _known_list_lines(node: yaml.MappingNode | None, key: str) -> tuple[int, ...]:
+    value = _mapping_value_node(node, key) if node is not None else None
+    if not isinstance(value, yaml.SequenceNode):
+        return ()
+    return tuple(_node_line(item) for item in value.value)
+
+
+def _permission_source_lines(
+    raw: dict[str, object], root: yaml.MappingNode | None
+) -> PermissionSourceLines:
+    """Recover only structural permission locations from one composed syntax tree."""
+    permissions_line = _mapping_key_line(root, "permissions")
+    permissions_node = _mapping_value_node(root, "permissions") if root is not None else None
+    permissions_mapping = (
+        permissions_node if isinstance(permissions_node, yaml.MappingNode) else None
+    )
+    raw_permissions = raw.get("permissions")
+    raw_permission_mapping = raw_permissions if isinstance(raw_permissions, dict) else {}
+    raw_permission_count = len(raw_permission_mapping)
+    recovered_key_lines = (
+        tuple(_node_line(key_node, permissions_line) for key_node, _ in permissions_mapping.value)
+        if permissions_mapping is not None
+        else ()
+    )
+    permission_key_lines = recovered_key_lines[:raw_permission_count] + (permissions_line,) * max(
+        0, raw_permission_count - len(recovered_key_lines)
+    )
+
+    return PermissionSourceLines(
+        permissions_line=permissions_line,
+        permission_key_lines=permission_key_lines,
+        allow_lines=_known_list_lines(permissions_mapping, "allow"),
+        ask_lines=_known_list_lines(permissions_mapping, "ask"),
+        deny_lines=_known_list_lines(permissions_mapping, "deny"),
+        additional_directory_lines=_known_list_lines(permissions_mapping, "additionalDirectories"),
+        default_mode_line=(
+            _mapping_key_line(permissions_mapping, "defaultMode", permissions_line)
+            if "defaultMode" in raw_permission_mapping
+            else None
+        ),
+        disable_bypass_line=(
+            _mapping_key_line(permissions_mapping, "disableBypassPermissionsMode", permissions_line)
+            if "disableBypassPermissionsMode" in raw_permission_mapping
+            else None
+        ),
+        disable_auto_line=(
+            _mapping_key_line(permissions_mapping, "disableAutoMode", permissions_line)
+            if "disableAutoMode" in raw_permission_mapping
+            else None
+        ),
+        skip_dangerous_prompt_line=(
+            _mapping_key_line(
+                permissions_mapping, "skipDangerousModePermissionPrompt", permissions_line
+            )
+            if "skipDangerousModePermissionPrompt" in raw_permission_mapping
+            else None
+        ),
+    )
+
+
+def _json_handler_lines_from_root(root: yaml.MappingNode | None) -> tuple[int, ...]:
+    """Locate handler declarations from an already composed JSON syntax tree."""
     return _event_map_handler_lines(
         _mapping_value_node(root, "hooks") if root is not None else None
     )
+
+
+def _json_handler_lines(content: str) -> tuple[int, ...]:
+    """Locate handler declarations under a JSON document's top-level hook map."""
+    return _json_handler_lines_from_root(_json_root_node(content))
 
 
 def _manifest_handler_lines(content: str) -> tuple[int, ...]:
@@ -565,17 +665,49 @@ def _parse_hook_document(
     registration_limit: int = _MAX_REGISTRATIONS_PER_DOCUMENT,
 ) -> HookDocument:
     raw = _load_json(content)
+    return _parse_hook_mapping_document(
+        path,
+        raw,
+        source_kind,
+        activation_lifetime,
+        content_digest=_digest("content", content),
+        execution_root=execution_root,
+        source_lines=_json_handler_lines(content),
+        registration_limit=registration_limit,
+    )
+
+
+def _parse_hook_mapping_document(
+    path: str,
+    raw: dict[str, object],
+    source_kind: str,
+    activation_lifetime: str,
+    *,
+    content_digest: str,
+    execution_root: str | None,
+    source_lines: tuple[int, ...],
+    registration_limit: int = _MAX_REGISTRATIONS_PER_DOCUMENT,
+) -> HookDocument:
+    """Build one hook document from a retained duplicate-safe JSON mapping."""
     if "hooks" not in raw:
         raise InvalidHookConfigurationError("hook document must contain hooks")
-    return _document(
+    parsed = _registrations(
+        raw["hooks"],
         source_kind=source_kind,
         source_path=path,
         activation_lifetime=activation_lifetime,
-        hook_map=raw["hooks"],
-        content_identity=content,
         execution_root=execution_root,
-        source_lines=iter(_json_handler_lines(content)),
+        source_lines=iter(source_lines),
         registration_limit=registration_limit,
+    )
+    return HookDocument(
+        source_kind=source_kind,
+        declaration_roles=(source_kind,),
+        source_path=path,
+        activation_lifetime=activation_lifetime,
+        content_digest=content_digest,
+        registrations=parsed.registrations,
+        flow_inputs=parsed.flow_inputs,
     )
 
 
@@ -800,6 +932,12 @@ def _path_parts(path: str) -> tuple[str, tuple[str, ...]]:
     return namespace, tuple(part for part in member.split("/") if part)
 
 
+def _permission_source_identity_digest(path: str) -> str:
+    """Hash the full normalized cache identity, including every archive namespace."""
+    payload = b"skillspector.bundled_permission.source.v1\0" + path.encode("utf-8")
+    return f"sha256:{sha256(payload).hexdigest()}"
+
+
 def _is_within_root(path: str, root: str) -> bool:
     path_namespace, path_parts = _path_parts(path)
     root_namespace, root_parts = _path_parts(root)
@@ -1005,8 +1143,8 @@ def _bh1_finding(document: HookDocument, known_paths: set[str]) -> Finding:
     )
 
 
-def _failure(path: str, error: BaseException) -> InspectionLedgerEvent:
-    reason = (
+def _failure_reason(error: BaseException) -> LedgerReason:
+    return (
         LedgerReason.MISSING_FILE_CACHE
         if isinstance(error, KeyError)
         else LedgerReason.BINARY_CONTENT
@@ -1017,10 +1155,16 @@ def _failure(path: str, error: BaseException) -> InspectionLedgerEvent:
         if isinstance(error, HookRegistrationLimitError)
         else LedgerReason.INVALID_CONFIGURATION
     )
+
+
+def _failure(
+    path: str, error: BaseException, *, phase: str = "bundled_hook"
+) -> InspectionLedgerEvent:
+    reason = _failure_reason(error)
     if isinstance(error, HookConfigurationSizeLimitError):
         return ledger_event(
             outcome=LedgerOutcome.FAILED,
-            phase="bundled_hook",
+            phase=phase,
             analyzer_id=ANALYZER_ID,
             path=path,
             reason=reason,
@@ -1031,7 +1175,7 @@ def _failure(path: str, error: BaseException) -> InspectionLedgerEvent:
         )
     return ledger_event(
         outcome=LedgerOutcome.FAILED,
-        phase="bundled_hook",
+        phase=phase,
         analyzer_id=ANALYZER_ID,
         path=path,
         reason=reason,
@@ -1040,13 +1184,68 @@ def _failure(path: str, error: BaseException) -> InspectionLedgerEvent:
     )
 
 
-def _completed(path: str, findings: list[Finding]) -> InspectionLedgerEvent:
+def _completed(
+    path: str, findings: list[Finding], *, phase: str = "bundled_hook"
+) -> InspectionLedgerEvent:
     return ledger_event(
         outcome=LedgerOutcome.COMPLETED,
-        phase="bundled_hook",
+        phase=phase,
         analyzer_id=ANALYZER_ID,
         path=path,
         emitted_finding_ids=[finding.finding_id for finding in findings],
+    )
+
+
+def _settings_terminal(
+    work: _SettingsWork,
+    hook_result: tuple[LedgerOutcome, LedgerReason | None] | None,
+    findings: list[Finding],
+) -> InspectionLedgerEvent | None:
+    """Reduce hook and permission subanalyses to one settings producer row."""
+    if work.parse_error is not None:
+        return _failure(work.source_path, work.parse_error, phase="bundled_settings")
+
+    permission = work.permission_analysis
+    permission_result = (
+        (permission.outcome, permission.reason)
+        if permission is not None and permission.applicable
+        else None
+    )
+    applicable_results = [
+        result for result in (hook_result, permission_result) if result is not None
+    ]
+    if not applicable_results:
+        return None
+
+    failed_results = [result for result in applicable_results if result[0] is LedgerOutcome.FAILED]
+    retained_valid_result = any(
+        result[0] in {LedgerOutcome.COMPLETED, LedgerOutcome.PARTIAL}
+        for result in applicable_results
+    )
+    incomplete_result = any(result[0] is LedgerOutcome.PARTIAL for result in applicable_results)
+
+    reason = (
+        LedgerReason.COMPONENT_LIMIT
+        if any(result[1] is LedgerReason.COMPONENT_LIMIT for result in applicable_results)
+        else LedgerReason.INVALID_CONFIGURATION
+    )
+    if failed_results:
+        outcome = LedgerOutcome.PARTIAL if retained_valid_result else LedgerOutcome.FAILED
+    elif incomplete_result:
+        outcome = LedgerOutcome.PARTIAL
+    else:
+        outcome = LedgerOutcome.COMPLETED
+
+    if outcome is LedgerOutcome.COMPLETED:
+        return _completed(work.source_path, findings, phase="bundled_settings")
+    return ledger_event(
+        outcome=outcome,
+        phase="bundled_settings",
+        analyzer_id=ANALYZER_ID,
+        path=work.source_path,
+        reason=reason,
+        emitted_finding_ids=[finding.finding_id for finding in findings],
+        stage="analyze",
     )
 
 
@@ -1100,6 +1299,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     def candidates_for_root(root: str) -> list[str]:
         return root_candidate_index.get(_path_parts(root), [])
+
+    def project_settings_metadata(path: str) -> tuple[str, str] | None:
+        _namespace_value, member_parts = _path_parts(path)
+        if len(member_parts) != 2:
+            return None
+        return _PROJECT_SETTINGS.get("/".join(member_parts))
 
     documents: list[HookDocument] = []
     document_indexes: dict[str, int] = {}
@@ -1165,6 +1370,66 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             ),
             declaration_roles=tuple(sorted({*document.declaration_roles, role})),
         )
+
+    settings_work_by_path: dict[str, _SettingsWork] = {}
+    settings_handler_lines_by_path: dict[str, tuple[int, ...]] = {}
+    settings_hook_results: dict[str, tuple[LedgerOutcome, LedgerReason | None]] = {}
+    for path in known_paths:
+        settings = project_settings_metadata(path)
+        if settings is None:
+            continue
+
+        content = cache.get(path)
+        source_identity_digest = _permission_source_identity_digest(path)
+        if content is None:
+            settings_work_by_path[path] = _SettingsWork(
+                source_path=path,
+                source_kind=settings[0],
+                content_digest=_digest("content", ""),
+                source_identity_digest=source_identity_digest,
+                raw=None,
+                parse_error=KeyError(path),
+                permission_analysis=None,
+                permission_source_lines=PermissionSourceLines(),
+            )
+            continue
+
+        try:
+            raw = _load_json(content)
+        except (InvalidHookConfigurationError, TypeError) as exc:
+            settings_work_by_path[path] = _SettingsWork(
+                source_path=path,
+                source_kind=settings[0],
+                content_digest=_digest("content", ""),
+                source_identity_digest=source_identity_digest,
+                raw=None,
+                parse_error=exc,
+                permission_analysis=None,
+                permission_source_lines=PermissionSourceLines(),
+            )
+            continue
+
+        content_digest = _digest("content", content)
+        syntax_root = _json_root_node(content)
+        permission_source_lines = _permission_source_lines(raw, syntax_root)
+        permission_analysis = analyze_permission_grants(
+            raw,
+            source_kind=settings[0],
+            content_digest=content_digest,
+            source_identity_digest=source_identity_digest,
+            source_lines=permission_source_lines,
+        )
+        settings_work_by_path[path] = _SettingsWork(
+            source_path=path,
+            source_kind=settings[0],
+            content_digest=content_digest,
+            source_identity_digest=source_identity_digest,
+            raw=raw,
+            parse_error=None,
+            permission_analysis=permission_analysis,
+            permission_source_lines=permission_source_lines,
+        )
+        settings_handler_lines_by_path[path] = _json_handler_lines_from_root(syntax_root)
 
     marketplace_entries: list[MarketplaceEntry] = []
     marketplace_declared_roots: set[str] = set()
@@ -1325,34 +1590,34 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             continue
         add_document(document)
 
-    for path in paths:
-        _namespace_value, path_parts = _path_parts(path)
-        settings = _PROJECT_SETTINGS.get("/".join(path_parts)) if len(path_parts) == 2 else None
-        if settings is None:
+    for path, settings_work in settings_work_by_path.items():
+        if (
+            settings_work.parse_error is not None
+            or settings_work.raw is None
+            or "hooks" not in settings_work.raw
+        ):
             continue
-        content = cache.get(path)
-        if content is None:
-            handled_paths.add(path)
-            events.append(_failure(path, KeyError(path)))
-            continue
+        settings = project_settings_metadata(path)
+        assert settings is not None
         try:
-            raw = _load_json(content)
-            if "hooks" not in raw:
-                continue
-            handled_paths.add(path)
-            document = _document(
-                source_kind=settings[0],
-                source_path=path,
-                activation_lifetime=settings[1],
-                hook_map=raw["hooks"],
-                content_identity=content,
+            document = _parse_hook_mapping_document(
+                path,
+                settings_work.raw,
+                settings_work.source_kind,
+                settings[1],
+                content_digest=settings_work.content_digest,
                 execution_root=_archive_or_project_root(path),
-                source_lines=iter(_json_handler_lines(content)),
+                source_lines=settings_handler_lines_by_path.get(path, ()),
             )
         except (InvalidHookConfigurationError, TypeError) as exc:
             handled_paths.add(path)
-            events.append(_failure(path, exc))
+            settings_hook_results[path] = (
+                LedgerOutcome.FAILED,
+                _failure_reason(exc),
+            )
             continue
+        handled_paths.add(path)
+        settings_hook_results[path] = (LedgerOutcome.COMPLETED, None)
         add_document(document)
 
     referenced_paths: dict[str, set[str]] = {}
@@ -1509,12 +1774,41 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         activation_roots: set[str],
     ) -> None:
         """Inventory every distinct execution root for one physical hook document."""
+        settings_work = settings_work_by_path.get(reference_path)
+        if (
+            settings_work is None
+            and (settings := project_settings_metadata(reference_path)) is not None
+        ):
+            settings_work = _SettingsWork(
+                source_path=reference_path,
+                source_kind=settings[0],
+                content_digest=_digest("content", ""),
+                source_identity_digest=_permission_source_identity_digest(reference_path),
+                raw=None,
+                parse_error=KeyError(reference_path),
+                permission_analysis=None,
+                permission_source_lines=PermissionSourceLines(),
+            )
+            settings_work_by_path[reference_path] = settings_work
         existing_index = document_indexes.get(reference_path)
-        if reference_path in handled_paths and existing_index is None:
+        if settings_work is not None and settings_work.parse_error is not None:
+            handled_paths.add(reference_path)
+            settings_hook_results.setdefault(
+                reference_path,
+                (LedgerOutcome.FAILED, _failure_reason(settings_work.parse_error)),
+            )
+            return
+        if (
+            settings_work is not None
+            and settings_hook_results.get(reference_path, (None, None))[0] is LedgerOutcome.FAILED
+        ):
+            handled_paths.add(reference_path)
+            return
+        if settings_work is None and reference_path in handled_paths and existing_index is None:
             add_declaration_role(reference_path, source_kind)
             return
-        content = cache.get(reference_path)
-        if content is None:
+        content = cache.get(reference_path) if settings_work is None else None
+        if settings_work is None and content is None:
             handled_paths.add(reference_path)
             events.append(_failure(reference_path, KeyError(reference_path)))
             return
@@ -1542,13 +1836,26 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             base_count = len(existing.registrations) if existing is not None else 0
             for execution_root in pending_roots:
                 remaining = _MAX_REGISTRATIONS_PER_DOCUMENT - base_count - len(added_registrations)
-                parsed = _parse_hook_document(
-                    reference_path,
-                    content,
-                    source_kind,
-                    "plugin_enabled",
-                    execution_root=execution_root,
-                    registration_limit=remaining,
+                parsed = (
+                    _parse_hook_mapping_document(
+                        reference_path,
+                        cast(_SettingsWork, settings_work).raw or {},
+                        source_kind,
+                        "plugin_enabled",
+                        content_digest=cast(_SettingsWork, settings_work).content_digest,
+                        execution_root=execution_root,
+                        source_lines=settings_handler_lines_by_path.get(reference_path, ()),
+                        registration_limit=remaining,
+                    )
+                    if settings_work is not None
+                    else _parse_hook_document(
+                        reference_path,
+                        cast(str, content),
+                        source_kind,
+                        "plugin_enabled",
+                        execution_root=execution_root,
+                        registration_limit=remaining,
+                    )
                 )
                 template = parsed
                 added_registrations.extend(parsed.registrations)
@@ -1570,10 +1877,18 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     )
                 )
             handled_paths.add(reference_path)
+            if settings_work is not None:
+                settings_hook_results[reference_path] = (LedgerOutcome.COMPLETED, None)
         except (InvalidHookConfigurationError, TypeError) as exc:
             discard_document(reference_path)
             handled_paths.add(reference_path)
-            events.append(_failure(reference_path, exc))
+            if settings_work is not None:
+                settings_hook_results[reference_path] = (
+                    LedgerOutcome.FAILED,
+                    _failure_reason(exc),
+                )
+            else:
+                events.append(_failure(reference_path, exc))
 
     for reference_path in sorted(referenced_paths, key=reference_order):
         inspect_referenced_document(
@@ -2067,9 +2382,21 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     for owned in flow_batch.findings:
         findings_by_owner.setdefault(owned.owner, []).append(owned.finding)
 
+    settings_permission_findings: dict[str, Finding] = {}
+    for path, settings_work in settings_work_by_path.items():
+        if settings_work.permission_analysis is None:
+            continue
+        permission_finding = build_bh3_finding(
+            settings_work.permission_analysis,
+            source_path=path,
+        )
+        if permission_finding is not None:
+            settings_permission_findings[path] = permission_finding
+
     findings: list[Finding] = []
     document_owners: set[FlowWorkRef] = set()
     documents_by_owner: dict[FlowWorkRef, HookDocument] = {}
+    settings_findings_by_path: dict[str, list[Finding]] = {}
     for document in documents:
         owner = FlowWorkRef(document.source_path)
         document_owners.add(owner)
@@ -2078,8 +2405,28 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             [_bh1_finding(document, cache_path_set)] if document.registrations else []
         )
         document_findings.extend(findings_by_owner.get(owner, []))
+        permission_finding = settings_permission_findings.get(document.source_path)
+        if permission_finding is not None:
+            document_findings.append(permission_finding)
         findings.extend(document_findings)
-        events.append(_completed(document.source_path, document_findings))
+        if document.source_path in settings_work_by_path:
+            settings_findings_by_path[document.source_path] = document_findings
+        else:
+            events.append(_completed(document.source_path, document_findings))
+
+    for path in sorted(settings_work_by_path, key=reference_order):
+        if path not in settings_findings_by_path:
+            permission_finding = settings_permission_findings.get(path)
+            path_findings = [permission_finding] if permission_finding is not None else []
+            findings.extend(path_findings)
+            settings_findings_by_path[path] = path_findings
+        terminal = _settings_terminal(
+            settings_work_by_path[path],
+            settings_hook_results.get(path),
+            settings_findings_by_path[path],
+        )
+        if terminal is not None:
+            events.append(terminal)
 
     findings.extend(
         owned.finding for owned in flow_batch.findings if owned.owner not in document_owners
