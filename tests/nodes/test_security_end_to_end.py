@@ -111,11 +111,26 @@ async def _assert_rules_across_public_surfaces(
     *,
     expected_locations: dict[str, set[str]],
     python_result: dict,
+    expected_executable_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     """Verify static-only finding contracts on every supported public surface."""
     expected_score = python_result["risk_score"]
     expected_recommendation = python_result["risk_recommendation"]
-    assert python_result["analysis_completeness"]["is_complete"] is True
+    executable_ranges = expected_executable_ranges or {}
+    expected_complete = not executable_ranges
+    completeness = python_result["analysis_completeness"]
+    assert completeness["is_complete"] is expected_complete
+    assert completeness["status"] == ("complete" if expected_complete else "partial")
+    assert completeness["execution_successful"] is True
+    if executable_ranges:
+        assert {
+            (row["path"], row["start_line"], row["end_line"])
+            for row in completeness["ledger_exceptions"]
+            if row["reason_code"] == "unscanned_executable_content"
+        } == {
+            (path, start_line, end_line)
+            for path, (start_line, end_line) in executable_ranges.items()
+        }
 
     for output_format in ("json", "markdown", "sarif", "terminal"):
         result = render_report({**python_result, "output_format": output_format})
@@ -124,6 +139,18 @@ async def _assert_rules_across_public_surfaces(
         report = result["report_body"]
         if output_format == "json":
             parsed = json.loads(report)
+            projected = parsed["analysis_completeness"]
+            assert projected["is_complete"] is expected_complete
+            assert projected["status"] == ("complete" if expected_complete else "partial")
+            if executable_ranges:
+                assert {
+                    (row["path"], row["start_line"], row["end_line"])
+                    for row in projected["ledger_exceptions"]
+                    if row["reason_code"] == "unscanned_executable_content"
+                } == {
+                    (path, start_line, end_line)
+                    for path, (start_line, end_line) in executable_ranges.items()
+                }
             for rule_id, paths in expected_locations.items():
                 observed = {
                     issue["location"]["file"]
@@ -139,10 +166,26 @@ async def _assert_rules_across_public_surfaces(
                 assert paths <= observed
         elif output_format == "sarif":
             parsed = json.loads(report)
-            projected = parsed["runs"][0]["invocations"][0]["properties"]["analysisCompleteness"]
-            assert projected["isComplete"] is True
-            assert projected["status"] == "complete"
-            assert projected["coveragePercent"] == 100.0
+            invocation = parsed["runs"][0]["invocations"][0]
+            projected = invocation["properties"]["analysisCompleteness"]
+            assert projected["isComplete"] is expected_complete
+            assert projected["status"] == ("complete" if expected_complete else "partial")
+            if expected_complete:
+                assert projected["coveragePercent"] == 100.0
+            else:
+                assert {
+                    (
+                        item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+                        item["locations"][0]["physicalLocation"]["region"]["startLine"],
+                        item["locations"][0]["physicalLocation"]["region"]["endLine"],
+                    )
+                    for item in invocation["toolExecutionNotifications"]
+                    if item.get("properties", {}).get("reasonCode")
+                    == "unscanned_executable_content"
+                } == {
+                    (path, start_line, end_line)
+                    for path, (start_line, end_line) in executable_ranges.items()
+                }
             for rule_id, paths in expected_locations.items():
                 observed = {
                     item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
@@ -151,6 +194,9 @@ async def _assert_rules_across_public_surfaces(
                 }
                 assert paths <= observed
         else:
+            assert ("complete" if expected_complete else "partial") in report.lower()
+            if executable_ranges:
+                assert "unscanned_executable_content" in report
             for rule_id, paths in expected_locations.items():
                 assert rule_id in report
                 assert all(path in report for path in paths)
@@ -179,7 +225,18 @@ async def _assert_rules_across_public_surfaces(
             assert paths <= observed
         assert parsed["risk_assessment"]["score"] == expected_score
         assert parsed["risk_assessment"]["recommendation"] == expected_recommendation
-        assert parsed["analysis_completeness"]["is_complete"] is True
+        projected = parsed["analysis_completeness"]
+        assert projected["is_complete"] is expected_complete
+        assert projected["status"] == ("complete" if expected_complete else "partial")
+        if executable_ranges:
+            assert {
+                (row["path"], row["start_line"], row["end_line"])
+                for row in projected["ledger_exceptions"]
+                if row["reason_code"] == "unscanned_executable_content"
+            } == {
+                (path, start_line, end_line)
+                for path, (start_line, end_line) in executable_ranges.items()
+            }
 
     verdict = await run_scan(str(root), use_llm=False, output_format="json")
     for rule_id, paths in expected_locations.items():
@@ -197,7 +254,12 @@ async def _assert_rules_across_public_surfaces(
         assert paths <= observed_occurrences | observed_locations
     assert verdict["risk_score"] == expected_score
     assert verdict["recommendation"] == expected_recommendation
-    assert verdict["analysis_completeness"]["is_complete"] is True
+    assert verdict["analysis_completeness"]["is_complete"] is expected_complete
+    assert verdict["analysis_completeness"]["status"] == (
+        "complete" if expected_complete else "partial"
+    )
+    if executable_ranges:
+        assert verdict["safe_to_install"] is False
 
 
 async def _assert_incomplete_across_public_surfaces(root: Path, python_result: dict) -> None:
@@ -539,11 +601,13 @@ async def test_rd07_collision_resistance_and_occurrence_preservation(tmp_path: P
         exact,
         expected_locations={"TM1": {"a.sh", "b.sh"}},
         python_result=exact_result,
+        expected_executable_ranges={"a.sh": (1, 1), "b.sh": (1, 1)},
     )
     await _assert_rules_across_public_surfaces(
         distinct,
         expected_locations={"TM1": {"a.sh", "b.sh"}},
         python_result=distinct_result,
+        expected_executable_ranges={"a.sh": (1, 1), "b.sh": (1, 1)},
     )
 
 
@@ -590,6 +654,7 @@ async def test_nine_case_contract_across_public_surfaces(tmp_path: Path) -> None
         tmp_path,
         expected_locations=expected,
         python_result=result,
+        expected_executable_ranges={"scripts/a.sh": (1, 1), "scripts/b.sh": (1, 1)},
     )
 
 

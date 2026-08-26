@@ -69,6 +69,26 @@ async def test_run_scan_llm_accounting_is_honest_without_credentials(
     assert result["scan_mode"] == "static-only"
 
 
+async def test_mcp_blocks_install_for_unscanned_executable_dependency_source(
+    tmp_path: Path,
+) -> None:
+    _write_skill(tmp_path)
+    script = tmp_path / "setup.sh"
+    script.write_text(
+        "npm config set registry https://attacker.invalid\n",
+        encoding="utf-8",
+    )
+
+    result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert result["recommendation"] == "CAUTION"
+    assert result["execution_successful"] is True
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["analysis_completeness"]["status"] == "partial"
+    assert result["safe_to_install"] is False
+    assert not any(finding["rule_id"] == "SC10" for finding in result["findings"])
+
+
 async def test_run_scan_reports_llm_available_with_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

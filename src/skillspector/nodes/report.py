@@ -28,7 +28,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from io import StringIO
-from typing import Literal
+from typing import Literal, cast
 
 from rich.console import Console
 from rich.markup import escape
@@ -63,6 +63,12 @@ from skillspector.sarif_models import (
 )
 from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
+from skillspector.url_redaction import (
+    REDACTED_VALUE,
+    CodeOwnedMapping,
+    redact_text_result,
+    redact_value,
+)
 
 logger = get_logger(__name__)
 
@@ -105,22 +111,167 @@ def _clean_text(value: str | None) -> str | None:
     return _CONTROL_RE.sub("", _ANSI_RE.sub("", value))
 
 
-def _sanitize_finding(finding: Finding) -> Finding:
-    """Return a copy of *finding* with control/ANSI bytes stripped from text fields."""
-    evidence = {
-        _clean_text(str(key)) or "": _clean_text(value) if isinstance(value, str) else value
-        for key, value in finding.evidence.items()
+def _sanitize_text(value: str | None) -> str | None:
+    """Strip terminal controls and fully redact structural URL credentials."""
+    cleaned = _clean_text(value)
+    if not isinstance(cleaned, str):
+        return cleaned
+    result = redact_text_result(cleaned)
+    return result.value if result.complete else REDACTED_VALUE
+
+
+def _unwrap_code_owned(value: object) -> object:
+    """Remove internal provenance wrappers before any formatter sees the value."""
+    if isinstance(value, CodeOwnedMapping):
+        return {str(key): _unwrap_code_owned(nested) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [_unwrap_code_owned(item) for item in value]
+    if isinstance(value, tuple):
+        return [_unwrap_code_owned(item) for item in value]
+    return value
+
+
+def _sanitize_fixed_mapping(values: Mapping[str, object]) -> dict[str, object]:
+    """Sanitize a mapping whose field names are owned by the report schema."""
+    redacted = redact_value(CodeOwnedMapping(cast(Mapping[object, object], values)))
+    unwrapped = _unwrap_code_owned(redacted)
+    return unwrapped if isinstance(unwrapped, dict) else {}
+
+
+def _sanitize_arbitrary_value(value: object) -> object:
+    """Sanitize arbitrary values while failing closed for untrusted nested mappings."""
+    if isinstance(value, str):
+        return _sanitize_text(value) or ""
+    if isinstance(value, list):
+        return [_sanitize_arbitrary_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_arbitrary_value(item) for item in value]
+    if isinstance(value, Mapping):
+        return {}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return REDACTED_VALUE
+
+
+_EVIDENCE_STRING_FIELDS = frozenset(
+    {
+        "actual_behavior_summary",
+        "code_path",
+        "concealment",
+        "container_type",
+        "destination",
+        "destination_status",
+        "ecosystem",
+        "nested_path",
+        "operation",
+        "outer_path",
+        "scope",
+        "surface",
     }
+)
+_EVIDENCE_STRING_LIST_FIELDS = frozenset({"concealment_reasons", "container_ancestry"})
+_EVIDENCE_INTEGER_FIELDS = frozenset({"code_end_line", "code_start_line", "container_depth"})
+_EVIDENCE_BOOLEAN_FIELDS = frozenset({"local_only"})
+_EVIDENCE_FIELDS = (
+    _EVIDENCE_STRING_FIELDS
+    | _EVIDENCE_STRING_LIST_FIELDS
+    | _EVIDENCE_INTEGER_FIELDS
+    | _EVIDENCE_BOOLEAN_FIELDS
+)
+
+
+def _sanitize_evidence(evidence: Mapping[str, object]) -> dict[str, object]:
+    """Sanitize only the fixed finding-evidence schema under one aggregate walk."""
+    if type(evidence) is not dict or len(evidence) > len(_EVIDENCE_FIELDS):
+        return {}
+    if any(type(key) is not str or key not in _EVIDENCE_FIELDS for key in evidence):
+        return {}
+
+    fixed: dict[str, object] = {}
+    for key, value in evidence.items():
+        if key in _EVIDENCE_STRING_FIELDS:
+            fixed[key] = _clean_text(value) if type(value) is str else REDACTED_VALUE
+        elif key in _EVIDENCE_STRING_LIST_FIELDS:
+            fixed[key] = value if isinstance(value, (list, tuple)) else []
+        elif key in _EVIDENCE_INTEGER_FIELDS:
+            if value is not None and type(value) is not int:
+                return {}
+            fixed[key] = value
+        elif key in _EVIDENCE_BOOLEAN_FIELDS:
+            if type(value) is not bool:
+                return {}
+            fixed[key] = value
+
+    redacted = redact_value(CodeOwnedMapping(cast(Mapping[object, object], fixed)))
+    if not isinstance(redacted, CodeOwnedMapping):
+        return {}
+    unwrapped = _unwrap_code_owned(redacted)
+    if not isinstance(unwrapped, dict):
+        return {}
+
+    for key in _EVIDENCE_STRING_FIELDS & unwrapped.keys():
+        if not isinstance(unwrapped[key], str):
+            unwrapped[key] = REDACTED_VALUE
+    for key in _EVIDENCE_STRING_LIST_FIELDS & unwrapped.keys():
+        value = unwrapped[key]
+        if not isinstance(value, list) or not all(type(item) is str for item in value):
+            unwrapped[key] = []
+        else:
+            unwrapped[key] = [_clean_text(item) or "" for item in value]
+    return unwrapped
+
+
+_OCCURRENCE_FIELDS = frozenset(
+    {
+        "file",
+        "start_line",
+        "end_line",
+        "source_identity",
+        "source_digest",
+        "source_url",
+        "transitive_depth",
+    }
+)
+
+
+def _sanitize_occurrences(occurrences: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    sanitized: list[dict[str, object]] = []
+    for occurrence in occurrences:
+        fixed = {
+            key: (_sanitize_text(value) if isinstance(value, str) else value)
+            for key, value in occurrence.items()
+            if key in _OCCURRENCE_FIELDS
+        }
+        sanitized.append(_sanitize_fixed_mapping(fixed))
+    return sanitized
+
+
+def _sanitize_finding(finding: Finding) -> Finding:
+    """Return a field-wise provider-safe copy without mutating canonical finding state."""
+    tags_value = redact_value([_clean_text(tag) or "" for tag in finding.tags])
+    tags = list(tags_value) if isinstance(tags_value, list) else []
     return replace(
         finding,
-        message=_clean_text(finding.message) or "",
-        explanation=_clean_text(finding.explanation),
-        remediation=_clean_text(finding.remediation),
-        finding=_clean_text(finding.finding),
-        context=_clean_text(finding.context),
-        matched_text=_clean_text(finding.matched_text),
-        code_snippet=_clean_text(finding.code_snippet),
-        evidence=evidence,
+        rule_id=_sanitize_text(finding.rule_id) or REDACTED_VALUE,
+        finding_id=_sanitize_text(finding.finding_id) or REDACTED_VALUE,
+        message=_sanitize_text(finding.message) or "",
+        severity=_sanitize_text(finding.severity) or "LOW",
+        file=_sanitize_text(finding.file) or REDACTED_VALUE,
+        category=_sanitize_text(finding.category),
+        pattern=_sanitize_text(finding.pattern),
+        explanation=_sanitize_text(finding.explanation),
+        remediation=_sanitize_text(finding.remediation),
+        finding=_sanitize_text(finding.finding),
+        context=_sanitize_text(finding.context),
+        matched_text=_sanitize_text(finding.matched_text),
+        code_snippet=_sanitize_text(finding.code_snippet),
+        intent=_sanitize_text(finding.intent),
+        tags=[str(tag) for tag in tags],
+        source_url=_sanitize_text(finding.source_url),
+        source_identity=_sanitize_text(finding.source_identity),
+        source_digest=_sanitize_text(finding.source_digest),
+        evidence=_sanitize_evidence(finding.evidence),
+        occurrences=_sanitize_occurrences(finding.occurrences),
     )
 
 
@@ -322,21 +473,171 @@ def _build_sarif_properties(
 
 
 def _sanitize_summary_value(value: object) -> object:
-    """Return a recursively sanitized copy of structured-summary content."""
-    if isinstance(value, str):
-        return _clean_text(value)
-    if isinstance(value, list):
-        return [_sanitize_summary_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_sanitize_summary_value(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _sanitize_summary_value(item) for key, item in value.items()}
-    return value
+    """Return a type-preserving sanitized structured-summary field value."""
+    return _sanitize_arbitrary_value(value)
 
 
 def _sanitize_structured_summary(summary: dict[str, object]) -> dict[str, object]:
-    """Return a structured summary with control/ANSI bytes stripped from text fields."""
-    return {str(key): _sanitize_summary_value(value) for key, value in summary.items()}
+    """Return only the fixed structured-summary output schema, fully redacted."""
+    allowed = frozenset(
+        {
+            "id",
+            "message",
+            "file",
+            "protocol",
+            "layout_kind",
+            "declared_tools",
+            "workflow_nodes",
+            "constraints",
+            "resources",
+            "tags",
+        }
+    )
+    values = {
+        key: _sanitize_summary_value(value) for key, value in summary.items() if key in allowed
+    }
+    return _sanitize_fixed_mapping(values)
+
+
+def _sanitize_component_metadata(
+    components: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Sanitize the fixed component-report schema and discard unknown fields."""
+    allowed = frozenset(
+        {
+            "path",
+            "type",
+            "lines",
+            "executable",
+            "size_bytes",
+            "source_url",
+            "source_identity",
+            "source_digest",
+        }
+    )
+    sanitized: list[dict[str, object]] = []
+    for component in components:
+        values = {
+            key: (_sanitize_text(value) if isinstance(value, str) else value)
+            for key, value in component.items()
+            if key in allowed
+        }
+        sanitized.append(_sanitize_fixed_mapping(values))
+    return sanitized
+
+
+_EXCEPTION_FIELDS = frozenset(
+    {
+        "outcome",
+        "phase",
+        "reason_code",
+        "message",
+        "path",
+        "start_line",
+        "end_line",
+        "error_class",
+        "analyzers",
+        "fatal",
+    }
+)
+_COMPLETENESS_FIELDS = frozenset(
+    {
+        "total_components",
+        "scanned_components",
+        "coverage_percent",
+        "is_complete",
+        "status",
+        "execution_successful",
+        "fully_inspected_files",
+        "partially_inspected_files",
+        "entirely_uninspected_files",
+        "ledger_exceptions",
+        "scope_exclusions",
+        "analyzer_statuses",
+        "references",
+        "limitations",
+        "findings_before_filtering",
+        "findings_after_filtering",
+    }
+)
+_ANALYZER_STATUS_FIELDS = frozenset({"analyzer_id", "status", "reason_code", "message"})
+_PLANNED_WORK_FIELDS = frozenset({"work_id", "path", "start_line", "end_line"})
+_REFERENCE_FIELDS = frozenset(
+    {"source_path", "line", "column", "evidence", "target_path", "status", "disposition"}
+)
+
+
+def _sanitize_fixed_record(
+    record: Mapping[str, object], allowed: frozenset[str]
+) -> dict[str, object]:
+    values = {
+        key: _sanitize_arbitrary_value(value) for key, value in record.items() if key in allowed
+    }
+    return _sanitize_fixed_mapping(values)
+
+
+def _sanitize_analysis_completeness(
+    completeness: Mapping[str, object],
+) -> dict[str, object]:
+    """Sanitize completeness text and fixed exception rows without changing scalar types."""
+    sanitized: dict[str, object] = {}
+    for key, value in completeness.items():
+        if key not in _COMPLETENESS_FIELDS:
+            continue
+        if key in {"ledger_exceptions", "scope_exclusions"} and isinstance(value, list):
+            sanitized[key] = [
+                _sanitize_fixed_record(item, _EXCEPTION_FIELDS)
+                for item in value
+                if isinstance(item, Mapping)
+            ]
+        elif key == "analyzer_statuses" and isinstance(value, list):
+            statuses: list[dict[str, object]] = []
+            for item in value:
+                if not isinstance(item, Mapping):
+                    continue
+                status = _sanitize_fixed_record(item, _ANALYZER_STATUS_FIELDS)
+                raw_work = item.get("planned_work")
+                status["planned_work"] = (
+                    [
+                        _sanitize_fixed_record(work, _PLANNED_WORK_FIELDS)
+                        for work in raw_work
+                        if isinstance(work, Mapping)
+                    ]
+                    if isinstance(raw_work, list)
+                    else []
+                )
+                statuses.append(status)
+            sanitized[key] = statuses
+        elif key == "references" and isinstance(value, list):
+            sanitized[key] = [
+                _sanitize_fixed_record(item, _REFERENCE_FIELDS)
+                for item in value
+                if isinstance(item, Mapping)
+            ]
+        else:
+            sanitized[key] = _sanitize_arbitrary_value(value)
+    return sanitized
+
+
+def _sanitize_llm_call_log(
+    records: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        _sanitize_fixed_record(record, frozenset({"node", "ok", "error"})) for record in records
+    ]
+
+
+def _sanitize_suppressed_findings(
+    suppressed: Sequence[SuppressedFinding],
+) -> list[SuppressedFinding]:
+    return [
+        replace(
+            item,
+            finding=_sanitize_finding(item.finding),
+            reason=_sanitize_text(item.reason) or REDACTED_VALUE,
+        )
+        for item in suppressed
+    ]
 
 
 def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note"]:
@@ -1115,7 +1416,11 @@ def _build_metadata(
     if degraded:
         meta["llm_degraded"] = True
         reasons = sorted(
-            {str(r.get("error")) for r in llm_call_log if not r.get("ok") and r.get("error")}
+            {
+                _sanitize_text(str(r.get("error"))) or REDACTED_VALUE
+                for r in llm_call_log
+                if not r.get("ok") and r.get("error")
+            }
         )
         detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
         failed = attempted - succeeded
@@ -1124,7 +1429,7 @@ def _build_metadata(
             f"results reflect static analysis only for the affected batch(es).{detail}"
         )
     elif use_llm and not provider_available:
-        meta["llm_error"] = llm_error
+        meta["llm_error"] = _sanitize_text(llm_error) or REDACTED_VALUE
     if transitive_targets_scanned is not None:
         meta["transitive_targets_scanned"] = transitive_targets_scanned
     if transitive_bytes_scanned is not None:
@@ -1405,7 +1710,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
     # Meta/LLM analysis can enrich canonical objects but cannot remove
     # deterministic findings from primary output.
     selected_findings = list(findings_by_id.values())
-    selected_findings = [_sanitize_finding(finding) for finding in selected_findings]
 
     raw_structured_summaries = state.get("structured_summaries") or []
     structured_summaries = [
@@ -1443,7 +1747,9 @@ def report(state: SkillspectorState) -> dict[str, object]:
     skill_path = state.get("skill_path")
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
-    llm_call_log = state.get("llm_call_log") or []
+    llm_call_log: Sequence[Mapping[str, object]] = cast(
+        Sequence[Mapping[str, object]], state.get("llm_call_log") or []
+    )
     inference_usage = state.get("inference_usage") or []
     transitive_targets_scanned = state.get("transitive_targets_scanned")
     transitive_bytes_scanned = state.get("transitive_bytes_scanned")
@@ -1469,9 +1775,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
     degraded = degraded or provider_unavailable
     degraded_notice = _llm_degradation_notice(use_llm, llm_call_log)
     if provider_unavailable and degraded_notice is None:
+        safe_provider_error = _sanitize_text(provider_error) or REDACTED_VALUE
         degraded_notice = (
             "LLM analysis was requested but the configured provider was unavailable"
-            f" ({provider_error or 'unknown reason'}); results may reflect static analysis only."
+            f" ({safe_provider_error}); results may reflect static analysis only."
         )
     if degraded:
         logger.warning(
@@ -1500,7 +1807,6 @@ def report(state: SkillspectorState) -> dict[str, object]:
         suppressed,
         limit=remaining_output_records,
     )
-    display_findings = _expand_occurrences(reported_findings)
     exceptions = analysis_completeness.get("ledger_exceptions", [])
     fatal_exception = (
         any(
@@ -1526,6 +1832,21 @@ def report(state: SkillspectorState) -> dict[str, object]:
         or transitive_truncation_reasons
     ) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
+
+    # Canonical internal findings and metadata have now driven suppression,
+    # deduplication, scoring, and recommendation. Only field-wise copies cross
+    # public formatter boundaries from this point onward.
+    reported_findings = [_sanitize_finding(finding) for finding in reported_findings]
+    suppressed = _sanitize_suppressed_findings(suppressed)
+    display_findings = _expand_occurrences(reported_findings)
+    component_metadata = _sanitize_component_metadata(component_metadata)
+    manifest = {"name": _sanitize_text(str(manifest.get("name") or "unknown")) or REDACTED_VALUE}
+    skill_path = _sanitize_text(skill_path)
+    llm_call_log = _sanitize_llm_call_log(llm_call_log)
+    analysis_completeness = _sanitize_analysis_completeness(analysis_completeness)
+    transitive_truncation_reasons = [
+        _sanitize_text(reason) or REDACTED_VALUE for reason in transitive_truncation_reasons
+    ]
 
     sarif_report = _build_sarif(
         reported_findings,

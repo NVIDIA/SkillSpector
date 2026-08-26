@@ -219,6 +219,8 @@ class SkillspectorState(TypedDict, total=False):
     raw_file_cache: dict[str, bytes]
     # External-model consumers use the redacted projection for sensitive local files.
     llm_file_cache: dict[str, str]
+    # Visible artifacts omitted because bounded provider redaction did not complete.
+    llm_redaction_incomplete_paths: list[str]
     artifact_inventory: list[ArtifactRecord]
     artifact_references: list[BundleReference]
     reference_resolution: dict[str, object]

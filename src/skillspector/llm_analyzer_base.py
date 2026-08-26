@@ -61,6 +61,7 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
+from skillspector.url_redaction import REDACTED_VALUE, redact_text_result
 
 logger = get_logger(__name__)
 
@@ -108,6 +109,10 @@ class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
 
 
+class _PromptRedactionIncompleteError(Exception):
+    """Content-free signal that the final provider prompt could not be fully redacted."""
+
+
 class LLMRuntimeLimitError(RuntimeError):
     """Signal that no shared scan time remains for an LLM operation."""
 
@@ -115,6 +120,20 @@ class LLMRuntimeLimitError(RuntimeError):
 def _is_retryable_api_connection_error(exc: BaseException) -> bool:
     """Return whether *exc* is the narrowly supported transient provider failure."""
     return type(exc).__name__ == "APIConnectionError"
+
+
+def _provider_safe_text(value: str) -> str:
+    """Return fully redacted text for a provider/log boundary or a fixed placeholder."""
+    result = redact_text_result(value)
+    return result.value if result.complete else REDACTED_VALUE
+
+
+def _redacted_prompt(prompt: str) -> str:
+    """Return the final serialized provider prompt or fail without retaining its content."""
+    result = redact_text_result(prompt)
+    if not result.complete:
+        raise _PromptRedactionIncompleteError
+    return result.value
 
 
 def _uses_native_connection_retries(
@@ -522,24 +541,33 @@ class LLMAnalyzerBase:
         self._timeout = timeout
         self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
-        # Native SDK retries cannot re-read a workflow-wide deadline between
-        # attempts.  A dynamic deadline therefore uses our explicit retry loop,
-        # which checks and caps every retry/backoff against remaining time.
-        native_retries = 0 if self._dynamic_timeout else API_CONNECTION_MAX_RETRIES
-        self._uses_native_connection_retries = _uses_native_connection_retries(
-            self._llm,
-            max_retries=native_retries,
-        )
-        self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
-        )
-        self._usage_collector = new_inference_usage_collector(
-            node=node,
-            request_kind="structured_output" if self.response_schema else "chat_completion",
-            model=model,
-            chat_model=self._llm,
-        )
+        try:
+            self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+            # Native SDK retries cannot re-read a workflow-wide deadline between
+            # attempts.  A dynamic deadline therefore uses our explicit retry loop,
+            # which checks and caps every retry/backoff against remaining time.
+            native_retries = 0 if self._dynamic_timeout else API_CONNECTION_MAX_RETRIES
+            self._uses_native_connection_retries = _uses_native_connection_retries(
+                self._llm,
+                max_retries=native_retries,
+            )
+            self._structured_llm = (
+                self._llm.with_structured_output(self.response_schema)
+                if self.response_schema
+                else None
+            )
+            self._usage_collector = new_inference_usage_collector(
+                node=node,
+                request_kind="structured_output" if self.response_schema else "chat_completion",
+                model=model,
+                chat_model=self._llm,
+            )
+        except LLMRuntimeLimitError:
+            raise
+        except ValueError as exc:
+            raise ValueError(_provider_safe_text(str(exc))) from None
+        except Exception as exc:
+            raise RuntimeError(_provider_safe_text(str(exc))) from None
 
     def _remaining_timeout(self) -> float | None:
         if callable(self._timeout):
@@ -679,21 +707,27 @@ class LLMAnalyzerBase:
 
     def _invoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
         """Invoke and parse one batch synchronously."""
+        safe_label = _provider_safe_text(batch.file_label)
         logger.debug(
             "LLM call for %s (tokens~%d, findings=%d)",
-            batch.file_label,
+            safe_label,
             estimate_tokens(prompt),
             len(batch.findings),
         )
         llm, structured_llm = self._model_for_call()
+        provider_prompt = _redacted_prompt(prompt)
         if structured_llm:
             try:
-                response = _invoke_with_usage(structured_llm, prompt, self._usage_collector)
+                response = _invoke_with_usage(
+                    structured_llm, provider_prompt, self._usage_collector
+                )
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
-            response = _raw_response_text(_invoke_with_usage(llm, prompt, self._usage_collector))
-        logger.debug("LLM response for %s", batch.file_label)
+            response = _raw_response_text(
+                _invoke_with_usage(llm, provider_prompt, self._usage_collector)
+            )
+        logger.debug("LLM response for %s", safe_label)
         return batch, self.parse_response(response, batch)
 
     def _invoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
@@ -703,6 +737,8 @@ class LLMAnalyzerBase:
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
                 return self._invoke_batch(batch, prompt)
+            except _PromptRedactionIncompleteError:
+                raise
             except _StructuredResponseValidationError:
                 if (
                     structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
@@ -714,7 +750,7 @@ class LLMAnalyzerBase:
                 structured_retries += 1
                 logger.warning(
                     "LLM structured response validation failed for %s; retrying in %.2fs (%d/%d)",
-                    batch.file_label,
+                    _provider_safe_text(batch.file_label),
                     delay,
                     structured_retries,
                     STRUCTURED_RESPONSE_MAX_RETRIES,
@@ -735,7 +771,7 @@ class LLMAnalyzerBase:
                 connection_retries += 1
                 logger.warning(
                     "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
-                    batch.file_label,
+                    _provider_safe_text(batch.file_label),
                     delay,
                     connection_retries,
                     API_CONNECTION_MAX_RETRIES,
@@ -746,23 +782,27 @@ class LLMAnalyzerBase:
 
     async def _ainvoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
         """Invoke and parse one batch asynchronously."""
+        safe_label = _provider_safe_text(batch.file_label)
         logger.debug(
             "LLM call for %s (tokens~%d, findings=%d)",
-            batch.file_label,
+            safe_label,
             estimate_tokens(prompt),
             len(batch.findings),
         )
         llm, structured_llm = self._model_for_call()
+        provider_prompt = _redacted_prompt(prompt)
         if structured_llm:
             try:
-                response = await _ainvoke_with_usage(structured_llm, prompt, self._usage_collector)
+                response = await _ainvoke_with_usage(
+                    structured_llm, provider_prompt, self._usage_collector
+                )
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
             response = _raw_response_text(
-                await _ainvoke_with_usage(llm, prompt, self._usage_collector)
+                await _ainvoke_with_usage(llm, provider_prompt, self._usage_collector)
             )
-        logger.debug("LLM response for %s", batch.file_label)
+        logger.debug("LLM response for %s", safe_label)
         return batch, self.parse_response(response, batch)
 
     async def _ainvoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
@@ -772,6 +812,8 @@ class LLMAnalyzerBase:
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
             try:
                 return await self._ainvoke_batch(batch, prompt)
+            except _PromptRedactionIncompleteError:
+                raise
             except _StructuredResponseValidationError:
                 if (
                     structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
@@ -783,7 +825,7 @@ class LLMAnalyzerBase:
                 structured_retries += 1
                 logger.warning(
                     "LLM structured response validation failed for %s; retrying in %.2fs (%d/%d)",
-                    batch.file_label,
+                    _provider_safe_text(batch.file_label),
                     delay,
                     structured_retries,
                     STRUCTURED_RESPONSE_MAX_RETRIES,
@@ -804,7 +846,7 @@ class LLMAnalyzerBase:
                 connection_retries += 1
                 logger.warning(
                     "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
-                    batch.file_label,
+                    _provider_safe_text(batch.file_label),
                     delay,
                     connection_retries,
                     API_CONNECTION_MAX_RETRIES,
@@ -840,10 +882,18 @@ class LLMAnalyzerBase:
                 prompt = self.build_prompt(batch, **kwargs)
                 result = self._invoke_batch_with_retries(batch, prompt)
                 outcome.successful.append(result)
+            except _PromptRedactionIncompleteError:
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class="PromptRedactionIncomplete",
+                        reason=LedgerReason.LLM_BATCH_FAILED,
+                    )
+                )
             except _StructuredResponseValidationError:
                 logger.warning(
                     "LLM structured response validation failed for %s after %d attempts",
-                    batch.file_label,
+                    _provider_safe_text(batch.file_label),
                     STRUCTURED_RESPONSE_MAX_ATTEMPTS,
                 )
                 outcome.failures.append(
@@ -864,7 +914,10 @@ class LLMAnalyzerBase:
             except (ValueError, NotImplementedError):
                 raise
             except Exception as exc:
-                logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                logger.warning(
+                    "LLM batch failed for %s",
+                    _provider_safe_text(batch.file_label),
+                )
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,
@@ -942,10 +995,19 @@ class LLMAnalyzerBase:
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         outcome = BatchExecutionResult()
         for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, _PromptRedactionIncompleteError):
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class="PromptRedactionIncomplete",
+                        reason=LedgerReason.LLM_BATCH_FAILED,
+                    )
+                )
+                continue
             if isinstance(result, _StructuredResponseValidationError):
                 logger.warning(
                     "LLM structured response validation failed for %s after %d attempts",
-                    batch.file_label,
+                    _provider_safe_text(batch.file_label),
                     STRUCTURED_RESPONSE_MAX_ATTEMPTS,
                 )
                 outcome.failures.append(
@@ -968,7 +1030,10 @@ class LLMAnalyzerBase:
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
             if isinstance(result, BaseException):
-                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                logger.warning(
+                    "LLM batch failed for %s",
+                    _provider_safe_text(batch.file_label),
+                )
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,

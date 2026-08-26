@@ -60,10 +60,18 @@ from skillspector.state import (
     MetaAnalyzerResponse,
     SkillspectorState,
     llm_call_record,
+    merge_inspection_ledger,
     transitive_remaining_seconds,
 )
+from skillspector.url_redaction import REDACTED_VALUE, redact_text_result
 
 logger = get_logger(__name__)
+
+
+def _safe_external_text(value: str) -> str:
+    """Redact provider-derived text before logging or persisting it."""
+    result = redact_text_result(value)
+    return result.value if result.complete else REDACTED_VALUE
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +656,24 @@ def _runtime_limited_events(findings: list[Finding]) -> list[InspectionLedgerEve
     return events
 
 
+def _redaction_incomplete_events(state: SkillspectorState) -> list[InspectionLedgerEvent]:
+    """Project omitted visible artifacts as bounded, content-free failed meta work."""
+    raw_paths = state.get("llm_redaction_incomplete_paths") or []
+    paths = list(dict.fromkeys(path for path in raw_paths if isinstance(path, str) and path))
+    events = [
+        ledger_event(
+            analyzer_id="meta_analyzer",
+            outcome=LedgerOutcome.FAILED,
+            phase="meta",
+            path=path,
+            reason=LedgerReason.LLM_BATCH_FAILED,
+            error_class="ArtifactRedactionIncomplete",
+        )
+        for path in paths
+    ]
+    return merge_inspection_ledger([], events)
+
+
 def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     """Filter and enrich findings via per-file LLM calls.
 
@@ -661,19 +687,29 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     an LLM call fails.
     """
     findings: list[Finding] = state.get("findings", [])
+    redaction_events = _redaction_incomplete_events(state)
+    redaction_incomplete_paths = {event["path"] for event in redaction_events}
     if not findings:
-        return {
+        empty_response: MetaAnalyzerResponse = {
             "findings": [],
             "effective_finding_ids": [],
-            "inspection_ledger": [],
+            "inspection_ledger": redaction_events,
             "analyzer_status_events": [
-                analyzer_status_event(
-                    analyzer_id="meta_analyzer",
-                    status="not_applicable",
-                    reason=LedgerReason.NO_APPLICABLE_FILES,
+                (
+                    analyzer_status_for_events("meta_analyzer", redaction_events)
+                    if redaction_events
+                    else analyzer_status_event(
+                        analyzer_id="meta_analyzer",
+                        status="not_applicable",
+                        reason=LedgerReason.NO_APPLICABLE_FILES,
+                    )
                 )
             ],
         }
+        if redaction_events and state.get("use_llm", True) is not False:
+            empty_response["llm_call_log"] = [llm_call_record("meta_analyzer", ok=False)]
+            empty_response["inference_usage"] = []
+        return empty_response
 
     # The workflow deadline applies to the whole graph, including the
     # deterministic fallback path.  Check it before partitioning or cloning
@@ -683,7 +719,12 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
     # meta processing did not start.
     shared_remaining = transitive_remaining_seconds(state)
     if shared_remaining is not None and shared_remaining <= 0:
-        events = _runtime_limited_events(findings)
+        events = merge_inspection_ledger(
+            redaction_events,
+            _runtime_limited_events(
+                [finding for finding in findings if finding.file not in redaction_incomplete_paths]
+            ),
+        )
         response: MetaAnalyzerResponse = {
             "findings": findings,
             "effective_finding_ids": _effective_finding_ids(findings),
@@ -703,15 +744,20 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
 
     if state.get("use_llm", True) is False:
         filtered = _fallback_filtered(findings)
+        events = redaction_events
         return {
             "findings": filtered,
             "effective_finding_ids": _effective_finding_ids(filtered),
-            "inspection_ledger": [],
+            "inspection_ledger": events,
             "analyzer_status_events": [
-                analyzer_status_event(
-                    analyzer_id="meta_analyzer",
-                    status="disabled",
-                    reason=LedgerReason.DISABLED_BY_CONFIGURATION,
+                (
+                    analyzer_status_for_events("meta_analyzer", events)
+                    if events
+                    else analyzer_status_event(
+                        analyzer_id="meta_analyzer",
+                        status="disabled",
+                        reason=LedgerReason.DISABLED_BY_CONFIGURATION,
+                    )
                 )
             ],
         }
@@ -740,7 +786,16 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
 
     if not eligible_findings:
         filtered_local = _fallback_filtered(local_only_findings)
-        events = _local_only_events(filtered_local)
+        events = merge_inspection_ledger(
+            redaction_events,
+            _local_only_events(
+                [
+                    finding
+                    for finding in filtered_local
+                    if finding.file not in redaction_incomplete_paths
+                ]
+            ),
+        )
         return {
             "findings": filtered_local,
             "effective_finding_ids": _effective_finding_ids(filtered_local),
@@ -841,7 +896,19 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(filtered),
         )
         ledger_events, status = _meta_ledger_response(batches, detailed, filtered)
-        ledger_events.extend(_local_only_events(filtered_local))
+        ledger_events = merge_inspection_ledger(
+            redaction_events,
+            [
+                *ledger_events,
+                *_local_only_events(
+                    [
+                        finding
+                        for finding in filtered_local
+                        if finding.file not in redaction_incomplete_paths
+                    ]
+                ),
+            ],
+        )
         status = analyzer_status_for_events("meta_analyzer", ledger_events)
         return {
             "findings": filtered,
@@ -853,7 +920,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 # partial batch failure (e.g. one file's batch 429'd while
                 # another's succeeded) is still lost coverage, so it must not
                 # read as ok=True just because some batches came back.
-                llm_call_record("meta_analyzer", ok=not detailed.failures)
+                llm_call_record("meta_analyzer", ok=not detailed.failures and not redaction_events)
             ],
             "inference_usage": analyzer.inference_usage,
         }
@@ -868,8 +935,21 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 finding for finding in filtered if finding.finding_id in local_only_ids
             ]
             ledger_events = [
-                *_runtime_limited_events(filtered_eligible),
-                *_local_only_events(filtered_local),
+                *redaction_events,
+                *_runtime_limited_events(
+                    [
+                        finding
+                        for finding in filtered_eligible
+                        if finding.file not in redaction_incomplete_paths
+                    ]
+                ),
+                *_local_only_events(
+                    [
+                        finding
+                        for finding in filtered_local
+                        if finding.file not in redaction_incomplete_paths
+                    ]
+                ),
             ]
             return {
                 "findings": filtered,
@@ -892,7 +972,11 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         )
         if isinstance(e, ValueError) and not post_response_value_error:
             raise
-        logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
+        safe_error = _safe_external_text(str(e))
+        logger.warning(
+            "LLM call failed, passing all findings through (fail-closed): %s",
+            safe_error,
+        )
         filtered = _passthrough_with_defaults(findings)
         filtered_local = [finding for finding in filtered if finding.finding_id in local_only_ids]
         if post_response_value_error:
@@ -905,16 +989,37 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 ),
                 filtered,
             )
-            ledger_events.extend(_local_only_events(filtered_local))
+            ledger_events = merge_inspection_ledger(
+                redaction_events,
+                [
+                    *ledger_events,
+                    *_local_only_events(
+                        [
+                            finding
+                            for finding in filtered_local
+                            if finding.file not in redaction_incomplete_paths
+                        ]
+                    ),
+                ],
+            )
             status = analyzer_status_for_events("meta_analyzer", ledger_events)
         else:
-            ledger_events = _local_only_events(filtered_local)
+            ledger_events = merge_inspection_ledger(
+                redaction_events,
+                _local_only_events(
+                    [
+                        finding
+                        for finding in filtered_local
+                        if finding.file not in redaction_incomplete_paths
+                    ]
+                ),
+            )
             status = analyzer_status_event(analyzer_id="meta_analyzer", status="unavailable")
         return {
             "findings": filtered,
             "effective_finding_ids": _effective_finding_ids(filtered),
             "inspection_ledger": ledger_events,
             "analyzer_status_events": [status],
-            "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=safe_error)],
             "inference_usage": analyzer.inference_usage if analyzer is not None else [],
         }

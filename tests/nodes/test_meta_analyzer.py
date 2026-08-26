@@ -22,10 +22,20 @@ degradation signal.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from langchain_core.messages import AIMessage
+
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
-from skillspector.llm_analyzer_base import Batch, BatchExecutionResult, BatchFailure
+from skillspector.llm_analyzer_base import (
+    Batch,
+    BatchExecutionResult,
+    BatchFailure,
+    LLMAnalyzerBase,
+)
+from skillspector.llm_utils import run_async
 from skillspector.models import Finding
 from skillspector.nodes.analyzers import static_patterns_anti_refusal
 from skillspector.nodes.analyzers.static_runner import analyzer_finding_to_finding
@@ -97,6 +107,45 @@ def _assert_preserved_ar2(result: dict[str, object], original: Finding) -> None:
     assert preserved.confidence >= original.confidence
 
 
+def _authoritative_projection(finding: Finding, *, confidence_floor: float) -> dict[str, object]:
+    """Normalize only deterministic fields that a provider can never change."""
+    return {
+        "finding_id": finding.finding_id,
+        "rule_id": finding.rule_id,
+        "severity": finding.severity,
+        "confidence_floor_preserved": finding.confidence >= confidence_floor,
+        "category": finding.category,
+        "file": finding.file,
+        "start_line": finding.start_line,
+        "end_line": finding.end_line,
+        "matched_text": finding.matched_text,
+        "evidence": finding.evidence,
+    }
+
+
+class _PromptBoundaryAnalyzer(LLMAnalyzerBase):
+    """Raw-mode probe that keeps the real shared invocation boundary."""
+
+    response_schema = None
+
+    def parse_response(self, response: object, batch: Batch) -> list[str]:
+        return [str(response)]
+
+
+def test_provider_construction_error_is_sanitized_before_callers_can_log_it() -> None:
+    sentinel = "task7-provider-error-secret"
+    raw_url = f"https://user:{sentinel}@provider.example.invalid/private"
+
+    with (
+        patch(MOCK_PATCH_TARGET, side_effect=RuntimeError(f"provider failed at {raw_url}")),
+        pytest.raises(RuntimeError) as error,
+    ):
+        _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+
+    assert sentinel not in str(error.value)
+    assert "provider.example.invalid" in str(error.value)
+
+
 def test_documentation_framed_finding_survives_provider_outcome_matrix() -> None:
     original = _documentation_framed_ar2()
     state: SkillspectorState = {
@@ -151,6 +200,352 @@ def test_documentation_framed_finding_survives_provider_outcome_matrix() -> None
         mock_cls.return_value.response_received = True
         mock_cls.return_value.inference_usage = []
         _assert_preserved_ar2(meta_analyzer(llm_state), original)
+
+
+def test_authoritative_projection_is_invariant_across_every_provider_outcome() -> None:
+    original = Finding(
+        rule_id="SC10",
+        message="deterministic dependency source replacement",
+        finding_id="task7-authoritative-finding",
+        severity="HIGH",
+        confidence=0.91,
+        file="pip.conf",
+        start_line=3,
+        end_line=3,
+        category="supply_chain",
+        matched_text="index-url = redacted destination",
+        evidence={"surface": "pip.conf", "operation": "replace", "scope": "global"},
+    )
+    batch = Batch(file_path=original.file, content="safe provider copy", findings=[original])
+    expected = _authoritative_projection(original, confidence_floor=original.confidence)
+    state: SkillspectorState = {
+        "findings": [original],
+        "use_llm": False,
+        "file_cache": {original.file: "safe canonical content"},
+        "llm_file_cache": {original.file: "safe provider copy"},
+        "manifest": {},
+        "model_config": {},
+    }
+    projected: dict[str, Finding] = {}
+
+    disabled_result = meta_analyzer(state)
+    [projected["disabled"]] = disabled_result["findings"]
+
+    failed_state = dict(state)
+    failed_state["use_llm"] = True
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
+        mock_cls.return_value.get_batches.return_value = [batch]
+        mock_cls.return_value.arun_batches = AsyncMock(side_effect=TimeoutError("provider timeout"))
+        mock_cls.return_value.response_received = False
+        mock_cls.return_value.inference_usage = []
+        failed_result = meta_analyzer(failed_state)
+    [projected["failed"]] = failed_result["findings"]
+
+    provider_outcomes: dict[str, list[dict[str, object]]] = {
+        "empty": [],
+        "confirming": [
+            {
+                "pattern_id": "SC10",
+                "is_vulnerability": True,
+                "confidence": 0.99,
+                "start_line": 3,
+                "_file": "pip.conf",
+                "explanation": "useful provider presentation context",
+                "remediation": "use the canonical registry",
+            }
+        ],
+        "downgrading": [
+            {
+                "pattern_id": "SC10",
+                "is_vulnerability": True,
+                "confidence": 0.0,
+                "start_line": 3,
+                "_file": "pip.conf",
+                "severity": "LOW",
+            }
+        ],
+        "suppressing": [
+            {
+                "pattern_id": "SC10",
+                "is_vulnerability": False,
+                "confidence": 0.0,
+                "start_line": 3,
+                "_file": "pip.conf",
+                "severity": "LOW",
+                "category": "benign",
+                "file": "other.conf",
+                "matched_text": "rewritten",
+                "evidence": {},
+            }
+        ],
+        "rewriting": [
+            {
+                "pattern_id": "SC10",
+                "is_vulnerability": True,
+                "confidence": 0.99,
+                "start_line": 3,
+                "_file": "pip.conf",
+                "explanation": "useful provider presentation context",
+                "remediation": "use the canonical registry",
+                "finding_id": "hostile-rewrite",
+                "severity": "LOW",
+                "evidence": {"surface": "hostile"},
+            }
+        ],
+        "hostile": [
+            {
+                "pattern_id": "HOSTILE",
+                "is_vulnerability": True,
+                "confidence": 1.0,
+                "start_line": 3,
+                "_file": "pip.conf",
+            }
+        ],
+    }
+
+    for outcome, provider_items in provider_outcomes.items():
+        [result] = _analyzer().apply_filter([original], [(batch, provider_items)])
+        projected[outcome] = result
+
+    assert set(projected) == {
+        "disabled",
+        "failed",
+        "empty",
+        "confirming",
+        "downgrading",
+        "suppressing",
+        "rewriting",
+        "hostile",
+    }
+    for outcome, result in projected.items():
+        assert (
+            _authoritative_projection(result, confidence_floor=original.confidence) == expected
+        ), outcome
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_sync_provider_prompt_is_redacted_immediately_before_invocation() -> None:
+    sentinel = "task7-sync-prompt-secret"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=f"index-url = https://user:{sentinel}@packages.example.invalid/private",
+    )
+    submitted: list[str] = []
+
+    def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with patch("skillspector.llm_analyzer_base._invoke_with_usage", side_effect=capture):
+        outcome = analyzer.run_batches_detailed([batch])
+
+    assert len(outcome.successful) == 1
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert "packages.example.invalid" in submitted[0]
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_sync_embedded_scheme_relative_prompt_never_reaches_provider_raw() -> None:
+    sentinel = "task9-sync-scheme-relative-secret"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=(f"index-url=//user:{sentinel}@packages.example.invalid/private?token={sentinel}"),
+    )
+    submitted: list[str] = []
+
+    def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with patch("skillspector.llm_analyzer_base._invoke_with_usage", side_effect=capture):
+        outcome = analyzer.run_batches_detailed([batch])
+
+    assert len(outcome.successful) == 1
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_async_embedded_scheme_relative_prompt_never_reaches_provider_raw() -> None:
+    sentinel = "task9-async-scheme-relative-secret"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=(f"index-url=//user:{sentinel}@packages.example.invalid/private?token={sentinel}"),
+    )
+    submitted: list[str] = []
+
+    async def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with patch(
+        "skillspector.llm_analyzer_base._ainvoke_with_usage",
+        new_callable=AsyncMock,
+        side_effect=capture,
+    ):
+        outcome = run_async(analyzer.arun_batches_detailed([batch], max_concurrency=1))
+
+    assert len(outcome.successful) == 1
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<url>//user:{sentinel}@packages.example.invalid/{private_path}</url>",
+        "url(//user:{sentinel}@packages.example.invalid/{private_path})",
+    ],
+    ids=("element-markup", "functional-markup"),
+)
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_sync_markup_embedded_scheme_relative_prompt_never_reaches_provider_raw(
+    template: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "round2-sync-scheme-relative-secret"
+    private_path = "round2-sync-private-path"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=template.format(sentinel=sentinel, private_path=private_path),
+    )
+    submitted: list[str] = []
+
+    def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="skillspector"),
+        patch("skillspector.llm_analyzer_base._invoke_with_usage", side_effect=capture),
+    ):
+        outcome = analyzer.run_batches_detailed([batch])
+
+    assert len(outcome.successful) == 1
+    assert outcome.failures == []
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert private_path not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+    assert sentinel not in caplog.text
+    assert private_path not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<url>//user:{sentinel}@packages.example.invalid/{private_path}</url>",
+        "url(//user:{sentinel}@packages.example.invalid/{private_path})",
+    ],
+    ids=("element-markup", "functional-markup"),
+)
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_async_markup_embedded_scheme_relative_prompt_never_reaches_provider_raw(
+    template: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "round2-async-scheme-relative-secret"
+    private_path = "round2-async-private-path"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=template.format(sentinel=sentinel, private_path=private_path),
+    )
+    submitted: list[str] = []
+
+    async def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="skillspector"),
+        patch(
+            "skillspector.llm_analyzer_base._ainvoke_with_usage",
+            new_callable=AsyncMock,
+            side_effect=capture,
+        ),
+    ):
+        outcome = run_async(analyzer.arun_batches_detailed([batch], max_concurrency=1))
+
+    assert len(outcome.successful) == 1
+    assert outcome.failures == []
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert private_path not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+    assert sentinel not in caplog.text
+    assert private_path not in caplog.text
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_sync_incomplete_prompt_redaction_makes_zero_calls_and_zero_retries() -> None:
+    sentinel = "task7-sync-incomplete-secret"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    candidates = " ".join(
+        f"https://user:{sentinel}@host{index}.example.invalid/private" for index in range(1_025)
+    )
+    batch = Batch(file_path="pip.conf", content=candidates)
+
+    with patch("skillspector.llm_analyzer_base._invoke_with_usage") as invoke:
+        outcome = analyzer.run_batches_detailed([batch])
+
+    invoke.assert_not_called()
+    assert outcome.successful == []
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].error_class == "PromptRedactionIncomplete"
+    assert outcome.failures[0].reason is LedgerReason.LLM_BATCH_FAILED
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_async_incomplete_prompt_redaction_makes_zero_calls_and_zero_retries() -> None:
+    sentinel = "task7-async-incomplete-secret"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    candidates = " ".join(
+        f"https://user:{sentinel}@host{index}.example.invalid/private" for index in range(1_025)
+    )
+    batch = Batch(file_path="pip.conf", content=candidates)
+
+    with patch(
+        "skillspector.llm_analyzer_base._ainvoke_with_usage", new_callable=AsyncMock
+    ) as invoke:
+        outcome = run_async(analyzer.arun_batches_detailed([batch], max_concurrency=1))
+
+    invoke.assert_not_awaited()
+    assert outcome.successful == []
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].error_class == "PromptRedactionIncomplete"
+    assert outcome.failures[0].reason is LedgerReason.LLM_BATCH_FAILED
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_prompt_redaction_failure_never_persists_or_logs_prompt_content(caplog) -> None:
+    sentinel = "task7-prompt-log-secret"
+    finding = Finding(rule_id="SC10", message="static", file="pip.conf", start_line=1)
+    repeated_metadata = " ".join(
+        f"https://user:{sentinel}@host{index}.example.invalid/private" for index in range(1_025)
+    )
+    state: SkillspectorState = {
+        "findings": [finding],
+        "use_llm": True,
+        "llm_file_cache": {"pip.conf": "safe provider artifact"},
+        "manifest": {"description": repeated_metadata},
+        "model_config": {"meta_analyzer": "test/model"},
+    }
+
+    with caplog.at_level(logging.DEBUG):
+        result = meta_analyzer(state)
+
+    assert result["llm_call_log"] == [{"node": "meta_analyzer", "ok": False, "error": None}]
+    assert sentinel not in caplog.text
+    assert sentinel not in str(result["llm_call_log"])
+    assert sentinel not in str(result["inspection_ledger"])
 
 
 def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
@@ -908,3 +1303,28 @@ def test_no_findings_records_nothing() -> None:
     result = meta_analyzer(_degr_state(findings=[]))
     assert "llm_call_log" not in result
     assert "filtered_findings" not in result
+
+
+def test_no_findings_projects_incomplete_visible_artifact_as_failed_meta_work() -> None:
+    """An omitted provider artifact remains failed planned work even without findings."""
+    result = meta_analyzer(
+        _degr_state(
+            findings=[],
+            llm_file_cache={},
+            llm_redaction_incomplete_paths=["pip.conf"],
+        )
+    )
+
+    assert result["findings"] == []
+    assert result["effective_finding_ids"] == []
+    assert result["llm_call_log"] == [{"node": "meta_analyzer", "ok": False, "error": None}]
+    assert len(result["inspection_ledger"]) == 1
+    event = result["inspection_ledger"][0]
+    assert event["path"] == "pip.conf"
+    assert event["outcome"] == LedgerOutcome.FAILED
+    assert event["reason_code"] == LedgerReason.LLM_BATCH_FAILED
+    assert event["input_finding_ids"] == []
+    assert event["emitted_finding_ids"] == []
+    [status] = result["analyzer_status_events"]
+    assert status["status"] == "failed"
+    assert [work["path"] for work in status["planned_work"]] == ["pip.conf"]

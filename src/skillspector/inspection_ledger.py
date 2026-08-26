@@ -90,6 +90,8 @@ class LedgerReason(StrEnum):
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
+    UNSCANNED_EXECUTABLE_CONTENT = "unscanned_executable_content"
+    DEPENDENCY_SOURCE_PARSE_INCOMPLETE = "dependency_source_parse_incomplete"
     OUTPUT_LIMIT = "output_limit"
 
 
@@ -175,6 +177,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.TRAVERSAL_DEPTH_LIMIT: ("Bundle discovery reached its directory-depth limit."),
     LedgerReason.TOTAL_BYTES_LIMIT: "Bundle caching reached its aggregate byte limit.",
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
+    LedgerReason.UNSCANNED_EXECUTABLE_CONTENT: (
+        "Executable content was identified but is not inspected for dependency-source changes."
+    ),
+    LedgerReason.DEPENDENCY_SOURCE_PARSE_INCOMPLETE: (
+        "Dependency-source configuration could not be completely interpreted."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
 }
 

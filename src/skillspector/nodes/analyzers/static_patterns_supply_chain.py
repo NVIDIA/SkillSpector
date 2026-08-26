@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: supply chain (SC1–SC9) and trigger analysis (TR1–TR3).
+"""Static patterns: supply chain (SC1–SC10) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
 SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
@@ -22,6 +22,7 @@ SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
 SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
 SC9: Concealed executable artifact — flags executables nested in document or hidden artifacts.
+SC10: Dependency source change — deterministic direct-config inspection.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
 
 Node and analyze() in one module.
@@ -44,12 +45,23 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
+from skillspector.dependency_source_types import (
+    DependencySourceLimitation,
+    DependencySourceLimitationReason,
+    DependencySourceSpan,
+    DependencyWorkBudget,
+)
+from skillspector.dependency_sources import analyze_dependency_sources
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
+    AnalyzerStatusEvent,
+    InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
+    analyzer_status_event,
     analyzer_status_for_events,
+    inspection_work_id,
     ledger_event,
 )
 from skillspector.logging_config import get_logger
@@ -57,6 +69,7 @@ from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import (
     AnalyzerNodeResponse,
     SkillspectorState,
+    merge_inspection_ledger,
     transitive_note_truncation,
     transitive_remaining_seconds,
 )
@@ -1964,7 +1977,7 @@ def _analyze_concealed_executables(
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Run supply_chain patterns (SC1–SC9) and trigger analysis (TR1–TR3)."""
+    """Run supply_chain patterns (SC1–SC10) and trigger analysis (TR1–TR3)."""
     # SC1–SC3 via static_runner
     response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
     findings = response["findings"]
@@ -2253,8 +2266,174 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             f"{ANALYZER_ID}_concealed_executable",
         )
 
+    # SC10: deterministic direct configuration plus explicit executable-surface gaps.
+    # Only the normalized executable bit crosses the inventory boundary; no metadata
+    # payload is passed to dependency-source parsing or projected into output.
+    executable_path_values: set[str] = set()
+    for metadata in component_metadata:
+        metadata_path = metadata.get("path")
+        if (
+            metadata.get("executable") is True
+            and isinstance(metadata_path, str)
+            and metadata_path in components
+        ):
+            executable_path_values.add(metadata_path)
+    executable_paths = frozenset(executable_path_values)
+    dependency_source_budget = DependencyWorkBudget.from_existing(
+        findings=findings,
+        ledger_events=response["inspection_ledger"],
+    )
+    source_analysis = analyze_dependency_sources(
+        components=components,
+        local_file_cache=file_cache,
+        raw_file_cache=state.get("raw_file_cache") or {},
+        artifact_inventory=state.get("artifact_inventory") or [],
+        budget=dependency_source_budget,
+        executable_paths=executable_paths,
+    )
+    parse_limitations_by_path: dict[str, list[DependencySourceLimitation]] = {}
+    coverage_limitations: list[DependencySourceLimitation] = []
+    for source_limitation in source_analysis.limitations:
+        if (
+            source_limitation.reason
+            is DependencySourceLimitationReason.UNSCANNED_EXECUTABLE_CONTENT
+        ):
+            coverage_limitations.append(source_limitation)
+        else:
+            parse_limitations_by_path.setdefault(source_limitation.path, []).append(
+                source_limitation
+            )
+
+    findings_by_source_path: dict[str, list[Finding]] = {}
+    for finding in source_analysis.findings:
+        findings_by_source_path.setdefault(finding.file, []).append(finding)
+
+    source_rows: list[InspectionLedgerEvent] = []
+    for span in source_analysis.applicable_spans:
+        path_limitations = parse_limitations_by_path.get(span.path, [])
+        finding_ids = [finding.finding_id for finding in findings_by_source_path.get(span.path, [])]
+        if path_limitations:
+            source_limitation = path_limitations[0]
+            source_rows.append(
+                ledger_event(
+                    analyzer_id="dependency_sources",
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="static",
+                    path=span.path,
+                    start_line=min(item.start_line for item in path_limitations),
+                    end_line=max(item.end_line for item in path_limitations),
+                    reason=LedgerReason.DEPENDENCY_SOURCE_PARSE_INCOMPLETE,
+                    emitted_finding_ids=finding_ids,
+                    observed_bytes=source_limitation.observed_bytes,
+                    limit_bytes=source_limitation.limit_bytes,
+                    observed_findings=source_limitation.observed_findings,
+                    limit_findings=source_limitation.limit_findings,
+                    observed_depth=source_limitation.observed_depth,
+                    limit_depth=source_limitation.limit_depth,
+                    observed_records=source_limitation.observed_records,
+                    limit_records=source_limitation.limit_records,
+                )
+            )
+        else:
+            source_rows.append(
+                ledger_event(
+                    analyzer_id="dependency_sources",
+                    outcome=LedgerOutcome.COMPLETED,
+                    phase="static",
+                    path=span.path,
+                    start_line=span.start_line,
+                    end_line=span.end_line,
+                    emitted_finding_ids=finding_ids,
+                )
+            )
+
+    coverage_rows: list[InspectionLedgerEvent] = [
+        ledger_event(
+            analyzer_id="dependency_source_coverage",
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            path=source_limitation.path,
+            start_line=source_limitation.start_line,
+            end_line=source_limitation.end_line,
+            reason=LedgerReason.UNSCANNED_EXECUTABLE_CONTENT,
+        )
+        for source_limitation in coverage_limitations
+    ]
+    base_ledger = list(response["inspection_ledger"])
+    if source_analysis.ledger_exhaustion is None:
+        findings.extend(source_analysis.findings)
+        response["inspection_ledger"] = merge_inspection_ledger(
+            base_ledger,
+            [*source_rows, *coverage_rows],
+        )
+        source_status = analyzer_status_for_events("dependency_sources", source_rows)
+        coverage_status = analyzer_status_for_events("dependency_source_coverage", coverage_rows)
+    else:
+        omitted_path = (
+            source_analysis.applicable_spans[0].path
+            if source_analysis.applicable_spans
+            else coverage_limitations[0].path
+            if coverage_limitations
+            else "SKILL.md"
+        )
+        exhaustion = source_analysis.ledger_exhaustion
+        marker = ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="ledger_output",
+            path=omitted_path,
+            reason=LedgerReason.OUTPUT_LIMIT,
+            observed_records=exhaustion.observed,
+            limit_records=exhaustion.limit,
+        )
+        response["inspection_ledger"] = merge_inspection_ledger(base_ledger, [marker])
+
+        def output_limited_status(
+            analyzer_id: str,
+            spans: list[DependencySourceSpan],
+        ) -> AnalyzerStatusEvent:
+            if not spans:
+                return analyzer_status_for_events(analyzer_id, [])
+            return analyzer_status_event(
+                analyzer_id=analyzer_id,
+                status="degraded",
+                reason=LedgerReason.OUTPUT_LIMIT,
+                planned_work=[
+                    {
+                        "work_id": inspection_work_id(
+                            analyzer_id,
+                            span.path,
+                            span.start_line,
+                            span.end_line,
+                        ),
+                        "path": span.path,
+                        "start_line": span.start_line,
+                        "end_line": span.end_line,
+                    }
+                    for span in spans
+                ],
+            )
+
+        source_status = output_limited_status(
+            "dependency_sources",
+            list(source_analysis.applicable_spans),
+        )
+        coverage_status = output_limited_status(
+            "dependency_source_coverage",
+            [
+                DependencySourceSpan(
+                    path=item.path,
+                    start_line=item.start_line,
+                    end_line=item.end_line,
+                )
+                for item in coverage_limitations
+            ],
+        )
+
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     response["analyzer_status_events"] = [
-        analyzer_status_for_events(ANALYZER_ID, response["inspection_ledger"])
+        analyzer_status_for_events(ANALYZER_ID, base_ledger),
+        source_status,
+        coverage_status,
     ]
     return response

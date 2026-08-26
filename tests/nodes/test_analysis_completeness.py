@@ -9,6 +9,13 @@ import json
 
 import pytest
 
+from skillspector.inspection_ledger import (
+    LedgerOutcome,
+    LedgerReason,
+    analyzer_status_for_events,
+    finalize_ledger,
+    ledger_event,
+)
 from skillspector.models import Finding
 from skillspector.nodes.report import report
 from skillspector.sarif_models import validate_sarif_report
@@ -117,3 +124,46 @@ def test_fatal_omission_floors_safe_recommendation_without_changing_score() -> N
 
     assert result["risk_score"] == 0
     assert result["risk_recommendation"] == "CAUTION"
+
+
+def test_unscanned_executable_content_is_successful_but_incomplete() -> None:
+    event = ledger_event(
+        analyzer_id="dependency_source_coverage",
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        path="docs/setup.md",
+        start_line=3,
+        end_line=5,
+        reason=LedgerReason.UNSCANNED_EXECUTABLE_CONTENT,
+    )
+
+    completeness, effective_ids = finalize_ledger(
+        {
+            "components": ["docs/setup.md"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "inspection_ledger": [event],
+            "analyzer_status_events": [
+                analyzer_status_for_events("dependency_source_coverage", [event])
+            ],
+            "artifact_inventory": [],
+        }
+    )
+
+    assert effective_ids == []
+    assert completeness["execution_successful"] is True
+    assert completeness["is_complete"] is False
+    assert completeness["status"] == "partial"
+    assert completeness["ledger_exceptions"] == [
+        {
+            "outcome": LedgerOutcome.PARTIAL,
+            "phase": "static",
+            "reason_code": LedgerReason.UNSCANNED_EXECUTABLE_CONTENT,
+            "message": "Executable content was identified but is not inspected for dependency-source changes.",
+            "path": "docs/setup.md",
+            "start_line": 3,
+            "end_line": 5,
+            "fatal": False,
+            "analyzers": ["dependency_source_coverage"],
+        }
+    ]

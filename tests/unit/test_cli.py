@@ -1835,7 +1835,7 @@ def test_scan_transitive_depth_one_merges_provenance(tmp_path: Path, monkeypatch
     assert len(issues) == 2
     transitive_issue = next(issue for issue in issues if issue.get("source_url") is not None)
     assert transitive_issue["transitive_depth"] == 1
-    assert transitive_issue["source_url"] == "https://github.com/org/transitive"
+    assert transitive_issue["source_url"] == "https://github.com/REDACTED_PATH"
 
 
 def test_scan_transitive_ignores_non_scannable_urls(tmp_path: Path, monkeypatch) -> None:
@@ -1931,7 +1931,7 @@ def test_scan_transitive_allow_prefix_filters_targets(tmp_path: Path, monkeypatc
     assert calls[1] == "https://github.com/allowed/dep"
     data = json.loads(result.output)
     assert any(
-        issue.get("source_url") == "https://github.com/allowed/dep" for issue in data["issues"]
+        issue.get("source_url") == "https://github.com/REDACTED_PATH" for issue in data["issues"]
     )
 
 
@@ -2715,7 +2715,7 @@ def test_scan_transitive_child_failure_stays_visible_and_fail_closed(monkeypatch
     assert body["analysis_completeness"]["is_complete"] is False
     assert body["metadata"]["transitive_truncated"] is True
     assert any(
-        "transitive child scan failed for https://github.com/org/broken" in limitation
+        "transitive child scan failed for https://github.com/REDACTED_PATH" in limitation
         for limitation in body["analysis_completeness"]["limitations"]
     )
     assert "secret token should stay private" not in merged["transitive_truncation_reasons"][0]
@@ -2787,7 +2787,10 @@ def test_scan_transitive_keeps_source_aware_component_coverage(monkeypatch) -> N
     body = json.loads(merged["report_body"])
     assert body["analysis_completeness"]["coverage_percent"] == 100.0
     assert len(body["components"]) == 2
-    assert {component["source_url"] for component in body["components"]} == {None, shared_dep}
+    assert {component["source_url"] for component in body["components"]} == {
+        None,
+        "https://github.com/REDACTED_PATH",
+    }
 
 
 def test_scan_transitive_source_scopes_identical_child_work_and_evidence(monkeypatch) -> None:

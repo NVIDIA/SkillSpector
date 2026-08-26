@@ -116,5 +116,8 @@ asyncio_mode = "auto"
 markers = [
     "integration: end-to-end tests that invoke the full graph (may call LLMs)",
     "provider: live OpenAI/Anthropic/NVIDIA Build provider endpoint tests",
+    "sc10_pr1: dependency-source behavior owned by the direct-configuration PR",
+    "sc10_pr2: dependency-source behavior owned by the executable-surface PR",
+    "sc10_deferred: dependency-source behavior with an explicitly deferred owner",
 ]
 addopts = "-m 'not integration and not provider'"

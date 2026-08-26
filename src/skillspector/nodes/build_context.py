@@ -80,6 +80,7 @@ from skillspector.state import (
     transitive_traversal_state,
 )
 from skillspector.structured_skill import extract_structured_skill_context_from_cache
+from skillspector.url_redaction import REDACTED_VALUE, redact_text_result
 
 logger = get_logger(__name__)
 
@@ -654,6 +655,12 @@ def _count_lines(file_path: Path) -> int:
         return 0
 
 
+def _safe_log_label(value: object) -> str:
+    """Return a credential-redacted label for an attacker-controlled log field."""
+    result = redact_text_result(str(value))
+    return result.value if result.complete else REDACTED_VALUE
+
+
 def _build_component_metadata(
     skill_dir: Path,
     components: list[str],
@@ -698,7 +705,7 @@ def _build_component_metadata(
             size_bytes = file_stat.st_size
             mode = file_stat.st_mode
         except OSError:
-            logger.debug("Could not stat file: %s", path)
+            logger.debug("Could not stat file: %s", _safe_log_label(path))
             size_bytes = 0
             mode = 0
         data = content.encode("utf-8", errors="replace") if content is not None else b""
@@ -734,19 +741,24 @@ def _build_component_metadata(
     return metadata, has_executable
 
 
-def _redact_for_external_model(path: str, content: str) -> str:
-    """Redact values from local environment files before external-model use."""
+def _redact_for_external_model(path: str, content: str) -> str | None:
+    """Return a fully redacted provider copy, or ``None`` when redaction is incomplete."""
     name = Path(path).name.lower()
-    if name != ".env" and not name.startswith(".env."):
-        return content
-    lines: list[str] = []
-    for line in content.splitlines(keepends=True):
-        match = re.match(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=)(.*?)(\r?\n)?$", line)
-        if match:
-            lines.append(f"{match.group(1)}<redacted>{match.group(3) or ''}")
-        else:
-            lines.append(line)
-    return "".join(lines)
+    redaction_input = content
+    if name == ".env" or name.startswith(".env."):
+        lines: list[str] = []
+        for line in content.splitlines(keepends=True):
+            match = re.match(
+                r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=)(.*?)(\r?\n)?$",
+                line,
+            )
+            if match:
+                lines.append(f"{match.group(1)}<redacted>{match.group(3) or ''}")
+            else:
+                lines.append(line)
+        redaction_input = "".join(lines)
+    result = redact_text_result(redaction_input)
+    return result.value if result.complete else None
 
 
 def _is_hidden_path(path: str) -> bool:
@@ -783,6 +795,7 @@ def _read_file_cache(
     *,
     started_at: float | None = None,
     state: SkillspectorState | None = None,
+    redaction_incomplete_paths: list[str] | None = None,
 ) -> tuple[
     dict[str, str],
     dict[str, bytes],
@@ -1090,7 +1103,12 @@ def _read_file_cache(
                     )
             inventory.append(artifact)
             if not truncated and not _is_hidden_path(path) and artifact["content_kind"] == "text":
-                llm_file_cache[path] = _redact_for_external_model(path, content)
+                provider_content = _redact_for_external_model(path, content)
+                if provider_content is None:
+                    if redaction_incomplete_paths is not None:
+                        redaction_incomplete_paths.append(path)
+                else:
+                    llm_file_cache[path] = provider_content
             if aggregate_truncated:
                 inventory.extend(
                     _opaque_artifact_record(
@@ -1140,7 +1158,7 @@ def _read_file_cache(
                 )
             )
         except _FileOpenError as exc:
-            logger.debug("Could not read file: %s", path)
+            logger.debug("Could not read file: %s", _safe_log_label(path))
             ledger_events.append(
                 ledger_event(
                     outcome=LedgerOutcome.FAILED,
@@ -1161,7 +1179,7 @@ def _read_file_cache(
                 )
             )
         except OSError as exc:
-            logger.debug("Could not read file: %s", path)
+            logger.debug("Could not read file: %s", _safe_log_label(path))
             ledger_events.append(
                 ledger_event(
                     outcome=LedgerOutcome.FAILED,
@@ -1703,6 +1721,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             processing_deadline,
             processing_started + max(0.0, shared_remaining_seconds),
         )
+    llm_redaction_incomplete_paths: list[str] = []
     (
         ordinary_file_cache,
         raw_file_cache,
@@ -1714,6 +1733,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         cache_candidates,
         started_at=processing_started,
         state=state,
+        redaction_incomplete_paths=llm_redaction_incomplete_paths,
     )
 
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
@@ -2184,6 +2204,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "local_file_cache": local_file_cache,
         "raw_file_cache": raw_file_cache,
         "llm_file_cache": llm_file_cache,
+        "llm_redaction_incomplete_paths": list(dict.fromkeys(llm_redaction_incomplete_paths)),
         "artifact_inventory": artifact_inventory,
         "artifact_references": references,
         "reference_resolution": reference_resolution,
