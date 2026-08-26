@@ -68,6 +68,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "EA2": "Skill enables autonomous high-impact decisions without human-in-the-loop verification. Critical operations (destructive commands, financial transactions, data deletion) should require explicit user confirmation.",
     "EA3": "Skill's behavior or capabilities extend beyond its stated purpose. Scope creep allows an agent to perform actions unrelated to its documented functionality, increasing the attack surface.",
     "EA4": "Skill allows unbounded resource consumption (API calls, storage, compute). Without rate limits or quotas, a compromised or misbehaving agent can cause denial-of-service or cost overruns.",
+    "EA5": "Skill selects an external model or provider that may use a different account or billing plan than the operator expects. Undisclosed model switches can cause unexpected cost or quota consumption.",
     # Output Handling (B.1.7)
     "OH1": "Model output is used without validation or sanitization. Unvalidated output injected into downstream contexts (SQL, shell, HTML) enables injection attacks and arbitrary code execution.",
     "OH2": "Output from one security context is used in another without boundary enforcement. Cross-context output flow can leak sensitive information or escalate privileges across trust boundaries.",
@@ -177,6 +178,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "EA2": PatternCategory.EXCESSIVE_AGENCY.value,
     "EA3": PatternCategory.EXCESSIVE_AGENCY.value,
     "EA4": PatternCategory.EXCESSIVE_AGENCY.value,
+    "EA5": PatternCategory.EXCESSIVE_AGENCY.value,
     "OH1": PatternCategory.OUTPUT_HANDLING.value,
     "OH2": PatternCategory.OUTPUT_HANDLING.value,
     "OH3": PatternCategory.OUTPUT_HANDLING.value,
@@ -264,6 +266,7 @@ PATTERN_NAMES: dict[str, str] = {
     "EA2": "Autonomous Decision Making",
     "EA3": "Scope Creep",
     "EA4": "Unbounded Resource Access",
+    "EA5": "External Model or Provider Selection",
     "OH1": "Unvalidated Output Injection",
     "OH2": "Cross-Context Output",
     "OH3": "Unbounded Output",
@@ -351,6 +354,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "EA2": "Add human-in-the-loop confirmation for destructive, irreversible, or high-impact operations. Never auto-execute commands that modify files, send data, or alter system state.",
     "EA3": "Limit the skill's scope to its documented purpose. Remove instructions that enable the agent to perform actions outside its stated functionality.",
     "EA4": "Set explicit rate limits, timeouts, and resource quotas for API calls, file operations, and compute. Implement circuit breakers for runaway loops.",
+    "EA5": "Remove the model/provider override or disclose it prominently and require explicit operator approval before invoking an external coding CLI or billed model.",
     # Output Handling (B.1.7)
     "OH1": "Validate and sanitize all model output before using it in downstream contexts. Use parameterized queries for SQL, shell quoting for commands, and HTML encoding for web output.",
     "OH2": "Enforce strict context boundaries. Do not pass output from one security domain into another without explicit validation and redaction of sensitive content.",

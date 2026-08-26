@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import time
 import tracemalloc
@@ -63,6 +64,86 @@ def test_artifact_integrity_reports_misleading_extension() -> None:
     )
 
     assert any(finding.rule_id == "AE2" for finding in response["findings"])
+
+
+def test_opaque_png_does_not_produce_decoded_text_findings(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        """---
+name: binary-repro
+description: A skill that ships one small PNG as reference material.
+---
+
+# Binary repro
+
+Describe the diagram in assets/diagram.png to the user.
+""",
+        encoding="utf-8",
+    )
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "diagram.png").write_bytes(png)
+
+    result = graph.invoke({"input_path": str(tmp_path), "output_format": "json", "use_llm": False})
+
+    artifact = next(
+        item for item in result["artifact_inventory"] if item["path"] == "assets/diagram.png"
+    )
+    findings = [finding for finding in result["findings"] if finding.file == "assets/diagram.png"]
+    assert artifact["content_kind"] in {ContentKind.BINARY, ContentKind.OPAQUE}
+    assert not {finding.rule_id for finding in findings} & {"AE3", "AE4"}
+    assert any(
+        finding.rule_id == "AE1" and finding.file == "SKILL.md" for finding in result["findings"]
+    )
+    assert any(
+        event.get("analyzer_id") == "artifact_integrity"
+        and event.get("path") == "assets/diagram.png"
+        and event.get("outcome") == "completed"
+        for event in result["inspection_ledger"]
+    )
+    assert any(
+        event.get("path") == "assets/diagram.png"
+        and event.get("reason_code") == LedgerReason.OPAQUE_CONTENT
+        for event in result["inspection_ledger"]
+    )
+
+
+def test_text_artifact_remains_eligible_for_ae4() -> None:
+    response = artifact_integrity(
+        {
+            "components": ["notes"],
+            "local_file_cache": {"notes": "latin-а"},
+            "artifact_inventory": [
+                {"path": "notes", "content_kind": ContentKind.TEXT},
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in response["findings"]] == ["AE4"]
+
+
+def test_opaque_misleading_extension_keeps_ae2_without_ae3_or_ae4() -> None:
+    response = artifact_integrity(
+        {
+            "components": ["payload.md"],
+            "file_cache": {"payload.md": "\x00latin-а"},
+            "artifact_inventory": [
+                {
+                    "path": "payload.md",
+                    "content_kind": ContentKind.OPAQUE,
+                    "misleading_extension": True,
+                    "contains_nul": True,
+                }
+            ],
+        }
+    )
+
+    rule_ids = [finding.rule_id for finding in response["findings"]]
+    assert "AE2" in rule_ids
+    assert "AE3" not in rule_ids
+    assert "AE4" not in rule_ids
 
 
 def test_normalized_view_removes_ignorables_maps_offsets_and_confusables() -> None:
@@ -299,6 +380,9 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
     (tmp_path / ".git" / "objects" / "aa").mkdir(parents=True)
     (tmp_path / ".git" / "config").write_text("[core]", encoding="utf-8")
     (tmp_path / ".git" / "hooks" / "pre-commit").write_text("echo check", encoding="utf-8")
+    sample_hook = tmp_path / ".git" / "hooks" / "pre-commit.sample"
+    sample_hook.write_text("echo sample", encoding="utf-8")
+    sample_hook.chmod(0o755)
     (tmp_path / ".git" / "objects" / "aa" / "object").write_bytes(b"opaque")
 
     result = build_context({"skill_path": str(tmp_path)})
@@ -306,9 +390,15 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
     assert ".hidden.md" in result["components"]
     assert ".git/config" in result["components"]
     assert ".git/hooks/pre-commit" in result["components"]
+    assert ".git/hooks/pre-commit.sample" not in result["components"]
     assert ".git/objects/aa/object" not in result["components"]
     assert ".hidden.md" not in result["llm_file_cache"]
     assert ".git/config" not in result["llm_file_cache"]
+    assert any(
+        event["path"] == ".git/hooks/pre-commit.sample"
+        and event["reason_code"] == LedgerReason.VCS_METADATA
+        for event in result["inspection_ledger"]
+    )
 
 
 def test_primary_manifest_parsing_uses_bounded_cached_bytes(

@@ -15,7 +15,7 @@
 
 """Pattern tests for static_patterns_* analyzer modules.
 
-Covers: EA1–EA4, OH1–OH3, P6–P8, MP1–MP3, TM1–TM3, RA1–RA2,
+Covers: EA1–EA5, OH1–OH3, P6–P8, MP1–MP3, TM1–TM3, RA1–RA2,
         SC4–SC6, TR1–TR3.
 """
 
@@ -78,11 +78,11 @@ def _analyze_deps(content: str, filename: str, osv_results: list | None = None) 
             return sc_mod._analyze_dependencies(content, filename)
 
 
-# ── Excessive Agency (EA1–EA4) ─────────────────────────────────────────
+# ── Excessive Agency (EA1–EA5) ─────────────────────────────────────────
 
 
 class TestExcessiveAgency:
-    """EA1–EA4 detection."""
+    """EA1–EA5 detection."""
 
     @pytest.mark.parametrize(
         "content",
@@ -236,6 +236,80 @@ class TestExcessiveAgency:
 
         ea3 = ea_mod.analyze("Extend your scope beyond the stated purpose.", "SKILL.md", "markdown")
         assert all(f.severity == Severity.LOW for f in ea3 if f.rule_id == "EA3")
+
+    @pytest.mark.parametrize("key", ["model", "provider", "model_name", "model_id"])
+    def test_ea5_frontmatter_pin_is_medium(self, key: str) -> None:
+        content = f"---\nname: example\n{key}: claude-sonnet-4-6\n---\n\n# Example\n"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.MEDIUM
+        assert ea5[0].location.start_line == 3
+        assert ea5[0].evidence == {
+            "selection_surface": "frontmatter",
+            "selection_key": key,
+        }
+
+    def test_ea5_only_matches_top_level_skill_frontmatter(self) -> None:
+        content = (
+            "---\n"
+            "name: example\n"
+            "parameters:\n"
+            "  model: user-selectable\n"
+            "---\n\n"
+            "The provider: field can be documented in prose.\n"
+        )
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        assert not any(finding.rule_id == "EA5" for finding in findings)
+
+    @pytest.mark.parametrize("value", ['""', "''", "null", "~", "default", "inherit"])
+    def test_ea5_empty_or_inherited_frontmatter_value_is_not_flagged(self, value: str) -> None:
+        content = f"---\nname: example\nmodel: {value}\n---\n"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        assert not any(finding.rule_id == "EA5" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            pytest.param("claude -p 'Review this diff'", id="claude_print"),
+            pytest.param("codex exec 'Fix the tests'", id="codex_exec"),
+            pytest.param("cmd -m claude-sonnet-4-6", id="generic_model_flag"),
+            pytest.param("cmd --model=gemini-2.5-pro", id="model_equals_flag"),
+            pytest.param("Run `codex exec 'Fix the tests'`", id="inline_instruction"),
+            pytest.param(
+                "Run `codex exec 'Fix the tests'`.", id="inline_instruction_with_punctuation"
+            ),
+        ],
+    )
+    def test_ea5_coding_cli_switch_is_high(self, command: str) -> None:
+        findings = ea_mod.analyze(command, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.HIGH
+        assert ea5[0].evidence == {"selection_surface": "command"}
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "The claude -p flag prints a response.",
+            'The `codex exec "Fix tests"` command is documented below.',
+            "For example, `claude -p 'Review this diff'` prints a response.",
+            "```text\ncodex exec 'Fix the tests'\n```",
+            "Compare Codex execution with other coding agents.",
+            "Use the user's currently selected model and provider.",
+            "model: claude-sonnet-4-6",
+            "python -m claude_tools",
+            "cmd --model custom-local-model",
+        ],
+    )
+    def test_ea5_non_actionable_prose_and_body_keys_are_not_flagged(self, content: str) -> None:
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        assert not any(finding.rule_id == "EA5" for finding in findings)
+
+    def test_ea5_shell_fence_is_actionable(self) -> None:
+        content = "```shell\ncodex exec 'Fix the tests'\n```"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        assert any(finding.rule_id == "EA5" for finding in findings)
 
 
 # ── Output Handling (OH1–OH3) ──────────────────────────────────────────
