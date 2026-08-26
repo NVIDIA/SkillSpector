@@ -24,7 +24,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **72 vulnerability patterns** across 18 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, MCP tool poisoning, and bundled execution surfaces
+- **73 vulnerability patterns** across 18 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, MCP tool poisoning, and bundled execution surfaces
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Claude Code bundled-hook analysis**: Deterministic BH1 execution-surface inventory and correlated BH2 sensitive-data exfiltration detection
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
@@ -404,7 +404,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **72 vulnerability patterns** across 18 categories:
+SkillSpector detects **73 vulnerability patterns** across 18 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -455,7 +455,7 @@ SkillSpector detects **72 vulnerability patterns** across 18 categories:
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 | SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
 
-### Excessive Agency (4 patterns)
+### Excessive Agency (5 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -463,6 +463,7 @@ SkillSpector detects **72 vulnerability patterns** across 18 categories:
 | EA2 | Autonomous Decision Making | HIGH | High-impact decisions without human-in-the-loop |
 | EA3 | Scope Creep | MEDIUM | Capabilities extending beyond stated purpose |
 | EA4 | Unbounded Resource Access | MEDIUM | No rate limits or quotas on resource consumption |
+| EA5 | External Model or Provider Selection | MEDIUM/HIGH | Model/provider pins or coding-CLI shell-outs that can switch billing accounts |
 
 ### Output Handling (3 patterns)
 
