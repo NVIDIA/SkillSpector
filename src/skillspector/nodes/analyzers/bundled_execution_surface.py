@@ -886,10 +886,12 @@ def _curl_url_has_unsupported_glob(value: str) -> bool:
 
 
 def _one_external_curl_url(values: list[str]) -> bool:
+    parsed = _parse_http_url(values[0]) if len(values) == 1 else None
     return (
-        len(values) == 1
+        parsed is not None
         and _CURL_HTTP_URL.match(values[0]) is not None
         and not _curl_url_has_unsupported_glob(values[0])
+        and not any(character in parsed.hostname for character in "!$&'()*+,;=")
         and _is_external_http_url(values[0])
     )
 
@@ -1163,7 +1165,7 @@ def _permissions_schema_allows_disable(document: dict[str, object]) -> bool:
         return False
     directories = permissions.get("additionalDirectories", [])
     if not isinstance(directories, list) or not all(
-        isinstance(value, str) and _is_safe_literal(value) for value in directories
+        _is_nonempty_bounded_string(value) for value in directories
     ):
         return False
     if "defaultMode" in permissions:
