@@ -178,8 +178,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
-        "Instruction text obfuscated by inter-character spacing could not be fully evaluated "
-        "by the deterministic layer."
+        "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
     ),
 }
 

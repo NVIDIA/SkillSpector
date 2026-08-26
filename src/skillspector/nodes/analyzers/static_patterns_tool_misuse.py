@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -38,6 +40,15 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
+
+_SHELL_COMMAND_WORD_START_RE = re.compile(r"[rR'\"\\]")
+_SHELL_COMMAND_WORD_CHARS = 64
+_ROOT_GLOB_COMMAND_CHARS = 256
+_ROOT_GLOB_PROSE_RE = re.compile(
+    r"\brm[ \t]+(?:utility|command|tool)\b[^\n]{0,160}\b(?:accepts?|supports?)\b"
+    r"[^\n]{0,160}\b(?:denotes?|means?|represents?)\b",
+    re.IGNORECASE,
+)
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
 TM1_PATTERNS = [
@@ -229,6 +240,290 @@ def _is_safe_cache_cleanup(matched_text: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _ShellToken:
+    text: str
+    has_quoted_content: bool
+    unquoted_star: bool
+
+
+def _is_shell_command_word_start(content: str, start: int) -> bool:
+    if start == 0:
+        return True
+    previous = content[start - 1]
+    if previous.isspace() or previous in ";|&()<>/":
+        return True
+    if previous in "'\"`":
+        before_quote = start - 2
+        return (
+            before_quote < 0
+            or content[before_quote].isspace()
+            or content[before_quote] in ";|&()<>{}/"
+        )
+    return False
+
+
+def _parse_shell_command_word(content: str, start: int) -> tuple[str, int] | None:
+    output: list[str] = []
+    quote: str | None = None
+    cursor = start
+    limit = min(len(content), start + _SHELL_COMMAND_WORD_CHARS)
+    while cursor < limit:
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif character == "\\" and quote != "'" and cursor + 1 < limit:
+                cursor += 1
+                output.append(content[cursor])
+            else:
+                output.append(character)
+        elif character in "'\"`":
+            quote = character
+        elif character == "\\" and cursor + 1 < limit:
+            if content[cursor + 1] == "\n":
+                cursor += 2
+                continue
+            cursor += 1
+            output.append(content[cursor])
+        elif character.isspace() or character in ";|&()<>":
+            break
+        else:
+            output.append(character)
+        cursor += 1
+    if quote is not None or (cursor == limit and limit < len(content)):
+        return None
+    return "".join(output), cursor
+
+
+def _rm_command_words(content: str) -> Iterator[tuple[int, int]]:
+    for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
+        start = candidate.start()
+        if not _is_shell_command_word_start(content, start):
+            continue
+        parsed = _parse_shell_command_word(content, start)
+        if parsed is None:
+            continue
+        command, end = parsed
+        if command.casefold() == "rm":
+            yield start, end
+
+
+def _command_wrapper_quote(content: str, command_start: int) -> str | None:
+    if command_start == 0 or content[command_start - 1] not in "'\"`":
+        return None
+    backslashes = 0
+    cursor = command_start - 2
+    while cursor >= 0 and content[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return content[command_start - 1] if backslashes % 2 == 0 else None
+
+
+def _skip_command_substitution(content: str, start: int, limit: int) -> int | None:
+    depth = 1
+    quote: str | None = None
+    cursor = start + 2
+    while cursor < limit:
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif character == "\\" and quote != "'" and cursor + 1 < limit:
+                cursor += 1
+        elif character in "'\"`":
+            quote = character
+        elif character == "\\" and cursor + 1 < limit:
+            cursor += 1
+        elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
+            depth += 1
+            cursor += 1
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return cursor + 1
+        cursor += 1
+    return None
+
+
+def _bounded_shell_tokens(
+    content: str,
+    command_start: int,
+    body_start: int,
+) -> tuple[tuple[_ShellToken, ...], int]:
+    """Return complete argument words from one bounded shell command."""
+    tokens: list[_ShellToken] = []
+    current: list[str] = []
+    word_started = False
+    current_is_argument = True
+    current_has_quoted_content = False
+    current_unquoted_star = False
+    expect_redirection_target = False
+    quote: str | None = None
+    cursor = body_start
+    limit = min(len(content), body_start + _ROOT_GLOB_COMMAND_CHARS)
+    wrapper_quote = _command_wrapper_quote(content, command_start)
+
+    def start_word() -> None:
+        nonlocal word_started, current_is_argument, expect_redirection_target
+        if not word_started:
+            word_started = True
+            current_is_argument = not expect_redirection_target
+            expect_redirection_target = False
+
+    def append(character: str, *, unquoted_star: bool = False) -> None:
+        nonlocal current_unquoted_star
+        start_word()
+        current.append(character)
+        current_unquoted_star = current_unquoted_star or unquoted_star
+
+    def flush(*, complete: bool = True) -> None:
+        nonlocal word_started, current_has_quoted_content, current_unquoted_star
+        if word_started:
+            if complete and current_is_argument:
+                tokens.append(
+                    _ShellToken(
+                        "".join(current),
+                        current_has_quoted_content,
+                        current_unquoted_star,
+                    )
+                )
+            current.clear()
+            word_started = False
+            current_has_quoted_content = False
+            current_unquoted_star = False
+
+    while cursor < limit:
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif character == "\\" and quote == '"' and cursor + 1 < limit:
+                cursor += 1
+                current.append(content[cursor])
+                current_has_quoted_content = True
+            else:
+                current.append(character)
+                current_has_quoted_content = True
+            cursor += 1
+            continue
+        if wrapper_quote is not None and character == wrapper_quote:
+            flush()
+            return tuple(tokens), cursor
+        if character in "'\"`":
+            start_word()
+            quote = character
+        elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
+            start_word()
+            current_has_quoted_content = True
+            substitution_end = _skip_command_substitution(content, cursor, limit)
+            if substitution_end is None:
+                return tuple(tokens), limit
+            current.append("$()")
+            cursor = substitution_end
+            continue
+        elif character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
+            start_word()
+            current_has_quoted_content = True
+            substitution_end = _skip_command_substitution(content, cursor, limit)
+            if substitution_end is None:
+                return tuple(tokens), limit
+            current.append(character + "()")
+            cursor = substitution_end
+            continue
+        elif character == "\\" and cursor + 1 < limit:
+            if content[cursor + 1] == "\n":
+                cursor += 2
+                continue
+            append(content[cursor + 1])
+            cursor += 1
+        elif character == "\n":
+            flush()
+            return tuple(tokens), cursor
+        elif character.isspace():
+            flush()
+        elif character == "#" and not word_started:
+            return tuple(tokens), cursor
+        elif character in "<>":
+            flush()
+            expect_redirection_target = True
+            if cursor + 1 < limit and content[cursor + 1] == character:
+                cursor += 1
+            if cursor + 1 < limit and content[cursor + 1] in "&|":
+                cursor += 1
+        elif character == "&" and cursor + 1 < limit and content[cursor + 1] == ">":
+            flush()
+            expect_redirection_target = True
+            cursor += 1
+            if cursor + 1 < limit and content[cursor + 1] == ">":
+                cursor += 1
+        elif character in ";|&()":
+            flush()
+            return tuple(tokens), cursor
+        else:
+            append(character, unquoted_star=character == "*")
+        cursor += 1
+    flush(complete=limit == len(content))
+    return tuple(tokens), limit
+
+
+def _has_destructive_root_glob(tokens: tuple[_ShellToken, ...], command: str) -> bool:
+    root_glob = any(token.text == "*" and token.unquoted_star for token in tokens)
+    if _ROOT_GLOB_PROSE_RE.search(command) is not None or not root_glob:
+        return False
+    try:
+        options_end = next(index for index, token in enumerate(tokens) if token.text == "--")
+    except StopIteration:
+        options_end = len(tokens)
+    short_options = [
+        token.text[1:]
+        for token in tokens[:options_end]
+        if not token.has_quoted_content and re.fullmatch(r"-[A-Za-z]+", token.text) is not None
+    ]
+    option_tokens = tokens[:options_end]
+    recursive = any(
+        token.text == "--recursive" and not token.has_quoted_content for token in option_tokens
+    ) or any("r" in option or "R" in option for option in short_options)
+    force = any(
+        token.text == "--force" and not token.has_quoted_content for token in option_tokens
+    ) or any("f" in option for option in short_options)
+    return recursive and force
+
+
+def _tm1_candidates(
+    content: str,
+) -> Iterator[tuple[int, int, str, float]]:
+    for pattern, confidence in TM1_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            yield match.start(), match.end(), match.group(0), confidence
+
+    seen_commands: set[tuple[int, int]] = set()
+    for command_start, body_start in _rm_command_words(content):
+        command_key = (command_start, body_start)
+        if command_key in seen_commands:
+            continue
+        seen_commands.add(command_key)
+        rough_end = min(
+            len(content),
+            body_start + _ROOT_GLOB_COMMAND_CHARS + 1,
+        )
+        if (
+            content.find("*", body_start, rough_end) < 0
+            or content.find("-", body_start, rough_end) < 0
+        ):
+            continue
+        tokens, command_end = _bounded_shell_tokens(
+            content,
+            command_start,
+            body_start,
+        )
+        command = content[command_start:command_end]
+        if _has_destructive_root_glob(tokens, command):
+            yield command_start, command_end, command, 0.9
+
+
 def _line_containing(content: str, start: int, end: int) -> str:
     """Return the full line containing a regex match."""
     line_start = content.rfind("\n", 0, start) + 1
@@ -250,39 +545,38 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     tag = [PatternCategory.TOOL_MISUSE.value]
 
-    for pattern, confidence in TM1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
-            context_text = ctx(match.start())
-            matched = match.group(0)[:200]
-            matched_line = _line_containing(content, match.start(), match.end())
+    for match_start, match_end, matched_text, confidence in _tm1_candidates(content):
+        line_num = get_line_number(content, match_start)
+        context_text = ctx(match_start)
+        matched = matched_text[:200]
+        matched_line = _line_containing(content, match_start, match_end)
 
-            if (
-                _is_safe_container_command(context_text)
-                or _is_safe_dockerfile_idiom(context_text, matched)
-                or _is_safe_cache_cleanup(matched_line)
-            ):
-                adj = min(confidence, 0.15)
-                sev = Severity.LOW
-            else:
-                adj = (
-                    min(1.0, confidence + 0.1)
-                    if file_type in ("python", "shell", "javascript")
-                    else confidence
-                )
-                sev = Severity.HIGH
-            findings.append(
-                AnalyzerFinding(
-                    rule_id="TM1",
-                    message="Tool Parameter Abuse",
-                    severity=sev,
-                    location=loc(line_num),
-                    confidence=adj,
-                    tags=tag,
-                    context=context_text,
-                    matched_text=matched,
-                )
+        if (
+            _is_safe_container_command(context_text)
+            or _is_safe_dockerfile_idiom(context_text, matched)
+            or _is_safe_cache_cleanup(matched_line)
+        ):
+            adj = min(confidence, 0.15)
+            sev = Severity.LOW
+        else:
+            adj = (
+                min(1.0, confidence + 0.1)
+                if file_type in ("python", "shell", "javascript")
+                else confidence
             )
+            sev = Severity.HIGH
+        findings.append(
+            AnalyzerFinding(
+                rule_id="TM1",
+                message="Tool Parameter Abuse",
+                severity=sev,
+                location=loc(line_num),
+                confidence=adj,
+                tags=tag,
+                context=context_text,
+                matched_text=matched,
+            )
+        )
     for pattern, confidence in TM2_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())

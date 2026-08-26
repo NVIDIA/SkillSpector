@@ -45,6 +45,10 @@ from skillspector.python_ast import (
     ParsedPythonFile,
     get_python_ast,
 )
+from skillspector.security_reconstruction import (
+    MAX_MARKER_LOOKAHEAD_CHARS,
+    build_declared_marker_views,
+)
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 
 from .pattern_defaults import get_category, get_explanation, get_pattern_name, get_remediation
@@ -73,13 +77,17 @@ FILE_TYPES: dict[str, str] = {
 
 MAX_FILE_CHARS = MAX_PYTHON_AST_SOURCE_CHARS
 SECURITY_VIEW_WINDOW_CHARS = 256_000
-_WINDOW_OVERLAP_CHARS = 8192
+SECURITY_VIEW_OVERLAP_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
+SECURITY_VIEW_LEFT_CONTEXT_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
+SECURITY_VIEW_OWNED_CHARS = (
+    SECURITY_VIEW_WINDOW_CHARS - SECURITY_VIEW_OVERLAP_CHARS - SECURITY_VIEW_LEFT_CONTEXT_CHARS
+)
 # The continuity projection keeps enough of an attacker-controlled separator
 # that bounded-gap expressions cannot be turned into matches.  Only expressions
 # which already accept an unbounded separator (for example ``\s+``) can bridge
 # it.  Each auxiliary view is therefore still substantially smaller than the
 # ordinary module-input ceiling.
-_CONTINUITY_SEPARATOR_CHARS = _WINDOW_OVERLAP_CHARS
+_CONTINUITY_SEPARATOR_CHARS = SECURITY_VIEW_OVERLAP_CHARS
 _CONTINUITY_CONTEXT_CHARS = 2048
 _CONTINUITY_MAX_CHAIN_RUNS = 24
 MAX_FINDINGS_PER_ARTIFACT = 10_000
@@ -518,6 +526,10 @@ def _scan_view_windows(
         for finding in findings:
             if "normalized-view" not in finding.tags:
                 finding.tags.append("normalized-view")
+    if view.name.startswith("declared-marker-"):
+        for finding in findings:
+            if "declared-marker-view" not in finding.tags:
+                finding.tags.append("declared-marker-view")
     return findings, resource_limit
 
 
@@ -526,7 +538,7 @@ def _bounded_view_slices(view: SecurityTextView) -> Iterator[SecurityTextView]:
     if len(view.text) <= SECURITY_VIEW_WINDOW_CHARS:
         yield view
         return
-    step = SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS
+    step = SECURITY_VIEW_WINDOW_CHARS - SECURITY_VIEW_OVERLAP_CHARS
     for start in range(0, len(view.text), step):
         end = min(len(view.text), start + SECURITY_VIEW_WINDOW_CHARS)
         offsets = None if view.source_offsets is None else view.source_offsets[start:end]
@@ -561,22 +573,22 @@ def _continuity_separator_runs(
         # that can actually contain normalized-away format characters.
         for match in _ASCII_CONTINUITY_SEPARATOR_RUN.finditer(content):
             finding_budget.check_runtime()
-            if match.end() - match.start() > _WINDOW_OVERLAP_CHARS:
+            if match.end() - match.start() > SECURITY_VIEW_OVERLAP_CHARS:
                 yield match.start(), match.end()
         return
 
     run_start: int | None = None
     for index, character in enumerate(content):
-        if index % _WINDOW_OVERLAP_CHARS == 0:
+        if index % SECURITY_VIEW_OVERLAP_CHARS == 0:
             finding_budget.check_runtime()
         if _is_continuity_separator(character):
             if run_start is None:
                 run_start = index
             continue
-        if run_start is not None and index - run_start > _WINDOW_OVERLAP_CHARS:
+        if run_start is not None and index - run_start > SECURITY_VIEW_OVERLAP_CHARS:
             yield run_start, index
         run_start = None
-    if run_start is not None and len(content) - run_start > _WINDOW_OVERLAP_CHARS:
+    if run_start is not None and len(content) - run_start > SECURITY_VIEW_OVERLAP_CHARS:
         yield run_start, len(content)
 
 
@@ -778,6 +790,8 @@ def _scan_all_views_detailed(
         deadline=deadline,
         clock=time.monotonic,
     )
+    marker_projection_limited = False
+    seen_marker_views: set[tuple[str, int, int]] = set()
 
     if ast_modules and len(content) <= MAX_FILE_CHARS:
         try:
@@ -800,9 +814,9 @@ def _scan_all_views_detailed(
 
     modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     if modules_for_windows:
-        step = SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS
         window_line = 1
-        for start in range(0, max(1, len(content)), step):
+        previous_raw_start = 0
+        for owned_start in range(0, max(1, len(content)), SECURITY_VIEW_OWNED_CHARS):
             now = time.monotonic()
             if now >= deadline:
                 return (
@@ -813,10 +827,42 @@ def _scan_all_views_detailed(
                         "limit_seconds": runtime_limit,
                     },
                 )
-            end = min(len(content), start + SECURITY_VIEW_WINDOW_CHARS)
-            raw_window = content[start:end]
+            raw_start = max(0, owned_start - SECURITY_VIEW_LEFT_CONTEXT_CHARS)
+            if raw_start > previous_raw_start:
+                window_line += content.count("\n", previous_raw_start, raw_start)
+            previous_raw_start = raw_start
+            raw_end = min(len(content), raw_start + SECURITY_VIEW_WINDOW_CHARS)
+            raw_window = content[raw_start:raw_end]
+            owned_source_start = owned_start - raw_start
+            owned_source_end = (
+                owned_source_start + SECURITY_VIEW_OWNED_CHARS if raw_end < len(content) else None
+            )
             for full_view in security_text_views(raw_window):
-                for view in _bounded_view_slices(full_view):
+                reconstruction = build_declared_marker_views(
+                    full_view,
+                    check_runtime=finding_budget.check_runtime,
+                    owned_source_start=owned_source_start,
+                    owned_source_end=owned_source_end,
+                )
+                marker_projection_limited = marker_projection_limited or reconstruction.limited
+                scan_views = [full_view]
+                for marker_view in reconstruction.views:
+                    if not marker_view.source_offsets:
+                        continue
+                    marker_key = (
+                        marker_view.text,
+                        raw_start + marker_view.source_offsets[0],
+                        raw_start + marker_view.source_offsets[-1],
+                    )
+                    if marker_key in seen_marker_views:
+                        continue
+                    seen_marker_views.add(marker_key)
+                    scan_views.append(marker_view)
+                for view in (
+                    bounded
+                    for candidate in scan_views
+                    for bounded in _bounded_view_slices(candidate)
+                ):
                     try:
                         finding_budget.check_runtime()
                         view_findings, resource_limit = _scan_view_windows(
@@ -845,9 +891,8 @@ def _scan_all_views_detailed(
                             resource_limit.reason,
                             resource_limit.metrics,
                         )
-            if end == len(content):
+            if raw_end == len(content):
                 break
-            window_line += content.count("\n", start, min(len(content), start + step))
 
         # Raw windows intentionally remain small, but a separator wider than
         # their overlap can split a lexical expression even though the
@@ -902,7 +947,11 @@ def _scan_all_views_detailed(
                 exc.metrics,
             )
 
-    return _deduplicate_view_findings(findings)[:max_findings], None, {}
+    return (
+        _deduplicate_view_findings(findings)[:max_findings],
+        (LedgerReason.OBFUSCATED_INSTRUCTION_TEXT if marker_projection_limited else None),
+        {},
+    )
 
 
 def _scan_all_views(
