@@ -472,7 +472,7 @@ SkillSpector detects the vulnerability patterns listed below:
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 | SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
 
-### Excessive Agency (4 patterns)
+### Excessive Agency (5 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -480,6 +480,7 @@ SkillSpector detects the vulnerability patterns listed below:
 | EA2 | Autonomous Decision Making | HIGH | High-impact decisions without human-in-the-loop |
 | EA3 | Scope Creep | MEDIUM | Capabilities extending beyond stated purpose |
 | EA4 | Unbounded Resource Access | MEDIUM | No rate limits or quotas on resource consumption |
+| EA5 | External Model or Provider Selection | MEDIUM/HIGH | Model/provider pins or coding-CLI shell-outs that can switch billing accounts |
 
 ### Output Handling (3 patterns)
 

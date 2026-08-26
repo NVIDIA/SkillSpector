@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: excessive agency (EA1–EA4). Node and analyze() in one module.
+"""Static patterns: excessive agency (EA1–EA5). Node and analyze() in one module.
 
 Detects patterns where an agent skill grants unrestricted tool access (EA1),
 enables autonomous high-impact decisions without human-in-the-loop (EA2),
 exhibits scope creep beyond stated purpose (EA3), or allows unbounded
-resource consumption (EA4).
+resource consumption (EA4), or selects an external model/provider with billing
+implications (EA5).
 
 Framework: LLM06, ASI02.
 """
@@ -26,6 +27,7 @@ Framework: LLM06, ASI02.
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 
 from skillspector.logging_config import get_logger
@@ -155,9 +157,210 @@ EA4_PATTERNS = [
     ),
 ]
 
+# EA5: External Model or Provider Selection
+_EA5_FRONTMATTER_KEY = re.compile(
+    r"^[\"']?(?P<key>model|provider|model_name|model_id)[\"']?[ \t]*:[ \t]*"
+    r"(?P<value>[^#\s][^#\r\n]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_EA5_INLINE_CODE = re.compile(r"`(?P<command>[^`\r\n]+)`")
+_EA5_IMPERATIVE_PREFIX = re.compile(
+    r"^(?:run|execute|invoke|call)(?:[ \t]+the)?(?:[ \t]+command)?[ \t]*:?[ \t]+",
+    re.IGNORECASE,
+)
+_EA5_INLINE_DIRECTIVE_PREFIX = re.compile(
+    r"^(?:(?:[-*+]|\d+[.)])[ \t]+)?"
+    r"(?:run|execute|invoke|call)(?:[ \t]+the)?(?:[ \t]+command)?[ \t]*:?[ \t]*$",
+    re.IGNORECASE,
+)
+_EA5_FENCE = re.compile(r"^[ \t]*(?P<marker>`{3,}|~{3,})[ \t]*(?P<language>[\w+-]*)")
+_EA5_SHELL_FENCE_LANGUAGES = {"bash", "console", "sh", "shell", "zsh"}
+_EA5_MODEL_VALUE = re.compile(
+    r"^(?:claude|gpt|gemini|deepseek|kimi|glm|minimax|mistral|llama)"
+    r"(?:$|[-_./:0-9])",
+    re.IGNORECASE,
+)
+
+
+def _frontmatter_bounds(content: str, file_path: str) -> tuple[int, int] | None:
+    """Return the YAML-frontmatter byte offsets for a SKILL.md file."""
+    if file_path.rsplit("/", 1)[-1].lower() != "skill.md":
+        return None
+    opening = re.match(r"\A---[ \t]*\r?\n", content)
+    if opening is None:
+        return None
+    closing = re.search(r"^---[ \t]*$", content[opening.end() :], re.MULTILINE)
+    if closing is None:
+        return None
+    return opening.end(), opening.end() + closing.start()
+
+
+def _is_model_switch_command(command: str) -> bool:
+    """Return whether a shell command selects another coding model/provider."""
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return False
+
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    if executable == "claude" and any(
+        token in {"-p", "--print"} or token.startswith("--print=") for token in tokens[1:]
+    ):
+        return True
+    if executable == "codex" and len(tokens) > 1 and tokens[1].lower() == "exec":
+        return True
+
+    if executable.startswith("python") or executable in {"node", "perl", "ruby"}:
+        return False
+
+    for index, token in enumerate(tokens[1:], start=1):
+        value: str | None = None
+        if token in {"-m", "--model"} and index + 1 < len(tokens):
+            value = tokens[index + 1]
+        elif token.startswith(("-m=", "--model=")):
+            value = token.split("=", 1)[1]
+        if value and _EA5_MODEL_VALUE.match(value):
+            return True
+    return False
+
+
+def _command_span(line: str) -> tuple[int, int] | None:
+    """Return the model-switch command span for an actionable instruction line."""
+    # Inline code is handled separately so surrounding prose and punctuation do
+    # not become part of the command span (or create a duplicate finding).
+    if "`" in line:
+        return None
+
+    leading = len(line) - len(line.lstrip(" \t"))
+    candidate = line[leading:]
+    if candidate.startswith(("$", ">")):
+        prompt_width = 1 + len(candidate[1:]) - len(candidate[1:].lstrip(" \t"))
+        leading += prompt_width
+        candidate = candidate[prompt_width:]
+
+    command = candidate.strip().strip("`")
+    if _is_model_switch_command(command):
+        start = line.find(command, leading)
+        return start, start + len(command)
+
+    imperative = _EA5_IMPERATIVE_PREFIX.match(candidate)
+    if imperative is not None:
+        command = candidate[imperative.end() :].strip().strip("`")
+        if _is_model_switch_command(command):
+            start = line.find(command, leading + imperative.end())
+            return start, start + len(command)
+    return None
+
+
+def _inline_command_span(line: str, inline: re.Match[str]) -> tuple[int, int] | None:
+    """Return an inline model-switch command only when prose directs its execution."""
+    if _EA5_INLINE_DIRECTIVE_PREFIX.match(line[: inline.start()]) is None:
+        return None
+    command = inline.group("command").strip()
+    if not _is_model_switch_command(command):
+        return None
+    command_offset = (
+        inline.start("command")
+        + len(inline.group("command"))
+        - len(inline.group("command").lstrip())
+    )
+    return command_offset, command_offset + len(command)
+
+
+def _ea5_findings(content: str, file_path: str) -> list[AnalyzerFinding]:
+    """Detect declarative model pins and actionable coding-CLI model switches."""
+    findings: list[AnalyzerFinding] = []
+    tag = [PatternCategory.EXCESSIVE_AGENCY.value]
+    bounds = _frontmatter_bounds(content, file_path)
+    body_start = 0
+    if bounds is not None:
+        start, end = bounds
+        body_start = end
+        frontmatter = content[start:end]
+        for match in _EA5_FRONTMATTER_KEY.finditer(frontmatter):
+            value = match.group("value").strip().lower()
+            if value in {'""', "''", "~", "null", "none", "default", "auto", "inherit"}:
+                continue
+            absolute_start = start + match.start()
+            key = match.group("key").lower()
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="EA5",
+                    message="External Model or Provider Selection",
+                    severity=Severity.MEDIUM,
+                    location=Location(
+                        file=file_path,
+                        start_line=get_line_number(content, absolute_start),
+                    ),
+                    confidence=0.9,
+                    tags=tag,
+                    context=get_context(content, absolute_start),
+                    matched_text=match.group(0)[:200],
+                    evidence={"selection_surface": "frontmatter", "selection_key": key},
+                )
+            )
+
+    seen: set[tuple[int, int]] = set()
+    cursor = body_start
+    fence_marker: str | None = None
+    fence_language = ""
+    for line in content[body_start:].splitlines(keepends=True):
+        line_text = line.rstrip("\r\n")
+        fence = _EA5_FENCE.match(line_text)
+        if fence is not None:
+            marker = fence.group("marker")
+            if fence_marker is None:
+                fence_marker = marker[0]
+                fence_language = fence.group("language").lower()
+            elif marker[0] == fence_marker:
+                fence_marker = None
+                fence_language = ""
+            cursor += len(line)
+            continue
+
+        candidates: list[tuple[int, int]] = []
+        if (
+            fence_marker is None
+            or fence_language in _EA5_SHELL_FENCE_LANGUAGES
+            or not fence_language
+        ):
+            direct = _command_span(line_text)
+            if direct is not None:
+                candidates.append(direct)
+        for inline in _EA5_INLINE_CODE.finditer(line_text):
+            command_span = _inline_command_span(line_text, inline)
+            if command_span is not None:
+                candidates.append(command_span)
+
+        for line_start, line_end in candidates:
+            absolute = (cursor + line_start, cursor + line_end)
+            if absolute in seen:
+                continue
+            seen.add(absolute)
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="EA5",
+                    message="External Model or Provider Selection",
+                    severity=Severity.HIGH,
+                    location=Location(
+                        file=file_path,
+                        start_line=get_line_number(content, absolute[0]),
+                    ),
+                    confidence=0.9,
+                    tags=tag,
+                    context=get_context(content, absolute[0]),
+                    matched_text=content[absolute[0] : absolute[1]][:200],
+                    evidence={"selection_surface": "command"},
+                )
+            )
+        cursor += len(line)
+    return findings
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
-    """Analyze content for excessive agency patterns (EA1–EA4)."""
+    """Analyze content for excessive agency patterns (EA1–EA5)."""
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:
@@ -229,6 +432,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
+    findings.extend(_ea5_findings(content, file_path))
     return findings
 
 
