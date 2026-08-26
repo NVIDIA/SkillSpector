@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import unicodedata
@@ -34,7 +35,13 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Finding, observe_analyzer_findings
+from skillspector.models import (
+    AnalyzerFinding,
+    Finding,
+    Severity,
+    compute_match_fingerprint,
+    observe_analyzer_findings,
+)
 from skillspector.python_ast import (
     MAX_PYTHON_AST_SOURCE_CHARS,
     ParsedPythonFile,
@@ -45,6 +52,13 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transiti
 from .pattern_defaults import get_category, get_explanation, get_pattern_name, get_remediation
 
 logger = get_logger(__name__)
+
+_ANALYZER_SEVERITY_ORDER = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+}
 
 # Extension -> file type (match v1 InventoryBuilder.FILE_TYPES)
 FILE_TYPES: dict[str, str] = {
@@ -83,6 +97,68 @@ MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = 30.0
 
 _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+
+
+def _analyzer_representative_key(finding: AnalyzerFinding) -> tuple[object, ...]:
+    """Rank exact analyzer duplicates by severity, confidence, and stable semantics."""
+    return (
+        _ANALYZER_SEVERITY_ORDER.get(finding.severity, 4),
+        -finding.confidence,
+        finding.location.file,
+        finding.location.start_line,
+        finding.location.end_line is not None,
+        finding.location.end_line or 0,
+        finding.rule_id,
+        finding.message,
+        finding.remediation or "",
+        tuple(finding.tags),
+        finding.context or "",
+        finding.matched_text or "",
+        json.dumps(
+            finding.evidence,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+
+def deduplicate_analyzer_findings(
+    findings: list[AnalyzerFinding],
+) -> list[AnalyzerFinding]:
+    """Compact only exact same-location matches before graph-state conversion."""
+    groups: dict[tuple[str, int, int | None, str, str], list[AnalyzerFinding]] = {}
+    identities: list[tuple[str, int, int | None, str, str] | None] = []
+    for finding in findings:
+        fingerprint = finding.match_fingerprint
+        if fingerprint is None and finding.matched_text:
+            fingerprint = compute_match_fingerprint(finding.rule_id, finding.matched_text)
+        identity = (
+            (
+                finding.location.file,
+                finding.location.start_line,
+                finding.location.end_line,
+                finding.rule_id,
+                fingerprint,
+            )
+            if fingerprint is not None
+            else None
+        )
+        identities.append(identity)
+        if identity is not None:
+            groups.setdefault(identity, []).append(finding)
+
+    compacted: list[AnalyzerFinding] = []
+    emitted: set[tuple[str, int, int | None, str, str]] = set()
+    for finding, identity in zip(findings, identities, strict=True):
+        if identity is None:
+            compacted.append(finding)
+        elif identity not in emitted:
+            compacted.append(min(groups[identity], key=_analyzer_representative_key))
+            emitted.add(identity)
+    return compacted
+
+
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 
@@ -288,6 +364,7 @@ def analyzer_finding_to_finding(
         code_snippet=af.context,
         intent=None,
         evidence=dict(af.evidence),
+        match_fingerprint=af.match_fingerprint,
     )
 
 

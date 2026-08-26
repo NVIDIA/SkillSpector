@@ -35,10 +35,10 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
+    get_complete_source_segment,
     get_context,
     get_context_from_lines,
     get_line_number,
-    get_source_segment,
     resolve_call_name,
     resolve_dynamic_import_call,
 )
@@ -542,6 +542,7 @@ def _analyze_subprocess_fallback(
             tags=tag,
             context=get_context(content, match.start()),
             matched_text=match.group(0)[:200],
+            complete_match=match.group(0),
         )
         for match in _SUBPROCESS_FALLBACK_PATTERN.finditer(content)
     ]
@@ -587,6 +588,7 @@ def _analyze_python_subprocess_calls(
 
         lineno = getattr(node, "lineno", 1)
         end_lineno = getattr(node, "end_lineno", None)
+        complete_match = get_complete_source_segment(lines, lineno, end_lineno)
         findings.append(
             AnalyzerFinding(
                 rule_id="OH1",
@@ -596,7 +598,8 @@ def _analyze_python_subprocess_calls(
                 confidence=0.95,
                 tags=tag,
                 context=get_context_from_lines(lines, lineno),
-                matched_text=get_source_segment(lines, lineno, end_lineno),
+                matched_text=complete_match[:200],
+                complete_match=complete_match,
             )
         )
 
@@ -643,6 +646,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     if file_type == "python":
@@ -666,6 +670,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in OH3_PATTERNS:
@@ -681,6 +686,7 @@ def analyze(
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings

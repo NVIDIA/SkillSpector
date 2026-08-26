@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
 logger = get_logger(__name__)
+
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
 
 def _occurrences(finding: Finding) -> list[dict[str, object]]:
@@ -49,6 +52,59 @@ def _finding_source_scope(finding: Finding) -> str:
     return ""
 
 
+def _representative_key(finding: Finding) -> tuple[object, ...]:
+    """Return a stable semantic rank without using opaque run-unique IDs."""
+    return (
+        _SEVERITY_ORDER.get(finding.severity.upper(), 4),
+        -finding.confidence,
+        finding.file,
+        finding.start_line,
+        finding.end_line is not None,
+        finding.end_line or 0,
+        finding.rule_id,
+        finding.message,
+        finding.category or "",
+        finding.pattern or "",
+        finding.finding or "",
+        finding.explanation or "",
+        finding.remediation or "",
+        finding.code_snippet or "",
+        finding.intent or "",
+        tuple(finding.tags),
+        finding.context or "",
+        finding.matched_text or "",
+        json.dumps(
+            finding.evidence,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        finding.source_identity or "",
+        finding.source_digest or "",
+        finding.source_url or "",
+        finding.transitive_depth,
+    )
+
+
+def _output_key(finding: Finding) -> tuple[object, ...]:
+    """Return a total semantic order for bounded downstream consumers."""
+    return (
+        _SEVERITY_ORDER.get(finding.severity.upper(), 4),
+        finding.file,
+        finding.start_line,
+        finding.rule_id,
+        _representative_key(finding),
+        _finding_source_scope(finding),
+        finding.fingerprint() or "",
+        json.dumps(
+            finding.occurrences,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+
 def deduplicate(findings: list[Finding]) -> list[Finding]:
     """Aggregate exact full-match duplicates while preserving every occurrence."""
     groups: dict[tuple[str, str, str], list[Finding]] = {}
@@ -62,16 +118,8 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
         groups.setdefault((source_scope, finding.rule_id, fingerprint), []).append(finding)
 
     compacted: list[Finding] = []
-    for (_source_scope, _rule_id, fingerprint), group in groups.items():
-        representative = max(
-            group,
-            key=lambda item: (
-                item.confidence,
-                -item.start_line,
-                item.file,
-                item.finding_id,
-            ),
-        )
+    for (_source_scope, _rule_id, _fingerprint), group in groups.items():
+        representative = min(group, key=_representative_key)
         occurrences = {
             (
                 str(occurrence.get("file", "")),
@@ -119,21 +167,12 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
         compacted.append(
             replace(
                 representative,
-                match_fingerprint=fingerprint,
                 occurrences=ordered_occurrences,
             )
         )
 
     compacted.extend(unique_without_match)
-    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    compacted.sort(
-        key=lambda finding: (
-            severity_order.get(finding.severity.upper(), 4),
-            finding.file,
-            finding.start_line,
-            finding.rule_id,
-        )
-    )
+    compacted.sort(key=_output_key)
     removed = len(findings) - len(compacted)
     if removed:
         logger.info(

@@ -17,7 +17,10 @@
 
 from __future__ import annotations
 
+import json
+
 from skillspector.nodes.analyzers import behavioral_ast
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.state import WorkflowResourceBudget
 
 
@@ -31,6 +34,15 @@ def _run(code: str, filename: str = "script.py") -> list:
 
 
 class TestExecDetection:
+    def test_same_line_exec_calls_keep_exact_node_identities(self) -> None:
+        """Separate AST calls on one line must not compact as one whole-line match."""
+        findings = _run('exec("first_payload_alpha"); exec("second_payload_beta")')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 2
+        assert len(deduplicate(ast1)) == 2
+
     def test_exec_produces_ast1(self):
         findings = _run('exec("print(1)")')
         ast1 = [f for f in findings if f.rule_id == "AST1"]
@@ -66,6 +78,22 @@ class TestDunderImport:
 
 
 class TestSubprocess:
+    def test_long_ast_matches_use_complete_source_identity(self):
+        def code(tail: str) -> str:
+            shared_arguments = "\n".join(f'    "{"a" * 80}",' for _ in range(5))
+            return f'import subprocess\nsubprocess.run([\n{shared_arguments}\n    "{tail}",\n])\n'
+
+        first_code = code("UNIQUE_FIRST_TAIL")
+        second_code = code("UNIQUE_SECOND_TAIL")
+        first = next(f for f in _run(first_code, "first.py") if f.rule_id == "AST4")
+        second = next(f for f in _run(second_code, "second.py") if f.rule_id == "AST4")
+
+        assert first.matched_text == second.matched_text
+        assert len(first.matched_text or "") == 200
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        assert "UNIQUE_FIRST_TAIL" not in json.dumps(first.to_dict(), sort_keys=True)
+
     def test_subprocess_run_produces_ast4(self):
         code = 'import subprocess\nsubprocess.run(["ls", "-la"])'
         findings = _run(code)

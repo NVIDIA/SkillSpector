@@ -445,20 +445,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                             previous_line=previous_line,
                         ),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
     return _deduplicate_findings(findings)
 
 
 def _deduplicate_findings(findings: list[AnalyzerFinding]) -> list[AnalyzerFinding]:
-    """Keep the highest-confidence finding per (file, line, rule_id)."""
-    best: dict[tuple[str, int, str], AnalyzerFinding] = {}
-    for f in findings:
-        key = (f.location.file, f.location.start_line, f.rule_id)
-        existing = best.get(key)
-        if existing is None or f.confidence > existing.confidence:
-            best[key] = f
-    return list(best.values())
+    """Compact only exact same-location matches."""
+    return static_runner.deduplicate_analyzer_findings(findings)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

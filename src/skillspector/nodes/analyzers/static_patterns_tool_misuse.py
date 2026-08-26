@@ -281,6 +281,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context_text,
                     matched_text=matched,
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in TM2_PATTERNS:
@@ -305,6 +306,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context_text,
                     matched_text=matched,
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in TM3_PATTERNS:
@@ -320,6 +322,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     # TM4: privileged K8s workload. Example filtering is delegated to the runner.
@@ -336,6 +339,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings

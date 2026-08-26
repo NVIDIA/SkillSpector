@@ -326,6 +326,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in PE2_PATTERNS:
@@ -345,6 +346,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in PE3_PATTERNS:
@@ -372,6 +374,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     # Collect best-confidence PE4 finding per line to avoid double-counting lines
@@ -395,6 +398,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 tags=finding_tags,
                 context=context,
                 matched_text=match.group(0)[:200],
+                complete_match=match.group(0),
             )
     findings.extend(pe4_best.values())
     # Collect best-confidence PE5 finding per line — a single `docker run` line
@@ -418,6 +422,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 tags=finding_tags,
                 context=context,
                 matched_text=match.group(0)[:200],
+                complete_match=match.group(0),
             )
     findings.extend(pe5_best.values())
     return findings

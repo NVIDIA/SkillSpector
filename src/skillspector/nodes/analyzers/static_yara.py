@@ -31,11 +31,12 @@ import stat
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yara  # type: ignore[import-not-found]
 
+from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.input_handler import (
     _FileOpenError,
     _open_regular_file_no_follow,
@@ -91,6 +92,7 @@ MAX_YARA_RULE_DIRECTORY_ENTRIES = 10_000
 MAX_YARA_RULE_TRAVERSAL_DEPTH = 64
 MAX_YARA_RULE_FILE_BYTES = 1 * 1024 * 1024
 MAX_YARA_RULE_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_YARA_MATCH_FINGERPRINT_BYTES_PER_FILE = MAX_ANALYZABLE_FILE_BYTES
 MAX_YARA_RULE_LOAD_SECONDS = 5.0
 
 
@@ -462,6 +464,125 @@ def _extract_match_strings(instances: list[tuple[str, object]]) -> tuple[int, st
     return first_offset if first_offset is not None else 0, matched_text
 
 
+class _YaraFingerprintLimitError(RuntimeError):
+    """Signal that complete-match hashing exhausted its per-file byte budget."""
+
+    def __init__(self, observed_bytes: int, limit_bytes: int) -> None:
+        super().__init__("YARA full-match fingerprint byte budget exceeded")
+        self.observed_bytes = observed_bytes
+        self.limit_bytes = limit_bytes
+
+
+@dataclass
+class _YaraFingerprintBudget:
+    """Bound complete-match hashing and cache repeated source spans."""
+
+    limit_bytes: int
+    hashed_bytes: int = 0
+    span_digests: dict[tuple[int, int], bytes] = field(default_factory=dict)
+
+    def digest(
+        self,
+        data: bytes,
+        offset: int,
+        matched_length: int,
+        matched_data: bytes,
+    ) -> bytes:
+        end = offset + matched_length
+        if offset >= 0 and end <= len(data):
+            span = (offset, matched_length)
+            cached = self.span_digests.get(span)
+            if cached is not None:
+                return cached
+            payload = memoryview(data)[offset:end]
+        else:
+            span = None
+            payload = memoryview(matched_data)
+
+        observed_bytes = self.hashed_bytes + len(payload)
+        if observed_bytes > self.limit_bytes:
+            raise _YaraFingerprintLimitError(observed_bytes, self.limit_bytes)
+        payload_digest = hashlib.sha256(payload).digest()
+        self.hashed_bytes = observed_bytes
+        if span is not None:
+            self.span_digests[span] = payload_digest
+        return payload_digest
+
+
+def _match_instances_fingerprint(
+    rule_id: str,
+    instances: list[tuple[str, object]],
+    data: bytes,
+    budget: _YaraFingerprintBudget,
+) -> str | None:
+    """Hash complete raw YARA matches without retaining them in finding state."""
+    records: list[tuple[bytes, int, bytes]] = []
+    for identifier, instance in instances:
+        matched_data = getattr(instance, "matched_data", None)
+        if not isinstance(matched_data, bytes):
+            continue
+        offset = int(getattr(instance, "offset", 0))
+        matched_length = int(getattr(instance, "matched_length", len(matched_data)))
+        if matched_length < 0:
+            matched_length = len(matched_data)
+        records.append(
+            (
+                identifier.encode("utf-8", errors="surrogatepass"),
+                matched_length,
+                budget.digest(data, offset, matched_length, matched_data),
+            )
+        )
+    if not records:
+        return None
+
+    digest = hashlib.sha256()
+    digest.update(b"skillspector-yara-match-v1\x00")
+
+    def update_framed(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    update_framed(rule_id.encode("utf-8", errors="surrogatepass"))
+    for identifier_bytes, matched_length, payload_digest in sorted(records):
+        update_framed(identifier_bytes)
+        digest.update(matched_length.to_bytes(8, "big", signed=False))
+        update_framed(payload_digest)
+    return digest.hexdigest()
+
+
+def _conservative_match_fingerprint(
+    rule_id: str,
+    match: yara.Match,
+    instances: list[tuple[str, object]],
+    file_path: str,
+) -> str:
+    """Identify a matched rule without retaining or hashing its raw payload."""
+    digest = hashlib.sha256()
+    digest.update(b"skillspector-yara-fallback-v1\x00")
+
+    def update_framed(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    update_framed(rule_id.encode("utf-8", errors="surrogatepass"))
+    update_framed(str(match.namespace).encode("utf-8", errors="surrogatepass"))
+    update_framed(str(match.rule).encode("utf-8", errors="surrogatepass"))
+    update_framed(file_path.encode("utf-8", errors="surrogatepass"))
+    records = sorted(
+        (
+            identifier,
+            int(getattr(instance, "offset", 0)),
+            max(0, int(getattr(instance, "matched_length", 0))),
+        )
+        for identifier, instance in instances
+    )
+    for identifier, offset, matched_length in records:
+        update_framed(identifier.encode("utf-8", errors="surrogatepass"))
+        digest.update(offset.to_bytes(8, "big", signed=True))
+        digest.update(matched_length.to_bytes(8, "big", signed=False))
+    return f"fallback-sha256:{digest.hexdigest()}"
+
+
 def _line_number_from_byte_offset(data: bytes, offset: int) -> int:
     """Return the 1-based line number for a YARA byte offset in *data*."""
     return data[:offset].count(b"\n") + 1
@@ -602,6 +723,7 @@ def _match_file(
     findings: list[AnalyzerFinding] = []
     instance_limited = False
     line_cache: dict[int, int] = {}
+    fingerprint_budget = _YaraFingerprintBudget(max(0, MAX_YARA_MATCH_FINGERPRINT_BYTES_PER_FILE))
     for match_index, match in enumerate(matches):
         now = clock()
         if now >= deadline:
@@ -634,6 +756,19 @@ def _match_file(
             continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(instances)
+        fingerprint_limit: _YaraFingerprintLimitError | None = None
+        try:
+            match_fingerprint = _match_instances_fingerprint(
+                rule_id,
+                instances,
+                data,
+                fingerprint_budget,
+            )
+        except _YaraFingerprintLimitError as exc:
+            match_fingerprint = _conservative_match_fingerprint(
+                rule_id, match, instances, file_path
+            )
+            fingerprint_limit = exc
         start_line = _cached_line_number(data, first_offset, line_cache)
 
         findings.append(
@@ -646,8 +781,18 @@ def _match_file(
                 tags=[PatternCategory.YARA_MATCH.value],
                 context=_bounded_context(data, first_offset),
                 matched_text=matched_text,
+                match_fingerprint=match_fingerprint,
             )
         )
+        if fingerprint_limit is not None:
+            return _YaraFileResult(
+                findings=findings,
+                reason=LedgerReason.SIZE_LIMIT,
+                metrics={
+                    "observed_bytes": fingerprint_limit.observed_bytes,
+                    "limit_bytes": fingerprint_limit.limit_bytes,
+                },
+            )
     finished_at = clock()
     if finished_at >= deadline:
         return _YaraFileResult(
@@ -897,6 +1042,10 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 path=path,
                 reason=matched.reason,
                 emitted_finding_ids=[finding.finding_id for finding in path_findings],
+                observed_bytes=(
+                    int(metrics["observed_bytes"]) if "observed_bytes" in metrics else None
+                ),
+                limit_bytes=(int(metrics["limit_bytes"]) if "limit_bytes" in metrics else None),
                 observed_findings=(
                     int(metrics["observed_findings"]) if "observed_findings" in metrics else None
                 ),
