@@ -30,6 +30,18 @@ and project URL.
 - **Copyright:** Copyright (c) 2017-2021 Ingy dot Net; Copyright (c) 2006-2016 Kirill Simonov
 - **URL:** https://github.com/yaml/pyyaml
 
+### tree-sitter (py-tree-sitter)
+
+- **License:** MIT
+- **Copyright:** Copyright (c) 2019 Max Brunsfeld, GitHub
+- **URL:** https://github.com/tree-sitter/py-tree-sitter
+
+### tree-sitter-bash
+
+- **License:** MIT
+- **Copyright:** Copyright (c) 2017 Max Brunsfeld
+- **URL:** https://github.com/tree-sitter/tree-sitter-bash
+
 ### pydantic
 
 - **License:** MIT

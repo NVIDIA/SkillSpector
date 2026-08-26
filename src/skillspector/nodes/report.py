@@ -1836,6 +1836,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     # Canonical internal findings and metadata have now driven suppression,
     # deduplication, scoring, and recommendation. Only field-wise copies cross
     # public formatter boundaries from this point onward.
+    public_findings = [_sanitize_finding(finding) for finding in selected_findings]
     reported_findings = [_sanitize_finding(finding) for finding in reported_findings]
     suppressed = _sanitize_suppressed_findings(suppressed)
     display_findings = _expand_occurrences(reported_findings)
@@ -1929,6 +1930,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         len(suppressed),
     )
     return {
+        "findings": public_findings,
         "sarif_report": sarif_report,
         "risk_score": risk_score,
         "risk_severity": risk_severity,

@@ -2114,6 +2114,7 @@ class TestLLMMetaAnalyzerApplyFilter:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_confirmed_finding_kept(self) -> None:
+        """Provider confirmation enriches presentation, not deterministic confidence."""
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
         findings = [self._make_finding("a.py", "E1")]
         batch = Batch(file_path="a.py", content="code", findings=findings)
@@ -2130,7 +2131,8 @@ class TestLLMMetaAnalyzerApplyFilter:
         result = analyzer.apply_filter(findings, [(batch, llm_items)])
         assert len(result) == 1
         assert result[0].explanation == "Dangerous"
-        assert result[0].confidence == 0.9
+        assert result[0].remediation == "Fix it"
+        assert result[0].confidence == findings[0].confidence
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_unconfirmed_finding_retained(self) -> None:
@@ -2539,9 +2541,9 @@ class TestApplyFilterSeverityFloor:
         """A CRITICAL finding confirmed by the LLM is still enriched as before.
 
         The floor does not interfere with the normal happy path: when the LLM
-        confirms a CRITICAL/HIGH finding, the enriched version (with LLM
-        explanation/remediation/confidence) is used and 'llm-unconfirmed' is
-        NOT added.
+        confirms a CRITICAL/HIGH finding, explanation and remediation are
+        enriched while deterministic confidence is preserved and
+        'llm-unconfirmed' is NOT added.
         """
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
         finding = self._make_finding("CRIT-002", "CRITICAL", line=20)
@@ -2564,7 +2566,8 @@ class TestApplyFilterSeverityFloor:
         assert kept.severity == "CRITICAL"
         assert kept.rule_id == "CRIT-002"
         assert kept.explanation == "LLM-confirmed dangerous pattern"
-        assert kept.confidence == 0.95
+        assert kept.remediation == "Remove immediately"
+        assert kept.confidence == finding.confidence
         assert "llm-unconfirmed" not in kept.tags
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)

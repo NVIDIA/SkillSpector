@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from skillspector.graph import graph
+from skillspector.sarif_models import validate_sarif_report
 
 _SKILL = "---\nname: helper\ndescription: Formats ordinary text.\n---\n# Helper\nFormats text.\n"
 _SENTINELS = ("alice", "supersecret", "querysecret", "fragmentsecret")
@@ -19,6 +21,18 @@ _NONCANONICAL_NPMRC = (
     "?token=querysecret&channel=stable#fragmentsecret\n"
 )
 _CANONICAL_NPMRC = "registry=https://registry.npmjs.org/\n"
+_TASK9_GRAPH_SENTINELS = {
+    "https": "task9-graph-https-secret",
+    "ssh": "task9-graph-ssh-secret",
+    "scp": "task9-graph-scp-secret",
+    "query": "task9-graph-query-secret",
+    "fragment": "task9-graph-fragment-secret",
+    "assignment": "task9-graph-assignment-secret",
+    "heredoc": "task9-graph-heredoc-secret",
+    "generated_config": "task9-graph-generated-secret",
+    "miss": "task9-graph-miss-secret",
+    "partial": "task9-graph-partial-secret",
+}
 _EXPECTED_SC10 = {
     "rule": "SC10",
     "severity": "HIGH",
@@ -63,6 +77,54 @@ _CANONICAL_DEFAULT_CASES = [
 def _write_skill(root: Path, npmrc: str) -> Path:
     (root / "SKILL.md").write_text(_SKILL, encoding="utf-8")
     (root / ".npmrc").write_text(npmrc, encoding="utf-8")
+    return root
+
+
+def _write_task9_credential_skill(root: Path) -> Path:
+    sentinels = _TASK9_GRAPH_SENTINELS
+    (root / "SKILL.md").write_text(_SKILL, encoding="utf-8")
+    (root / ".npmrc").write_text(
+        "registry=https://user:"
+        f"{sentinels['https']}@https.example.invalid/private"
+        f"?token={sentinels['query']}#{sentinels['fragment']}\n",
+        encoding="utf-8",
+    )
+    scripts = root / "scripts"
+    scripts.mkdir()
+    (scripts / "setup.sh").write_text(
+        "#!/bin/sh\n"
+        "REGISTRY=https://user:"
+        f"{sentinels['assignment']}@assignment.example.invalid/private\n"
+        'npm config set registry "$REGISTRY"\n'
+        "npm config set registry ssh://git:"
+        f"{sentinels['ssh']}@ssh.example.invalid/org/repo.git\n"
+        f"npm config set registry {sentinels['scp']}@scp.example.invalid:org/repo.git\n"
+        "writer >pip.conf <<'EOF'\n"
+        "[global]\n"
+        "index-url=https://user:"
+        f"{sentinels['heredoc']}@heredoc.example.invalid/private\n"
+        "EOF\n"
+        "writer >.npmrc <<'EOF'\n"
+        "registry=https://user:"
+        f"{sentinels['generated_config']}@generated.example.invalid/private\n"
+        "EOF\n",
+        encoding="utf-8",
+    )
+    (scripts / "partial.sh").write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' 'config set registry https://user:"
+        f"{sentinels['partial']}@partial.example.invalid/private' | xargs npm\n",
+        encoding="utf-8",
+    )
+    docs = root / "docs"
+    docs.mkdir()
+    (docs / "install.md").write_text(
+        "```bash\n"
+        "npm config set registry https://user:"
+        f"{sentinels['miss']}@miss.example.invalid/private\n"
+        "```\n",
+        encoding="utf-8",
+    )
     return root
 
 
@@ -185,3 +247,52 @@ def test_canonical_npm_registry_is_safe_without_sc10(tmp_path: Path, npmrc: str)
     assert result["execution_successful"] is True
     assert completeness["is_complete"] is True
     assert completeness["status"] == "complete"
+
+
+@pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
+def test_unique_credential_carriers_never_cross_real_graph_output_boundaries(
+    tmp_path: Path,
+    output_format: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = _write_task9_credential_skill(tmp_path)
+
+    with caplog.at_level(logging.DEBUG, logger="skillspector"):
+        result = _scan(root, output_format)
+
+    sc10_findings = [finding for finding in result["findings"] if finding.rule_id == "SC10"]
+    assert sc10_findings
+    public_finding_fields = [
+        {
+            "message": finding.message,
+            "matched_text": finding.matched_text,
+            "evidence": finding.evidence,
+        }
+        for finding in sc10_findings
+    ]
+    public_artifacts = (
+        str(result["findings"]),
+        str(result["filtered_findings"]),
+        str(result["analysis_completeness"]),
+        str(public_finding_fields),
+        result["report_body"],
+        json.dumps(result["sarif_report"], sort_keys=True),
+        caplog.text,
+    )
+    for carrier, sentinel in _TASK9_GRAPH_SENTINELS.items():
+        assert all(sentinel not in artifact for artifact in public_artifacts), carrier
+
+    assert result["execution_successful"] is True
+    completeness = result["analysis_completeness"]
+    assert isinstance(completeness, dict)
+    assert completeness["status"] == "partial"
+    assert any(
+        exception["reason_code"] == "dependency_source_unsupported_semantics"
+        and exception["path"] == "scripts/partial.sh"
+        for exception in completeness["ledger_exceptions"]
+    )
+    if output_format == "json":
+        payload = json.loads(result["report_body"])
+        assert any(issue["id"] == "SC10" for issue in payload["issues"])
+    if output_format == "sarif":
+        validate_sarif_report(json.loads(result["report_body"]))

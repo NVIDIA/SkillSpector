@@ -601,13 +601,11 @@ async def test_rd07_collision_resistance_and_occurrence_preservation(tmp_path: P
         exact,
         expected_locations={"TM1": {"a.sh", "b.sh"}},
         python_result=exact_result,
-        expected_executable_ranges={"a.sh": (1, 1), "b.sh": (1, 1)},
     )
     await _assert_rules_across_public_surfaces(
         distinct,
         expected_locations={"TM1": {"a.sh", "b.sh"}},
         python_result=distinct_result,
-        expected_executable_ranges={"a.sh": (1, 1), "b.sh": (1, 1)},
     )
 
 
@@ -654,7 +652,6 @@ async def test_nine_case_contract_across_public_surfaces(tmp_path: Path) -> None
         tmp_path,
         expected_locations=expected,
         python_result=result,
-        expected_executable_ranges={"scripts/a.sh": (1, 1), "scripts/b.sh": (1, 1)},
     )
 
 

@@ -401,10 +401,10 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         ``(file, rule_id)`` keying for LLM responses that omit ``start_line``.
 
         Every deterministic finding remains in primary output. Unconfirmed
-        findings receive an annotation tag; confirmed findings may gain an
-        explanation or higher confidence, but are never downgraded.
+        findings receive an annotation tag; confirmed findings may gain
+        presentation text, but cannot change deterministic confidence.
         """
-        _enrichment = tuple[str, str, float]
+        _enrichment = tuple[str, str]
         confirmed_granular: dict[tuple[str, str, int, int | None], _enrichment] = {}
         # Fallback index keyed without end_line (see lookup below). Issue #67.
         confirmed_by_start: dict[tuple[str, str, int], _enrichment] = {}
@@ -422,7 +422,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                 explanation = (item.get("explanation") or "").strip() or get_explanation(pattern_id)
                 remediation = (item.get("remediation") or "").strip() or get_remediation(pattern_id)
                 file_path = item.get("_file", batch.file_path)
-                enrichment: _enrichment = (explanation, remediation, conf)
+                enrichment: _enrichment = (explanation, remediation)
                 start_line = item.get("start_line")
                 if start_line is not None:
                     end_line = item.get("end_line")
@@ -445,13 +445,13 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             coarse_key = (f.file, f.rule_id)
             start_key = (f.file, f.rule_id, f.start_line) if f.start_line is not None else None
             if exact_key in confirmed_granular:
-                expl, rem, conf = confirmed_granular[exact_key]
+                expl, rem = confirmed_granular[exact_key]
             elif start_only_key in confirmed_granular:
-                expl, rem, conf = confirmed_granular[start_only_key]
+                expl, rem = confirmed_granular[start_only_key]
             elif f.end_line is None and start_key is not None and start_key in confirmed_by_start:
-                expl, rem, conf = confirmed_by_start[start_key]
+                expl, rem = confirmed_by_start[start_key]
             elif coarse_key in confirmed_coarse:
-                expl, rem, conf = confirmed_coarse[coarse_key]
+                expl, rem = confirmed_coarse[coarse_key]
             else:
                 unconfirmed_tags = list(f.tags)
                 if "llm-unconfirmed" not in unconfirmed_tags:
@@ -492,7 +492,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                     message=expl,
                     finding_id=f.finding_id,
                     severity=f.severity,
-                    confidence=max(f.confidence, conf),
+                    confidence=f.confidence,
                     file=f.file,
                     start_line=f.start_line,
                     end_line=f.end_line,

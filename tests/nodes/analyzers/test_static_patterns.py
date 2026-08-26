@@ -1187,10 +1187,17 @@ class TestSupplyChainLedger:
 
 class TestLicenseFiles:
     @staticmethod
-    def _third_party_notice_range(start_line: int, end_line: int) -> str:
+    def _third_party_notice_range(expected_lines: tuple[str, ...]) -> str:
         notice_path = Path(__file__).resolve().parents[3] / "THIRD_PARTY_NOTICES.md"
         lines = notice_path.read_text(encoding="utf-8").splitlines()
-        return "\n".join(lines[start_line - 1 : end_line]) + "\n"
+        matching_starts = [
+            index
+            for index in range(len(lines) - len(expected_lines) + 1)
+            if tuple(lines[index : index + len(expected_lines)]) == expected_lines
+        ]
+        assert len(matching_starts) == 1
+        start = matching_starts[0]
+        return "\n".join(lines[start : start + len(expected_lines)]) + "\n"
 
     @staticmethod
     def _range_content(range_index: int) -> tuple[str, int]:
@@ -1247,14 +1254,26 @@ class TestLicenseFiles:
         assert any(f.rule_id == "EA3" and f.start_line == attack_line_number for f in findings)
 
     @pytest.mark.parametrize(
-        "start_line,match_line",
-        [(92, 2), (118, 2)],
+        "notice_lines",
+        [
+            (
+                'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR',
+                "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,",
+                "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE",
+            ),
+            (
+                'THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"',
+                "AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE",
+                "IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE",
+            ),
+        ],
         ids=["mit_notice", "bsd_notice"],
     )
     def test_independent_third_party_ranges_suppress_ea3(
-        self, start_line: int, match_line: int
+        self, notice_lines: tuple[str, ...]
     ) -> None:
-        content = self._third_party_notice_range(start_line, start_line + 2)
+        content = self._third_party_notice_range(notice_lines)
+        match_line = 2
         findings = static_runner.run_static_patterns(
             {"components": ["LICENSE"], "file_cache": {"LICENSE": content}},
             [excessive_agency_module],

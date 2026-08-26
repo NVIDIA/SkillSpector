@@ -115,6 +115,65 @@ def _credential_bearing_finding(sentinel: str) -> Finding:
     )
 
 
+_TASK9_REPORT_SENTINELS = {
+    "https": "task9-report-https-secret",
+    "ssh": "task9-report-ssh-secret",
+    "scp": "task9-report-scp-secret",
+    "query": "task9-report-query-secret",
+    "fragment": "task9-report-fragment-secret",
+    "assignment": "task9-report-assignment-secret",
+    "heredoc": "task9-report-heredoc-secret",
+    "generated_config": "task9-report-generated-secret",
+    "finding": "task9-report-finding-secret",
+    "exception": "task9-report-exception-secret",
+    "provider_batch": "task9-report-provider-batch-secret",
+}
+
+
+def _task9_unique_credential_finding() -> Finding:
+    sentinels = _TASK9_REPORT_SENTINELS
+    return Finding(
+        rule_id="SC10",
+        message=(
+            "Dependency source points to https://user:"
+            f"{sentinels['https']}@https.example.invalid/private"
+        ),
+        severity="HIGH",
+        confidence=1.0,
+        file="scripts/setup.sh",
+        start_line=1,
+        category="supply-chain",
+        finding=(f"registry=ssh://git:{sentinels['ssh']}@ssh.example.invalid/org/repo.git"),
+        explanation=f"source {sentinels['scp']}@scp.example.invalid:org/repo.git",
+        remediation=(f"replace https://query.example.invalid/private?token={sentinels['query']}"),
+        context=(f"source https://fragment.example.invalid/private#{sentinels['fragment']}"),
+        matched_text=(
+            f"REGISTRY=https://user:{sentinels['assignment']}@assignment.example.invalid/private"
+        ),
+        source_url=(f"https://user:{sentinels['heredoc']}@heredoc.example.invalid/private"),
+        evidence={
+            "destination": (
+                f"https://user:{sentinels['generated_config']}@generated.example.invalid/private"
+            ),
+            "destination_status": "resolved",
+            "ecosystem": "npm",
+            "operation": "set",
+            "scope": "global",
+            "surface": "generated-config",
+        },
+        occurrences=[
+            {
+                "file": "scripts/setup.sh",
+                "start_line": 1,
+                "end_line": 1,
+                "source_url": (
+                    f"https://user:{sentinels['finding']}@finding.example.invalid/private"
+                ),
+            }
+        ],
+    )
+
+
 @pytest.mark.parametrize("fmt", ["terminal", "json", "markdown", "sarif"])
 def test_report_redacts_credentials_across_every_public_artifact(fmt: str) -> None:
     sentinel = "task7-public-output-secret"
@@ -174,6 +233,85 @@ def test_report_redacts_credentials_across_every_public_artifact(fmt: str) -> No
         evidence = payload["runs"][0]["results"][0]["properties"]["evidence"]
         assert isinstance(evidence, dict)
         assert evidence == {}
+
+
+@pytest.mark.parametrize("fmt", ["terminal", "json", "markdown", "sarif"])
+def test_unique_credential_carriers_never_cross_any_report_boundary(
+    fmt: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinels = _TASK9_REPORT_SENTINELS
+    finding = _task9_unique_credential_finding()
+    exception_url = f"https://user:{sentinels['exception']}@exception.example.invalid/private"
+    provider_url = f"https://user:{sentinels['provider_batch']}@provider.example.invalid/private"
+    state: SkillspectorState = {
+        "findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": True,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": fmt,
+        "use_llm": True,
+        "llm_call_log": [
+            {"node": "meta_analyzer", "ok": False, "error": f"provider failed at {provider_url}"}
+        ],
+        "analysis_completeness": {
+            "is_complete": False,
+            "status": "partial",
+            "execution_successful": True,
+            "ledger_exceptions": [
+                {
+                    "path": "scripts/setup.sh",
+                    "message": f"dependency source incomplete at {exception_url}",
+                    "fatal": False,
+                }
+            ],
+        },
+    }
+
+    with caplog.at_level("DEBUG", logger="skillspector"):
+        result = report(state)
+
+    public_artifacts = (
+        result["report_body"],
+        json.dumps(result["sarif_report"], sort_keys=True),
+        str(result["findings"]),
+        str(result["filtered_findings"]),
+        caplog.text,
+    )
+    for carrier, sentinel in sentinels.items():
+        assert all(sentinel not in artifact for artifact in public_artifacts), carrier
+
+    assert finding.message.endswith(f"{sentinels['https']}@https.example.invalid/private"), (
+        "report sanitization must not mutate canonical findings"
+    )
+    [public_finding] = result["findings"]
+    assert public_finding is not finding
+    assert (
+        public_finding.finding_id,
+        public_finding.rule_id,
+        public_finding.severity,
+        public_finding.confidence,
+        public_finding.file,
+        public_finding.start_line,
+        public_finding.end_line,
+    ) == (
+        finding.finding_id,
+        finding.rule_id,
+        finding.severity,
+        finding.confidence,
+        finding.file,
+        finding.start_line,
+        finding.end_line,
+    )
+    if fmt == "json":
+        payload = json.loads(result["report_body"])
+        assert payload["issues"][0]["evidence"]["destination"] == (
+            "https://generated.example.invalid/REDACTED_PATH"
+        )
+    if fmt == "sarif":
+        payload = json.loads(result["report_body"])
+        validate_sarif_report(payload)
 
 
 def test_report_evidence_with_arbitrary_top_level_key_fails_closed() -> None:

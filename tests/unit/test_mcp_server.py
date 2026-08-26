@@ -69,7 +69,7 @@ async def test_run_scan_llm_accounting_is_honest_without_credentials(
     assert result["scan_mode"] == "static-only"
 
 
-async def test_mcp_blocks_install_for_unscanned_executable_dependency_source(
+async def test_mcp_reports_scanned_executable_dependency_source(
     tmp_path: Path,
 ) -> None:
     _write_skill(tmp_path)
@@ -83,10 +83,10 @@ async def test_mcp_blocks_install_for_unscanned_executable_dependency_source(
 
     assert result["recommendation"] == "CAUTION"
     assert result["execution_successful"] is True
-    assert result["analysis_completeness"]["is_complete"] is False
-    assert result["analysis_completeness"]["status"] == "partial"
-    assert result["safe_to_install"] is False
-    assert not any(finding["rule_id"] == "SC10" for finding in result["findings"])
+    assert result["analysis_completeness"]["is_complete"] is True
+    assert result["analysis_completeness"]["status"] == "complete"
+    assert result["safe_to_install"] is True
+    assert any(finding["id"] == "SC10" for finding in result["findings"])
 
 
 async def test_run_scan_reports_llm_available_with_credentials(

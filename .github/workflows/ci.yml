@@ -17,9 +17,14 @@ name: CI
 
 on:
   pull_request:
-    branches: ["main"]
   push:
     branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      change_base_sha:
+        description: "Full base commit SHA for change detection"
+        required: true
+        type: string
 
 # Least privilege: these jobs only read the repo; no write scopes are needed.
 permissions:
@@ -44,12 +49,19 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
           fetch-depth: 0
       - id: filter
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.change_base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+             ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::Change base must be an available full commit SHA."
+            exit 1
+          fi
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
             .dockerignore .github/workflows/ci.yml .gitlab-ci.yml Dockerfile \
             Makefile pyproject.toml uv.lock src tests/docker tests/fixtures/safe_skill; then
@@ -62,6 +74,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Set up uv
         # Pinned to a full commit SHA (third-party action); comment tracks the tag.
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
@@ -78,6 +93,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - name: Set up uv
         # Pinned to a full commit SHA (third-party action); comment tracks the tag.
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
@@ -90,12 +108,69 @@ jobs:
       - run: uv run skillspector --version
       - run: uv run make test-ci
 
+  parser-wheel-smoke:
+    name: Parser wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-py312
+            os: ubuntu-latest
+            python-version: "3.12"
+          - name: linux-x86_64-py313
+            os: ubuntu-latest
+            python-version: "3.13"
+          - name: linux-x86_64-py314
+            os: ubuntu-latest
+            python-version: "3.14"
+          - name: linux-arm64-py314
+            os: ubuntu-24.04-arm
+            python-version: "3.14"
+          - name: macos-py314
+            os: macos-latest
+            python-version: "3.14"
+          - name: windows-x86_64-py314
+            os: windows-latest
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up uv
+        # Pinned to a full commit SHA (third-party action); comment tracks the tag.
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python-version }}
+      - name: Create clean parser environment
+        run: uv venv --python ${{ matrix.python-version }} .parser-smoke-venv
+      - name: Install exact parser wheels only
+        run: >-
+          uv pip install --python .parser-smoke-venv --only-binary=:all:
+          tree-sitter==0.25.2 tree-sitter-bash==0.25.1
+      - name: Install SkillSpector runtime
+        run: uv pip install --python .parser-smoke-venv .
+      - name: Smoke production parser loader
+        run: >-
+          uv run --no-project --python .parser-smoke-venv python -c
+          "import time;
+          from skillspector.shell_frontend import load_bash_language, parse_bash_source;
+          tree = parse_bash_source(
+          b'printf ok\\n', deadline_monotonic=time.monotonic() + 5.0);
+          assert load_bash_language().abi_version == 15;
+          assert tree.root_node.type == 'program'"
+
   docker-smoke:
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - run: docker version
       - run: docker info
       - run: docker build -t skillspector .
@@ -116,6 +191,8 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Verify DCO sign-off on all commits

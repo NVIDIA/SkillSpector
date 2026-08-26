@@ -48,8 +48,11 @@ from packaging.version import InvalidVersion, Version
 from skillspector.dependency_source_types import (
     DependencySourceLimitation,
     DependencySourceLimitationReason,
-    DependencySourceSpan,
     DependencyWorkBudget,
+    ShellIssue,
+    ShellIssueReason,
+    ShellWorkItem,
+    ShellWorkOutcome,
 )
 from skillspector.dependency_sources import analyze_dependency_sources
 from skillspector.inspection_ledger import (
@@ -92,6 +95,186 @@ from .static_runner import analyzer_finding_to_finding
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_supply_chain"
+DEPENDENCY_SOURCE_ANALYZER_ID = "dependency_sources"
+DEPENDENCY_SOURCE_SHELL_ANALYZER_ID = "dependency_source_shell"
+DEPENDENCY_SOURCE_COVERAGE_ANALYZER_ID = "dependency_source_coverage"
+
+_SHELL_OUTCOME_PRIORITY = {
+    ShellWorkOutcome.COMPLETED: 0,
+    ShellWorkOutcome.PARTIAL: 1,
+    ShellWorkOutcome.SKIPPED: 2,
+    ShellWorkOutcome.FAILED: 3,
+}
+_SHELL_REASON_PRIORITY = {
+    ShellIssueReason.UNSUPPORTED_SEMANTICS: 0,
+    ShellIssueReason.SYNTAX_ERROR: 1,
+    ShellIssueReason.RUNTIME_LIMIT: 2,
+    ShellIssueReason.RESOURCE_LIMIT: 3,
+    ShellIssueReason.SHELL_PARSER_UNAVAILABLE: 4,
+}
+_SHELL_LEDGER_REASON = {
+    ShellIssueReason.SYNTAX_ERROR: LedgerReason.DEPENDENCY_SOURCE_SHELL_SYNTAX_ERROR,
+    ShellIssueReason.UNSUPPORTED_SEMANTICS: (LedgerReason.DEPENDENCY_SOURCE_UNSUPPORTED_SEMANTICS),
+    ShellIssueReason.RUNTIME_LIMIT: LedgerReason.RUNTIME_LIMIT,
+    ShellIssueReason.SHELL_PARSER_UNAVAILABLE: (
+        LedgerReason.DEPENDENCY_SOURCE_SHELL_PARSER_UNAVAILABLE
+    ),
+    ShellIssueReason.RESOURCE_LIMIT: LedgerReason.DEPENDENCY_SOURCE_RESOURCE_LIMIT,
+}
+
+
+def _aggregate_shell_outcome(
+    current: ShellWorkOutcome,
+    incoming: ShellWorkOutcome,
+) -> ShellWorkOutcome:
+    """Retain productive partial work when a same-range sibling is skipped."""
+    if {current, incoming} == {ShellWorkOutcome.PARTIAL, ShellWorkOutcome.SKIPPED}:
+        return ShellWorkOutcome.PARTIAL
+    return (
+        incoming
+        if _SHELL_OUTCOME_PRIORITY[incoming] > _SHELL_OUTCOME_PRIORITY[current]
+        else current
+    )
+
+
+@dataclass(slots=True)
+class _DependencyRowPlan:
+    """One staged SC10 producer row before atomic public-output reservation."""
+
+    analyzer_id: str
+    outcome: LedgerOutcome
+    path: str
+    start_line: int
+    end_line: int
+    reason: LedgerReason | None = None
+    emitted_finding_ids: list[str] | None = None
+    unit_ids: set[str] | None = None
+    metrics: dict[str, int] | None = None
+
+    def event(self) -> InspectionLedgerEvent:
+        metrics = self.metrics or {}
+        return ledger_event(
+            analyzer_id=self.analyzer_id,
+            outcome=self.outcome,
+            phase="static",
+            path=self.path,
+            start_line=self.start_line,
+            end_line=self.end_line,
+            reason=self.reason,
+            emitted_finding_ids=self.emitted_finding_ids or (),
+            observed_bytes=metrics.get("observed_bytes"),
+            limit_bytes=metrics.get("limit_bytes"),
+            observed_findings=metrics.get("observed_findings"),
+            limit_findings=metrics.get("limit_findings"),
+            observed_depth=metrics.get("observed_depth"),
+            limit_depth=metrics.get("limit_depth"),
+            observed_records=metrics.get("observed_records"),
+            limit_records=metrics.get("limit_records"),
+        )
+
+
+def _clone_ledger_event(event: InspectionLedgerEvent) -> InspectionLedgerEvent:
+    """Clone one row and its mutable finding-ID collections for staged mutation."""
+    cloned = event.copy()
+    cloned["input_finding_ids"] = list(event["input_finding_ids"])
+    cloned["emitted_finding_ids"] = list(event["emitted_finding_ids"])
+    return cloned
+
+
+def _shell_dependency_row_plans(
+    work_items: tuple[ShellWorkItem, ...],
+    issues: tuple[ShellIssue, ...],
+) -> tuple[list[_DependencyRowPlan], dict[str, _DependencyRowPlan]]:
+    """Aggregate duplicate terminal identities and retain their worst outcome."""
+    plans: dict[tuple[str, int, int], _DependencyRowPlan] = {}
+    unit_keys: dict[str, set[tuple[str, int, int]]] = {}
+    unit_item_counts: dict[str, int] = {}
+    issues_by_key: dict[tuple[str, int, int], list[ShellIssue]] = {}
+
+    for item in work_items:
+        key = (item.span.path, item.span.start_line, item.span.end_line)
+        unit_keys.setdefault(item.unit_id, set()).add(key)
+        unit_item_counts[item.unit_id] = unit_item_counts.get(item.unit_id, 0) + 1
+        outcome = LedgerOutcome(item.outcome.value)
+        plan = plans.get(key)
+        if plan is None:
+            plans[key] = _DependencyRowPlan(
+                analyzer_id=DEPENDENCY_SOURCE_SHELL_ANALYZER_ID,
+                outcome=outcome,
+                path=item.span.path,
+                start_line=item.span.start_line,
+                end_line=item.span.end_line,
+                emitted_finding_ids=[],
+                unit_ids={item.unit_id},
+            )
+        else:
+            plan.outcome = LedgerOutcome(
+                _aggregate_shell_outcome(
+                    ShellWorkOutcome(plan.outcome.value),
+                    item.outcome,
+                ).value
+            )
+            if plan.unit_ids is None:
+                plan.unit_ids = set()
+            plan.unit_ids.add(item.unit_id)
+
+    for issue in issues:
+        issue_key: tuple[str, int, int]
+        keys = unit_keys.get(issue.unit_id, set()) if issue.unit_id is not None else set()
+        if len(keys) == 1:
+            issue_key = next(iter(keys))
+        else:
+            issue_key = (issue.span.path, issue.span.start_line, issue.span.end_line)
+        plan = plans.get(issue_key)
+        if plan is None:
+            plans[issue_key] = _DependencyRowPlan(
+                analyzer_id=DEPENDENCY_SOURCE_SHELL_ANALYZER_ID,
+                outcome=LedgerOutcome(issue.outcome.value),
+                path=issue_key[0],
+                start_line=issue_key[1],
+                end_line=issue_key[2],
+                emitted_finding_ids=[],
+                unit_ids=({issue.unit_id} if issue.unit_id is not None else set()),
+            )
+        else:
+            current = ShellWorkOutcome(plan.outcome.value)
+            plan.outcome = LedgerOutcome(_aggregate_shell_outcome(current, issue.outcome).value)
+        issues_by_key.setdefault(issue_key, []).append(issue)
+
+    global_blocking_issues = [
+        issue
+        for issue in issues
+        if issue.reason
+        in {
+            ShellIssueReason.RUNTIME_LIMIT,
+            ShellIssueReason.RESOURCE_LIMIT,
+            ShellIssueReason.SHELL_PARSER_UNAVAILABLE,
+        }
+    ]
+    for key, plan in plans.items():
+        if plan.outcome is LedgerOutcome.COMPLETED:
+            continue
+        candidates = issues_by_key.get(key, [])
+        if not candidates and plan.outcome is LedgerOutcome.SKIPPED:
+            candidates = global_blocking_issues
+        selected = max(
+            candidates,
+            key=lambda issue: _SHELL_REASON_PRIORITY[issue.reason],
+            default=None,
+        )
+        if selected is None:
+            plan.reason = LedgerReason.DEPENDENCY_SOURCE_UNSUPPORTED_SEMANTICS
+        else:
+            plan.reason = _SHELL_LEDGER_REASON[selected.reason]
+            if selected.exhaustion is not None:
+                plan.metrics = selected.exhaustion.ledger_metrics()
+
+    plan_by_unit_id: dict[str, _DependencyRowPlan] = {}
+    for unit_id, keys in unit_keys.items():
+        if len(keys) == 1 and unit_item_counts.get(unit_id) == 1:
+            plan_by_unit_id[unit_id] = plans[next(iter(keys))]
+    return list(plans.values()), plan_by_unit_id
+
 
 # Dependency work is supplemental to the canonical text scan and therefore
 # needs its own aggregate ceilings.  These apply across every manifest in a
@@ -2290,6 +2473,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         artifact_inventory=state.get("artifact_inventory") or [],
         budget=dependency_source_budget,
         executable_paths=executable_paths,
+        deadline_monotonic=dependency_deadline,
     )
     parse_limitations_by_path: dict[str, list[DependencySourceLimitation]] = {}
     coverage_limitations: list[DependencySourceLimitation] = []
@@ -2304,79 +2488,178 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 source_limitation
             )
 
-    findings_by_source_path: dict[str, list[Finding]] = {}
-    for finding in source_analysis.findings:
-        findings_by_source_path.setdefault(finding.file, []).append(finding)
-
-    source_rows: list[InspectionLedgerEvent] = []
+    source_plans: list[_DependencyRowPlan] = []
+    direct_plan_by_path: dict[str, _DependencyRowPlan] = {}
     for span in source_analysis.applicable_spans:
         path_limitations = parse_limitations_by_path.get(span.path, [])
-        finding_ids = [finding.finding_id for finding in findings_by_source_path.get(span.path, [])]
         if path_limitations:
             source_limitation = path_limitations[0]
-            source_rows.append(
-                ledger_event(
-                    analyzer_id="dependency_sources",
-                    outcome=LedgerOutcome.PARTIAL,
-                    phase="static",
-                    path=span.path,
-                    start_line=min(item.start_line for item in path_limitations),
-                    end_line=max(item.end_line for item in path_limitations),
-                    reason=LedgerReason.DEPENDENCY_SOURCE_PARSE_INCOMPLETE,
-                    emitted_finding_ids=finding_ids,
-                    observed_bytes=source_limitation.observed_bytes,
-                    limit_bytes=source_limitation.limit_bytes,
-                    observed_findings=source_limitation.observed_findings,
-                    limit_findings=source_limitation.limit_findings,
-                    observed_depth=source_limitation.observed_depth,
-                    limit_depth=source_limitation.limit_depth,
-                    observed_records=source_limitation.observed_records,
-                    limit_records=source_limitation.limit_records,
-                )
+            plan = _DependencyRowPlan(
+                analyzer_id=DEPENDENCY_SOURCE_ANALYZER_ID,
+                outcome=LedgerOutcome.PARTIAL,
+                path=span.path,
+                start_line=min(item.start_line for item in path_limitations),
+                end_line=max(item.end_line for item in path_limitations),
+                reason=LedgerReason.DEPENDENCY_SOURCE_PARSE_INCOMPLETE,
+                emitted_finding_ids=[],
+                metrics=source_limitation.ledger_metrics(),
             )
         else:
-            source_rows.append(
-                ledger_event(
-                    analyzer_id="dependency_sources",
-                    outcome=LedgerOutcome.COMPLETED,
-                    phase="static",
-                    path=span.path,
-                    start_line=span.start_line,
-                    end_line=span.end_line,
-                    emitted_finding_ids=finding_ids,
-                )
+            plan = _DependencyRowPlan(
+                analyzer_id=DEPENDENCY_SOURCE_ANALYZER_ID,
+                outcome=LedgerOutcome.COMPLETED,
+                path=span.path,
+                start_line=span.start_line,
+                end_line=span.end_line,
+                emitted_finding_ids=[],
             )
+        if span.path in direct_plan_by_path:
+            raise ValueError("dependency-source path has multiple direct producer rows")
+        direct_plan_by_path[span.path] = plan
+        source_plans.append(plan)
 
-    coverage_rows: list[InspectionLedgerEvent] = [
-        ledger_event(
-            analyzer_id="dependency_source_coverage",
+    shell_plans, shell_plan_by_unit_id = _shell_dependency_row_plans(
+        source_analysis.shell_work_items,
+        source_analysis.shell_issues,
+    )
+    coverage_plans: list[_DependencyRowPlan] = [
+        _DependencyRowPlan(
+            analyzer_id=DEPENDENCY_SOURCE_COVERAGE_ANALYZER_ID,
             outcome=LedgerOutcome.PARTIAL,
-            phase="static",
             path=source_limitation.path,
             start_line=source_limitation.start_line,
             end_line=source_limitation.end_line,
             reason=LedgerReason.UNSCANNED_EXECUTABLE_CONTENT,
+            emitted_finding_ids=[],
         )
         for source_limitation in coverage_limitations
     ]
-    base_ledger = list(response["inspection_ledger"])
-    if source_analysis.ledger_exhaustion is None:
-        findings.extend(source_analysis.findings)
-        response["inspection_ledger"] = merge_inspection_ledger(
-            base_ledger,
-            [*source_rows, *coverage_rows],
+
+    for finding, producer_unit_id in zip(
+        source_analysis.findings,
+        source_analysis.finding_producer_unit_ids,
+        strict=True,
+    ):
+        producer_plan = (
+            direct_plan_by_path.get(finding.file)
+            if producer_unit_id is None
+            else shell_plan_by_unit_id.get(producer_unit_id)
         )
-        source_status = analyzer_status_for_events("dependency_sources", source_rows)
-        coverage_status = analyzer_status_for_events("dependency_source_coverage", coverage_rows)
+        if producer_plan is None:
+            raise ValueError("dependency-source finding has no unique producer row")
+        if producer_plan.outcome not in {LedgerOutcome.COMPLETED, LedgerOutcome.PARTIAL}:
+            raise ValueError("non-producing dependency work cannot attach a finding")
+        if producer_plan.emitted_finding_ids is None:
+            producer_plan.emitted_finding_ids = []
+        if finding.finding_id not in producer_plan.emitted_finding_ids:
+            producer_plan.emitted_finding_ids.append(finding.finding_id)
+
+    all_plans = [*source_plans, *shell_plans, *coverage_plans]
+    planned_events: list[InspectionLedgerEvent] = [plan.event() for plan in all_plans]
+    planned_work_ids = [event["work_id"] for event in planned_events]
+    if len(planned_work_ids) != len(set(planned_work_ids)):
+        raise ValueError("dependency-source work identities must be unique before commit")
+
+    base_ledger: list[InspectionLedgerEvent] = list(response["inspection_ledger"])
+    staged_base_ledger: list[InspectionLedgerEvent] = [
+        _clone_ledger_event(event) for event in base_ledger
+    ]
+    base_positions: dict[str, int] = {}
+    for index, event in enumerate(staged_base_ledger):
+        work_id = event["work_id"]
+        if work_id in base_positions:
+            raise ValueError("base ledger contains a duplicate dependency producer identity")
+        base_positions[work_id] = index
+
+    new_rows: list[InspectionLedgerEvent] = []
+    for event in planned_events:
+        existing_index = base_positions.get(event["work_id"])
+        if existing_index is None:
+            new_rows.append(event)
+            continue
+        existing = staged_base_ledger[existing_index]
+        if (
+            existing.get("analyzer_id") != event.get("analyzer_id")
+            or existing["path"] != event["path"]
+            or existing["start_line"] != event["start_line"]
+            or existing["end_line"] != event["end_line"]
+            or existing["outcome"] is not event["outcome"]
+        ):
+            raise ValueError("existing dependency producer row conflicts with planned work")
+        for finding_id in event["emitted_finding_ids"]:
+            if finding_id not in existing["emitted_finding_ids"]:
+                existing["emitted_finding_ids"].append(finding_id)
+
+    staged_ledger: list[InspectionLedgerEvent] = [*staged_base_ledger, *new_rows]
+    for finding in source_analysis.findings:
+        attachment_count = sum(
+            finding.finding_id in event["emitted_finding_ids"] for event in staged_ledger
+        )
+        if attachment_count != 1:
+            raise ValueError("dependency-source finding must attach to exactly one producer")
+
+    existing_finding_ids = {finding.finding_id for finding in findings}
+    new_source_findings = [
+        finding
+        for finding in source_analysis.findings
+        if finding.finding_id not in existing_finding_ids
+    ]
+    exhaustion = dependency_source_budget.reserve_dependency_outputs(
+        emitted_changes=len(new_source_findings),
+        finding_output_records=len(new_source_findings),
+        new_ledger_events=len(new_rows),
+    )
+
+    def output_limited_status(
+        analyzer_id: str,
+        plans: list[_DependencyRowPlan],
+    ) -> AnalyzerStatusEvent:
+        if not plans:
+            return analyzer_status_for_events(analyzer_id, [])
+        return analyzer_status_event(
+            analyzer_id=analyzer_id,
+            status="degraded",
+            reason=LedgerReason.OUTPUT_LIMIT,
+            planned_work=[
+                {
+                    "work_id": inspection_work_id(
+                        analyzer_id,
+                        plan.path,
+                        plan.start_line,
+                        plan.end_line,
+                    ),
+                    "path": plan.path,
+                    "start_line": plan.start_line,
+                    "end_line": plan.end_line,
+                }
+                for plan in plans
+            ],
+        )
+
+    if exhaustion is None:
+        findings = [*findings, *new_source_findings]
+        response["findings"] = findings
+        response["inspection_ledger"] = staged_ledger
+        committed_by_id = {event["work_id"]: event for event in staged_ledger}
+
+        def committed_events(plans: list[_DependencyRowPlan]) -> list[InspectionLedgerEvent]:
+            return [committed_by_id[plan.event()["work_id"]] for plan in plans]
+
+        source_status = analyzer_status_for_events(
+            DEPENDENCY_SOURCE_ANALYZER_ID,
+            committed_events(source_plans),
+        )
+        shell_status = analyzer_status_for_events(
+            DEPENDENCY_SOURCE_SHELL_ANALYZER_ID,
+            committed_events(shell_plans),
+        )
+        coverage_status = analyzer_status_for_events(
+            DEPENDENCY_SOURCE_COVERAGE_ANALYZER_ID,
+            committed_events(coverage_plans),
+        )
     else:
-        omitted_path = (
-            source_analysis.applicable_spans[0].path
-            if source_analysis.applicable_spans
-            else coverage_limitations[0].path
-            if coverage_limitations
-            else "SKILL.md"
-        )
-        exhaustion = source_analysis.ledger_exhaustion
+        dependency_source_budget.claim_reserved_truncation_event()
+        omitted_path = all_plans[0].path if all_plans else "SKILL.md"
         marker = ledger_event(
             outcome=LedgerOutcome.PARTIAL,
             record_type=LedgerRecordType.SYSTEM,
@@ -2387,53 +2670,24 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             limit_records=exhaustion.limit,
         )
         response["inspection_ledger"] = merge_inspection_ledger(base_ledger, [marker])
-
-        def output_limited_status(
-            analyzer_id: str,
-            spans: list[DependencySourceSpan],
-        ) -> AnalyzerStatusEvent:
-            if not spans:
-                return analyzer_status_for_events(analyzer_id, [])
-            return analyzer_status_event(
-                analyzer_id=analyzer_id,
-                status="degraded",
-                reason=LedgerReason.OUTPUT_LIMIT,
-                planned_work=[
-                    {
-                        "work_id": inspection_work_id(
-                            analyzer_id,
-                            span.path,
-                            span.start_line,
-                            span.end_line,
-                        ),
-                        "path": span.path,
-                        "start_line": span.start_line,
-                        "end_line": span.end_line,
-                    }
-                    for span in spans
-                ],
-            )
-
         source_status = output_limited_status(
-            "dependency_sources",
-            list(source_analysis.applicable_spans),
+            DEPENDENCY_SOURCE_ANALYZER_ID,
+            source_plans,
+        )
+        shell_status = output_limited_status(
+            DEPENDENCY_SOURCE_SHELL_ANALYZER_ID,
+            shell_plans,
         )
         coverage_status = output_limited_status(
-            "dependency_source_coverage",
-            [
-                DependencySourceSpan(
-                    path=item.path,
-                    start_line=item.start_line,
-                    end_line=item.end_line,
-                )
-                for item in coverage_limitations
-            ],
+            DEPENDENCY_SOURCE_COVERAGE_ANALYZER_ID,
+            coverage_plans,
         )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     response["analyzer_status_events"] = [
         analyzer_status_for_events(ANALYZER_ID, base_ledger),
         source_status,
+        shell_status,
         coverage_status,
     ]
     return response

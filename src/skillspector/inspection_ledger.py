@@ -92,6 +92,10 @@ class LedgerReason(StrEnum):
     RUNTIME_LIMIT = "runtime_limit"
     UNSCANNED_EXECUTABLE_CONTENT = "unscanned_executable_content"
     DEPENDENCY_SOURCE_PARSE_INCOMPLETE = "dependency_source_parse_incomplete"
+    DEPENDENCY_SOURCE_SHELL_SYNTAX_ERROR = "dependency_source_shell_syntax_error"
+    DEPENDENCY_SOURCE_UNSUPPORTED_SEMANTICS = "dependency_source_unsupported_semantics"
+    DEPENDENCY_SOURCE_SHELL_PARSER_UNAVAILABLE = "dependency_source_shell_parser_unavailable"
+    DEPENDENCY_SOURCE_RESOURCE_LIMIT = "dependency_source_resource_limit"
     OUTPUT_LIMIT = "output_limit"
 
 
@@ -182,6 +186,18 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.DEPENDENCY_SOURCE_PARSE_INCOMPLETE: (
         "Dependency-source configuration could not be completely interpreted."
+    ),
+    LedgerReason.DEPENDENCY_SOURCE_SHELL_SYNTAX_ERROR: (
+        "Shell dependency-source syntax could not be completely interpreted."
+    ),
+    LedgerReason.DEPENDENCY_SOURCE_UNSUPPORTED_SEMANTICS: (
+        "Shell dependency-source behavior uses unsupported semantics."
+    ),
+    LedgerReason.DEPENDENCY_SOURCE_SHELL_PARSER_UNAVAILABLE: (
+        "The bounded shell parser was unavailable for dependency-source inspection."
+    ),
+    LedgerReason.DEPENDENCY_SOURCE_RESOURCE_LIMIT: (
+        "Shell dependency-source inspection reached a configured resource limit."
     ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
 }
