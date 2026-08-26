@@ -40,6 +40,7 @@ SkillSpector 2.10.0 expands security coverage across concealed artifacts, refere
 - Parse `package.json` as JSON for supply-chain analysis and route fatal CLI diagnostics to stderr.
 - Detect whitespace-tolerant environment harvesting and all supported `os.environ` read forms.
 - Reduce false positives across inactive Git hook samples, license boilerplate, wildcard tool grants, OAuth credential terminology, reference directories, and non-text artifact content.
+- Require an operation tied to a keyring or keychain noun before reporting PE3 in Markdown and text prose, while preserving actionable credential-store findings.
 - Preserve the original custom CLI-provider call contract for ordinary scans while forwarding explicit deadlines to providers used by bounded scan paths.
 
 ## Security
@@ -63,7 +64,7 @@ SkillSpector 2.10.0 expands security coverage across concealed artifacts, refere
 
 - `uv lock --check` — passed.
 - `.venv/bin/pytest -q tests/unit/test_llm_utils.py tests/unit/test_create_github_release.py tests/unit/test_github_release_workflow.py tests/unit/test_wheel_contents.py` — 54 passed.
-- `.venv/bin/pytest -m 'not integration and not provider' --cov=src/skillspector --cov-report=term --cov-report=xml tests/` — 2,859 passed, 13 skipped, 38 deselected, and 4 expected failures.
+- `.venv/bin/pytest -m 'not integration and not provider' --cov=src/skillspector --cov-report=term --cov-report=xml tests/` — 2,937 passed, 13 skipped, 38 deselected, and 4 expected failures.
 - `.venv/bin/ruff check src/ tests/ scripts/` — passed.
 - `.venv/bin/ruff format --check src/ tests/ scripts/` — 196 files already formatted.
 - Built `skillspector-2.10.0-py3-none-any.whl` and `skillspector-2.10.0.tar.gz`; `twine check` passed for both distributions.
@@ -103,6 +104,7 @@ SkillSpector 2.10.0 expands security coverage across concealed artifacts, refere
 - [GitHub PR #415](https://github.com/NVIDIA/SkillSpector/pull/415)
 - [GitHub PR #417](https://github.com/NVIDIA/SkillSpector/pull/417)
 - [GitHub PR #422](https://github.com/NVIDIA/SkillSpector/pull/422)
+- [GitHub PR #424](https://github.com/NVIDIA/SkillSpector/pull/424)
 - [GitHub PR #425](https://github.com/NVIDIA/SkillSpector/pull/425)
 - [GitHub PR #426](https://github.com/NVIDIA/SkillSpector/pull/426)
 - [GitHub commit 550b9f0](https://github.com/NVIDIA/SkillSpector/commit/550b9f00ad1635f9b5066ac2b1c4cf399a631cfb)

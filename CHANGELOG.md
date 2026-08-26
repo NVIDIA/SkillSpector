@@ -16,6 +16,7 @@
 * fix(cli,supply-chain): parse package.json as JSON and send fatal errors to stderr (#323)
 * fix(analyzer): detect whitespace variants and all os.environ read forms for E2 (1d379dc)
 * fix(analyzers): reduce false positives across AE3, AE4, EA1, EA3, E5, PE3, and TM4 (#237) (#328) (#415) (#417) (#422)
+* fix(pe3): require credential-store operations instead of flagging bare keyring or keychain nouns (#424)
 * fix(scan): exclude inactive Git hook samples from executable analysis (#412)
 * fix(nv_build): update the default served model and its token limits (#390) (#391)
 * fix(lp1): tailor least-privilege remediation to the manifest type (#402)
