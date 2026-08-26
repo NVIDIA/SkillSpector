@@ -1036,13 +1036,23 @@ def _permission_rule_is_valid(value: str) -> bool:
     return depth == 0
 
 
+def _permission_allow_rule_is_valid(value: str) -> bool:
+    if not _permission_rule_is_valid(value):
+        return False
+    tool = value.partition("(")[0]
+    return (
+        "*" not in tool
+        or re.fullmatch(r"mcp__[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]*\*", tool) is not None
+    )
+
+
 def _permission_rule_list_is_schema_compatible(permissions: dict[str, object], key: str) -> bool:
     if key not in permissions:
         return True
     values = permissions.get(key)
+    validator = _permission_allow_rule_is_valid if key == "allow" else _permission_rule_is_valid
     return isinstance(values, list) and all(
-        isinstance(value, str) and _is_safe_literal(value) and _permission_rule_is_valid(value)
-        for value in values
+        isinstance(value, str) and _is_safe_literal(value) and validator(value) for value in values
     )
 
 
