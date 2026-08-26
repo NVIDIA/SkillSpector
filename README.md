@@ -24,79 +24,12 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **Broad vulnerability coverage**: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, MCP tool poisoning, and bundled execution surfaces
+- **71 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
-- **Claude Code bundled hook and permission analysis**: Deterministic BH1 execution-surface inventory, correlated BH2 sensitive-data exfiltration detection, and BH3 project permission-grant classification
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
 - **Risk scoring**: 0-100 score with severity labels and clear recommendations
 - **Baseline / false-positive suppression**: Accept known findings via a glob-rule or fingerprint baseline so re-scans surface only *new* issues ([docs](docs/SUPPRESSION.md))
-
-## Claude Code Bundled Hooks and Permissions
-
-SkillSpector recognizes supported Claude Code hook and project-permission declarations by their
-runtime location and schema; it does not promote an arbitrary file merely because it contains a
-`hooks` or `permissions` key. BH1, BH2, and BH3 are deterministic structural findings and remain
-present with or without LLM analysis.
-
-| Finding | Meaning | Gate behavior |
-|---------|---------|---------------|
-| BH1 — Bundled Hook Execution Surface | One inventory finding per concrete hook document, including dormant or unmodeled declarations. Severity reflects the most capable handler in that document. | Does not independently force `DO_NOT_INSTALL`; review the declared activation and handlers. |
-| BH2 — Bundled Hook Data Exfiltration | A runnable hook has a correlated sensitive-source-to-outbound-sink chain within one handler and its bounded, bundle-resolvable entrypoints. | Unsuppressed BH2 is CRITICAL at confidence 1.0, sets a score floor of 51, produces `DO_NOT_INSTALL`, and exits 1. |
-| BH3 — Bundled Permission Grant | One aggregate finding per concrete project settings document that declares a classified permission grant. Severity reflects the most capable retained grant. | Only an unsuppressed, positive-confidence BH3 whose evidence contains the literal boolean `blocking_critical: true` sets a score floor of 51. Other BH3 findings use ordinary scoring. |
-
-Supported hook declaration sources are:
-
-- plugin-root `hooks/hooks.json`;
-- inline, referenced, or mixed `hooks` declarations in `.claude-plugin/plugin.json`;
-- effective plugin definitions in `.claude-plugin/marketplace.json`, including documented `strict`
-  merge/replacement behavior;
-- root `.claude/settings.json` and `.claude/settings.local.json` project settings;
-- hook frontmatter in documented root, project, plugin, and manifest-declared custom skill or command
-  locations; and
-- root project `.claude/agents/*.md` frontmatter while that project subagent runs.
-
-Supported permission declaration sources are the exact project roots `.claude/settings.json` and
-`.claude/settings.local.json`, including those exact roots inside successfully validated top-level
-or nested archives. Plugin-root `settings.json`, user settings, managed settings, and settings found
-at any other bundled path are excluded from BH3.
-
-BH1 and BH2 classification is pinned to the documented Claude Code **2.1.238 semantics snapshot**;
-BH3 is pinned to **2.1.241**. These snapshots are static parsing and classification contracts, not
-claims that an installed Claude Code version loads or enforces every accepted declaration. A BH3
-finding proves only that the artifact declares a classified grant. Runtime activation still depends
-on provenance and trust. Capability-granting `permissions.allow` rules and
-`permissions.additionalDirectories` entries in shared `.claude/settings.json` wait for workspace
-trust. `.claude/settings.local.json` normally applies without that trust step only when Claude treats
-it as user-local, such as an untracked file or one outside Git. A Git-tracked local file or symlinked
-`.claude` directory is repository-supplied and trust-gated. Activation also depends on the Claude
-interface and session mode and on user, managed, command-line, and other external policy.
-SkillSpector cannot infer those facts from the artifact, so BH3 records activation, provenance,
-runtime, and interface uncertainty instead of labeling a declaration as an observed runtime grant.
-See Claude Code's
-[settings scopes](https://code.claude.com/docs/en/settings#settings-files),
-[project grant trust](https://code.claude.com/docs/en/permissions#project-allow-rules-and-workspace-trust),
-[local settings trust](https://code.claude.com/docs/en/permissions#when-your-local-settings-file-needs-trust), and
-[permission modes](https://code.claude.com/docs/en/permission-modes).
-
-Analysis fails closed when an applicable hook, permission document, or runnable/reachable payload
-cannot be fully inspected—for example, because it is malformed, missing, oversized, binary,
-unresolved, outside traversal bounds, or uses an unmodeled reachable payload. If independently valid
-work remains, SkillSpector preserves its findings and reports `PARTIAL`; the normal CLI then exits 0
-or 1 under its ordinary risk policy, while `--fail-on-incomplete` forces exit 1. An atomic `FAILED`
-analysis exits 2, and that failure takes precedence over risk or incomplete-analysis exit 1.
-
-Hook evidence contains sanitized scalar metadata and full chain digests, not raw commands, URLs,
-headers, secret values, prompts, tool payloads, or script excerpts. Permission evidence contains
-only allowlisted classifications, counts, status labels, and domain-separated digests—not raw rules,
-paths, modes, unknown keys, or settings excerpts. Exact baseline fingerprints bind the declaration
-content and typed source provenance, so a relevant mutation makes the finding active again. A
-reviewed baseline may suppress BH1, BH2, or BH3, but it cannot suppress an incomplete-analysis
-failure.
-
-This scope excludes plugin-root `settings.json` permissions, plugin-shipped agent hooks, user-level
-and managed settings outside the artifact, background monitors, plugin MCP/LSP servers, general
-and complete interprocedural analysis of arbitrary programs.
 
 ## Quick Start
 
@@ -421,7 +354,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects the vulnerability patterns listed below:
+SkillSpector detects **71 vulnerability patterns** across 17 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -580,13 +513,7 @@ SkillSpector detects the vulnerability patterns listed below:
 | TP3 | Parameter Description Injection | MEDIUM | Injection patterns in parameter definitions (overrides, system tokens, malicious defaults) |
 | TP4 | Description-Behavior Mismatch | MEDIUM | Declared tool description does not match actual code behavior (LLM-powered) |
 
-### Bundled Execution Surface (3 patterns)
-
-| ID | Pattern | Severity | Description |
-|----|---------|----------|-------------|
-| BH1 | Bundled Hook Execution Surface | LOW-HIGH | Inventories supported Claude Code hook declarations and their effective execution surface |
-| BH2 | Bundled Hook Data Exfiltration | CRITICAL | Correlates sensitive hook data, credentials, or files with a concrete outbound transport in one reachable handler chain |
-| BH3 | Bundled Permission Grant | MEDIUM-CRITICAL | Classifies conditional permission capabilities declared in supported Claude Code project settings without retaining raw grant values |
+All detected patterns are listed in the tables above.
 
 ## Risk Scoring
 
@@ -703,7 +630,7 @@ SkillSpector is built to be driven by other tools (CI pipelines, install gates, 
 |------|---------|
 | `0` | Scan completed, `risk_score` ≤ 50 (recommendation `SAFE` or `CAUTION`) |
 | `1` | Scan completed, `risk_score` > 50 (recommendation `DO_NOT_INSTALL`) |
-| `2` | Analysis incomplete or failed (including bad input, unreadable/reachable hook payloads, or internal failure) |
+| `2` | Error (bad input, unreadable source, internal failure) |
 
 > The exit code collapses `SAFE` and `CAUTION` into `0`. To act differently on them (e.g. *warn* on `CAUTION` but *block* on `DO_NOT_INSTALL`), read the `recommendation` field from the JSON output rather than relying on the exit code.
 

@@ -101,25 +101,6 @@ processing deadline. It does not start a second unbounded filesystem traversal.
 | Output records | 512 | One extraction |
 | Extraction time | 2 seconds | One extraction, constrained by the bundle deadline |
 
-## Bundled permission settings
-
-Claude Code project-permission analysis consumes an already bounded, duplicate-key-safe JSON
-document and applies these additional per-document ceilings:
-
-| Resource | Ceiling | Scope |
-|---|---:|---|
-| Permission structural items | 2,048 | Permission keys plus entries in `allow`, `ask`, `deny`, and `additionalDirectories` |
-| Permission matcher work | 8,388,608 characters | Charged glob-pattern and tool-identifier comparisons |
-| Optional location-recovery input | 256,000 characters | One decoded settings document |
-| Optional location-recovery scheduled nodes | 4,096 | JSON root, mapping keys and values, and sequence entries |
-
-The structural and matcher-work ceilings bound classification itself; exceeding either fails that
-permission subanalysis closed with an explicit component-limit reason. Source-line recovery is
-optional enrichment performed only after strict JSON parsing. If either location-recovery ceiling is
-exceeded, SkillSpector skips the additional syntax-tree composition but continues permission
-classification with fallback source lines. Grant and diagnostic kinds, identities, digests, counts,
-outcome, reason, and completeness are unchanged by that optional skip.
-
 ## Recursive and transitive scans
 
 Pre-scan recursive discovery uses bounded `scandir` traversal and does not construct YAML merely to

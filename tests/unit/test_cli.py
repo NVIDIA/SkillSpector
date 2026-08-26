@@ -3771,40 +3771,6 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
     assert "0 suppressed finding(s)" in re.sub(r"\x1b\[[0-9;]*m", "", invocation.output)
 
 
-def test_cli_baseline_uses_local_cache_for_hidden_structural_findings(tmp_path: Path) -> None:
-    """Hidden hook findings fingerprint their deterministic local-cache source."""
-    skill = tmp_path / "skill"
-    skill.mkdir()
-    (skill / "SKILL.md").write_text("---\nname: baseline\n---\n", encoding="utf-8")
-    output = tmp_path / "baseline.yaml"
-    path = ".claude/settings.json"
-    content = '{"hooks": {}}'
-    finding = Finding(
-        rule_id="BH1",
-        message="bundled hook",
-        finding_id="bh1-hidden",
-        severity="LOW",
-        confidence=1.0,
-        file=path,
-        matched_text="sha256:" + ("a" * 64),
-    )
-    graph_result = {
-        "findings": [finding],
-        "filtered_findings": [finding],
-        "suppressed_findings": [],
-        "file_cache": {},
-        "local_file_cache": {path: content},
-        "risk_score": 5,
-    }
-
-    with patch("skillspector.cli.graph.invoke", return_value=graph_result):
-        invocation = runner.invoke(app, ["baseline", str(skill), "-o", str(output), "--no-llm"])
-
-    assert invocation.exit_code == 0, invocation.output
-    written = yaml.safe_load(output.read_text(encoding="utf-8"))
-    assert [entry["rule_id"] for entry in written["fingerprints"]] == ["BH1"]
-
-
 def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: Path) -> None:
     """Hidden and nested findings retain exact, source-bound fingerprints."""
     skill = tmp_path / "skill"

@@ -2217,6 +2217,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pywhatwgurl"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "idna" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c0/d2/ce0fffb9eb66ea2f88d20d7c3841b017d25559b6b617bce566811fe0bb48/pywhatwgurl-0.1.1.tar.gz", hash = "sha256:65c85da35367511c12a4dd87fecaf08aa3ae564259055b37b4ae53429289fcf6", size = 155366, upload-time = "2026-04-03T08:20:13.984Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/2f/6e14535f7532c836c1200ea53785570d3c37128719ff62915d0971e00598/pywhatwgurl-0.1.1-py3-none-any.whl", hash = "sha256:d67072d3f702f899e6e5de074e7fa14b5c9c5c85f616c6016c4eef9c94113d5f", size = 26605, upload-time = "2026-04-03T08:20:12.46Z" },
+]
+
+[[package]]
 name = "pywin32"
 version = "312"
 source = { registry = "https://pypi.org/simple" }
@@ -2689,7 +2701,9 @@ dependencies = [
     { name = "openai" },
     { name = "packaging" },
     { name = "pydantic" },
+    { name = "pywhatwgurl" },
     { name = "pyyaml" },
+    { name = "regex" },
     { name = "rich" },
     { name = "typer" },
     { name = "yara-python" },
@@ -2737,7 +2751,9 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.3.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.0.0" },
+    { name = "pywhatwgurl", specifier = "==0.1.1" },
     { name = "pyyaml", specifier = ">=6.0.1" },
+    { name = "regex", specifier = "==2026.5.9" },
     { name = "rich", specifier = ">=14.3.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.0" },
     { name = "skillspector", extras = ["mcp"], marker = "extra == 'dev'" },

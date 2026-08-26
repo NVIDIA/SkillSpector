@@ -1,2846 +1,1743 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Deterministic, cache-backed inventory for Claude Code hook declarations."""
+"""Analyze the bounded bundled hook and permission execution surfaces."""
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import math
+import posixpath
 import re
-from collections.abc import Iterator
-from dataclasses import dataclass, field, replace
-from hashlib import sha256
-from pathlib import PurePosixPath
-from typing import Final, cast
+import socket
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Final
+from urllib.parse import urlsplit
 
-import yaml  # type: ignore[import-untyped]
-from yaml.resolver import BaseResolver  # type: ignore[import-untyped]
+import regex  # type: ignore[import-untyped]
+from pywhatwgurl import URL
 
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
     analyzer_status_for_events,
-    inspection_work_id,
     ledger_event,
 )
-from skillspector.models import Finding
+from skillspector.logging_config import get_logger
+from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
-from .bundled_hook_flow import (
-    DocumentFlowInput,
-    FlowWorkRef,
-    FlowWorkResult,
-    HandlerFlowInput,
-    UserConfigProfile,
-    analyze_documents,
-    build_user_config_profile,
-    capture_handler,
-)
-from .bundled_hook_runtime import (
-    HookRegistration,
-    registration_severity,
-)
-from .bundled_hook_runtime import (
-    normalize_registration as _normalize_registration,
-)
-from .bundled_permission_grants import (
-    PermissionAnalysis,
-    PermissionSourceLines,
-    analyze_permission_grants,
-    build_bh3_finding,
-)
-from .static_runner import MAX_FILE_CHARS
+from .static_runner import MAX_FILE_CHARS, analyzer_finding_to_finding
 
-ANALYZER_ID: Final = "bundled_execution_surface"
-_PLUGIN_DEFAULT_PATH: Final = "hooks/hooks.json"
-_EVIDENCE_SCHEMA: Final = "skillspector.bundled_hook.v1"
-_SEMANTICS_SNAPSHOT: Final = "2.1.238"
-_PLUGIN_METADATA_DIRECTORY: Final = ".claude-plugin"
-_PLUGIN_MANIFEST_FILENAME: Final = "plugin.json"
-_PLUGIN_MARKETPLACE_FILENAME: Final = "marketplace.json"
-_MANIFEST_COMPONENT_FIELDS: Final = frozenset(
+ANALYZER_ID = "bundled_execution_surface"
+logger = get_logger(__name__)
+
+_APPLICABLE_PATHS: Final = frozenset(
     {
-        "hooks",
-        "skills",
-        "commands",
-        "agents",
-        "mcpServers",
-        "lspServers",
-        "outputStyles",
-        "workflows",
-        "experimental",
+        "hooks/hooks.json",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
     }
 )
-# Settings-file hooks can load in never-trusted headless sessions. These labels
-# describe session scope rather than implying that permission grants were trusted.
-_PROJECT_SETTINGS: Final = {
-    ".claude/settings.json": ("project_settings", "project_session"),
-    ".claude/settings.local.json": ("project_local_settings", "project_local_session"),
-}
-_ARCHIVE_CONTAINER_TYPES: Final = frozenset({"docx", "pptx", "xlsx", "zip"})
-_FRONTMATTER_DELIMITER: Final = re.compile(r"^(?:---|\.\.\.)[ \t]*$")
-_MAX_YAML_COLLECTION_DEPTH: Final = 64
-_MAX_YAML_NODES: Final = 2048
-_MAX_JSON_LOCATION_CHARS: Final = 256_000
-_MAX_JSON_LOCATION_NODES: Final = 4_096
-_MAX_REGISTRATIONS_PER_DOCUMENT: Final = 2048
-_MAX_HOOK_STRUCTURE_ITEMS: Final = 8192
+_MAX_DECLARATIONS: Final = 2_048
+_MAX_DECLARATION_CHARS: Final = 16_384
+_VALID_DEFAULT_MODES: Final = frozenset(
+    {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "manual", "plan"}
+)
+_LIMITED_BROADCAST: Final = ipaddress.IPv4Address("255.255.255.255")
+_BIDI_RTL_TRIGGER: Final = regex.compile(r"\A[\p{bc=R}\p{bc=AL}\p{bc=AN}]\Z")
+_BIDI_RTL_FIRST: Final = regex.compile(r"\A[\p{bc=R}\p{bc=AL}]\Z")
+_BIDI_LTR_FIRST: Final = regex.compile(r"\A\p{bc=L}\Z")
+_BIDI_RTL_ALLOWED: Final = regex.compile(
+    r"\A[\p{bc=R}\p{bc=AL}\p{bc=AN}\p{bc=EN}\p{bc=ES}\p{bc=CS}"
+    r"\p{bc=ET}\p{bc=ON}\p{bc=BN}\p{bc=NSM}]\Z"
+)
+_BIDI_LTR_ALLOWED: Final = regex.compile(
+    r"\A[\p{bc=L}\p{bc=EN}\p{bc=ES}\p{bc=CS}\p{bc=ET}"
+    r"\p{bc=ON}\p{bc=BN}\p{bc=NSM}]\Z"
+)
+_BIDI_RTL_END: Final = regex.compile(r"\A[\p{bc=R}\p{bc=AL}\p{bc=EN}\p{bc=AN}]\Z")
+_BIDI_LTR_END: Final = regex.compile(r"\A[\p{bc=L}\p{bc=EN}]\Z")
+_BIDI_NSM: Final = regex.compile(r"\A\p{bc=NSM}\Z")
+_BIDI_AN: Final = regex.compile(r"\A\p{bc=AN}\Z")
+_BIDI_EN: Final = regex.compile(r"\A\p{bc=EN}\Z")
+_KNOWN_HANDLER_TYPES: Final = frozenset({"command", "http", "mcp_tool", "prompt", "agent"})
+_KNOWN_EVENTS: Final = frozenset(
+    {
+        "ConfigChange",
+        "CwdChanged",
+        "DirectoryAdded",
+        "Elicitation",
+        "ElicitationResult",
+        "FileChanged",
+        "InstructionsLoaded",
+        "MessageDisplay",
+        "Notification",
+        "PermissionDenied",
+        "PermissionRequest",
+        "PostCompact",
+        "PostToolBatch",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PreCompact",
+        "PreToolUse",
+        "SessionEnd",
+        "SessionStart",
+        "Setup",
+        "Stop",
+        "StopFailure",
+        "SubagentStart",
+        "SubagentStop",
+        "TaskCompleted",
+        "TaskCreated",
+        "TeammateIdle",
+        "UserPromptExpansion",
+        "UserPromptSubmit",
+        "WorktreeCreate",
+        "WorktreeRemove",
+    }
+)
+_NO_MATCHER_EVENTS: Final = frozenset(
+    {
+        "CwdChanged",
+        "MessageDisplay",
+        "PostToolBatch",
+        "Stop",
+        "TaskCompleted",
+        "TaskCreated",
+        "TeammateIdle",
+        "UserPromptSubmit",
+        "WorktreeCreate",
+        "WorktreeRemove",
+    }
+)
+_PROMPT_AGENT_EVENTS: Final = frozenset(
+    {
+        "PermissionDenied",
+        "PermissionRequest",
+        "PostToolBatch",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PreToolUse",
+        "Stop",
+        "SubagentStop",
+        "TaskCompleted",
+        "TaskCreated",
+        "TeammateIdle",
+        "UserPromptExpansion",
+        "UserPromptSubmit",
+    }
+)
+_COMMAND_MCP_ONLY_EVENTS: Final = frozenset({"SessionStart", "Setup"})
+_IF_EVENTS: Final = frozenset(
+    {
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PermissionRequest",
+        "PermissionDenied",
+    }
+)
+_SENSITIVE_EVENTS: Final = frozenset(
+    {
+        "UserPromptSubmit",
+        "UserPromptExpansion",
+        "MessageDisplay",
+        "PreToolUse",
+        "PermissionRequest",
+        "PermissionDenied",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PostToolBatch",
+        "SubagentStop",
+        "TaskCreated",
+        "TaskCompleted",
+        "Stop",
+        "StopFailure",
+        "PreCompact",
+        "PostCompact",
+        "Elicitation",
+        "ElicitationResult",
+    }
+)
+_SENSITIVE_DIRECTORY_SUFFIXES: Final = (
+    "/.ssh",
+    "/.aws",
+    "/.kube",
+    "/.config/gcloud",
+)
+_SENSITIVE_FILE_SUFFIXES: Final = frozenset(
+    {
+        "/.claude/settings.json",
+        "/.claude/settings.local.json",
+        "/.claude/.credentials.json",
+        "/.docker/config.json",
+        "/.netrc",
+        "/.npmrc",
+    }
+)
+_ABSOLUTE_HOME_PATH = re.compile(
+    r"^/(?:Users/(?!\.{1,2}/)[^/]+|home/(?!\.{1,2}/)[^/]+|root)(?P<suffix>/.*)$"
+)
+_REMOTE_PATH = re.compile(r"^(?:[A-Za-z0-9._-]+@)?(?P<host>[A-Za-z0-9.-]+):(?P<path>[^\s]+)$")
+_BRACKETED_REMOTE_PATH = re.compile(
+    r"^(?:[A-Za-z0-9._-]+@)?\[(?P<host>[0-9A-Fa-f:.]+)\]:(?P<path>[^\s]+)$"
+)
+_CURL_HTTP_URL = re.compile(r"(?i)\Ahttps?:/{1,3}[^/]", re.ASCII)
+_WGET_HTTP_URL = re.compile(r"(?i)\Ahttps?://[^/]", re.ASCII)
+_DISABLE_TRUSTED_TOP_LEVEL_KEYS: Final = frozenset(
+    {
+        "$schema",
+        "disableAllHooks",
+        "env",
+        "hooks",
+        "includeCoAuthoredBy",
+        "model",
+        "permissions",
+    }
+)
+_HookIdentity = tuple[str, str, str]
 
 
-class InvalidHookConfigurationError(ValueError):
-    """A supported runtime source cannot be safely interpreted."""
+class _DuplicateKeyError(ValueError):
+    """Raised when untrusted JSON contains an ambiguous duplicate key."""
 
 
-class BinaryHookConfigurationError(InvalidHookConfigurationError):
-    """A hook configuration contains binary data."""
+class _NonFiniteConstantError(ValueError):
+    """Raised when JSON uses a non-standard NaN or Infinity constant."""
 
 
-class HookConfigurationSizeLimitError(InvalidHookConfigurationError):
-    """A hook configuration exceeds the bounded parser input limit."""
-
-    def __init__(self, observed_characters: int) -> None:
-        super().__init__("hook configuration exceeds character limit")
-        self.observed_characters = observed_characters
-
-
-class HookRegistrationLimitError(InvalidHookConfigurationError):
-    """A hook document exceeds the bounded registration cardinality."""
-
-
-class _DuplicateKeySafeLoader(yaml.SafeLoader):
-    """Safe YAML loader which rejects duplicate mapping keys at every depth."""
+@dataclass(frozen=True)
+class _HookDeclaration:
+    event: str
+    handler_type: str
+    ambient: bool
+    matcher_breadth: str
+    remote_http: bool
+    handler: dict[str, object]
+    active: bool = True
 
 
-def _construct_unique_mapping(
-    loader: _DuplicateKeySafeLoader, node: yaml.MappingNode, deep: bool = False
-) -> dict[object, object]:
-    mapping: dict[object, object] = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
+@dataclass(frozen=True)
+class _Bh2Proof:
+    kind: str
+    transport: str
+
+
+@dataclass(frozen=True)
+class _PermissionDeclaration:
+    severity: Severity
+    kind: str
+    activation_state: str = "conditional"
+
+
+@dataclass(frozen=True)
+class _DeclarationScan:
+    hooks: list[_HookDeclaration]
+    permissions: list[_PermissionDeclaration]
+    partial: bool
+    observed: int
+
+
+def _address_is_non_remote(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return (
+        address.is_loopback
+        or address.is_unspecified
+        or address.is_multicast
+        or address == _LIMITED_BROADCAST
+    )
+
+
+def _is_non_remote_host(host: str) -> bool:
+    normalized = host.lower().rstrip(".")
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
         try:
-            if key in mapping:
-                raise InvalidHookConfigurationError("duplicate YAML key")
-        except TypeError as exc:
-            raise InvalidHookConfigurationError("YAML mapping key is not scalar") from exc
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
+            address = ipaddress.ip_address(socket.inet_aton(normalized))
+        except (OSError, ValueError):
+            return False
+    return _address_is_non_remote(address)
 
 
-_DuplicateKeySafeLoader.add_constructor(BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+def _punycode_labels_are_valid(host: str) -> bool:
+    for label in host.split("."):
+        if not label.startswith("xn--"):
+            continue
+        try:
+            decoded = label.encode("ascii").decode("idna")
+            if decoded.encode("idna").decode("ascii") != label:
+                return False
+        except UnicodeError:
+            return False
+    return True
 
 
-@dataclass(frozen=True)
-class HookDocument:
-    """One immutable, cache-backed hook declaration document."""
-
-    source_kind: str
-    declaration_roles: tuple[str, ...]
-    source_path: str
-    activation_lifetime: str
-    content_digest: str
-    registrations: tuple[HookRegistration, ...]
-    flow_inputs: tuple[HandlerFlowInput, ...] = field(repr=False)
-    runtime_status: str = "declared_unclassified"
-
-
-@dataclass(frozen=True)
-class _SettingsWork:
-    """One parse-once project settings document and its safe permission result."""
-
-    source_path: str
-    source_kind: str
-    content_digest: str
-    source_identity_digest: str
-    raw: dict[str, object] | None
-    parse_error: BaseException | None
-    permission_analysis: PermissionAnalysis | None
-    permission_source_lines: PermissionSourceLines
-
-
-@dataclass(frozen=True)
-class _RegistrationSet:
-    """Parallel normalized and raw-flow records for one parsed hook map."""
-
-    registrations: tuple[HookRegistration, ...]
-    flow_inputs: tuple[HandlerFlowInput, ...] = field(repr=False)
+def _is_valid_literal_host(host: str) -> bool:
+    if host.endswith(".."):
+        return False
+    normalized = host.lower().removesuffix(".")
+    if not normalized or not normalized.isascii() or "%" in normalized:
+        return False
+    try:
+        ipaddress.ip_address(normalized)
+        return True
+    except ValueError:
+        pass
+    try:
+        socket.inet_aton(normalized)
+        return True
+    except (OSError, ValueError):
+        pass
+    if normalized.startswith("0x") or re.fullmatch(r"[0-9.]+", normalized):
+        return False
+    labels = normalized.split(".")
+    if not _punycode_labels_are_valid(normalized):
+        return False
+    return all(
+        1 <= len(label) <= 63
+        and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) is not None
+        for label in labels
+    )
 
 
-@dataclass(frozen=True)
-class MarketplaceEntry:
-    """A validated local or remote marketplace plugin declaration."""
-
-    marketplace_path: str
-    ledger_path: str
-    index: int
-    plugin_root: str | None
-    strict: bool
-    hooks: object | None
-    skills: object | None
-    commands: object | None
-    handler_lines: tuple[int, ...] = ()
-    source_is_root: bool = False
+def _bracketed_url_host_is_ipv6(value: str, host: str) -> bool:
+    parts = value.split("://", 1)
+    if len(parts) != 2:
+        return True
+    authority = re.split(r"[/?#]", parts[1], maxsplit=1)[0]
+    if not authority.rsplit("@", 1)[-1].startswith("["):
+        return True
+    try:
+        ipaddress.IPv6Address(host)
+    except ValueError:
+        return False
+    return True
 
 
-def _digest(domain: str, value: str) -> str:
-    return _digest_bytes(domain, value.encode("utf-8"))
+def _is_safe_literal(value: str) -> bool:
+    return (
+        len(value) <= _MAX_DECLARATION_CHARS
+        and "\x00" not in value
+        and not any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+    )
 
 
-def _digest_bytes(domain: str, value: bytes) -> str:
-    payload = f"skillspector.bundled_hook.v1\0{domain}\0".encode() + value
-    return f"sha256:{sha256(payload).hexdigest()}"
+def _is_bounded_http_string(value: object) -> bool:
+    return isinstance(value, str) and len(value) <= _MAX_DECLARATION_CHARS
+
+
+def _is_bounded_string(value: object) -> bool:
+    return isinstance(value, str) and _is_safe_literal(value)
+
+
+def _is_nonempty_bounded_string(value: object) -> bool:
+    return _is_bounded_string(value) and bool(value)
+
+
+def _is_bool(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+def _is_positive_json_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _is_bounded_string_list(value: object) -> bool:
+    return isinstance(value, list) and all(_is_bounded_string(item) for item in value)
+
+
+def _is_bounded_header_value(value: object) -> bool:
+    return _is_bounded_http_string(value)
+
+
+def _is_bounded_header_map(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        _is_bounded_string(key) and _is_bounded_header_value(item) for key, item in value.items()
+    )
+
+
+def _is_bounded_string_map(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        _is_bounded_string(key) and _is_bounded_string(item) for key, item in value.items()
+    )
+
+
+def _optional_field_is_valid(
+    handler: dict[str, object], field: str, validator: Callable[[object], bool]
+) -> bool:
+    return field not in handler or validator(handler.get(field))
+
+
+def _label_satisfies_bidi_rule(label: str) -> bool:
+    if not label:
+        return False
+    rtl = _BIDI_RTL_FIRST.fullmatch(label[0]) is not None
+    if not rtl and _BIDI_LTR_FIRST.fullmatch(label[0]) is None:
+        return False
+    allowed = _BIDI_RTL_ALLOWED if rtl else _BIDI_LTR_ALLOWED
+    if not all(allowed.fullmatch(character) is not None for character in label):
+        return False
+    ending = next(
+        (character for character in reversed(label) if _BIDI_NSM.fullmatch(character) is None),
+        "",
+    )
+    valid_end = _BIDI_RTL_END if rtl else _BIDI_LTR_END
+    if valid_end.fullmatch(ending) is None:
+        return False
+    if rtl:
+        has_an = any(_BIDI_AN.fullmatch(character) is not None for character in label)
+        has_en = any(_BIDI_EN.fullmatch(character) is not None for character in label)
+        return not (has_an and has_en)
+    return True
+
+
+def _hostname_satisfies_bidi_rule(hostname: str) -> bool:
+    """Apply the domain-wide WHATWG BiDi check omitted by pywhatwgurl 0.1.1."""
+    if "xn--" not in hostname:
+        return True
+
+    labels: list[str] = []
+    try:
+        for label in hostname.rstrip(".").split("."):
+            labels.append(
+                label.removeprefix("xn--").encode("ascii").decode("punycode")
+                if label.startswith("xn--")
+                else label
+            )
+    except UnicodeError:
+        return False
+
+    if not any(
+        _BIDI_RTL_TRIGGER.fullmatch(character) is not None
+        for label in labels
+        for character in label
+    ):
+        return True
+    return all(_label_satisfies_bidi_rule(label) for label in labels if label)
+
+
+def _parse_schema_url(value: object) -> URL | None:
+    if not _is_bounded_http_string(value):
+        return None
+    assert isinstance(value, str)
+    value = value.encode("utf-16", errors="surrogatepass").decode("utf-16", errors="replace")
+    try:
+        return URL(value)
+    except (UnicodeError, ValueError):
+        return None
+
+
+def _parse_http_url(value: object) -> URL | None:
+    parsed = _parse_schema_url(value)
+    return (
+        parsed
+        if parsed is not None
+        and parsed.protocol in {"http:", "https:"}
+        and parsed.hostname
+        and "$" not in parsed.hostname
+        and _hostname_satisfies_bidi_rule(parsed.hostname)
+        else None
+    )
+
+
+def _handler_url_is_valid(value: object) -> bool:
+    parsed = _parse_schema_url(value)
+    if parsed is None:
+        return False
+    if parsed.protocol not in {"http:", "https:"}:
+        return True
+    return bool(parsed.hostname and _hostname_satisfies_bidi_rule(parsed.hostname))
+
+
+def _handler_schema_url_is_valid(value: object) -> bool:
+    return _parse_schema_url(value) is not None
+
+
+def _is_external_http_url(value: object) -> bool:
+    if not isinstance(value, str) or not _is_safe_literal(value):
+        return False
+    if "\\" in value or any(character.isspace() or ord(character) < 0x20 for character in value):
+        return False
+    parsed = _parse_http_url(value)
+    return parsed is not None and not _is_non_remote_host(parsed.hostname)
+
+
+def _http_headers_are_sendable(headers: dict[str, object]) -> bool:
+    for name in headers:
+        if re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", name) is None:
+            return False
+    return True
+
+
+def _is_remote_http(handler: dict[str, object]) -> bool:
+    headers = handler.get("headers", {})
+    assert isinstance(headers, dict)
+    parsed = _parse_http_url(handler.get("url"))
+    return (
+        parsed is not None
+        and not _is_non_remote_host(parsed.hostname)
+        and _http_headers_are_sendable(headers)
+    )
+
+
+def _matcher_breadth(event: str, matcher: str | None) -> str:
+    if event not in _KNOWN_EVENTS:
+        return "unsupported"
+    if event in _NO_MATCHER_EVENTS:
+        return "not_applicable"
+    if matcher is None or matcher in {"", "*"}:
+        return "all"
+    if event == "FileChanged":
+        segments = matcher.split("|")
+        literal_pattern = r"[A-Za-z0-9_./:-]+"
+    elif event == "StopFailure":
+        segments = matcher.split("|")
+        literal_pattern = r"[A-Za-z0-9_]+"
+    else:
+        segments = re.split(r"\s*[|,]\s*", matcher.strip())
+        literal_pattern = r"[A-Za-z0-9_-]+"
+    if all(segment and re.fullmatch(literal_pattern, segment) for segment in segments):
+        return "scoped"
+    return "unsupported"
+
+
+def _handler_strings_are_bounded(handler: dict[str, object]) -> bool:
+    for key in ("type", "command", "url", "prompt", "server", "tool", "shell", "if"):
+        value = handler.get(key)
+        if isinstance(value, str) and not (
+            _is_bounded_http_string(value)
+            if key == "url" and handler.get("type") == "http"
+            else _is_safe_literal(value)
+        ):
+            return False
+    if handler.get("type") != "command" or "args" not in handler:
+        return True
+    args = handler.get("args")
+    return isinstance(args, list) and all(
+        isinstance(arg, str) and _is_safe_literal(arg) for arg in args
+    )
+
+
+def _handler_optional_fields_are_valid(handler_type: str, handler: dict[str, object]) -> bool:
+    if handler_type not in _KNOWN_HANDLER_TYPES:
+        return True
+    common = (
+        _optional_field_is_valid(handler, "if", _is_bounded_string)
+        and _optional_field_is_valid(handler, "timeout", _is_positive_json_number)
+        and _optional_field_is_valid(handler, "statusMessage", _is_bounded_string)
+        and _optional_field_is_valid(handler, "once", _is_bool)
+    )
+    if not common:
+        return False
+    if handler_type == "command":
+        return (
+            _optional_field_is_valid(handler, "args", _is_bounded_string_list)
+            and _optional_field_is_valid(handler, "async", _is_bool)
+            and _optional_field_is_valid(handler, "asyncRewake", _is_bool)
+            and _optional_field_is_valid(handler, "rewakeMessage", _is_nonempty_bounded_string)
+            and _optional_field_is_valid(handler, "rewakeSummary", _is_nonempty_bounded_string)
+        )
+    if handler_type == "http":
+        return _optional_field_is_valid(
+            handler, "headers", _is_bounded_header_map
+        ) and _optional_field_is_valid(handler, "allowedEnvVars", _is_bounded_string_list)
+    if handler_type == "prompt":
+        return _optional_field_is_valid(
+            handler, "model", _is_bounded_string
+        ) and _optional_field_is_valid(handler, "continueOnBlock", _is_bool)
+    if handler_type == "agent":
+        return _optional_field_is_valid(handler, "model", _is_bounded_string)
+    if handler_type == "mcp_tool":
+        return _optional_field_is_valid(handler, "input", lambda value: isinstance(value, dict))
+    return True
+
+
+def _handler_shape_is_valid(
+    handler_type: str,
+    handler: dict[str, object],
+    *,
+    url_validator: Callable[[object], bool] = _handler_url_is_valid,
+) -> bool:
+    required_fields = {
+        "command": ("command",),
+        "http": ("url",),
+        "prompt": ("prompt",),
+        "agent": ("prompt",),
+        "mcp_tool": ("server", "tool"),
+    }.get(handler_type, ())
+    if not handler_type:
+        return False
+    if handler_type == "command" and "shell" in handler:
+        shell = handler.get("shell")
+        if not isinstance(shell, str) or shell not in {"bash", "powershell"}:
+            return False
+    for field in required_fields:
+        value = handler.get(field)
+        valid_string = (
+            _is_bounded_http_string(value)
+            if handler_type == "http" and field == "url"
+            else isinstance(value, str) and _is_safe_literal(value)
+        )
+        if not valid_string:
+            return False
+    if handler_type == "http" and not url_validator(handler.get("url")):
+        return False
+    return _handler_optional_fields_are_valid(handler_type, handler)
+
+
+def _handler_type_is_supported(event: str, handler_type: str) -> bool:
+    if event not in _KNOWN_EVENTS or handler_type not in _KNOWN_HANDLER_TYPES:
+        return True
+    if event in _COMMAND_MCP_ONLY_EVENTS:
+        return handler_type in {"command", "mcp_tool"}
+    if handler_type in {"prompt", "agent"}:
+        return event in _PROMPT_AGENT_EVENTS
+    return True
+
+
+def _hook_declaration(
+    event: str, matcher_breadth: str, raw_handler: object
+) -> _HookDeclaration | None:
+    if not isinstance(raw_handler, dict) or not _handler_strings_are_bounded(raw_handler):
+        return None
+    raw_type = raw_handler.get("type")
+    if not isinstance(raw_type, str):
+        return None
+    if not _handler_shape_is_valid(raw_type, raw_handler):
+        return None
+    if not _handler_type_is_supported(event, raw_type):
+        return None
+    condition = raw_handler.get("if")
+    if "if" in raw_handler and (
+        not isinstance(condition, str) or not _permission_rule_is_valid(condition)
+    ):
+        return None
+    return _HookDeclaration(
+        event=event,
+        handler_type=raw_type,
+        ambient=matcher_breadth != "scoped",
+        matcher_breadth=matcher_breadth,
+        remote_http=raw_type == "http" and _is_remote_http(raw_handler),
+        handler=raw_handler,
+        active=not ("if" in raw_handler and event in _KNOWN_EVENTS and event not in _IF_EVENTS),
+    )
+
+
+def _hook_group_declarations(
+    event: str,
+    raw_group: object,
+    *,
+    invalid_event: bool,
+    limit: int,
+    previous_handler_ids: set[_HookIdentity] | None,
+    current_handler_ids: set[_HookIdentity],
+) -> tuple[list[_HookDeclaration], bool, int]:
+    if not isinstance(raw_group, dict):
+        return [], True, 0
+    raw_handlers = raw_group.get("hooks")
+    if not isinstance(raw_handlers, list):
+        return [], True, 0
+    matcher = raw_group.get("matcher")
+    invalid_matcher = (isinstance(matcher, str) and not _is_safe_literal(matcher)) or (
+        "matcher" in raw_group and not isinstance(matcher, str)
+    )
+    if invalid_event or invalid_matcher:
+        return [], True, len(raw_handlers)
+
+    assert matcher is None or isinstance(matcher, str)
+    matcher_breadth = _matcher_breadth(event, matcher)
+    declarations: list[_HookDeclaration] = []
+    partial = False
+    observed = 0
+    for raw_handler in raw_handlers:
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        declaration = _hook_declaration(event, matcher_breadth, raw_handler)
+        if declaration is None:
+            partial = True
+        elif declaration.active:
+            identity = (
+                event,
+                matcher_breadth,
+                json.dumps(raw_handler, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            )
+            current_handler_ids.add(identity)
+            if previous_handler_ids is None or identity not in previous_handler_ids:
+                declarations.append(declaration)
+    return declarations, partial, observed
+
+
+def _remember_settings_handlers(
+    previous_handler_ids: set[_HookIdentity] | None,
+    current_handler_ids: set[_HookIdentity],
+) -> None:
+    if previous_handler_ids is not None:
+        previous_handler_ids.update(current_handler_ids)
+
+
+def _hook_declarations(
+    document: object,
+    *,
+    limit: int,
+    previous_handler_ids: set[_HookIdentity] | None = None,
+) -> tuple[list[_HookDeclaration], bool, int]:
+    if not isinstance(document, dict):
+        return [], False, 0
+    if "hooks" not in document:
+        return [], False, 0
+    hooks = document.get("hooks")
+    if not isinstance(hooks, dict):
+        return [], True, 0
+
+    declarations: list[_HookDeclaration] = []
+    current_handler_ids: set[_HookIdentity] = set()
+    partial = False
+    observed = 0
+    for raw_event, raw_groups in hooks.items():
+        if not isinstance(raw_event, str):
+            partial = True
+            continue
+        invalid_event = not _is_safe_literal(raw_event)
+        if invalid_event:
+            partial = True
+        if not isinstance(raw_groups, list):
+            partial = True
+            continue
+        for raw_group in raw_groups:
+            group_declarations, group_partial, group_observed = _hook_group_declarations(
+                raw_event,
+                raw_group,
+                invalid_event=invalid_event,
+                limit=max(0, limit - observed),
+                previous_handler_ids=previous_handler_ids,
+                current_handler_ids=current_handler_ids,
+            )
+            declarations.extend(group_declarations)
+            partial = partial or group_partial
+            observed += group_observed
+            if observed > limit:
+                _remember_settings_handlers(previous_handler_ids, current_handler_ids)
+                return declarations, True, observed
+    _remember_settings_handlers(previous_handler_ids, current_handler_ids)
+    return declarations, partial, observed
+
+
+def _sensitive_suffix(suffix: str) -> bool:
+    if not _is_safe_literal(suffix) or not suffix.startswith("/"):
+        return False
+    segments = suffix[1:].split("/")
+    if segments[-1:] == [""]:
+        segments.pop()
+    if not segments or any(segment in {"", ".", ".."} for segment in segments):
+        return False
+    if suffix in _SENSITIVE_FILE_SUFFIXES:
+        return True
+    return any(
+        suffix == directory or suffix.startswith(f"{directory}/")
+        for directory in _SENSITIVE_DIRECTORY_SUFFIXES
+    )
+
+
+def _sensitive_file_suffix(suffix: str) -> bool:
+    return (
+        not suffix.endswith("/")
+        and suffix not in _SENSITIVE_DIRECTORY_SUFFIXES
+        and _sensitive_suffix(suffix)
+    )
+
+
+def _is_sensitive_absolute_path(value: object) -> bool:
+    if not isinstance(value, str) or not _is_safe_literal(value):
+        return False
+    match = _ABSOLUTE_HOME_PATH.fullmatch(value)
+    return bool(match and _sensitive_file_suffix(match.group("suffix")))
+
+
+def _is_sensitive_shell_path(value: str) -> bool:
+    if not _is_safe_literal(value):
+        return False
+    for anchor in ("$HOME", "${HOME}"):
+        if value.startswith(f"{anchor}/"):
+            suffix = value[len(anchor) :]
+            return not any(
+                character in suffix for character in "\\$*?[]{}!"
+            ) and _sensitive_file_suffix(suffix)
+    return False
+
+
+def _is_sensitive_tilde_path(value: str) -> bool:
+    return (
+        _is_safe_literal(value)
+        and value.startswith("~/")
+        and value != "~/.claude/settings.local.json"
+        and _sensitive_suffix(value[1:])
+    )
+
+
+def _is_remote_uri_destination(value: str, transport: str) -> bool:
+    if not value.startswith(f"{transport}://"):
+        return False
+    authority = re.split(r"[/?#]", value.split("://", 1)[1], maxsplit=1)[0]
+    if transport == "scp" and authority.rsplit("@", 1)[-1].endswith(":"):
+        return False
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return False
+    if transport == "scp":
+        username = parsed.username
+        if (
+            username is not None and re.fullmatch(r"(?!-)[A-Za-z0-9._-]+", username) is None
+        ) or "%" in parsed.path:
+            return False
+    if transport == "rsync" and parsed.path.startswith("//"):
+        return False
+    if not _bracketed_url_host_is_ipv6(value, host):
+        return False
+    return (
+        _is_valid_literal_host(host)
+        and parsed.path not in {"", "/"}
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and port != 0
+        and not _is_non_remote_host(host)
+    )
+
+
+def _is_remote_destination(value: object, transport: str) -> bool:
+    if not isinstance(value, str) or not _is_safe_literal(value):
+        return False
+    if (
+        value.startswith("-")
+        or re.match(r"^[A-Za-z]:", value)
+        or "\\" in value
+        or any(character.isspace() or ord(character) < 0x20 for character in value)
+    ):
+        return False
+    if "://" in value:
+        return _is_remote_uri_destination(value, transport)
+    match = _BRACKETED_REMOTE_PATH.fullmatch(value) or _REMOTE_PATH.fullmatch(value)
+    if not match:
+        return False
+    host = match.group("host")
+    remote_path = match.group("path")
+    rsync_module = remote_path[1:].split("/", 1)[0] if remote_path.startswith(":") else None
+    return (
+        (transport != "rsync" or rsync_module is None or bool(rsync_module))
+        and _is_valid_literal_host(host)
+        and not _is_non_remote_host(host)
+    )
+
+
+def _literal_args(handler: dict[str, object]) -> list[str] | None:
+    args = handler.get("args")
+    if not isinstance(args, list) or not all(
+        isinstance(arg, str) and _is_safe_literal(arg) for arg in args
+    ):
+        return None
+    return args
+
+
+def _flag_source(args: list[str], flags: frozenset[str]) -> tuple[str, list[str]] | None:
+    matches: list[tuple[int, str]] = []
+    consumed: set[int] = set()
+    for index, arg in enumerate(args):
+        if arg in flags:
+            if index + 1 >= len(args):
+                return None
+            matches.append((index, args[index + 1]))
+            consumed.update({index, index + 1})
+            continue
+        for flag in flags:
+            if flag.startswith("--") and arg.startswith(f"{flag}="):
+                matches.append((index, arg[len(flag) + 1 :]))
+                consumed.add(index)
+                break
+    if len(matches) != 1:
+        return None
+    remaining = [arg for index, arg in enumerate(args) if index not in consumed]
+    return matches[0][1], remaining
+
+
+def _one_external_url(values: list[str]) -> bool:
+    return (
+        len(values) == 1
+        and _WGET_HTTP_URL.match(values[0]) is not None
+        and _is_external_http_url(values[0])
+    )
+
+
+def _curl_url_has_unsupported_glob(value: str) -> bool:
+    if any(character in value for character in "{}"):
+        return True
+    if "[" not in value and "]" not in value:
+        return False
+    if _CURL_HTTP_URL.match(value) is None:
+        return True
+    parsed = _parse_http_url(value)
+    authority = re.split(r"[/?#]", value.split(":", 1)[1].lstrip("/"), maxsplit=1)[0]
+    return not (
+        value.count("[") == value.count("]") == 1
+        and authority.count("[") == authority.count("]") == 1
+        and parsed is not None
+        and ":" in parsed.hostname
+    )
+
+
+def _one_external_curl_url(values: list[str]) -> bool:
+    parsed = _parse_http_url(values[0]) if len(values) == 1 else None
+    return (
+        parsed is not None
+        and _CURL_HTTP_URL.match(values[0]) is not None
+        and not _curl_url_has_unsupported_glob(values[0])
+        and not any(character in parsed.hostname for character in "!$&'()*+,;=")
+        and _is_external_http_url(values[0])
+    )
+
+
+def _without_curl_transport_flags(args: list[str]) -> list[str] | None:
+    remaining: list[str] = []
+    saw_silent = False
+    saw_request = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-s":
+            if saw_silent:
+                return None
+            saw_silent = True
+            index += 1
+            continue
+        if arg == "-X":
+            if saw_request or args[index + 1 : index + 2] != ["POST"]:
+                return None
+            saw_request = True
+            index += 2
+            continue
+        remaining.append(arg)
+        index += 1
+    return remaining
+
+
+def _curl_exec_proof(event: str, args: list[str]) -> bool:
+    data = _flag_source(args, frozenset({"-d", "--data", "--data-ascii", "--data-binary"}))
+    if data is not None:
+        source, remaining = data
+        url_args = _without_curl_transport_flags(remaining)
+        if url_args is None:
+            return False
+        source_is_sensitive = (source == "@-" and event in _SENSITIVE_EVENTS) or (
+            source.startswith("@") and _is_sensitive_absolute_path(source[1:])
+        )
+        return source_is_sensitive and _one_external_curl_url(url_args)
+
+    upload = _flag_source(args, frozenset({"-T", "--upload-file"}))
+    if upload is None:
+        return False
+    source, remaining = upload
+    url_args = _without_curl_transport_flags(remaining)
+    if url_args is None:
+        return False
+    source_is_sensitive = (source == "-" and event in _SENSITIVE_EVENTS) or (
+        _is_sensitive_absolute_path(source)
+    )
+    return source_is_sensitive and _one_external_curl_url(url_args)
+
+
+def _wget_exec_proof(args: list[str]) -> bool:
+    body = _flag_source(args, frozenset({"--post-file", "--body-file"}))
+    if body is None:
+        return False
+    source, remaining = body
+    return _is_sensitive_absolute_path(source) and _one_external_url(remaining)
+
+
+def _shell_curl_proof(event: str, command: str) -> bool:
+    if not _is_safe_literal(command) or any(
+        character in command for character in "\t\r\n\"'|&;<>`()\\*?[]!"
+    ):
+        return False
+    tokens = command.split(" ")
+    if any(not token for token in tokens) or not tokens or tokens.pop(0) != "curl":
+        return False
+    data = _flag_source(tokens, frozenset({"-d"}))
+    if data is None:
+        return False
+    source, remaining = data
+    url_args = _without_curl_transport_flags(remaining)
+    if url_args is None:
+        return False
+    source_is_sensitive = (source == "@-" and event in _SENSITIVE_EVENTS) or (
+        source.startswith("@") and _is_sensitive_shell_path(source[1:])
+    )
+    return source_is_sensitive and _one_external_curl_url(url_args)
+
+
+def _command_bh2_transport(declaration: _HookDeclaration, args: list[str]) -> str | None:
+    command = declaration.handler.get("command")
+    if command == "curl" and _curl_exec_proof(declaration.event, args):
+        return "curl"
+    if command == "wget" and _wget_exec_proof(args):
+        return "wget"
+    if command in {"scp", "rsync"} and len(args) == 2:
+        if _is_sensitive_absolute_path(args[0]) and _is_remote_destination(args[1], command):
+            return command
+    return None
+
+
+def _command_bh2_proof(declaration: _HookDeclaration) -> _Bh2Proof | None:
+    handler = declaration.handler
+    command = handler.get("command")
+    if not isinstance(command, str) or not _is_safe_literal(command):
+        return None
+    if "args" not in handler:
+        if handler.get("shell") not in (None, "bash"):
+            return None
+        return (
+            _Bh2Proof("direct_command_upload", "curl")
+            if _shell_curl_proof(declaration.event, command)
+            else None
+        )
+
+    args = _literal_args(handler)
+    if args is None:
+        return None
+    transport = _command_bh2_transport(declaration, args)
+    return _Bh2Proof("direct_command_upload", transport) if transport is not None else None
+
+
+def _bh2_proof(declaration: _HookDeclaration) -> _Bh2Proof | None:
+    if declaration.handler_type == "http":
+        if declaration.event in _SENSITIVE_EVENTS and declaration.remote_http:
+            return _Bh2Proof("event_http_body", "http")
+        return None
+    if declaration.handler_type == "command":
+        return _command_bh2_proof(declaration)
+    return None
+
+
+def _permission_allow_declaration(value: str) -> _PermissionDeclaration | None:
+    if value in {
+        "Bash",
+        "Bash(*)",
+        "PowerShell",
+        "PowerShell(*)",
+        "Read",
+        "Edit",
+        "Write",
+    }:
+        return _PermissionDeclaration(Severity.CRITICAL, "whole_tool")
+
+    match = re.fullmatch(r"(Read|Edit)\((.*)\)", value)
+    if not match:
+        return None
+    specifier = match.group(2)
+    if specifier in {"//", "//**", "~", "~/**"}:
+        return _PermissionDeclaration(Severity.CRITICAL, "root_or_home")
+    if _is_sensitive_tilde_path(specifier):
+        return _PermissionDeclaration(Severity.HIGH, "sensitive_path")
+    return None
+
+
+def _permission_document(path: str, document: object) -> tuple[dict[str, object] | None, bool]:
+    if path not in {".claude/settings.json", ".claude/settings.local.json"}:
+        return None, False
+    if not isinstance(document, dict) or "permissions" not in document:
+        return None, False
+    permissions = document.get("permissions")
+    if not isinstance(permissions, dict):
+        return None, True
+    return permissions, False
+
+
+def _permission_list_values(
+    permissions: dict[str, object], key: str, *, limit: int
+) -> tuple[list[str], bool, int]:
+    if key not in permissions:
+        return [], False, 0
+    raw_values = permissions.get(key)
+    if not isinstance(raw_values, list):
+        return [], True, 0
+    observed = min(len(raw_values), limit + 1)
+    values: list[str] = []
+    partial = len(raw_values) > limit
+    for value in raw_values[:limit]:
+        if not _is_nonempty_bounded_string(value):
+            partial = True
+        else:
+            values.append(value)
+    return values, partial, observed
+
+
+def _permission_rule_is_valid(value: str) -> bool:
+    tool, separator, remainder = value.partition("(")
+    if re.fullmatch(r"[A-Za-z0-9_*.-]+", tool) is None:
+        return False
+    if not separator:
+        return ")" not in value
+    if not remainder.endswith(")") or len(remainder) == 1:
+        return False
+    depth = 0
+    for character in remainder[:-1]:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def _permission_allow_rule_is_valid(value: str) -> bool:
+    if not _permission_rule_is_valid(value):
+        return False
+    tool = value.partition("(")[0]
+    return (
+        "*" not in tool
+        or re.fullmatch(r"mcp__[A-Za-z0-9_.-]+__[A-Za-z0-9_.-]*\*", tool) is not None
+    )
+
+
+def _permission_rule_values(
+    permissions: dict[str, object], *, limit: int
+) -> tuple[list[str], bool, int]:
+    values, partial, observed = _permission_list_values(permissions, "allow", limit=limit)
+    valid_values = [value for value in values if _permission_allow_rule_is_valid(value)]
+    return valid_values, partial or len(valid_values) != len(values), observed
+
+
+def _permission_rule_list_is_schema_compatible(permissions: dict[str, object], key: str) -> bool:
+    if key not in permissions:
+        return True
+    values = permissions.get(key)
+    validator = _permission_allow_rule_is_valid if key == "allow" else _permission_rule_is_valid
+    return isinstance(values, list) and all(
+        isinstance(value, str) and _is_safe_literal(value) and validator(value) for value in values
+    )
+
+
+def _unclassified_permission_lists_are_valid(permissions: dict[str, object]) -> bool:
+    return all(
+        _permission_rule_list_is_schema_compatible(permissions, key) for key in ("ask", "deny")
+    )
+
+
+def _permission_mode_declaration(value: str) -> _PermissionDeclaration | None:
+    if value == "bypassPermissions":
+        return _PermissionDeclaration(Severity.CRITICAL, "mode")
+    if value == "acceptEdits":
+        return _PermissionDeclaration(Severity.MEDIUM, "mode")
+    if value == "auto":
+        return _PermissionDeclaration(Severity.LOW, "mode", "ignored_by_surface")
+    return None
+
+
+def _permission_scalar_declarations(
+    permissions: dict[str, object], *, limit: int
+) -> tuple[list[_PermissionDeclaration], bool, int]:
+    declarations: list[_PermissionDeclaration] = []
+    partial = False
+    observed = 0
+    if "defaultMode" in permissions:
+        default_mode = permissions.get("defaultMode")
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        if (
+            not isinstance(default_mode, str)
+            or not _is_safe_literal(default_mode)
+            or default_mode not in _VALID_DEFAULT_MODES
+        ):
+            partial = True
+        else:
+            declaration = (
+                None
+                if default_mode == "bypassPermissions"
+                and permissions.get("disableBypassPermissionsMode") == "disable"
+                else _permission_mode_declaration(default_mode)
+            )
+            if declaration is not None:
+                declarations.append(declaration)
+
+    for key in ("disableBypassPermissionsMode", "disableAutoMode"):
+        if key in permissions:
+            observed += 1
+            if observed > limit:
+                return declarations, True, observed
+            if permissions.get(key) != "disable":
+                partial = True
+    return declarations, partial, observed
+
+
+def _is_root_or_home_directory(value: str) -> bool:
+    if value.startswith("/"):
+        if (
+            value.startswith("//")
+            and not value.startswith("///")
+            and any(segment not in {"", ".", ".."} for segment in value[2:].split("/"))
+        ):
+            return False
+        return posixpath.normpath(value) in {"/", "//"}
+    if value == "~":
+        return True
+    if not value.startswith("~/"):
+        return False
+
+    depth = 0
+    for segment in value[2:].split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            if depth == 0:
+                return False
+            depth -= 1
+        else:
+            depth += 1
+    return depth == 0
+
+
+def _permission_declarations(
+    path: str, document: object, *, limit: int
+) -> tuple[list[_PermissionDeclaration], bool, int]:
+    permissions, partial = _permission_document(path, document)
+    if permissions is None:
+        return [], partial, 0
+    partial = partial or not _unclassified_permission_lists_are_valid(permissions)
+    declarations: list[_PermissionDeclaration] = []
+    observed = 0
+
+    allow, rules_partial, rules_observed = _permission_rule_values(permissions, limit=limit)
+    declarations.extend(
+        declaration
+        for value in allow
+        if (declaration := _permission_allow_declaration(value)) is not None
+    )
+    partial = partial or rules_partial
+    observed += rules_observed
+    if observed > limit:
+        return declarations, True, observed
+
+    directories, directories_partial, directories_observed = _permission_list_values(
+        permissions, "additionalDirectories", limit=max(0, limit - observed)
+    )
+    declarations.extend(
+        _PermissionDeclaration(Severity.CRITICAL, "directory")
+        for value in directories
+        if _is_root_or_home_directory(value)
+    )
+    partial = partial or directories_partial
+    observed += directories_observed
+    if observed > limit:
+        return declarations, True, observed
+
+    scalar_declarations, scalar_partial, scalar_observed = _permission_scalar_declarations(
+        permissions, limit=max(0, limit - observed)
+    )
+    declarations.extend(scalar_declarations)
+    partial = partial or scalar_partial
+    observed += scalar_observed
+    return declarations, partial, observed
+
+
+def _scan_declarations(
+    path: str,
+    document: object,
+    previous_settings_hook_ids: set[_HookIdentity] | None = None,
+) -> _DeclarationScan:
+    if not isinstance(document, dict):
+        return _DeclarationScan(hooks=[], permissions=[], partial=True, observed=0)
+    hooks, hook_partial, hook_observed = _hook_declarations(
+        document,
+        limit=_MAX_DECLARATIONS,
+        previous_handler_ids=previous_settings_hook_ids,
+    )
+    remaining = max(0, _MAX_DECLARATIONS - hook_observed)
+    permissions, permission_partial, permission_observed = _permission_declarations(
+        path, document, limit=remaining
+    )
+    return _DeclarationScan(
+        hooks=hooks,
+        permissions=permissions,
+        partial=(
+            hook_partial
+            or permission_partial
+            or (
+                path in {".claude/settings.json", ".claude/settings.local.json"}
+                and "disableAllHooks" in document
+                and not isinstance(document.get("disableAllHooks"), bool)
+            )
+            or (
+                path in {".claude/settings.json", ".claude/settings.local.json"}
+                and document.get("disableAllHooks") is True
+                and not _settings_schema_allows_disable(document)
+            )
+            or (path == "hooks/hooks.json" and "hooks" not in document)
+        ),
+        observed=hook_observed + permission_observed,
+    )
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise InvalidHookConfigurationError("duplicate JSON key")
+            raise _DuplicateKeyError(key)
         result[key] = value
     return result
 
 
-def _load_json(content: str) -> dict[str, object]:
-    if "\x00" in content:
-        raise BinaryHookConfigurationError("binary hook configuration")
-    if len(content) > MAX_FILE_CHARS:
-        raise HookConfigurationSizeLimitError(len(content))
+def _reject_non_finite_constant(value: str) -> None:
+    raise _NonFiniteConstantError(value)
 
-    def reject_nonfinite_json_constant(value: str) -> object:
-        raise InvalidHookConfigurationError(f"non-finite JSON constant: {value}")
 
-    try:
-        raw = json.loads(
-            content,
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=reject_nonfinite_json_constant,
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise _NonFiniteConstantError(value)
+    return parsed
+
+
+def _parse_document(content: str) -> object:
+    return json.loads(
+        content,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_non_finite_constant,
+        parse_float=_parse_finite_float,
+    )
+
+
+def _handler_schema_allows_disable(handler: object) -> bool:
+    if not isinstance(handler, dict) or not _handler_strings_are_bounded(handler):
+        return False
+    handler_type = handler.get("type")
+    return (
+        isinstance(handler_type, str)
+        and handler_type in _KNOWN_HANDLER_TYPES
+        and _handler_shape_is_valid(
+            handler_type,
+            handler,
+            url_validator=_handler_schema_url_is_valid,
         )
-    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-        raise InvalidHookConfigurationError("malformed JSON") from exc
-    if not isinstance(raw, dict):
-        raise InvalidHookConfigurationError("JSON root must be an object")
-    return cast(dict[str, object], raw)
-
-
-def _canonical_settings_bytes(content: str, raw_content: bytes | None) -> bytes:
-    """Return canonical UTF-8 bytes or reject a lossy/mismatched text projection."""
-    if len(content) > MAX_FILE_CHARS:
-        raise HookConfigurationSizeLimitError(len(content))
-    if raw_content is None:
-        try:
-            return content.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise BinaryHookConfigurationError("settings text is not UTF-8") from exc
-    try:
-        decoded = raw_content.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise BinaryHookConfigurationError("settings bytes are not UTF-8") from exc
-    if decoded != content:
-        raise InvalidHookConfigurationError("settings text does not match canonical bytes")
-    return raw_content
-
-
-def _validate_yaml_before_construction(frontmatter: str) -> None:
-    """Reject alias graphs and oversized YAML collections before object construction."""
-    collection_depth = 0
-    node_count = 0
-    try:
-        for event in yaml.parse(frontmatter):
-            if isinstance(event, yaml.events.AliasEvent):
-                raise InvalidHookConfigurationError("YAML aliases are unsupported")
-            if isinstance(event, (yaml.events.MappingStartEvent, yaml.events.SequenceStartEvent)):
-                collection_depth += 1
-                node_count += 1
-                if collection_depth > _MAX_YAML_COLLECTION_DEPTH:
-                    raise InvalidHookConfigurationError("YAML collection depth exceeds limit")
-            elif isinstance(event, (yaml.events.MappingEndEvent, yaml.events.SequenceEndEvent)):
-                collection_depth -= 1
-            elif isinstance(event, yaml.events.ScalarEvent):
-                node_count += 1
-            if node_count > _MAX_YAML_NODES:
-                raise InvalidHookConfigurationError("YAML node count exceeds limit")
-    except (yaml.YAMLError, RecursionError, ValueError) as exc:
-        raise InvalidHookConfigurationError("malformed YAML frontmatter") from exc
-
-
-def _load_frontmatter(content: str) -> dict[str, object] | None:
-    """Load only a leading YAML frontmatter mapping from bounded cached content."""
-    if "\x00" in content:
-        raise BinaryHookConfigurationError("binary hook configuration")
-    if len(content) > MAX_FILE_CHARS:
-        raise HookConfigurationSizeLimitError(len(content))
-
-    lines = content.splitlines(keepends=True)
-    if not lines or lines[0].rstrip("\r\n") != "---":
-        return None
-    for index, line in enumerate(lines[1:], start=1):
-        if _FRONTMATTER_DELIMITER.fullmatch(line.rstrip("\r\n")):
-            frontmatter = "".join(lines[1:index])
-            try:
-                _validate_yaml_before_construction(frontmatter)
-                raw = yaml.load(frontmatter, Loader=_DuplicateKeySafeLoader)
-            except (yaml.YAMLError, RecursionError, ValueError) as exc:
-                raise InvalidHookConfigurationError("malformed YAML frontmatter") from exc
-            if raw is None:
-                return {}
-            if not isinstance(raw, dict):
-                raise InvalidHookConfigurationError("YAML frontmatter must be a mapping")
-            return cast(dict[str, object], raw)
-    raise InvalidHookConfigurationError("unterminated YAML frontmatter")
-
-
-def _frontmatter_has_explicit_hooks_key(content: str) -> bool:
-    """Recognize a top-level hooks key from bounded YAML parser events."""
-    if "\x00" in content or len(content) > MAX_FILE_CHARS:
-        return False
-    lines = content.splitlines()
-    if not lines or lines[0] != "---":
-        return False
-    frontmatter_lines: list[str] = []
-    for line in lines[1:]:
-        if _FRONTMATTER_DELIMITER.fullmatch(line):
-            break
-        frontmatter_lines.append(line)
-
-    collection_depth = 0
-    collection_roles: list[bool | None] = []
-    root_is_mapping = False
-    expecting_key = False
-    node_count = 0
-    try:
-        for event in yaml.parse("\n".join(frontmatter_lines)):
-            if isinstance(event, (yaml.events.MappingStartEvent, yaml.events.SequenceStartEvent)):
-                role = expecting_key if root_is_mapping and collection_depth == 1 else None
-                collection_roles.append(role)
-                if collection_depth == 0:
-                    root_is_mapping = isinstance(event, yaml.events.MappingStartEvent)
-                    expecting_key = root_is_mapping
-                collection_depth += 1
-                node_count += 1
-                if collection_depth > _MAX_YAML_COLLECTION_DEPTH or node_count > _MAX_YAML_NODES:
-                    return False
-                continue
-            if isinstance(event, (yaml.events.MappingEndEvent, yaml.events.SequenceEndEvent)):
-                role = collection_roles.pop()
-                collection_depth -= 1
-                if root_is_mapping and collection_depth == 1 and role is not None:
-                    expecting_key = not role
-                continue
-            if isinstance(event, (yaml.events.ScalarEvent, yaml.events.AliasEvent)):
-                node_count += 1
-                if node_count > _MAX_YAML_NODES:
-                    return False
-                if root_is_mapping and collection_depth == 1:
-                    if expecting_key:
-                        if isinstance(event, yaml.events.ScalarEvent) and event.value == "hooks":
-                            return True
-                        if isinstance(event, yaml.events.AliasEvent):
-                            return True
-                    expecting_key = not expecting_key
-    except (yaml.YAMLError, RecursionError, ValueError):
-        return False
-    return False
-
-
-def _registrations(
-    hook_map: object,
-    *,
-    source_kind: str,
-    source_path: str,
-    activation_lifetime: str,
-    source_line: int = 1,
-    source_lines: Iterator[int] | None = None,
-    execution_root: str | None = None,
-    runtime_confirmed: bool = True,
-    registration_limit: int = _MAX_REGISTRATIONS_PER_DOCUMENT,
-) -> _RegistrationSet:
-    if not isinstance(hook_map, dict):
-        raise InvalidHookConfigurationError("hooks must be an event-map object")
-
-    registrations: list[HookRegistration] = []
-    flow_inputs: list[HandlerFlowInput] = []
-    structure_items = 0
-    for event, matcher_groups in hook_map.items():
-        structure_items += 1
-        if structure_items > _MAX_HOOK_STRUCTURE_ITEMS:
-            raise HookRegistrationLimitError("hook structure cardinality limit exceeded")
-        if not isinstance(event, str) or not isinstance(matcher_groups, list):
-            raise InvalidHookConfigurationError("hook events must map to matcher arrays")
-        for matcher_group in matcher_groups:
-            structure_items += 1
-            if structure_items > _MAX_HOOK_STRUCTURE_ITEMS:
-                raise HookRegistrationLimitError("hook structure cardinality limit exceeded")
-            if not isinstance(matcher_group, dict) or not isinstance(
-                matcher_group.get("hooks"), list
-            ):
-                raise InvalidHookConfigurationError(
-                    "hook matcher groups must contain handler arrays"
-                )
-            handlers = cast(list[object], matcher_group["hooks"])
-            if len(handlers) > registration_limit - len(registrations):
-                raise HookRegistrationLimitError("hook registration limit exceeded")
-            for handler in handlers:
-                structure_items += 1
-                if (
-                    structure_items > _MAX_HOOK_STRUCTURE_ITEMS
-                    or len(registrations) >= registration_limit
-                ):
-                    raise HookRegistrationLimitError("hook registration limit exceeded")
-                if not isinstance(handler, dict):
-                    raise InvalidHookConfigurationError("hook handlers must be objects")
-                try:
-                    normalized_group = cast(dict[str, object], dict(matcher_group))
-                    normalized_group["hooks"] = [handler]
-                    registration = _normalize_registration(
-                        event,
-                        normalized_group,
-                        cast(dict[str, object], handler),
-                        source_kind=source_kind,
-                        activation_lifetime=activation_lifetime,
-                        source_line=(
-                            next(source_lines, source_line) if source_lines else source_line
-                        ),
-                        source_path=source_path,
-                        execution_root=execution_root,
-                        runtime_confirmed=runtime_confirmed,
-                    )
-                except (RecursionError, TypeError, ValueError) as exc:
-                    raise InvalidHookConfigurationError("recursive hook handler") from exc
-                if registration.handler_status == "invalid" or (
-                    registration.event_status == "known" and registration.matcher_kind == "invalid"
-                ):
-                    raise InvalidHookConfigurationError(
-                        "documented hook matcher or handler fields are invalid"
-                    )
-                registrations.append(registration)
-                flow_inputs.append(capture_handler(registration, cast(dict[str, object], handler)))
-    return _RegistrationSet(tuple(registrations), tuple(flow_inputs))
-
-
-def _document(
-    *,
-    source_kind: str,
-    source_path: str,
-    activation_lifetime: str,
-    hook_map: object,
-    content_identity: str,
-    execution_root: str | None,
-    source_lines: Iterator[int] | None = None,
-    runtime_confirmed: bool = True,
-    registration_limit: int = _MAX_REGISTRATIONS_PER_DOCUMENT,
-) -> HookDocument:
-    parsed = _registrations(
-        hook_map,
-        source_kind=source_kind,
-        source_path=source_path,
-        activation_lifetime=activation_lifetime,
-        source_lines=source_lines,
-        execution_root=execution_root,
-        runtime_confirmed=runtime_confirmed,
-        registration_limit=registration_limit,
-    )
-    return HookDocument(
-        source_kind=source_kind,
-        declaration_roles=(source_kind,),
-        source_path=source_path,
-        activation_lifetime=activation_lifetime,
-        content_digest=_digest("content", content_identity),
-        registrations=parsed.registrations,
-        flow_inputs=parsed.flow_inputs,
     )
 
 
-def _mapping_value_node(node: yaml.MappingNode, key: str) -> yaml.Node | None:
-    for key_node, value_node in node.value:
-        if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
-            return value_node
-    return None
-
-
-def _mapping_keys(node: yaml.MappingNode) -> set[str]:
-    return {
-        key_node.value
-        for key_node, _value_node in node.value
-        if isinstance(key_node, yaml.ScalarNode)
-    }
-
-
-def _handler_type_line(node: yaml.MappingNode) -> int:
-    """Return the handler type-key line, falling back to the mapping start."""
-    for key_node, _value_node in node.value:
-        if isinstance(key_node, yaml.ScalarNode) and key_node.value == "type":
-            return cast(int, key_node.start_mark.line) + 1
-    return cast(int, node.start_mark.line) + 1
-
-
-def _event_map_handler_lines(node: yaml.Node | None) -> tuple[int, ...]:
-    """Return handler lines from one structurally validated event map node."""
-    if not isinstance(node, yaml.MappingNode):
-        return ()
-    result: list[int] = []
-    for _event_node, matcher_groups in node.value:
-        if not isinstance(matcher_groups, yaml.SequenceNode):
-            continue
-        for matcher_group in matcher_groups.value:
-            if not isinstance(matcher_group, yaml.MappingNode):
-                continue
-            handlers = _mapping_value_node(matcher_group, "hooks")
-            if not isinstance(handlers, yaml.SequenceNode):
-                continue
-            result.extend(
-                _handler_type_line(handler)
-                for handler in handlers.value
-                if isinstance(handler, yaml.MappingNode)
-            )
-    return tuple(result)
-
-
-def _inline_declaration_handler_lines(node: yaml.Node | None) -> tuple[int, ...]:
-    """Return handler lines from a manifest-style object, path, or mixed array."""
-    items = node.value if isinstance(node, yaml.SequenceNode) else [node]
-    result: list[int] = []
-    for item in items:
-        if not isinstance(item, yaml.MappingNode):
-            continue
-        event_map: yaml.Node | None = item
-        if _mapping_keys(item) == {"hooks"}:
-            event_map = _mapping_value_node(item, "hooks")
-        result.extend(_event_map_handler_lines(event_map))
-    return tuple(result)
-
-
-def _json_root_node(content: str) -> yaml.MappingNode | None:
-    """Compose already validated JSON solely to recover structural source locations."""
-    try:
-        root = yaml.compose(content, Loader=yaml.BaseLoader)
-    except (yaml.YAMLError, RecursionError):
-        return None
-    return root if isinstance(root, yaml.MappingNode) else None
-
-
-def _json_location_recovery_allowed(content: str, raw: object) -> bool:
-    """Preflight optional JSON location composition with exact scheduled-node bounds."""
-    if len(content) > _MAX_JSON_LOCATION_CHARS:
+def _hook_group_schema_allows_disable(group: object) -> bool:
+    if not isinstance(group, dict):
         return False
+    handlers = group.get("hooks")
+    if not isinstance(handlers, list):
+        return False
+    matcher = group.get("matcher")
+    if "matcher" in group and (not isinstance(matcher, str) or not _is_safe_literal(matcher)):
+        return False
+    return all(_handler_schema_allows_disable(handler) for handler in handlers)
 
-    scheduled_nodes = 1
-    pending: list[object] = [raw]
-    while pending:
-        current = pending.pop()
-        if isinstance(current, dict):
-            descendant_count = 2 * len(current)
-            if scheduled_nodes + descendant_count > _MAX_JSON_LOCATION_NODES:
-                return False
-            scheduled_nodes += descendant_count
-            pending.extend(current.keys())
-            pending.extend(current.values())
-        elif isinstance(current, list):
-            descendant_count = len(current)
-            if scheduled_nodes + descendant_count > _MAX_JSON_LOCATION_NODES:
-                return False
-            scheduled_nodes += descendant_count
-            pending.extend(current)
+
+def _hooks_schema_allows_disable(document: dict[str, object]) -> bool:
+    hooks = document.get("hooks")
+    if hooks is None:
+        return "hooks" not in document
+    if not isinstance(hooks, dict):
+        return False
+    for event, groups in hooks.items():
+        if not isinstance(event, str) or not _is_safe_literal(event):
+            return False
+        if event not in _KNOWN_EVENTS:
+            continue
+        if not isinstance(groups, list) or not all(
+            _hook_group_schema_allows_disable(group) for group in groups
+        ):
+            return False
     return True
 
 
-def _node_line(node: yaml.Node | None, fallback: int = 1) -> int:
-    """Return one positive parser location without retaining its source value."""
-    if node is None:
-        return max(1, fallback)
-    line = cast(int, node.start_mark.line) + 1
-    return line if line > 0 else max(1, fallback)
-
-
-def _mapping_key_line(node: yaml.MappingNode | None, key: str, fallback: int = 1) -> int:
-    if node is not None:
-        for key_node, _value_node in node.value:
-            if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
-                return _node_line(key_node, fallback)
-    return max(1, fallback)
-
-
-def _known_list_lines(node: yaml.MappingNode | None, key: str) -> tuple[int, ...]:
-    value = _mapping_value_node(node, key) if node is not None else None
-    if not isinstance(value, yaml.SequenceNode):
-        return ()
-    return tuple(_node_line(item) for item in value.value)
-
-
-def _permission_source_lines(
-    raw: dict[str, object], root: yaml.MappingNode | None
-) -> PermissionSourceLines:
-    """Recover only structural permission locations from one composed syntax tree."""
-    permissions_line = _mapping_key_line(root, "permissions")
-    permissions_node = _mapping_value_node(root, "permissions") if root is not None else None
-    permissions_mapping = (
-        permissions_node if isinstance(permissions_node, yaml.MappingNode) else None
-    )
-    raw_permissions = raw.get("permissions")
-    raw_permission_mapping = raw_permissions if isinstance(raw_permissions, dict) else {}
-    raw_permission_count = len(raw_permission_mapping)
-    recovered_key_lines = (
-        tuple(_node_line(key_node, permissions_line) for key_node, _ in permissions_mapping.value)
-        if permissions_mapping is not None
-        else ()
-    )
-    permission_key_lines = recovered_key_lines[:raw_permission_count] + (permissions_line,) * max(
-        0, raw_permission_count - len(recovered_key_lines)
-    )
-
-    return PermissionSourceLines(
-        permissions_line=permissions_line,
-        permission_key_lines=permission_key_lines,
-        allow_lines=_known_list_lines(permissions_mapping, "allow"),
-        ask_lines=_known_list_lines(permissions_mapping, "ask"),
-        deny_lines=_known_list_lines(permissions_mapping, "deny"),
-        additional_directory_lines=_known_list_lines(permissions_mapping, "additionalDirectories"),
-        default_mode_line=(
-            _mapping_key_line(permissions_mapping, "defaultMode", permissions_line)
-            if "defaultMode" in raw_permission_mapping
-            else None
-        ),
-        disable_bypass_line=(
-            _mapping_key_line(permissions_mapping, "disableBypassPermissionsMode", permissions_line)
-            if "disableBypassPermissionsMode" in raw_permission_mapping
-            else None
-        ),
-        disable_auto_line=(
-            _mapping_key_line(permissions_mapping, "disableAutoMode", permissions_line)
-            if "disableAutoMode" in raw_permission_mapping
-            else None
-        ),
-        skip_dangerous_prompt_line=(
-            _mapping_key_line(
-                permissions_mapping, "skipDangerousModePermissionPrompt", permissions_line
-            )
-            if "skipDangerousModePermissionPrompt" in raw_permission_mapping
-            else None
-        ),
-    )
-
-
-def _json_handler_lines_from_root(root: yaml.MappingNode | None) -> tuple[int, ...]:
-    """Locate handler declarations from an already composed JSON syntax tree."""
-    return _event_map_handler_lines(
-        _mapping_value_node(root, "hooks") if root is not None else None
-    )
-
-
-def _json_handler_lines(content: str) -> tuple[int, ...]:
-    """Locate handler declarations under a JSON document's top-level hook map."""
-    return _json_handler_lines_from_root(_json_root_node(content))
-
-
-def _manifest_handler_lines(content: str) -> tuple[int, ...]:
-    """Locate only inline handler declarations in a plugin manifest."""
-    root = _json_root_node(content)
-    return _inline_declaration_handler_lines(
-        _mapping_value_node(root, "hooks") if root is not None else None
-    )
-
-
-def _marketplace_handler_lines(content: str) -> tuple[tuple[int, ...], ...]:
-    """Locate inline handlers per marketplace entry without matching metadata fields."""
-    root = _json_root_node(content)
-    plugins = _mapping_value_node(root, "plugins") if root is not None else None
-    if not isinstance(plugins, yaml.SequenceNode):
-        return ()
-    return tuple(
-        _inline_declaration_handler_lines(_mapping_value_node(entry, "hooks"))
-        if isinstance(entry, yaml.MappingNode)
-        else ()
-        for entry in plugins.value
-    )
-
-
-def _yaml_handler_lines(content: str) -> tuple[int, ...]:
-    """Return source lines for handler mappings in leading YAML frontmatter."""
-    lines = content.splitlines(keepends=True)
-    delimiter = next(
-        (
-            index
-            for index, line in enumerate(lines[1:], start=1)
-            if _FRONTMATTER_DELIMITER.fullmatch(line.rstrip("\r\n"))
-        ),
-        None,
-    )
-    if delimiter is None:
-        return ()
-    try:
-        root = yaml.compose("".join(lines[1:delimiter]), Loader=yaml.BaseLoader)
-    except yaml.YAMLError:
-        return ()
-    if not isinstance(root, yaml.MappingNode):
-        return ()
-
-    def mapping_value(node: yaml.MappingNode, key: str) -> yaml.Node | None:
-        for key_node, value_node in node.value:
-            if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
-                return value_node
-        return None
-
-    hook_map = mapping_value(root, "hooks")
-    if not isinstance(hook_map, yaml.MappingNode):
-        return ()
-    result: list[int] = []
-    for _event_node, matcher_groups in hook_map.value:
-        if not isinstance(matcher_groups, yaml.SequenceNode):
-            continue
-        for matcher_group in matcher_groups.value:
-            if not isinstance(matcher_group, yaml.MappingNode):
-                continue
-            handlers = mapping_value(matcher_group, "hooks")
-            if not isinstance(handlers, yaml.SequenceNode):
-                continue
-            result.extend(
-                handler.start_mark.line + 2
-                for handler in handlers.value
-                if isinstance(handler, yaml.MappingNode)
-            )
-    return tuple(result)
-
-
-def _archive_or_project_root(path: str) -> str:
-    namespace, _parts = _path_parts(path)
-    return f"{namespace}!/" if namespace else ""
-
-
-def _parse_hook_document(
-    path: str,
-    content: str,
-    source_kind: str,
-    activation_lifetime: str,
-    *,
-    execution_root: str | None,
-    registration_limit: int = _MAX_REGISTRATIONS_PER_DOCUMENT,
-) -> HookDocument:
-    raw = _load_json(content)
-    return _parse_hook_mapping_document(
-        path,
-        raw,
-        source_kind,
-        activation_lifetime,
-        content_digest=_digest("content", content),
-        execution_root=execution_root,
-        source_lines=_json_handler_lines(content),
-        registration_limit=registration_limit,
-    )
-
-
-def _parse_hook_mapping_document(
-    path: str,
-    raw: dict[str, object],
-    source_kind: str,
-    activation_lifetime: str,
-    *,
-    content_digest: str,
-    execution_root: str | None,
-    source_lines: tuple[int, ...],
-    registration_limit: int = _MAX_REGISTRATIONS_PER_DOCUMENT,
-) -> HookDocument:
-    """Build one hook document from a retained duplicate-safe JSON mapping."""
-    if "hooks" not in raw:
-        raise InvalidHookConfigurationError("hook document must contain hooks")
-    parsed = _registrations(
-        raw["hooks"],
-        source_kind=source_kind,
-        source_path=path,
-        activation_lifetime=activation_lifetime,
-        execution_root=execution_root,
-        source_lines=iter(source_lines),
-        registration_limit=registration_limit,
-    )
-    return HookDocument(
-        source_kind=source_kind,
-        declaration_roles=(source_kind,),
-        source_path=path,
-        activation_lifetime=activation_lifetime,
-        content_digest=content_digest,
-        registrations=parsed.registrations,
-        flow_inputs=parsed.flow_inputs,
-    )
-
-
-def _parse_frontmatter_document(
-    path: str,
-    content: str,
-    source_kind: str,
-    activation_lifetime: str,
-    execution_root: str | None,
-    runtime_status: str = "declared_unclassified",
-    registration_limit: int = _MAX_REGISTRATIONS_PER_DOCUMENT,
-) -> HookDocument | None:
-    """Return a frontmatter hook document, or None when no hooks are declared."""
-    raw = _load_frontmatter(content)
-    if raw is None or "hooks" not in raw:
-        return None
-    document = _document(
-        source_kind=source_kind,
-        source_path=path,
-        activation_lifetime=activation_lifetime,
-        hook_map=raw["hooks"],
-        content_identity=content,
-        execution_root=execution_root,
-        source_lines=iter(_yaml_handler_lines(content)),
-        runtime_confirmed=runtime_status != "runtime_unconfirmed",
-        registration_limit=registration_limit,
-    )
-    return replace(document, runtime_status=runtime_status)
-
-
-def _is_plugin_metadata_path(path: str, filename: str) -> bool:
-    """Return whether a cache key ends in an exact plugin metadata path."""
-    _namespace_value, parts = _path_parts(path)
-    return parts[-2:] == (_PLUGIN_METADATA_DIRECTORY, filename)
-
-
-def _plugin_metadata_root(path: str, filename: str) -> str:
-    """Return the root owning an exact metadata file without slicing raw strings."""
-    namespace, parts = _path_parts(path)
-    if parts[-2:] != (_PLUGIN_METADATA_DIRECTORY, filename):
-        raise ValueError("not a plugin metadata path")
-    root = "/".join(parts[:-2])
-    if not namespace:
-        return root
-    return f"{namespace}!/{root}" if root else f"{namespace}!/"
-
-
-def _plugin_metadata_path(plugin_root: str, filename: str) -> str:
-    """Build one normalized metadata path inside a project or archive root."""
-    namespace, root_parts = _path_parts(plugin_root)
-    joined = "/".join((*root_parts, _PLUGIN_METADATA_DIRECTORY, filename))
-    return f"{namespace}!/{joined}" if namespace else joined
-
-
-def _is_manifest_path(path: str) -> bool:
-    return _is_plugin_metadata_path(path, _PLUGIN_MANIFEST_FILENAME)
-
-
-def _is_marketplace_path(path: str) -> bool:
-    return _is_plugin_metadata_path(path, _PLUGIN_MARKETPLACE_FILENAME)
-
-
-def _manifest_root(path: str) -> str:
-    return _plugin_metadata_root(path, _PLUGIN_MANIFEST_FILENAME)
-
-
-def _marketplace_root(path: str) -> str:
-    return _plugin_metadata_root(path, _PLUGIN_MARKETPLACE_FILENAME)
-
-
-def _resolve_local_path(
-    root: str, reference: str, *, allow_dot: bool = True, allow_bare: bool = False
-) -> str:
-    """Resolve a marketplace-local path without leaving its cache namespace."""
-    if not isinstance(reference, str) or "\x00" in reference or "\\" in reference:
-        raise InvalidHookConfigurationError("marketplace path is not safe")
-    if reference == "." and allow_dot:
-        relative_parts: tuple[str, ...] = ()
-    else:
-        if not reference.startswith("./") and not allow_bare:
-            raise InvalidHookConfigurationError("marketplace path must be relative")
-        if "!/" in reference:
-            raise InvalidHookConfigurationError("marketplace path changes archive namespace")
-        parsed = PurePosixPath(reference)
-        if parsed.is_absolute() or any(
-            part == ".." or (len(part) >= 2 and part[1] == ":") for part in parsed.parts
-        ):
-            raise InvalidHookConfigurationError("marketplace path escapes its root")
-        relative_parts = tuple(part for part in parsed.parts if part != ".")
-        if not relative_parts and not allow_dot:
-            raise InvalidHookConfigurationError("marketplace path must name a component")
-    namespace, root_parts = _path_parts(root)
-    joined = "/".join((*root_parts, *relative_parts))
-    return f"{namespace}!/{joined}" if namespace else joined
-
-
-def _manifest_path(plugin_root: str) -> str:
-    return _plugin_metadata_path(plugin_root, _PLUGIN_MANIFEST_FILENAME)
-
-
-def _marketplace_entry_path(path: str, index: int, reserved_paths: set[str] | None = None) -> str:
-    """Return a safe synthetic ledger path for one marketplace entry."""
-    base = f"{path}#plugin[{index}]"
-    candidate = base
-    suffix = 0
-    while reserved_paths is not None and candidate in reserved_paths:
-        suffix += 1
-        candidate = f"{base}#ledger[{suffix}]"
-    return candidate
-
-
-def _validate_marketplace_component(
-    value: object, plugin_root: str | None, *, component_kind: str
-) -> object:
-    if not isinstance(value, (str, list)):
-        raise InvalidHookConfigurationError(
-            "marketplace component must be a relative path or array"
-        )
-    values = [value] if isinstance(value, str) else value
-    if not all(isinstance(item, str) for item in values):
-        raise InvalidHookConfigurationError("marketplace component entries must be paths")
-    if plugin_root is not None:
-        for item in values:
-            if item == "." and component_kind != "skills":
-                raise InvalidHookConfigurationError(
-                    "only marketplace skills may use the bare-dot plugin root"
-                )
-            _resolve_local_path(plugin_root, cast(str, item), allow_dot=True)
-    return value
-
-
-def _validate_marketplace_hooks(value: object) -> object:
-    if not isinstance(value, (str, dict, list)):
-        raise InvalidHookConfigurationError("marketplace hooks must be an object, path, or array")
-    if isinstance(value, list) and not all(isinstance(item, (str, dict)) for item in value):
-        raise InvalidHookConfigurationError("marketplace hook items must be paths or objects")
-    return value
-
-
-def _required_nonempty_string(mapping: dict[str, object], field: str, owner: str) -> str:
-    value = mapping.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise InvalidHookConfigurationError(f"{owner} {field} is required")
-    return value
-
-
-def _validate_manifest_identity(manifest: dict[str, object]) -> None:
-    _required_nonempty_string(manifest, "name", "plugin manifest")
-
-
-def _validate_marketplace_identity(marketplace: dict[str, object]) -> list[object]:
-    _required_nonempty_string(marketplace, "name", "marketplace")
-    owner = marketplace.get("owner")
-    if not isinstance(owner, dict):
-        raise InvalidHookConfigurationError("marketplace owner must be an object")
-    _required_nonempty_string(cast(dict[str, object], owner), "name", "marketplace owner")
-    plugins = marketplace.get("plugins")
-    if not isinstance(plugins, list):
-        raise InvalidHookConfigurationError("marketplace plugins must be an array")
-    return plugins
-
-
-def _validate_remote_plugin_source(source: dict[str, object]) -> None:
-    source_type = source.get("source")
-    required_fields = {
-        "github": ("repo",),
-        "url": ("url",),
-        "git-subdir": ("url", "path"),
-        "npm": ("package",),
-        "archive": ("url",),
-        "command": ("command",),
-    }
-    if not isinstance(source_type, str) or source_type not in required_fields:
-        raise InvalidHookConfigurationError("remote marketplace source is malformed")
-    for required_field in required_fields[source_type]:
-        _required_nonempty_string(source, required_field, f"remote {source_type} source")
-    for optional_field in ("ref", "sha", "sha256", "version", "registry", "mode"):
-        if optional_field in source and not isinstance(source[optional_field], str):
-            raise InvalidHookConfigurationError(
-                f"remote marketplace source {optional_field} must be a string"
-            )
-
-
-def _default_path(plugin_root: str) -> str:
-    if not plugin_root:
-        return _PLUGIN_DEFAULT_PATH
-    separator = "" if plugin_root.endswith("/") else "/"
-    return f"{plugin_root}{separator}{_PLUGIN_DEFAULT_PATH}"
-
-
-def _namespace(path: str) -> str:
-    return path.rsplit("!/", 1)[0] if "!/" in path else ""
-
-
-def _resolve_reference(plugin_root: str, reference: str) -> str:
-    """Resolve a documented relative manifest ref without crossing path namespaces."""
-    if not reference.startswith("./"):
-        raise InvalidHookConfigurationError("hook reference must be relative")
-    if "\x00" in reference or "\\" in reference:
-        raise InvalidHookConfigurationError("hook reference contains NUL")
-    root_namespace = _namespace(plugin_root)
-    if "!/" in reference or _namespace(reference) not in {"", root_namespace}:
-        raise InvalidHookConfigurationError("hook reference changes archive namespace")
-
-    root_prefix = plugin_root.rsplit("!/", 1)[-1].strip("/")
-    reference_path = PurePosixPath(reference)
-    if reference_path.is_absolute() or any(
-        part == ".." or (len(part) >= 2 and part[1] == ":") for part in reference_path.parts
-    ):
-        raise InvalidHookConfigurationError("hook reference escapes plugin root")
-    inner = "/".join(part for part in reference_path.parts if part != ".")
-    if not inner:
-        raise InvalidHookConfigurationError("hook reference must name a configuration document")
-    joined = "/".join(part for part in (root_prefix, inner) if part)
-    return f"{root_namespace}!/{joined}" if root_namespace else joined
-
-
-def _path_parts(path: str) -> tuple[str, tuple[str, ...]]:
-    """Split a normal or archive-backed cache key into namespace and POSIX parts."""
-    namespace = _namespace(path)
-    member = path.rsplit("!/", 1)[-1] if namespace else path
-    return namespace, tuple(part for part in member.split("/") if part)
-
-
-def _permission_source_identity_digest(hops: tuple[tuple[str, str], ...]) -> str:
-    """Hash a sanitized typed projection of opaque physical provenance hops."""
-    projected_hops: list[dict[str, str]] = []
-    for kind, locator in hops:
-        locator_payload = json.dumps(
-            {"kind": kind, "locator": locator},
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("ascii")
-        locator_digest = (
-            "sha256:"
-            + sha256(b"skillspector.bundled_permission.locator.v1\0" + locator_payload).hexdigest()
-        )
-        projected_hops.append({"kind": kind, "locator_digest": locator_digest})
-    source_payload = json.dumps(
-        {
-            "schema": "skillspector.bundled_permission.provenance.v1",
-            "hops": projected_hops,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
-    return (
-        "sha256:"
-        + sha256(b"skillspector.bundled_permission.source.v2\0" + source_payload).hexdigest()
-    )
-
-
-def _metadata_rows_by_path(
-    component_metadata: list[dict[str, object]],
-) -> dict[str, list[dict[str, object]]]:
-    rows_by_path: dict[str, list[dict[str, object]]] = {}
-    for row in component_metadata:
-        path = row.get("path")
-        if isinstance(path, str):
-            rows_by_path.setdefault(path, []).append(row)
-    return rows_by_path
-
-
-def _direct_permission_provenance_hops(
-    path: str, rows_by_path: dict[str, list[dict[str, object]]]
-) -> tuple[tuple[str, str], ...]:
-    rows = rows_by_path.get(path, [])
-    if len(rows) != 1:
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    row = rows[0]
-    if row.get("type") != "json":
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    provenance_fields = {
-        "outer_path",
-        "nested_path",
-        "container_type",
-        "container_ancestry",
-        "container_depth",
-    }
-    if provenance_fields.isdisjoint(row):
-        return (("filesystem", path),)
-    depth = row.get("container_depth")
-    if not (
-        row.get("outer_path") == path
-        and row.get("nested_path") == path
-        and row.get("container_type") == "filesystem"
-        and row.get("container_ancestry") == ["filesystem"]
-        and isinstance(depth, int)
-        and not isinstance(depth, bool)
-        and depth == 0
-    ):
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    return (("filesystem", path),)
-
-
-def _archive_permission_provenance_hops(
-    path: str,
-    *,
-    component_paths: set[str],
-    local_cache_paths: set[str],
-    raw_cache_paths: set[str],
-    rows_by_path: dict[str, list[dict[str, object]]],
-) -> tuple[tuple[str, str], ...]:
-    target_rows = rows_by_path.get(path, [])
-    if len(target_rows) != 1:
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    target = target_rows[0]
-    outer_path = target.get("outer_path")
-    nested_path = target.get("nested_path")
-    ancestry_value = target.get("container_ancestry")
-    depth = target.get("container_depth")
-    if not (
-        isinstance(outer_path, str)
-        and bool(outer_path)
-        and isinstance(nested_path, str)
-        and bool(nested_path)
-        and isinstance(ancestry_value, list)
-        and isinstance(depth, int)
-        and not isinstance(depth, bool)
-        and depth > 0
-    ):
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    ancestry = tuple(ancestry_value)
-    segments = tuple(nested_path.split("!/"))
-    if (
-        len(segments) != depth
-        or len(ancestry) != depth
-        or any(not segment for segment in segments)
-        or any(
-            not isinstance(container_type, str) or container_type not in _ARCHIVE_CONTAINER_TYPES
-            for container_type in ancestry
-        )
-        or target.get("container_type") != ancestry[-1]
-        or target.get("type") != "json"
-        or target.get("local_only") is not True
-        or path != f"{outer_path}!/{nested_path}"
-    ):
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-
-    prefixes = [outer_path]
-    prefixes.extend(f"{outer_path}!/{'!/'.join(segments[:index])}" for index in range(1, depth + 1))
-    for prefix in prefixes:
-        if (
-            prefix not in component_paths
-            or prefix not in local_cache_paths
-            or prefix not in raw_cache_paths
-        ):
-            raise InvalidHookConfigurationError("invalid permission source provenance")
-
-    outer_rows = rows_by_path.get(outer_path, [])
-    if len(outer_rows) != 1:
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    outer = outer_rows[0]
-    outer_depth = outer.get("container_depth")
-    if not (
-        outer.get("type") == ancestry[0]
-        and outer.get("container_type") == ancestry[0]
-        and outer.get("container_ancestry") == [ancestry[0]]
-        and outer.get("local_only") is True
-        and "outer_path" not in outer
-        and "nested_path" not in outer
-        and (
-            "container_depth" not in outer
-            or isinstance(outer_depth, int)
-            and not isinstance(outer_depth, bool)
-            and outer_depth == 0
-        )
-    ):
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-
-    for index, prefix in enumerate(prefixes[1:], start=1):
-        prefix_rows = rows_by_path.get(prefix, [])
-        if len(prefix_rows) != 1:
-            raise InvalidHookConfigurationError("invalid permission source provenance")
-        row = prefix_rows[0]
-        expected_type = "zip" if index < depth else "json"
-        row_depth = row.get("container_depth")
-        if not (
-            row.get("type") == expected_type
-            and row.get("outer_path") == outer_path
-            and row.get("nested_path") == "!/".join(segments[:index])
-            and isinstance(row_depth, int)
-            and not isinstance(row_depth, bool)
-            and row_depth == index
-            and row.get("container_ancestry") == list(ancestry[:index])
-            and row.get("container_type") == ancestry[index - 1]
-            and row.get("local_only") is True
-        ):
-            raise InvalidHookConfigurationError("invalid permission source provenance")
-
-    return (
-        ("filesystem", outer_path),
-        *(("archive_member", segment) for segment in segments),
-    )
-
-
-def _fallback_permission_provenance_hops(
-    path: str, *, cache_paths: set[str]
-) -> tuple[tuple[str, str], ...]:
-    segments = tuple(path.split("!/"))
-    if any(not segment for segment in segments):
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    if len(segments) == 1:
-        return (("filesystem", path),)
-    prefix = segments[0]
-    if prefix not in cache_paths:
-        raise InvalidHookConfigurationError("invalid permission source provenance")
-    for segment in segments[1:-1]:
-        prefix = f"{prefix}!/{segment}"
-        if prefix not in cache_paths:
-            raise InvalidHookConfigurationError("invalid permission source provenance")
-    return (
-        ("filesystem", segments[0]),
-        *(("archive_member", segment) for segment in segments[1:]),
-    )
-
-
-def _claims_archive_member(row: dict[str, object], path: str) -> bool:
-    """Distinguish member-like metadata from filesystem and outer-container rows."""
-    depth = row.get("container_depth")
-    filesystem_only = (
-        row.get("outer_path") == path
-        and row.get("nested_path") == path
-        and row.get("container_type") == "filesystem"
-        and row.get("container_ancestry") == ["filesystem"]
-        and isinstance(depth, int)
-        and not isinstance(depth, bool)
-        and depth == 0
-    )
-    if filesystem_only:
+def _permissions_schema_allows_disable(document: dict[str, object]) -> bool:
+    permissions = document.get("permissions")
+    if permissions is None:
+        return "permissions" not in document
+    if not isinstance(permissions, dict):
         return False
-    if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
-        return True
-    outer_path = row.get("outer_path")
-    nested_path = row.get("nested_path")
-    return (
-        isinstance(outer_path, str)
-        and bool(outer_path)
-        and isinstance(nested_path, str)
-        and bool(nested_path)
-        and path == f"{outer_path}!/{nested_path}"
+    if not all(
+        _permission_rule_list_is_schema_compatible(permissions, key)
+        for key in ("allow", "ask", "deny")
+    ):
+        return False
+    directories = permissions.get("additionalDirectories", [])
+    if not isinstance(directories, list) or not all(
+        _is_nonempty_bounded_string(value) for value in directories
+    ):
+        return False
+    if "defaultMode" in permissions:
+        default_mode = permissions.get("defaultMode")
+        if (
+            not isinstance(default_mode, str)
+            or not _is_safe_literal(default_mode)
+            or default_mode not in _VALID_DEFAULT_MODES
+        ):
+            return False
+    return all(
+        key not in permissions or permissions.get(key) == "disable"
+        for key in ("disableBypassPermissionsMode", "disableAutoMode")
     )
 
 
-def _is_within_root(path: str, root: str) -> bool:
-    path_namespace, path_parts = _path_parts(path)
-    root_namespace, root_parts = _path_parts(root)
-    return path_namespace == root_namespace and path_parts[: len(root_parts)] == root_parts
+def _settings_schema_allows_disable(document: dict[str, object]) -> bool:
+    if not set(document).issubset(_DISABLE_TRUSTED_TOP_LEVEL_KEYS):
+        return False
+    if "$schema" in document and not _is_bounded_string(document.get("$schema")):
+        return False
+    if "model" in document and not _is_bounded_string(document.get("model")):
+        return False
+    if "includeCoAuthoredBy" in document and not _is_bool(document.get("includeCoAuthoredBy")):
+        return False
+    if "env" in document and not _is_bounded_string_map(document.get("env")):
+        return False
+    return _hooks_schema_allows_disable(document) and _permissions_schema_allows_disable(document)
 
 
-def _relative_parts(path: str, root: str) -> tuple[str, ...] | None:
-    if not _is_within_root(path, root):
-        return None
-    return _path_parts(path)[1][len(_path_parts(root)[1]) :]
-
-
-def _resolve_component_reference(plugin_root: str, reference: str) -> str:
-    """Resolve a manifest component path without filesystem access or namespace escape."""
-    if (
-        not reference.startswith("./")
-        or "\x00" in reference
-        or "\\" in reference
-        or "!/" in reference
-    ):
-        raise InvalidHookConfigurationError("component reference is not a safe relative path")
-    parsed = PurePosixPath(reference)
-    if parsed.is_absolute() or any(
-        part == ".." or (len(part) >= 2 and part[1] == ":") for part in parsed.parts
-    ):
-        raise InvalidHookConfigurationError("component reference escapes plugin root")
-    relative = tuple(part for part in parsed.parts if part != ".")
-    namespace, root_parts = _path_parts(plugin_root)
-    joined = "/".join((*root_parts, *relative))
-    return f"{namespace}!/{joined}" if namespace else joined
-
-
-def _manifest_component_paths(
-    plugin_root: str,
-    references: object,
-    *,
-    component_kind: str,
-    candidates: list[str],
-) -> tuple[set[str], tuple[str, ...]]:
-    """Expand explicit file/directory manifest components from known cache keys."""
-    if not isinstance(references, (str, list)):
-        raise InvalidHookConfigurationError(
-            f"manifest {component_kind} must be a relative path or array"
-        )
-    raw_references = [references] if isinstance(references, str) else references
-    resolved: set[str] = set()
-    missing: list[str] = []
-    for reference in raw_references:
-        if not isinstance(reference, str):
-            raise InvalidHookConfigurationError(
-                f"manifest {component_kind} entries must be relative paths"
-            )
-        if reference == "." and component_kind != "skills":
-            raise InvalidHookConfigurationError(
-                "only manifest skills may use the bare-dot plugin root"
-            )
-        target = _resolve_local_path(plugin_root, reference, allow_dot=True)
-        target_parts = _path_parts(target)[1]
-        is_file = bool(target_parts) and target_parts[-1].lower().endswith(".md")
-        if is_file:
-            if target not in candidates:
-                missing.append(target)
-                continue
-            resolved.add(target)
+def _bundled_hooks_are_disabled(
+    applicable_paths: set[str],
+    file_cache: dict[str, str],
+    decodable: dict[str, bool],
+) -> bool:
+    for path in (".claude/settings.local.json", ".claude/settings.json"):
+        if path not in applicable_paths:
             continue
-        if not any(_is_within_root(path, target) for path in candidates):
-            missing.append(target)
-            continue
-        if component_kind == "skills":
-            resolved.update(
-                path
-                for path in candidates
-                if _is_within_root(path, target) and _path_parts(path)[1][-1] == "SKILL.md"
-            )
-        else:
-            resolved.update(
-                path
-                for path in candidates
-                if _is_within_root(path, target) and path.lower().endswith(".md")
-            )
-    return resolved, tuple(dict.fromkeys(missing))
+        content = file_cache.get(path)
+        if (
+            decodable.get(path) is False
+            or not isinstance(content, str)
+            or len(content) > MAX_FILE_CHARS
+        ):
+            return False
+        try:
+            document = _parse_document(content)
+        except (RecursionError, ValueError):
+            return False
+        if not isinstance(document, dict):
+            return False
+        if "disableAllHooks" in document:
+            value = document.get("disableAllHooks")
+            if not isinstance(value, bool) or not value:
+                return False
+            return _settings_schema_allows_disable(document)
+    return False
 
 
-def _default_plugin_skill_paths(plugin_root: str, candidates: list[str]) -> set[str]:
-    return {
-        path
-        for path in candidates
-        if (relative := _relative_parts(path, plugin_root)) is not None
-        and len(relative) == 3
-        and relative[0] == "skills"
-        and relative[-1] == "SKILL.md"
+def _bh1_severity(declarations: list[_HookDeclaration]) -> Severity:
+    severity = Severity.LOW
+    for declaration in declarations:
+        if declaration.remote_http:
+            return Severity.HIGH
+        if declaration.ambient or declaration.handler_type in {
+            "prompt",
+            "agent",
+            "http",
+            "mcp_tool",
+        }:
+            severity = Severity.MEDIUM
+        elif declaration.handler_type != "command":
+            severity = Severity.MEDIUM
+    return severity
+
+
+def _payload_is_directly_modeled(declaration: _HookDeclaration) -> bool:
+    return _bh2_proof(declaration) is not None
+
+
+def _payload_analysis_level(declarations: list[_HookDeclaration]) -> str:
+    if any(declaration.handler_type not in _KNOWN_HANDLER_TYPES for declaration in declarations):
+        return "unmodeled"
+    payload_declarations = [
+        declaration
+        for declaration in declarations
+        if declaration.handler_type in {"command", "http"}
+    ]
+    if not payload_declarations:
+        return "not_applicable"
+    if all(_payload_is_directly_modeled(declaration) for declaration in payload_declarations):
+        return "direct"
+    return "unmodeled"
+
+
+def _target_summary(declarations: list[_HookDeclaration]) -> str:
+    ambient = any(declaration.ambient for declaration in declarations)
+    declarations = [declaration for declaration in declarations if declaration.ambient == ambient]
+    summaries = {
+        "remote_http" if declaration.remote_http else declaration.handler_type
+        for declaration in declarations
     }
+    priority = ("remote_http", "http", "agent", "prompt", "mcp_tool", "command")
+    return next((value for value in priority if value in summaries), "unsupported")
 
 
-def _default_plugin_command_paths(plugin_root: str, candidates: list[str]) -> set[str]:
-    return {
-        path
-        for path in candidates
-        if (relative := _relative_parts(path, plugin_root)) is not None
-        and len(relative) >= 2
-        and relative[0] == "commands"
-        and relative[-1].lower().endswith(".md")
-    }
-
-
-def _has_default_plugin_skills_directory(plugin_root: str, candidates: list[str]) -> bool:
-    return any(
-        (relative := _relative_parts(path, plugin_root)) is not None
-        and len(relative) >= 2
-        and relative[0] == "skills"
-        for path in candidates
-    )
-
-
-def _manifest_inline_map(raw_item: dict[str, object]) -> object:
-    """Accept direct event maps and an unambiguous one-key compatibility wrapper."""
-    if set(raw_item) == {"hooks"}:
-        return raw_item["hooks"]
-    return raw_item
-
-
-def _bh1_finding(document: HookDocument, known_paths: set[str]) -> Finding:
-    chain_digest = _digest(
-        "BH1",
-        "\0".join(
-            (
-                document.source_kind,
-                *document.declaration_roles,
-                document.source_path,
-                document.activation_lifetime,
-                _SEMANTICS_SNAPSHOT,
-                document.content_digest,
-                *(registration.chain_digest for registration in document.registrations),
-            )
-        ),
-    )
-    severity_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-    severity = max(
-        (
-            registration_severity(registration, known_paths)
-            for registration in document.registrations
-        ),
-        key=severity_rank.__getitem__,
-        default="LOW",
-    )
-    handler_types = ",".join(
-        sorted({registration.handler_type for registration in document.registrations})
-    )
-    events = ",".join(
-        sorted(
-            {
-                registration.event if registration.event_status == "known" else "unknown"
-                for registration in document.registrations
-            }
-        )
-    )
-    runnable_count = sum(registration.runnable for registration in document.registrations)
-    ambient_count = sum(registration.ambient for registration in document.registrations)
-    if document.runtime_status == "runtime_unconfirmed":
-        runtime_status = document.runtime_status
-    elif runnable_count:
-        runtime_status = "runnable"
-    elif document.registrations and all(
-        registration.runtime_status == "dormant" for registration in document.registrations
-    ):
-        runtime_status = "all_dormant"
-    else:
-        runtime_status = "unconfirmed"
-    evidence: dict[str, object] = {
-        "schema": _EVIDENCE_SCHEMA,
-        "claude_semantics_snapshot": _SEMANTICS_SNAPSHOT,
-        "source_kind": document.source_kind,
-        "declaration_roles": ",".join(document.declaration_roles),
-        "activation_lifetime": document.activation_lifetime,
-        "runtime_status": runtime_status,
-        "handler_count": len(document.registrations),
-        "runnable_handler_count": runnable_count,
-        "ambient_handler_count": ambient_count,
-        "handler_types": handler_types,
-        "events": events,
-        "chain_digest": chain_digest,
-    }
-    return Finding(
+def _bh1_finding(path: str, declarations: list[_HookDeclaration]) -> Finding:
+    handler_types = sorted(
+        {
+            declaration.handler_type
+            if declaration.handler_type in _KNOWN_HANDLER_TYPES
+            else "unsupported"
+            for declaration in declarations
+        }
+    )[:32]
+    events = sorted(
+        {
+            declaration.event if declaration.event in _KNOWN_EVENTS else "unsupported"
+            for declaration in declarations
+        }
+    )[:32]
+    reach = "ambient" if any(declaration.ambient for declaration in declarations) else "scoped"
+    analyzer_finding = AnalyzerFinding(
         rule_id="BH1",
+        message="Bundled hooks can execute when matching lifecycle events occur.",
+        severity=_bh1_severity(declarations),
+        location=Location(path, 1),
+        confidence=0.95,
+        remediation="Review bundled hook handlers, destinations, and event reach before install.",
+        tags=["Bundled Execution Surface", "Hooks"],
+        matched_text=f"document:{path}",
+        evidence={
+            "activation_state": "conditional",
+            "activation_reason": "requires_hook_activation",
+            "declaration_count": len(declarations),
+            "events": events,
+            "handler_types": handler_types,
+            "matcher_breadth": sorted(
+                {declaration.matcher_breadth for declaration in declarations}
+            )[:32],
+            "payload_analysis_level": _payload_analysis_level(declarations),
+            "reach": reach,
+            "target_summary": _target_summary(declarations),
+            "unknown_event_count": sum(
+                declaration.event not in _KNOWN_EVENTS for declaration in declarations
+            ),
+            "unknown_handler_count": sum(
+                declaration.handler_type not in _KNOWN_HANDLER_TYPES for declaration in declarations
+            ),
+        },
+    )
+    return analyzer_finding_to_finding(analyzer_finding)
+
+
+def _bh2_finding(path: str, proofs: list[_Bh2Proof]) -> Finding:
+    analyzer_finding = AnalyzerFinding(
+        rule_id="BH2",
+        message="A bundled hook directly sends sensitive event or file content remotely.",
+        severity=Severity.CRITICAL,
+        location=Location(path, 1),
+        confidence=0.99,
+        remediation="Remove the remote transfer or require explicit, narrowly scoped user action.",
+        tags=["Bundled Execution Surface", "Exfiltration"],
+        matched_text=f"document:{path}",
+        evidence={
+            "activation_reason": "requires_hook_activation",
+            "activation_state": "conditional",
+            "proof_count": len(proofs),
+            "proof_kinds": sorted({proof.kind for proof in proofs})[:32],
+            "proof_status": "closed",
+            "transport_kinds": sorted({proof.transport for proof in proofs})[:32],
+        },
+    )
+    return analyzer_finding_to_finding(analyzer_finding)
+
+
+def _bh3_finding(path: str, declarations: list[_PermissionDeclaration]) -> Finding:
+    rank = {
+        Severity.LOW: 0,
+        Severity.MEDIUM: 1,
+        Severity.HIGH: 2,
+        Severity.CRITICAL: 3,
+    }
+    severity = max((declaration.severity for declaration in declarations), key=rank.__getitem__)
+    activation_state = (
+        "conditional"
+        if any(declaration.activation_state == "conditional" for declaration in declarations)
+        else "ignored_by_surface"
+    )
+    ignored = activation_state == "ignored_by_surface"
+    analyzer_finding = AnalyzerFinding(
+        rule_id="BH3",
         message=(
-            "Bundled hook document declares "
-            f"{len(document.registrations)} handler(s) for automatic execution."
+            "Bundled project settings declare a permission mode ignored on this surface."
+            if ignored
+            else "Bundled project settings declare a broad permission surface."
         ),
         severity=severity,
-        confidence=1.0,
-        file=document.source_path,
-        start_line=min(
-            (registration.source_line for registration in document.registrations), default=1
+        location=Location(path, 1),
+        confidence=0.99,
+        remediation=(
+            "Remove the ignored mode if it is unintended; it does not expand permissions here."
+            if ignored
+            else "Remove broad grants and declare only the narrow tools and paths required."
         ),
-        category="Bundled Execution Surface",
-        pattern="Bundled Hook Declaration",
-        explanation="The artifact declares hooks that may execute when their activation fires.",
-        remediation="Review each bundled hook before trusting or enabling the artifact.",
-        tags=["bundled-execution-surface", "structural"],
-        matched_text=chain_digest,
-        finding=chain_digest,
-        evidence=evidence,
+        tags=["Bundled Execution Surface", "Permissions"],
+        matched_text=f"document:{path}",
+        evidence={
+            "activation_reason": (
+                "mode_ignored_in_project_settings" if ignored else "requires_workspace_trust"
+            ),
+            "activation_state": activation_state,
+            "activation_states": sorted(
+                {declaration.activation_state for declaration in declarations}
+            ),
+            "declaration_count": len(declarations),
+            "grant_kinds": sorted({declaration.kind for declaration in declarations})[:32],
+        },
     )
+    finding = analyzer_finding_to_finding(analyzer_finding)
+    if ignored:
+        finding.explanation = (
+            "The auto permission mode is recognized but ignored by this supported project "
+            "settings surface, so it does not receive a blocking score floor."
+        )
+    return finding
 
 
-def _failure_reason(error: BaseException) -> LedgerReason:
-    return (
-        LedgerReason.MISSING_FILE_CACHE
-        if isinstance(error, KeyError)
-        else LedgerReason.BINARY_CONTENT
-        if isinstance(error, BinaryHookConfigurationError)
-        else LedgerReason.SIZE_LIMIT
-        if isinstance(error, HookConfigurationSizeLimitError)
-        else LedgerReason.COMPONENT_LIMIT
-        if isinstance(error, HookRegistrationLimitError)
-        else LedgerReason.INVALID_CONFIGURATION
-    )
-
-
-def _failure(
-    path: str, error: BaseException, *, phase: str = "bundled_hook"
-) -> InspectionLedgerEvent:
-    reason = _failure_reason(error)
-    if isinstance(error, HookConfigurationSizeLimitError):
-        return ledger_event(
-            outcome=LedgerOutcome.FAILED,
-            phase=phase,
+def _analyze_document(
+    path: str,
+    content: str,
+    previous_settings_hook_ids: set[_HookIdentity] | None = None,
+    *,
+    hooks_disabled: bool = False,
+) -> tuple[list[Finding], InspectionLedgerEvent]:
+    if len(content) > MAX_FILE_CHARS:
+        return [], ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
             analyzer_id=ANALYZER_ID,
             path=path,
-            reason=reason,
-            error_class=type(error).__name__,
-            stage="parse",
-            observed_characters=error.observed_characters,
+            reason=LedgerReason.SIZE_LIMIT,
+            observed_characters=len(content),
             limit_characters=MAX_FILE_CHARS,
+            observed_bytes=len(content.encode("utf-8", errors="replace")),
         )
-    return ledger_event(
-        outcome=LedgerOutcome.FAILED,
-        phase=phase,
-        analyzer_id=ANALYZER_ID,
-        path=path,
-        reason=reason,
-        error_class=type(error).__name__,
-        stage="parse",
-    )
+    try:
+        document = _parse_document(content)
+    except (RecursionError, ValueError):
+        return [], ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=ANALYZER_ID,
+            path=path,
+            reason=LedgerReason.OPAQUE_CONTENT,
+        )
 
-
-def _completed(
-    path: str, findings: list[Finding], *, phase: str = "bundled_hook"
-) -> InspectionLedgerEvent:
-    return ledger_event(
-        outcome=LedgerOutcome.COMPLETED,
-        phase=phase,
-        analyzer_id=ANALYZER_ID,
-        path=path,
-        emitted_finding_ids=[finding.finding_id for finding in findings],
-    )
-
-
-def _settings_terminal(
-    work: _SettingsWork,
-    hook_result: tuple[LedgerOutcome, LedgerReason | None] | None,
-    findings: list[Finding],
-) -> InspectionLedgerEvent | None:
-    """Reduce hook and permission subanalyses to one settings producer row."""
-    if work.parse_error is not None:
-        return _failure(work.source_path, work.parse_error, phase="bundled_settings")
-
-    permission = work.permission_analysis
-    permission_result = (
-        (permission.outcome, permission.reason)
-        if permission is not None and permission.applicable
-        else None
-    )
-    applicable_results = [
-        result for result in (hook_result, permission_result) if result is not None
-    ]
-    if not applicable_results:
-        return None
-
-    failed_results = [result for result in applicable_results if result[0] is LedgerOutcome.FAILED]
-    retained_valid_result = any(
-        result[0] in {LedgerOutcome.COMPLETED, LedgerOutcome.PARTIAL}
-        for result in applicable_results
-    )
-    incomplete_result = any(result[0] is LedgerOutcome.PARTIAL for result in applicable_results)
-
-    reason = (
-        LedgerReason.COMPONENT_LIMIT
-        if any(result[1] is LedgerReason.COMPONENT_LIMIT for result in applicable_results)
-        else LedgerReason.INVALID_CONFIGURATION
-    )
-    if failed_results:
-        outcome = LedgerOutcome.PARTIAL if retained_valid_result else LedgerOutcome.FAILED
-    elif incomplete_result:
-        outcome = LedgerOutcome.PARTIAL
-    else:
-        outcome = LedgerOutcome.COMPLETED
-
-    if outcome is LedgerOutcome.COMPLETED:
-        return _completed(work.source_path, findings, phase="bundled_settings")
-    return ledger_event(
-        outcome=outcome,
-        phase="bundled_settings",
-        analyzer_id=ANALYZER_ID,
-        path=work.source_path,
-        reason=reason,
-        emitted_finding_ids=[finding.finding_id for finding in findings],
-        stage="analyze",
-    )
-
-
-def _flow_terminal(work: FlowWorkResult, findings: list[Finding]) -> InspectionLedgerEvent:
-    """Convert one sanitized flow result into its unique producer ledger row."""
-    common: dict[str, object] = {
-        "phase": "bundled_hook",
-        "analyzer_id": ANALYZER_ID,
-        "path": work.ref.path,
-        "start_line": work.ref.start_line,
-        "end_line": work.ref.end_line,
-    }
-    if work.outcome is LedgerOutcome.COMPLETED:
-        return ledger_event(
-            outcome=LedgerOutcome.COMPLETED,
+    scan = _scan_declarations(path, document, previous_settings_hook_ids)
+    declarations = [] if hooks_disabled else scan.hooks
+    proofs = [proof for declaration in declarations if (proof := _bh2_proof(declaration))]
+    permission_declarations = scan.permissions
+    findings: list[Finding] = []
+    if declarations:
+        findings.append(_bh1_finding(path, declarations))
+    if proofs:
+        findings.append(_bh2_finding(path, proofs))
+    if permission_declarations:
+        findings.append(_bh3_finding(path, permission_declarations))
+    if scan.partial:
+        return findings, ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            phase="static",
+            analyzer_id=ANALYZER_ID,
+            path=path,
+            reason=LedgerReason.OPAQUE_CONTENT,
             emitted_finding_ids=[finding.finding_id for finding in findings],
-            **common,  # type: ignore[arg-type]
+            observed_records=scan.observed,
+            limit_records=_MAX_DECLARATIONS,
         )
-    return ledger_event(
-        outcome=work.outcome,
-        reason=work.reason or LedgerReason.ANALYZER_RUNTIME_ERROR,
-        error_class=work.error_class,
-        observed_characters=work.observed_characters,
-        limit_characters=work.limit_characters,
-        **common,  # type: ignore[arg-type]
+    return findings, ledger_event(
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        analyzer_id=ANALYZER_ID,
+        path=path,
+        emitted_finding_ids=[finding.finding_id for finding in findings],
     )
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Discover supported hook documents from deterministic cache state only."""
-    component_paths = cast(list[str], state.get("components") or [])
-    cache = cast(dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {})
-    raw_cache = cast(dict[str, bytes], state.get("raw_file_cache") or {})
-    paths = list(dict.fromkeys(component_paths))
-    known_paths = list(dict.fromkeys([*paths, *cache, *raw_cache]))
-    known_path_set = set(known_paths)
-    cache_path_set = set(cache)
-    manifest_limited_paths = {
-        str(artifact.get("path", ""))
-        for artifact in state.get("artifact_inventory", []) or []
-        if str(artifact.get("reason", "")) in {"manifest_parse_error", "manifest_parse_limit"}
+    """Inspect exact bundled hook/settings paths using bounded literal classifiers."""
+    components = state.get("components") or []
+    file_cache = state.get("local_file_cache") or state.get("file_cache") or {}
+    decodable = {
+        record.get("path"): record.get("decodable", True)
+        for record in (state.get("artifact_inventory") or [])
     }
-    path_rank = {path: index for index, path in enumerate(paths)}
-    root_candidate_index: dict[tuple[str, tuple[str, ...]], list[str]] = {}
-    for path in known_paths:
-        namespace, path_parts = _path_parts(path)
-        for prefix_length in range(len(path_parts) + 1):
-            root_candidate_index.setdefault((namespace, path_parts[:prefix_length]), []).append(
-                path
-            )
-    user_config_by_root: dict[str, UserConfigProfile] = {}
-
-    def candidates_for_root(root: str) -> list[str]:
-        return root_candidate_index.get(_path_parts(root), [])
-
-    component_metadata = cast(list[dict[str, object]], state.get("component_metadata", []) or [])
-    metadata_rows_by_path = _metadata_rows_by_path(component_metadata)
-    component_metadata_supplied = "component_metadata" in state
-    component_path_set = set(paths)
-    local_cache_path_set = set(cache)
-    raw_cache_path_set = set(raw_cache)
-    content_cache_path_set = local_cache_path_set | raw_cache_path_set
-
-    def archive_provenance_hops(path: str) -> tuple[tuple[str, str], ...]:
-        return _archive_permission_provenance_hops(
-            path,
-            component_paths=component_path_set,
-            local_cache_paths=local_cache_path_set,
-            raw_cache_paths=raw_cache_path_set,
-            rows_by_path=metadata_rows_by_path,
-        )
-
-    def permission_provenance_hops(path: str) -> tuple[tuple[str, str], ...]:
-        if not component_metadata_supplied:
-            return _fallback_permission_provenance_hops(path, cache_paths=content_cache_path_set)
-        if "!/" in path:
-            return archive_provenance_hops(path)
-        return _direct_permission_provenance_hops(path, metadata_rows_by_path)
-
-    def archive_namespace_is_corroborated(
-        path: str, *, referring_paths: set[str] | None = None
-    ) -> bool:
-        if "!/" not in path:
-            return True
-        if not component_metadata_supplied:
-            try:
-                _fallback_permission_provenance_hops(path, cache_paths=content_cache_path_set)
-            except InvalidHookConfigurationError:
-                return False
-            return True
-
-        target_rows = metadata_rows_by_path.get(path, [])
-        if target_rows:
-            try:
-                archive_provenance_hops(path)
-            except InvalidHookConfigurationError:
-                return any(_claims_archive_member(row, path) for row in target_rows)
-            return True
-        if path in known_path_set:
-            return True
-        namespace = _namespace(path)
-        for referring_path in referring_paths or ():
-            if _namespace(referring_path) != namespace:
-                continue
-            try:
-                archive_provenance_hops(referring_path)
-            except InvalidHookConfigurationError:
-                continue
-            return True
-        return False
-
-    def project_settings_metadata(
-        path: str, *, referring_paths: set[str] | None = None
-    ) -> tuple[str, str] | None:
-        if not archive_namespace_is_corroborated(path, referring_paths=referring_paths):
-            return None
-        _namespace_value, member_parts = _path_parts(path)
-        if len(member_parts) != 2:
-            return None
-        return _PROJECT_SETTINGS.get("/".join(member_parts))
-
-    documents: list[HookDocument] = []
-    document_indexes: dict[str, int] = {}
-    events: list[InspectionLedgerEvent] = []
-    marketplace_entry_events: dict[str, InspectionLedgerEvent] = {}
-    handled_paths: set[str] = set()
-
-    def record_marketplace_entry_failure(path: str, error: BaseException) -> None:
-        """Record at most one terminal failure for one logical marketplace entry."""
-        if path in marketplace_entry_events:
-            return
-        event = _failure(path, error)
-        marketplace_entry_events[path] = event
-        events.append(event)
-
-    def add_document(document: HookDocument) -> None:
-        if len(document.registrations) > _MAX_REGISTRATIONS_PER_DOCUMENT:
-            raise HookRegistrationLimitError("aggregated hook registration limit exceeded")
-        if document.source_path in document_indexes:
-            index = document_indexes[document.source_path]
-            existing = documents[index]
-            if (
-                existing.source_kind == "marketplace_plugin_inline"
-                and document.source_kind == "marketplace_plugin_inline"
-            ):
-                if (
-                    len(existing.registrations) + len(document.registrations)
-                    > _MAX_REGISTRATIONS_PER_DOCUMENT
-                ):
-                    raise HookRegistrationLimitError(
-                        "aggregated marketplace registration limit exceeded"
-                    )
-                documents[index] = replace(
-                    existing,
-                    registrations=(*existing.registrations, *document.registrations),
-                    flow_inputs=(*existing.flow_inputs, *document.flow_inputs),
-                )
-            add_declaration_role(document.source_path, document.source_kind)
-            return
-        document_indexes[document.source_path] = len(documents)
-        documents.append(document)
-
-    def discard_document(path: str) -> None:
-        """Remove a partially aggregated physical document before recording failure."""
-        index = document_indexes.pop(path, None)
-        if index is None:
-            return
-        documents.pop(index)
-        for shifted_index in range(index, len(documents)):
-            document_indexes[documents[shifted_index].source_path] = shifted_index
-
-    def add_declaration_role(path: str, role: str) -> None:
-        index = document_indexes.get(path)
-        if index is None:
-            return
-        document = documents[index]
-        documents[index] = replace(
-            document,
-            activation_lifetime=(
-                "plugin_enabled"
-                if role in {"plugin_manifest_reference", "marketplace_plugin_reference"}
-                else document.activation_lifetime
-            ),
-            declaration_roles=tuple(sorted({*document.declaration_roles, role})),
-        )
-
-    settings_work_by_path: dict[str, _SettingsWork] = {}
-    settings_handler_lines_by_path: dict[str, tuple[int, ...]] = {}
-    settings_hook_results: dict[str, tuple[LedgerOutcome, LedgerReason | None]] = {}
-    for path in known_paths:
-        settings = project_settings_metadata(path)
-        if settings is None:
-            continue
-
-        content = cache.get(path)
-        if content is None:
-            settings_work_by_path[path] = _SettingsWork(
-                source_path=path,
-                source_kind=settings[0],
-                content_digest=_digest("content", ""),
-                source_identity_digest="",
-                raw=None,
-                parse_error=KeyError(path),
-                permission_analysis=None,
-                permission_source_lines=PermissionSourceLines(),
-            )
-            continue
-
-        try:
-            canonical_content = _canonical_settings_bytes(content, raw_cache.get(path))
-            raw = _load_json(content)
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            settings_work_by_path[path] = _SettingsWork(
-                source_path=path,
-                source_kind=settings[0],
-                content_digest=_digest("content", ""),
-                source_identity_digest="",
-                raw=None,
-                parse_error=exc,
-                permission_analysis=None,
-                permission_source_lines=PermissionSourceLines(),
-            )
-            continue
-
-        content_digest = _digest_bytes("content", canonical_content)
-        syntax_root = (
-            _json_root_node(content) if _json_location_recovery_allowed(content, raw) else None
-        )
-        permission_source_lines = _permission_source_lines(raw, syntax_root)
-        source_identity_digest = ""
-        if "permissions" not in raw:
-            permission_analysis = PermissionAnalysis(False, None, None, (), (), None)
-        else:
-            try:
-                provenance_hops = permission_provenance_hops(path)
-            except InvalidHookConfigurationError:
-                permission_analysis = PermissionAnalysis(
-                    True,
-                    LedgerOutcome.FAILED,
-                    LedgerReason.INVALID_CONFIGURATION,
-                    (),
-                    (),
-                    None,
-                )
-            else:
-                source_identity_digest = _permission_source_identity_digest(provenance_hops)
-                permission_analysis = analyze_permission_grants(
-                    raw,
-                    source_kind=settings[0],
-                    content_digest=content_digest,
-                    source_identity_digest=source_identity_digest,
-                    source_lines=permission_source_lines,
-                )
-        settings_work_by_path[path] = _SettingsWork(
-            source_path=path,
-            source_kind=settings[0],
-            content_digest=content_digest,
-            source_identity_digest=source_identity_digest,
-            raw=raw,
-            parse_error=None,
-            permission_analysis=permission_analysis,
-            permission_source_lines=permission_source_lines,
-        )
-        settings_handler_lines_by_path[path] = _json_handler_lines_from_root(syntax_root)
-
-    marketplace_entries: list[MarketplaceEntry] = []
-    marketplace_declared_roots: set[str] = set()
-    marketplace_managed_manifests: set[str] = set()
-    invalid_manifest_paths: set[str] = set()
-    marketplace_paths = [path for path in paths if _is_marketplace_path(path)]
-    marketplace_path_set = set(marketplace_paths)
-    for marketplace_path in marketplace_paths:
-        content = cache.get(marketplace_path)
-        if content is None:
-            handled_paths.add(marketplace_path)
-            events.append(_failure(marketplace_path, KeyError(marketplace_path)))
-            continue
-        try:
-            marketplace = _load_json(content)
-            raw_plugins = _validate_marketplace_identity(marketplace)
-            metadata = marketplace.get("metadata", {})
-            if not isinstance(metadata, dict):
-                raise InvalidHookConfigurationError("marketplace metadata must be an object")
-            plugin_root_ref = metadata.get("pluginRoot", ".")
-            if not isinstance(plugin_root_ref, str):
-                raise InvalidHookConfigurationError("marketplace pluginRoot must be a path")
-            catalog_root = _marketplace_root(marketplace_path)
-            catalog_plugin_root = _resolve_local_path(catalog_root, plugin_root_ref)
-            explicit_plugin_root = "pluginRoot" in metadata
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            handled_paths.add(marketplace_path)
-            events.append(_failure(marketplace_path, exc))
-            continue
-
-        handler_lines_by_entry = _marketplace_handler_lines(content)
-        for index, raw_entry in enumerate(raw_plugins):
-            entry_path = _marketplace_entry_path(marketplace_path, index, known_path_set)
-            entry_handler_lines = (
-                handler_lines_by_entry[index] if index < len(handler_lines_by_entry) else ()
-            )
-            try:
-                if not isinstance(raw_entry, dict):
-                    raise InvalidHookConfigurationError(
-                        "marketplace plugin entry must be an object"
-                    )
-                _required_nonempty_string(
-                    cast(dict[str, object], raw_entry), "name", "marketplace plugin entry"
-                )
-                source = raw_entry.get("source")
-                if source is None:
-                    raise InvalidHookConfigurationError("marketplace plugin source is required")
-                strict = raw_entry.get("strict", True)
-                if not isinstance(strict, bool):
-                    raise InvalidHookConfigurationError("marketplace strict must be boolean")
-                plugin_root: str | None
-                source_is_root = isinstance(source, str) and source in {".", "./"}
-                if isinstance(source, dict):
-                    _validate_remote_plugin_source(cast(dict[str, object], source))
-                    plugin_root = None
-                elif isinstance(source, str):
-                    plugin_root = _resolve_local_path(
-                        catalog_plugin_root,
-                        source,
-                        allow_bare=explicit_plugin_root,
-                    )
-                else:
-                    raise InvalidHookConfigurationError(
-                        "marketplace source must be local or remote"
-                    )
-                hooks = (
-                    _validate_marketplace_hooks(raw_entry["hooks"])
-                    if "hooks" in raw_entry
-                    else None
-                )
-                skills = (
-                    _validate_marketplace_component(
-                        raw_entry["skills"], plugin_root, component_kind="skills"
-                    )
-                    if "skills" in raw_entry
-                    else None
-                )
-                commands = (
-                    _validate_marketplace_component(
-                        raw_entry["commands"], plugin_root, component_kind="commands"
-                    )
-                    if "commands" in raw_entry
-                    else None
-                )
-                entry = MarketplaceEntry(
-                    marketplace_path=marketplace_path,
-                    ledger_path=entry_path,
-                    index=index,
-                    plugin_root=plugin_root,
-                    strict=strict,
-                    hooks=hooks,
-                    skills=skills,
-                    commands=commands,
-                    handler_lines=entry_handler_lines,
-                    source_is_root=source_is_root,
-                )
-                if plugin_root is not None:
-                    marketplace_declared_roots.add(plugin_root)
-                    manifest_path = _manifest_path(plugin_root)
-                    if not candidates_for_root(plugin_root):
-                        raise KeyError(plugin_root)
-                    if not strict:
-                        marketplace_managed_manifests.add(manifest_path)
-                        manifest_content = cache.get(manifest_path)
-                        if manifest_content is not None:
-                            manifest = _load_json(manifest_content)
-                            _validate_manifest_identity(manifest)
-                            if any(key in manifest for key in _MANIFEST_COMPONENT_FIELDS):
-                                raise InvalidHookConfigurationError(
-                                    "strict-false marketplace definition conflicts with plugin manifest"
-                                )
-                            user_config_by_root[plugin_root] = build_user_config_profile(
-                                manifest.get("userConfig")
-                            )
-                marketplace_entries.append(entry)
-            except (InvalidHookConfigurationError, TypeError, KeyError) as exc:
-                record_marketplace_entry_failure(entry_path, exc)
-
-    manifests = [
-        path
-        for path in known_paths
-        if _is_manifest_path(path) and path not in marketplace_managed_manifests
-    ]
-    manifest_path_set = set(manifests)
-    marketplace_owned_paths = {
-        candidate for root in marketplace_declared_roots for candidate in candidates_for_root(root)
-    }
-    default_paths = {
-        path
-        for path in paths
-        if _path_parts(path)[1] == tuple(_PLUGIN_DEFAULT_PATH.split("/"))
-        and path not in marketplace_owned_paths
-    }
-
-    for path in paths:
-        if path not in default_paths:
-            continue
-        handled_paths.add(path)
-        content = cache.get(path)
-        if content is None:
-            events.append(_failure(path, KeyError(path)))
-            continue
-        try:
-            namespace, parts = _path_parts(path)
-            root_parts = parts[: -len(tuple(_PLUGIN_DEFAULT_PATH.split("/")))]
-            execution_root = "/".join(root_parts)
-            if namespace:
-                execution_root = f"{namespace}!/{execution_root}"
-            document = _parse_hook_document(
-                path,
-                content,
-                "plugin_default",
-                "plugin_enabled",
-                execution_root=execution_root,
-            )
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            events.append(_failure(path, exc))
-            continue
-        add_document(document)
-
-    for path, settings_work in settings_work_by_path.items():
-        if (
-            settings_work.parse_error is not None
-            or settings_work.raw is None
-            or "hooks" not in settings_work.raw
-        ):
-            continue
-        settings = project_settings_metadata(path)
-        assert settings is not None
-        try:
-            document = _parse_hook_mapping_document(
-                path,
-                settings_work.raw,
-                settings_work.source_kind,
-                settings[1],
-                content_digest=settings_work.content_digest,
-                execution_root=_archive_or_project_root(path),
-                source_lines=settings_handler_lines_by_path.get(path, ()),
-            )
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            handled_paths.add(path)
-            settings_hook_results[path] = (
-                LedgerOutcome.FAILED,
-                _failure_reason(exc),
-            )
-            continue
-        handled_paths.add(path)
-        settings_hook_results[path] = (LedgerOutcome.COMPLETED, None)
-        add_document(document)
-
-    referenced_paths: dict[str, set[str]] = {}
-    manifest_components: dict[str, dict[str, list[str]]] = {}
-    manifest_fields: dict[str, set[str]] = {}
-    for manifest_path in manifests:
-        content = cache.get(manifest_path)
-        if content is None:
-            handled_paths.add(manifest_path)
-            invalid_manifest_paths.add(manifest_path)
-            events.append(_failure(manifest_path, KeyError(manifest_path)))
-            continue
-        try:
-            manifest = _load_json(content)
-            _validate_manifest_identity(manifest)
-            manifest_root = _manifest_root(manifest_path)
-            user_config_by_root[manifest_root] = build_user_config_profile(
-                manifest.get("userConfig")
-            )
-            manifest_line_iterator = iter(_manifest_handler_lines(content))
-            component_fields = {field for field in ("skills", "commands") if field in manifest}
-            component_references: dict[str, list[str]] = {}
-            for field in component_fields:
-                value = manifest[field]
-                if not isinstance(value, (str, list)):
-                    raise InvalidHookConfigurationError(
-                        f"manifest {field} must be a relative path or array"
-                    )
-                values = [value] if isinstance(value, str) else value
-                if not all(isinstance(item, str) for item in values):
-                    raise InvalidHookConfigurationError(
-                        f"manifest {field} entries must be relative paths"
-                    )
-                for item in values:
-                    if item == "." and field != "skills":
-                        raise InvalidHookConfigurationError(
-                            "only manifest skills may use the bare-dot plugin root"
-                        )
-                    _resolve_local_path(manifest_root, item, allow_dot=True)
-                component_references[field] = cast(list[str], values)
-            if "hooks" in manifest:
-                declared_hooks = manifest["hooks"]
-                if not isinstance(declared_hooks, (str, dict, list)):
-                    raise InvalidHookConfigurationError(
-                        "manifest hooks must be an object, path, or array"
-                    )
-                items = declared_hooks if isinstance(declared_hooks, list) else [declared_hooks]
-                inline_registrations: list[HookRegistration] = []
-                inline_flow_inputs: list[HandlerFlowInput] = []
-                manifest_references: set[str] = set()
-                for item in items:
-                    if isinstance(item, str):
-                        reference_path = _resolve_reference(manifest_root, item)
-                        if reference_path == manifest_path:
-                            raise InvalidHookConfigurationError("manifest hook reference is cyclic")
-                        manifest_references.add(reference_path)
-                        continue
-                    if not isinstance(item, dict):
-                        raise InvalidHookConfigurationError(
-                            "manifest hook items must be paths or objects"
-                        )
-                    parsed_inline = _registrations(
-                        _manifest_inline_map(item),
-                        source_kind="plugin_manifest_inline",
-                        source_path=manifest_path,
-                        activation_lifetime="plugin_enabled",
-                        source_lines=manifest_line_iterator,
-                        execution_root=manifest_root,
-                        registration_limit=(
-                            _MAX_REGISTRATIONS_PER_DOCUMENT - len(inline_registrations)
-                        ),
-                    )
-                    inline_registrations.extend(parsed_inline.registrations)
-                    inline_flow_inputs.extend(parsed_inline.flow_inputs)
-                if inline_registrations:
-                    add_document(
-                        HookDocument(
-                            source_kind="plugin_manifest_inline",
-                            declaration_roles=("plugin_manifest_inline",),
-                            source_path=manifest_path,
-                            activation_lifetime="plugin_enabled",
-                            content_digest=_digest("content", content),
-                            registrations=tuple(inline_registrations),
-                            flow_inputs=tuple(inline_flow_inputs),
-                        )
-                    )
-                    handled_paths.add(manifest_path)
-                for reference_path in manifest_references:
-                    referenced_paths.setdefault(reference_path, set()).add(manifest_root)
-            manifest_components[manifest_path] = component_references
-            manifest_fields[manifest_path] = component_fields
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            handled_paths.add(manifest_path)
-            invalid_manifest_paths.add(manifest_path)
-            events.append(_failure(manifest_path, exc))
-
-    for manifest_path in manifest_fields:
-        default_path = _default_path(_manifest_root(manifest_path))
-        if default_path in handled_paths or default_path not in known_paths:
-            continue
-        handled_paths.add(default_path)
-        content = cache.get(default_path)
-        if content is None:
-            events.append(_failure(default_path, KeyError(default_path)))
-            continue
-        try:
-            add_document(
-                _parse_hook_document(
-                    default_path,
-                    content,
-                    "plugin_default",
-                    "plugin_enabled",
-                    execution_root=_manifest_root(manifest_path),
-                )
-            )
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            events.append(_failure(default_path, exc))
-
-    marketplace_manifest_roots = {_manifest_root(path) for path in manifest_fields}
-    for entry in marketplace_entries:
-        if not entry.strict or entry.plugin_root is None:
-            continue
-        if _manifest_path(entry.plugin_root) in invalid_manifest_paths:
-            continue
-        if entry.plugin_root in marketplace_manifest_roots:
-            continue
-        default_path = _default_path(entry.plugin_root)
-        if default_path in handled_paths or default_path not in known_paths:
-            continue
-        handled_paths.add(default_path)
-        content = cache.get(default_path)
-        if content is None:
-            events.append(_failure(default_path, KeyError(default_path)))
-            continue
-        try:
-            add_document(
-                _parse_hook_document(
-                    default_path,
-                    content,
-                    "plugin_default",
-                    "plugin_enabled",
-                    execution_root=entry.plugin_root,
-                )
-            )
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            events.append(_failure(default_path, exc))
-
-    def reference_order(path: str) -> tuple[int, str]:
-        return (path_rank.get(path, len(paths)), path)
-
-    def inspect_referenced_document(
-        reference_path: str,
-        source_kind: str,
-        activation_roots: set[str],
-    ) -> None:
-        """Inventory every distinct execution root for one physical hook document."""
-        settings_work = settings_work_by_path.get(reference_path)
-        referring_paths = (
-            {_manifest_path(root) for root in activation_roots}
-            if source_kind == "plugin_manifest_reference"
-            else set()
-        )
-        if (
-            settings_work is None
-            and (
-                settings := project_settings_metadata(
-                    reference_path, referring_paths=referring_paths
-                )
-            )
-            is not None
-        ):
-            settings_work = _SettingsWork(
-                source_path=reference_path,
-                source_kind=settings[0],
-                content_digest=_digest("content", ""),
-                source_identity_digest="",
-                raw=None,
-                parse_error=KeyError(reference_path),
-                permission_analysis=None,
-                permission_source_lines=PermissionSourceLines(),
-            )
-            settings_work_by_path[reference_path] = settings_work
-        existing_index = document_indexes.get(reference_path)
-        if settings_work is not None and settings_work.parse_error is not None:
-            handled_paths.add(reference_path)
-            settings_hook_results.setdefault(
-                reference_path,
-                (LedgerOutcome.FAILED, _failure_reason(settings_work.parse_error)),
-            )
-            return
-        if (
-            settings_work is not None
-            and settings_hook_results.get(reference_path, (None, None))[0] is LedgerOutcome.FAILED
-        ):
-            handled_paths.add(reference_path)
-            return
-        if settings_work is None and reference_path in handled_paths and existing_index is None:
-            add_declaration_role(reference_path, source_kind)
-            return
-        content = cache.get(reference_path) if settings_work is None else None
-        if settings_work is None and content is None:
-            handled_paths.add(reference_path)
-            events.append(_failure(reference_path, KeyError(reference_path)))
-            return
-
-        existing = documents[existing_index] if existing_index is not None else None
-        existing_roots = (
-            {
-                registration.execution_root
-                for registration in existing.registrations
-                if registration.source_kind != "marketplace_plugin_inline"
-            }
-            if existing is not None
-            else set()
-        )
-        pending_roots = sorted(activation_roots - existing_roots)
-        if not pending_roots:
-            handled_paths.add(reference_path)
-            add_declaration_role(reference_path, source_kind)
-            return
-
-        try:
-            added_registrations: list[HookRegistration] = []
-            added_flow_inputs: list[HandlerFlowInput] = []
-            template: HookDocument | None = None
-            base_count = len(existing.registrations) if existing is not None else 0
-            for execution_root in pending_roots:
-                remaining = _MAX_REGISTRATIONS_PER_DOCUMENT - base_count - len(added_registrations)
-                parsed = (
-                    _parse_hook_mapping_document(
-                        reference_path,
-                        cast(_SettingsWork, settings_work).raw or {},
-                        source_kind,
-                        "plugin_enabled",
-                        content_digest=cast(_SettingsWork, settings_work).content_digest,
-                        execution_root=execution_root,
-                        source_lines=settings_handler_lines_by_path.get(reference_path, ()),
-                        registration_limit=remaining,
-                    )
-                    if settings_work is not None
-                    else _parse_hook_document(
-                        reference_path,
-                        cast(str, content),
-                        source_kind,
-                        "plugin_enabled",
-                        execution_root=execution_root,
-                        registration_limit=remaining,
-                    )
-                )
-                template = parsed
-                added_registrations.extend(parsed.registrations)
-                added_flow_inputs.extend(parsed.flow_inputs)
-            if existing is not None:
-                assert existing_index is not None
-                documents[existing_index] = replace(
-                    existing,
-                    registrations=(*existing.registrations, *added_registrations),
-                    flow_inputs=(*existing.flow_inputs, *added_flow_inputs),
-                )
-                add_declaration_role(reference_path, source_kind)
-            elif template is not None:
-                add_document(
-                    replace(
-                        template,
-                        registrations=tuple(added_registrations),
-                        flow_inputs=tuple(added_flow_inputs),
-                    )
-                )
-            handled_paths.add(reference_path)
-            if settings_work is not None:
-                settings_hook_results[reference_path] = (LedgerOutcome.COMPLETED, None)
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            discard_document(reference_path)
-            handled_paths.add(reference_path)
-            if settings_work is not None:
-                settings_hook_results[reference_path] = (
-                    LedgerOutcome.FAILED,
-                    _failure_reason(exc),
-                )
-            else:
-                events.append(_failure(reference_path, exc))
-
-    for reference_path in sorted(referenced_paths, key=reference_order):
-        inspect_referenced_document(
-            reference_path,
-            "plugin_manifest_reference",
-            referenced_paths[reference_path],
-        )
-
-    marketplace_references: dict[str, set[str]] = {}
-    staged_marketplace_registrations: dict[str, list[HookRegistration]] = {}
-    staged_marketplace_flow_inputs: dict[str, list[HandlerFlowInput]] = {}
-    failed_marketplace_documents: set[str] = set()
-
-    def marketplace_document_failed(path: str) -> bool:
-        return path in failed_marketplace_documents or (
-            path in handled_paths and path not in document_indexes
-        )
-
-    def remaining_marketplace_registrations(path: str, pending_count: int) -> int:
-        existing_index = document_indexes.get(path)
-        existing_count = (
-            len(documents[existing_index].registrations) if existing_index is not None else 0
-        )
-        return (
-            _MAX_REGISTRATIONS_PER_DOCUMENT
-            - existing_count
-            - len(staged_marketplace_registrations.get(path, []))
-            - pending_count
-        )
-
-    def fail_marketplace_document(path: str, error: HookRegistrationLimitError) -> None:
-        """Discard every staged inline entry and fail the physical marketplace once."""
-        staged_marketplace_registrations.pop(path, None)
-        staged_marketplace_flow_inputs.pop(path, None)
-        discard_document(path)
-        if path in failed_marketplace_documents:
-            return
-        failed_marketplace_documents.add(path)
-        handled_paths.add(path)
-        events.append(_failure(path, error))
-
-    for entry in marketplace_entries:
-        entry_path = entry.ledger_path
-        if (
-            entry.plugin_root is not None
-            and _manifest_path(entry.plugin_root) in invalid_manifest_paths
-        ):
-            continue
-        content = cache.get(entry.marketplace_path)
-        if content is None:
-            record_marketplace_entry_failure(entry_path, KeyError(entry_path))
-            continue
-        if entry.plugin_root is None:
-            # Remote sources cannot be mapped to the cache, but inline declarations
-            # remain useful and are intentionally retained.
-            if entry.hooks is not None:
-                try:
-                    items = entry.hooks if isinstance(entry.hooks, list) else [entry.hooks]
-                    remote_inline_registrations: list[HookRegistration] = []
-                    remote_inline_flow_inputs: list[HandlerFlowInput] = []
-                    entry_line_iterator = iter(entry.handler_lines)
-                    for item in items:
-                        if isinstance(item, str):
-                            continue
-                        if marketplace_document_failed(entry.marketplace_path):
-                            continue
-                        parsed_inline = _registrations(
-                            _manifest_inline_map(item),
-                            source_kind="marketplace_plugin_inline",
-                            source_path=entry.marketplace_path,
-                            activation_lifetime="plugin_enabled",
-                            source_lines=entry_line_iterator,
-                            execution_root=None,
-                            registration_limit=remaining_marketplace_registrations(
-                                entry.marketplace_path,
-                                len(remote_inline_registrations),
-                            ),
-                        )
-                        remote_inline_registrations.extend(parsed_inline.registrations)
-                        remote_inline_flow_inputs.extend(parsed_inline.flow_inputs)
-                    if remote_inline_registrations:
-                        staged_marketplace_registrations.setdefault(
-                            entry.marketplace_path, []
-                        ).extend(remote_inline_registrations)
-                        staged_marketplace_flow_inputs.setdefault(
-                            entry.marketplace_path, []
-                        ).extend(remote_inline_flow_inputs)
-                except HookRegistrationLimitError as exc:
-                    fail_marketplace_document(entry.marketplace_path, exc)
-                    record_marketplace_entry_failure(entry_path, KeyError(entry_path))
-                    continue
-                except (InvalidHookConfigurationError, TypeError) as exc:
-                    record_marketplace_entry_failure(entry_path, exc)
-                    continue
-            record_marketplace_entry_failure(entry_path, KeyError(entry_path))
-            continue
-
-        if entry.hooks is not None:
-            try:
-                items = entry.hooks if isinstance(entry.hooks, list) else [entry.hooks]
-                entry_inline_registrations: list[HookRegistration] = []
-                entry_inline_flow_inputs: list[HandlerFlowInput] = []
-                entry_references: set[str] = set()
-                entry_line_iterator = iter(entry.handler_lines)
-                for item in items:
-                    if isinstance(item, str):
-                        reference_path = _resolve_local_path(
-                            entry.plugin_root, item, allow_dot=False
-                        )
-                        entry_references.add(reference_path)
-                        continue
-                    if marketplace_document_failed(entry.marketplace_path):
-                        continue
-                    parsed_inline = _registrations(
-                        _manifest_inline_map(item),
-                        source_kind="marketplace_plugin_inline",
-                        source_path=entry.marketplace_path,
-                        activation_lifetime="plugin_enabled",
-                        source_lines=entry_line_iterator,
-                        execution_root=entry.plugin_root,
-                        registration_limit=remaining_marketplace_registrations(
-                            entry.marketplace_path,
-                            len(entry_inline_registrations),
-                        ),
-                    )
-                    entry_inline_registrations.extend(parsed_inline.registrations)
-                    entry_inline_flow_inputs.extend(parsed_inline.flow_inputs)
-                if entry_inline_registrations:
-                    staged_marketplace_registrations.setdefault(entry.marketplace_path, []).extend(
-                        entry_inline_registrations
-                    )
-                    staged_marketplace_flow_inputs.setdefault(entry.marketplace_path, []).extend(
-                        entry_inline_flow_inputs
-                    )
-                for reference_path in entry_references:
-                    marketplace_references.setdefault(reference_path, set()).add(entry.plugin_root)
-            except HookRegistrationLimitError as exc:
-                fail_marketplace_document(entry.marketplace_path, exc)
-            except (InvalidHookConfigurationError, TypeError) as exc:
-                record_marketplace_entry_failure(entry_path, exc)
-
-    for marketplace_path, registrations in staged_marketplace_registrations.items():
-        if not registrations or marketplace_document_failed(marketplace_path):
-            continue
-        content = cache[marketplace_path]
-        existing_index = document_indexes.get(marketplace_path)
-        if existing_index is None:
-            add_document(
-                HookDocument(
-                    source_kind="marketplace_plugin_inline",
-                    declaration_roles=("marketplace_plugin_inline",),
-                    source_path=marketplace_path,
-                    activation_lifetime="plugin_enabled",
-                    content_digest=_digest("content", content),
-                    registrations=tuple(registrations),
-                    flow_inputs=tuple(staged_marketplace_flow_inputs[marketplace_path]),
-                )
-            )
-            continue
-        existing = documents[existing_index]
-        if len(existing.registrations) + len(registrations) > _MAX_REGISTRATIONS_PER_DOCUMENT:
-            fail_marketplace_document(
-                marketplace_path,
-                HookRegistrationLimitError("aggregated marketplace registration limit exceeded"),
-            )
-            continue
-        documents[existing_index] = replace(
-            existing,
-            registrations=(*existing.registrations, *registrations),
-            flow_inputs=(
-                *existing.flow_inputs,
-                *staged_marketplace_flow_inputs[marketplace_path],
-            ),
-        )
-        add_declaration_role(marketplace_path, "marketplace_plugin_inline")
-
-    for reference_path in sorted(marketplace_references, key=reference_order):
-        inspect_referenced_document(
-            reference_path,
-            "marketplace_plugin_reference",
-            marketplace_references[reference_path],
-        )
-
-    frontmatter_attempted: set[str] = set()
-    frontmatter_activations: dict[str, set[tuple[str, str, str | None, str]]] = {}
-    frontmatter_failed: set[str] = set()
-    frontmatter_hookless: set[str] = set()
-
-    def inspect_frontmatter(
-        path: str,
-        source_kind: str,
-        activation_lifetime: str,
-        execution_root: str | None,
-        runtime_status: str = "declared_unclassified",
-    ) -> None:
-        """Aggregate each distinct runtime activation of one physical Markdown document."""
-        _namespace_value, path_parts = _path_parts(path)
-        if source_kind.endswith("skill") and path_parts and path_parts[-1] == "skill.md":
-            runtime_status = "runtime_unconfirmed"
-        if path in frontmatter_failed or path in frontmatter_hookless:
-            return
-        existing_index = document_indexes.get(path)
-        if path in handled_paths and existing_index is None:
-            return
-        if existing_index is not None and path not in frontmatter_activations:
-            add_declaration_role(path, source_kind)
-            return
-        activation = (source_kind, activation_lifetime, execution_root, runtime_status)
-        activations = frontmatter_activations.setdefault(path, set())
-        if activation in activations:
-            add_declaration_role(path, source_kind)
-            return
-        activations.add(activation)
-        frontmatter_attempted.add(path)
-        content = cache.get(path)
-        if content is None:
-            handled_paths.add(path)
-            frontmatter_failed.add(path)
-            events.append(_failure(path, KeyError(path)))
-            return
-        if path in manifest_limited_paths and not _frontmatter_has_explicit_hooks_key(content):
-            frontmatter_hookless.add(path)
-            return
-        try:
-            existing = documents[existing_index] if existing_index is not None else None
-            document = _parse_frontmatter_document(
-                path,
-                content,
-                source_kind,
-                activation_lifetime,
-                execution_root,
-                runtime_status,
-                registration_limit=(
-                    _MAX_REGISTRATIONS_PER_DOCUMENT
-                    - (len(existing.registrations) if existing is not None else 0)
-                ),
-            )
-        except (InvalidHookConfigurationError, TypeError) as exc:
-            discard_document(path)
-            handled_paths.add(path)
-            frontmatter_failed.add(path)
-            events.append(_failure(path, exc))
-            return
-        if document is None:
-            frontmatter_hookless.add(path)
-            return
-        handled_paths.add(path)
-        if existing is None:
-            add_document(document)
-            return
-        assert existing_index is not None
-        documents[existing_index] = replace(
-            existing,
-            registrations=(*existing.registrations, *document.registrations),
-            flow_inputs=(*existing.flow_inputs, *document.flow_inputs),
-        )
-        add_declaration_role(path, source_kind)
-
-    plugin_roots_by_manifest = {
-        manifest_path: _manifest_root(manifest_path) for manifest_path in manifest_fields
-    }
-    marketplace_command_overrides = {
-        entry.plugin_root
-        for entry in marketplace_entries
-        if entry.plugin_root is not None and entry.commands is not None
-    }
-    marketplace_skill_overrides = {
-        entry.plugin_root
-        for entry in marketplace_entries
-        if entry.strict
-        and entry.plugin_root is not None
-        and entry.skills is not None
-        and entry.source_is_root
-    }
-    for manifest_path, plugin_root in plugin_roots_by_manifest.items():
-        if plugin_root not in marketplace_skill_overrides:
-            for path in sorted(
-                _default_plugin_skill_paths(plugin_root, candidates_for_root(plugin_root)),
-                key=reference_order,
-            ):
-                inspect_frontmatter(
-                    path, "plugin_default_skill", "invocation_through_session", plugin_root
-                )
-
-        fields = manifest_fields.get(manifest_path, set())
-        components = manifest_components.get(manifest_path, {})
-        if "skills" in fields:
-            custom_skills, missing_skills = _manifest_component_paths(
-                plugin_root,
-                components["skills"],
-                component_kind="skills",
-                candidates=candidates_for_root(plugin_root),
-            )
-            for missing_path in missing_skills:
-                if missing_path not in frontmatter_attempted and missing_path not in handled_paths:
-                    frontmatter_attempted.add(missing_path)
-                    handled_paths.add(missing_path)
-                    events.append(_failure(missing_path, KeyError(missing_path)))
-            for path in sorted(custom_skills, key=reference_order):
-                inspect_frontmatter(
-                    path, "plugin_manifest_skill", "invocation_through_session", plugin_root
-                )
-
-        if "commands" in fields:
-            custom_commands, missing_commands = _manifest_component_paths(
-                plugin_root,
-                components["commands"],
-                component_kind="commands",
-                candidates=candidates_for_root(plugin_root),
-            )
-            for missing_path in missing_commands:
-                if missing_path not in frontmatter_attempted and missing_path not in handled_paths:
-                    frontmatter_attempted.add(missing_path)
-                    handled_paths.add(missing_path)
-                    events.append(_failure(missing_path, KeyError(missing_path)))
-            for path in sorted(custom_commands, key=reference_order):
-                inspect_frontmatter(
-                    path, "plugin_manifest_command", "invocation_through_session", plugin_root
-                )
-        else:
-            for path in sorted(
-                _default_plugin_command_paths(plugin_root, candidates_for_root(plugin_root)),
-                key=reference_order,
-            ):
-                if plugin_root not in marketplace_command_overrides:
-                    inspect_frontmatter(
-                        path, "plugin_default_command", "invocation_through_session", plugin_root
-                    )
-
-        root_skill = _resolve_component_reference(plugin_root, "./SKILL.md")
-        if (
-            root_skill in known_paths
-            and "skills" not in fields
-            and not _has_default_plugin_skills_directory(
-                plugin_root, candidates_for_root(plugin_root)
-            )
-        ):
-            inspect_frontmatter(
-                root_skill, "plugin_root_skill", "invocation_through_session", plugin_root
-            )
-
-    manifest_roots = set(plugin_roots_by_manifest.values())
-    for entry in marketplace_entries:
-        plugin_root = entry.plugin_root
-        if plugin_root is None:
-            continue
-        if _manifest_path(plugin_root) in invalid_manifest_paths:
-            continue
-        if entry.strict and plugin_root not in manifest_roots:
-            if plugin_root not in marketplace_skill_overrides:
-                for path in sorted(
-                    _default_plugin_skill_paths(plugin_root, candidates_for_root(plugin_root)),
-                    key=reference_order,
-                ):
-                    inspect_frontmatter(
-                        path, "plugin_default_skill", "invocation_through_session", plugin_root
-                    )
-                if entry.skills is None and not _has_default_plugin_skills_directory(
-                    plugin_root, candidates_for_root(plugin_root)
-                ):
-                    root_skill = _resolve_component_reference(plugin_root, "./SKILL.md")
-                    if root_skill in known_paths:
-                        inspect_frontmatter(
-                            root_skill,
-                            "plugin_root_skill",
-                            "invocation_through_session",
-                            plugin_root,
-                        )
-            if entry.commands is None:
-                for path in sorted(
-                    _default_plugin_command_paths(plugin_root, candidates_for_root(plugin_root)),
-                    key=reference_order,
-                ):
-                    inspect_frontmatter(
-                        path, "plugin_default_command", "invocation_through_session", plugin_root
-                    )
-
-        for field, value, source_kind in (
-            ("skills", entry.skills, "marketplace_plugin_skill"),
-            ("commands", entry.commands, "marketplace_plugin_command"),
-        ):
-            if value is None:
-                continue
-            try:
-                candidates = [
-                    path
-                    for path in candidates_for_root(plugin_root)
-                    if path not in marketplace_path_set and path not in manifest_path_set
-                ]
-                selected, missing = _manifest_component_paths(
-                    plugin_root,
-                    value,
-                    component_kind=field,
-                    candidates=candidates,
-                )
-                for missing_path in missing:
-                    if (
-                        missing_path not in frontmatter_attempted
-                        and missing_path not in handled_paths
-                    ):
-                        frontmatter_attempted.add(missing_path)
-                        handled_paths.add(missing_path)
-                        events.append(_failure(missing_path, KeyError(missing_path)))
-                if field == "skills" and entry.strict and not selected and missing:
-                    for fallback_path in sorted(
-                        _default_plugin_skill_paths(plugin_root, candidates_for_root(plugin_root)),
-                        key=reference_order,
-                    ):
-                        inspect_frontmatter(
-                            fallback_path,
-                            "plugin_default_skill",
-                            "invocation_through_session",
-                            plugin_root,
-                        )
-                for path in sorted(selected, key=reference_order):
-                    inspect_frontmatter(
-                        path, source_kind, "invocation_through_session", plugin_root
-                    )
-            except (InvalidHookConfigurationError, TypeError) as exc:
-                record_marketplace_entry_failure(entry.ledger_path, exc)
-
-    all_plugin_root_values = tuple(_manifest_root(manifest_path) for manifest_path in manifests)
-    plugin_content_paths = {
-        candidate for root in all_plugin_root_values for candidate in candidates_for_root(root)
-    }
-    for path in paths:
-        _, parts = _path_parts(path)
-        if not parts or path in frontmatter_attempted:
-            continue
-        is_plugin_content = path in plugin_content_paths
-        if len(parts) == 1 and parts[0] in {"SKILL.md", "skill.md"} and not is_plugin_content:
-            inspect_frontmatter(
-                path,
-                "root_skill",
-                "invocation_through_session",
-                _archive_or_project_root(path),
-                "runtime_unconfirmed" if parts[0] == "skill.md" else "declared_unclassified",
-            )
-            continue
-        if parts[:2] == (".claude", "skills") and parts[-1] == "SKILL.md":
-            inspect_frontmatter(
-                path,
-                "project_skill",
-                "invocation_through_session",
-                _archive_or_project_root(path),
-            )
-            continue
-        if (
-            len(parts) >= 3
-            and parts[:2] == (".claude", "commands")
-            and parts[-1].lower().endswith(".md")
-        ):
-            inspect_frontmatter(
-                path,
-                "project_command",
-                "invocation_through_session",
-                _archive_or_project_root(path),
-            )
-            continue
-        if (
-            len(parts) == 3
-            and parts[:2] == (".claude", "agents")
-            and parts[-1].lower().endswith(".md")
-            and not is_plugin_content
-        ):
-            inspect_frontmatter(
-                path,
-                "project_agent",
-                "project_subagent",
-                _archive_or_project_root(path),
-            )
-
-    documents.sort(key=lambda document: reference_order(document.source_path))
-    flow_batch = analyze_documents(
-        tuple(
-            DocumentFlowInput(
-                source_kind=document.source_kind,
-                declaration_roles=document.declaration_roles,
-                source_path=document.source_path,
-                activation_lifetime=document.activation_lifetime,
-                content_digest=document.content_digest,
-                handlers=document.flow_inputs,
-            )
-            for document in documents
-        ),
-        local_file_cache=cast(dict[str, str], state.get("local_file_cache") or {}),
-        user_config_by_root=user_config_by_root,
-        python_ast_cache_key=cast(str | None, state.get("python_ast_cache_key")),
-    )
-    findings_by_owner: dict[FlowWorkRef, list[Finding]] = {}
-    for owned in flow_batch.findings:
-        findings_by_owner.setdefault(owned.owner, []).append(owned.finding)
-
-    settings_permission_findings: dict[str, Finding] = {}
-    for path, settings_work in settings_work_by_path.items():
-        if settings_work.permission_analysis is None:
-            continue
-        permission_finding = build_bh3_finding(
-            settings_work.permission_analysis,
-            source_path=path,
-        )
-        if permission_finding is not None:
-            settings_permission_findings[path] = permission_finding
-
     findings: list[Finding] = []
-    document_owners: set[FlowWorkRef] = set()
-    documents_by_owner: dict[FlowWorkRef, HookDocument] = {}
-    settings_findings_by_path: dict[str, list[Finding]] = {}
-    for document in documents:
-        owner = FlowWorkRef(document.source_path)
-        document_owners.add(owner)
-        documents_by_owner[owner] = document
-        document_findings = (
-            [_bh1_finding(document, cache_path_set)] if document.registrations else []
-        )
-        document_findings.extend(findings_by_owner.get(owner, []))
-        permission_finding = settings_permission_findings.get(document.source_path)
-        if permission_finding is not None:
-            document_findings.append(permission_finding)
-        findings.extend(document_findings)
-        if document.source_path in settings_work_by_path:
-            settings_findings_by_path[document.source_path] = document_findings
-        else:
-            events.append(_completed(document.source_path, document_findings))
+    ledger_events: list[InspectionLedgerEvent] = []
+    previous_settings_hook_ids: set[_HookIdentity] = set()
+    applicable_paths = set(components).intersection(_APPLICABLE_PATHS)
+    hooks_disabled = _bundled_hooks_are_disabled(applicable_paths, file_cache, decodable)
 
-    for path in sorted(settings_work_by_path, key=reference_order):
-        if path not in settings_findings_by_path:
-            permission_finding = settings_permission_findings.get(path)
-            path_findings = [permission_finding] if permission_finding is not None else []
-            findings.extend(path_findings)
-            settings_findings_by_path[path] = path_findings
-        terminal = _settings_terminal(
-            settings_work_by_path[path],
-            settings_hook_results.get(path),
-            settings_findings_by_path[path],
-        )
-        if terminal is not None:
-            events.append(terminal)
-
-    findings.extend(
-        owned.finding for owned in flow_batch.findings if owned.owner not in document_owners
-    )
-    occupied_work_refs = {
-        FlowWorkRef(event["path"], event["start_line"], event["end_line"]) for event in events
-    }
-    for work in flow_batch.work:
-        original_ref = work.ref
-        if original_ref in occupied_work_refs:
-            if original_ref in document_owners and work.outcome is LedgerOutcome.COMPLETED:
-                continue
-            collision_document = documents_by_owner.get(original_ref)
-            source_line = (
-                min(
-                    (registration.source_line for registration in collision_document.registrations),
-                    default=1,
+    for path in sorted(applicable_paths):
+        if decodable.get(path) is False:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="static",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
                 )
-                if collision_document is not None
-                else original_ref.start_line or 1
             )
-            activation_ref = FlowWorkRef(original_ref.path, source_line, source_line)
-            while activation_ref in occupied_work_refs:
-                source_line += 1
-                activation_ref = FlowWorkRef(original_ref.path, source_line, source_line)
-            work = replace(work, ref=activation_ref)
-        occupied_work_refs.add(work.ref)
-        events.append(_flow_terminal(work, findings_by_owner.get(original_ref, [])))
-
-    synthetic_event_ids = {id(event) for event in marketplace_entry_events.values()}
-    occupied_work_ids = {
-        event["work_id"] for event in events if id(event) not in synthetic_event_ids
-    }
-    for base_path, event in marketplace_entry_events.items():
-        if event["work_id"] in occupied_work_ids:
-            suffix = 1
-            candidate_path = f"{base_path}#ledger[{suffix}]"
-            candidate_work_id = inspection_work_id(
-                ANALYZER_ID,
-                candidate_path,
-                event["start_line"],
-                event["end_line"],
-            )
-            while candidate_work_id in occupied_work_ids:
-                suffix += 1
-                candidate_path = f"{base_path}#ledger[{suffix}]"
-                candidate_work_id = inspection_work_id(
-                    ANALYZER_ID,
-                    candidate_path,
-                    event["start_line"],
-                    event["end_line"],
+            continue
+        content = file_cache.get(path)
+        if content is None:
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.MISSING_FILE_CACHE,
                 )
-            event["path"] = candidate_path
-            event["work_id"] = candidate_work_id
-        occupied_work_ids.add(event["work_id"])
+            )
+            continue
+        try:
+            path_findings, event = _analyze_document(
+                path,
+                content,
+                previous_settings_hook_ids
+                if path in {".claude/settings.json", ".claude/settings.local.json"}
+                else None,
+                hooks_disabled=hooks_disabled and path != "hooks/hooks.json",
+            )
+        except Exception as exc:
+            logger.exception("%s failed for %s", ANALYZER_ID, path)
+            ledger_events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    phase="static",
+                    analyzer_id=ANALYZER_ID,
+                    path=path,
+                    reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        findings.extend(path_findings)
+        ledger_events.append(event)
 
+    status = analyzer_status_for_events(ANALYZER_ID, ledger_events)
     return {
         "findings": findings,
-        "inspection_ledger": events,
-        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, events)],
+        "inspection_ledger": ledger_events,
+        "analyzer_status_events": [status],
     }

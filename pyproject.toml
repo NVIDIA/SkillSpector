@@ -34,6 +34,8 @@ dependencies = [
     "typer>=0.23.0,<0.24",
     "rich>=14.3.0",
     "httpx>=0.28.0",
+    "pywhatwgurl==0.1.1",
+    "regex==2026.5.9",
     "packaging>=24.0",
     "pyyaml>=6.0.1",
     "pydantic>=2.12.0",

@@ -42,11 +42,13 @@ class PatternCategory(StrEnum):
     ANTI_REFUSAL = "Anti-Refusal"
     SERVER_SIDE_REQUEST_FORGERY = "Server-Side Request Forgery"
     DESERIALIZATION = "Insecure Deserialization"
-    BUNDLED_EXECUTION_SURFACE = "Bundled Execution Surface"
 
 
 # Pattern-specific explanations (why the finding is dangerous)
 DEFAULT_EXPLANATIONS: dict[str, str] = {
+    "BH1": "Bundled lifecycle hooks can run automatically when their configured events occur, so their reach and handler capability require review before installation.",
+    "BH2": "The bundled hook declaration directly proves that sensitive event or local file content is sent to a non-loopback remote destination.",
+    "BH3": "Bundled project settings contain permission-related configuration; activation evidence distinguishes conditional grants from modes ignored on this surface.",
     "P1": "This pattern attempts to override system instructions or ignore safety constraints. Without LLM analysis, manual review is recommended.",
     "P2": "Hidden instructions were detected in comments or invisible text. These could contain malicious directives. Manual review is recommended.",
     "P3": "Instructions found that direct the agent to transmit conversation context or user data to external services.",
@@ -97,9 +99,6 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SC7": "Code pulls a container image with signature or registry verification disabled (--disable-content-trust, DOCKER_CONTENT_TRUST=0, --insecure-registry). This accepts tampered or unverified images and is a container supply-chain risk.",
     "SC8": "Skill ships Python bytecode (__pycache__/ or .pyc/.pyo). Discovery skips these paths, so malicious bytecode can score SAFE while decoy sources look clean.",
     "SC9": "Executable content is concealed inside a document container or hidden/disguised artifact, where extension-based review can miss it.",
-    "BH1": "The artifact declares Claude Code hooks that can run automatically when runtime events fire. Review the activation scope and handler behavior before enabling the artifact.",
-    "BH2": "A bundled hook contains a correlated path from sensitive runtime data to an outbound transport. Enabling the artifact can disclose prompts, tool data, credentials, or local files.",
-    "BH3": "The artifact declares Claude Code permission grants that can broaden tool or permission-mode access when the artifact is trusted. Review every effective grant before enabling the artifact.",
     # Trigger Abuse
     "TR1": "Skill uses overly broad trigger patterns that match common words or phrases, causing it to activate in unintended contexts and potentially shadow other skills.",
     "TR2": "Skill trigger shadows a common built-in command or another skill's trigger, potentially intercepting requests meant for trusted functionality.",
@@ -201,9 +200,6 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SC7": PatternCategory.SUPPLY_CHAIN.value,
     "SC8": PatternCategory.SUPPLY_CHAIN.value,
     "SC9": PatternCategory.SUPPLY_CHAIN.value,
-    "BH1": PatternCategory.BUNDLED_EXECUTION_SURFACE.value,
-    "BH2": PatternCategory.BUNDLED_EXECUTION_SURFACE.value,
-    "BH3": PatternCategory.BUNDLED_EXECUTION_SURFACE.value,
     "TR1": PatternCategory.TRIGGER_ABUSE.value,
     "TR2": PatternCategory.TRIGGER_ABUSE.value,
     "TR3": PatternCategory.TRIGGER_ABUSE.value,
@@ -292,9 +288,6 @@ PATTERN_NAMES: dict[str, str] = {
     "SC7": "Untrusted Container Image",
     "SC8": "Shipped Python Bytecode",
     "SC9": "Concealed Executable Artifact",
-    "BH1": "Bundled Hook Execution Surface",
-    "BH2": "Bundled Hook Data Exfiltration",
-    "BH3": "Bundled Permission Grant",
     "TR1": "Overly Broad Trigger",
     "TR2": "Shadow Command Trigger",
     "TR3": "Keyword Baiting Trigger",
@@ -392,9 +385,6 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SC7": "Keep image signature verification (Docker Content Trust / cosign) and registry TLS enabled. Pull only signed images from trusted registries; never disable content-trust or use insecure registries in skill code.",
     "SC8": "Do not ship __pycache__/ or .pyc/.pyo in skills. Delete bytecode before packaging; if presence is intentional for a lab fixture, quarantine it outside the skill install path.",
     "SC9": "Keep executable files explicit and directly reviewable. Review the artifact provenance and why executable content is packaged inside a document, hidden file, or disguised container.",
-    "BH1": "Inspect every declared hook, narrow its event and matcher scope, and remove handlers that are not essential. Do not enable the artifact until its automatic execution behavior is trusted.",
-    "BH2": "Remove the sensitive source-to-outbound-sink flow. Never forward hook event input, prompt or tool data, credentials, or sensitive files to an external destination.",
-    "BH3": "Remove grants that are not essential, replace broad rules with narrowly scoped permissions, and avoid bypass permission modes. Do not trust the artifact until every effective grant is justified.",
     # Trigger Abuse
     "TR1": "Use specific, narrow trigger patterns that match only the skill's intended use case. Avoid single-word or common-phrase triggers.",
     "TR2": "Choose triggers that do not conflict with built-in commands or other skills. Prefix with a unique namespace if necessary.",

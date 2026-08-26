@@ -20,7 +20,7 @@ from __future__ import annotations
 from skillspector.nodes.analyzers import ANALYZER_NODE_IDS, ANALYZER_NODES
 
 # Expected analyzer node IDs per the workflow reference table.
-# Order: artifact integrity (1), static (17), behavioral (2), mcp (3), semantic (4).
+# Order: artifact integrity (1), static (16), behavioral (2), mcp (3), semantic (3).
 EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "artifact_integrity",
     "static_patterns_prompt_injection",
@@ -39,9 +39,9 @@ EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "static_patterns_ssrf",
     "static_patterns_deserialization",
     "static_yara",
-    "bundled_execution_surface",
     "behavioral_ast",
     "behavioral_taint_tracking",
+    "bundled_execution_surface",
     "mcp_least_privilege",
     "mcp_tool_poisoning",
     "mcp_rug_pull",
@@ -68,9 +68,3 @@ class TestAnalyzerRegistry:
         """ANALYZER_NODES has no entries beyond ANALYZER_NODE_IDS."""
         for node_id in ANALYZER_NODES:
             assert node_id in ANALYZER_NODE_IDS, f"Extra ANALYZER_NODES entry: {node_id}"
-
-    def test_permission_grants_extend_the_existing_bundled_surface_node(self) -> None:
-        """BH3 must not add a second analyzer node for the same settings document."""
-        assert ANALYZER_NODE_IDS.count("bundled_execution_surface") == 1
-        assert "bundled_permission_grants" not in ANALYZER_NODE_IDS
-        assert "bundled_permission_grants" not in ANALYZER_NODES
