@@ -596,7 +596,7 @@ def scan(
                 "[yellow]Warning:[/yellow] Recursive skill discovery was incomplete; "
                 "continuing with a bounded scan and reporting partial coverage."
             )
-        if detection.is_multi_skill:
+        if detection.skills:
             if baseline is not None:
                 err_console.print(
                     "[red]Error:[/red] --baseline is not supported for recursive "

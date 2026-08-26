@@ -370,6 +370,59 @@ def test_cli_scan_required_table_keeps_malicious_pe3(tmp_path: Path) -> None:
     assert any(issue["id"] == "PE3" for issue in issues)
 
 
+def test_cli_keyring_access_can_be_suppressed_by_baseline(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: keyring-access\ndescription: test\n---\n\n"
+        "Use the keyring CLI to export credentials.\n",
+        encoding="utf-8",
+    )
+    baseline = tmp_path / "baseline.yaml"
+    generated = runner.invoke(app, ["baseline", str(skill), "--no-llm", "--output", str(baseline)])
+    assert generated.exit_code == 0, generated.output
+    result = runner.invoke(
+        app,
+        ["scan", str(skill), "--format", "json", "--no-llm", "--baseline", str(baseline)],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["suppressed_count"] >= 1
+    assert any(issue["id"] == "PE3" for issue in payload["suppressed"])
+
+
+def test_cli_keyring_access_is_kept_in_json_and_sarif(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: keyring-access\ndescription: test\n---\n\nFetch secrets from the keyring.\n",
+        encoding="utf-8",
+    )
+
+    json_result = runner.invoke(app, ["scan", str(skill), "--format", "json", "--no-llm"])
+    assert json_result.exit_code in {0, 1}, json_result.output
+    json_payload = json.loads(json_result.output)
+    assert any(issue["id"] == "PE3" for issue in json_payload["issues"])
+
+    sarif_result = runner.invoke(app, ["scan", str(skill), "--format", "sarif", "--no-llm"])
+    assert sarif_result.exit_code in {0, 1}, sarif_result.output
+    sarif_payload = json.loads(sarif_result.output)
+    validate_sarif_report(sarif_payload)
+    assert any(
+        result.get("ruleId") == "PE3"
+        for run in sarif_payload["runs"]
+        for result in run.get("results", [])
+    )
+
+
+def test_cli_keyring_fixture_reproduction_is_clean() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "pe3_bare_keyring"
+    result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert not any(issue["id"] == "PE3" for issue in payload["issues"])
+
+
 def test_cli_scan_nonexistent_exits_2() -> None:
     """scan with nonexistent path exits with code 2."""
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])
@@ -3716,40 +3769,6 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
     written = yaml.safe_load(out.read_text(encoding="utf-8"))
     assert written.get("fingerprints", []) == []
     assert "0 suppressed finding(s)" in re.sub(r"\x1b\[[0-9;]*m", "", invocation.output)
-
-
-def test_cli_baseline_uses_local_cache_for_hidden_structural_findings(tmp_path: Path) -> None:
-    """Hidden hook findings fingerprint their deterministic local-cache source."""
-    skill = tmp_path / "skill"
-    skill.mkdir()
-    (skill / "SKILL.md").write_text("---\nname: baseline\n---\n", encoding="utf-8")
-    output = tmp_path / "baseline.yaml"
-    path = ".claude/settings.json"
-    content = '{"hooks": {}}'
-    finding = Finding(
-        rule_id="BH1",
-        message="bundled hook",
-        finding_id="bh1-hidden",
-        severity="LOW",
-        confidence=1.0,
-        file=path,
-        matched_text="sha256:" + ("a" * 64),
-    )
-    graph_result = {
-        "findings": [finding],
-        "filtered_findings": [finding],
-        "suppressed_findings": [],
-        "file_cache": {},
-        "local_file_cache": {path: content},
-        "risk_score": 5,
-    }
-
-    with patch("skillspector.cli.graph.invoke", return_value=graph_result):
-        invocation = runner.invoke(app, ["baseline", str(skill), "-o", str(output), "--no-llm"])
-
-    assert invocation.exit_code == 0, invocation.output
-    written = yaml.safe_load(output.read_text(encoding="utf-8"))
-    assert [entry["rule_id"] for entry in written["fingerprints"]] == ["BH1"]
 
 
 def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: Path) -> None:

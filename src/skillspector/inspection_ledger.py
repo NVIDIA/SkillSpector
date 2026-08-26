@@ -52,11 +52,6 @@ class LedgerReason(StrEnum):
     BINARY_CONTENT = "binary_content"
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
-    INVALID_CONFIGURATION = "invalid_configuration"
-    DEPTH_LIMIT = "depth_limit"
-    COMPONENT_LIMIT = "component_limit"
-    AGGREGATE_BUDGET = "aggregate_budget"
-    UNMODELED_PAYLOAD = "unmodeled_payload"
     LLM_BATCH_FAILED = "llm_batch_failed"
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
@@ -112,11 +107,6 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Evaluation dataset prose is excluded from static pattern analysis."
     ),
     LedgerReason.SYNTAX_ERROR: "Python source could not be parsed.",
-    LedgerReason.INVALID_CONFIGURATION: "Applicable configuration is malformed or invalid.",
-    LedgerReason.DEPTH_LIMIT: "Referenced component traversal exceeded its depth limit.",
-    LedgerReason.COMPONENT_LIMIT: "Referenced component traversal exceeded its component limit.",
-    LedgerReason.AGGREGATE_BUDGET: "Referenced component traversal exceeded its aggregate budget.",
-    LedgerReason.UNMODELED_PAYLOAD: "Reachable payload behavior is outside the supported model.",
     LedgerReason.LLM_BATCH_FAILED: "LLM analysis failed for this file range.",
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM returned a malformed structured response after bounded retries."
