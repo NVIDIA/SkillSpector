@@ -68,6 +68,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "EA2": "Skill enables autonomous high-impact decisions without human-in-the-loop verification. Critical operations (destructive commands, financial transactions, data deletion) should require explicit user confirmation.",
     "EA3": "Skill's behavior or capabilities extend beyond its stated purpose. Scope creep allows an agent to perform actions unrelated to its documented functionality, increasing the attack surface.",
     "EA4": "Skill allows unbounded resource consumption (API calls, storage, compute). Without rate limits or quotas, a compromised or misbehaving agent can cause denial-of-service or cost overruns.",
+    "EA5": "Skill selects an external model or provider that may use a different account or billing plan than the operator expects. Undisclosed model switches can cause unexpected cost or quota consumption.",
     # Output Handling (B.1.7)
     "OH1": "Model output is used without validation or sanitization. Unvalidated output injected into downstream contexts (SQL, shell, HTML) enables injection attacks and arbitrary code execution.",
     "OH2": "Output from one security context is used in another without boundary enforcement. Cross-context output flow can leak sensitive information or escalate privileges across trust boundaries.",
@@ -94,6 +95,7 @@ DEFAULT_EXPLANATIONS: dict[str, str] = {
     "SC6": "Package name closely resembles a popular package, suggesting possible typosquatting. Attackers publish malicious packages with similar names to trick developers into installing them.",
     "SC7": "Code pulls a container image with signature or registry verification disabled (--disable-content-trust, DOCKER_CONTENT_TRUST=0, --insecure-registry). This accepts tampered or unverified images and is a container supply-chain risk.",
     "SC8": "Skill ships Python bytecode (__pycache__/ or .pyc/.pyo). Discovery skips these paths, so malicious bytecode can score SAFE while decoy sources look clean.",
+    "SC9": "Executable content is concealed inside a document container or hidden/disguised artifact, where extension-based review can miss it.",
     # Trigger Abuse
     "TR1": "Skill uses overly broad trigger patterns that match common words or phrases, causing it to activate in unintended contexts and potentially shadow other skills.",
     "TR2": "Skill trigger shadows a common built-in command or another skill's trigger, potentially intercepting requests meant for trusted functionality.",
@@ -176,6 +178,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "EA2": PatternCategory.EXCESSIVE_AGENCY.value,
     "EA3": PatternCategory.EXCESSIVE_AGENCY.value,
     "EA4": PatternCategory.EXCESSIVE_AGENCY.value,
+    "EA5": PatternCategory.EXCESSIVE_AGENCY.value,
     "OH1": PatternCategory.OUTPUT_HANDLING.value,
     "OH2": PatternCategory.OUTPUT_HANDLING.value,
     "OH3": PatternCategory.OUTPUT_HANDLING.value,
@@ -193,6 +196,7 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "SC6": PatternCategory.SUPPLY_CHAIN.value,
     "SC7": PatternCategory.SUPPLY_CHAIN.value,
     "SC8": PatternCategory.SUPPLY_CHAIN.value,
+    "SC9": PatternCategory.SUPPLY_CHAIN.value,
     "TR1": PatternCategory.TRIGGER_ABUSE.value,
     "TR2": PatternCategory.TRIGGER_ABUSE.value,
     "TR3": PatternCategory.TRIGGER_ABUSE.value,
@@ -262,6 +266,7 @@ PATTERN_NAMES: dict[str, str] = {
     "EA2": "Autonomous Decision Making",
     "EA3": "Scope Creep",
     "EA4": "Unbounded Resource Access",
+    "EA5": "External Model or Provider Selection",
     "OH1": "Unvalidated Output Injection",
     "OH2": "Cross-Context Output",
     "OH3": "Unbounded Output",
@@ -279,6 +284,7 @@ PATTERN_NAMES: dict[str, str] = {
     "SC6": "Typosquatting Dependency",
     "SC7": "Untrusted Container Image",
     "SC8": "Shipped Python Bytecode",
+    "SC9": "Concealed Executable Artifact",
     "TR1": "Overly Broad Trigger",
     "TR2": "Shadow Command Trigger",
     "TR3": "Keyword Baiting Trigger",
@@ -348,6 +354,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "EA2": "Add human-in-the-loop confirmation for destructive, irreversible, or high-impact operations. Never auto-execute commands that modify files, send data, or alter system state.",
     "EA3": "Limit the skill's scope to its documented purpose. Remove instructions that enable the agent to perform actions outside its stated functionality.",
     "EA4": "Set explicit rate limits, timeouts, and resource quotas for API calls, file operations, and compute. Implement circuit breakers for runaway loops.",
+    "EA5": "Remove the model/provider override or disclose it prominently and require explicit operator approval before invoking an external coding CLI or billed model.",
     # Output Handling (B.1.7)
     "OH1": "Validate and sanitize all model output before using it in downstream contexts. Use parameterized queries for SQL, shell quoting for commands, and HTML encoding for web output.",
     "OH2": "Enforce strict context boundaries. Do not pass output from one security domain into another without explicit validation and redaction of sensitive content.",
@@ -374,6 +381,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "SC6": "Verify the package name is correct and not a typosquatting variant. Compare against the official package name on PyPI or npm.",
     "SC7": "Keep image signature verification (Docker Content Trust / cosign) and registry TLS enabled. Pull only signed images from trusted registries; never disable content-trust or use insecure registries in skill code.",
     "SC8": "Do not ship __pycache__/ or .pyc/.pyo in skills. Delete bytecode before packaging; if presence is intentional for a lab fixture, quarantine it outside the skill install path.",
+    "SC9": "Keep executable files explicit and directly reviewable. Review the artifact provenance and why executable content is packaged inside a document, hidden file, or disguised container.",
     # Trigger Abuse
     "TR1": "Use specific, narrow trigger patterns that match only the skill's intended use case. Avoid single-word or common-phrase triggers.",
     "TR2": "Choose triggers that do not conflict with built-in commands or other skills. Prefix with a unique namespace if necessary.",
@@ -402,7 +410,7 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "YR3": "Remove all cryptocurrency mining code, pool references, and miner binaries. Mining in agent skills is unauthorized resource abuse. Report the skill as malicious.",
     "YR4": "Remove offensive tool references and exploit code. Legitimate agent skills should not contain penetration testing tools, exploit frameworks, or reconnaissance utilities.",
     # MCP Least Privilege (B.3.1)
-    "LP1": "Add the missing permission to SKILL.md, or remove the code that requires it.",
+    "LP1": "Declare the missing capability in the manifest type being scanned: for Agent Skills SKILL.md, add a covering tool to the 'allowed-tools' frontmatter field; for MCP server manifests, add the capability to the 'permissions' list. Otherwise, remove the code that requires it.",
     "LP2": "Replace wildcard permissions ('*', 'all', 'full', 'any') with an explicit list of required permissions.",
     "LP3": "Declare the skill's tool scope: for Claude Code / Agent Skills SKILL.md, list the tools the skill may invoke in the 'allowed-tools' frontmatter field; for MCP server manifests, add a 'permissions' list naming the required capabilities.",
     "LP4": "Remove the declared permission if the corresponding capability is no longer used.",

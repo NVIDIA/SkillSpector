@@ -108,6 +108,62 @@ class TestCrossFileDedup:
         assert result[0].confidence == 0.9
         assert result[0].file == "b.py"
 
+    def test_same_pattern_from_different_transitive_sources_is_preserved(self) -> None:
+        first = _finding(file="tool.py")
+        first.source_url = "https://github.com/org/first"
+        second = _finding(file="tool.py")
+        second.source_url = "https://github.com/org/second"
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
+    def test_same_display_url_with_different_source_identities_is_preserved(self) -> None:
+        first = _finding(file="tool.py")
+        first.source_url = "https://github.com/org/repository"
+        first.source_identity = "external/first"
+        first.source_digest = "sha256:" + "a" * 64
+        second = _finding(file="tool.py")
+        second.source_url = first.source_url
+        second.source_identity = "external/second"
+        second.source_digest = "sha256:" + "b" * 64
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
+    def test_same_immutable_source_deduplicates_across_display_urls(self) -> None:
+        first = _finding(file="tool.py", start_line=1)
+        first.source_url = "https://github.com/org/repository/tree/main"
+        first.source_identity = "external/source"
+        first.source_digest = "sha256:" + "a" * 64
+        second = _finding(file="tool.py", start_line=2)
+        second.source_url = "https://github.com/org/repository/tree/release"
+        second.source_identity = first.source_identity
+        second.source_digest = first.source_digest
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 1
+        assert {item["source_identity"] for item in result[0].occurrences} == {"external/source"}
+        assert {item["source_digest"] for item in result[0].occurrences} == {"sha256:" + "a" * 64}
+        assert {item["source_url"] for item in result[0].occurrences} == {
+            first.source_url,
+            second.source_url,
+        }
+
+    def test_occurrence_only_source_identities_are_not_cross_deduplicated(self) -> None:
+        first = _finding(file="tool.py")
+        first.occurrences = [
+            {"file": "tool.py", "start_line": 1, "source_identity": "external/first"}
+        ]
+        second = _finding(file="tool.py")
+        second.occurrences = [
+            {"file": "tool.py", "start_line": 1, "source_identity": "external/second"}
+        ]
+
+        assert len(deduplicate([first, second])) == 2
+
     def test_different_patterns_across_files_not_deduped(self) -> None:
         """Different matched texts are independent even with same rule_id."""
         findings = [
@@ -212,13 +268,12 @@ class TestEdgeCases:
         result = deduplicate(findings)
         assert len(result) == 1
 
-    def test_long_matched_text_truncated_for_key(self) -> None:
-        """Only first 100 chars of matched_text are used for dedup key."""
+    def test_long_matched_text_uses_complete_fingerprint(self) -> None:
+        """Matches sharing a long prefix remain distinct when their suffix differs."""
         base = "x" * 100
         findings = [
             _finding(file="a.py", matched_text=base + "AAAA"),
             _finding(file="b.py", matched_text=base + "BBBB"),
         ]
         result = deduplicate(findings)
-        # First 100 chars are identical → deduplicated
-        assert len(result) == 1
+        assert len(result) == 2

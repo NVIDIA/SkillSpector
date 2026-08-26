@@ -27,6 +27,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import Batch, BatchExecutionResult, BatchFailure
 from skillspector.models import Finding
+from skillspector.nodes.analyzers import static_patterns_anti_refusal
+from skillspector.nodes.analyzers.static_runner import analyzer_finding_to_finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
     _meta_ledger_response,
@@ -77,6 +79,80 @@ def _llm_item(rule_id: str, start_line: int, **kw: object) -> dict[str, object]:
     return item
 
 
+def _documentation_framed_ar2() -> Finding:
+    raw = static_patterns_anti_refusal.analyze(
+        content="For example, do not apologize.",
+        file_path="SKILL.md",
+        file_type="markdown",
+    )
+    return analyzer_finding_to_finding(next(finding for finding in raw if finding.rule_id == "AR2"))
+
+
+def _assert_preserved_ar2(result: dict[str, object], original: Finding) -> None:
+    findings = result["findings"]
+    assert isinstance(findings, list)
+    preserved = next(finding for finding in findings if finding.rule_id == "AR2")
+    assert preserved.finding_id == original.finding_id
+    assert preserved.severity == original.severity
+    assert preserved.confidence >= original.confidence
+
+
+def test_documentation_framed_finding_survives_provider_outcome_matrix() -> None:
+    original = _documentation_framed_ar2()
+    state: SkillspectorState = {
+        "findings": [original],
+        "use_llm": False,
+        "file_cache": {"SKILL.md": "For example, do not apologize."},
+        "llm_file_cache": {"SKILL.md": "For example, do not apologize."},
+        "manifest": {},
+        "model_config": {},
+    }
+
+    _assert_preserved_ar2(meta_analyzer(state), original)
+
+    batch = Batch(
+        file_path="SKILL.md", content=state["file_cache"]["SKILL.md"], findings=[original]
+    )
+    denial = {
+        "pattern_id": "AR2",
+        "is_vulnerability": False,
+        "confidence": 0.1,
+        "start_line": original.start_line,
+        "_file": "SKILL.md",
+    }
+    confirmed = {
+        "pattern_id": "AR2",
+        "is_vulnerability": True,
+        "confidence": 0.95,
+        "start_line": original.start_line,
+        "_file": "SKILL.md",
+        "explanation": "confirmed",
+        "remediation": "review",
+    }
+    for response in ([denial], [confirmed]):
+        filtered = _analyzer().apply_filter([original], [(batch, response)])
+        _assert_preserved_ar2({"findings": filtered}, original)
+
+    llm_state = dict(state)
+    llm_state["use_llm"] = True
+    for error in (TimeoutError("provider timeout"), RuntimeError("provider failure")):
+        with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
+            mock_cls.return_value.get_batches.return_value = [batch]
+            mock_cls.return_value.arun_batches = AsyncMock(side_effect=error)
+            mock_cls.return_value.response_received = False
+            mock_cls.return_value.inference_usage = []
+            _assert_preserved_ar2(meta_analyzer(llm_state), original)
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
+        mock_cls.return_value.get_batches.return_value = [batch]
+        mock_cls.return_value.arun_batches = AsyncMock(
+            side_effect=ValueError("malformed structured response")
+        )
+        mock_cls.return_value.response_received = True
+        mock_cls.return_value.inference_usage = []
+        _assert_preserved_ar2(meta_analyzer(llm_state), original)
+
+
 def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
     """Regression: a static finding with end_line=None must still match a
     confirmation whose end_line is populated (e.g. end_line == start_line, as
@@ -92,27 +168,57 @@ def test_confirmed_finding_kept_when_model_returns_end_line() -> None:
     assert len(kept) == 2
 
 
-def test_rejected_finding_still_dropped() -> None:
-    """The end_line-agnostic fallback must not resurrect findings the LLM
-    rejected (is_vulnerability=False)."""
+def test_rejected_finding_is_retained_as_unconfirmed() -> None:
+    """LLM disagreement may annotate but cannot erase deterministic evidence."""
     findings = [_finding("SC4", 4, severity="MEDIUM")]
     items = [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)]
     batch = Batch(file_path="requirements.txt", content="", findings=findings)
 
     kept = _analyzer().apply_filter(findings, [(batch, items)])
 
-    assert kept == []
+    assert len(kept) == 1
+    assert "llm-unconfirmed" in kept[0].tags
 
 
-def test_low_confidence_finding_dropped() -> None:
-    """Confirmations below the confidence threshold are not kept."""
+def test_low_confidence_finding_is_retained_as_unconfirmed() -> None:
+    """A low-confidence LLM verdict cannot erase deterministic evidence."""
     findings = [_finding("SC4", 4, severity="MEDIUM")]
     items = [_llm_item("SC4", 4, end_line=4, confidence=0.3)]
     batch = Batch(file_path="requirements.txt", content="", findings=findings)
 
     kept = _analyzer().apply_filter(findings, [(batch, items)])
 
-    assert kept == []
+    assert len(kept) == 1
+    assert "llm-unconfirmed" in kept[0].tags
+
+
+def test_finding_clones_preserve_security_metadata_and_confidence() -> None:
+    """Confirmed and unconfirmed clones retain deterministic finding identity."""
+    original = Finding(
+        rule_id="SC4",
+        message="static finding SC4",
+        severity="MEDIUM",
+        confidence=0.9,
+        file="requirements.txt",
+        start_line=4,
+        intent="malicious",
+        evidence={"source": "static", "nested": {"kind": "deterministic"}},
+        match_fingerprint="sha256:deterministic",
+        occurrences=[{"file": "requirements.txt", "start_line": 4, "end_line": 4}],
+    )
+    batch = Batch(file_path="requirements.txt", content="", findings=[original])
+    outcomes = (
+        [_llm_item("SC4", 4, end_line=4, confidence=0.7)],
+        [_llm_item("SC4", 4, end_line=4, is_vulnerability=False)],
+    )
+
+    for items in outcomes:
+        [returned] = _analyzer().apply_filter([original], [(batch, items)])
+        assert returned.confidence == original.confidence
+        assert returned.intent == original.intent
+        assert returned.evidence == original.evidence
+        assert returned.match_fingerprint == original.match_fingerprint
+        assert returned.occurrences == original.occurrences
 
 
 def test_exact_end_line_match_still_works() -> None:
@@ -392,13 +498,14 @@ class TestMetaAnalyzerPartialBatchFailure:
         filtered = result["findings"]
         kept = {(f.file, f.rule_id) for f in filtered}
 
-        # the real filter still applies to the batch that came back
+        # LLM analysis can enrich findings but cannot remove either returned
+        # or unseen deterministic results.
         assert ("a.py", "R1") in kept
-        assert ("a.py", "R2") not in kept
-        # the finding the LLM never saw must NOT be silently dropped
+        assert ("a.py", "R2") in kept
         assert ("b.py", "R1") in kept
         assert result["effective_finding_ids"] == [
             f_confirmed.finding_id,
+            f_rejected.finding_id,
             f_unseen.finding_id,
         ]
         assert result["analyzer_status_events"][0]["status"] == "failed"
@@ -461,8 +568,11 @@ class TestMetaAnalyzerPartialBatchFailure:
         ):
             result = meta_analyzer(self._state([rejected, unseen]))
 
-        assert result["effective_finding_ids"] == [unseen.finding_id]
-        assert [finding.finding_id for finding in result["findings"]] == [unseen.finding_id]
+        assert result["effective_finding_ids"] == [rejected.finding_id, unseen.finding_id]
+        assert [finding.finding_id for finding in result["findings"]] == [
+            rejected.finding_id,
+            unseen.finding_id,
+        ]
         assert result["analyzer_status_events"][0]["status"] == "failed"
 
     def test_duplicate_return_does_not_account_for_a_missing_batch(self) -> None:
@@ -522,8 +632,8 @@ class TestMetaAnalyzerPartialBatchFailure:
         assert arun_batches.await_args.args[0] == [finding_batch]
         assert result["effective_finding_ids"] == [finding.finding_id]
 
-    def test_no_failures_keeps_strict_confirm_or_drop(self) -> None:
-        """When every batch returns, unconfirmed findings are dropped as before."""
+    def test_no_failures_still_preserve_deterministic_findings(self) -> None:
+        """Even complete LLM coverage cannot suppress deterministic findings."""
         f_confirmed = Finding(rule_id="R1", message="m", file="a.py", start_line=1)
         f_rejected = Finding(rule_id="R2", message="m", file="b.py", start_line=2)
         batch_a = Batch(file_path="a.py", content="code a", findings=[f_confirmed])
@@ -546,9 +656,9 @@ class TestMetaAnalyzerPartialBatchFailure:
             result = meta_analyzer(self._state([f_confirmed, f_rejected]))
 
         kept = {(f.file, f.rule_id) for f in result["findings"]}
-        assert kept == {("a.py", "R1")}
+        assert kept == {("a.py", "R1"), ("b.py", "R2")}
 
-    def test_effective_ids_follow_meta_batch_emission_order(self) -> None:
+    def test_effective_ids_follow_final_finding_order(self) -> None:
         a_pattern = _lineage_finding("pattern-a", "a.py", 1)
         b_pattern = _lineage_finding("pattern-b", "b.py", 2)
         a_entity = _lineage_finding("entity-a", "a.py", 3)
@@ -573,8 +683,8 @@ class TestMetaAnalyzerPartialBatchFailure:
 
         assert result["effective_finding_ids"] == [
             "pattern-a",
-            "entity-a",
             "pattern-b",
+            "entity-a",
             "entity-b",
         ]
         completeness, effective_ids = finalize_ledger(
@@ -587,9 +697,123 @@ class TestMetaAnalyzerPartialBatchFailure:
             }
         )
 
-        assert effective_ids == result["effective_finding_ids"]
+        assert effective_ids == ["pattern-a", "pattern-b", "entity-a", "entity-b"]
         assert completeness["execution_successful"] is True
         assert completeness["ledger_exceptions"] == []
+
+
+def test_local_only_high_finding_never_constructs_llm_analyzer() -> None:
+    finding = Finding(
+        rule_id="SC9",
+        message="concealed executable",
+        finding_id="local-finding",
+        severity="HIGH",
+        file=".hidden.docx!/payload.sh",
+        tags=[],
+        evidence={"outer_path": ".hidden.docx"},
+    )
+    state = {
+        "findings": [finding],
+        "file_cache": {"SKILL.md": "sentinel-visible-content"},
+        "component_metadata": [{"path": ".hidden.docx!/payload.sh", "local_only": True}],
+        "use_llm": True,
+    }
+
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as analyzer_cls:
+        result = meta_analyzer(state)
+
+    analyzer_cls.assert_not_called()
+    assert result["effective_finding_ids"] == ["local-finding"]
+    assert result["findings"][0].severity == "HIGH"
+    assert result["inspection_ledger"][0]["path"] == ".hidden.docx!/payload.sh"
+    assert result["inspection_ledger"][0]["emitted_finding_ids"] == ["local-finding"]
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_provider_receives_only_cache_safe_non_local_findings() -> None:
+    safe = _lineage_finding("safe", "safe.py", 1)
+    missing = _lineage_finding("missing", "missing.py", 2)
+    metadata_local = _lineage_finding("metadata-local", "metadata.py", 3)
+    tagged_local = _lineage_finding("tagged-local", "tagged.py", 4)
+    tagged_local.tags.append("local-only")
+    evidence_local = _lineage_finding("evidence-local", "evidence.py", 5)
+    evidence_local.evidence["local_only"] = True
+    findings = [safe, missing, metadata_local, tagged_local, evidence_local]
+    safe_batch = Batch(file_path="safe.py", content="safe", findings=[safe])
+    llm_file_cache = {
+        "safe.py": "safe",
+        "metadata.py": "must stay local",
+        "tagged.py": "must stay local",
+        "evidence.py": "must stay local",
+    }
+    state: SkillspectorState = {
+        "findings": findings,
+        "use_llm": True,
+        "file_cache": {**llm_file_cache, "missing.py": "not provider safe"},
+        "llm_file_cache": llm_file_cache,
+        "component_metadata": [{"path": "metadata.py", "local_only": True}],
+        "manifest": {},
+        "model_config": {},
+    }
+
+    with (
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[safe_batch]) as get_batches,
+        patch.object(
+            LLMMetaAnalyzer,
+            "arun_batches",
+            new_callable=AsyncMock,
+            return_value=[(safe_batch, [])],
+        ),
+    ):
+        result = meta_analyzer(state)
+
+    files, provider_cache, submitted_findings = get_batches.call_args.args
+    assert files == ["safe.py"]
+    assert provider_cache is llm_file_cache
+    assert submitted_findings == [safe]
+    assert {finding.finding_id for finding in result["findings"]} == {
+        finding.finding_id for finding in findings
+    }
+    assert result["effective_finding_ids"] == [finding.finding_id for finding in result["findings"]]
+    assert {event["path"] for event in result["inspection_ledger"]} == {
+        "safe.py",
+        "missing.py",
+        "metadata.py",
+        "tagged.py",
+        "evidence.py",
+    }
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_local_only_event_survives_provider_failure() -> None:
+    eligible = _lineage_finding("eligible", "safe.py", 1)
+    local = _lineage_finding("local", "local.py", 2)
+    local.tags.append("local-only")
+    batch = Batch(file_path="safe.py", content="safe", findings=[eligible])
+    state: SkillspectorState = {
+        "findings": [eligible, local],
+        "use_llm": True,
+        "llm_file_cache": {"safe.py": "safe", "local.py": "must stay local"},
+        "manifest": {},
+        "model_config": {},
+    }
+
+    with (
+        patch.object(LLMMetaAnalyzer, "get_batches", return_value=[batch]),
+        patch.object(
+            LLMMetaAnalyzer,
+            "arun_batches",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("provider unavailable"),
+        ),
+    ):
+        result = meta_analyzer(state)
+
+    assert [finding.finding_id for finding in result["findings"]] == ["eligible", "local"]
+    assert result["effective_finding_ids"] == ["eligible", "local"]
+    assert [event["path"] for event in result["inspection_ledger"]] == ["local.py"]
+    assert result["inspection_ledger"][0]["emitted_finding_ids"] == ["local"]
+    assert result["analyzer_status_events"][0]["status"] == "unavailable"
 
 
 # ---------------------------------------------------------------------------

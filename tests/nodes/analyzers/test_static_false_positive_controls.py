@@ -18,7 +18,7 @@ def _scan(path: str, content: str, module):
     return static_runner.run_static_patterns(state, [module])
 
 
-def test_negated_credential_access_constraint_is_clean() -> None:
+def test_negated_credential_access_constraint_is_contextualized() -> None:
     findings = _scan(
         "SKILL.md",
         "This skill summarizes setup notes. It must not access credentials, "
@@ -26,7 +26,9 @@ def test_negated_credential_access_constraint_is_clean() -> None:
         privilege_escalation_module,
     )
 
-    assert not any(f.rule_id == "PE3" for f in findings)
+    pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
+    assert pe3
+    assert all("contextual-triage" in finding.tags for finding in pe3)
 
 
 def test_negated_credential_access_does_not_hide_later_positive() -> None:

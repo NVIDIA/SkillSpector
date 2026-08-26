@@ -175,7 +175,7 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
         def inference_usage(self) -> list[object]:
             return []
 
-        def __init__(self, _model: str) -> None:
+        def __init__(self, _model: str, **_kwargs: object) -> None:
             pass
 
         def run_batches_detailed(self, _batches: object) -> object:

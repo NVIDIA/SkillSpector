@@ -121,12 +121,12 @@ def _make_state(
     for item in fixture_dir.rglob("*"):
         if not item.is_file():
             continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
+        rel = item.relative_to(fixture_dir)
+        if any(skip in rel.parts for skip in _SKIP_DIRS):
             continue
         if item.name.startswith(".") and not item.name.startswith(".claude"):
             continue
-        rel = item.relative_to(fixture_dir).as_posix()  # forward slashes on every OS
-        components.append(rel)
+        components.append(rel.as_posix())  # forward slashes on every OS
     components.sort()
 
     # Build file_cache
@@ -919,6 +919,16 @@ class TestTP4DescriptionBehaviorMismatch:
 
 
 class TestTP4Fallbacks:
+    def test_configured_output_language_is_included(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "German")
+        _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        analyzer = mcp_tool_poisoning._TP4Analyzer(model="test-model")
+        prompt = analyzer.build_prompt(
+            mcp_tool_poisoning.Batch(file_path="script.py", content="Analyze this code")
+        )
+        assert "in German" in prompt
+        assert "Keep rule IDs" in prompt
+
     def test_skipped_no_llm(self):
         state = _make_state("mcp_mismatched_skill", use_llm=False)
         result = node(state)
@@ -1072,6 +1082,88 @@ class TestInspectionLedgerStatus:
         assert [work["work_id"] for work in status["planned_work"]] == [
             event["work_id"] for event in result["inspection_ledger"]
         ]
+
+
+class TestResourceBounds:
+    def test_static_finding_cap_is_enforced_during_detector_construction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_tool_poisoning, "MAX_FINDINGS_PER_ANALYZER", 2)
+        description = " ".join(f"<!-- hidden {index} -->" for index in range(5))
+
+        result = node(
+            _make_state(
+                manifest={"name": "bounded", "description": description},
+                use_llm=False,
+            )
+        )
+
+        assert len(result["findings"]) == 2
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] is LedgerOutcome.PARTIAL
+        assert event["reason_code"] is LedgerReason.OUTPUT_LIMIT
+        assert event["observed_findings"] == 3
+        assert event["limit_findings"] == 2
+        assert event["emitted_finding_ids"] == [
+            finding.finding_id for finding in result["findings"]
+        ]
+
+    def test_tp4_low_model_input_budget_fails_closed_without_provider_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = {
+            "manifest": {
+                "name": "bounded",
+                "description": "Visible <!-- hidden instruction -->",
+            },
+            "file_cache": {"tool.py": "print('safe')\n"},
+            "component_metadata": [{"path": "tool.py", "type": "python"}],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 1)
+        get_chat_model = MagicMock()
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
+
+        result = node(state)
+
+        get_chat_model.assert_not_called()
+        assert any(finding.rule_id == "TP1" for finding in result["findings"])
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert semantic
+        assert semantic[0]["outcome"] is LedgerOutcome.PARTIAL
+        assert semantic[0]["reason_code"] is LedgerReason.SIZE_LIMIT
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        assert "llm_call_log" not in result
+
+    def test_tp4_batches_code_and_accounts_unplanned_remainder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = {
+            "manifest": {"name": "bounded", "description": "Runs local calculations."},
+            "file_cache": {
+                "tool.py": "".join(f"value_{index} = {index}\n" for index in range(300))
+            },
+            "component_metadata": [{"path": "tool.py", "type": "python"}],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 256)
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", 3)
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MIN_CODE_TOKENS", 1)
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 2048)
+        structured = _mock_tp4_structured_llm(
+            monkeypatch,
+            [{"is_mismatch": False} for _ in range(3)],
+        )
+
+        result = node(state)
+
+        assert structured.calls == 3
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert sum(event["outcome"] is LedgerOutcome.COMPLETED for event in semantic) == 3
+        assert any(event.get("reason_code") is LedgerReason.OUTPUT_LIMIT for event in semantic)
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
 
 
 # ---------------------------------------------------------------------------

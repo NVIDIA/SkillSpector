@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: supply chain (SC1–SC8) and trigger analysis (TR1–TR3).
+"""Static patterns: supply chain (SC1–SC9) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
 SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
@@ -21,6 +21,7 @@ SC5: Abandoned dependencies — flags known-abandoned or archived packages.
 SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
 SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
+SC9: Concealed executable artifact — flags executables nested in document or hidden artifacts.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
 
 Node and analyze() in one module.
@@ -28,30 +29,69 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import re
 import sys
+import time
 import tomllib
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
-from skillspector.inspection_ledger import LedgerOutcome, analyzer_status_for_events, ledger_event
+from skillspector.inspection_ledger import (
+    MAX_FINDING_OUTPUT_RECORDS,
+    LedgerOutcome,
+    LedgerReason,
+    LedgerRecordType,
+    analyzer_status_for_events,
+    ledger_event,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.state import (
+    AnalyzerNodeResponse,
+    SkillspectorState,
+    transitive_note_truncation,
+    transitive_remaining_seconds,
+)
 
 from . import static_runner
 from .common import get_context, get_line_number
-from .osv_client import ECOSYSTEM_NPM, ECOSYSTEM_PYPI, VulnResult, query_batch, was_osv_reachable
+from .osv_client import (
+    ECOSYSTEM_NPM,
+    ECOSYSTEM_PYPI,
+    OsvQueryBudget,
+    OsvQueryLimitation,
+    QueryBatchResults,
+    VulnResult,
+    query_batch,
+    was_osv_reachable,
+)
 from .pattern_defaults import PatternCategory
 from .static_runner import analyzer_finding_to_finding
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_supply_chain"
+
+# Dependency work is supplemental to the canonical text scan and therefore
+# needs its own aggregate ceilings.  These apply across every manifest in a
+# bundle, not independently per file.
+MAX_DEPENDENCY_FILES_PER_SCAN = 64
+MAX_DEPENDENCY_PACKAGES_PER_FILE = 256
+MAX_DEPENDENCY_PACKAGES_PER_SCAN = 1_024
+MAX_DEPENDENCY_FINDINGS_PER_FILE = 512
+MAX_DEPENDENCY_FINDINGS_PER_SCAN = 2_048
+MAX_DEPENDENCY_ANALYSIS_SECONDS = 30.0
+MAX_DEPENDENCY_NAME_CHARS = 256
+MAX_DEPENDENCY_VERSION_CHARS = 128
+MAX_DEPENDENCY_SPEC_CHARS = 4_096
 
 # ---------------------------------------------------------------------------
 # SC1–SC3: Original regex-based patterns
@@ -313,7 +353,7 @@ def _edit_distance(a: str, b: str) -> int:
 def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> str | None:
     """Return the popular package name if pkg_name is a close-but-not-exact match."""
     normalized = pkg_name.lower().replace("_", "-")
-    for popular_name in popular:
+    for popular_name in sorted(popular):
         pop_norm = popular_name.lower().replace("_", "-")
         if normalized == pop_norm:
             return None
@@ -460,13 +500,13 @@ def _extract_python_requirement(spec: str) -> tuple[str, str | None] | None:
     return requirement.name, _pinned_version(specifier.operator, specifier.version)
 
 
-def _logical_requirement_lines(content: str) -> list[tuple[int, str]]:
+def _logical_requirement_lines(content: str) -> Iterator[tuple[int, str]]:
     """Join pip-style continuations and retain each logical line's first line number."""
-    logical_lines: list[tuple[int, str]] = []
     parts: list[str] = []
     start_line = 1
 
-    for line_num, line in enumerate(content.splitlines(), 1):
+    for line_num, raw_line in enumerate(io.StringIO(content), 1):
+        line = raw_line.rstrip("\r\n")
         if not parts:
             start_line = line_num
 
@@ -480,12 +520,11 @@ def _logical_requirement_lines(content: str) -> list[tuple[int, str]]:
             # allowing its later comment-stripping pass to recognize it.
             line = " " + line
         parts.append(line)
-        logical_lines.append((start_line, "".join(parts)))
+        yield start_line, "".join(parts)
         parts = []
 
     if parts:
-        logical_lines.append((start_line, "".join(parts)))
-    return logical_lines
+        yield start_line, "".join(parts)
 
 
 def _strip_pip_per_requirement_options(line: str) -> str:
@@ -528,9 +567,29 @@ def _pinned_npm_version(spec: str) -> str | None:
     return None
 
 
-def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | None, int]]:
+def _extract_packages_from_requirements(
+    content: str,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from requirements.txt format."""
+    results, _largest_omitted = _extract_packages_from_requirements_detailed(
+        content,
+        limit=limit,
+    )
+    return results
+
+
+def _extract_packages_from_requirements_detailed(
+    content: str,
+    *,
+    limit: int | None = None,
+) -> tuple[list[tuple[str, str | None, int]], int | None]:
+    """Extract bounded requirements and measure any oversized logical specifier."""
     results: list[tuple[str, str | None, int]] = []
+    largest_omitted: int | None = None
+    if limit is not None and limit <= 0:
+        return results, largest_omitted
     for line_num, line in _logical_requirement_lines(content):
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
@@ -540,16 +599,92 @@ def _extract_packages_from_requirements(content: str) -> list[tuple[str, str | N
         # before handing the complete requirement to ``packaging``.
         line = re.split(r"\s+#", line, maxsplit=1)[0]
         line = _strip_pip_per_requirement_options(line)
+        if len(line) > MAX_DEPENDENCY_SPEC_CHARS:
+            largest_omitted = max(largest_omitted or 0, len(line))
+            continue
         requirement = _extract_python_requirement(line)
         if requirement:
             name, version = requirement
             results.append((name, version, line_num))
-    return results
+            if limit is not None and len(results) >= max(0, limit):
+                break
+    return results, largest_omitted
 
 
-def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | None, int]]:
-    """Extract (package_name, version_or_None, line_number) from package.json content."""
+_NPM_DEPENDENCY_SECTIONS = ("dependencies", "devDependencies", "peerDependencies")
+
+
+def _package_json_line(content: str, section: str, name: str) -> int:
+    """Best-effort line for a dependency entry, so findings keep pointing somewhere useful.
+
+    Parsing JSON loses positions, and the search starts at the section header so a name that
+    also appears in ``scripts`` does not win.
+    """
+    return _package_json_lines(content, [(section, name)]).get((section, name), 1)
+
+
+_JSON_OBJECT_KEY_RE = re.compile(r'"((?:\\.|[^"\\])*)"\s*:')
+
+
+def _package_json_lines(
+    content: str,
+    requested: list[tuple[str, str]],
+) -> dict[tuple[str, str], int]:
+    """Locate dependency keys in one bounded pass instead of rescanning per package."""
+    requested_by_name: dict[str, set[str]] = {}
+    encoded_to_name: dict[str, str] = {}
+    for section, name in requested:
+        requested_by_name.setdefault(name, set()).add(section)
+        encoded_to_name[json.dumps(name, ensure_ascii=True)[1:-1]] = name
+    if not requested_by_name:
+        return {}
+
+    section_starts: dict[str, int] = {}
+    for section in _NPM_DEPENDENCY_SECTIONS:
+        header = re.search(rf'"{re.escape(section)}"\s*:', content)
+        section_starts[section] = header.end() if header else 0
+
+    positions: dict[tuple[str, str], int] = {}
+    for match in _JSON_OBJECT_KEY_RE.finditer(content):
+        matched_name = encoded_to_name.get(match.group(1))
+        if matched_name is None:
+            continue
+        for section in requested_by_name[matched_name]:
+            key = (section, matched_name)
+            if key not in positions and match.start() >= section_starts.get(section, 0):
+                positions[key] = match.start()
+        if len(positions) >= len(requested):
+            break
+
+    ordered_positions = sorted((position, key) for key, position in positions.items())
+    line_numbers: dict[tuple[str, str], int] = {}
+    position_index = 0
+    line_number = 1
+    for newline in re.finditer("\n", content):
+        while (
+            position_index < len(ordered_positions)
+            and ordered_positions[position_index][0] < newline.start()
+        ):
+            _position, key = ordered_positions[position_index]
+            line_numbers[key] = line_number
+            position_index += 1
+        line_number += 1
+    while position_index < len(ordered_positions):
+        _position, key = ordered_positions[position_index]
+        line_numbers[key] = line_number
+        position_index += 1
+    return line_numbers
+
+
+def _extract_packages_from_package_json_scan(
+    content: str,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, str | None, int]]:
+    """Line-oriented fallback, used only when the manifest is not valid JSON."""
     results: list[tuple[str, str | None, int]] = []
+    if limit is not None and limit <= 0:
+        return results
     in_deps = False
     for i, line in enumerate(content.splitlines(), 1):
         stripped = line.strip()
@@ -562,13 +697,68 @@ def _extract_packages_from_package_json(content: str) -> list[tuple[str, str | N
         if in_deps:
             m = re.match(r'"([^"]+)"\s*:\s*"([^"]*)"', stripped)
             if m:
-                name = m.group(1)
-                version = _pinned_npm_version(m.group(2))
-                results.append((name, version, i))
+                results.append((m.group(1), _pinned_npm_version(m.group(2)), i))
+                if limit is not None and len(results) >= max(0, limit):
+                    break
     return results
 
 
-def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None, int]]:
+def _extract_packages_from_package_json(
+    content: str,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, str | None, int]]:
+    """Extract (package_name, version_or_None, line_number) from package.json content.
+
+    package.json is JSON, so it is parsed as JSON. Scanning it line by line made the result
+    depend on formatting: a manifest written on a single line — which is valid, and what many
+    generators emit — never entered the dependency section at all and yielded *no* dependencies,
+    silently. The line-oriented scan remains as a fallback for manifests that do not parse.
+    """
+    if limit is not None and limit <= 0:
+        return []
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return _extract_packages_from_package_json_scan(content, limit=limit)
+    if not isinstance(data, dict):
+        return []
+    dependencies: list[tuple[str, str, str]] = []
+    for section in _NPM_DEPENDENCY_SECTIONS:
+        deps = data.get(section)
+        if not isinstance(deps, dict):
+            continue
+        for name, spec in deps.items():
+            if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            dependencies.append((section, name, spec))
+            if limit is not None and len(dependencies) >= max(0, limit):
+                break
+        if limit is not None and len(dependencies) >= max(0, limit):
+            break
+    line_numbers = _package_json_lines(
+        content,
+        [
+            (section, name)
+            for section, name, _spec in dependencies
+            if len(name) <= MAX_DEPENDENCY_NAME_CHARS
+        ],
+    )
+    return [
+        (
+            name,
+            (_pinned_npm_version(spec) if len(spec) <= MAX_DEPENDENCY_SPEC_CHARS else None),
+            line_numbers.get((section, name), 1),
+        )
+        for section, name, spec in dependencies
+    ]
+
+
+def _extract_packages_from_pyproject(
+    content: str,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, str | None, int]]:
     """Extract (package_name, version_or_None, line_number) from pyproject.toml.
 
     Reads PEP 621 ``[project]`` ``dependencies`` / ``optional-dependencies``,
@@ -576,32 +766,44 @@ def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None
     metadata keys (``requires-python``, ``name``, ``version``, ...) are not
     dependencies and must not be looked up as packages.
     """
+    if limit is not None and limit <= 0:
+        return []
     try:
         data = tomllib.loads(content)
     except tomllib.TOMLDecodeError:
         return []
 
     specs: list[str] = []
+
+    def extend_specs(values: object) -> None:
+        if not isinstance(values, list):
+            return
+        for value in values:
+            if limit is not None and len(specs) >= max(0, limit):
+                return
+            if isinstance(value, str):
+                specs.append(value)
+                if limit is not None and len(specs) >= max(0, limit):
+                    return
+
     project = data.get("project")
     if isinstance(project, dict):
-        deps = project.get("dependencies")
-        if isinstance(deps, list):
-            specs.extend(d for d in deps if isinstance(d, str))
+        extend_specs(project.get("dependencies"))
         optional = project.get("optional-dependencies")
         if isinstance(optional, dict):
             for group in optional.values():
-                if isinstance(group, list):
-                    specs.extend(d for d in group if isinstance(d, str))
+                extend_specs(group)
+                if limit is not None and len(specs) >= max(0, limit):
+                    break
     groups = data.get("dependency-groups")
-    if isinstance(groups, dict):
+    if isinstance(groups, dict) and (limit is None or len(specs) < max(0, limit)):
         for group in groups.values():
-            if isinstance(group, list):
-                specs.extend(d for d in group if isinstance(d, str))
+            extend_specs(group)
+            if limit is not None and len(specs) >= max(0, limit):
+                break
     build_system = data.get("build-system")
-    if isinstance(build_system, dict):
-        requires = build_system.get("requires")
-        if isinstance(requires, list):
-            specs.extend(d for d in requires if isinstance(d, str))
+    if isinstance(build_system, dict) and (limit is None or len(specs) < max(0, limit)):
+        extend_specs(build_system.get("requires"))
 
     results: list[tuple[str, str | None, int]] = []
     for spec in specs:
@@ -612,6 +814,8 @@ def _extract_packages_from_pyproject(content: str) -> list[tuple[str, str | None
         idx = content.find(spec)
         line_num = get_line_number(content, idx) if idx >= 0 else 1
         results.append((name, version, line_num))
+        if limit is not None and len(results) >= max(0, limit):
+            break
     return results
 
 
@@ -630,8 +834,14 @@ def _is_python_lockfile(file_path: str) -> bool:
     return "uv.lock" in lower_path or "poetry.lock" in lower_path
 
 
-def _extract_packages_from_toml_lock(content: str) -> list[tuple[str, str | None, int]]:
+def _extract_packages_from_toml_lock(
+    content: str,
+    *,
+    limit: int | None = None,
+) -> list[tuple[str, str | None, int]]:
     """Extract exact package versions from TOML lockfiles such as uv.lock and poetry.lock."""
+    if limit is not None and limit <= 0:
+        return []
     try:
         data = tomllib.loads(content)
     except tomllib.TOMLDecodeError:
@@ -639,8 +849,8 @@ def _extract_packages_from_toml_lock(content: str) -> list[tuple[str, str | None
     packages = data.get("package")
     if not isinstance(packages, list):
         return []
-    blocks = list(_LOCKFILE_PACKAGE_BLOCK_RE.finditer(content))
     results: list[tuple[str, str | None, int]] = []
+    blocks = _LOCKFILE_PACKAGE_BLOCK_RE.finditer(content)
     for package, block in zip(packages, blocks, strict=False):
         if not isinstance(package, dict):
             continue
@@ -653,6 +863,8 @@ def _extract_packages_from_toml_lock(content: str) -> list[tuple[str, str | None
         idx = block.start() + name_match.start() if name_match else block.start()
         line_num = get_line_number(content, idx)
         results.append((name, version_value, line_num))
+        if limit is not None and len(results) >= max(0, limit):
+            break
     return results
 
 
@@ -673,19 +885,107 @@ def _apply_locked_versions(
 def _collect_locked_versions(
     file_cache: dict[str, str],
     components: list[str],
+    *,
+    limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
 ) -> dict[str, str]:
     """Build package -> exact version map from Python lockfiles in the project."""
+    locked_versions, _limitations = _collect_locked_versions_detailed(
+        file_cache,
+        components,
+        limit=limit,
+    )
+    return locked_versions
+
+
+def _collect_locked_versions_detailed(
+    file_cache: dict[str, str],
+    components: list[str],
+    *,
+    limit: int = MAX_DEPENDENCY_PACKAGES_PER_SCAN,
+    max_files: int | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[dict[str, str], list[tuple[str, OsvQueryLimitation]]]:
+    """Build a bounded lock map and identify any manifest whose tail was omitted."""
     locked_versions: dict[str, str] = {}
+    limitations: list[tuple[str, OsvQueryLimitation]] = []
+    packages_seen = 0
+    lockfiles_seen = 0
+    file_limit = MAX_DEPENDENCY_FILES_PER_SCAN if max_files is None else max(0, max_files)
+    started_at = time.monotonic()
+    runtime_limit = (
+        MAX_DEPENDENCY_ANALYSIS_SECONDS
+        if timeout_seconds is None
+        else min(MAX_DEPENDENCY_ANALYSIS_SECONDS, max(0.0, timeout_seconds))
+    )
+    deadline = started_at + runtime_limit
     for path in components:
         if not _is_python_lockfile(path):
             continue
+        lockfiles_seen += 1
+        if lockfiles_seen > file_limit:
+            limitations.append(
+                (
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=lockfiles_seen,
+                        limit_records=file_limit,
+                    ),
+                )
+            )
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            limitations.append(
+                (
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.RUNTIME_LIMIT,
+                        observed_seconds=max(0.0, now - started_at),
+                        limit_seconds=runtime_limit,
+                    ),
+                )
+            )
+            break
         content = file_cache.get(path)
         if not content:
             continue
-        for name, version, _line_num in _extract_packages_from_toml_lock(content):
+        remaining = max(0, limit - packages_seen)
+        if remaining <= 0:
+            limitations.append(
+                (
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=packages_seen + 1,
+                        limit_records=max(0, limit),
+                    ),
+                )
+            )
+            break
+        packages = _extract_packages_from_toml_lock(
+            content,
+            limit=remaining + 1,
+        )
+        if len(packages) > remaining:
+            limitations.append(
+                (
+                    path,
+                    OsvQueryLimitation(
+                        reason=LedgerReason.OUTPUT_LIMIT,
+                        observed_records=packages_seen + len(packages),
+                        limit_records=max(0, limit),
+                    ),
+                )
+            )
+            packages = packages[:remaining]
+        packages_seen += len(packages)
+        for name, version, _line_num in packages:
             if version:
                 locked_versions[_normalize_package_name(name)] = version
-    return locked_versions
+        if limitations:
+            break
+    return locked_versions, limitations
 
 
 def _version_lt(v1: str, v2: str) -> bool:
@@ -713,7 +1013,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         return Location(file=file_path, start_line=ln)
 
     def ctx(start: int) -> str:
-        return get_context(content, start)
+        return str(get_context(content, start))
 
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
@@ -890,8 +1190,34 @@ def _sc4_from_osv(
         one vulnerability.  Callers can use this to decide which packages
         still need a fallback lookup.
     """
+    findings, covered, _limitations = _sc4_from_osv_detailed(
+        packages,
+        ecosystem,
+        file_path,
+        tag,
+    )
+    return findings, covered
+
+
+def _sc4_from_osv_detailed(
+    packages: list[tuple[str, str | None, int]],
+    ecosystem: str,
+    file_path: str,
+    tag: list[str],
+    *,
+    timeout_seconds: float | None = None,
+    budget: OsvQueryBudget | None = None,
+) -> tuple[list[AnalyzerFinding], set[str], list[OsvQueryLimitation]]:
+    """Run a bounded OSV lookup and retain its non-fatal limitation metadata."""
     pkg_pairs = [(name, version) for name, version, _ in packages]
-    osv_results = query_batch(pkg_pairs, ecosystem)
+    if budget is not None:
+        osv_results = query_batch(pkg_pairs, ecosystem, budget=budget)
+    elif timeout_seconds is not None:
+        osv_results = query_batch(pkg_pairs, ecosystem, timeout_seconds=timeout_seconds)
+    else:
+        # Keep the two-argument call compatible with callers that replace the
+        # OSV function with a small offline test/provider adapter.
+        osv_results = query_batch(pkg_pairs, ecosystem)
 
     findings: list[AnalyzerFinding] = []
     covered: set[str] = set()
@@ -940,7 +1266,10 @@ def _sc4_from_osv(
                 matched_text=matched_text,
             )
         )
-    return findings, covered
+    limitations = (
+        list(osv_results.limitations) if isinstance(osv_results, QueryBatchResults) else []
+    )
+    return findings, covered, limitations
 
 
 def _sc4_from_fallback(
@@ -992,7 +1321,27 @@ def _analyze_dependencies(
     locked_versions: dict[str, str] | None = None,
 ) -> list[AnalyzerFinding]:
     """Run SC4/SC5/SC6 checks on dependency files."""
+    findings, _limitations, _packages_seen = _analyze_dependencies_detailed(
+        content,
+        file_path,
+        locked_versions,
+    )
+    return findings
+
+
+def _analyze_dependencies_detailed(
+    content: str,
+    file_path: str,
+    locked_versions: dict[str, str] | None = None,
+    *,
+    max_packages: int | None = None,
+    max_findings: int | None = None,
+    timeout_seconds: float | None = None,
+    osv_budget: OsvQueryBudget | None = None,
+) -> tuple[list[AnalyzerFinding], list[OsvQueryLimitation], int]:
+    """Run bounded dependency checks and return sanitized omission metadata."""
     findings: list[AnalyzerFinding] = []
+    limitations: list[OsvQueryLimitation] = []
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
     lower_path = file_path.lower()
@@ -1004,29 +1353,111 @@ def _analyze_dependencies(
     is_npm_dep = "package.json" in lower_path
 
     if not is_python_dep and not is_npm_dep:
-        return findings
+        return findings, limitations, 0
+
+    requested_package_limit = (
+        MAX_DEPENDENCY_PACKAGES_PER_FILE if max_packages is None else max_packages
+    )
+    package_limit = max(
+        0,
+        min(requested_package_limit, MAX_DEPENDENCY_PACKAGES_PER_FILE),
+    )
+    extraction_limit = package_limit + 1
 
     if is_python_dep:
         if "pyproject.toml" in lower_path:
-            packages = _extract_packages_from_pyproject(content)
+            packages = _extract_packages_from_pyproject(content, limit=extraction_limit)
         elif is_lockfile:
-            packages = _extract_packages_from_toml_lock(content)
+            packages = _extract_packages_from_toml_lock(content, limit=extraction_limit)
         else:
-            packages = _extract_packages_from_requirements(content)
+            packages, oversized_spec = _extract_packages_from_requirements_detailed(
+                content,
+                limit=extraction_limit,
+            )
+            if oversized_spec is not None:
+                limitations.append(
+                    OsvQueryLimitation(
+                        reason=LedgerReason.SIZE_LIMIT,
+                        observed_characters=oversized_spec,
+                        limit_characters=MAX_DEPENDENCY_SPEC_CHARS,
+                    )
+                )
         if not is_lockfile:
             packages = _apply_locked_versions(packages, locked_versions)
         ecosystem = ECOSYSTEM_PYPI
         fallback_db = _FALLBACK_VULNERABLE_PYPI
         popular = _POPULAR_PYPI
     else:
-        packages = _extract_packages_from_package_json(content)
+        packages = _extract_packages_from_package_json(content, limit=extraction_limit)
         ecosystem = ECOSYSTEM_NPM
         fallback_db = _FALLBACK_VULNERABLE_NPM
         popular = _POPULAR_NPM
 
+    if len(packages) > package_limit:
+        limitations.append(
+            OsvQueryLimitation(
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=len(packages),
+                limit_records=package_limit,
+            )
+        )
+        packages = packages[:package_limit]
+    parsed_package_count = len(packages)
+
+    bounded_packages: list[tuple[str, str | None, int]] = []
+    for name, version, line_num in packages:
+        if len(name) > MAX_DEPENDENCY_NAME_CHARS:
+            limitations.append(
+                OsvQueryLimitation(
+                    reason=LedgerReason.SIZE_LIMIT,
+                    observed_characters=len(name),
+                    limit_characters=MAX_DEPENDENCY_NAME_CHARS,
+                )
+            )
+            continue
+        if version is not None and len(version) > MAX_DEPENDENCY_VERSION_CHARS:
+            limitations.append(
+                OsvQueryLimitation(
+                    reason=LedgerReason.SIZE_LIMIT,
+                    observed_characters=len(version),
+                    limit_characters=MAX_DEPENDENCY_VERSION_CHARS,
+                )
+            )
+            continue
+        bounded_packages.append((name, version, line_num))
+    packages = bounded_packages
+
+    requested_finding_limit = (
+        MAX_DEPENDENCY_FINDINGS_PER_FILE if max_findings is None else max_findings
+    )
+    finding_limit = max(
+        0,
+        min(requested_finding_limit, MAX_DEPENDENCY_FINDINGS_PER_FILE),
+    )
+
+    def retain(extra: list[AnalyzerFinding]) -> None:
+        remaining = max(0, finding_limit - len(findings))
+        if len(extra) > remaining:
+            limitations.append(
+                OsvQueryLimitation(
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_records=len(findings) + len(extra),
+                    limit_records=finding_limit,
+                )
+            )
+        findings.extend(extra[:remaining])
+
     # SC4: Live OSV.dev lookup, then static fallback for uncovered packages
-    osv_findings, osv_covered = _sc4_from_osv(packages, ecosystem, file_path, tag)
-    findings.extend(osv_findings)
+    osv_findings, osv_covered, osv_limitations = _sc4_from_osv_detailed(
+        packages,
+        ecosystem,
+        file_path,
+        tag,
+        timeout_seconds=timeout_seconds,
+        budget=osv_budget,
+    )
+    limitations.extend(osv_limitations)
+    retain(osv_findings)
     uncovered_packages = [p for p in packages if p[0].lower().replace("_", "-") not in osv_covered]
     fallback_findings = _sc4_from_fallback(uncovered_packages, fallback_db, file_path, tag)
     if fallback_findings:
@@ -1035,57 +1466,70 @@ def _analyze_dependencies(
         )
     elif uncovered_packages and not osv_findings and not was_osv_reachable():
         # OSV.dev was unreachable and fallback found nothing — surface the gap
-        findings.append(
-            AnalyzerFinding(
-                rule_id="SC4",
-                message=(
-                    f"🟡 SC4: OSV.dev unreachable, using static fallback "
-                    f"({len(fallback_db)} packages). "
-                    "Results may be incomplete. Set SKILLSPECTOR_OSV_TIMEOUT to increase "
-                    "timeout or check network connectivity to api.osv.dev."
-                ),
-                severity=Severity.LOW,
-                location=Location(file=file_path, start_line=1),
-                confidence=1.0,
-                tags=tag,
-                matched_text="SC4 fallback active",
-            )
+        retain(
+            [
+                AnalyzerFinding(
+                    rule_id="SC4",
+                    message=(
+                        f"🟡 SC4: OSV.dev unreachable, using static fallback "
+                        f"({len(fallback_db)} packages). "
+                        "Results may be incomplete. Set SKILLSPECTOR_OSV_TIMEOUT to increase "
+                        "timeout or check network connectivity to api.osv.dev."
+                    ),
+                    severity=Severity.LOW,
+                    location=Location(file=file_path, start_line=1),
+                    confidence=1.0,
+                    tags=tag,
+                    matched_text="SC4 fallback active",
+                )
+            ]
         )
-    findings.extend(fallback_findings)
+    retain(fallback_findings)
 
     for pkg_name, _pkg_version, line_num in packages:
         pkg_lower = pkg_name.lower().replace("_", "-")
 
         # SC5: Abandoned dependencies
         if pkg_lower in {a.lower().replace("_", "-") for a in _ABANDONED_PACKAGES}:
-            findings.append(
-                AnalyzerFinding(
-                    rule_id="SC5",
-                    message=f"Abandoned Dependency: {pkg_name} is unmaintained and no longer receives security updates",
-                    severity=Severity.MEDIUM,
-                    location=Location(file=file_path, start_line=line_num),
-                    confidence=0.75,
-                    tags=tag,
-                    matched_text=pkg_name,
-                )
+            retain(
+                [
+                    AnalyzerFinding(
+                        rule_id="SC5",
+                        message=f"Abandoned Dependency: {pkg_name} is unmaintained and no longer receives security updates",
+                        severity=Severity.MEDIUM,
+                        location=Location(file=file_path, start_line=line_num),
+                        confidence=0.75,
+                        tags=tag,
+                        matched_text=pkg_name,
+                    )
+                ]
             )
 
         # SC6: Typosquatting
         similar = _is_typosquat(pkg_name, popular)
         if similar:
-            findings.append(
-                AnalyzerFinding(
-                    rule_id="SC6",
-                    message=f"Possible Typosquatting: '{pkg_name}' resembles popular package '{similar}'",
-                    severity=Severity.HIGH,
-                    location=Location(file=file_path, start_line=line_num),
-                    confidence=0.7,
-                    tags=tag,
-                    matched_text=pkg_name,
-                )
+            retain(
+                [
+                    AnalyzerFinding(
+                        rule_id="SC6",
+                        message=f"Possible Typosquatting: '{pkg_name}' resembles popular package '{similar}'",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=line_num),
+                        confidence=0.7,
+                        tags=tag,
+                        matched_text=pkg_name,
+                    )
+                ]
             )
 
-    return findings
+    # Do not let repeated provider conditions create unbounded metadata.
+    unique_limitations: list[OsvQueryLimitation] = []
+    for limitation in limitations:
+        if limitation not in unique_limitations:
+            unique_limitations.append(limitation)
+        if len(unique_limitations) >= 16:
+            break
+    return findings, unique_limitations, parsed_package_count
 
 
 # ---------------------------------------------------------------------------
@@ -1195,6 +1639,243 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
 # Still skip heavy/vendor trees for SC8, but *do* descend into __pycache__.
 _SC8_SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"})
 _SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
+MAX_SC8_DISCOVERED_ENTRIES = 10_000
+MAX_SC8_DIRECTORY_ENTRIES = 10_000
+MAX_SC8_TRAVERSAL_DEPTH = 64
+MAX_SC8_ANALYSIS_SECONDS = 5.0
+MAX_SC8_FINDINGS = 10_000
+MAX_SC8_LIMITATIONS = 256
+
+
+@dataclass(frozen=True)
+class _SupplementalLimitation:
+    """One bounded, report-safe supplemental omission."""
+
+    path: str
+    reason: LedgerReason
+    observed_artifacts: int | None = None
+    limit_artifacts: int | None = None
+    observed_depth: int | None = None
+    limit_depth: int | None = None
+    observed_findings: int | None = None
+    limit_findings: int | None = None
+    observed_seconds: float | None = None
+    limit_seconds: float | None = None
+    error_class: str | None = None
+
+
+@dataclass(frozen=True)
+class _ShippedBytecodeScanResult:
+    findings: list[Finding]
+    limitations: list[_SupplementalLimitation]
+
+
+def _scan_shipped_bytecode(
+    skill_path: str,
+    *,
+    timeout_seconds: float | None = None,
+    max_findings: int | None = None,
+) -> _ShippedBytecodeScanResult:
+    """Discover shipped bytecode with deterministic aggregate resource bounds."""
+    findings: list[Finding] = []
+    limitations: list[_SupplementalLimitation] = []
+    if not skill_path or not isinstance(skill_path, str):
+        return _ShippedBytecodeScanResult(findings, limitations)
+    root = Path(skill_path)
+    if not root.is_dir():
+        return _ShippedBytecodeScanResult(findings, limitations)
+
+    started_at = time.monotonic()
+    runtime_limit = max(0.0, MAX_SC8_ANALYSIS_SECONDS)
+    if timeout_seconds is not None:
+        runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
+    deadline = started_at + runtime_limit
+    requested_finding_limit = MAX_SC8_FINDINGS if max_findings is None else max_findings
+    finding_limit = max(0, min(requested_finding_limit, MAX_SC8_FINDINGS))
+    discovered_entries = 0
+    stack: list[tuple[Path, str, int]] = [(root, "", 0)]
+    stop_scan = False
+
+    def scope_path(relative_directory: str) -> str:
+        return relative_directory.rstrip("/") or "SKILL.md"
+
+    def add_limitation(limitation: _SupplementalLimitation) -> None:
+        if limitation in limitations:
+            return
+        if len(limitations) < max(1, MAX_SC8_LIMITATIONS):
+            limitations.append(limitation)
+            return
+        limitations[-1] = _SupplementalLimitation(
+            path=scope_path(""),
+            reason=LedgerReason.OUTPUT_LIMIT,
+            observed_findings=len(limitations) + 1,
+            limit_findings=max(1, MAX_SC8_LIMITATIONS),
+        )
+
+    def runtime_exhausted(relative_directory: str) -> bool:
+        now = time.monotonic()
+        if now < deadline:
+            return False
+        add_limitation(
+            _SupplementalLimitation(
+                path=scope_path(relative_directory),
+                reason=LedgerReason.RUNTIME_LIMIT,
+                observed_seconds=max(0.0, now - started_at),
+                limit_seconds=runtime_limit,
+            )
+        )
+        return True
+
+    def add_finding(relative_path: str, *, directory: bool) -> bool:
+        nonlocal stop_scan
+        if len(findings) >= finding_limit:
+            add_limitation(
+                _SupplementalLimitation(
+                    path=relative_path.rstrip("/"),
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_findings=len(findings) + 1,
+                    limit_findings=finding_limit,
+                )
+            )
+            stop_scan = True
+            return False
+        if directory:
+            analyzer_finding = AnalyzerFinding(
+                rule_id="SC8",
+                message="Skill ships a __pycache__ directory that normal discovery skips",
+                severity=Severity.HIGH,
+                location=Location(file=relative_path, start_line=1),
+                confidence=0.95,
+                tags=[PatternCategory.SUPPLY_CHAIN.value],
+                matched_text=relative_path,
+                context=(
+                    "Python may load .pyc from this directory even when decoy "
+                    ".py sources look clean (PEP 552 UNCHECKED_HASH)."
+                ),
+            )
+        else:
+            analyzer_finding = AnalyzerFinding(
+                rule_id="SC8",
+                message="Skill ships Python bytecode (.pyc/.pyo) that normal analysis skips",
+                severity=Severity.HIGH,
+                location=Location(file=relative_path, start_line=1),
+                confidence=0.95,
+                tags=[PatternCategory.SUPPLY_CHAIN.value],
+                matched_text=Path(relative_path).name,
+                context=(
+                    "Bytecode is excluded from content analysis; a malicious "
+                    ".pyc can execute while source decoys remain clean."
+                ),
+            )
+        findings.append(analyzer_finding_to_finding(analyzer_finding))
+        return True
+
+    while stack and not stop_scan:
+        directory, relative_directory, depth = stack.pop()
+        if runtime_exhausted(relative_directory):
+            break
+        remaining_entries = max(0, MAX_SC8_DISCOVERED_ENTRIES - discovered_entries)
+        directory_limit = min(max(0, MAX_SC8_DIRECTORY_ENTRIES), remaining_entries)
+        if directory_limit <= 0:
+            add_limitation(
+                _SupplementalLimitation(
+                    path=scope_path(relative_directory),
+                    reason=LedgerReason.ARTIFACT_COUNT_LIMIT,
+                    observed_artifacts=discovered_entries + 1,
+                    limit_artifacts=max(0, MAX_SC8_DISCOVERED_ENTRIES),
+                )
+            )
+            break
+
+        entries: list[tuple[str, bool, bool, bool, str | None]] = []
+        directory_overflow = False
+        try:
+            with os.scandir(directory) as scanner:
+                for entry in scanner:
+                    if runtime_exhausted(relative_directory):
+                        directory_overflow = True
+                        break
+                    if len(entries) >= directory_limit:
+                        add_limitation(
+                            _SupplementalLimitation(
+                                path=scope_path(relative_directory),
+                                reason=LedgerReason.ARTIFACT_COUNT_LIMIT,
+                                observed_artifacts=discovered_entries + len(entries) + 1,
+                                limit_artifacts=min(
+                                    max(0, MAX_SC8_DISCOVERED_ENTRIES),
+                                    discovered_entries + max(0, MAX_SC8_DIRECTORY_ENTRIES),
+                                ),
+                            )
+                        )
+                        directory_overflow = True
+                        break
+                    try:
+                        is_link = entry.is_symlink()
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                        is_file = entry.is_file(follow_symlinks=False)
+                        error_class = None
+                    except OSError as exc:
+                        is_link = False
+                        is_directory = False
+                        is_file = False
+                        error_class = type(exc).__name__
+                    entries.append((entry.name, is_directory, is_file, is_link, error_class))
+        except OSError as exc:
+            add_limitation(
+                _SupplementalLimitation(
+                    path=scope_path(relative_directory),
+                    reason=LedgerReason.READ_ERROR,
+                    error_class=type(exc).__name__,
+                )
+            )
+            continue
+        if directory_overflow:
+            break
+
+        child_directories: list[tuple[Path, str, int]] = []
+        for name, is_directory, is_file, is_link, error_class in sorted(
+            entries, key=lambda item: item[0]
+        ):
+            if runtime_exhausted(relative_directory):
+                stop_scan = True
+                break
+            discovered_entries += 1
+            relative_path = f"{relative_directory}/{name}" if relative_directory else name
+            if error_class is not None:
+                add_limitation(
+                    _SupplementalLimitation(
+                        path=relative_path,
+                        reason=LedgerReason.STAT_ERROR,
+                        error_class=error_class,
+                    )
+                )
+                continue
+            if is_link:
+                continue
+            if is_directory:
+                if name == "__pycache__" and not add_finding(f"{relative_path}/", directory=True):
+                    break
+                if name in _SC8_SKIP_DIRS:
+                    continue
+                child_depth = depth + 1
+                if child_depth > max(0, MAX_SC8_TRAVERSAL_DEPTH):
+                    add_limitation(
+                        _SupplementalLimitation(
+                            path=relative_path,
+                            reason=LedgerReason.TRAVERSAL_DEPTH_LIMIT,
+                            observed_depth=child_depth,
+                            limit_depth=max(0, MAX_SC8_TRAVERSAL_DEPTH),
+                        )
+                    )
+                    continue
+                child_directories.append((directory / name, relative_path, child_depth))
+                continue
+            if is_file and name.lower().endswith(_SC8_BYTECODE_SUFFIXES):
+                if not add_finding(relative_path, directory=False):
+                    break
+        stack.extend(reversed(child_directories))
+
+    return _ShippedBytecodeScanResult(findings, limitations)
 
 
 def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
@@ -1205,58 +1886,75 @@ def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
     otherwise score SAFE. Presence alone is a HIGH supply-chain signal;
     full disassembly can come later.
     """
+    return _scan_shipped_bytecode(skill_path).findings
+
+
+def _analyze_concealed_executables(
+    component_metadata: list[dict[str, object]],
+) -> list[Finding]:
+    """Emit SC9 for executable content concealed in a local-only artifact."""
     findings: list[Finding] = []
-    if not skill_path or not isinstance(skill_path, str):
-        return findings
-    root = Path(skill_path)
-    if not root.is_dir():
-        return findings
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name not in _SC8_SKIP_DIRS)
-        rel_dir = Path(dirpath).relative_to(root).as_posix()
-        if rel_dir == ".":
-            rel_dir = ""
-
-        for dirname in list(dirnames):
-            if dirname != "__pycache__":
-                continue
-            rel = f"{rel_dir}/{dirname}/" if rel_dir else f"{dirname}/"
-            af = AnalyzerFinding(
-                rule_id="SC8",
-                message="Skill ships a __pycache__ directory that normal discovery skips",
-                severity=Severity.HIGH,
-                location=Location(file=rel, start_line=1),
-                confidence=0.95,
-                tags=[PatternCategory.SUPPLY_CHAIN.value],
-                matched_text=rel,
-                context=(
-                    "Python may load .pyc from this directory even when decoy "
-                    ".py sources look clean (PEP 552 UNCHECKED_HASH)."
+    for metadata in component_metadata:
+        if not metadata.get("concealed_executable"):
+            continue
+        path = str(metadata.get("path", ""))
+        if not path:
+            continue
+        outer_path = str(metadata.get("outer_path", path.split("!/", 1)[0]))
+        nested_path = str(
+            metadata.get("nested_path", path.split("!/", 1)[1] if "!/" in path else path)
+        )
+        container_type = str(metadata.get("container_type", "zip"))
+        raw_reasons = metadata.get("concealment_reasons", [])
+        concealment_reasons = (
+            [str(item) for item in raw_reasons] if isinstance(raw_reasons, list) else []
+        )
+        if not concealment_reasons:
+            if container_type in {"docx", "xlsx", "pptx"}:
+                concealment_reasons.append("document_container")
+            elif metadata.get("outer_hidden") or metadata.get("hidden"):
+                concealment_reasons.append("hidden_artifact")
+            else:
+                concealment_reasons.append("disguised_container")
+        concealment = concealment_reasons[0]
+        findings.append(
+            Finding(
+                rule_id="SC9",
+                message=(
+                    "Executable content is concealed inside a document, hidden, "
+                    "or disguised artifact."
                 ),
-            )
-            findings.append(analyzer_finding_to_finding(af))
-
-        for filename in sorted(filenames):
-            lower = filename.lower()
-            if not lower.endswith(_SC8_BYTECODE_SUFFIXES):
-                continue
-            rel = f"{rel_dir}/{filename}" if rel_dir else filename
-            af = AnalyzerFinding(
-                rule_id="SC8",
-                message="Skill ships Python bytecode (.pyc/.pyo) that normal analysis skips",
-                severity=Severity.HIGH,
-                location=Location(file=rel, start_line=1),
-                confidence=0.95,
-                tags=[PatternCategory.SUPPLY_CHAIN.value],
-                matched_text=filename,
-                context=(
-                    "Bytecode is excluded from content analysis; a malicious "
-                    ".pyc can execute while source decoys remain clean."
+                severity="HIGH",
+                confidence=1.0,
+                file=path,
+                start_line=1,
+                category="Supply Chain",
+                pattern="Concealed Executable Artifact",
+                finding=nested_path,
+                explanation=(
+                    "An executable nested in a document or hidden/disguised artifact can "
+                    "evade ordinary extension-based review while still being available to "
+                    "the skill at runtime."
                 ),
+                remediation=(
+                    "Review the artifact provenance and the reason executable content is "
+                    "packaged in this location; keep executable files explicit and directly "
+                    "reviewable."
+                ),
+                tags=["supply-chain", "concealed-executable", "local-only"],
+                matched_text=path,
+                evidence={
+                    "outer_path": outer_path,
+                    "nested_path": nested_path,
+                    "container_type": container_type,
+                    "container_ancestry": metadata.get("container_ancestry", [container_type]),
+                    "container_depth": metadata.get("container_depth", 1),
+                    "concealment": concealment,
+                    "concealment_reasons": concealment_reasons,
+                    "local_only": True,
+                },
             )
-            findings.append(analyzer_finding_to_finding(af))
-
+        )
     return findings
 
 
@@ -1266,10 +1964,16 @@ def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Run supply_chain patterns (SC1–SC8) and trigger analysis (TR1–TR3)."""
+    """Run supply_chain patterns (SC1–SC9) and trigger analysis (TR1–TR3)."""
     # SC1–SC3 via static_runner
     response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
     findings = response["findings"]
+    completed_event_by_path = {
+        event["path"]: event
+        for event in response["inspection_ledger"]
+        if event["outcome"] is LedgerOutcome.COMPLETED
+    }
+    recorded_limitations: set[tuple[str, str, LedgerReason]] = set()
 
     def record_extra_findings(
         path: str,
@@ -1280,24 +1984,99 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         if not extra_findings:
             return
         finding_ids = [finding.finding_id for finding in extra_findings]
-        for event in response["inspection_ledger"]:
-            if event["path"] == path and event["outcome"] is LedgerOutcome.COMPLETED:
-                event["emitted_finding_ids"].extend(finding_ids)
-                return
+        event = completed_event_by_path.get(path)
+        if event is not None:
+            event["emitted_finding_ids"].extend(finding_ids)
+            return
+        event = ledger_event(
+            analyzer_id=fallback_analyzer_id,
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            emitted_finding_ids=finding_ids,
+        )
+        response["inspection_ledger"].append(event)
+        completed_event_by_path[path] = event
+
+    def record_limitation(
+        path: str,
+        limitation: OsvQueryLimitation | _SupplementalLimitation,
+        fallback_analyzer_id: str,
+    ) -> None:
+        """Project one supplemental omission into canonical partial accounting."""
+        key = (path, fallback_analyzer_id, limitation.reason)
+        if key in recorded_limitations:
+            return
+        recorded_limitations.add(key)
         response["inspection_ledger"].append(
             ledger_event(
-                analyzer_id=fallback_analyzer_id,
-                outcome=LedgerOutcome.COMPLETED,
+                analyzer_id=f"{fallback_analyzer_id}_{limitation.reason.value}",
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
                 phase="static",
                 path=path,
-                emitted_finding_ids=finding_ids,
+                reason=limitation.reason,
+                error_class=limitation.error_class,
+                observed_records=getattr(limitation, "observed_records", None),
+                limit_records=getattr(limitation, "limit_records", None),
+                observed_characters=getattr(limitation, "observed_characters", None),
+                limit_characters=getattr(limitation, "limit_characters", None),
+                observed_bytes=getattr(limitation, "observed_bytes", None),
+                limit_bytes=getattr(limitation, "limit_bytes", None),
+                observed_artifacts=getattr(limitation, "observed_artifacts", None),
+                limit_artifacts=getattr(limitation, "limit_artifacts", None),
+                observed_depth=getattr(limitation, "observed_depth", None),
+                limit_depth=getattr(limitation, "limit_depth", None),
+                observed_findings=getattr(limitation, "observed_findings", None),
+                limit_findings=getattr(limitation, "limit_findings", None),
+                observed_seconds=limitation.observed_seconds,
+                limit_seconds=limitation.limit_seconds,
             )
+        )
+        transitive_note_truncation(
+            state,
+            f"{fallback_analyzer_id} incomplete: {limitation.reason.value}",
         )
 
     # SC4–SC6: dependency-level analysis on dependency files
     components: list[str] = state.get("components") or []
-    file_cache: dict[str, str] = state.get("file_cache") or {}
-    locked_versions = _collect_locked_versions(file_cache, components)
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
+    dependency_started_at = time.monotonic()
+    workflow_remaining = transitive_remaining_seconds(state)
+    dependency_runtime_limit = max(0.0, MAX_DEPENDENCY_ANALYSIS_SECONDS)
+    if workflow_remaining is not None:
+        dependency_runtime_limit = min(
+            dependency_runtime_limit,
+            max(0.0, workflow_remaining),
+        )
+    dependency_deadline = dependency_started_at + dependency_runtime_limit
+
+    def dependency_remaining_seconds() -> float:
+        local_remaining = max(0.0, dependency_deadline - time.monotonic())
+        shared_remaining = transitive_remaining_seconds(state)
+        return (
+            local_remaining
+            if shared_remaining is None
+            else min(local_remaining, max(0.0, shared_remaining))
+        )
+
+    locked_versions, lockfile_limitations = _collect_locked_versions_detailed(
+        file_cache,
+        components,
+        limit=MAX_DEPENDENCY_PACKAGES_PER_SCAN,
+        max_files=MAX_DEPENDENCY_FILES_PER_SCAN,
+        timeout_seconds=dependency_remaining_seconds(),
+    )
+    for lockfile_path, limitation in lockfile_limitations:
+        record_limitation(
+            lockfile_path,
+            limitation,
+            f"{ANALYZER_ID}_dependencies",
+        )
+    dependency_files_seen = 0
+    dependency_packages_seen = 0
+    dependency_findings_seen = 0
+    osv_budget = OsvQueryBudget.create(dependency_remaining_seconds())
     for path in components:
         lower_path = path.lower()
         is_dep_file = any(
@@ -1314,45 +2093,165 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         )
         if not is_dep_file:
             continue
+        dependency_files_seen += 1
+        if dependency_files_seen > max(0, MAX_DEPENDENCY_FILES_PER_SCAN):
+            record_limitation(
+                path,
+                OsvQueryLimitation(
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_records=dependency_files_seen,
+                    limit_records=max(0, MAX_DEPENDENCY_FILES_PER_SCAN),
+                ),
+                f"{ANALYZER_ID}_dependencies",
+            )
+            break
+        remaining_packages = max(
+            0,
+            MAX_DEPENDENCY_PACKAGES_PER_SCAN - dependency_packages_seen,
+        )
+        remaining_dependency_findings = max(
+            0,
+            min(
+                MAX_DEPENDENCY_FINDINGS_PER_SCAN - dependency_findings_seen,
+                MAX_FINDING_OUTPUT_RECORDS - len(findings),
+            ),
+        )
+        if remaining_packages <= 0 or remaining_dependency_findings <= 0:
+            record_limitation(
+                path,
+                OsvQueryLimitation(
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_records=(
+                        dependency_packages_seen + 1
+                        if remaining_packages <= 0
+                        else dependency_findings_seen + 1
+                    ),
+                    limit_records=(
+                        MAX_DEPENDENCY_PACKAGES_PER_SCAN
+                        if remaining_packages <= 0
+                        else MAX_DEPENDENCY_FINDINGS_PER_SCAN
+                    ),
+                ),
+                f"{ANALYZER_ID}_dependencies",
+            )
+            break
+        shared_remaining = dependency_remaining_seconds()
+        if shared_remaining <= 0:
+            record_limitation(
+                path,
+                OsvQueryLimitation(
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                    observed_seconds=max(0.0, time.monotonic() - dependency_started_at),
+                    limit_seconds=dependency_runtime_limit,
+                ),
+                f"{ANALYZER_ID}_dependencies",
+            )
+            break
         content = file_cache.get(path)
         if not content:
             continue
-        dep_findings = _analyze_dependencies(content, path, locked_versions)
+        dep_findings, dependency_limitations, packages_seen = _analyze_dependencies_detailed(
+            content,
+            path,
+            locked_versions,
+            max_packages=min(MAX_DEPENDENCY_PACKAGES_PER_FILE, remaining_packages),
+            max_findings=min(MAX_DEPENDENCY_FINDINGS_PER_FILE, remaining_dependency_findings),
+            timeout_seconds=shared_remaining,
+            osv_budget=osv_budget,
+        )
+        dependency_packages_seen += packages_seen
         dependency_findings = [analyzer_finding_to_finding(af) for af in dep_findings]
+        dependency_findings_seen += len(dependency_findings)
         findings.extend(dependency_findings)
         record_extra_findings(
             path,
             dependency_findings,
             f"{ANALYZER_ID}_dependencies",
         )
+        for limitation in dependency_limitations:
+            record_limitation(
+                path,
+                limitation,
+                f"{ANALYZER_ID}_dependencies",
+            )
 
     # TR1–TR3: trigger analysis from manifest
     manifest: dict[str, object] = state.get("manifest") or {}
     if manifest:
         skill_path = state.get("skill_path") or ""
         trigger_findings = _analyze_triggers(manifest, skill_path)
+        trigger_limit = max(0, MAX_FINDING_OUTPUT_RECORDS - len(findings))
+        omitted_triggers = len(trigger_findings) > trigger_limit
+        trigger_findings = trigger_findings[:trigger_limit]
         findings.extend(trigger_findings)
         record_extra_findings(
             "SKILL.md",
             trigger_findings,
             f"{ANALYZER_ID}_triggers",
         )
+        if omitted_triggers:
+            record_limitation(
+                "SKILL.md",
+                OsvQueryLimitation(
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_records=len(trigger_findings) + 1,
+                    limit_records=trigger_limit,
+                ),
+                f"{ANALYZER_ID}_triggers",
+            )
 
     # SC8: shipped bytecode / __pycache__ (discovery otherwise skips these)
     skill_path = state.get("skill_path") or ""
     if isinstance(skill_path, str) and skill_path.strip():
-        bytecode_findings = _analyze_shipped_bytecode(skill_path)
+        bytecode_scan = _scan_shipped_bytecode(
+            skill_path,
+            timeout_seconds=transitive_remaining_seconds(state),
+            max_findings=max(0, MAX_FINDING_OUTPUT_RECORDS - len(findings)),
+        )
+        bytecode_findings = bytecode_scan.findings
         findings.extend(bytecode_findings)
-        for finding_path in sorted({finding.file.rstrip("/") for finding in bytecode_findings}):
+        findings_by_path: dict[str, list[Finding]] = {}
+        for finding in bytecode_findings:
+            findings_by_path.setdefault(finding.file.rstrip("/"), []).append(finding)
+        for finding_path in sorted(findings_by_path):
             record_extra_findings(
                 finding_path,
-                [
-                    finding
-                    for finding in bytecode_findings
-                    if finding.file.rstrip("/") == finding_path
-                ],
+                findings_by_path[finding_path],
                 f"{ANALYZER_ID}_bytecode",
             )
+        for sc8_limitation in bytecode_scan.limitations:
+            record_limitation(
+                sc8_limitation.path,
+                sc8_limitation,
+                f"{ANALYZER_ID}_bytecode",
+            )
+
+    # SC9: executables concealed in document containers or hidden/disguised artifacts.
+    component_metadata: list[dict[str, object]] = state.get("component_metadata") or []
+    concealed_findings = _analyze_concealed_executables(component_metadata)
+    concealed_limit = max(0, MAX_FINDING_OUTPUT_RECORDS - len(findings))
+    omitted_concealed = len(concealed_findings) > concealed_limit
+    concealed_findings = concealed_findings[:concealed_limit]
+    findings.extend(concealed_findings)
+    concealed_by_path: dict[str, list[Finding]] = {}
+    for finding in concealed_findings:
+        concealed_by_path.setdefault(finding.file, []).append(finding)
+    for finding_path in sorted(concealed_by_path):
+        record_extra_findings(
+            finding_path,
+            concealed_by_path[finding_path],
+            f"{ANALYZER_ID}_concealed_executable",
+        )
+    if omitted_concealed:
+        record_limitation(
+            "SKILL.md",
+            OsvQueryLimitation(
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=len(concealed_findings) + 1,
+                limit_records=concealed_limit,
+            ),
+            f"{ANALYZER_ID}_concealed_executable",
+        )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     response["analyzer_status_events"] = [
