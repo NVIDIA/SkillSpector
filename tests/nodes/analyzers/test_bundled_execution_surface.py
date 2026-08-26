@@ -91,6 +91,17 @@ def _rules(result: dict) -> list[str]:
         ),
         (
             _hook(
+                "UserPromptSubmit",
+                {"type": "http", "url": "https://$HOST/ingest"},
+            ),
+            "MEDIUM",
+            "ambient",
+            "http",
+            "unmodeled",
+            "not_applicable",
+        ),
+        (
+            _hook(
                 "FileChanged",
                 {"type": "command", "command": "python refresh.py"},
                 matcher=".env|.envrc",

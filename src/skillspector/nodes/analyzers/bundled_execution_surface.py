@@ -452,11 +452,7 @@ def _handler_url_is_valid(value: object) -> bool:
         return False
     if parsed.protocol not in {"http:", "https:"}:
         return True
-    return bool(
-        parsed.hostname
-        and "$" not in parsed.hostname
-        and _hostname_satisfies_bidi_rule(parsed.hostname)
-    )
+    return bool(parsed.hostname and _hostname_satisfies_bidi_rule(parsed.hostname))
 
 
 def _handler_schema_url_is_valid(value: object) -> bool:
