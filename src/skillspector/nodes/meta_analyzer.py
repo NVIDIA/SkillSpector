@@ -46,6 +46,7 @@ from skillspector.llm_analyzer_base import (
     BatchFailure,
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
+    append_output_language_instruction,
     estimate_tokens,
 )
 from skillspector.llm_utils import run_async
@@ -353,11 +354,13 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
     def build_prompt(self, batch: Batch, **kwargs: object) -> str:
         metadata_text = kwargs.get("metadata_text", "No metadata available")
         findings_text = _format_findings_for_prompt(batch.findings)
-        return self.base_prompt.format(
-            metadata=metadata_text,
-            file_label=batch.file_label,
-            file_content=batch.content,
-            static_findings=findings_text,
+        return append_output_language_instruction(
+            self.base_prompt.format(
+                metadata=metadata_text,
+                file_label=batch.file_label,
+                file_content=batch.content,
+                static_findings=findings_text,
+            )
         )
 
     def parse_response(  # type: ignore[override]  # Base class permits custom parsed values.
