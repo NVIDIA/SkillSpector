@@ -537,7 +537,7 @@ def _match_instances_fingerprint(
         return None
 
     digest = hashlib.sha256()
-    digest.update(b"skillspector-yara-match-v2\x00")
+    digest.update(b"skillspector-yara-match-v1\x00")
 
     def update_framed(value: bytes) -> None:
         digest.update(len(value).to_bytes(8, "big"))
