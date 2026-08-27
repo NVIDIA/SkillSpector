@@ -44,7 +44,8 @@ class ReferenceResolutionResult:
 
 
 _PLAIN_RELATIVE_PATH = re.compile(
-    r"(?<![\w:/.-])((?:\./)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9]{1,12})?)(?![\w/.-])"
+    r"(?<![\w:/.-])((?:\./(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}))(?![\w/.-])"
 )
 
 
