@@ -511,11 +511,12 @@ class _YaraFingerprintBudget:
 
 def _match_instances_fingerprint(
     rule_id: str,
+    match: yara.Match,
     instances: list[tuple[str, object]],
     data: bytes,
     budget: _YaraFingerprintBudget,
 ) -> str | None:
-    """Hash complete raw YARA matches without retaining them in finding state."""
+    """Hash a concrete YARA rule's complete matches without retaining raw bytes."""
     records: list[tuple[bytes, int, bytes]] = []
     for identifier, instance in instances:
         matched_data = getattr(instance, "matched_data", None)
@@ -536,13 +537,15 @@ def _match_instances_fingerprint(
         return None
 
     digest = hashlib.sha256()
-    digest.update(b"skillspector-yara-match-v1\x00")
+    digest.update(b"skillspector-yara-match-v2\x00")
 
     def update_framed(value: bytes) -> None:
         digest.update(len(value).to_bytes(8, "big"))
         digest.update(value)
 
     update_framed(rule_id.encode("utf-8", errors="surrogatepass"))
+    update_framed(str(match.namespace).encode("utf-8", errors="surrogatepass"))
+    update_framed(str(match.rule).encode("utf-8", errors="surrogatepass"))
     for identifier_bytes, matched_length, payload_digest in sorted(records):
         update_framed(identifier_bytes)
         digest.update(matched_length.to_bytes(8, "big", signed=False))
@@ -760,6 +763,7 @@ def _match_file(
         try:
             match_fingerprint = _match_instances_fingerprint(
                 rule_id,
+                match,
                 instances,
                 data,
                 fingerprint_budget,

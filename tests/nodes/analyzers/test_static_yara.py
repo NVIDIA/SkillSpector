@@ -133,6 +133,71 @@ class TestCorePipeline:
         }
         assert shared + "X" not in json.dumps(first.to_dict(), sort_keys=True)
 
+    def test_distinct_rule_names_matching_same_bytes_keep_distinct_identities(
+        self, monkeypatch
+    ) -> None:
+        rules = static_yara.yara.compile(
+            source="""
+rule first_detector {
+    meta:
+        category = "malware"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+
+rule second_detector {
+    meta:
+        category = "malware"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+"""
+        )
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        findings = static_yara.node(
+            {
+                "components": ["skill.txt"],
+                "file_cache": {"skill.txt": "SHARED_MARKER"},
+            }
+        )["findings"]
+
+        assert len(findings) == 2
+        assert {finding.rule_id for finding in findings} == {"YR1"}
+        assert len({finding.match_fingerprint for finding in findings}) == 2
+        assert len(deduplicate(findings)) == 2
+
+    def test_same_rule_name_in_distinct_namespaces_keeps_distinct_identities(
+        self, monkeypatch
+    ) -> None:
+        source = """
+rule shared_detector {
+    meta:
+        category = "malware"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+"""
+        rules = static_yara.yara.compile(sources={"first_feed": source, "second_feed": source})
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        findings = static_yara.node(
+            {
+                "components": ["skill.txt"],
+                "file_cache": {"skill.txt": "SHARED_MARKER"},
+            }
+        )["findings"]
+
+        assert len(findings) == 2
+        assert len({finding.match_fingerprint for finding in findings}) == 2
+        assert len(deduplicate(findings)) == 2
+
     def test_full_match_fingerprinting_is_byte_bounded(self, monkeypatch):
         rules = static_yara.yara.compile(
             source="rule long_tail { strings: $a = /A{700}X/ condition: $a }"
