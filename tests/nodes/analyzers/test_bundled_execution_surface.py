@@ -1052,6 +1052,19 @@ def test_bh3_closed_permission_table(
         assert "ignored" in (bh3.explanation or "").lower()
 
 
+def test_bh3_local_settings_uses_source_neutral_activation_evidence() -> None:
+    result = _run(
+        {
+            ".claude/settings.local.json": {
+                "permissions": {"allow": ["Bash(*)"]},
+            }
+        }
+    )
+
+    assert _rules(result) == ["BH3"]
+    assert result["findings"][0].evidence["activation_reason"] == "requires_settings_activation"
+
+
 @pytest.mark.parametrize(
     "case",
     [

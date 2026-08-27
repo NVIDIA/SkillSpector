@@ -1593,7 +1593,7 @@ def _bh3_finding(path: str, declarations: list[_PermissionDeclaration]) -> Findi
         matched_text=f"document:{path}",
         evidence={
             "activation_reason": (
-                "mode_ignored_in_project_settings" if ignored else "requires_workspace_trust"
+                "mode_ignored_in_project_settings" if ignored else "requires_settings_activation"
             ),
             "activation_state": activation_state,
             "activation_states": sorted(
