@@ -162,6 +162,17 @@ def resolve_max_concurrency() -> int:
     return value
 
 
+def _compact_prompts_enabled() -> bool:
+    """Return True when ``SKILLSPECTOR_COMPACT_PROMPTS=true`` is set.
+
+    Compact mode reduces LLM token usage by condensing prompt text, removing
+    line-number zero-padding, and omitting redundant fields from structured
+    output schemas. The default (off) preserves the original prompt format
+    for backward compatibility.
+    """
+    return os.environ.get("SKILLSPECTOR_COMPACT_PROMPTS", "").lower() == "true"
+
+
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
 CHUNK_OVERLAP_LINES = 50
@@ -441,10 +452,15 @@ def number_lines(content: str, start_line: int = 1) -> str:
 
     For chunks, *start_line* offsets the numbering so the LLM sees real file
     line numbers it can reference in :attr:`LLMFinding.start_line`.
+
+    When ``SKILLSPECTOR_COMPACT_PROMPTS=true``, line numbers are not
+    zero-padded (``L1:`` instead of ``L01:``) to save tokens.
     """
     lines = content.splitlines()
     if not lines:
         return ""
+    if _compact_prompts_enabled():
+        return "\n".join(f"L{start_line + i}: {line}" for i, line in enumerate(lines))
     end = start_line + len(lines) - 1
     width = len(str(end))
     return "\n".join(f"L{start_line + i:0>{width}}: {line}" for i, line in enumerate(lines))
@@ -482,6 +498,21 @@ Reference line numbers (shown as L-prefixes) when reporting findings.
 - Precision over recall: only report issues you are confident about.  It is
   far better to miss an edge case than to report a false positive.
 - Be precise: report only genuine issues, not speculative ones."""
+
+_COMPACT_BASE_ANALYSIS_PROMPT = """\
+{analyzer_prompt}
+
+Analyze the following skill file for security issues matching the criteria above.
+Reference line numbers (L-prefixes) when reporting findings.
+
+## {file_label}
+```
+{numbered_content}
+```
+
+Most files are clean; an empty findings list is correct when no genuine issues \
+exist. Do not manufacture findings. Precision over recall: only report issues \
+you are confident about."""
 
 
 # ---------------------------------------------------------------------------
@@ -652,10 +683,16 @@ class LLMAnalyzerBase:
         The default wraps :attr:`base_prompt` with line-numbered file content
         so the LLM can reference exact line numbers in its findings.
         Override in subclasses that need a custom prompt layout.
+
+        When ``SKILLSPECTOR_COMPACT_PROMPTS=true``, uses a condensed output
+        guidelines section to save tokens.
         """
         numbered = number_lines(batch.content, batch.start_line)
+        template = (
+            _COMPACT_BASE_ANALYSIS_PROMPT if _compact_prompts_enabled() else BASE_ANALYSIS_PROMPT
+        )
         return append_output_language_instruction(
-            BASE_ANALYSIS_PROMPT.format(
+            template.format(
                 analyzer_prompt=self.base_prompt,
                 file_label=batch.file_label,
                 numbered_content=numbered,

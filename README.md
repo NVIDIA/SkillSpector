@@ -598,6 +598,7 @@ Issues (2)
 | `SKILLSPECTOR_MODEL` | Override the active provider model. For hosted providers, this replaces the bundled default from the LLM Analysis table. For `claude_cli` and `codex_cli`, this is forwarded as `--model` instead of using the local CLI runtime fallback. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
+| `SKILLSPECTOR_COMPACT_PROMPTS` | Set to `true` to reduce LLM token usage by condensing prompt text, removing line-number zero-padding, omitting redundant context from findings, and using a slimmer structured output schema. Default is off (original prompts preserved). | Optional |
 
 > **CLI providers** (`claude_cli`, `codex_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session (`claude auth login` / `codex login`). SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run in a hardened sandbox: tools disabled, no MCP, read-only sandbox mode (codex), and untrusted skill content is delivered only via stdin.
 

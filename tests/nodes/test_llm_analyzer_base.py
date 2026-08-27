@@ -293,10 +293,19 @@ class TestNumberLines:
     def test_single_line(self) -> None:
         assert number_lines("only") == "L1: only"
 
-    def test_zero_padding(self) -> None:
+    def test_zero_padding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_COMPACT_PROMPTS", raising=False)
         lines = "\n".join(f"line{i}" for i in range(11))
         result = number_lines(lines)
         assert result.startswith("L01: line0")
+        assert "L11: line10" in result
+
+    def test_compact_no_zero_padding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "true")
+        lines = "\n".join(f"line{i}" for i in range(11))
+        result = number_lines(lines)
+        assert result.startswith("L1: line0")
+        assert "L10: line9" in result
         assert "L11: line10" in result
 
 
@@ -1628,11 +1637,20 @@ class TestFormatFindingsForPrompt:
         text = _format_findings_for_prompt([f])
         assert long_match in text
 
-    def test_full_context_preserved(self) -> None:
+    def test_full_context_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_COMPACT_PROMPTS", raising=False)
         long_ctx = "line\n" * 200
         f = Finding(rule_id="E1", message="msg", context=long_ctx, file="a.py", start_line=1)
         text = _format_findings_for_prompt([f])
         assert long_ctx.strip() in text.replace("   ", "")
+
+    def test_compact_context_omitted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "true")
+        long_ctx = "line\n" * 200
+        f = Finding(rule_id="E1", message="msg", context=long_ctx, file="a.py", start_line=1)
+        text = _format_findings_for_prompt([f])
+        assert "Context:" not in text
+        assert long_ctx.strip() not in text
 
 
 # ---------------------------------------------------------------------------
@@ -2037,11 +2055,21 @@ class TestLLMMetaAnalyzerBuildPrompt:
         assert "100" in prompt and "200" in prompt
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_prompt_has_critical_instructions(self) -> None:
+    def test_prompt_has_critical_instructions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_COMPACT_PROMPTS", raising=False)
         analyzer = LLMMetaAnalyzer(model=self.MODEL)
         batch = Batch(file_path="a.py", content="x")
         prompt = analyzer.build_prompt(batch, metadata_text="")
         assert "CRITICAL INSTRUCTIONS" in prompt
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_compact_prompt_has_anti_jailbreak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "true")
+        analyzer = LLMMetaAnalyzer(model=self.MODEL)
+        batch = Batch(file_path="a.py", content="x")
+        prompt = analyzer.build_prompt(batch, metadata_text="")
+        assert "ANTI-JAILBREAK" in prompt
+        assert "CRITICAL INSTRUCTIONS" not in prompt
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_configured_output_language_is_included(self, monkeypatch: pytest.MonkeyPatch) -> None:
