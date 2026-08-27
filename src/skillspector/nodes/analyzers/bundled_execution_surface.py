@@ -1068,17 +1068,14 @@ def _scan_declarations(
         limit=_MAX_DECLARATIONS,
         previous_handler_ids=previous_settings_hook_ids,
     )
+    is_settings = path in {".claude/settings.json", ".claude/settings.local.json"}
     return _DeclarationScan(
         hooks=hooks,
         partial=(
             hook_partial
+            or (is_settings and not _modeled_settings_fields_are_valid(document))
             or (
-                path in {".claude/settings.json", ".claude/settings.local.json"}
-                and "disableAllHooks" in document
-                and not isinstance(document.get("disableAllHooks"), bool)
-            )
-            or (
-                path in {".claude/settings.json", ".claude/settings.local.json"}
+                is_settings
                 and document.get("disableAllHooks") is True
                 and not _settings_schema_allows_disable(document)
             )
@@ -1192,8 +1189,8 @@ def _permissions_schema_allows_disable(document: dict[str, object]) -> bool:
     )
 
 
-def _settings_schema_allows_disable(document: dict[str, object]) -> bool:
-    if not set(document).issubset(_DISABLE_TRUSTED_TOP_LEVEL_KEYS):
+def _modeled_settings_fields_are_valid(document: dict[str, object]) -> bool:
+    if "disableAllHooks" in document and not isinstance(document.get("disableAllHooks"), bool):
         return False
     if "$schema" in document and not _is_bounded_string(document.get("$schema")):
         return False
@@ -1203,7 +1200,15 @@ def _settings_schema_allows_disable(document: dict[str, object]) -> bool:
         return False
     if "env" in document and not _is_bounded_string_map(document.get("env")):
         return False
-    return _hooks_schema_allows_disable(document) and _permissions_schema_allows_disable(document)
+    return _permissions_schema_allows_disable(document)
+
+
+def _settings_schema_allows_disable(document: dict[str, object]) -> bool:
+    if not set(document).issubset(_DISABLE_TRUSTED_TOP_LEVEL_KEYS):
+        return False
+    if not _modeled_settings_fields_are_valid(document):
+        return False
+    return _hooks_schema_allows_disable(document)
 
 
 def _bundled_hooks_are_disabled(
@@ -1454,7 +1459,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 previous_settings_hook_ids
                 if path in {".claude/settings.json", ".claude/settings.local.json"}
                 else None,
-                hooks_disabled=hooks_disabled and path != "hooks/hooks.json",
+                hooks_disabled=hooks_disabled,
             )
         except Exception as exc:
             logger.exception("%s failed for %s", ANALYZER_ID, path)

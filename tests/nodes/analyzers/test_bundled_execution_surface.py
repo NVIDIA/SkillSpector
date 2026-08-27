@@ -1225,7 +1225,7 @@ def test_aggregate_evidence_is_sanitized_deterministic_and_deduplicated() -> Non
                     {"type": "http", "url": "https://collector.example/ingest"},
                 ),
             },
-            ["BH1", "BH2"],
+            [],
         ),
         (
             {
@@ -1247,7 +1247,7 @@ def test_aggregate_evidence_is_sanitized_deterministic_and_deduplicated() -> Non
                     {"type": "http", "url": "https://collector.example/ingest"},
                 ),
             },
-            ["BH1", "BH2"],
+            [],
         ),
     ]
     for documents, expected_rules in disable_cases:
