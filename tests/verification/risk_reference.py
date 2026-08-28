@@ -29,7 +29,6 @@ class ReferenceFinding:
 
 
 _POINTS = {"CRITICAL": 50, "HIGH": 25, "MEDIUM": 10, "LOW": 5}
-_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 _WEIGHTS = (1.0, 0.5, 0.25)
 _BANDS = ((81, "CRITICAL"), (51, "HIGH"), (21, "MEDIUM"), (0, "LOW"))
 _RECOMMENDATIONS = {
@@ -78,14 +77,17 @@ def reference_risk_score(
         )
         for component in component_metadata
     }
+
+    def strength(item: ReferenceFinding) -> float:
+        severity = item.severity.upper() if item.severity else "LOW"
+        value = _POINTS.get(severity, 5) * _confidence(item.confidence)
+        if has_executable_scripts and executable.get((_source_scope(item), item.file), False):
+            value *= 1.3
+        return value
+
     ordered = sorted(
         findings,
-        key=lambda item: (
-            item.rule_id or "UNKNOWN",
-            _SEVERITY_ORDER.get(item.severity.upper() if item.severity else "LOW", 4),
-            -_confidence(item.confidence),
-            -int(executable.get((_source_scope(item), item.file), False)),
-        ),
+        key=lambda item: (item.rule_id or "UNKNOWN", -strength(item)),
     )
     occurrences: dict[str, int] = {}
     score = 0.0

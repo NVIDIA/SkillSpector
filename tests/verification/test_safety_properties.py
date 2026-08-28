@@ -104,27 +104,34 @@ def test_risk_score_is_permutation_invariant(
     )
 
 
-@given(
-    st.lists(
-        st.floats(min_value=0.001, max_value=1.0, allow_nan=False, allow_infinity=False),
-        max_size=8,
-    ),
-    st.floats(min_value=0.001, max_value=1.0, allow_nan=False, allow_infinity=False),
-    st.sampled_from(SEVERITIES),
-)
-def test_adding_same_severity_evidence_cannot_lower_score(
-    confidences: list[float], new_confidence: float, severity: str
+@given(st.lists(reference_findings(), max_size=12), reference_findings(), st.booleans())
+@settings(max_examples=500, deadline=None)
+def test_adding_arbitrary_evidence_cannot_lower_score(
+    findings: list[ReferenceFinding],
+    added: ReferenceFinding,
+    has_executable_scripts: bool,
 ) -> None:
-    findings = [
-        ReferenceFinding(rule_id="R1", severity=severity, confidence=confidence)
-        for confidence in confidences
+    combined = [*findings, added]
+    metadata: list[dict[str, object]] = [
+        {
+            "path": item.file,
+            "source_identity": item.source_identity,
+            "executable": item.file.endswith(".py"),
+        }
+        for item in combined
     ]
-    before = reference_risk_score(findings, False)[0]
-    after = reference_risk_score(
-        [*findings, ReferenceFinding(rule_id="R1", severity=severity, confidence=new_confidence)],
-        False,
+
+    reference_before = reference_risk_score(findings, has_executable_scripts, metadata)[0]
+    reference_after = reference_risk_score(combined, has_executable_scripts, metadata)[0]
+    production_before = _compute_risk_score(
+        [_production_finding(item) for item in findings], has_executable_scripts, metadata
     )[0]
-    assert after >= before
+    production_after = _compute_risk_score(
+        [_production_finding(item) for item in combined], has_executable_scripts, metadata
+    )[0]
+
+    assert reference_after >= reference_before
+    assert production_after >= production_before
 
 
 @st.composite
@@ -203,6 +210,24 @@ def test_reference_model_detects_the_historical_equal_severity_order_bug() -> No
         50,
         "MEDIUM",
         "CAUTION",
+    )
+
+
+def test_higher_severity_evidence_cannot_steal_weight_from_stronger_evidence() -> None:
+    strong_high = ReferenceFinding(rule_id="R1", severity="HIGH", confidence=0.1)
+    weak_critical = ReferenceFinding(rule_id="R1", severity="CRITICAL", confidence=0.01)
+
+    before = reference_risk_score([strong_high], False)
+    after = reference_risk_score([strong_high, weak_critical], False)
+
+    assert before == (2, "LOW", "SAFE")
+    assert after == (2, "LOW", "SAFE")
+    assert _compute_risk_score([_production_finding(strong_high)], False) == before
+    assert (
+        _compute_risk_score(
+            [_production_finding(strong_high), _production_finding(weak_critical)], False
+        )
+        == after
     )
 
 

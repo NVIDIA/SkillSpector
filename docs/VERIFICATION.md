@@ -19,10 +19,10 @@ make verify
 
 - Risk scores are integers in `[0, 100]` and map exhaustively to the documented bands.
 - Diminishing returns apply independently per rule with weights `1`, `0.5`, and `0.25`.
-- Higher severity receives priority within a rule. Equal-severity findings are ordered by
-  confidence and then executable status, making the score permutation-invariant and
-  preventing weaker weighted evidence from displacing stronger evidence solely because an
-  analyzer returned it first.
+- Within a rule, findings are ordered by their unweighted score contribution (severity,
+  confidence, and executable provenance together). This makes the score permutation-invariant
+  and monotone: adding non-negative evidence cannot lower the score by taking a larger
+  diminishing-return weight away from stronger evidence.
 - Blocking floors for proven SC8, BH2, and BH3 conditions survive ordinary weighted scoring.
 - Executable-file multiplication is scoped by both source provenance and path.
 - The LLM meta-analyzer may enrich a deterministic finding, but cannot remove it, change its
