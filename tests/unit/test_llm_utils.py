@@ -32,6 +32,7 @@ from langchain_core.outputs import ChatGeneration, LLMResult
 from pydantic import BaseModel
 
 from skillspector import llm_utils
+from skillspector.constants import build_model_config
 from skillspector.inference_usage import InferenceUsageCollector
 from skillspector.llm_utils import (
     AgentCLIChatModel,
@@ -657,6 +658,17 @@ class TestGetChatModel:
 
         llm = get_chat_model()
 
+        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+
+    def test_graph_model_config_matches_openai_fallback_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+        model = build_model_config()["default"]
+        llm = get_chat_model(model=model)
+
+        assert model == OpenAIProvider.DEFAULT_MODEL
         assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
 
     def test_explicit_model_still_overrides_openai_fallback(
