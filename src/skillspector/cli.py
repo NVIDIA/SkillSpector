@@ -596,7 +596,7 @@ def scan(
                 "[yellow]Warning:[/yellow] Recursive skill discovery was incomplete; "
                 "continuing with a bounded scan and reporting partial coverage."
             )
-        if detection.is_multi_skill:
+        if detection.skills:
             if baseline is not None:
                 err_console.print(
                     "[red]Error:[/red] --baseline is not supported for recursive "
@@ -2181,7 +2181,11 @@ def _scan_multi_skill(
             elif not child_failed:
                 complete_skill_count += 1
             score = result.get("risk_score") or 0
-            if isinstance(score, int) and score > max_score:
+            try:
+                score = int(score)
+            except (TypeError, ValueError):
+                score = 0
+            if score > max_score:
                 max_score = score
             child_transitive_count = result.get("transitive_finding_count")
             if isinstance(child_transitive_count, int):

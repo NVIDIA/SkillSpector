@@ -19,13 +19,21 @@ from __future__ import annotations
 
 import re
 import sys
+from bisect import bisect_right
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+    get_context,
+    get_line_number,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -213,13 +221,199 @@ _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
 _MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
 
 
-def _source_line(content: str, match: re.Match[str]) -> str:
+def _source_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    starts = [0]
+    ends: list[int] = []
+    for separator in LOGICAL_LINE_BREAK.finditer(content):
+        ends.append(separator.start())
+        starts.append(separator.end())
+    ends.append(len(content))
+    return tuple(starts), tuple(ends)
+
+
+def _source_line_bounds(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> tuple[int, int]:
+    if line_starts is None or line_ends is None:
+        line_starts, line_ends = _source_line_metadata(content)
+    index = bisect_right(line_starts, match.start()) - 1
+    return line_starts[index], line_ends[index]
+
+
+def _source_line(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> str:
     """Return only the source line containing *match*."""
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end < 0:
-        line_end = len(content)
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
     return content[line_start:line_end]
+
+
+_PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
+# Attacker-controlled credential placement remains actionable, including Save/Put/Write.
+_PE3_CREDENTIAL_STORE_AFTER_VERBS = (
+    r"access(?:es|ed|ing)?|copy|copies|copied|copying|dump(?:s|ed|ing)?|"
+    r"exfiltrat(?:e|es|ed|ing|ion)|export(?:s|ed|ing)?|extract(?:s|ed|ing)?|"
+    r"fetch(?:es|ed|ing)?|get(?:s|ting)?|grab(?:s|bed|bing)?|harvest(?:s|ed|ing)?|"
+    r"load(?:s|ed|ing)?|lookup|obtain(?:s|ed|ing)?|open(?:s|ed|ing)?|pull(?:s|ed|ing)?|"
+    r"query|queries|queried|querying|read(?:s|ing)?|retrieve(?:s|d|ing)?|scrape(?:s|d|ing)?|"
+    r"send(?:s|ing|sent)?|steal(?:s|ing|stolen)?|transmit(?:s|ted|ting)?|"
+    r"unlock(?:s|ed|ing)?|upload(?:s|ed|ing)?|save(?:s|d|ing)?|put(?:s|ting)?|"
+    r"write|writes|wrote|writing|written|"
+    r"store(?:s|d|ing)?|remove(?:s|d|ing)?|delete(?:s|d|ing)?|clear(?:s|ed|ing)?|"
+    r"update(?:s|d|ing)?|add(?:s|ed|ing)?|set(?:s|ting)?|use(?:s|ing)?"
+)
+_PE3_CREDENTIAL_STORE_OPERATION = re.compile(
+    rf"\b(?:{_PE3_CREDENTIAL_STORE_AFTER_VERBS})\b"
+    r"(?:\s+(?:the|a|an|my|your|local|credentials?|secrets?|passwords?|"
+    r"tokens?|keys?|contents?|system|from|to|for|in|on)){0,8}\s*$",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_OPERATION_AFTER = re.compile(
+    rf"^\s*(?:(?:and|then|but)\s+)?(?:(?:is|was|can|will|should|must)\s+)?"
+    rf"(?:used\s+(?:to|for)\s+)?"
+    rf"(?:{_PE3_CREDENTIAL_STORE_AFTER_VERBS})\b",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_DOCUMENTATION = re.compile(
+    r"^\s+(?:api\s+documentation|cli\s+reference|access\s+policy|access\s+controls|"
+    r"lookup\s+table|query\s+syntax|export\s+format)\b",
+    re.IGNORECASE,
+)
+_PE3_BENIGN_READING_PURPOSE_AFTER = re.compile(
+    r"^\s+(?:is\s+)?(?:solely\s+for\s+reading|for\s+reading(?:\s+purposes?)?\s+only|"
+    r"only\s+for\s+reading(?:\s+purposes?)?)\s*$",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_CALL = re.compile(
+    r"\s*[.]\s*(?:add|clear|delete|get|remove|save|set|store|update|write)"
+    r"\w*\s*(?=\()",
+    re.IGNORECASE,
+)
+_PE3_CREDENTIAL_STORE_CLI = re.compile(
+    r"\b(?:security\s+)?find-generic-password\b(?P<args>[^.;:\n]*)$", re.IGNORECASE
+)
+
+
+def _cli_targets_credential_store_noun(before_noun: str, noun: str) -> bool:
+    """Accept CLI evidence only when it has not already named another store noun."""
+    cli = _PE3_CREDENTIAL_STORE_CLI.search(f"{before_noun}{noun}")
+    if cli is None:
+        return False
+    args = cli.group("args").rstrip()
+    if not args.lower().endswith(noun.lower()):
+        return False
+    args_before_noun = args[: -len(noun)].rstrip()
+    if re.search(
+        r"\b(?:and|then|document|describe|reference|the)\b", args_before_noun, re.IGNORECASE
+    ):
+        return False
+    return not any(
+        word != noun.lower() and re.search(rf"\b{re.escape(word)}\b", args, re.IGNORECASE)
+        for word in _PE3_CREDENTIAL_STORE_WORDS
+    )
+
+
+def _markdown_fence_ranges(content: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    active: tuple[str, int, int] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+        if active is not None:
+            if closing and closing.group(1)[0] == active[0] and len(closing.group(1)) >= active[1]:
+                ranges.append((active[2], offset))
+                active = None
+        else:
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped)
+            if opening:
+                marker = opening.group(1)
+                active = (marker[0], len(marker), offset + len(line))
+        offset += len(line)
+    if active is not None:
+        ranges.append((active[2], len(content)))
+    return ranges
+
+
+def _is_bare_credential_store_noun(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    fence_ranges: list[tuple[int, int]] | None = None,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Suppress only descriptive credential-store nouns in prose."""
+    if file_type not in {"markdown", "text"}:
+        return False
+    if match.group(0).lower() not in _PE3_CREDENTIAL_STORE_WORDS:
+        return False
+    ranges = _markdown_fence_ranges(content) if fence_ranges is None else fence_ranges
+    if any(start <= match.start() < end for start, end in ranges):
+        return False
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    relation_start = max(line_start, match.start() - 80)
+    relation_end = min(line_end, match.end() + 80)
+    relation = content[relation_start:relation_end]
+    noun_offset = match.start() - relation_start
+    separators_before = [
+        (separator.start(), 1)
+        for separator in re.finditer(r"[.,;:](?=\s|$)", relation[:noun_offset])
+    ] + [
+        (separator.start(), len(separator.group(0)))
+        for separator in re.finditer(r"\b(?:and|then|but|or)\b", relation[:noun_offset])
+    ]
+    clause_start, clause_prefix_length = max(separators_before, default=(-1, 0))
+    after_relation = relation[noun_offset:]
+    separators_after = [
+        separator.start() for separator in re.finditer(r"[.,;:](?=\s|$)", after_relation)
+    ]
+    for separator in re.finditer(r"\b(?:and|then|but|or)\b", after_relation):
+        if re.search(
+            r"\b(?:keychain|keyring|gnome-keyring)\b",
+            after_relation[separator.end() :],
+            re.IGNORECASE,
+        ):
+            separators_after.append(separator.start())
+    clause_end = noun_offset + min(separators_after) if separators_after else len(relation)
+    clause_start_offset = clause_start + clause_prefix_length if clause_start >= 0 else 0
+    clause = relation[clause_start_offset:clause_end]
+    noun_start = noun_offset - clause_start_offset
+    noun_end = noun_start + match.end() - match.start()
+    before_noun = clause[:noun_start]
+    after_noun = clause[noun_end:]
+    operation = _PE3_CREDENTIAL_STORE_OPERATION.search(before_noun)
+    operation_after = _PE3_CREDENTIAL_STORE_OPERATION_AFTER.search(after_noun)
+    call = _PE3_CREDENTIAL_STORE_CALL.match(after_noun)
+    cli = _cli_targets_credential_store_noun(before_noun, match.group(0))
+    documentation = _PE3_CREDENTIAL_STORE_DOCUMENTATION.match(after_noun)
+    if documentation:
+        documentation_tail = after_noun[documentation.end() :]
+        tail_is_explanatory = re.match(
+            r"\s+(?:for|about|with|on|that|which|of)\b", documentation_tail, re.IGNORECASE
+        )
+        if (
+            _PE3_CREDENTIAL_STORE_OPERATION_AFTER.search(documentation_tail) is None
+            or tail_is_explanatory
+        ):
+            return True
+    if (
+        _PE3_BENIGN_READING_PURPOSE_AFTER.fullmatch(after_noun)
+        and operation is None
+        and not call
+        and not cli
+    ):
+        return True
+    if not (operation or operation_after or call or cli):
+        return True
+    # Any operation tied to this exact noun, including a read, dominates benign prose.
+    return False
 
 
 def _is_access_token_documentation_noun(
@@ -227,6 +421,8 @@ def _is_access_token_documentation_noun(
     match: re.Match[str],
     file_type: str,
     file_path: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
 ) -> bool:
     """Return True for a bounded ``access token`` compound noun in documentation.
 
@@ -254,8 +450,8 @@ def _is_access_token_documentation_noun(
     if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
         return False
 
-    line = _source_line(content, match)
-    line_start = content.rfind("\n", 0, match.start()) + 1
+    line = _source_line(content, match, line_starts, line_ends)
+    line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
     relative_start = match.start() - line_start
     relative_end = match.end() - line_start
     prefix = _MARKDOWN_LINE_PREFIX.sub("", line[:relative_start])
@@ -276,7 +472,11 @@ def _is_access_token_documentation_noun(
 
 
 def _is_qualified_benign_access_requirement(
-    content: str, match: re.Match[str], file_type: str
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
 ) -> bool:
     """Suppress only the reviewed GTL requirement row in its exact table."""
     if file_type != "markdown" or match.group(0) != "access credential":
@@ -306,6 +506,8 @@ def _is_qualified_benign_access_requirement(
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
+    line_starts, line_ends = _source_line_metadata(content)
+    fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -349,14 +551,22 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in PE3_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            if _is_bare_credential_store_noun(
+                content, match, file_type, fence_ranges, line_starts, line_ends
+            ):
+                continue
+            line_num = bisect_right(line_starts, match.start())
             context = get_context(content, match.start())
             contextual = any(
                 (
-                    _is_pe3_documentation_example(content, match, file_type, file_path),
-                    _is_qualified_benign_access_requirement(content, match, file_type),
+                    _is_pe3_documentation_example(
+                        content, match, file_type, file_path, line_starts, line_ends
+                    ),
+                    _is_qualified_benign_access_requirement(
+                        content, match, file_type, line_starts, line_ends
+                    ),
                     _is_read_only_passwd_volume_match(content, match),
-                    _is_negated_safety_constraint(content, match),
+                    _is_negated_safety_constraint(content, match, line_starts, line_ends),
                 )
             )
             finding_tags = list(tag)
@@ -453,6 +663,8 @@ def _is_pe3_documentation_example(
     match: re.Match[str],
     file_type: str,
     file_path: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
 ) -> bool:
     """Filter reviewed, position-bound access-token documentation forms.
 
@@ -468,23 +680,27 @@ def _is_pe3_documentation_example(
     if match.group(0).lower() not in {"access token", "access tokens"}:
         return False
 
-    line = _source_line(content, match)
+    line = _source_line(content, match, line_starts, line_ends)
     navigation = _PE3_SAFE_ACCESS_TOKEN_NAVIGATION.search(line)
     if navigation is not None:
-        line_start = content.rfind("\n", 0, match.start()) + 1
+        line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
         match_span = (match.start() - line_start, match.end() - line_start)
         if navigation.span("target") == match_span:
             return True
 
-    return _is_access_token_documentation_noun(content, match, file_type, file_path)
+    return _is_access_token_documentation_noun(
+        content, match, file_type, file_path, line_starts, line_ends
+    )
 
 
-def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+def _is_negated_safety_constraint(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
     """Return True when a privilege-escalation phrase is forbidden in policy prose."""
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(content)
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
     line = content[line_start:line_end]
     local_start = match.start() - line_start
     phrase = line[local_start : local_start + len(match.group(0))]

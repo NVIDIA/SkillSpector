@@ -420,6 +420,22 @@ _DIMINISHING_WEIGHTS = (1.0, 0.5, 0.25)
 _RISK_SCORE_FLOORS_BY_RULE_ID = {"SC8": 51}
 
 
+def _risk_score_floor(finding: Finding) -> int:
+    """Return a blocking floor only for closed, potentially effective proofs."""
+    configured_floor = _RISK_SCORE_FLOORS_BY_RULE_ID.get(finding.rule_id, 0)
+    if configured_floor:
+        return configured_floor
+    if (finding.severity or "").upper() != "CRITICAL":
+        return 0
+    if finding.evidence.get("activation_state") != "conditional":
+        return 0
+    if finding.rule_id == "BH2" and finding.evidence.get("proof_status") == "closed":
+        return 51
+    if finding.rule_id == "BH3":
+        return 51
+    return 0
+
+
 def _compute_risk_score(
     findings: list[Finding],
     has_executable_scripts: bool,
@@ -503,11 +519,7 @@ def _compute_risk_score(
         score += contribution
 
     score_floor = max(
-        (
-            _RISK_SCORE_FLOORS_BY_RULE_ID.get(f.rule_id, 0)
-            for f in sorted_findings
-            if max(0.0, min(1.0, f.confidence)) > 0.0
-        ),
+        (_risk_score_floor(f) for f in sorted_findings if max(0.0, min(1.0, f.confidence)) > 0.0),
         default=0,
     )
     final_score = min(100, max(score_floor, int(score)))

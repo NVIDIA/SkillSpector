@@ -21,6 +21,8 @@ Covers: EA1–EA5, OH1–OH3, P6–P8, MP1–MP3, TM1–TM3, RA1–RA2,
 
 from __future__ import annotations
 
+import json
+import time
 from unittest.mock import patch
 
 import pytest
@@ -66,7 +68,13 @@ def _make_vuln(
     return VulnResult(vuln_id=vuln_id, summary=summary, severity=severity, aliases=aliases)
 
 
-def _analyze_deps(content: str, filename: str, osv_results: list | None = None) -> list:
+def _analyze_deps(
+    content: str,
+    filename: str,
+    osv_results: list | None = None,
+    locked_versions: dict[str, str] | None = None,
+    npm_locked_versions: dict[str, str] | None = None,
+) -> list:
     """Run ``_analyze_dependencies`` with a mocked OSV ``query_batch``.
 
     Patches both ``query_batch`` and ``was_osv_reachable`` to return ``True``
@@ -75,7 +83,9 @@ def _analyze_deps(content: str, filename: str, osv_results: list | None = None) 
     """
     with patch(_OSV_PATCH_TARGET, return_value=osv_results or [[]]):
         with patch(_WAS_OSV_REACHABLE_TARGET, return_value=True):
-            return sc_mod._analyze_dependencies(content, filename)
+            return sc_mod._analyze_dependencies(
+                content, filename, locked_versions, npm_locked_versions
+            )
 
 
 # ── Excessive Agency (EA1–EA5) ─────────────────────────────────────────
@@ -1537,6 +1547,55 @@ class TestSupplyChainDependencies:
         assert "CVE-2024-22195" in sc4[0].message
         assert sc4[0].severity == Severity.HIGH
 
+    def test_sc4_scans_the_npm_lockfile_itself(self) -> None:
+        # A transitive dependency appears only in the lockfile. Without this the scanner sees
+        # the manifest's direct dependencies and nothing else — which is where npm advisories
+        # mostly are not.
+        lock = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "the-project"},
+                    "node_modules/jest/node_modules/picomatch": {"version": "2.3.1"},
+                },
+            }
+        )
+        findings = _analyze_deps(
+            lock,
+            "package-lock.json",
+            osv_results=[
+                [_make_vuln("GHSA-pico", "Method injection", "HIGH", ("CVE-2026-33672",))]
+            ],
+        )
+        sc4 = [f for f in findings if f.rule_id == "SC4"]
+        assert len(sc4) == 1
+        assert "picomatch==2.3.1" in sc4[0].message
+        assert sc4[0].severity == Severity.HIGH
+
+    def test_sc4_manifest_range_becomes_verifiable_with_a_lockfile(self) -> None:
+        # Without the lockfile a range has no version, so #319 correctly refuses to claim a
+        # match: LOW, "unverifiable". With it the exact release is known and the advisory is
+        # reported for what it is.
+        manifest = json.dumps({"dependencies": {"lodash": "^4.17.0"}}, indent=2)
+        vuln = [_make_vuln("GHSA-lodash", "Prototype pollution", "HIGH", ("CVE-2021-23337",))]
+
+        unverifiable = [
+            f for f in _analyze_deps(manifest, "package.json", [vuln]) if f.rule_id == "SC4"
+        ]
+        assert len(unverifiable) == 1
+        assert unverifiable[0].severity == Severity.LOW
+
+        verified = [
+            f
+            for f in _analyze_deps(
+                manifest, "package.json", [vuln], npm_locked_versions={"lodash": "4.17.20"}
+            )
+            if f.rule_id == "SC4"
+        ]
+        assert len(verified) == 1
+        assert verified[0].severity == Severity.HIGH
+        assert "lodash==4.17.20" in verified[0].message
+
     def test_sc4_osv_no_vulns_returns_empty(self) -> None:
         sc4 = [f for f in _analyze_deps("pyyaml==6.0\n", "requirements.txt") if f.rule_id == "SC4"]
         assert len(sc4) == 0
@@ -1901,6 +1960,170 @@ class TestSupplyChainHelpers:
         assert sc_mod._pinned_npm_version("*") is None
         assert sc_mod._pinned_npm_version(">=1.2.3 <2.0.0") is None
         assert sc_mod._pinned_npm_version("") is None
+
+    def test_npm_lock_v3_packages_layout(self) -> None:
+        # lockfileVersion 2/3 keys every install by path. The root entry ("") is the project
+        # itself, not a dependency, and a nested node_modules is a transitive install.
+        content = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "the-project", "version": "1.0.0"},
+                    "node_modules/commander": {"version": "11.1.0"},
+                    "node_modules/jest/node_modules/picomatch": {"version": "2.3.1"},
+                    "node_modules/@scope/pkg": {"version": "3.0.0"},
+                },
+            }
+        )
+        versions = {n: v for n, v, _ in sc_mod._extract_packages_from_npm_lock(content)}
+        assert versions == {
+            "commander": "11.1.0",
+            "picomatch": "2.3.1",
+            "@scope/pkg": "3.0.0",
+        }
+
+    def test_npm_lock_v1_dependencies_layout(self) -> None:
+        # lockfileVersion 1 nests transitive installs instead of flattening them.
+        content = json.dumps(
+            {
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "jest": {
+                        "version": "29.7.0",
+                        "dependencies": {"picomatch": {"version": "2.3.1"}},
+                    }
+                },
+            }
+        )
+        versions = {n: v for n, v, _ in sc_mod._extract_packages_from_npm_lock(content)}
+        assert versions == {"jest": "29.7.0", "picomatch": "2.3.1"}
+
+    def test_npm_lock_aliased_install_uses_the_declared_name(self) -> None:
+        # npm alias: the install path is the alias, the real package is in "name".
+        content = json.dumps(
+            {"packages": {"node_modules/alias": {"name": "real-pkg", "version": "2.0.0"}}}
+        )
+        assert sc_mod._extract_packages_from_npm_lock(content) == [("real-pkg", "2.0.0", 1)]
+
+    def test_npm_lock_invalid_json_yields_nothing(self) -> None:
+        assert sc_mod._extract_packages_from_npm_lock('{"packages": ') == []
+        assert sc_mod._extract_packages_from_npm_lock("[1, 2, 3]") == []
+
+    def test_npm_lock_keeps_every_installed_version_of_a_package(self) -> None:
+        # npm installs the same package at several versions routinely, nesting the ones that
+        # cannot be hoisted. Deduplicating by name would keep whichever came first and drop the
+        # rest — and the dropped copy is on disk, so a vulnerable one would go unreported.
+        content = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "the-project"},
+                    "node_modules/ws": {"version": "8.20.0"},
+                    "node_modules/legacy-dep": {"version": "1.0.0"},
+                    "node_modules/legacy-dep/node_modules/ws": {"version": "8.19.0"},
+                },
+            },
+            indent=2,
+        )
+        installed = {(n, v) for n, v, _ in sc_mod._extract_packages_from_npm_lock(content)}
+        assert ("ws", "8.20.0") in installed
+        assert ("ws", "8.19.0") in installed
+
+    def test_npm_lock_reports_an_identical_install_once(self) -> None:
+        # Same name *and* version hoisted twice is one package, not two findings.
+        content = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/a/node_modules/ws": {"version": "8.19.0"},
+                    "node_modules/b/node_modules/ws": {"version": "8.19.0"},
+                },
+            },
+            indent=2,
+        )
+        assert [(n, v) for n, v, _ in sc_mod._extract_packages_from_npm_lock(content)] == [
+            ("ws", "8.19.0")
+        ]
+
+    def test_npm_lock_line_numbers_do_not_rescan_the_file(self) -> None:
+        # Looking the line up per package is quadratic: search and offset-to-line both restart
+        # from the top. A 5000-entry lockfile is ordinary and took 6.3s that way.
+        content = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {f"node_modules/pkg-{i}": {"version": "1.0.0"} for i in range(2000)},
+            },
+            indent=2,
+        )
+        started = time.perf_counter()
+        packages = sc_mod._extract_packages_from_npm_lock(content)
+        elapsed = time.perf_counter() - started
+        assert len(packages) == 2000
+        # Generous by ~10x against the linear implementation, still far under the quadratic one.
+        assert elapsed < 1.0, f"{elapsed:.2f}s for 2000 packages suggests a per-package rescan"
+
+    def test_npm_lock_line_numbers_point_at_the_entry(self) -> None:
+        content = json.dumps(
+            {"lockfileVersion": 3, "packages": {"node_modules/commander": {"version": "11.1.0"}}},
+            indent=2,
+        )
+        [(_name, _version, line)] = sc_mod._extract_packages_from_npm_lock(content)
+        assert content.splitlines()[line - 1].strip().startswith('"node_modules/commander"')
+
+    def test_manifest_range_resolves_to_the_direct_install(self) -> None:
+        # A manifest range names a direct dependency, so it resolves to the top-level copy —
+        # not to a nested one that exists only to satisfy some other package's constraint.
+        content = json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/legacy-dep/node_modules/ws": {"version": "8.19.0"},
+                    "node_modules/ws": {"version": "8.20.0"},
+                },
+            },
+            indent=2,
+        )
+        cache = {"package-lock.json": content}
+        assert sc_mod._collect_npm_locked_versions(cache, list(cache)) == {"ws": "8.20.0"}
+
+    def test_npm_normalization_keeps_underscores_distinct(self) -> None:
+        # PyPI folds "_" into "-"; npm does not, and both string_decoder and string-decoder
+        # exist as separate packages. Folding them would resolve one against the other.
+        assert sc_mod._normalize_npm_package_name("String_Decoder") == "string_decoder"
+        assert sc_mod._normalize_package_name("String_Decoder") == "string-decoder"
+
+    def test_manifest_range_resolves_to_the_locked_version(self) -> None:
+        # The whole point: "^11.0.0" does not mean 11.0.0. The lockfile says which release is
+        # actually installed, and that is the only version worth asking OSV about.
+        manifest = json.dumps({"dependencies": {"commander": "^11.0.0"}}, indent=2)
+        packages = sc_mod._apply_locked_versions(
+            sc_mod._extract_packages_from_package_json(manifest),
+            {"commander": "11.1.0"},
+            sc_mod._normalize_npm_package_name,
+        )
+        assert [(n, v) for n, v, _ in packages] == [("commander", "11.1.0")]
+
+    def test_exact_manifest_pin_wins_over_the_lockfile(self) -> None:
+        manifest = json.dumps({"dependencies": {"commander": "11.0.0"}}, indent=2)
+        packages = sc_mod._apply_locked_versions(
+            sc_mod._extract_packages_from_package_json(manifest),
+            {"commander": "11.1.0"},
+            sc_mod._normalize_npm_package_name,
+        )
+        assert [(n, v) for n, v, _ in packages] == [("commander", "11.0.0")]
+
+    def test_npm_and_python_lock_maps_are_collected_separately(self) -> None:
+        # "semver", "packaging" and "requests" all exist in both ecosystems: a single map
+        # would answer a PyPI question with an npm version.
+        cache = {
+            "uv.lock": '[[package]]\nname = "semver"\nversion = "3.0.2"\n',
+            "package-lock.json": json.dumps(
+                {"packages": {"node_modules/semver": {"version": "7.6.0"}}}
+            ),
+        }
+        components = list(cache)
+        assert sc_mod._collect_locked_versions(cache, components) == {"semver": "3.0.2"}
+        assert sc_mod._collect_npm_locked_versions(cache, components) == {"semver": "7.6.0"}
 
     def test_extract_packages_requirements_specifier_is_not_a_pin(self) -> None:
         # Regression: any specifier was treated as "==", so the floor "pillow>=10.0.0" was
