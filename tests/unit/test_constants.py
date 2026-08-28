@@ -23,6 +23,10 @@ import logging
 import pytest
 
 from skillspector.providers import registry
+from skillspector.providers.bedrock import BedrockProvider
+from skillspector.providers.codex_cli import CodexCLIProvider
+from skillspector.providers.nv_build import NvBuildProvider
+from skillspector.providers.openai import OpenAIProvider
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +41,8 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch):
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "SKILLSPECTOR_REASONING_EFFORT",
+        "SKILLSPECTOR_TEMPERATURE",
+        "SKILLSPECTOR_SEED",
         "ANTHROPIC_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -95,6 +101,53 @@ class TestPerSlotModelOverrides:
         mod = _reload_constants()
         # Whitespace-only treated as unset — falls through to provider.
         assert mod.MODEL_CONFIG["meta_analyzer"] != "   "
+
+    def test_openai_fallback_uses_openai_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+        config = _reload_constants().build_model_config()
+
+        provider = OpenAIProvider()
+        assert config["default"] == provider.resolve_model()
+        assert config["meta_analyzer"] == provider.resolve_model("meta_analyzer")
+
+    def test_slot_override_wins_over_openai_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_META_ANALYZER", "custom/meta-model")
+
+        config = _reload_constants().build_model_config()
+
+        assert config["default"] == OpenAIProvider.DEFAULT_MODEL
+        assert config["meta_analyzer"] == "custom/meta-model"
+
+    def test_configured_provider_precedes_openai_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "nv_build")
+        monkeypatch.setenv("NVIDIA_INFERENCE_KEY", "nvapi-test")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+
+        config = _reload_constants().build_model_config()
+
+        assert config["default"] == NvBuildProvider.DEFAULT_MODEL
+
+    def test_cli_provider_precedes_openai_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "codex_cli")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+
+        config = _reload_constants().build_model_config()
+
+        assert config["default"] == CodexCLIProvider.DEFAULT_MODEL
+
+    def test_bedrock_native_auth_precedes_openai_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
+
+        config = _reload_constants().build_model_config()
+
+        assert config["default"] == BedrockProvider.DEFAULT_MODEL
 
 
 class TestModelValidation:
