@@ -75,7 +75,12 @@ P1_PATTERNS = [
 # constant so hidden-instruction and padding detection cannot drift apart.
 _ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
 P2_PATTERNS = [
-    (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
+    (
+        r"<!--(?:(?!-->).)*?(?<![^\W_])(?:system|instructions?|ignore|POST|GET|send|transmit)"
+        r"(?![^\W_])"
+        r"(?:(?!-->).)*?-->",
+        0.7,
+    ),
     (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
     (_ZERO_WIDTH_PATTERN, 0.6),
     (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
