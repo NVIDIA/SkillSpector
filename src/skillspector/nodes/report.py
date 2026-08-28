@@ -455,17 +455,15 @@ def _compute_risk_score(
 
     Within each rule_id bucket, findings are processed in severity-descending
     order so that the highest-severity occurrence always receives the full weight.
+    Equal-severity findings are processed by confidence descending, then executable
+    status, so the score is independent of analyzer output order and the strongest
+    weighted evidence receives the largest diminishing-return weight.
 
     Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
     1.3x multiplier applied only to findings from executable script files;
     findings from documentation files (markdown, text, json, yaml, toml)
     are scored at base weight to avoid punishing security documentation.
     """
-    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    sorted_findings = sorted(
-        findings,
-        key=lambda f: (f.rule_id or "UNKNOWN", severity_rank.get((f.severity or "LOW").upper(), 4)),
-    )
 
     def component_source_scope(component: Mapping[str, object]) -> str:
         for key in ("source_identity", "source_url", "source_digest"):
@@ -490,6 +488,17 @@ def _compute_risk_score(
             file_executable[(component_source_scope(cm), str(cm.get("path", "")))] = bool(
                 cm.get("executable", False)
             )
+
+    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    sorted_findings = sorted(
+        findings,
+        key=lambda f: (
+            f.rule_id or "UNKNOWN",
+            severity_rank.get((f.severity or "LOW").upper(), 4),
+            -max(0.0, min(1.0, f.confidence)),
+            -int(file_executable.get((finding_source_scope(f), f.file), False)),
+        ),
+    )
 
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
