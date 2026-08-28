@@ -297,7 +297,11 @@ def _open_regular_file_no_follow(file_path: Path) -> BinaryIO:
 
 def _open_regular_file_from_trusted_directory(file_path: Path) -> BinaryIO:
     """Open *file_path* one non-symlinked component at a time."""
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    # Traversal only needs search access on each component. Prefer O_PATH where it
+    # exists (Linux); O_RDONLY additionally demands read access, which sandboxes
+    # such as Landlock withhold on "/". Elsewhere (e.g. macOS) this is O_RDONLY,
+    # i.e. 0, leaving the flags unchanged.
+    directory_flags = os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_PATH", os.O_RDONLY)
     directory_fd: int | None = None
     try:
         directory_fd = os.open(file_path.anchor, directory_flags)
