@@ -431,6 +431,8 @@ def _risk_score_floor(finding: Finding) -> int:
         return 0
     if finding.rule_id == "BH2" and finding.evidence.get("proof_status") == "closed":
         return 51
+    if finding.rule_id == "BH3":
+        return 51
     return 0
 
 

@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Analyze the bounded bundled hook execution surface."""
+"""Analyze the bounded bundled hook and permission execution surfaces."""
 
 from __future__ import annotations
 
 import ipaddress
 import json
 import math
+import posixpath
 import re
 import socket
 from collections.abc import Callable
@@ -227,8 +228,16 @@ class _Bh2Proof:
 
 
 @dataclass(frozen=True)
+class _PermissionDeclaration:
+    severity: Severity
+    kind: str
+    activation_state: str = "conditional"
+
+
+@dataclass(frozen=True)
 class _DeclarationScan:
     hooks: list[_HookDeclaration]
+    permissions: list[_PermissionDeclaration]
     partial: bool
     observed: int
 
@@ -772,6 +781,15 @@ def _is_sensitive_shell_path(value: str) -> bool:
     return False
 
 
+def _is_sensitive_tilde_path(value: str) -> bool:
+    return (
+        _is_safe_literal(value)
+        and value.startswith("~/")
+        and value != "~/.claude/settings.local.json"
+        and _sensitive_suffix(value[1:])
+    )
+
+
 def _is_remote_uri_destination(value: str, transport: str) -> bool:
     if not value.startswith(f"{transport}://"):
         return False
@@ -1017,6 +1035,59 @@ def _bh2_proof(declaration: _HookDeclaration) -> _Bh2Proof | None:
     return None
 
 
+def _permission_allow_declaration(value: str) -> _PermissionDeclaration | None:
+    if value in {
+        "Bash",
+        "Bash(*)",
+        "PowerShell",
+        "PowerShell(*)",
+        "Read",
+        "Edit",
+        "Write",
+    }:
+        return _PermissionDeclaration(Severity.CRITICAL, "whole_tool")
+
+    match = re.fullmatch(r"(Read|Edit)\((.*)\)", value)
+    if not match:
+        return None
+    specifier = match.group(2)
+    if specifier in {"//", "//**", "~", "~/**"}:
+        return _PermissionDeclaration(Severity.CRITICAL, "root_or_home")
+    if _is_sensitive_tilde_path(specifier):
+        return _PermissionDeclaration(Severity.HIGH, "sensitive_path")
+    return None
+
+
+def _permission_document(path: str, document: object) -> tuple[dict[str, object] | None, bool]:
+    if path not in {".claude/settings.json", ".claude/settings.local.json"}:
+        return None, False
+    if not isinstance(document, dict) or "permissions" not in document:
+        return None, False
+    permissions = document.get("permissions")
+    if not isinstance(permissions, dict):
+        return None, True
+    return permissions, False
+
+
+def _permission_list_values(
+    permissions: dict[str, object], key: str, *, limit: int
+) -> tuple[list[str], bool, int]:
+    if key not in permissions:
+        return [], False, 0
+    raw_values = permissions.get(key)
+    if not isinstance(raw_values, list):
+        return [], True, 0
+    observed = min(len(raw_values), limit + 1)
+    values: list[str] = []
+    partial = len(raw_values) > limit
+    for value in raw_values[:limit]:
+        if not _is_nonempty_bounded_string(value):
+            partial = True
+        else:
+            values.append(value)
+    return values, partial, observed
+
+
 def _permission_rule_is_valid(value: str) -> bool:
     tool, separator, remainder = value.partition("(")
     if re.fullmatch(r"[A-Za-z0-9_*.-]+", tool) is None:
@@ -1046,6 +1117,14 @@ def _permission_allow_rule_is_valid(value: str) -> bool:
     )
 
 
+def _permission_rule_values(
+    permissions: dict[str, object], *, limit: int
+) -> tuple[list[str], bool, int]:
+    values, partial, observed = _permission_list_values(permissions, "allow", limit=limit)
+    valid_values = [value for value in values if _permission_allow_rule_is_valid(value)]
+    return valid_values, partial or len(valid_values) != len(values), observed
+
+
 def _permission_rule_list_is_schema_compatible(permissions: dict[str, object], key: str) -> bool:
     if key not in permissions:
         return True
@@ -1056,23 +1135,152 @@ def _permission_rule_list_is_schema_compatible(permissions: dict[str, object], k
     )
 
 
+def _unclassified_permission_lists_are_valid(permissions: dict[str, object]) -> bool:
+    return all(
+        _permission_rule_list_is_schema_compatible(permissions, key) for key in ("ask", "deny")
+    )
+
+
+def _permission_mode_declaration(value: str) -> _PermissionDeclaration | None:
+    if value == "bypassPermissions":
+        return _PermissionDeclaration(Severity.CRITICAL, "mode")
+    if value == "acceptEdits":
+        return _PermissionDeclaration(Severity.MEDIUM, "mode")
+    if value == "auto":
+        return _PermissionDeclaration(Severity.LOW, "mode", "ignored_by_surface")
+    return None
+
+
+def _permission_scalar_declarations(
+    permissions: dict[str, object], *, limit: int
+) -> tuple[list[_PermissionDeclaration], bool, int]:
+    declarations: list[_PermissionDeclaration] = []
+    partial = False
+    observed = 0
+    if "defaultMode" in permissions:
+        default_mode = permissions.get("defaultMode")
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        if (
+            not isinstance(default_mode, str)
+            or not _is_safe_literal(default_mode)
+            or default_mode not in _VALID_DEFAULT_MODES
+        ):
+            partial = True
+        else:
+            declaration = (
+                None
+                if default_mode == "bypassPermissions"
+                and permissions.get("disableBypassPermissionsMode") == "disable"
+                else _permission_mode_declaration(default_mode)
+            )
+            if declaration is not None:
+                declarations.append(declaration)
+
+    for key in ("disableBypassPermissionsMode", "disableAutoMode"):
+        if key in permissions:
+            observed += 1
+            if observed > limit:
+                return declarations, True, observed
+            if permissions.get(key) != "disable":
+                partial = True
+    return declarations, partial, observed
+
+
+def _is_root_or_home_directory(value: str) -> bool:
+    if value.startswith("/"):
+        if (
+            value.startswith("//")
+            and not value.startswith("///")
+            and any(segment not in {"", ".", ".."} for segment in value[2:].split("/"))
+        ):
+            return False
+        return posixpath.normpath(value) in {"/", "//"}
+    if value == "~":
+        return True
+    if not value.startswith("~/"):
+        return False
+
+    depth = 0
+    for segment in value[2:].split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            if depth == 0:
+                return False
+            depth -= 1
+        else:
+            depth += 1
+    return depth == 0
+
+
+def _permission_declarations(
+    path: str, document: object, *, limit: int
+) -> tuple[list[_PermissionDeclaration], bool, int]:
+    permissions, partial = _permission_document(path, document)
+    if permissions is None:
+        return [], partial, 0
+    partial = partial or not _unclassified_permission_lists_are_valid(permissions)
+    declarations: list[_PermissionDeclaration] = []
+    observed = 0
+
+    allow, rules_partial, rules_observed = _permission_rule_values(permissions, limit=limit)
+    declarations.extend(
+        declaration
+        for value in allow
+        if (declaration := _permission_allow_declaration(value)) is not None
+    )
+    partial = partial or rules_partial
+    observed += rules_observed
+    if observed > limit:
+        return declarations, True, observed
+
+    directories, directories_partial, directories_observed = _permission_list_values(
+        permissions, "additionalDirectories", limit=max(0, limit - observed)
+    )
+    declarations.extend(
+        _PermissionDeclaration(Severity.CRITICAL, "directory")
+        for value in directories
+        if _is_root_or_home_directory(value)
+    )
+    partial = partial or directories_partial
+    observed += directories_observed
+    if observed > limit:
+        return declarations, True, observed
+
+    scalar_declarations, scalar_partial, scalar_observed = _permission_scalar_declarations(
+        permissions, limit=max(0, limit - observed)
+    )
+    declarations.extend(scalar_declarations)
+    partial = partial or scalar_partial
+    observed += scalar_observed
+    return declarations, partial, observed
+
+
 def _scan_declarations(
     path: str,
     document: object,
     previous_settings_hook_ids: set[_HookIdentity] | None = None,
 ) -> _DeclarationScan:
     if not isinstance(document, dict):
-        return _DeclarationScan(hooks=[], partial=True, observed=0)
+        return _DeclarationScan(hooks=[], permissions=[], partial=True, observed=0)
     hooks, hook_partial, hook_observed = _hook_declarations(
         document,
         limit=_MAX_DECLARATIONS,
         previous_handler_ids=previous_settings_hook_ids,
     )
+    remaining = max(0, _MAX_DECLARATIONS - hook_observed)
+    permissions, permission_partial, permission_observed = _permission_declarations(
+        path, document, limit=remaining
+    )
     is_settings = path in {".claude/settings.json", ".claude/settings.local.json"}
     return _DeclarationScan(
         hooks=hooks,
+        permissions=permissions,
         partial=(
             hook_partial
+            or permission_partial
             or (is_settings and not _modeled_settings_fields_are_valid(document))
             or (
                 is_settings
@@ -1081,7 +1289,7 @@ def _scan_declarations(
             )
             or (path == "hooks/hooks.json" and "hooks" not in document)
         ),
-        observed=hook_observed,
+        observed=hook_observed + permission_observed,
     )
 
 
@@ -1357,6 +1565,58 @@ def _bh2_finding(path: str, proofs: list[_Bh2Proof]) -> Finding:
     return analyzer_finding_to_finding(analyzer_finding)
 
 
+def _bh3_finding(path: str, declarations: list[_PermissionDeclaration]) -> Finding:
+    rank = {
+        Severity.LOW: 0,
+        Severity.MEDIUM: 1,
+        Severity.HIGH: 2,
+        Severity.CRITICAL: 3,
+    }
+    severity = max((declaration.severity for declaration in declarations), key=rank.__getitem__)
+    activation_state = (
+        "conditional"
+        if any(declaration.activation_state == "conditional" for declaration in declarations)
+        else "ignored_by_surface"
+    )
+    ignored = activation_state == "ignored_by_surface"
+    analyzer_finding = AnalyzerFinding(
+        rule_id="BH3",
+        message=(
+            "Bundled project settings declare a permission mode ignored on this surface."
+            if ignored
+            else "Bundled project settings declare a broad permission surface."
+        ),
+        severity=severity,
+        location=Location(path, 1),
+        confidence=0.99,
+        remediation=(
+            "Remove the ignored mode if it is unintended; it does not expand permissions here."
+            if ignored
+            else "Remove broad grants and declare only the narrow tools and paths required."
+        ),
+        tags=["Bundled Execution Surface", "Permissions"],
+        matched_text=f"document:{path}",
+        evidence={
+            "activation_reason": (
+                "mode_ignored_in_project_settings" if ignored else "requires_settings_activation"
+            ),
+            "activation_state": activation_state,
+            "activation_states": sorted(
+                {declaration.activation_state for declaration in declarations}
+            ),
+            "declaration_count": len(declarations),
+            "grant_kinds": sorted({declaration.kind for declaration in declarations})[:32],
+        },
+    )
+    finding = analyzer_finding_to_finding(analyzer_finding)
+    if ignored:
+        finding.explanation = (
+            "The auto permission mode is recognized but ignored by this supported project "
+            "settings surface, so it does not receive a blocking score floor."
+        )
+    return finding
+
+
 def _analyze_document(
     path: str,
     content: str,
@@ -1389,11 +1649,14 @@ def _analyze_document(
     scan = _scan_declarations(path, document, previous_settings_hook_ids)
     declarations = [] if hooks_disabled else scan.hooks
     proofs = [proof for declaration in declarations if (proof := _bh2_proof(declaration))]
+    permission_declarations = scan.permissions
     findings: list[Finding] = []
     if declarations:
         findings.append(_bh1_finding(path, declarations))
     if proofs:
         findings.append(_bh2_finding(path, proofs))
+    if permission_declarations:
+        findings.append(_bh3_finding(path, permission_declarations))
     if scan.partial:
         return findings, ledger_event(
             outcome=LedgerOutcome.PARTIAL,

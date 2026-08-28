@@ -128,6 +128,14 @@ class TestComputeRiskScoreBasic:
             ),
             (
                 _finding(
+                    "BH3",
+                    "CRITICAL",
+                    evidence={"activation_state": "conditional"},
+                ),
+                51,
+            ),
+            (
+                _finding(
                     "BH2",
                     "CRITICAL",
                     evidence={
@@ -136,6 +144,22 @@ class TestComputeRiskScoreBasic:
                     },
                 ),
                 50,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "CRITICAL",
+                    evidence={"activation_state": "ignored_by_surface"},
+                ),
+                50,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "LOW",
+                    evidence={"activation_state": "ignored_by_surface"},
+                ),
+                5,
             ),
         ],
     )

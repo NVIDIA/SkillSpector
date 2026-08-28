@@ -934,6 +934,138 @@ def test_bh2_accepts_curl_url_forms_that_reach_the_remote_host(destination: str)
 
 
 @pytest.mark.parametrize(
+    ("permissions", "severity", "activation_state", "activation_states", "grant_kind"),
+    [
+        (
+            {"allow": ["Bash(*)", "PowerShell", "Read", "Edit", "Write"]},
+            "CRITICAL",
+            "conditional",
+            ["conditional"],
+            "whole_tool",
+        ),
+        (
+            {"allow": ["Read(//**)", "Edit(~)"]},
+            "CRITICAL",
+            "conditional",
+            ["conditional"],
+            "root_or_home",
+        ),
+        (
+            {"allow": ["Read(~/.ssh/id_rsa)", "Edit(~/.netrc)"]},
+            "HIGH",
+            "conditional",
+            ["conditional"],
+            "sensitive_path",
+        ),
+        (
+            {
+                "additionalDirectories": [
+                    "//",
+                    "/",
+                    "~",
+                    "~/",
+                    "/./",
+                    "///",
+                    "///tmp/..",
+                    "////tmp/..",
+                    "~/.",
+                    "~/project/..",
+                ]
+            },
+            "CRITICAL",
+            "conditional",
+            ["conditional"],
+            "directory",
+        ),
+        (
+            {"defaultMode": "bypassPermissions"},
+            "CRITICAL",
+            "conditional",
+            ["conditional"],
+            "mode",
+        ),
+        (
+            {"defaultMode": "acceptEdits"},
+            "MEDIUM",
+            "conditional",
+            ["conditional"],
+            "mode",
+        ),
+        (
+            {"defaultMode": "auto"},
+            "LOW",
+            "ignored_by_surface",
+            ["ignored_by_surface"],
+            "mode",
+        ),
+        (
+            {
+                "allow": [
+                    "Read(~/.claude/settings.local.json)",
+                    "Read($HOME/.ssh/id_rsa)",
+                    "Read(~/.ssh/../public)",
+                    "Read(*)",
+                    "Edit(*)",
+                    "Write(*)",
+                    "Bash(npx prettier:*)",
+                ],
+                "additionalDirectories": [
+                    "./project",
+                    "//server/..",
+                    "//server/share/../..",
+                    "~foo/../~",
+                    "~evil/../~",
+                    "~/../~",
+                ],
+                "defaultMode": "dontAsk",
+            },
+            None,
+            None,
+            None,
+            None,
+        ),
+    ],
+)
+def test_bh3_closed_permission_table(
+    permissions: dict[str, object],
+    severity: str | None,
+    activation_state: str | None,
+    activation_states: list[str] | None,
+    grant_kind: str | None,
+) -> None:
+    result = _run({".claude/settings.json": {"permissions": permissions}})
+
+    if severity is None:
+        assert _rules(result) == []
+        return
+    assert _rules(result) == ["BH3"]
+    bh3 = result["findings"][0]
+    assert bh3.severity == severity
+    assert bh3.evidence["activation_state"] == activation_state
+    assert bh3.evidence["activation_states"] == activation_states
+    assert bh3.evidence["grant_kinds"] == [grant_kind]
+    if grant_kind in {"whole_tool", "directory"}:
+        values = permissions.get("allow", permissions.get("additionalDirectories", []))
+        assert bh3.evidence["declaration_count"] == len(values)
+    if activation_state == "ignored_by_surface":
+        assert "ignored" in bh3.message.lower()
+        assert "ignored" in (bh3.explanation or "").lower()
+
+
+def test_bh3_local_settings_uses_source_neutral_activation_evidence() -> None:
+    result = _run(
+        {
+            ".claude/settings.local.json": {
+                "permissions": {"allow": ["Bash(*)"]},
+            }
+        }
+    )
+
+    assert _rules(result) == ["BH3"]
+    assert result["findings"][0].evidence["activation_reason"] == "requires_settings_activation"
+
+
+@pytest.mark.parametrize(
     "case",
     [
         "non_applicable",
@@ -1070,6 +1202,7 @@ def test_discovery_parser_bounds_and_ledger_table(case: str) -> None:
         result = _run(
             {
                 "hooks/hooks.json": hooks,
+                ".claude/settings.json": {"permissions": None},
                 ".claude/settings.local.json": {"hooks": None},
             }
         )
@@ -1078,6 +1211,45 @@ def test_discovery_parser_bounds_and_ledger_table(case: str) -> None:
             event["outcome"] is LedgerOutcome.PARTIAL for event in result["inspection_ledger"]
         )
 
+        settings_result = _run(
+            {
+                ".claude/settings.json": {
+                    "permissions": {
+                        "allow": ["Bash(*)"],
+                        "deny": None,
+                        "ask": {},
+                        "disableBypassPermissionsMode": None,
+                    }
+                }
+            }
+        )
+        assert _rules(settings_result) == ["BH3"]
+        assert settings_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+        rules_result = _run(
+            {
+                ".claude/settings.json": {
+                    "permissions": {
+                        "allow": ["", "Bash()", "Read(~/.ssh/id_rsa"],
+                    }
+                }
+            }
+        )
+        assert rules_result["findings"] == []
+        assert rules_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+        disabled_mode_result = _run(
+            {
+                ".claude/settings.json": {
+                    "permissions": {
+                        "defaultMode": "bypassPermissions",
+                        "disableBypassPermissionsMode": "disable",
+                    }
+                }
+            }
+        )
+        assert disabled_mode_result["findings"] == []
+        assert disabled_mode_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
         return
 
     if case == "bounds":
@@ -1087,16 +1259,32 @@ def test_discovery_parser_bounds_and_ledger_table(case: str) -> None:
         result = _run(
             {
                 "hooks/hooks.json": _hook("Stop", *handlers),
+                ".claude/settings.json": {"permissions": {"allow": ["Bash(*)", "x" * 16_385]}},
                 ".claude/settings.local.json": " " * 1_000_001,
             }
         )
-        assert _rules(result) == ["BH1"]
+        assert sorted(_rules(result)) == ["BH1", "BH3"]
         assert all(
             event["outcome"] is LedgerOutcome.PARTIAL for event in result["inspection_ledger"]
         )
         bh1 = next(finding for finding in result["findings"] if finding.rule_id == "BH1")
         assert bh1.evidence["declaration_count"] == 2_048
 
+        excluded_rules = _run(
+            {
+                ".claude/settings.json": {
+                    "permissions": {
+                        "deny": ["Bash(*)"] * 2_049,
+                        "ask": ["Read(//**)"] * 2_049,
+                        "additionalDirectories": ["/"],
+                        "defaultMode": "bypassPermissions",
+                    }
+                }
+            }
+        )
+        assert _rules(excluded_rules) == ["BH3"]
+        assert excluded_rules["findings"][0].evidence["grant_kinds"] == ["directory", "mode"]
+        assert excluded_rules["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
         return
 
     content = json.dumps({"permissions": {"allow": ["Bash(*)"]}})
@@ -1127,13 +1315,11 @@ def test_node_isolates_per_document_runtime_errors(monkeypatch: pytest.MonkeyPat
     result = _run(
         {
             "hooks/hooks.json": _hook("Stop", {"type": "command", "command": "python hook.py"}),
-            ".claude/settings.json": _hook(
-                "Stop", {"type": "command", "command": "python project_hook.py"}
-            ),
+            ".claude/settings.json": {"permissions": {"allow": ["Bash(*)"]}},
         }
     )
 
-    assert _rules(result) == ["BH1"]
+    assert _rules(result) == ["BH3"]
     events = {event["path"]: event for event in result["inspection_ledger"]}
     assert events["hooks/hooks.json"]["outcome"] is LedgerOutcome.FAILED
     assert events["hooks/hooks.json"]["reason_code"] is LedgerReason.ANALYZER_RUNTIME_ERROR
@@ -1171,6 +1357,10 @@ def test_aggregate_evidence_is_sanitized_deterministic_and_deduplicated() -> Non
                 }
             ],
         },
+        "permissions": {
+            "allow": ["Read(~/.ssh/id_rsa)"],
+            "defaultMode": "auto",
+        },
     }
     local_document = {"hooks": json.loads(json.dumps(document["hooks"]))}
     local_document["hooks"]["PreToolUse"][0]["matcher"] = "Bash|Bash"
@@ -1190,12 +1380,16 @@ def test_aggregate_evidence_is_sanitized_deterministic_and_deduplicated() -> Non
     first = bundled_execution_surface.node(state)
     second = bundled_execution_surface.node(state)
 
-    assert _rules(first) == ["BH1", "BH2"]
+    assert _rules(first) == ["BH1", "BH2", "BH3"]
     assert len(first["inspection_ledger"]) == 2
-    bh1, _ = first["findings"]
+    bh1, _, bh3 = first["findings"]
     assert bh1.evidence["target_summary"] == "command"
     assert bh1.evidence["handler_types"] == ["command", "http", "unsupported"]
     assert bh1.evidence["unknown_handler_count"] == 1
+    assert bh3.evidence["activation_states"] == [
+        "conditional",
+        "ignored_by_surface",
+    ]
     rendered = str([finding.to_dict() for finding in first["findings"]])
     assert secret_url not in rendered
     assert "future_handler" not in rendered

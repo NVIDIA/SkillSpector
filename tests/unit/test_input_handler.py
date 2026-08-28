@@ -29,6 +29,7 @@ from skillspector.input_handler import (
     ALLOWED_GIT_HOSTS,
     InputHandler,
     _open_regular_file_from_windows_handle,
+    _open_regular_file_no_follow,
 )
 
 
@@ -231,6 +232,24 @@ def test_resolve_file_open_failure_does_not_create_temp_dir(tmp_path: Path) -> N
         assert handler.temp_dir_for_cleanup() is None
     finally:
         handler.cleanup()
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires O_PATH (Linux)")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses directory permissions"
+)
+def test_secure_open_traverses_search_only_ancestors(tmp_path: Path) -> None:
+    """Traversal needs search access on ancestors, not read access."""
+    parent = tmp_path / "search_only"
+    parent.mkdir()
+    source = parent / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    os.chmod(parent, 0o111)
+    try:
+        with _open_regular_file_no_follow(source) as opened:
+            assert opened.read() == b"# Skill"
+    finally:
+        os.chmod(parent, 0o755)
 
 
 def test_resolve_file_rejects_platform_without_safe_open_support(
