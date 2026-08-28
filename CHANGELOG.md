@@ -1,7 +1,28 @@
-### Unreleased
+### 2.10.0 (Wednesday, August 26, 2026)
 ### Features/Bug Fixes
 * Inspect hidden and nested ZIP-compatible artifacts under cumulative safety bounds.
 * Report HIGH SC9 findings for executables concealed in documents or hidden/disguised artifacts.
+* feat(scan): add opt-in transitive reference scanning (#225)
+* feat(analyzer): add phase-1 structured skill summaries (#211)
+* feat(analyzer): detect external model and provider selection as EA5 (#426)
+* feat(llm): support configurable human-readable output language (#425)
+* feat(report): expose the highest reported issue severity (#398)
+* feat: dynamically discover analyzers and validate risk-score inputs (#74)
+* fix(security): strengthen bounded inspection and fail-closed completeness handling (#393)
+* fix(report): mark partial or unavailable requested LLM analysis as degraded (#291) (#362)
+* fix(cli): report only the findings that drove the risk score (#375)
+* fix(cli): normalize multi-skill risk scores before aggregate exit-code checks (#368)
+* fix(scanner): preserve eligible findings from SKILL.md files (#381)
+* fix(cli,supply-chain): parse package.json as JSON and send fatal errors to stderr (#323)
+* fix(analyzer): detect whitespace variants and all os.environ read forms for E2 (1d379dc)
+* fix(analyzers): reduce false positives across AE3, AE4, EA1, EA3, E5, PE3, and TM4 (#237) (#328) (#415) (#417) (#422)
+* fix(pe3): require credential-store operations instead of flagging bare keyring or keychain nouns (#424)
+* fix(scan): exclude inactive Git hook samples from executable analysis (#412)
+* fix(nv_build): update the default served model and its token limits (#390) (#391)
+* fix(lp1): tailor least-privilege remediation to the manifest type (#402)
+* fix(provider): preserve the original custom CLI-provider call contract for ordinary scans
+* build: move LangGraph Studio tooling to the langgraph-dev optional extra (550b9f0)
+* ci: keep eligible pull-request branches current after main changes (#376)
 ---
 ### 2.9.6 (Tuesday, August 18, 2026)
 ### Features/Bug Fixes

@@ -40,6 +40,7 @@ def _finding(
     message: str = "test",
     confidence: float = 1.0,
     file: str = "SKILL.md",
+    evidence: dict[str, object] | None = None,
 ) -> Finding:
     return Finding(
         rule_id=rule_id,
@@ -48,6 +49,7 @@ def _finding(
         confidence=confidence,
         file=file,
         start_line=1,
+        evidence=evidence or {},
     )
 
 
@@ -109,6 +111,63 @@ class TestComputeRiskScoreBasic:
         assert score == 51
         assert band == "HIGH"
         assert recommendation == "DO_NOT_INSTALL"
+
+    @pytest.mark.parametrize(
+        ("finding", "expected_score"),
+        [
+            (
+                _finding(
+                    "BH2",
+                    "CRITICAL",
+                    evidence={
+                        "activation_state": "conditional",
+                        "proof_status": "closed",
+                    },
+                ),
+                51,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "CRITICAL",
+                    evidence={"activation_state": "conditional"},
+                ),
+                51,
+            ),
+            (
+                _finding(
+                    "BH2",
+                    "CRITICAL",
+                    evidence={
+                        "activation_state": "conditional",
+                        "proof_status": "unmodeled",
+                    },
+                ),
+                50,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "CRITICAL",
+                    evidence={"activation_state": "ignored_by_surface"},
+                ),
+                50,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "LOW",
+                    evidence={"activation_state": "ignored_by_surface"},
+                ),
+                5,
+            ),
+        ],
+    )
+    def test_bundled_surface_floor_requires_closed_effective_critical_evidence(
+        self, finding: Finding, expected_score: int
+    ) -> None:
+        score, _, _ = _compute_risk_score([finding], False)
+        assert score == expected_score
 
     def test_unknown_severity_defaults_to_low_points(self) -> None:
         f = _finding("R1", "LOW")
@@ -907,6 +966,29 @@ def test_report_baseline_keeps_unmatched_finding() -> None:
     }
     result = report(state)
     assert result["risk_score"] == 50  # only the CRITICAL counts
+    assert len(result["suppressed_findings"]) == 1
+
+
+def test_report_suppressed_bh2_does_not_apply_blocking_floor() -> None:
+    finding = _finding(
+        "BH2",
+        "CRITICAL",
+        evidence={"activation_state": "conditional", "proof_status": "closed"},
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="BH2", reason="accepted")]),
+    }
+
+    result = report(state)
+
+    assert result["risk_score"] == 0
+    assert result["risk_recommendation"] == "SAFE"
     assert len(result["suppressed_findings"]) == 1
 
 
