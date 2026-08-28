@@ -1,3 +1,13 @@
+### 2.11.0 (Friday, August 28, 2026)
+### Features/Bug Fixes
+* feat: analyze bundled permission grants (#429)
+* feat(supply-chain): resolve npm dependencies through the lockfile (#344)
+* feat(providers): add LLM sampling controls (#427)
+* fix(provider): align OpenAI fallback model config (#325)
+* fix(input-handler): traverse ancestors with O_PATH where available (#443)
+* fix(analyzers): avoid nominal MP3 and P6 matches (#453)
+* docs(cli): list all supported LLM providers (#432)
+---
 ### 2.10.0 (Wednesday, August 26, 2026)
 ### Features/Bug Fixes
 * Inspect hidden and nested ZIP-compatible artifacts under cumulative safety bounds.
