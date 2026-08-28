@@ -419,7 +419,76 @@ class TestGetChatModelCLIAdapter:
         ) as fake_complete:
             msg = get_chat_model(model="claude-sonnet-4-6").invoke("hi")
         assert msg.content == "hello"
-        assert fake_complete.call_args[1]["timeout"] is None
+        assert "timeout" not in fake_complete.call_args[1]
+
+    def test_adapter_preserves_the_legacy_cli_provider_signature(self) -> None:
+        class _Schema(BaseModel):
+            verdict: str
+
+        class _LegacyCLIProvider:
+            DEFAULT_MODEL = "legacy-model"
+            SLOT_DEFAULTS: dict[str, str] = {}
+
+            def __init__(self) -> None:
+                self.responses = iter(["hello", '{"verdict": "safe"}'])
+                self.calls: list[tuple[str, str, int]] = []
+
+            def get_context_length(self, model: str) -> int | None:
+                return 4096
+
+            def get_max_output_tokens(self, model: str) -> int | None:
+                return 1024
+
+            def resolve_model(self, slot: str = "default") -> str:
+                return "legacy-model"
+
+            def resolve_credentials(self) -> tuple[str, str | None] | None:
+                return None
+
+            def is_available(self) -> tuple[bool, str | None]:
+                return True, None
+
+            def complete(
+                self,
+                prompt: str,
+                *,
+                model: str,
+                max_output_tokens: int,
+            ) -> str:
+                self.calls.append((prompt, model, max_output_tokens))
+                return next(self.responses)
+
+        provider = _LegacyCLIProvider()
+        token = use_provider(provider)
+        try:
+            model = get_chat_model()
+            assert isinstance(model, AgentCLIChatModel)
+            assert model.invoke("plain").content == "hello"
+            structured = model.with_structured_output(_Schema).invoke("structured")
+        finally:
+            reset_provider(token)
+
+        assert structured == _Schema(verdict="safe")
+        assert [call[1:] for call in provider.calls] == [
+            ("legacy-model", 1024),
+            ("legacy-model", 1024),
+        ]
+
+    def test_explicit_timeout_requires_cli_provider_timeout_support(self) -> None:
+        class _LegacyCLIProvider:
+            def complete(
+                self,
+                prompt: str,
+                *,
+                model: str,
+                max_output_tokens: int,
+            ) -> str:
+                return "unreachable"
+
+        model = AgentCLIChatModel(_LegacyCLIProvider(), "legacy-model", 1024, timeout=1.0)
+
+        with pytest.raises(TypeError, match="timeout"):
+            model.invoke("bounded")
 
     def test_structured_output_parses_and_validates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "claude_cli")

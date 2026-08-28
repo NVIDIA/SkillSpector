@@ -215,6 +215,36 @@ def _extract_json_object(raw: str) -> dict:
     )
 
 
+def _complete_agent_cli(
+    provider: object,
+    prompt: str,
+    *,
+    model: str,
+    max_output_tokens: int,
+    timeout: float | None,
+) -> str:
+    """Call a CLI provider without breaking the original extension protocol.
+
+    ``AgentCLICapable`` originally exposed no ``timeout`` keyword. Preserve
+    that call shape for ordinary scans, while forwarding an explicit deadline
+    to providers used by bounded scan paths. Legacy providers therefore keep
+    working for existing flows and fail closed if selected for a new flow that
+    requires deadline support.
+    """
+    if timeout is None:
+        return provider.complete(  # type: ignore[attr-defined,no-any-return]
+            prompt,
+            model=model,
+            max_output_tokens=max_output_tokens,
+        )
+    return provider.complete(  # type: ignore[attr-defined,no-any-return]
+        prompt,
+        model=model,
+        max_output_tokens=max_output_tokens,
+        timeout=timeout,
+    )
+
+
 class _StructuredAgentCLIModel:
     """Mimics ``ChatOpenAI.with_structured_output(schema)`` for a CLI provider.
 
@@ -247,7 +277,8 @@ class _StructuredAgentCLIModel:
 
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""
-        return self._provider.complete(  # type: ignore[attr-defined,no-any-return]
+        return _complete_agent_cli(
+            self._provider,
             self._augment(prompt),
             model=self._model,
             max_output_tokens=self._max_output_tokens,
@@ -312,7 +343,8 @@ class AgentCLIChatModel:
         )
 
     def invoke(self, prompt: str) -> _AgentCLIMessage:
-        text = self._provider.complete(  # type: ignore[attr-defined]
+        text = _complete_agent_cli(
+            self._provider,
             prompt,
             model=self._model,
             max_output_tokens=self._max_output_tokens,

@@ -94,9 +94,11 @@ class AgentCLICapable(Protocol):
         otherwise.  This replaces the credential-based availability check
         in :func:`skillspector.llm_utils.is_llm_available` for CLI providers.
 
-    ``complete(prompt, *, model, max_output_tokens, timeout)``
+    ``complete(prompt, *, model, max_output_tokens)``
         Execute the CLI, pass the prompt via stdin, and return the
-        assistant's text response.  Raises on any failure (fail-closed).
+        assistant's text response.  Implementations may also accept an
+        optional ``timeout`` keyword to participate in bounded scans. Raises
+        on any failure (fail-closed).
     """
 
     def is_available(self) -> tuple[bool, str | None]: ...
@@ -107,7 +109,6 @@ class AgentCLICapable(Protocol):
         *,
         model: str,
         max_output_tokens: int,
-        timeout: float | None = None,
     ) -> str: ...
 
 

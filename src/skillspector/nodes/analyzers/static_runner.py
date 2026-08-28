@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
+from array import array
+from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import cast
@@ -42,6 +44,12 @@ from skillspector.python_ast import (
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 
+from .common import (
+    LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+)
 from .pattern_defaults import get_category, get_explanation, get_pattern_name, get_remediation
 
 logger = get_logger(__name__)
@@ -85,6 +93,81 @@ _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
+
+
+def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
+    stripped = line.rstrip(LINE_BREAK_CHARS)
+    closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped)
+    if active is not None:
+        if closing and closing.group(1)[0] == active[0] and len(closing.group(1)) >= active[1]:
+            return None
+        return active
+    opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped)
+    if opening:
+        marker = opening.group(1)
+        return marker[0], len(marker)
+    return None
+
+
+def _markdown_fence_states(
+    content: str, offsets: tuple[int, ...]
+) -> tuple[dict[int, tuple[str, int] | None], dict[int, tuple[str, int, str, int, int]]]:
+    states: dict[int, tuple[str, int] | None] = {}
+    transitions: dict[int, tuple[str, int, str, int, int]] = {}
+    active: tuple[str, int] | None = None
+    offset_index = 0
+    content_offset = 0
+    for line in content.splitlines(keepends=True):
+        line_end = content_offset + len(line)
+        complete = line.endswith(tuple(LINE_BREAK_CHARS))
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped) if complete else None
+        closing = MARKDOWN_FENCE_CLOSE.fullmatch(stripped) if complete else None
+        while offset_index < len(offsets) and offsets[offset_index] < line_end:
+            offset = offsets[offset_index]
+            states[offset] = active
+            if offset > content_offset:
+                if active is None and opening is not None:
+                    marker = opening.group(1)
+                    transitions[offset] = (marker[0], len(marker), "open", line_end, content_offset)
+                elif (
+                    active is not None
+                    and closing is not None
+                    and closing.group(1)[0] == active[0]
+                    and len(closing.group(1)) >= active[1]
+                ):
+                    marker = closing.group(1)
+                    transitions[offset] = (
+                        marker[0],
+                        len(marker),
+                        "close",
+                        line_end,
+                        content_offset,
+                    )
+            offset_index += 1
+        if not complete:
+            break
+        active = _advance_markdown_fence(active, line)
+        content_offset = line_end
+        while offset_index < len(offsets) and offsets[offset_index] == line_end:
+            states[offsets[offset_index]] = active
+            offset_index += 1
+    while offset_index < len(offsets):
+        states[offsets[offset_index]] = active
+        offset_index += 1
+    return states, transitions
+
+
+def _window_view_with_markdown_context(
+    view: SecurityTextView, prefix_length: int
+) -> SecurityTextView:
+    if prefix_length == 0:
+        return view
+    if view.source_offsets is None:
+        offsets = array("I", (max(0, offset - prefix_length) for offset in range(len(view.text))))
+    else:
+        offsets = array("I", (max(0, offset - prefix_length) for offset in view.source_offsets))
+    return SecurityTextView(view.name, view.text, offsets)
 
 
 def _normalize_license_line(line: str) -> str:
@@ -484,11 +567,18 @@ def _deduplicate_view_findings(findings: list[Finding]) -> list[Finding]:
     """Remove overlap/view duplicates using the complete match fingerprint."""
     result: list[Finding] = []
     seen: set[tuple[str, str, int, str | None]] = set()
+    raw_fingerprints: set[tuple[str, str, str]] = set()
     for finding in findings:
-        key = (finding.rule_id, finding.file, finding.start_line, finding.fingerprint())
+        fingerprint = finding.fingerprint()
+        fingerprint_key = (finding.rule_id, finding.file, fingerprint)
+        if "normalized-view" in finding.tags and fingerprint_key in raw_fingerprints:
+            continue
+        key = (finding.rule_id, finding.file, finding.start_line, fingerprint)
         if key in seen:
             continue
         seen.add(key)
+        if "normalized-view" not in finding.tags and fingerprint is not None:
+            raw_fingerprints.add(fingerprint_key)
         result.append(finding)
     return result
 
@@ -581,14 +671,10 @@ def _append_projected_piece(
 ) -> int:
     """Append one contiguous raw piece and extend its exact line projection."""
     text_parts.append(piece)
-    offset = 0
-    while True:
-        newline = piece.find("\n", offset)
-        if newline < 0:
-            return source_line
+    for _ in LOGICAL_LINE_BREAK.finditer(piece):
         source_line += 1
         source_lines.append(source_line)
-        offset = newline + 1
+    return source_line
 
 
 def _continuity_views(
@@ -620,7 +706,9 @@ def _continuity_views(
         selected_runs = separator_runs[run_index : last_run_index + 1]
         left = max(0, run_start - _CONTINUITY_CONTEXT_CHARS)
         right = min(len(content), selected_runs[-1][1] + _CONTINUITY_CONTEXT_CHARS)
-        previous_left_line += content.count("\n", previous_left, left)
+        previous_left_line += sum(
+            1 for _ in LOGICAL_LINE_BREAK.finditer(content, previous_left, left)
+        )
         previous_left = left
         source_lines = [previous_left_line]
         text_parts: list[str] = []
@@ -652,7 +740,9 @@ def _continuity_views(
                     content[selected_start:head_end],
                     current_line,
                 )
-                skipped_newlines = content.count("\n", head_end, tail_start)
+                skipped_newlines = sum(
+                    1 for _ in LOGICAL_LINE_BREAK.finditer(content, head_end, tail_start)
+                )
                 if skipped_newlines:
                     # Retain a line boundary so DOT-without-DOTALL and anchors
                     # do not acquire semantics absent from the original source.
@@ -717,10 +807,10 @@ def _line_start_offset(text: str, line_number: int) -> int:
         return 0
     offset = 0
     for _ in range(line_number - 1):
-        newline = text.find("\n", offset)
-        if newline < 0:
+        separator = LOGICAL_LINE_BREAK.search(text, offset)
+        if separator is None:
             return len(text)
-        offset = newline + 1
+        offset = separator.end()
     return offset
 
 
@@ -730,16 +820,24 @@ def _restore_source_lines(
     raw_window: str,
     window_line: int,
     view: SecurityTextView,
+    window_start: int = 0,
+    source_line_starts: tuple[int, ...] | None = None,
 ) -> None:
     """Map normalized/window-relative locations to raw whole-file lines."""
+
+    def source_line(raw_offset: int) -> int:
+        if source_line_starts is not None:
+            return bisect_right(source_line_starts, window_start + raw_offset)
+        return window_line + sum(1 for _ in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_offset))
+
     for finding in findings:
         derived_start = _line_start_offset(view.text, finding.start_line)
         raw_start = view.source_offset(derived_start)
-        finding.start_line = window_line + raw_window.count("\n", 0, raw_start)
+        finding.start_line = source_line(raw_start)
         if finding.end_line is not None:
             derived_end = _line_start_offset(view.text, finding.end_line)
             raw_end = view.source_offset(derived_end)
-            finding.end_line = window_line + raw_window.count("\n", 0, raw_end)
+            finding.end_line = source_line(raw_end)
 
 
 def _scan_all_views_detailed(
@@ -790,6 +888,16 @@ def _scan_all_views_detailed(
     if modules_for_windows:
         step = SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS
         window_line = 1
+        source_line_starts = (
+            0,
+            *(separator.end() for separator in LOGICAL_LINE_BREAK.finditer(content)),
+        )
+        window_starts = tuple(range(0, max(1, len(content)), step))
+        fence_states, fence_transitions = (
+            _markdown_fence_states(content, window_starts)
+            if _infer_file_type(path) in {"markdown", "text"}
+            else ({}, {})
+        )
         for start in range(0, max(1, len(content)), step):
             now = time.monotonic()
             if now >= deadline:
@@ -803,7 +911,19 @@ def _scan_all_views_detailed(
                 )
             end = min(len(content), start + SECURITY_VIEW_WINDOW_CHARS)
             raw_window = content[start:end]
-            for full_view in security_text_views(raw_window):
+            fence = fence_states.get(start)
+            transition = fence_transitions.get(start)
+            if transition is not None and transition[2] == "close" and transition[3] <= end:
+                closing_prefix = content[transition[4] : start]
+                context_prefix = transition[0] * transition[1] + "\n" + closing_prefix
+            elif fence is not None:
+                context_prefix = fence[0] * fence[1] + "\n"
+            elif transition is not None and transition[3] <= end:
+                context_prefix = transition[0] * transition[1] + "\n"
+            else:
+                context_prefix = ""
+            for full_view in security_text_views(context_prefix + raw_window):
+                full_view = _window_view_with_markdown_context(full_view, len(context_prefix))
                 for view in _bounded_view_slices(full_view):
                     try:
                         finding_budget.check_runtime()
@@ -825,6 +945,8 @@ def _scan_all_views_detailed(
                         raw_window=raw_window,
                         window_line=window_line,
                         view=view,
+                        window_start=start,
+                        source_line_starts=source_line_starts,
                     )
                     findings.extend(view_findings)
                     if resource_limit is not None:
@@ -835,7 +957,12 @@ def _scan_all_views_detailed(
                         )
             if end == len(content):
                 break
-            window_line += content.count("\n", start, min(len(content), start + step))
+            window_line += sum(
+                1
+                for _ in LOGICAL_LINE_BREAK.finditer(
+                    content, start, min(len(content), start + step)
+                )
+            )
 
         # Raw windows intentionally remain small, but a separator wider than
         # their overlap can split a lexical expression even though the
