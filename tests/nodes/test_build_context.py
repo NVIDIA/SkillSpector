@@ -35,6 +35,7 @@ from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MODEL_CONFIG
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
+from skillspector.providers.openai import OpenAIProvider
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import (
     MAX_WORKFLOW_ARTIFACTS,
@@ -580,6 +581,23 @@ def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
 
     assert result["model_config"]["default"] == "bound-default"
     assert result["model_config"]["meta_analyzer"] == "bound-meta"
+
+
+def test_build_context_model_config_matches_openai_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in (
+        "SKILLSPECTOR_PROVIDER",
+        "SKILLSPECTOR_MODEL",
+        "NVIDIA_INFERENCE_KEY",
+        "NVIDIA_INFERENCE_METADATA_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
 def test_build_context_inventories_but_excludes_valid_root_oms_signature(
