@@ -88,6 +88,28 @@ def test_cli_version() -> None:
     assert "v" in result.output
 
 
+def test_cli_scan_help_lists_every_available_provider() -> None:
+    """Built-in help names every provider accepted by the selector."""
+    result = runner.invoke(app, ["scan", "--help"])
+
+    assert result.exit_code == 0
+    for provider in (
+        "openai",
+        "anthropic",
+        "anthropic_proxy",
+        "bedrock",
+        "nv_build",
+        "nv_inference",
+        "ollama",
+        "azure_openai",
+        "openai_compatible",
+        "claude_cli",
+        "codex_cli",
+        "gemini_cli",
+    ):
+        assert provider in result.output
+
+
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
     """scan with local directory runs graph and prints report."""
     (tmp_path / "SKILL.md").write_text("---\nname: scan-test\n---\n# Safe", encoding="utf-8")

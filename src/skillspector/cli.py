@@ -524,7 +524,9 @@ def scan(
 
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
-                               nv_inference. Defaults to the NVIDIA path
+                               nv_inference | ollama | azure_openai |
+                               openai_compatible | claude_cli | codex_cli |
+                               gemini_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
@@ -535,10 +537,19 @@ def scan(
 
         OPENAI_API_KEY [+ OPENAI_BASE_URL]   for SKILLSPECTOR_PROVIDER=openai
         ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
+        ANTHROPIC_PROXY_API_KEY +
+          ANTHROPIC_PROXY_ENDPOINT_URL       for anthropic_proxy
         AWS_PROFILE (optional) + AWS_REGION  for SKILLSPECTOR_PROVIDER=bedrock
                                              (AWS_PROFILE: standard boto3 credential
                                              chain when unset; AWS_REGION default: us-west-2)
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
+        AZURE_OPENAI_API_KEY +
+          AZURE_OPENAI_ENDPOINT              for azure_openai
+        SKILLSPECTOR_COMPAT_API_KEY +
+          SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
+
+        ollama uses the local Ollama service. claude_cli, codex_cli, and
+        gemini_cli use their CLI's existing local authentication session.
     """
     if mcp_registry:
         if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
