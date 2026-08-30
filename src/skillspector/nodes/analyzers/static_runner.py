@@ -46,6 +46,7 @@ from skillspector.python_ast import (
     get_python_ast,
 )
 from skillspector.security_reconstruction import (
+    MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
     build_declared_marker_views,
 )
@@ -77,17 +78,25 @@ FILE_TYPES: dict[str, str] = {
 
 MAX_FILE_CHARS = MAX_PYTHON_AST_SOURCE_CHARS
 SECURITY_VIEW_WINDOW_CHARS = 256_000
-SECURITY_VIEW_OVERLAP_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
-SECURITY_VIEW_LEFT_CONTEXT_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
-SECURITY_VIEW_OWNED_CHARS = (
-    SECURITY_VIEW_WINDOW_CHARS - SECURITY_VIEW_OVERLAP_CHARS - SECURITY_VIEW_LEFT_CONTEXT_CHARS
+_WINDOW_OVERLAP_CHARS = 8192
+_RAW_WINDOW_OWNED_CHARS = SECURITY_VIEW_WINDOW_CHARS - 2 * _WINDOW_OVERLAP_CHARS
+_VIEW_START_EVIDENCE = "_security_view_start"
+_SOURCE_START_EVIDENCE = "_security_source_start"
+assert _RAW_WINDOW_OWNED_CHARS > 0
+DECLARED_MARKER_LEFT_CONTEXT_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
+DECLARED_MARKER_RIGHT_CONTEXT_CHARS = MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS
+DECLARED_MARKER_OWNED_CHARS = (
+    SECURITY_VIEW_WINDOW_CHARS
+    - DECLARED_MARKER_LEFT_CONTEXT_CHARS
+    - DECLARED_MARKER_RIGHT_CONTEXT_CHARS
 )
+assert DECLARED_MARKER_OWNED_CHARS > 0
 # The continuity projection keeps enough of an attacker-controlled separator
 # that bounded-gap expressions cannot be turned into matches.  Only expressions
 # which already accept an unbounded separator (for example ``\s+``) can bridge
 # it.  Each auxiliary view is therefore still substantially smaller than the
 # ordinary module-input ceiling.
-_CONTINUITY_SEPARATOR_CHARS = SECURITY_VIEW_OVERLAP_CHARS
+_CONTINUITY_SEPARATOR_CHARS = _WINDOW_OVERLAP_CHARS
 _CONTINUITY_CONTEXT_CHARS = 2048
 _CONTINUITY_MAX_CHAIN_RUNS = 24
 MAX_FINDINGS_PER_ARTIFACT = 10_000
@@ -317,10 +326,13 @@ class _StaticResourceLimitError(RuntimeError):
         self,
         reason: LedgerReason,
         metrics: dict[str, int | float],
+        *,
+        partial_findings: list[Finding] | None = None,
     ) -> None:
         super().__init__(reason.value)
         self.reason = reason
         self.metrics = metrics
+        self.partial_findings = partial_findings or []
 
 
 @dataclass
@@ -494,12 +506,41 @@ def _scan_path(
     return findings, None
 
 
+def _view_finding_key(finding: Finding) -> tuple[str, str, int, str | None]:
+    return (finding.rule_id, finding.file, finding.start_line, finding.fingerprint())
+
+
+def _extend_unique_findings(
+    result: list[Finding],
+    seen: set[tuple[str, str, int, str | None]],
+    candidates: list[Finding],
+    *,
+    max_findings: int,
+) -> _StaticResourceLimitError | None:
+    """Append distinct final findings and enforce the user-visible output cap."""
+    for finding in candidates:
+        key = _view_finding_key(finding)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(finding)
+        if len(result) > max_findings:
+            return _StaticResourceLimitError(
+                LedgerReason.OUTPUT_LIMIT,
+                {
+                    "observed_findings": len(result),
+                    "limit_findings": max_findings,
+                },
+            )
+    return None
+
+
 def _deduplicate_view_findings(findings: list[Finding]) -> list[Finding]:
     """Remove overlap/view duplicates using the complete match fingerprint."""
     result: list[Finding] = []
     seen: set[tuple[str, str, int, str | None]] = set()
     for finding in findings:
-        key = (finding.rule_id, finding.file, finding.start_line, finding.fingerprint())
+        key = _view_finding_key(finding)
         if key in seen:
             continue
         seen.add(key)
@@ -522,6 +563,10 @@ def _scan_view_windows(
         finding_budget,
         python_ast_cache_key,
     )
+    for finding in findings:
+        local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
+        if isinstance(local_start, int) and 0 <= local_start < len(view.text):
+            finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
     if view.name != "raw":
         for finding in findings:
             if "normalized-view" not in finding.tags:
@@ -538,7 +583,7 @@ def _bounded_view_slices(view: SecurityTextView) -> Iterator[SecurityTextView]:
     if len(view.text) <= SECURITY_VIEW_WINDOW_CHARS:
         yield view
         return
-    step = SECURITY_VIEW_WINDOW_CHARS - SECURITY_VIEW_OVERLAP_CHARS
+    step = SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS
     for start in range(0, len(view.text), step):
         end = min(len(view.text), start + SECURITY_VIEW_WINDOW_CHARS)
         offsets = None if view.source_offsets is None else view.source_offsets[start:end]
@@ -573,22 +618,22 @@ def _continuity_separator_runs(
         # that can actually contain normalized-away format characters.
         for match in _ASCII_CONTINUITY_SEPARATOR_RUN.finditer(content):
             finding_budget.check_runtime()
-            if match.end() - match.start() > SECURITY_VIEW_OVERLAP_CHARS:
+            if match.end() - match.start() > _WINDOW_OVERLAP_CHARS:
                 yield match.start(), match.end()
         return
 
     run_start: int | None = None
     for index, character in enumerate(content):
-        if index % SECURITY_VIEW_OVERLAP_CHARS == 0:
+        if index % _WINDOW_OVERLAP_CHARS == 0:
             finding_budget.check_runtime()
         if _is_continuity_separator(character):
             if run_start is None:
                 run_start = index
             continue
-        if run_start is not None and index - run_start > SECURITY_VIEW_OVERLAP_CHARS:
+        if run_start is not None and index - run_start > _WINDOW_OVERLAP_CHARS:
             yield run_start, index
         run_start = None
-    if run_start is not None and len(content) - run_start > SECURITY_VIEW_OVERLAP_CHARS:
+    if run_start is not None and len(content) - run_start > _WINDOW_OVERLAP_CHARS:
         yield run_start, len(content)
 
 
@@ -764,6 +809,121 @@ def _restore_source_lines(
             derived_end = _line_start_offset(view.text, finding.end_line)
             raw_end = view.source_offset(derived_end)
             finding.end_line = window_line + raw_window.count("\n", 0, raw_end)
+        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+
+
+def _scan_declared_marker_views(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    finding_budget: _FindingBudget,
+) -> tuple[list[Finding], bool, _StaticResourceLimitError | None]:
+    """Reconstruct marker payloads with directive-relative context windows."""
+    findings: list[Finding] = []
+
+    def check_runtime() -> None:
+        try:
+            finding_budget.check_runtime()
+        except _StaticResourceLimitError as exc:
+            raise _StaticResourceLimitError(
+                exc.reason,
+                exc.metrics,
+                partial_findings=list(findings),
+            ) from exc
+
+    check_runtime()
+    projection_limited = False
+    seen_views: set[tuple[str, int, int]] = set()
+    seen_findings: set[tuple[str, str, int, str | None]] = set()
+    window_line = 1
+    previous_raw_start = 0
+
+    for owned_start in range(0, max(1, len(content)), DECLARED_MARKER_OWNED_CHARS):
+        check_runtime()
+        owned_end = min(len(content), owned_start + DECLARED_MARKER_OWNED_CHARS)
+        raw_start = max(0, owned_start - DECLARED_MARKER_LEFT_CONTEXT_CHARS)
+        raw_end = min(len(content), owned_end + DECLARED_MARKER_RIGHT_CONTEXT_CHARS)
+        if raw_start > previous_raw_start:
+            window_line += content.count("\n", previous_raw_start, raw_start)
+        previous_raw_start = raw_start
+        raw_window = content[raw_start:raw_end]
+        owned_source_start = owned_start - raw_start
+        owned_source_end = owned_end - raw_start if owned_end < len(content) else None
+
+        check_runtime()
+        full_views = security_text_views(raw_window)
+        check_runtime()
+        for full_view in full_views:
+            reconstruction = build_declared_marker_views(
+                full_view,
+                check_runtime=check_runtime,
+                owned_source_start=owned_source_start,
+                owned_source_end=owned_source_end,
+                source_end_is_truncated=raw_end < len(content),
+            )
+            projection_limited = projection_limited or reconstruction.limited
+            for marker_view in reconstruction.views:
+                if not marker_view.source_offsets:
+                    continue
+                marker_key = (
+                    marker_view.text,
+                    raw_start + marker_view.source_offsets[0],
+                    raw_start + marker_view.source_offsets[-1],
+                )
+                if marker_key in seen_views:
+                    continue
+                seen_views.add(marker_key)
+                for view in _bounded_view_slices(marker_view):
+                    check_runtime()
+                    view_budget = _FindingBudget(
+                        max_findings=finding_budget.max_findings,
+                        started_at=finding_budget.started_at,
+                        deadline=finding_budget.deadline,
+                        clock=finding_budget.clock,
+                    )
+                    view_findings, resource_limit = _scan_view_windows(
+                        path,
+                        view,
+                        pattern_modules,
+                        view_budget,
+                        None,
+                    )
+                    _restore_source_lines(
+                        view_findings,
+                        raw_window=raw_window,
+                        window_line=window_line,
+                        view=view,
+                    )
+                    for finding in view_findings:
+                        key = (
+                            finding.rule_id,
+                            finding.file,
+                            finding.start_line,
+                            finding.fingerprint(),
+                        )
+                        if key in seen_findings:
+                            continue
+                        seen_findings.add(key)
+                        findings.append(finding)
+                        if len(findings) > finding_budget.max_findings:
+                            return (
+                                findings,
+                                projection_limited,
+                                _StaticResourceLimitError(
+                                    LedgerReason.OUTPUT_LIMIT,
+                                    {
+                                        "observed_findings": len(findings),
+                                        "limit_findings": finding_budget.max_findings,
+                                    },
+                                ),
+                            )
+                    if resource_limit is not None:
+                        return findings, projection_limited, resource_limit
+
+        if owned_end == len(content):
+            break
+
+    return findings, projection_limited, None
 
 
 def _scan_all_views_detailed(
@@ -779,6 +939,7 @@ def _scan_all_views_detailed(
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
     findings: list[Finding] = []
+    seen_findings: set[tuple[str, str, int, str | None]] = set()
     started_at = time.monotonic()
     runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
     if timeout_seconds is not None:
@@ -791,7 +952,51 @@ def _scan_all_views_detailed(
         clock=time.monotonic,
     )
     marker_projection_limited = False
-    seen_marker_views: set[tuple[str, int, int]] = set()
+    modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
+    bounded_parse_limited = False
+
+    if modules_for_windows:
+        marker_budget = _FindingBudget(
+            max_findings=max(0, max_findings),
+            started_at=started_at,
+            deadline=deadline,
+            clock=time.monotonic,
+        )
+        try:
+            marker_findings, marker_projection_limited, resource_limit = (
+                _scan_declared_marker_views(
+                    path,
+                    content,
+                    modules_for_windows,
+                    marker_budget,
+                )
+            )
+        except _StaticResourceLimitError as exc:
+            _extend_unique_findings(
+                findings,
+                seen_findings,
+                exc.partial_findings,
+                max_findings=max_findings,
+            )
+            return (
+                findings[:max_findings],
+                exc.reason,
+                exc.metrics,
+            )
+        unique_limit = _extend_unique_findings(
+            findings,
+            seen_findings,
+            marker_findings,
+            max_findings=max_findings,
+        )
+        if unique_limit is not None:
+            return findings[:max_findings], unique_limit.reason, unique_limit.metrics
+        if resource_limit is not None:
+            return (
+                _deduplicate_view_findings(findings)[:max_findings],
+                resource_limit.reason,
+                resource_limit.metrics,
+            )
 
     if ast_modules and len(content) <= MAX_FILE_CHARS:
         try:
@@ -804,7 +1009,14 @@ def _scan_all_views_detailed(
             )
         except _StaticResourceLimitError as exc:
             return _deduplicate_view_findings(findings), exc.reason, exc.metrics
-        findings.extend(ast_findings)
+        unique_limit = _extend_unique_findings(
+            findings,
+            seen_findings,
+            ast_findings,
+            max_findings=max_findings,
+        )
+        if unique_limit is not None:
+            return findings[:max_findings], unique_limit.reason, unique_limit.metrics
         if resource_limit is not None:
             return (
                 _deduplicate_view_findings(findings)[:max_findings],
@@ -812,11 +1024,16 @@ def _scan_all_views_detailed(
                 resource_limit.metrics,
             )
 
-    modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     if modules_for_windows:
         window_line = 1
         previous_raw_start = 0
-        for owned_start in range(0, max(1, len(content)), SECURITY_VIEW_OWNED_CHARS):
+        whole_artifact_window = len(content) <= SECURITY_VIEW_WINDOW_CHARS
+        owned_starts = (
+            (0,)
+            if whole_artifact_window
+            else range(0, max(1, len(content)), _RAW_WINDOW_OWNED_CHARS)
+        )
+        for owned_start in owned_starts:
             now = time.monotonic()
             if now >= deadline:
                 return (
@@ -827,49 +1044,59 @@ def _scan_all_views_detailed(
                         "limit_seconds": runtime_limit,
                     },
                 )
-            raw_start = max(0, owned_start - SECURITY_VIEW_LEFT_CONTEXT_CHARS)
+            owned_end = (
+                len(content)
+                if whole_artifact_window
+                else min(len(content), owned_start + _RAW_WINDOW_OWNED_CHARS)
+            )
+            raw_start = 0 if whole_artifact_window else max(0, owned_start - _WINDOW_OVERLAP_CHARS)
+            raw_end = (
+                len(content)
+                if whole_artifact_window
+                else min(len(content), owned_end + _WINDOW_OVERLAP_CHARS)
+            )
             if raw_start > previous_raw_start:
                 window_line += content.count("\n", previous_raw_start, raw_start)
             previous_raw_start = raw_start
-            raw_end = min(len(content), raw_start + SECURITY_VIEW_WINDOW_CHARS)
             raw_window = content[raw_start:raw_end]
             owned_source_start = owned_start - raw_start
-            owned_source_end = (
-                owned_source_start + SECURITY_VIEW_OWNED_CHARS if raw_end < len(content) else None
-            )
+            owned_source_end = owned_end - raw_start
             for full_view in security_text_views(raw_window):
-                reconstruction = build_declared_marker_views(
-                    full_view,
-                    check_runtime=finding_budget.check_runtime,
-                    owned_source_start=owned_source_start,
-                    owned_source_end=owned_source_end,
-                )
-                marker_projection_limited = marker_projection_limited or reconstruction.limited
-                scan_views = [full_view]
-                for marker_view in reconstruction.views:
-                    if not marker_view.source_offsets:
-                        continue
-                    marker_key = (
-                        marker_view.text,
-                        raw_start + marker_view.source_offsets[0],
-                        raw_start + marker_view.source_offsets[-1],
+                try:
+                    for module in modules_for_windows:
+                        exhaustion_hook = getattr(
+                            module,
+                            "has_bounded_parse_exhaustion",
+                            None,
+                        )
+                        if callable(exhaustion_hook):
+                            finding_budget.check_runtime()
+                            bounded_parse_limited = bounded_parse_limited or bool(
+                                exhaustion_hook(
+                                    full_view.text,
+                                    finding_budget.check_runtime,
+                                )
+                            )
+                except _StaticResourceLimitError as exc:
+                    return (
+                        _deduplicate_view_findings(findings)[:max_findings],
+                        exc.reason,
+                        exc.metrics,
                     )
-                    if marker_key in seen_marker_views:
-                        continue
-                    seen_marker_views.add(marker_key)
-                    scan_views.append(marker_view)
-                for view in (
-                    bounded
-                    for candidate in scan_views
-                    for bounded in _bounded_view_slices(candidate)
-                ):
+                for view in _bounded_view_slices(full_view):
                     try:
                         finding_budget.check_runtime()
+                        view_budget = _FindingBudget(
+                            max_findings=max(0, max_findings),
+                            started_at=started_at,
+                            deadline=deadline,
+                            clock=finding_budget.clock,
+                        )
                         view_findings, resource_limit = _scan_view_windows(
                             path,
                             view,
                             modules_for_windows,
-                            finding_budget,
+                            view_budget,
                             None,
                         )
                     except _StaticResourceLimitError as exc:
@@ -878,20 +1105,36 @@ def _scan_all_views_detailed(
                             exc.reason,
                             exc.metrics,
                         )
+                    owned_findings: list[Finding] = []
+                    for finding in view_findings:
+                        source_start = finding.evidence.get(_SOURCE_START_EVIDENCE)
+                        if isinstance(source_start, int) and not (
+                            owned_source_start <= source_start < owned_source_end
+                        ):
+                            continue
+                        owned_findings.append(finding)
+                    view_findings = owned_findings
                     _restore_source_lines(
                         view_findings,
                         raw_window=raw_window,
                         window_line=window_line,
                         view=view,
                     )
-                    findings.extend(view_findings)
+                    unique_limit = _extend_unique_findings(
+                        findings,
+                        seen_findings,
+                        view_findings,
+                        max_findings=max_findings,
+                    )
+                    if unique_limit is not None:
+                        return findings[:max_findings], unique_limit.reason, unique_limit.metrics
                     if resource_limit is not None:
                         return (
                             _deduplicate_view_findings(findings)[:max_findings],
                             resource_limit.reason,
                             resource_limit.metrics,
                         )
-            if raw_end == len(content):
+            if owned_end == len(content):
                 break
 
         # Raw windows intentionally remain small, but a separator wider than
@@ -911,11 +1154,17 @@ def _scan_all_views_detailed(
                     )
                     for view in _bounded_view_slices(named_view):
                         finding_budget.check_runtime()
+                        view_budget = _FindingBudget(
+                            max_findings=max(0, max_findings),
+                            started_at=started_at,
+                            deadline=deadline,
+                            clock=finding_budget.clock,
+                        )
                         view_findings, resource_limit = _scan_view_windows(
                             path,
                             view,
                             modules_for_windows,
-                            finding_budget,
+                            view_budget,
                             None,
                         )
                         _restore_source_lines(
@@ -932,8 +1181,19 @@ def _scan_all_views_detailed(
                             key = _continuity_finding_key(finding)
                             if finding.rule_id == "P9" or key in continuity_seen:
                                 continue
-                            findings.append(finding)
                             continuity_seen.add(key)
+                            unique_limit = _extend_unique_findings(
+                                findings,
+                                seen_findings,
+                                [finding],
+                                max_findings=max_findings,
+                            )
+                            if unique_limit is not None:
+                                return (
+                                    findings[:max_findings],
+                                    unique_limit.reason,
+                                    unique_limit.metrics,
+                                )
                         if resource_limit is not None:
                             return (
                                 _deduplicate_view_findings(findings)[:max_findings],
@@ -947,9 +1207,25 @@ def _scan_all_views_detailed(
                 exc.metrics,
             )
 
+    deduplicated = _deduplicate_view_findings(findings)
+    if len(deduplicated) > max_findings:
+        return (
+            deduplicated[:max_findings],
+            LedgerReason.OUTPUT_LIMIT,
+            {
+                "observed_findings": len(deduplicated),
+                "limit_findings": max_findings,
+            },
+        )
     return (
-        _deduplicate_view_findings(findings)[:max_findings],
-        (LedgerReason.OBFUSCATED_INSTRUCTION_TEXT if marker_projection_limited else None),
+        deduplicated,
+        (
+            LedgerReason.STATIC_PARSE_LIMIT
+            if bounded_parse_limited
+            else LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
+            if marker_projection_limited
+            else None
+        ),
         {},
     )
 
