@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -134,12 +135,130 @@ def _uses_native_connection_retries(
     return False
 
 
+# ONE BUDGET FOR THE PROCESS, AND IT CANNOT BE AN asyncio.Semaphore.
+#
+# The analyzers are separate graph nodes and each node is a *synchronous* function: it reaches
+# ``run_async()``, which calls ``asyncio.run()`` — and, when a loop is already running, does so on
+# a fresh thread. Every analyzer therefore gets its own event loop. An ``asyncio.Semaphore`` is
+# bound to the loop that created it, so one semaphore per loop is one semaphore per analyzer, and
+# the process still puts N x limit requests on the wire. That is the burst
+# ``SKILLSPECTOR_MAX_LLM_CONCURRENCY`` exists to prevent: users set it to 1 on a free tier
+# precisely because a burst guarantees 429s, and 429'd batches are dropped from the result.
+#
+# So the permits live outside asyncio, under a plain lock, and each waiter parks on a future
+# belonging to *its own* loop. Releasing hands the permit to the next waiter through that loop's
+# ``call_soon_threadsafe``, which is the one asyncio primitive that is safe to call from another
+# thread. Nothing blocks a worker thread while it waits, which rules out the obvious alternative
+# of wrapping a ``threading.Semaphore`` in ``run_in_executor``: that pins one thread per queued
+# request, and the queue is exactly as long as the fan-out this is meant to bound.
+class _Handover:
+    """One queued waiter, plus the fact of whether the permit was already given to it.
+
+    ``granted`` is the whole point. A permit changes hands in two steps — taken out of the queue
+    here, delivered by ``_settle`` on the waiter's own loop — and the waiter can be cancelled
+    between them. Asking the future what happened cannot answer that question: a cancelled future
+    looks exactly like one that was never chosen. So the transfer is recorded explicitly, under
+    the same lock that performs it.
+    """
+
+    __slots__ = ("future", "granted", "loop")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, future: asyncio.Future) -> None:
+        self.loop = loop
+        self.future = future
+        self.granted = False
+
+
+class _GlobalLLMLimiter:
+    """A permit counter shared by every event loop and thread in the process."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, limit)
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        # Arrival order. FIFO, so a late analyzer is not starved by an early one that keeps
+        # re-acquiring.
+        self._waiters: deque[_Handover] = deque()
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._in_flight < self._limit:
+                self._in_flight += 1
+                return
+            handover = _Handover(loop, loop.create_future())
+            self._waiters.append(handover)
+        try:
+            await handover.future
+        except BaseException:
+            # Cancelled or timed out while queued. Leaving the waiter in the deque would let a
+            # later release() hand a permit to a coroutine that is already gone, and the permit
+            # would never come back.
+            with self._lock:
+                try:
+                    self._waiters.remove(handover)
+                except ValueError:
+                    pass  # already taken out of the queue: the handover was in flight
+                granted = handover.granted
+            if granted:
+                # The permit was handed to us and nobody will use it — whether the callback has
+                # run yet or is still queued on this loop. Pass it on rather than leak it.
+                self.release()
+            raise
+
+    def release(self) -> None:
+        with self._lock:
+            while self._waiters:
+                handover = self._waiters.popleft()
+                if handover.future.cancelled():
+                    continue
+                try:
+                    # The permit is transferred, not returned: _in_flight stays as it is.
+                    handover.granted = True
+                    handover.loop.call_soon_threadsafe(_settle, handover.future)
+                except RuntimeError:
+                    # That loop is closed — its waiter can never run. Try the next one.
+                    handover.granted = False
+                    continue
+                return
+            self._in_flight = max(0, self._in_flight - 1)
+
+    async def __aenter__(self) -> _GlobalLLMLimiter:
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self.release()
+
+
+def _settle(waiter: asyncio.Future) -> None:
+    """Resolve a queued waiter, unless it went away between the handover and the callback."""
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+# Keyed by the resolved limit, not shared blindly: a caller that resolves a different value gets
+# its own budget instead of silently resizing one that other coroutines are holding permits from.
+_limiters: dict[int, _GlobalLLMLimiter] = {}
+_limiters_lock = threading.Lock()
+
+
+def _shared_limiter(limit: int) -> _GlobalLLMLimiter:
+    """Return the process-wide limiter for *limit*."""
+    with _limiters_lock:
+        limiter = _limiters.get(limit)
+        if limiter is None:
+            limiter = _GlobalLLMLimiter(limit)
+            _limiters[limit] = limiter
+        return limiter
+
+
 def resolve_max_concurrency() -> int:
     """Resolve the LLM fan-out concurrency from ``SKILLSPECTOR_MAX_LLM_CONCURRENCY``.
 
     Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
     providers (free tiers with a low RPM) can set it to ``1`` to serialize
-    requests instead of bursting up to 10 in parallel — a burst that otherwise
+    requests across every analyzer instead of bursting up to 10 in parallel — a burst that otherwise
     guarantees 429s, and 429'd batches are dropped from the result (see the
     analyzer fan-out below). Invalid values fall back to the default; values
     below 1 are clamped to 1.
@@ -930,9 +1049,15 @@ class LLMAnalyzerBase:
         **kwargs: object,
     ) -> BatchExecutionResult:
         """Execute batches concurrently and retain sanitized per-batch failures."""
+        # Resolved from the environment: one budget for the whole process, because that is what
+        # the variable promises — "requests in parallel", not "requests in parallel per analyzer".
+        # An explicit argument keeps its documented meaning and stays local to this call: a caller
+        # that passes a number is asking for a fan-out width, not for a share of the budget.
+        sem: _GlobalLLMLimiter | asyncio.Semaphore
         if max_concurrency is None:
-            max_concurrency = resolve_max_concurrency()
-        sem = asyncio.Semaphore(max_concurrency)
+            sem = _shared_limiter(resolve_max_concurrency())
+        else:
+            sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
             async with sem:

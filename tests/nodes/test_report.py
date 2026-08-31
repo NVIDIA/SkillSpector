@@ -906,6 +906,77 @@ class TestReportNode:
         assert len(body["issues"]) == 4
         assert result["risk_score"] < 4 * 25
 
+    @pytest.mark.parametrize("output_format", ["json", "sarif"])
+    def test_report_keeps_occurrence_local_pe3_classification(
+        self,
+        output_format: str,
+    ) -> None:
+        safe = Finding(
+            rule_id="PE3",
+            message="Credential Access",
+            severity="HIGH",
+            confidence=0.9,
+            file="scripts/build.sh",
+            start_line=6,
+            matched_text="/etc/passwd",
+            code_snippet="docker run -v /etc/passwd:/etc/passwd:ro image",
+            tags=["Privilege Escalation", "contextual-triage", "likely-benign-context"],
+        )
+        unsafe = Finding(
+            rule_id="PE3",
+            message="Credential Access",
+            severity="HIGH",
+            confidence=0.9,
+            file="scripts/unsafe-passwd.sh",
+            start_line=5,
+            matched_text="/etc/passwd",
+            code_snippet="cat /etc/passwd",
+            tags=["Privilege Escalation"],
+        )
+        state: SkillspectorState = {
+            "filtered_findings": [safe, unsafe],
+            "component_metadata": [],
+            "has_executable_scripts": True,
+            "manifest": {},
+            "output_format": output_format,
+        }
+
+        result = report(state)
+        if output_format == "json":
+            rows = json.loads(result["report_body"])["issues"]
+            actual = {
+                row["location"]["file"]: (
+                    row["finding_id"],
+                    row["code_snippet"],
+                    row["tags"],
+                )
+                for row in rows
+            }
+        else:
+            rows = result["sarif_report"]["runs"][0]["results"]
+            actual = {
+                row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]: (
+                    row["properties"]["findingId"],
+                    row["properties"]["code_snippet"],
+                    row["properties"]["tags"],
+                )
+                for row in rows
+            }
+
+        assert len(rows) == 2
+        assert actual == {
+            "scripts/build.sh": (
+                safe.finding_id,
+                safe.code_snippet,
+                safe.tags,
+            ),
+            "scripts/unsafe-passwd.sh": (
+                unsafe.finding_id,
+                unsafe.code_snippet,
+                unsafe.tags,
+            ),
+        }
+
 
 def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     """A baseline-suppressed CRITICAL finding does not count toward the risk score."""
