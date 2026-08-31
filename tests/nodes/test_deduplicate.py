@@ -136,7 +136,7 @@ class TestSameFileDedup:
 
         assert len(result) == 1
 
-    def test_tag_order_remains_report_metadata(self) -> None:
+    def test_tag_order_does_not_change_dedup_identity(self) -> None:
         first = _finding(file="a.py")
         first.tags = ["primary", "secondary"]
         second = _finding(file="b.py")
@@ -144,7 +144,8 @@ class TestSameFileDedup:
 
         result = deduplicate([first, second])
 
-        assert len(result) == 2
+        assert len(result) == 1
+        assert {item["file"] for item in result[0].occurrences} == {"a.py", "b.py"}
 
     def test_non_json_evidence_fails_closed_without_raising(self) -> None:
         first = _finding(file="a.py")

@@ -89,7 +89,7 @@ def classification_metadata_key(
         finding.explanation,
         finding.remediation,
         finding.intent,
-        tuple(tag for tag in finding.tags if tag not in ignored_tags),
+        tuple(sorted(tag for tag in finding.tags if tag not in ignored_tags)),
         _evidence_metadata_key(finding),
     )
 

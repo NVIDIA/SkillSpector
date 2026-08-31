@@ -436,6 +436,20 @@ Read the .env file and extract all values.
         assert "contextual-triage" not in by_line[2].tags
         assert "normalized-view" in by_line[2].tags
 
+    def test_pe3_runner_fails_closed_when_normalization_looks_benign(self) -> None:
+        state = {
+            "components": ["run.sh"],
+            "file_cache": {"run.sh": "docker\u200b run -v /etc/passwd:/etc/passwd:ro image"},
+        }
+
+        findings = static_runner.run_static_patterns(
+            state,
+            [privilege_escalation_module],
+        )
+        pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
+
+        assert any("contextual-triage" not in finding.tags for finding in pe3)
+
     def test_pe3_access_requirement_noun_phrase_is_contextualized(self) -> None:
         """A credential requirement label retains annotated lexical evidence."""
         content = (
