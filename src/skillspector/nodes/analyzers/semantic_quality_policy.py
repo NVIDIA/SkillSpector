@@ -30,6 +30,7 @@ from skillspector.llm_analyzer_base import (
     BatchFailure,
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
+    _compact_prompts_enabled,
     ledger_events_for_batches,
 )
 from skillspector.llm_utils import run_async
@@ -155,6 +156,46 @@ Use rule ID **SQP-3** for all policy-violation findings.
   quality and policy concerns that require natural-language understanding.
 """
 
+_COMPACT_ANALYZER_PROMPT = """\
+You are a quality and safety auditor for AI agent skills. Review a single \
+skill file and report findings from the categories below. Each category \
+specifies applicable file types; skip categories that do not apply.
+
+The file is identified by its path/extension in the heading that follows. \
+Only report findings for matching file-type scopes.
+
+| Rule ID | Category | Applies to |
+|---------|----------|------------|
+| SQP-1 | Vague Triggers | markdown, text, manifest files only |
+| SQP-2 | Missing User Warnings | code AND markdown files |
+| SQP-3 | Natural-Language Policy Violations | ALL file types |
+
+### SQP-1  Vague Triggers
+**Markdown (.md), text (.txt), manifest (.yaml, .yml, .json, .toml) only.** Skip for code files.
+Flag ambiguous/overly broad activation conditions that could cause unintended invocations: \
+broad trigger phrases overlapping everyday speech, unclear activation conditions, missing \
+specificity on trigger scope.
+Do NOT flag domain-specific triggers (e.g. "run terraform plan"), triggers with negative \
+examples, or triggers limited to narrow contexts.
+
+### SQP-2  Missing User Warnings
+**Code files AND markdown files.**
+For code: flag safety-critical operations lacking ANY disclosure (no confirmation prompt, \
+no logging, no docstring). Check: file writes/deletions, network calls transmitting data, \
+credential access, subprocess execution, destructive operations.
+For markdown: flag when description omits warnings about data/privacy/integrity impacts.
+Do NOT flag if code has visible confirmation/log/print, markdown warns about the operation, \
+or the operation is clearly part of the stated purpose.
+
+### SQP-3  Natural-Language Policy Violations
+**ALL file types.**
+Flag language/locale policy violations (e.g. skill forces specific language without user opt-in).
+Do NOT flag if the skill offers language choice or the constraint is documented and justified.
+
+Do NOT report issues already covered by static security scanners. Focus on semantic \
+quality and policy concerns requiring natural-language understanding.
+"""
+
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Discover quality/policy findings via LLM analysis."""
@@ -215,8 +256,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         (lambda: transitive_remaining_seconds(state)) if shared_remaining is not None else None
     )
     try:
+        prompt = _COMPACT_ANALYZER_PROMPT if _compact_prompts_enabled() else ANALYZER_PROMPT
         analyzer = LLMAnalyzerBase(
-            base_prompt=ANALYZER_PROMPT,
+            base_prompt=prompt,
             model=model,
             node=ANALYZER_ID,
             timeout=timeout,
