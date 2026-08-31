@@ -5,15 +5,24 @@
 
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
+from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from skillspector.artifacts import ContentKind
+from skillspector.artifacts import (
+    ContentKind,
+    _concealed_instruction_run_spans,
+    _contextual_default_ignorable_boundary_spans,
+    _obfuscated_instruction_matches,
+)
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_for_events,
     ledger_event,
 )
@@ -24,7 +33,9 @@ from skillspector.state import (
     SkillspectorState,
     transitive_remaining_seconds,
 )
+from skillspector.unicode_confusables import ASCII_CONFUSABLE_SKELETON
 
+from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_line_number
 from .static_runner import MAX_FINDINGS_PER_ANALYZER, MAX_FINDINGS_PER_ARTIFACT
 
 ANALYZER_ID = "artifact_integrity"
@@ -35,6 +46,299 @@ _INSTRUCTION_SUFFIXES = (
 )
 _RUNTIME_CHECK_INTERVAL_CHARS = 4096
 _ALLOWED_FORMAT_CHARACTERS = frozenset({"\n", "\r", "\t"})
+_LETTER_SPACING_SECURITY_TERMS = (
+    "bypass",
+    "disregard",
+    "ignore",
+    "instructions",
+    "jailbreak",
+    "override",
+    "previousinstructions",
+    "restrictions",
+    "securityconstraints",
+    "silentlysend",
+    "sshkey",
+    "unfiltered",
+    "unrestricted",
+    "userdata",
+)
+_LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "credential",
+        "credentials",
+        "password",
+        "privatekey",
+        "secrettoken",
+        "systemprompt",
+    }
+)
+_LETTER_SPACING_PROMPT_ACTIONS = (
+    "disclose",
+    "disclosed",
+    "discloses",
+    "disclosing",
+    "display",
+    "displayed",
+    "displaying",
+    "displays",
+    "dump",
+    "dumped",
+    "dumping",
+    "dumps",
+    "echo",
+    "echoed",
+    "echoes",
+    "echoing",
+    "expose",
+    "exposed",
+    "exposes",
+    "exposing",
+    "output",
+    "outputs",
+    "outputted",
+    "outputting",
+    "print",
+    "printed",
+    "printing",
+    "prints",
+    "return",
+    "returned",
+    "returning",
+    "returns",
+    "reveal",
+    "revealed",
+    "revealing",
+    "reveals",
+    "show",
+    "showed",
+    "showing",
+    "shown",
+    "shows",
+)
+_LETTER_SPACING_HIGH_RISK_EXFILTRATION_ACTIONS = (
+    "exfiltrate",
+    "exfiltrated",
+    "exfiltrates",
+    "exfiltrating",
+    "leak",
+    "leaked",
+    "leaking",
+    "leaks",
+    "steal",
+    "stealing",
+    "steals",
+    "stole",
+    "stolen",
+)
+_LETTER_SPACING_TRANSFER_ACTIONS = (
+    "forward",
+    "forwarded",
+    "forwarding",
+    "forwards",
+    "post",
+    "posted",
+    "posting",
+    "posts",
+    "send",
+    "sending",
+    "sends",
+    "sent",
+    "transmit",
+    "transmits",
+    "transmitted",
+    "transmitting",
+    "upload",
+    "uploaded",
+    "uploading",
+    "uploads",
+)
+_LETTER_SPACING_DESTRUCTIVE_ACTIONS = (
+    "delete",
+    "deleted",
+    "deletes",
+    "deleting",
+    "destroy",
+    "destroyed",
+    "destroying",
+    "destroys",
+    "erase",
+    "erased",
+    "erases",
+    "erasing",
+    "remove",
+    "removed",
+    "removes",
+    "removing",
+    "wipe",
+    "wiped",
+    "wipes",
+    "wiping",
+)
+_LETTER_SPACING_SECURITY_PREFIXES = (
+    "covertly",
+    "immediately",
+    "now",
+    "please",
+    "quietly",
+    "secretly",
+    "silently",
+)
+_LETTER_SPACING_SECURITY_CONNECTORS = (
+    "a",
+    "all",
+    "any",
+    "available",
+    "full",
+    "local",
+    "private",
+    "remote",
+    "secret",
+    "sensitive",
+    "stored",
+    "system",
+    "the",
+    "user",
+    "users",
+    "your",
+)
+_LETTER_SPACING_PROMPT_TARGETS = (
+    "instructions",
+    "prompt",
+    "prompts",
+    "rules",
+    "systeminstructions",
+    "systemprompt",
+    "systemprompts",
+)
+_LETTER_SPACING_SENSITIVE_TARGETS = (
+    "accesstoken",
+    "accesstokens",
+    "apikey",
+    "apikeys",
+    "credential",
+    "credentials",
+    "password",
+    "passwords",
+    "privatekey",
+    "privatekeys",
+    "secret",
+    "secrets",
+    "secrettoken",
+    "secrettokens",
+    "sshkey",
+    "sshkeys",
+    "systeminstructions",
+    "systemprompt",
+    "systemprompts",
+    "token",
+    "tokens",
+    "userdata",
+)
+_LETTER_SPACING_HIGH_RISK_EXFILTRATION_TARGETS = (
+    *_LETTER_SPACING_SENSITIVE_TARGETS,
+    "data",
+    "file",
+    "files",
+)
+_LETTER_SPACING_DESTRUCTIVE_TARGETS = (
+    "credential",
+    "credentials",
+    "data",
+    "directories",
+    "directory",
+    "file",
+    "files",
+    "history",
+    "memory",
+    "password",
+    "passwords",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "userdata",
+    "workspace",
+)
+_LETTER_SPACING_SECURITY_SUFFIXES = (
+    "immediately",
+    "now",
+)
+_MAX_LETTER_SPACING_SECURITY_CONNECTORS = 3
+_MAX_BENIGN_NOTATION_RUN_CHARS = 96
+_BENIGN_NOTATION_SECURITY_TERMS = frozenset({"bypass", "restrictions"})
+_BENIGN_STANDALONE_BYPASS_SUM = re.compile(r"b *\+ *y *\+ *p *\+ *a *\+ *s *\+ *s")
+_BENIGN_SPELLING_PREFIX = re.compile(
+    r"(?:the\s+)?spelling\s+(?:example|exercise)\s*",
+)
+_BENIGN_SPELLING_SUFFIX = re.compile(
+    r"\s*(?:demonstrates|illustrates|shows)\s+(?:the\s+)?letter\s+order[.!?]?\s*",
+)
+_BENIGN_EXPRESSION_PREFIX = re.compile(r"(?:the\s+)?(?:expression|formula)\s*")
+_BENIGN_EXPRESSION_SUFFIX = re.compile(
+    r"\s*(?:is|equals)\s+(?:a\s+)?spelling\s+(?:example|exercise)[.!?]?\s*",
+)
+
+
+def _compile_letter_spacing_command_pattern(
+    actions: tuple[str, ...],
+    targets: tuple[str, ...],
+) -> re.Pattern[str]:
+    """Compile one finite command family over a condensed letter run."""
+
+    def alternation(values: tuple[str, ...]) -> str:
+        return "|".join(re.escape(value) for value in sorted(values, key=len, reverse=True))
+
+    return re.compile(
+        rf"(?:(?:{alternation(_LETTER_SPACING_SECURITY_PREFIXES)}))?"
+        rf"(?:{alternation(actions)})"
+        rf"(?:(?:{alternation(_LETTER_SPACING_SECURITY_CONNECTORS)}))"
+        rf"{{0,{_MAX_LETTER_SPACING_SECURITY_CONNECTORS}}}"
+        rf"(?:{alternation(targets)})"
+        rf"(?:(?:{alternation(_LETTER_SPACING_SECURITY_SUFFIXES)}))?"
+    )
+
+
+_LETTER_SPACING_COMMAND_PATTERNS = (
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_PROMPT_ACTIONS,
+        _LETTER_SPACING_PROMPT_TARGETS,
+    ),
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_HIGH_RISK_EXFILTRATION_ACTIONS,
+        _LETTER_SPACING_HIGH_RISK_EXFILTRATION_TARGETS,
+    ),
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_TRANSFER_ACTIONS,
+        _LETTER_SPACING_SENSITIVE_TARGETS,
+    ),
+    _compile_letter_spacing_command_pattern(
+        _LETTER_SPACING_DESTRUCTIVE_ACTIONS,
+        _LETTER_SPACING_DESTRUCTIVE_TARGETS,
+    ),
+)
+_MAX_LETTER_SPACING_SECURITY_TERM = max(map(len, _LETTER_SPACING_SECURITY_TERMS))
+_LETTER_SPACING_ALL_ACTIONS = (
+    _LETTER_SPACING_PROMPT_ACTIONS
+    + _LETTER_SPACING_HIGH_RISK_EXFILTRATION_ACTIONS
+    + _LETTER_SPACING_TRANSFER_ACTIONS
+    + _LETTER_SPACING_DESTRUCTIVE_ACTIONS
+)
+_LETTER_SPACING_ALL_TARGETS = (
+    _LETTER_SPACING_PROMPT_TARGETS
+    + _LETTER_SPACING_HIGH_RISK_EXFILTRATION_TARGETS
+    + _LETTER_SPACING_SENSITIVE_TARGETS
+    + _LETTER_SPACING_DESTRUCTIVE_TARGETS
+)
+_MAX_LETTER_SPACING_SECURITY_PHRASE = max(
+    max(map(len, _LETTER_SPACING_EXACT_SECURITY_TERMS)),
+    max(map(len, _LETTER_SPACING_SECURITY_PREFIXES))
+    + max(map(len, _LETTER_SPACING_ALL_ACTIONS))
+    + _MAX_LETTER_SPACING_SECURITY_CONNECTORS * max(map(len, _LETTER_SPACING_SECURITY_CONNECTORS))
+    + max(map(len, _LETTER_SPACING_ALL_TARGETS))
+    + max(map(len, _LETTER_SPACING_SECURITY_SUFFIXES)),
+)
 
 
 class _ArtifactIntegrityResourceLimitError(RuntimeError):
@@ -100,10 +404,197 @@ class _ArtifactIntegrityBudget:
         return len(self.findings) >= MAX_FINDINGS_PER_ANALYZER
 
 
+def _spacing_phrase_has_security_signal(phrase: str) -> bool:
+    """Match a complete sensitive concept or bounded command grammar."""
+    return phrase in _LETTER_SPACING_EXACT_SECURITY_TERMS or any(
+        pattern.fullmatch(phrase) is not None for pattern in _LETTER_SPACING_COMMAND_PATTERNS
+    )
+
+
+def _bounded_same_line_context(
+    content: str,
+    start: int,
+    end: int,
+) -> tuple[str, str] | None:
+    """Return complete bounded line context around a short candidate."""
+    prefix_start = max(0, start - _MAX_BENIGN_NOTATION_RUN_CHARS)
+    prefix = content[prefix_start:start]
+    prefix_breaks = tuple(LOGICAL_LINE_BREAK.finditer(prefix))
+    if prefix_breaks:
+        prefix = prefix[prefix_breaks[-1].end() :]
+    elif prefix_start > 0:
+        return None
+
+    suffix_end = min(len(content), end + _MAX_BENIGN_NOTATION_RUN_CHARS)
+    suffix = content[end:suffix_end]
+    suffix_break = LOGICAL_LINE_BREAK.search(suffix)
+    if suffix_break is not None:
+        suffix = suffix[: suffix_break.start()]
+    elif suffix_end < len(content):
+        return None
+    return prefix.casefold(), suffix.casefold()
+
+
+def _spacing_span_is_benign_notation(content: str, span: tuple[int, int]) -> bool:
+    """Recognize narrow, complete spelling/math controls without hiding commands."""
+    start, end = span
+    # The broad concealed-run scanner may retain the first letter of the
+    # ordinary word that follows a spaced run. Exclude that lookahead letter
+    # when the next source character proves the word continues.
+    semantic_end = end - 1 if end < len(content) and content[end].isalpha() else end
+    while semantic_end > start and content[semantic_end - 1] in LINE_BREAK_CHARS:
+        semantic_end -= 1
+    if semantic_end <= start or semantic_end - start > _MAX_BENIGN_NOTATION_RUN_CHARS:
+        return False
+
+    raw_run = content[start:semantic_end]
+    folded_letters: list[str] = []
+    for character in raw_run:
+        if character.isalpha():
+            folded = unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON)
+            folded_letters.extend(value for value in folded.casefold() if value.isalpha())
+    phrase = "".join(folded_letters)
+    if phrase not in _BENIGN_NOTATION_SECURITY_TERMS:
+        return False
+
+    context = _bounded_same_line_context(content, start, semantic_end)
+    if context is None:
+        return False
+    prefix, suffix = context
+
+    if (
+        phrase == "bypass"
+        and _BENIGN_STANDALONE_BYPASS_SUM.fullmatch(raw_run.casefold())
+        and start <= _MAX_BENIGN_NOTATION_RUN_CHARS
+        and len(content) - semantic_end <= _MAX_BENIGN_NOTATION_RUN_CHARS
+        and not content[:start].strip()
+        and not content[semantic_end:].strip(" \t.!?" + LINE_BREAK_CHARS)
+    ):
+        return True
+    return bool(
+        _BENIGN_SPELLING_PREFIX.fullmatch(prefix)
+        and _BENIGN_SPELLING_SUFFIX.fullmatch(suffix)
+        or _BENIGN_EXPRESSION_PREFIX.fullmatch(prefix)
+        and _BENIGN_EXPRESSION_SUFFIX.fullmatch(suffix)
+    )
+
+
+def _spacing_span_has_security_signal(
+    content: str,
+    span: tuple[int, int],
+    budget: _ArtifactIntegrityBudget,
+) -> bool:
+    """Match bounded security semantics without retaining the full run."""
+    if _spacing_span_is_benign_notation(content, span):
+        return False
+    overlap = ""
+    letters: list[str] = []
+    letter_characters = 0
+    phrase_parts: list[str] = []
+    phrase_characters = 0
+    phrase_overflow = False
+    for offset in range(*span):
+        if offset % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
+            budget.check_runtime()
+        character = content[offset]
+        if not character.isalpha():
+            continue
+        folded = (
+            unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON).casefold()
+        )
+        folded = "".join(normalized for normalized in folded if normalized.isalpha())
+        if not folded:
+            continue
+        letters.append(folded)
+        letter_characters += len(folded)
+        if not phrase_overflow:
+            phrase_characters += len(folded)
+            if phrase_characters <= _MAX_LETTER_SPACING_SECURITY_PHRASE:
+                phrase_parts.append(folded)
+            else:
+                phrase_parts.clear()
+                phrase_overflow = True
+        if letter_characters < _RUNTIME_CHECK_INTERVAL_CHARS:
+            continue
+        block = overlap + "".join(letters)
+        if any(term in block for term in _LETTER_SPACING_SECURITY_TERMS):
+            return True
+        overlap = block[-(_MAX_LETTER_SPACING_SECURITY_TERM - 1) :]
+        letters.clear()
+        letter_characters = 0
+
+    block = overlap + "".join(letters)
+    if any(term in block for term in _LETTER_SPACING_SECURITY_TERMS):
+        return True
+    if phrase_overflow:
+        return False
+    if _spacing_phrase_has_security_signal("".join(phrase_parts)):
+        return True
+    return (
+        bool(phrase_parts)
+        and span[1] < len(content)
+        and content[span[1]].isalpha()
+        and _spacing_phrase_has_security_signal("".join(phrase_parts[:-1]))
+    )
+
+
+def _matching_security_term_raw_spans(
+    projection: deque[str],
+    raw_offsets: deque[int],
+) -> Iterator[tuple[int, int]]:
+    """Yield raw envelopes for terms ending in a bounded projection."""
+    normalized = "".join(projection)
+    for term in _LETTER_SPACING_SECURITY_TERMS:
+        if normalized.endswith(term):
+            yield raw_offsets[-len(term)], raw_offsets[-1] + 1
+
+
+def _contextual_ignorable_security_line(
+    content: str,
+    budget: _ArtifactIntegrityBudget,
+) -> int | None:
+    """Return the first boundary gap that touches a security-term match."""
+    spans = iter(
+        _contextual_default_ignorable_boundary_spans(
+            content,
+            budget.check_runtime,
+        )
+    )
+    next_span = next(spans, None)
+    latest_span: tuple[int, int] | None = None
+    projection: deque[str] = deque(maxlen=_MAX_LETTER_SPACING_SECURITY_TERM)
+    raw_offsets: deque[int] = deque(maxlen=_MAX_LETTER_SPACING_SECURITY_TERM)
+
+    for offset, character in enumerate(content):
+        if offset % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
+            budget.check_runtime()
+        if not character.isalpha():
+            continue
+        for folded in character.casefold():
+            if not folded.isalpha():
+                continue
+            projection.append(folded)
+            raw_offsets.append(offset)
+            term_end = offset + 1
+            while next_span is not None and next_span[0] <= term_end:
+                latest_span = next_span
+                next_span = next(spans, None)
+            if latest_span is None:
+                continue
+            for term_start, matched_term_end in _matching_security_term_raw_spans(
+                projection,
+                raw_offsets,
+            ):
+                if latest_span[0] <= matched_term_end and latest_span[1] >= term_start:
+                    budget.check_runtime()
+                    return content.count("\n", 0, latest_span[0]) + 1
+    return None
+
+
 def _text_signals(
     content: str,
     budget: _ArtifactIntegrityBudget,
-) -> tuple[float, bool, int | None]:
+) -> tuple[float, bool, int | None, int | None]:
     """Derive Unicode and NUL signals with cooperative deadline checks.
 
     Only counters, a three-entry script set, and the first NUL line are kept;
@@ -114,6 +605,40 @@ def _text_signals(
     token_scripts: set[str] = set()
     line = 1
     first_nul_line: int | None = None
+    spacing_span = next(
+        (
+            span
+            for span in _concealed_instruction_run_spans(
+                content,
+                budget.check_runtime,
+            )
+            if _spacing_span_has_security_signal(content, span, budget)
+        ),
+        None,
+    )
+    first_spacing_line = (
+        content.count("\n", 0, spacing_span[0]) + 1 if spacing_span is not None else None
+    )
+    first_contextual_ignorable_line = _contextual_ignorable_security_line(content, budget)
+    targeted_instruction = next(
+        _obfuscated_instruction_matches(content, budget.check_runtime),
+        None,
+    )
+    first_targeted_instruction_line = (
+        get_line_number(content, targeted_instruction.evidence_offset)
+        if targeted_instruction is not None
+        else None
+    )
+    obfuscation_lines = [
+        value
+        for value in (
+            first_spacing_line,
+            first_contextual_ignorable_line,
+            first_targeted_instruction_line,
+        )
+        if value is not None
+    ]
+    first_obfuscation_line = min(obfuscation_lines, default=None)
 
     for index, character in enumerate(content):
         if index % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
@@ -147,7 +672,7 @@ def _text_signals(
     budget.check_runtime()
     mixed_script = mixed_script or ("latin" in token_scripts and len(token_scripts) > 1)
     density = ignored_characters / len(content) if content else 0.0
-    return density, mixed_script, first_nul_line
+    return density, mixed_script, first_nul_line, first_obfuscation_line
 
 
 def _partial_limit_event(
@@ -242,6 +767,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         artifact: dict[str, object] = raw_artifact if isinstance(raw_artifact, dict) else {}
         finding_start = len(budget.findings)
         resource_limit: _ArtifactIntegrityResourceLimitError | None = None
+        first_obfuscation_line: int | None = None
         try:
             budget.check_runtime()
             if artifact.get("misleading_extension"):
@@ -274,7 +800,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                     ContentKind.BINARY,
                     ContentKind.OPAQUE,
                 }:
-                    format_density, mixed_script, first_nul_line = _text_signals(content, budget)
+                    format_density, mixed_script, first_nul_line, first_obfuscation_line = (
+                        _text_signals(content, budget)
+                    )
                     if artifact.get("contains_nul") and first_nul_line is not None:
                         budget.emit(
                             _finding(
@@ -296,6 +824,17 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                                 confidence=0.8,
                             )
                         )
+                    if first_obfuscation_line is not None:
+                        budget.emit(
+                            _finding(
+                                "AE6",
+                                "Instruction text uses inter-character separators to evade pattern matching",
+                                path,
+                                severity="HIGH",
+                                confidence=0.9,
+                                line=first_obfuscation_line,
+                            )
+                        )
         except _ArtifactIntegrityResourceLimitError as exc:
             resource_limit = exc
 
@@ -313,8 +852,21 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 emitted_finding_ids=emitted_ids,
             )
         events.append(event)
+        if resource_limit is None and first_obfuscation_line is not None:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="artifact_interpretation",
+                    path=path,
+                    start_line=first_obfuscation_line,
+                    end_line=first_obfuscation_line,
+                    record_type=LedgerRecordType.SYSTEM,
+                    reason=LedgerReason.OBFUSCATED_INSTRUCTION_TEXT,
+                )
+            )
+    work_events = (event for event in events if event["record_type"] == LedgerRecordType.WORK_ITEM)
     return {
         "findings": budget.findings,
         "inspection_ledger": events,
-        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, events)],
+        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, work_events)],
     }

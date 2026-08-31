@@ -163,6 +163,39 @@ class TestRunStaticPatternsPromptInjection:
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
         assert any(f.rule_id == "P2" for f in findings)
 
+    def test_p2_repeated_single_character_signals_are_coalesced_per_line(self):
+        """A format-control flood cannot consume the analyzer output budget."""
+        findings = prompt_injection_module.analyze(
+            content="prefix" + "\u2060" * 20_000 + "suffix",
+            file_path="skill.md",
+            file_type="markdown",
+        )
+
+        p2 = [finding for finding in findings if finding.rule_id == "P2"]
+        assert len(p2) == 1
+        assert p2[0].location.start_line == 1
+
+    def test_p2_control_coalescing_preserves_each_affected_line(self):
+        findings = prompt_injection_module.analyze(
+            content="\u2060" * 1_000 + "\n" + "\u2060" * 1_000,
+            file_path="skill.md",
+            file_type="markdown",
+        )
+
+        p2 = [finding for finding in findings if finding.rule_id == "P2"]
+        assert [finding.location.start_line for finding in p2] == [1, 2]
+
+    def test_p2_safe_emoji_zwj_does_not_hide_later_bare_joiner_on_same_line(self):
+        findings = prompt_injection_module.analyze(
+            content="role: \U0001f9d1\u200d\u2696\ufe0f then hidden\u200dtext",
+            file_path="skill.md",
+            file_type="markdown",
+        )
+
+        p2 = [finding for finding in findings if finding.rule_id == "P2"]
+        assert len(p2) == 1
+        assert p2[0].matched_text == "\u200d"
+
     def test_p2_emoji_wrapped_smuggling_still_flagged(self):
         """Adversarial: an attacker wraps a smuggled instruction between the
         emoji base U+1F3F4 and U+E007F CANCEL TAG to mimic a subdivision flag
