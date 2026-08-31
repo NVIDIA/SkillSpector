@@ -93,7 +93,9 @@ _RAW_WINDOW_OWNED_CHARS = SECURITY_VIEW_WINDOW_CHARS - 2 * _WINDOW_OVERLAP_CHARS
 _VIEW_START_EVIDENCE = "_security_view_start"
 _SOURCE_START_EVIDENCE = "_security_source_start"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
+_BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
 _ViewFindingKey = tuple[str, str, int, str | None, tuple[object, ...]]
+_ViewScopeKey = tuple[str, str, int, str | None]
 assert _RAW_WINDOW_OWNED_CHARS > 0
 DECLARED_MARKER_LEFT_CONTEXT_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
 DECLARED_MARKER_RIGHT_CONTEXT_CHARS = MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS
@@ -650,6 +652,15 @@ def _view_finding_key(finding: Finding) -> _ViewFindingKey:
     )
 
 
+def _view_scope_key(finding: Finding) -> _ViewScopeKey:
+    return (
+        finding.rule_id,
+        finding.file,
+        finding.start_line,
+        finding.fingerprint(),
+    )
+
+
 def _extend_unique_findings(
     result: list[Finding],
     seen: set[_ViewFindingKey],
@@ -682,9 +693,23 @@ def _deduplicate_view_findings(findings: list[Finding]) -> list[Finding]:
     raw_keys = {
         _view_finding_key(finding) for finding in findings if "normalized-view" not in finding.tags
     }
+    raw_non_benign_scopes = {
+        _view_scope_key(finding)
+        for finding in findings
+        if "normalized-view" not in finding.tags and not _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
+    }
     for finding in findings:
         key = _view_finding_key(finding)
         if "normalized-view" in finding.tags and key in raw_keys:
+            continue
+        if (
+            "normalized-view" in finding.tags
+            and _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
+            and _view_scope_key(finding) in raw_non_benign_scopes
+        ):
+            # Normalization may make an ambiguous raw occurrence look benign.
+            # Prefer the raw non-benign signal, but never suppress a derived
+            # unsafe classification that exposes obfuscated content.
             continue
         if key in seen:
             continue
