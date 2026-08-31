@@ -1,4 +1,4 @@
-.PHONY: help install install-dev langgraph-dev test test-unit test-provider openai anthropic nv_build test-integration test-cov test-ci lint lint-fix format format-check clean build docker-build docker-smoke
+.PHONY: help install install-dev langgraph-dev test test-unit test-provider openai anthropic nv_build test-integration test-cov test-ci verify lint lint-fix format format-check clean build docker-build docker-smoke
 
 # Prefer uv if available, else use pip (set when Makefile is parsed)
 UV := $(shell command -v uv 2>/dev/null)
@@ -37,6 +37,7 @@ help:
 	@echo "  make test-provider [openai|anthropic|nv_build] - Run live provider tests"
 	@echo "  make test-integration - Run integration tests only (invokes full graph, may call LLMs)"
 	@echo "  make test-cov       - Run tests with coverage report"
+	@echo "  make verify         - Check deterministic and neural-envelope safety invariants"
 	@echo "  make lint           - Run linters (ruff only)"
 	@echo "  make lint-fix       - Auto-fix lint errors with ruff"
 	@echo "  make format         - Format code with ruff"
@@ -104,6 +105,10 @@ test-cov:
 # Run tests with coverage for CI (Cobertura XML + terminal)
 test-ci:
 	pytest -m "not integration and not provider" --cov=src/skillspector --cov-report=term-missing --cov-report=xml tests/
+
+# Run the fast executable specification and adversarial-oracle property suite.
+verify:
+	pytest tests/verification/
 
 # Run linters (fast: ruff only)
 lint:
