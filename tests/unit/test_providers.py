@@ -23,6 +23,7 @@ NVIDIA catalog API) is covered by the layered tests in
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -828,6 +829,62 @@ class TestAntigravityCLIProvider:
         available, reason = AntigravityCLIProvider().is_available()
         assert available is False
         assert reason
+
+
+class TestAgentCLIProviderMetadata:
+    """Shared model-registry behavior for supported agent CLI providers."""
+
+    @pytest.mark.parametrize(
+        "provider_type",
+        [ClaudeCLIProvider, CodexCLIProvider, GeminiCLIProvider],
+    )
+    def test_honors_model_registry_override(
+        self,
+        provider_type: type[ClaudeCLIProvider | CodexCLIProvider | GeminiCLIProvider],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            "models:\n  test-model:\n    context_length: 200000\n    max_output_tokens: 32000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = provider_type()
+        assert provider.get_context_length("test-model") == 200_000
+        assert provider.get_max_output_tokens("test-model") == 32_000
+
+    @pytest.mark.parametrize("registry_value", [None, "   "])
+    def test_returns_none_without_registry(
+        self,
+        registry_value: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if registry_value is None:
+            monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
+        else:
+            monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", registry_value)
+
+        provider = ClaudeCLIProvider()
+        assert provider.get_context_length("test-model") is None
+        assert provider.get_max_output_tokens("test-model") is None
+
+    def test_unknown_model_returns_none(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            "models:\n  known-model:\n    context_length: 200000\n    max_output_tokens: 32000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = ClaudeCLIProvider()
+        assert provider.get_context_length("unknown-model") is None
+        assert provider.get_max_output_tokens("unknown-model") is None
 
 
 class TestClaudeCLIProvider:
