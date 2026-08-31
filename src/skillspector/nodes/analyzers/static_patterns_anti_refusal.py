@@ -180,6 +180,12 @@ _AR2_DIRECT_INTENT_PATTERNS = (
     ),
     re.compile(r"\b(?:do\s+not|don'?t)\s+(?:apologize|apologise|say\s+sorry)\b", re.IGNORECASE),
 )
+# "never <do X> without warning(s)" mandates a warning rather than suppressing one.
+_AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
+    r"\b(?:never|do\s+not|don'?t)\b[^.;!?\n]{0,80}?\bwithout\s+(?:any\s+)?"
+    r"(?:warnings?|disclaimers?|caveats?)\b",
+    re.IGNORECASE,
+)
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
     r"""
     ^\s*(?:\[\])?\s+(?:field|key|property|array|list|entry)\b
@@ -370,6 +376,11 @@ def _is_schema_field_clause(
     return bool(_BENIGN_AR_SCHEMA_FIELD_PATTERN.search(continuation))
 
 
+def _is_negated_warning_mandate_clause(match_clause: str) -> bool:
+    """Return True when the clause reads 'never/do not/don't ... without warning(s)'."""
+    return bool(_AR2_NEGATED_WARNING_MANDATE_PATTERN.search(match_clause))
+
+
 def _is_benign_ar_context(
     match_line: str,
     match: str,
@@ -424,9 +435,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     line_match_end,
                     previous_line=previous_line,
                 )
+                negated_mandate = rule_id == "AR2" and _is_negated_warning_mandate_clause(
+                    match_clause
+                )
                 finding_tags = list(tag)
-                if security_review_context or example_context or benign_context:
+                if security_review_context or example_context or benign_context or negated_mandate:
                     finding_tags.extend(["contextual-triage", "likely-benign-context"])
+                # Zero confidence keeps a negated-mandate match visible in the report
+                # without it inflating the risk score (score skips confidence <= 0).
+                finding_confidence = 0.0 if negated_mandate else base_confidence
                 findings.append(
                     AnalyzerFinding(
                         rule_id=rule_id,
@@ -436,7 +453,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                             file=file_path,
                             start_line=line_num,
                         ),
-                        confidence=base_confidence,
+                        confidence=finding_confidence,
                         tags=finding_tags,
                         context=_emitted_context(
                             context,
