@@ -892,6 +892,39 @@ def test_build_context_parses_allowed_tools_comma_string(tmp_path: Path) -> None
     assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
 
 
+def test_build_context_parses_allowed_tools_space_string(tmp_path: Path) -> None:
+    """`allowed-tools` space-separated string form is normalized to a list."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: Bash Read\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
+
+
+def test_build_context_parses_allowed_tools_mixed_whitespace(tmp_path: Path) -> None:
+    """`allowed-tools` string with mixed whitespace (multiple spaces) is normalized."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: Bash  Read   Write\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash", "Read", "Write"]
+
+
+def test_build_context_parses_allowed_tools_single_space_string(tmp_path: Path) -> None:
+    """`allowed-tools` single tool as space-separated string yields one item."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: Bash\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash"]
+
+
 def test_build_context_reports_exclusion_boundary_without_descendants(tmp_path: Path) -> None:
     """Excluded directory trees produce one boundary record, not child records."""
     (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")

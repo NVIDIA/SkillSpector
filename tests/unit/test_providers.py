@@ -117,6 +117,8 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
@@ -400,6 +402,25 @@ class TestAnthropicProvider:
 
         assert "effort" not in captured
 
+    def test_temperature_is_forwarded_without_openai_seed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_anthropic(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(anthropic_provider_module, "ChatAnthropic", fake_chat_anthropic)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+
+        assert captured["temperature"] == 0.0
+        assert "seed" not in captured
+
     def test_create_chat_model_returns_none_without_key(self) -> None:
         # No ANTHROPIC_API_KEY → no client, signalling the caller to fall back.
         assert AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123) is None
@@ -549,6 +570,49 @@ class TestOpenAICompatibleConstructor:
         )
 
         assert captured["reasoning_effort"] == "provider-specific-value"
+
+    def test_sampling_controls_are_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", " 0.25 ")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["temperature"] == 0.25
+        assert captured["seed"] == 42
+
+    @pytest.mark.parametrize(
+        ("name", "value", "message"),
+        [
+            ("SKILLSPECTOR_TEMPERATURE", "warm", "must be a number"),
+            ("SKILLSPECTOR_TEMPERATURE", "1.1", "must be between 0 and 1"),
+            ("SKILLSPECTOR_SEED", "4.2", "must be an integer"),
+        ],
+    )
+    def test_invalid_sampling_control_fails_before_model_construction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+        message: str,
+    ) -> None:
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValueError, match=message):
+            create_openai_compatible_chat_model(
+                model="gpt-5.4",
+                credentials=("sk-x", "http://localhost:1234/v1"),
+                max_tokens=123,
+            )
 
 
 class TestProviderSelection:

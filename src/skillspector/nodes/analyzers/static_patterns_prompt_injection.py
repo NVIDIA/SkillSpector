@@ -20,13 +20,15 @@ from __future__ import annotations
 import fnmatch
 import re
 import sys
+from collections.abc import Iterator
 
+from skillspector.artifacts import _is_emoji_base
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
 from .pattern_defaults import PatternCategory
 from .whitespace_padding import (
     VERTICAL_HIGH_SEVERITY_LINES,
@@ -81,6 +83,12 @@ P2_PATTERNS = [
     (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
+_SINGLE_CHARACTER_P2_PATTERNS = frozenset(
+    {
+        _ZERO_WIDTH_PATTERN,
+        r"[\u202a-\u202e\u2066-\u2069]",
+    }
+)
 # P3: Exfiltration Commands
 P3_PATTERNS = [
     (
@@ -173,15 +181,6 @@ _EMOJI_MODIFIERS = range(0x1F3FB, 0x1F400)
 _VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
 
 
-def _is_emoji_base(ch: str) -> bool:
-    codepoint = ord(ch)
-    return (
-        0x1F000 <= codepoint <= 0x1FAFF
-        or 0x2600 <= codepoint <= 0x27BF
-        or codepoint in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D)
-    )
-
-
 def _previous_emoji_base(content: str, offset: int) -> bool:
     i = offset - 1
     while i >= 0 and (
@@ -207,6 +206,31 @@ def _zero_width_match_is_safe_emoji_zwj(content: str, offset: int) -> bool:
         and _previous_emoji_base(content, offset)
         and _next_emoji_base(content, offset)
     )
+
+
+def _p2_pattern_matches(content: str, pattern: str) -> Iterator[re.Match[str]]:
+    """Yield all structured matches or the first control signal on each line."""
+    compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
+        yield from compiled.finditer(content)
+        return
+
+    cursor = 0
+    while cursor < len(content):
+        match = compiled.search(content, cursor)
+        if match is None:
+            return
+        if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
+            content,
+            match.start(),
+        ):
+            cursor = match.end()
+            continue
+        yield match
+        line_break = LOGICAL_LINE_BREAK.search(content, match.end())
+        if line_break is None:
+            return
+        cursor = line_break.end()
 
 
 def _first_smuggled_tag_offset(content: str) -> int | None:
@@ -252,11 +276,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     if file_type in ("markdown", "other"):
         for pattern, confidence in P2_PATTERNS:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.DOTALL):
-                if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
-                    content, match.start()
-                ):
-                    continue
+            for match in _p2_pattern_matches(content, pattern):
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(

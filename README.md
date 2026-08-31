@@ -586,6 +586,8 @@ Issues (2)
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
 | `SKILLSPECTOR_REASONING_EFFORT` | Optional provider- and model-dependent reasoning-effort setting. Non-empty values are trimmed and passed through unchanged; unset or blank preserves provider-default behavior. | Optional |
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
+| `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. | Optional |
+| `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
 | `ANTHROPIC_BASE_URL` | Override the native Anthropic endpoint (default: `https://api.anthropic.com`). | Optional |
 | `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |

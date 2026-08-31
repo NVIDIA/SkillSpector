@@ -41,6 +41,8 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch):
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "SKILLSPECTOR_REASONING_EFFORT",
+        "SKILLSPECTOR_TEMPERATURE",
+        "SKILLSPECTOR_SEED",
         "ANTHROPIC_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
