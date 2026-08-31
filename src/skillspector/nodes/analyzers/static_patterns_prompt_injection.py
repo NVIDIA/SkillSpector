@@ -76,8 +76,22 @@ P1_PATTERNS = [
 # P2: Hidden Instructions. Build the character class from the shared P9
 # constant so hidden-instruction and padding detection cannot drift apart.
 _ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
+# Treat separators, lower-to-upper transitions, and acronym-to-PascalCase transitions as
+# identifier boundaries without matching keyword prefixes in ordinary alphanumeric words.
+_P2_IDENTIFIER_START = (
+    r"(?:(?<![^\W_])|(?<=(?-i:[a-z0-9]))(?=(?-i:[A-Z]))|(?<=(?-i:[A-Z]))(?=(?-i:[A-Z][a-z])))"
+)
+_P2_IDENTIFIER_END = (
+    r"(?:(?![^\W_])|(?<=(?-i:[a-z0-9]))(?=(?-i:[A-Z]))|(?<=(?-i:[A-Z]))(?=(?-i:[A-Z][a-z])))"
+)
 P2_PATTERNS = [
-    (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
+    (
+        rf"<!--(?:(?!--!?>).)*?{_P2_IDENTIFIER_START}"
+        r"(?:system|instructions?|ignore|POST|GET|send|transmit)"
+        rf"{_P2_IDENTIFIER_END}"
+        r"(?:(?!--!?>).)*?--!?>",
+        0.7,
+    ),
     (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
     (_ZERO_WIDTH_PATTERN, 0.6),
     (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
