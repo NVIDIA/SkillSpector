@@ -963,6 +963,7 @@ class TestReportNode:
                 for row in rows
             }
 
+        assert len(rows) == 2
         assert actual == {
             "scripts/build.sh": (
                 safe.finding_id,

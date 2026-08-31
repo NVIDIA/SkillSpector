@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from hashlib import sha256
 
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -50,7 +51,27 @@ def _finding_source_scope(finding: Finding) -> str:
     return ""
 
 
-def _classification_metadata_key(finding: Finding) -> tuple[object, ...]:
+def _evidence_metadata_key(finding: Finding) -> tuple[str, object]:
+    """Return a bounded, fail-closed identity for classification evidence."""
+    try:
+        canonical = json.dumps(
+            finding.evidence,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    except (RecursionError, TypeError, ValueError):
+        # ``Finding.evidence`` intentionally accepts arbitrary plugin metadata.
+        # Ambiguous values must never crash a scan or merge distinct findings.
+        return ("opaque", id(finding))
+    return ("sha256", sha256(canonical).digest())
+
+
+def classification_metadata_key(
+    finding: Finding,
+    *,
+    ignored_tags: frozenset[str] = frozenset(),
+) -> tuple[object, ...]:
     """Return the classification semantics compacted occurrences must share.
 
     Occurrence expansion reuses one representative finding's report fields.
@@ -60,12 +81,6 @@ def _classification_metadata_key(finding: Finding) -> tuple[object, ...]:
     location-specific context are intentionally excluded because compaction
     retains one highest-confidence representative for equivalent findings.
     """
-    evidence = json.dumps(
-        finding.evidence,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
     return (
         finding.message,
         finding.severity,
@@ -74,8 +89,8 @@ def _classification_metadata_key(finding: Finding) -> tuple[object, ...]:
         finding.explanation,
         finding.remediation,
         finding.intent,
-        tuple(sorted(finding.tags)),
-        evidence,
+        tuple(tag for tag in finding.tags if tag not in ignored_tags),
+        _evidence_metadata_key(finding),
     )
 
 
@@ -94,13 +109,18 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 source_scope,
                 finding.rule_id,
                 fingerprint,
-                _classification_metadata_key(finding),
+                classification_metadata_key(finding),
             ),
             [],
         ).append(finding)
 
     compacted: list[Finding] = []
-    for (_source_scope, _rule_id, fingerprint, _report_metadata), group in groups.items():
+    for (
+        _source_scope,
+        _rule_id,
+        fingerprint,
+        _classification_metadata,
+    ), group in groups.items():
         representative = max(
             group,
             key=lambda item: (

@@ -126,6 +126,46 @@ class TestSameFileDedup:
         assert len(result) == 1
         assert {item["file"] for item in result[0].occurrences} == {"a.py", "b.py"}
 
+    def test_evidence_mapping_order_does_not_change_dedup_identity(self) -> None:
+        first = _finding(file="a.py")
+        first.evidence = {"outer": {"a": 1, "b": [2, 3]}}
+        second = _finding(file="b.py")
+        second.evidence = {"outer": {"b": [2, 3], "a": 1}}
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 1
+
+    def test_tag_order_remains_report_metadata(self) -> None:
+        first = _finding(file="a.py")
+        first.tags = ["primary", "secondary"]
+        second = _finding(file="b.py")
+        second.tags = ["secondary", "primary"]
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
+    def test_non_json_evidence_fails_closed_without_raising(self) -> None:
+        first = _finding(file="a.py")
+        first.evidence = {"raw": b"same"}
+        second = _finding(file="b.py")
+        second.evidence = {"raw": b"same"}
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
+    def test_cyclic_evidence_fails_closed_without_raising(self) -> None:
+        first = _finding(file="a.py")
+        first.evidence["cycle"] = first.evidence
+        second = _finding(file="b.py")
+        second.evidence["cycle"] = second.evidence
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
     def test_same_line_benign_and_unsafe_matches_keep_local_classification(self) -> None:
         safe = _finding(rule_id="PE3", file="build.sh", matched_text="/etc/passwd")
         safe.tags = ["Privilege Escalation", "contextual-triage", "likely-benign-context"]
