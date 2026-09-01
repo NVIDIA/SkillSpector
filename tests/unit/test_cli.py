@@ -220,6 +220,33 @@ def test_cli_fail_on_incomplete_exits_one_after_writing_report(
     assert output.exists()
 
 
+def test_cli_fail_on_findings_exits_one_below_risk_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Active findings can gate automation even when aggregate risk remains low."""
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        "skillspector.cli.graph.invoke",
+        lambda state, config: {
+            "report_body": '{"issues": []}',
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": True},
+            "risk_score": 0,
+            "findings": [_finding("T1", "active finding")],
+            "filtered_findings": [_finding("T1", "active finding")],
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "-f", "json", "-o", str(output), "--fail-on-findings"],
+    )
+
+    assert result.exit_code == 1
+    assert output.exists()
+
+
 def test_recursive_scan_exits_two_after_writing_all_child_reports(tmp_path: Path) -> None:
     """Recursive mode aggregates child execution failures after producing output."""
     s1 = SkillDirectory(path=tmp_path / "one", name="one", relative_path="one")
@@ -912,6 +939,28 @@ def _bounded_recursive_result(label: str, *, finding_count: int = 1) -> dict[str
         "filtered_findings": findings,
         "suppressed_findings": [],
     }
+
+
+def test_recursive_fail_on_findings_exits_one_below_risk_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive scans gate on active child findings, not only aggregate score."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=[skill])
+    monkeypatch.setattr(
+        cli.graph, "invoke", lambda *_args, **_kwargs: _bounded_recursive_result("one")
+    )
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            detection,
+            FormatChoice.json,
+            None,
+            no_llm=True,
+            fail_on_findings=True,
+        )
+
+    assert exit_info.value.exit_code == 1
 
 
 def test_recursive_json_uses_one_global_public_record_budget(
