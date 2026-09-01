@@ -112,7 +112,6 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         assert provider in result.output
 
 
-
 def test_cli_help_does_not_initialize_analyzers() -> None:
     """Help should not compile the scan graph or warn about missing credentials."""
     env = os.environ.copy()
@@ -149,6 +148,7 @@ def test_package_graph_export_stays_lazy_after_first_load() -> None:
 
     assert later is first
     assert callable(later.invoke)
+
 
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
     """scan with local directory runs graph and prints report."""
