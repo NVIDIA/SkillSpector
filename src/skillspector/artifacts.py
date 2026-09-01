@@ -1700,6 +1700,99 @@ def compact_letter_view(text: str) -> SecurityTextView:
     return SecurityTextView("compact", output.getvalue(), offsets)
 
 
+def prompt_injection_letter_spacing_view(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+    *,
+    preserve_identifier_boundaries: bool = True,
+) -> SecurityTextView:
+    """Collapse ASCII-spaced tokens without inventing word boundaries.
+
+    The prompt-injection analyzer alone consumes this projection. Existing
+    multi-space word boundaries are retained verbatim, while one-space token
+    interiors are removed with exact raw offsets. A completely boundary-free
+    run therefore remains one condensed token and cannot acquire a guessed P3
+    or P4 segmentation. Identifier-adjacent runs are preserved for semantic
+    classification; artifact-integrity may opt into their projection solely to
+    produce an ambiguity finding.
+    """
+    if check_runtime is not None:
+        check_runtime()
+    processed_since_check = 0
+
+    def record_work(characters: int = 1) -> None:
+        nonlocal processed_since_check
+        if check_runtime is None:
+            return
+        processed_since_check += characters
+        if processed_since_check >= 4096:
+            check_runtime()
+            processed_since_check %= 4096
+
+    output = StringIO()
+    offsets = array("I")
+    transformed = False
+
+    def append_source(start: int, end: int) -> None:
+        for source_offset in range(start, end):
+            record_work()
+            output.write(text[source_offset])
+            offsets.append(source_offset)
+
+    cursor = 0
+    index = 0
+    while index < len(text):
+        record_work()
+        if (
+            text[index].isspace()
+            or index + 2 >= len(text)
+            or text[index + 1] != " "
+            or text[index + 2].isspace()
+        ):
+            index += 1
+            continue
+
+        run_start = index
+        run_end = index + 1
+        while run_end + 1 < len(text) and text[run_end] == " " and not text[run_end + 1].isspace():
+            run_end += 2
+            record_work(2)
+
+        # Do not rewrite a letter-spaced fragment embedded in an identifier.
+        # Advance past rejected runs too, so attacker-controlled near misses
+        # cannot force quadratic rescanning from every interior character.
+        left_identifier = run_start > 0 and (
+            text[run_start - 1].isascii()
+            and (text[run_start - 1].isalnum() or text[run_start - 1] == "_")
+        )
+        right_identifier = run_end < len(text) and (
+            text[run_end].isascii() and (text[run_end].isalnum() or text[run_end] == "_")
+        )
+        left_letter = (
+            run_start > 0 and text[run_start - 1].isascii() and text[run_start - 1].isalpha()
+        )
+        right_letter = run_end < len(text) and text[run_end].isascii() and text[run_end].isalpha()
+        boundary_is_safe = (
+            not left_identifier and not right_identifier
+            if preserve_identifier_boundaries
+            else not left_letter and not right_letter
+        )
+        if boundary_is_safe:
+            append_source(cursor, run_start)
+            for source_offset in range(run_start, run_end, 2):
+                record_work(2)
+                output.write(text[source_offset])
+                offsets.append(source_offset)
+            cursor = run_end
+            transformed = True
+        index = run_end
+
+    if not transformed:
+        return SecurityTextView("prompt-letter-spacing", text)
+    append_source(cursor, len(text))
+    return SecurityTextView("prompt-letter-spacing", output.getvalue(), offsets)
+
+
 def _requires_normalized_security_view(text: str) -> bool:
     """Return whether normalization can produce a distinct security view."""
     if _IGNORED_ASCII_CONTROL.search(text) is not None:
