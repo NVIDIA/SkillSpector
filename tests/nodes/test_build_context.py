@@ -202,9 +202,7 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
         ("not-a-number", DEFAULT_MAX_WORKFLOW_SECONDS),
     ],
 )
-def test_workflow_budget_seconds_environment_parsing(
-    value: str | None, expected: float
-) -> None:
+def test_workflow_budget_seconds_environment_parsing(value: str | None, expected: float) -> None:
     assert _workflow_max_seconds_from_environment(value) == expected
 
 
