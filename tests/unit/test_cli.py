@@ -878,7 +878,7 @@ def test_scan_multi_skill_json_stdout_is_machine_readable(
             transitive_allow_prefix=(),
             transitive_deny_prefix=(),
             yara_dir=None,
-            verbose=False,
+            verbose=True,
         )
 
     captured = capsys.readouterr()
@@ -889,7 +889,108 @@ def test_scan_multi_skill_json_stdout_is_machine_readable(
     assert "Scanning" not in captured.out
     assert "Multi-Skill Summary" not in captured.out
     assert "Scanning" in captured.err
+    assert "Running scan" in captured.err
     assert "Multi-Skill Summary" in captured.err
+
+
+def test_scan_multi_skill_json_stdout_survives_child_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A failed child still emits one parseable combined document before exit 2."""
+    skills = [
+        SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
+        for name in ("healthy", "broken")
+    ]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    healthy = {
+        "report_body": json.dumps({"issues": []}),
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+
+    with (
+        patch("skillspector.cli.graph.invoke", side_effect=[healthy, RuntimeError("boom")]),
+        pytest.raises(typer.Exit) as exit_info,
+    ):
+        _scan_multi_skill(detection, FormatChoice.json, None, no_llm=True)
+
+    assert exit_info.value.exit_code == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["execution_successful"] is False
+    assert payload["skills"][1] == {"name": "broken", "error": "boom"}
+    assert "Error: boom" in captured.err
+
+
+def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive fallback advisories stay off stdout when JSON is requested."""
+    monkeypatch.setattr(
+        cli,
+        "detect_skills",
+        lambda _path: MultiSkillDetectionResult(
+            is_multi_skill=False,
+            skills=[],
+            has_root_skill=False,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_scan_skill",
+        lambda **_kwargs: {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 0,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--recursive", "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"issues": []}
+    assert "Scanning as single" not in result.stdout
+    assert "Scanning as single" in result.stderr
+
+
+def test_json_multi_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The non-recursive multi-skill advisory stays off JSON stdout."""
+    skills = [
+        SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
+        for name in ("one", "two")
+    ]
+    monkeypatch.setattr(
+        cli,
+        "detect_skills",
+        lambda _path: MultiSkillDetectionResult(
+            is_multi_skill=True,
+            skills=skills,
+            has_root_skill=False,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_scan_skill",
+        lambda **_kwargs: {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 0,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"issues": []}
+    assert "Use --recursive" not in result.stdout
+    assert "Use --recursive" in result.stderr
 
 
 def test_recursive_detection_limit_reaches_canonical_incomplete_report(

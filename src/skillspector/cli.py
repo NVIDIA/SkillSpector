@@ -631,7 +631,7 @@ def scan(
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
                 "detected. Scanning as single skill."
             )
@@ -644,7 +644,7 @@ def scan(
                 "with a bounded scan and reporting partial coverage."
             )
         if detection.is_multi_skill:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
@@ -1864,7 +1864,9 @@ def _scan_skill(
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
     if verbose:
-        console.print("[dim]Running scan...[/dim]")
+        (err_console if format == FormatChoice.json else console).print(
+            "[dim]Running scan...[/dim]"
+        )
     logger.debug(
         "Scan started: input_path=%s, format=%s, use_llm=%s, transitive=%s",
         input_path,
