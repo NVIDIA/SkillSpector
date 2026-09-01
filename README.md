@@ -235,9 +235,13 @@ inference gateways.
 | `anthropic` | `ANTHROPIC_API_KEY` | api.anthropic.com | `claude-opus-4-6` |
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
 | `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
-| `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
+| `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `z-ai/glm-5.2` |
+| `ollama` | _(none)_ | `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`) | `llama3.1:8b` |
+| `azure_openai` | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | Azure OpenAI Service | `gpt-4o` (deployment defaults to the model label) |
+| `openai_compatible` | `SKILLSPECTOR_COMPAT_API_KEY` + `SKILLSPECTOR_COMPAT_BASE_URL` | Any OpenAI-compatible endpoint | `llama-3.1-70b-versatile` |
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
 
 ```bash
 # Stock OpenAI
@@ -286,11 +290,24 @@ skillspector scan ./my-skill/
 export SKILLSPECTOR_PROVIDER=codex_cli
 skillspector scan ./my-skill/
 
-# Local Ollama or any OpenAI-compatible endpoint
-export SKILLSPECTOR_PROVIDER=openai
-export OPENAI_API_KEY=ollama
-export OPENAI_BASE_URL=http://localhost:11434/v1
+# Local Ollama — no API key
+export SKILLSPECTOR_PROVIDER=ollama
+# export OLLAMA_BASE_URL=http://localhost:11434/v1  # shown default
 export SKILLSPECTOR_MODEL=llama3.1:8b
+skillspector scan ./my-skill/
+
+# Azure OpenAI
+export SKILLSPECTOR_PROVIDER=azure_openai
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_ENDPOINT=https://example.openai.azure.com/
+export AZURE_OPENAI_DEPLOYMENT=my-deployment
+skillspector scan ./my-skill/
+
+# Any other OpenAI-compatible endpoint
+export SKILLSPECTOR_PROVIDER=openai_compatible
+export SKILLSPECTOR_COMPAT_API_KEY=...
+export SKILLSPECTOR_COMPAT_BASE_URL=https://api.groq.com/openai/v1
+export SKILLSPECTOR_MODEL=llama-3.1-70b-versatile
 skillspector scan ./my-skill/
 
 # Override the provider's default model
@@ -580,7 +597,7 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Hosted providers use bundled `model_registry.yaml` defaults; `claude_cli` and `codex_cli` fall back to the local CLI runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `codex_cli`, or `gemini_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
@@ -595,11 +612,18 @@ Issues (2)
 | `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
 | `AWS_PROFILE` | Named AWS profile for the Bedrock provider — authenticates via SigV4 through boto3. When unset, the standard boto3 credential chain (env vars, instance metadata, SSO, etc.) resolves. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
 | `AWS_REGION` | AWS region for the Bedrock Runtime endpoint. Defaults to `us-west-2`. | Optional (used when `SKILLSPECTOR_PROVIDER=bedrock`) |
-| `SKILLSPECTOR_MODEL` | Override the active provider model. For hosted providers, this replaces the bundled default from the LLM Analysis table. For `claude_cli` and `codex_cli`, this is forwarded as `--model` instead of using the local CLI runtime fallback. | Optional |
+| `OLLAMA_BASE_URL` | Ollama OpenAI-compatible endpoint. Defaults to `http://localhost:11434/v1`. | Optional (used when `SKILLSPECTOR_PROVIDER=ollama`) |
+| `AZURE_OPENAI_API_KEY` | API key for the Azure OpenAI provider. | Required when `SKILLSPECTOR_PROVIDER=azure_openai` |
+| `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint for the Azure OpenAI provider. | Required when `SKILLSPECTOR_PROVIDER=azure_openai` |
+| `AZURE_OPENAI_DEPLOYMENT` | Azure deployment name. Defaults to the selected model label. | Optional |
+| `AZURE_OPENAI_API_VERSION` | Azure OpenAI API version. Defaults to `2024-06-01`. | Optional |
+| `SKILLSPECTOR_COMPAT_API_KEY` | API key for a generic OpenAI-compatible provider. | Required when `SKILLSPECTOR_PROVIDER=openai_compatible` |
+| `SKILLSPECTOR_COMPAT_BASE_URL` | Base URL for a generic OpenAI-compatible provider. | Required when `SKILLSPECTOR_PROVIDER=openai_compatible` |
+| `SKILLSPECTOR_MODEL` | Override the active provider model. For hosted providers, this replaces the bundled default from the LLM Analysis table. For CLI providers, this is forwarded as `--model` instead of using the local runtime fallback. | Optional |
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 
-> **CLI providers** (`claude_cli`, `codex_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session (`claude auth login` / `codex login`). SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run in a hardened sandbox: tools disabled, no MCP, read-only sandbox mode (codex), and untrusted skill content is delivered only via stdin.
+> **CLI providers** (`claude_cli`, `codex_cli`, `gemini_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 
 ### CLI Options
 
