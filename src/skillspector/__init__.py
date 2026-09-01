@@ -35,6 +35,7 @@ warnings.filterwarnings(
     category=Warning,
 )
 
+
 def create_graph() -> Any:
     """Build and return a new SkillSpector workflow graph."""
     from skillspector.graph import create_graph as build_graph

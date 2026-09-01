@@ -276,6 +276,7 @@ def test_package_graph_export_stays_lazy_after_first_load() -> None:
     assert later is first
     assert callable(later.invoke)
 
+
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
     """scan with local directory runs graph and prints report."""
     (tmp_path / "SKILL.md").write_text("---\nname: scan-test\n---\n# Safe", encoding="utf-8")
