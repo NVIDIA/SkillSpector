@@ -195,6 +195,7 @@ def test_plain_slash_separated_prose_is_not_a_reference(tmp_path: Path) -> None:
     ("source_text", "target_path"),
     [
         ("Read references/guide.md before continuing.", "references/guide.md"),
+        ("Read ./guide before continuing.", "guide"),
         ("Read ./references/guide before continuing.", "references/guide"),
     ],
 )
