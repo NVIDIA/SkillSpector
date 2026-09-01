@@ -39,7 +39,7 @@ class LazyGraph:
                     # Importing the submodule assigns it to the parent package.
                     # Restore the documented package-level lazy export before
                     # another caller imports it.
-                    setattr(sys.modules["skillspector"], "graph", graph)
+                    sys.modules["skillspector"].graph = graph
         return self._compiled
 
     def __getattr__(self, name: str) -> Any:
