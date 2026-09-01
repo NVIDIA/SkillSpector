@@ -211,3 +211,13 @@ When relevant analysis is incomplete:
 
 A low score or zero findings must not be interpreted as complete coverage when
 `analysis_completeness.is_complete` is false.
+
+
+## Configuring the aggregate workflow deadline
+
+The scanner limits one complete workflow to 60 seconds by default. Set
+`SKILLSPECTOR_MAX_WORKFLOW_SECONDS` to a positive finite number of seconds to
+raise that aggregate deadline for large skills. The setting applies to direct,
+CLI, recursive, and multi-skill scans; byte and artifact ceilings remain in
+effect. Invalid, zero, negative, infinite, or NaN values safely keep the
+60-second default.
