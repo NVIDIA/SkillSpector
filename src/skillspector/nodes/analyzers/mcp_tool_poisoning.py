@@ -79,6 +79,7 @@ TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
+TP4_MAX_MARKDOWN_BYTES = 32_768
 
 _CATEGORY = "MCP Tool Poisoning"
 
@@ -916,6 +917,77 @@ class _TP4CodeChunk:
     observed_characters: int = 0
 
 
+@dataclass(frozen=True)
+class _TP4Candidate:
+    """One executable file or accepted Markdown fence for TP4."""
+
+    path: str
+    language: str
+    content: str
+    start_line: int = 1
+    end_line: int = 1
+    source_path: str | None = None
+
+
+_TP4_MARKDOWN_TYPES = frozenset({"markdown", "text"})
+_TP4_MARKDOWN_EXECUTABLE_LABELS = {
+    "python": "python",
+    "py": "python",
+    "javascript": "javascript",
+    "js": "javascript",
+    "typescript": "typescript",
+    "ts": "typescript",
+    "shell": "shell",
+    "bash": "shell",
+    "sh": "shell",
+    "zsh": "shell",
+    "ruby": "ruby",
+    "rb": "ruby",
+    "go": "go",
+    "golang": "go",
+    "rust": "rust",
+    "rs": "rust",
+}
+_TP4_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*([^ \t]+)?[ \t]*$")
+_TP4_FENCE_CLOSE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
+
+
+def _extract_tp4_markdown_fences(
+    content: str,
+) -> list[tuple[str, str, int, int]]:
+    """Extract bounded, exactly labeled executable fences from Markdown/text."""
+    bounded, _, _ = _bounded_utf8_prefix(content, TP4_MAX_MARKDOWN_BYTES)
+    lines = bounded.splitlines(keepends=True)
+    accepted: list[tuple[str, str, int, int]] = []
+    active: tuple[str, int, str] | None = None
+    body: list[str] = []
+    body_start = 0
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.rstrip("\r\n")
+        if active is None:
+            opening = _TP4_FENCE_OPEN_RE.fullmatch(stripped)
+            if opening is None:
+                continue
+            delimiter, label = opening.groups()
+            active = (delimiter[0], len(delimiter), label.casefold() if label else "")
+            body = []
+            body_start = line_number + 1
+            continue
+
+        closing = _TP4_FENCE_CLOSE_RE.fullmatch(stripped)
+        if closing is not None:
+            delimiter, minimum_length, _label = active
+            if closing.group(1)[0] == delimiter and len(closing.group(1)) >= minimum_length:
+                language = _TP4_MARKDOWN_EXECUTABLE_LABELS.get(active[2])
+                if language is not None:
+                    accepted.append((language, "".join(body), body_start, line_number - 1))
+                active = None
+                body = []
+                continue
+        body.append(line)
+    return accepted
+
+
 @dataclass
 class _TP4CheckOutcome:
     """Bounded TP4 evidence, telemetry, and terminal work accounting."""
@@ -1140,8 +1212,62 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             and bool(content)
             and not content.isspace()
         ]
-        if not executable_paths:
-            return result
+        markdown_type_by_path = {
+            str(metadata.get("path")): str(metadata.get("type"))
+            for metadata in component_metadata
+            if isinstance(metadata, dict) and metadata.get("type") in _TP4_MARKDOWN_TYPES
+        }
+        candidates = [
+            _TP4Candidate(
+                path,
+                executable_type_by_path[path],
+                file_cache[path],
+                1,
+                max(1, file_cache[path].count("\n") + 1),
+            )
+            for path in executable_paths
+        ]
+        markdown_truncated_paths: list[str] = []
+        for path, content in file_cache.items():
+            if (
+                markdown_type_by_path.get(path) is None
+                or not isinstance(content, str)
+                or not content.strip()
+            ):
+                continue
+            _, _, overflow = _bounded_utf8_prefix(content, TP4_MAX_MARKDOWN_BYTES)
+            if overflow:
+                markdown_truncated_paths.append(path)
+            fences = [fence for fence in _extract_tp4_markdown_fences(content) if fence[1].strip()]
+            if not fences:
+                continue
+            if len(fences) == 1:
+                language, body, start_line, end_line = fences[0]
+                candidates.append(
+                    _TP4Candidate(
+                        f"{path}#fence-1",
+                        language,
+                        body,
+                        start_line,
+                        end_line,
+                        source_path=path,
+                    )
+                )
+                continue
+            parts = [
+                f"### {path}#fence-{index} ({language})\n{body}"
+                for index, (language, body, _start_line, _end_line) in enumerate(fences, start=1)
+            ]
+            candidates.append(
+                _TP4Candidate(
+                    f"{path}#fence-1",
+                    "markdown-fenced-code",
+                    "\n\n".join(parts),
+                    min(fence[2] for fence in fences),
+                    max(fence[3] for fence in fences),
+                    source_path=path,
+                )
+            )
 
         partial_paths: set[str] = set()
 
@@ -1150,6 +1276,19 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             if path not in partial_paths:
                 result.ledger.append(event)
                 partial_paths.add(path)
+
+        for path in markdown_truncated_paths:
+            add_partial_once(
+                _tp4_partial_event(
+                    path,
+                    LedgerReason.SIZE_LIMIT,
+                    observed_bytes=TP4_MAX_MARKDOWN_BYTES + 1,
+                    limit_bytes=TP4_MAX_MARKDOWN_BYTES,
+                )
+            )
+
+        if not candidates:
+            return result
 
         if declaration_truncated:
             add_partial_once(
@@ -1175,7 +1314,9 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
         retained_total_bytes = 0
         total_prompt_bytes = 0
         stop_planning = False
-        for path_index, path in enumerate(executable_paths):
+        for path_index, candidate in enumerate(candidates):
+            display_path = candidate.path
+            path = candidate.source_path or display_path
             dynamic_remaining = transitive_remaining_seconds(state)
             if dynamic_remaining is not None and dynamic_remaining <= 0:
                 add_partial_once(
@@ -1193,7 +1334,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     _tp4_partial_event(
                         path,
                         LedgerReason.ARTIFACT_COUNT_LIMIT,
-                        observed_artifacts=len(executable_paths),
+                        observed_artifacts=len(candidates),
                         limit_artifacts=TP4_MAX_FILES,
                     )
                 )
@@ -1222,7 +1363,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 stop_planning = True
                 continue
 
-            content = file_cache[path]
+            content = candidate.content
             file_limit = min(TP4_MAX_FILE_CODE_BYTES, remaining_total)
             retained, retained_bytes, file_truncated = _bounded_utf8_prefix(content, file_limit)
             retained_total_bytes += retained_bytes
@@ -1250,6 +1391,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 )
 
             for chunk in _tp4_line_chunks(retained, code_token_budget):
+                chunk_start_line = candidate.start_line + chunk.start_line - 1
+                chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
                 dynamic_remaining = transitive_remaining_seconds(state)
                 if dynamic_remaining is not None and dynamic_remaining <= 0:
                     add_partial_once(
@@ -1267,8 +1410,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         _tp4_partial_event(
                             path,
                             LedgerReason.SIZE_LIMIT,
-                            start_line=chunk.start_line,
-                            end_line=chunk.end_line,
+                            start_line=chunk_start_line,
+                            end_line=chunk_end_line,
                             observed_characters=chunk.observed_characters,
                             limit_characters=code_token_budget * 4,
                         )
@@ -1287,7 +1430,7 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     break
                 prompt = (
                     prefix
-                    + f"### {path} ({executable_type_by_path[path]})\n{chunk.content}"
+                    + f"### {display_path} ({candidate.language})\n{chunk.content}"
                     + _TP4_PROMPT_SUFFIX
                 )
                 if estimate_tokens(prompt) > batch_input_tokens:
@@ -1295,8 +1438,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         _tp4_partial_event(
                             path,
                             LedgerReason.SIZE_LIMIT,
-                            start_line=chunk.start_line,
-                            end_line=chunk.end_line,
+                            start_line=chunk_start_line,
+                            end_line=chunk_end_line,
                             observed_characters=len(prompt),
                             limit_characters=batch_input_tokens * 4,
                         )
@@ -1319,8 +1462,8 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     Batch(
                         file_path=path,
                         content=prompt,
-                        start_line=chunk.start_line,
-                        end_line=chunk.end_line,
+                        start_line=chunk_start_line,
+                        end_line=chunk_end_line,
                     )
                 )
 
