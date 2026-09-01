@@ -38,11 +38,13 @@ from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import (
+    DEFAULT_MAX_WORKFLOW_SECONDS,
     MAX_WORKFLOW_ARTIFACTS,
     MAX_WORKFLOW_BYTES,
     MAX_WORKFLOW_SECONDS,
     SkillspectorState,
     WorkflowResourceBudget,
+    _workflow_max_seconds_from_environment,
 )
 
 _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
@@ -186,6 +188,22 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
     assert budget.started_at is not None
     assert budget.scanned_bytes == len(payload)
     assert budget.scanned_artifacts == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("120", 120.0),
+        ("0.5", 0.5),
+        ("0", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("-1", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("nan", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("not-a-number", DEFAULT_MAX_WORKFLOW_SECONDS),
+    ],
+)
+def test_workflow_budget_seconds_environment_parsing(value: str | None, expected: float) -> None:
+    assert _workflow_max_seconds_from_environment(value) == expected
 
 
 def test_build_context_reuses_supplied_stricter_transitive_budget(tmp_path: Path) -> None:
