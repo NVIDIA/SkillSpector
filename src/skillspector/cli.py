@@ -44,7 +44,7 @@ from rich.tree import Tree
 from skillspector import __version__, transitive
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
-from skillspector.graph import graph
+from skillspector.graph_proxy import graph
 from skillspector.input_handler import validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
