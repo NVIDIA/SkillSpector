@@ -1575,6 +1575,15 @@ def _parse_manifest(
                 runtime_limit=runtime_limit,
             )
             return {}
+        while content.startswith("\ufeff"):
+            # decode_text() decodes with plain "utf-8", which never strips a
+            # leading byte-order mark (only "utf-8-sig" does), so a BOM-prefixed
+            # SKILL.md leaves content[0] == "\ufeff" and the delimiter check below
+            # silently sees {} instead of the frontmatter. Strip leading BOMs here,
+            # scoped to delimiter detection — decode_text() itself stays untouched
+            # because P2/TP1/P9 treat U+FEFF as a hidden-character injection signal
+            # in file bodies.
+            content = content[1:]
         if not content.startswith("---"):
             return {}
         end_match = re.search(r"\n---\s*\n", content[3:])

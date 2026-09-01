@@ -744,6 +744,55 @@ def test_build_context_skill_md_lowercase(tmp_path: Path) -> None:
     assert "references/guide.md" in result["components"]
 
 
+def test_build_context_parses_manifest_with_utf8_bom(tmp_path: Path) -> None:
+    """A leading UTF-8 BOM before the frontmatter delimiter must not blank the manifest.
+
+    Regression guard: ``decode_text()`` decodes with plain "utf-8", which does not
+    strip a leading byte-order mark (only "utf-8-sig" does), so
+    ``content[0] == "\\ufeff"`` and the naive ``content.startswith("---")`` check in
+    ``_parse_manifest`` used to fail silently, returning ``{}`` with no ledger record.
+    """
+    (tmp_path / "SKILL.md").write_bytes(
+        b"\xef\xbb\xbf---\nname: bom-skill\ndescription: has a leading BOM\n---\n# Skill\n"
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+
+    assert result["manifest"]["name"] == "bom-skill"
+    assert result["manifest"]["description"] == "has a leading BOM"
+
+
+def test_build_context_parses_manifest_without_bom_identically(tmp_path: Path) -> None:
+    """Regression guard: the BOM-free sibling of the fixture above parses identically."""
+    (tmp_path / "SKILL.md").write_bytes(
+        b"---\nname: bom-skill\ndescription: has a leading BOM\n---\n# Skill\n"
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+
+    assert result["manifest"]["name"] == "bom-skill"
+    assert result["manifest"]["description"] == "has a leading BOM"
+
+
+def test_build_context_parses_manifest_with_stacked_utf8_bom(tmp_path: Path) -> None:
+    """A doubled leading BOM must not reproduce the original silent ``{}`` manifest.
+
+    Regression guard: the single-strip fix (``if content.startswith("\\ufeff")``)
+    only removes one BOM, so ``content[0] == "\\ufeff"`` again after the strip and
+    ``content.startswith("---")`` still fails on a stacked BOM. ``_parse_manifest``
+    strips leading BOMs in a loop so repeated markers are all removed.
+    """
+    (tmp_path / "SKILL.md").write_bytes(
+        b"\xef\xbb\xbf\xef\xbb\xbf---\nname: stacked-bom-skill\ndescription: doubled BOM\n"
+        b"---\n# Skill\n"
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+
+    assert result["manifest"]["name"] == "stacked-bom-skill"
+    assert result["manifest"]["description"] == "doubled BOM"
+
+
 def test_build_context_parses_manifest_from_cached_snapshot_after_file_disappears(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
