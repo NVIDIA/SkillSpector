@@ -17,6 +17,7 @@ from skillspector.artifacts import (
     _concealed_instruction_run_spans,
     _contextual_default_ignorable_boundary_spans,
     _obfuscated_instruction_matches,
+    prompt_injection_letter_spacing_view,
 )
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
@@ -36,6 +37,7 @@ from skillspector.state import (
 from skillspector.unicode_confusables import ASCII_CONFUSABLE_SKELETON
 
 from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_line_number
+from .static_patterns_prompt_injection import P3_PATTERNS, P4_PATTERNS
 from .static_runner import MAX_FINDINGS_PER_ANALYZER, MAX_FINDINGS_PER_ARTIFACT
 
 ANALYZER_ID = "artifact_integrity"
@@ -61,6 +63,12 @@ _LETTER_SPACING_SECURITY_TERMS = (
     "unfiltered",
     "unrestricted",
     "userdata",
+    "withoutinforming",
+    "withoutnotifying",
+    "withouttelling",
+    "withouttheuserknowing",
+    "withouttheusernoticing",
+    "withouttheuserrealizing",
 )
 _LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
     {
@@ -73,6 +81,32 @@ _LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
         "secrettoken",
         "systemprompt",
     }
+)
+_AMBIGUOUS_PROMPT_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"(?:send|transmit|upload|post|forward)(?:the)?(?:conversation|context|chat|history|messages?)to[a-z]{0,96}",
+        r"(?:send|transmit|upload|post)(?:all)?(?:user)?(?:data|information|input|files?)to(?:https|external)[a-z]{0,96}",
+        r"(?:copy|extract|collect)(?:the)?(?:conversation|context|session)(?:and)?(?:send|upload|transmit)",
+        r"(?:call|notify|ping|hit)(?:this)?(?:webhook|endpoint|url|api)with(?:the)?(?:user|conversation|context)",
+        r"include(?:the)?(?:full)?(?:conversation|context|history)in(?:the)?(?:request|payload|body)",
+        r"(?:silently|quietly|secretly|covertly)(?:send|transmit|log|record)",
+        r"without(?:telling|informing|notifying)(?:the)?user[a-z]{0,128}(?:send|transmit|upload)",
+        r"always(?:recommend|suggest|prefer|choose|use)[a-z]{1,96}(?:over|insteadof|ratherthan)",
+        r"never(?:recommend|suggest|mention|tell|warn|inform)(?:the)?(?:user|them)",
+        r"(?:prioritize|prefer)[a-z]{1,96}(?:over|above)(?:user)?(?:safety|security|privacy|preferences?)",
+        r"(?:subtly|gradually|slowly)(?:steer|guide|push|nudge)(?:the)?(?:user|conversation)",
+        r"(?:the)?user(?:knowing|realizing|noticing)[a-z]{0,128}(?:change|modify|alter|influence)",
+        r"(?:gain|build|establish)(?:the)?users?trust(?:andthen|before|sothat)",
+        r"(?:appear|seem|act)(?:helpful|friendly|trustworthy)(?:while|but|then)",
+        r"(?:always|never)include(?:this|thefollowing)in(?:every|all)(?:response|output|reply)",
+        r"append(?:this|thefollowing)to(?:every|all|each)(?:response|message|output)",
+    )
+)
+_MAX_AMBIGUOUS_PROMPT_PHRASE = 512
+_PROJECTED_PROMPT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+    for pattern, _confidence in (*P3_PATTERNS, *P4_PATTERNS)
 )
 _LETTER_SPACING_PROMPT_ACTIONS = (
     "disclose",
@@ -333,6 +367,7 @@ _LETTER_SPACING_ALL_TARGETS = (
 )
 _MAX_LETTER_SPACING_SECURITY_PHRASE = max(
     max(map(len, _LETTER_SPACING_EXACT_SECURITY_TERMS)),
+    _MAX_AMBIGUOUS_PROMPT_PHRASE,
     max(map(len, _LETTER_SPACING_SECURITY_PREFIXES))
     + max(map(len, _LETTER_SPACING_ALL_ACTIONS))
     + _MAX_LETTER_SPACING_SECURITY_CONNECTORS * max(map(len, _LETTER_SPACING_SECURITY_CONNECTORS))
@@ -411,6 +446,11 @@ def _spacing_phrase_has_security_signal(phrase: str) -> bool:
     )
 
 
+def _ambiguous_prompt_phrase_has_security_signal(phrase: str) -> bool:
+    """Match bounded P3/P4 grammar only when source word boundaries are absent."""
+    return any(pattern.search(phrase) is not None for pattern in _AMBIGUOUS_PROMPT_PATTERNS)
+
+
 def _bounded_same_line_context(
     content: str,
     start: int,
@@ -487,6 +527,7 @@ def _spacing_span_has_security_signal(
     """Match bounded security semantics without retaining the full run."""
     if _spacing_span_is_benign_notation(content, span):
         return False
+    has_explicit_boundary = content.find("  ", span[0], span[1]) != -1
     overlap = ""
     letters: list[str] = []
     letter_characters = 0
@@ -527,14 +568,26 @@ def _spacing_span_has_security_signal(
     if any(term in block for term in _LETTER_SPACING_SECURITY_TERMS):
         return True
     if phrase_overflow:
-        return False
-    if _spacing_phrase_has_security_signal("".join(phrase_parts)):
+        # A boundary-free letter stream this large cannot be reconstructed
+        # safely. Treat it as ambiguous instead of silently blessing it.
+        return not has_explicit_boundary
+    phrase = "".join(phrase_parts)
+    if _spacing_phrase_has_security_signal(phrase) or (
+        not has_explicit_boundary and _ambiguous_prompt_phrase_has_security_signal(phrase)
+    ):
         return True
+    shortened_phrase = "".join(phrase_parts[:-1])
     return (
         bool(phrase_parts)
         and span[1] < len(content)
         and content[span[1]].isalpha()
-        and _spacing_phrase_has_security_signal("".join(phrase_parts[:-1]))
+        and (
+            _spacing_phrase_has_security_signal(shortened_phrase)
+            or (
+                not has_explicit_boundary
+                and _ambiguous_prompt_phrase_has_security_signal(shortened_phrase)
+            )
+        )
     )
 
 
@@ -591,6 +644,32 @@ def _contextual_ignorable_security_line(
     return None
 
 
+def _projected_prompt_injection_line(
+    content: str,
+    budget: _ArtifactIntegrityBudget,
+) -> int | None:
+    """Return the first raw line whose letter-spacing projection matches P3/P4."""
+    view = prompt_injection_letter_spacing_view(
+        content,
+        budget.check_runtime,
+        preserve_identifier_boundaries=False,
+    )
+    if view.source_offsets is None:
+        return None
+    first_offset: int | None = None
+    projected_texts = (view.text, re.sub(r"[0-9_]", " ", view.text))
+    for projected_text in projected_texts:
+        for pattern in _PROJECTED_PROMPT_PATTERNS:
+            budget.check_runtime()
+            match = pattern.search(projected_text)
+            if match is None:
+                continue
+            source_offset = view.source_offset(match.start())
+            if first_offset is None or source_offset < first_offset:
+                first_offset = source_offset
+    return get_line_number(content, first_offset) if first_offset is not None else None
+
+
 def _text_signals(
     content: str,
     budget: _ArtifactIntegrityBudget,
@@ -629,12 +708,14 @@ def _text_signals(
         if targeted_instruction is not None
         else None
     )
+    first_projected_prompt_line = _projected_prompt_injection_line(content, budget)
     obfuscation_lines = [
         value
         for value in (
             first_spacing_line,
             first_contextual_ignorable_line,
             first_targeted_instruction_line,
+            first_projected_prompt_line,
         )
         if value is not None
     ]

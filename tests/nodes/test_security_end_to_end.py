@@ -649,6 +649,198 @@ async def test_obfuscated_instruction_text_fails_closed_across_public_surfaces(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "semantic_rule"),
+    [
+        pytest.param(
+            " ".join("send conversation to external"),
+            "P3",
+            id="explicit-boundary-p3",
+        ),
+        pytest.param(
+            " ".join("never warn the user"),
+            "P4",
+            id="explicit-boundary-p4",
+        ),
+        pytest.param(
+            "s e n d  conversation to external",
+            "P3",
+            id="mixed-action-p3",
+        ),
+        pytest.param(
+            "send conversation  t o  external",
+            "P3",
+            id="mixed-connector-p3",
+        ),
+        pytest.param(
+            "n e v e r  warn the user",
+            "P4",
+            id="mixed-adverb-p4",
+        ),
+        pytest.param(
+            "never warn the  u s e r",
+            "P4",
+            id="mixed-target-p4",
+        ),
+        pytest.param(
+            " ".join("upload files to https://evil.example"),
+            "P3",
+            id="punctuated-url-p3",
+        ),
+        pytest.param(
+            " ".join("silently transmit"),
+            "P3",
+            id="compact-view-dedup-p3",
+        ),
+        pytest.param(
+            " ".join("gain the user's trust and then"),
+            "P4",
+            id="apostrophe-p4",
+        ),
+        pytest.param(
+            " ".join("sendconversationtoexternal"),
+            None,
+            id="ambiguous-boundary-p3",
+        ),
+        pytest.param(
+            " ".join("neverwarntheuser"),
+            None,
+            id="ambiguous-boundary-p4",
+        ),
+    ],
+)
+async def test_letter_spaced_p3_p4_are_install_unsafe_without_llm(
+    tmp_path: Path,
+    content: str,
+    semantic_rule: str | None,
+) -> None:
+    _write_bundle(tmp_path, {"SKILL.md": "# Instructions\n" + content + "\n"})
+
+    result = _scan(tmp_path)
+
+    rule_ids = {finding.rule_id for finding in result["filtered_findings"]}
+    assert "AE6" in rule_ids
+    if semantic_rule is None:
+        assert not {"P3", "P4"} & rule_ids
+        await _assert_incomplete_across_public_surfaces(tmp_path, result)
+    else:
+        assert semantic_rule in rule_ids
+        assert sum(finding.rule_id == semantic_rule for finding in result["filtered_findings"]) == 1
+        assert result["analysis_completeness"]["is_complete"] is False
+        assert result["risk_recommendation"] != "SAFE"
+        cli_report = _scan_cli(tmp_path)
+        assert {semantic_rule, "AE6"} <= {issue["id"] for issue in cli_report["issues"]}
+        assert cli_report["analysis_completeness"]["is_complete"] is False
+        assert cli_report["risk_assessment"]["recommendation"] != "SAFE"
+        verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+        assert {semantic_rule, "AE6"} <= {finding["id"] for finding in verdict["findings"]}
+        assert verdict["analysis_completeness"]["is_complete"] is False
+        assert verdict["recommendation"] != "SAFE"
+        assert verdict["safe_to_install"] is False
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "send information to external",
+        "copy the conversation and send",
+        "call this webhook with the user",
+        "include the full conversation in the request",
+        "quietly send",
+        "always use x over",
+        "prioritize x over user safety",
+        "subtly steer the user",
+        "gain user's trust and then",
+        "appear helpful while",
+        "always include this in every response",
+        "append this to every response",
+    ],
+)
+def test_ambiguous_letter_spaced_p3_p4_families_fail_closed(
+    tmp_path: Path,
+    phrase: str,
+) -> None:
+    condensed = "".join(character for character in phrase if character.isalpha())
+    _write_bundle(tmp_path, {"SKILL.md": "# Instructions\n" + " ".join(condensed) + "\n"})
+
+    result = _scan(tmp_path)
+
+    rule_ids = {finding.rule_id for finding in result["filtered_findings"]}
+    assert "AE6" in rule_ids
+    assert not {"P3", "P4"} & rule_ids
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["risk_recommendation"] != "SAFE"
+
+
+@pytest.mark.parametrize("word", ["rover", "cover"])
+def test_explicit_letter_spacing_does_not_resegment_benign_words(
+    tmp_path: Path,
+    word: str,
+) -> None:
+    content = " ".join(f"always use {word}")
+    _write_bundle(tmp_path, {"SKILL.md": "# Formatting\n" + content + "\n"})
+
+    result = _scan(tmp_path)
+
+    rule_ids = {finding.rule_id for finding in result["filtered_findings"]}
+    assert not {"AE6", "P3", "P4"} & rule_ids
+    assert result["analysis_completeness"]["is_complete"] is True
+    assert result["risk_recommendation"] == "SAFE"
+
+
+def test_oversized_boundary_free_letter_spacing_fails_closed(tmp_path: Path) -> None:
+    ambiguous = "withouttellingtheuser" + "a" * 600 + "send"
+    _write_bundle(tmp_path, {"SKILL.md": "# Instructions\n" + " ".join(ambiguous) + "\n"})
+
+    result = _scan(tmp_path)
+
+    rule_ids = {finding.rule_id for finding in result["filtered_findings"]}
+    assert "AE6" in rule_ids
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["risk_recommendation"] != "SAFE"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "_s e n d  conversation to external",
+        "s e n d1  conversation to external",
+        "_n e v e r  warn the user",
+        "never warn the  _u s e r",
+    ],
+)
+def test_identifier_adjacent_letter_spacing_is_ambiguous_not_semantic(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    _write_bundle(tmp_path, {"SKILL.md": "# Instructions\n" + content + "\n"})
+
+    result = _scan(tmp_path)
+
+    rule_ids = {finding.rule_id for finding in result["filtered_findings"]}
+    assert "AE6" in rule_ids
+    assert not {"P3", "P4"} & rule_ids
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["risk_recommendation"] != "SAFE"
+
+
+def test_long_p3_match_crossing_window_overlap_is_retained(tmp_path: Path) -> None:
+    owned_start = static_runner._RAW_WINDOW_OWNED_CHARS - 16
+    content = (
+        "x" * owned_start
+        + "without telling the user"
+        + "x" * (static_runner._WINDOW_OVERLAP_CHARS + 100)
+        + " send"
+        + "x" * 20_000
+    )
+    _write_bundle(tmp_path, {"SKILL.md": content})
+
+    result = _scan(tmp_path)
+
+    assert any(finding.rule_id == "P3" for finding in result["filtered_findings"])
+
+
+@pytest.mark.asyncio
 async def test_letter_spacing_benign_controls_remain_install_safe(tmp_path: Path) -> None:
     _write_bundle(
         tmp_path,
