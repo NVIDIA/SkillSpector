@@ -183,7 +183,8 @@ def test_plain_slash_separated_prose_is_not_a_reference(tmp_path: Path) -> None:
         tmp_path,
         source_path="SKILL.md",
         source_text=(
-            "Compare reads/writes, environment/profile settings, and operation/node behavior."
+            "Compare reads/writes, environment/profile settings, operation/node behavior, "
+            "and model/provider options."
         ),
         known_paths=["SKILL.md"],
     )
