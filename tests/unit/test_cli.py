@@ -841,6 +841,57 @@ def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
     assert "skills" in data
 
 
+def test_scan_multi_skill_json_stdout_is_machine_readable(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Recursive JSON without --output emits only the combined document to stdout."""
+    s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
+    s2 = SkillDirectory(path=tmp_path / "skill2", name="skill2", relative_path="skill2")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+    results = [
+        {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 10,
+            "risk_severity": "LOW",
+            "findings": [],
+        },
+        {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 20,
+            "risk_severity": "LOW",
+            "findings": [],
+        },
+    ]
+
+    with patch("skillspector.cli.graph.invoke", side_effect=results):
+        _scan_multi_skill(
+            detection,
+            FormatChoice.json,
+            None,
+            no_llm=True,
+            baseline=None,
+            show_suppressed=False,
+            transitive_enabled=False,
+            transitive_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            yara_dir=None,
+            verbose=False,
+        )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["multi_skill"] is True
+    assert payload["skill_count"] == 2
+    assert payload["max_risk_score"] == 20
+    assert "Scanning" not in captured.out
+    assert "Multi-Skill Summary" not in captured.out
+    assert "Scanning" in captured.err
+    assert "Multi-Skill Summary" in captured.err
+
+
 def test_recursive_detection_limit_reaches_canonical_incomplete_report(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
