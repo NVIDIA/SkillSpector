@@ -201,6 +201,7 @@ _CONCEALED_INSTRUCTION_CANDIDATE = re.compile(
     r"(?:[^\W\d_](?:[^\w]|_)+){5}[^\W\d_]",
     re.UNICODE,
 )
+_PROMPT_SPACED_PAIR = re.compile(r"(?<![A-Za-z])\S \S(?![A-Za-z])")
 _MIN_LETTER_SPACING_RUN_LETTERS = 6
 # Unicode 15.1.0 DerivedCoreProperties.txt: Default_Ignorable_Code_Point.
 _DEFAULT_IGNORABLE_RANGES = (
@@ -1718,6 +1719,8 @@ def prompt_injection_letter_spacing_view(
     """
     if check_runtime is not None:
         check_runtime()
+    if _PROMPT_SPACED_PAIR.search(text) is None:
+        return SecurityTextView("prompt-letter-spacing", text)
     processed_since_check = 0
 
     def record_work(characters: int = 1) -> None:

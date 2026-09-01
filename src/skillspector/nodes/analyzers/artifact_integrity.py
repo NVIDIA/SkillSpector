@@ -657,7 +657,12 @@ def _projected_prompt_injection_line(
     if view.source_offsets is None:
         return None
     first_offset: int | None = None
-    projected_texts = (view.text, re.sub(r"[0-9_]", " ", view.text))
+    identifier_relaxed_text = re.sub(r"[0-9_]", " ", view.text)
+    projected_texts = (
+        (view.text, identifier_relaxed_text)
+        if identifier_relaxed_text != view.text
+        else (view.text,)
+    )
     for projected_text in projected_texts:
         for pattern in _PROJECTED_PROMPT_PATTERNS:
             budget.check_runtime()
