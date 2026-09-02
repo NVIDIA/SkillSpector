@@ -24,6 +24,9 @@ def test_package_graph_export_survives_submodule_load() -> None:
     submodule = types.ModuleType("skillspector.graph")
     submodule.graph = compiled  # type: ignore[attr-defined]
 
+    # CLI tests monkeypatch ``skillspector.cli.graph.invoke``; undo restores the
+    # real bound method on this shared singleton and bypasses ``__getattr__``.
+    lazy_graph.__dict__.pop("invoke", None)
     lazy_graph._compiled = compiled
     skillspector.graph = lazy_graph
 
