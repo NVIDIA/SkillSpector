@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import skillspector
-from skillspector.graph_proxy import LazyGraph, graph as lazy_graph
+from skillspector.graph_proxy import LazyGraph
+from skillspector.graph_proxy import graph as lazy_graph
 
 
 def test_package_graph_export_survives_submodule_load() -> None:
@@ -24,8 +27,11 @@ def test_package_graph_export_survives_submodule_load() -> None:
     submodule.graph = compiled  # type: ignore[attr-defined]
 
     lazy_graph._compiled = None  # noqa: SLF001 — reset lazy singleton for test
-    sys.modules["skillspector.graph"] = submodule
+    sys.modules.pop("skillspector.graph", None)
+    importlib.invalidate_caches()
 
-    assert lazy_graph.invoke({"ok": True}) == {"ok": True}
+    with patch.dict(sys.modules, {"skillspector.graph": submodule}):
+        assert lazy_graph.invoke({"ok": True}) == {"ok": True}
+
     assert isinstance(skillspector.graph, LazyGraph)
     assert skillspector.graph.invoke({"again": 1}) == {"again": 1}
