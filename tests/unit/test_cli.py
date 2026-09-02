@@ -17,7 +17,9 @@
 
 import ast
 import json
+import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
@@ -108,6 +110,44 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         "gemini_cli",
     ):
         assert provider in result.output
+
+
+def test_cli_help_does_not_initialize_analyzers() -> None:
+    """Help should not compile the scan graph or warn about missing credentials."""
+    env = os.environ.copy()
+    env["SKILLSPECTOR_PROVIDER"] = "nv_build"
+    for name in ("ANTHROPIC_API_KEY", "NVIDIA_INFERENCE_KEY", "OPENAI_API_KEY"):
+        env.pop(name, None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from skillspector.cli import app; app()",
+            "--help",
+        ],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == 0
+    assert "Usage:" in completed.stdout
+    assert "Skipping analyzer" not in completed.stderr
+
+
+def test_package_graph_export_stays_lazy_after_first_load() -> None:
+    """The package export must not be replaced by the graph submodule."""
+    from skillspector import graph as first
+
+    assert first._get_compiled() is not None
+
+    from skillspector import graph as later
+
+    assert later is first
+    assert callable(later.invoke)
 
 
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
