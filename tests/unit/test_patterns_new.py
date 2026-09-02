@@ -260,6 +260,21 @@ class TestExcessiveAgency:
             "selection_key": key,
         }
 
+    def test_ea5_frontmatter_pin_detected_through_leading_bom(self) -> None:
+        """A BOM-prefixed SKILL.md must not hide the frontmatter model pin."""
+        content = "\ufeff---\nname: example\nmodel: claude-sonnet-4-6\n---\n\n# Example\n"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.MEDIUM
+        # The BOM is matched, not stripped, so offsets still index the original
+        # content and the reported line matches the no-BOM case exactly.
+        assert ea5[0].location.start_line == 3
+        assert ea5[0].evidence == {
+            "selection_surface": "frontmatter",
+            "selection_key": "model",
+        }
+
     def test_ea5_only_matches_top_level_skill_frontmatter(self) -> None:
         content = (
             "---\n"
