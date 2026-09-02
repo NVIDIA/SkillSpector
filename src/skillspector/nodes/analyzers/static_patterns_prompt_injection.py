@@ -79,6 +79,10 @@ _ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
 # Bidirectional control characters (Trojan Source, CVE-2021-42574). Evaluated
 # unconditionally below, NOT in the markdown-gated P2_PATTERNS list -- see the
 # comment at that check for why.
+# The class is the 9 paired controls only. The direction marks U+200E/U+200F/
+# U+061C are deliberately excluded: they cannot reorder a span the way the
+# paired controls can, which is the same line GCC's -Wbidi-chars draws by
+# default. Do not add them here without revisiting that tradeoff.
 _BIDI_CONTROL_PATTERN = r"[\u202a-\u202e\u2066-\u2069]"
 P2_PATTERNS = [
     (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
