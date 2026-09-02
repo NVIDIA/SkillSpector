@@ -128,6 +128,32 @@ class TestDetectSkills:
         names = {s.name for s in result.skills}
         assert names == {"weather-lookup", "email-sender", "file-manager"}
 
+    def test_skill_name_extracted_from_bom_prefixed_frontmatter(self, tmp_path: Path) -> None:
+        """A BOM-prefixed sub-skill resolves to its declared `name:`, not the directory name.
+
+        Regression guard: `_extract_skill_name` sniffs raw bytes for a leading
+        `b"---"` before decoding. A UTF-8 BOM (`b"\\xef\\xbb\\xbf"`) in front of that
+        delimiter used to defeat the sniff and silently fall back to `skill_dir.name`
+        instead of the frontmatter's declared name.
+        """
+        clean_dir = tmp_path / "clean-skill"
+        clean_dir.mkdir()
+        (clean_dir / "SKILL.md").write_bytes(
+            b"---\nname: clean-declared-name\ndescription: no BOM\n---\n# Clean\n"
+        )
+
+        bom_dir = tmp_path / "bom-dir-name"
+        bom_dir.mkdir()
+        (bom_dir / "SKILL.md").write_bytes(
+            b"\xef\xbb\xbf---\nname: bom-declared-name\ndescription: has a BOM\n---\n# BOM\n"
+        )
+
+        result = detect_skills(tmp_path)
+
+        names = {s.relative_path: s.name for s in result.skills}
+        assert names["clean-skill"] == "clean-declared-name"
+        assert names["bom-dir-name"] == "bom-declared-name"
+
     def test_structured_skill_subdir_detected(self, tmp_path: Path) -> None:
         """An immediate subdirectory with a valid AISOP/AISP bundle is detected."""
         sub = tmp_path / "workflow-bundle"
