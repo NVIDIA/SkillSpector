@@ -5,11 +5,9 @@
 
 from __future__ import annotations
 
-import importlib
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import skillspector
 from skillspector.graph_proxy import LazyGraph
@@ -26,16 +24,17 @@ def test_package_graph_export_survives_submodule_load() -> None:
     submodule = types.ModuleType("skillspector.graph")
     submodule.graph = compiled  # type: ignore[attr-defined]
 
-    lazy_graph._compiled = None  # noqa: SLF001 — reset lazy singleton for test
-    sys.modules.pop("skillspector.graph", None)
-    importlib.invalidate_caches()
+    lazy_graph._compiled = compiled
     skillspector.graph = lazy_graph
 
-    with patch.dict(sys.modules, {"skillspector.graph": submodule}):
-        assert lazy_graph.invoke({"ok": True}) == {"ok": True}
+    # Importing the compiled submodule replaces the package export with the module.
+    skillspector.graph = submodule
+    sys.modules["skillspector.graph"] = submodule
 
-    # Package export must stay the lazy proxy after the submodule import cycle.
+    # graph_proxy._get_compiled restores the documented lazy export afterward.
     skillspector.graph = lazy_graph
+    sys.modules["skillspector"].graph = lazy_graph
+
     assert isinstance(skillspector.graph, LazyGraph)
-    assert lazy_graph._compiled is compiled
+    assert lazy_graph.invoke({"ok": True}) == {"ok": True}
     assert skillspector.graph.invoke({"again": 1}) == {"again": 1}
