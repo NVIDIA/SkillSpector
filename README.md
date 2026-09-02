@@ -24,7 +24,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **71 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **74 vulnerability patterns** across 18 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, agent snooping, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
@@ -354,7 +354,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **71 vulnerability patterns** across 17 categories:
+SkillSpector detects **74 vulnerability patterns** across 18 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -453,6 +453,14 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 |----|---------|----------|-------------|
 | RA1 | Self-Modification | CRITICAL | Modifying own code or configuration at runtime |
 | RA2 | Session Persistence | HIGH | Unauthorized persistence via cron jobs or startup scripts |
+
+### Agent Snooping (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| AS1 | Agent Config Directory Access | HIGH | Reading `.claude/`, `.codex/`, `.gemini/`, or `.continue/` directories, exposing API keys, system prompts, and custom instructions stored there |
+| AS2 | MCP Config File Access | HIGH | Reading `mcp.json` / `mcp_config.json`, exposing MCP server endpoints and authentication tokens |
+| AS3 | Skill Enumeration | MEDIUM | Listing or reading other skills' source files to learn the full tool surface of the agent |
 
 ### Trigger Abuse (3 patterns)
 
