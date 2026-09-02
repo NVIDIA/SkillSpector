@@ -16,7 +16,7 @@ import pytest
 
 from skillspector.artifacts import ArtifactDisposition, ContentKind
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.nested_artifacts import inspect_nested_artifacts
+from skillspector.nested_artifacts import inspect_nested_artifacts, is_executable_content
 from skillspector.nodes.analyzers.static_patterns_supply_chain import (
     _analyze_concealed_executables,
 )
@@ -828,3 +828,22 @@ def test_reserved_virtual_delimiter_cannot_collide_with_recursive_provenance(
         event.get("reason_code") == LedgerReason.ARCHIVE_UNSAFE_MEMBER_PATH
         for event in result.ledger_events
     )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [".cjs", ".cts", ".jsx", ".mjs", ".mts", ".tsx", ".php", ".phtml", ".rake"],
+)
+def test_analyzer_recognized_script_suffixes_classify_as_executable(suffix: str) -> None:
+    assert is_executable_content("helper" + suffix, b"payload without a shebang") is True
+
+
+def test_hidden_standalone_esm_script_has_sc9_and_stays_local(tmp_path: Path) -> None:
+    (tmp_path / ".setup.mjs").write_text('import cp from "child_process";', encoding="utf-8")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    assert ".setup.mjs" in context["components"]
+    assert len(findings) == 1
+    assert findings[0].file == ".setup.mjs"
