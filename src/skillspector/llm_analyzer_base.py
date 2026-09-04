@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -39,6 +41,7 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
@@ -69,10 +72,45 @@ STRUCTURED_RESPONSE_MAX_RETRIES = 3
 STRUCTURED_RESPONSE_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_RETRIES + 1
 STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS = API_CONNECTION_RETRY_DELAYS_SECONDS
 LLM_BATCH_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_RETRIES
+OUTPUT_LANGUAGE_MAX_LENGTH = 64
+
+
+def resolve_output_language() -> str | None:
+    """Return the configured language for human-readable LLM finding text."""
+    raw_language = os.environ.get("SKILLSPECTOR_OUTPUT_LANGUAGE", "")
+    language = raw_language.strip()
+    if not language:
+        return None
+    if (
+        "\r" in raw_language
+        or "\n" in raw_language
+        or len(language) > OUTPUT_LANGUAGE_MAX_LENGTH
+        or not all(character.isalnum() or character in " -_" for character in language)
+    ):
+        return None
+    return language
+
+
+def append_output_language_instruction(prompt: str) -> str:
+    """Append the optional output-language contract to an analyzer prompt."""
+    language = resolve_output_language()
+    if language is None:
+        return prompt
+    return (
+        f"{prompt}\n\n## Output language\n\n"
+        "Write human-readable finding text (including message, finding, explanation, "
+        f"remediation, and intent fields when present) in {language}. Keep rule IDs, "
+        "severity values, categories, file paths, code, and other machine-readable values "
+        "unchanged."
+    )
 
 
 class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
+
+
+class LLMRuntimeLimitError(RuntimeError):
+    """Signal that no shared scan time remains for an LLM operation."""
 
 
 def _is_retryable_api_connection_error(exc: BaseException) -> bool:
@@ -80,17 +118,139 @@ def _is_retryable_api_connection_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "APIConnectionError"
 
 
-def _uses_native_connection_retries(chat_model: object) -> bool:
-    """Set the common native retry budget and report whether it is available."""
+def _uses_native_connection_retries(
+    chat_model: object,
+    *,
+    max_retries: int = API_CONNECTION_MAX_RETRIES,
+) -> bool:
+    """Set the native retry budget and report whether native retries remain enabled."""
     if isinstance(chat_model, ChatOpenAI):
         for client in (chat_model.root_client, chat_model.root_async_client):
             if client is not None:
-                client.max_retries = API_CONNECTION_MAX_RETRIES
-        return True
+                client.max_retries = max_retries
+        return max_retries > 0
     if isinstance(chat_model, ChatAnthropic):
-        chat_model.max_retries = API_CONNECTION_MAX_RETRIES
-        return True
+        chat_model.max_retries = max_retries
+        return max_retries > 0
     return False
+
+
+# ONE BUDGET FOR THE PROCESS, AND IT CANNOT BE AN asyncio.Semaphore.
+#
+# The analyzers are separate graph nodes and each node is a *synchronous* function: it reaches
+# ``run_async()``, which calls ``asyncio.run()`` — and, when a loop is already running, does so on
+# a fresh thread. Every analyzer therefore gets its own event loop. An ``asyncio.Semaphore`` is
+# bound to the loop that created it, so one semaphore per loop is one semaphore per analyzer, and
+# the process still puts N x limit requests on the wire. That is the burst
+# ``SKILLSPECTOR_MAX_LLM_CONCURRENCY`` exists to prevent: users set it to 1 on a free tier
+# precisely because a burst guarantees 429s, and 429'd batches are dropped from the result.
+#
+# So the permits live outside asyncio, under a plain lock, and each waiter parks on a future
+# belonging to *its own* loop. Releasing hands the permit to the next waiter through that loop's
+# ``call_soon_threadsafe``, which is the one asyncio primitive that is safe to call from another
+# thread. Nothing blocks a worker thread while it waits, which rules out the obvious alternative
+# of wrapping a ``threading.Semaphore`` in ``run_in_executor``: that pins one thread per queued
+# request, and the queue is exactly as long as the fan-out this is meant to bound.
+class _Handover:
+    """One queued waiter, plus the fact of whether the permit was already given to it.
+
+    ``granted`` is the whole point. A permit changes hands in two steps — taken out of the queue
+    here, delivered by ``_settle`` on the waiter's own loop — and the waiter can be cancelled
+    between them. Asking the future what happened cannot answer that question: a cancelled future
+    looks exactly like one that was never chosen. So the transfer is recorded explicitly, under
+    the same lock that performs it.
+    """
+
+    __slots__ = ("future", "granted", "loop")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, future: asyncio.Future) -> None:
+        self.loop = loop
+        self.future = future
+        self.granted = False
+
+
+class _GlobalLLMLimiter:
+    """A permit counter shared by every event loop and thread in the process."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, limit)
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        # Arrival order. FIFO, so a late analyzer is not starved by an early one that keeps
+        # re-acquiring.
+        self._waiters: deque[_Handover] = deque()
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._in_flight < self._limit:
+                self._in_flight += 1
+                return
+            handover = _Handover(loop, loop.create_future())
+            self._waiters.append(handover)
+        try:
+            await handover.future
+        except BaseException:
+            # Cancelled or timed out while queued. Leaving the waiter in the deque would let a
+            # later release() hand a permit to a coroutine that is already gone, and the permit
+            # would never come back.
+            with self._lock:
+                try:
+                    self._waiters.remove(handover)
+                except ValueError:
+                    pass  # already taken out of the queue: the handover was in flight
+                granted = handover.granted
+            if granted:
+                # The permit was handed to us and nobody will use it — whether the callback has
+                # run yet or is still queued on this loop. Pass it on rather than leak it.
+                self.release()
+            raise
+
+    def release(self) -> None:
+        with self._lock:
+            while self._waiters:
+                handover = self._waiters.popleft()
+                if handover.future.cancelled():
+                    continue
+                try:
+                    # The permit is transferred, not returned: _in_flight stays as it is.
+                    handover.granted = True
+                    handover.loop.call_soon_threadsafe(_settle, handover.future)
+                except RuntimeError:
+                    # That loop is closed — its waiter can never run. Try the next one.
+                    handover.granted = False
+                    continue
+                return
+            self._in_flight = max(0, self._in_flight - 1)
+
+    async def __aenter__(self) -> _GlobalLLMLimiter:
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self.release()
+
+
+def _settle(waiter: asyncio.Future) -> None:
+    """Resolve a queued waiter, unless it went away between the handover and the callback."""
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+# Keyed by the resolved limit, not shared blindly: a caller that resolves a different value gets
+# its own budget instead of silently resizing one that other coroutines are holding permits from.
+_limiters: dict[int, _GlobalLLMLimiter] = {}
+_limiters_lock = threading.Lock()
+
+
+def _shared_limiter(limit: int) -> _GlobalLLMLimiter:
+    """Return the process-wide limiter for *limit*."""
+    with _limiters_lock:
+        limiter = _limiters.get(limit)
+        if limiter is None:
+            limiter = _GlobalLLMLimiter(limit)
+            _limiters[limit] = limiter
+        return limiter
 
 
 def resolve_max_concurrency() -> int:
@@ -98,7 +258,7 @@ def resolve_max_concurrency() -> int:
 
     Defaults to :data:`DEFAULT_MAX_LLM_CONCURRENCY`. Users on rate-limited
     providers (free tiers with a low RPM) can set it to ``1`` to serialize
-    requests instead of bursting up to 10 in parallel — a burst that otherwise
+    requests across every analyzer instead of bursting up to 10 in parallel — a burst that otherwise
     guarantees 429s, and 429'd batches are dropped from the result (see the
     analyzer fan-out below). Invalid values fall back to the default; values
     below 1 are clamped to 1.
@@ -321,7 +481,11 @@ def ledger_events_for_batches(
                 events.append(
                     ledger_event(
                         analyzer_id=analyzer_id,
-                        outcome=outcome_for_llm_batch_failure(failure.reason),
+                        outcome=(
+                            LedgerOutcome.PARTIAL
+                            if failure.reason is LedgerReason.RUNTIME_LIMIT
+                            else outcome_for_llm_batch_failure(failure.reason)
+                        ),
                         phase="semantic",
                         path=path,
                         start_line=start_line,
@@ -464,12 +628,28 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
 
-    def __init__(self, base_prompt: str, model: str, *, node: str = "llm_analyzer"):
+    def __init__(
+        self,
+        base_prompt: str,
+        model: str,
+        *,
+        node: str = "llm_analyzer",
+        timeout: float | None | Callable[[], float | None] = None,
+    ):
         self.base_prompt = base_prompt
         self.model = model
+        self._timeout = timeout
+        self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model)
-        self._uses_native_connection_retries = _uses_native_connection_retries(self._llm)
+        self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        # Native SDK retries cannot re-read a workflow-wide deadline between
+        # attempts.  A dynamic deadline therefore uses our explicit retry loop,
+        # which checks and caps every retry/backoff against remaining time.
+        native_retries = 0 if self._dynamic_timeout else API_CONNECTION_MAX_RETRIES
+        self._uses_native_connection_retries = _uses_native_connection_retries(
+            self._llm,
+            max_retries=native_retries,
+        )
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
@@ -480,8 +660,45 @@ class LLMAnalyzerBase:
             chat_model=self._llm,
         )
 
+    def _remaining_timeout(self) -> float | None:
+        if callable(self._timeout):
+            remaining = self._timeout()
+        else:
+            remaining = self._timeout
+        if remaining is None:
+            return None
+        return max(0.0, float(remaining))
+
+    def _require_time_remaining(self) -> float | None:
+        """Return the current provider timeout or fail before starting work."""
+        remaining = self._remaining_timeout()
+        if remaining is not None and remaining <= 0:
+            raise LLMRuntimeLimitError("shared scan runtime limit reached")
+        return remaining
+
+    def _sleep_before_retry(self, delay: float) -> None:
+        """Sleep no longer than the current shared deadline permits."""
+        remaining = self._require_time_remaining()
+        time.sleep(delay if remaining is None else min(delay, remaining))
+
+    async def _asleep_before_retry(self, delay: float) -> None:
+        """Asynchronously sleep no longer than the shared deadline permits."""
+        remaining = self._require_time_remaining()
+        await asyncio.sleep(delay if remaining is None else min(delay, remaining))
+
+    def _model_for_call(self) -> tuple[object, object | None]:
+        remaining = self._require_time_remaining()
+        if not self._dynamic_timeout:
+            return self._llm, self._structured_llm
+        llm = get_chat_model(model=self.model, timeout=remaining)
+        _uses_native_connection_retries(llm, max_retries=0)
+        structured = (
+            llm.with_structured_output(self.response_schema) if self.response_schema else None
+        )
+        return llm, structured
+
     @property
-    def inference_usage(self) -> list[dict[str, object]]:
+    def inference_usage(self) -> list[InferenceUsageRecord]:
         """Provider-reported usage captured for this analyzer instance."""
         return list(self._usage_collector.snapshot())
 
@@ -556,10 +773,12 @@ class LLMAnalyzerBase:
         Override in subclasses that need a custom prompt layout.
         """
         numbered = number_lines(batch.content, batch.start_line)
-        return BASE_ANALYSIS_PROMPT.format(
-            analyzer_prompt=self.base_prompt,
-            file_label=batch.file_label,
-            numbered_content=numbered,
+        return append_output_language_instruction(
+            BASE_ANALYSIS_PROMPT.format(
+                analyzer_prompt=self.base_prompt,
+                file_label=batch.file_label,
+                numbered_content=numbered,
+            )
         )
 
     def parse_response(self, response: object, batch: Batch) -> list[Finding]:
@@ -585,15 +804,14 @@ class LLMAnalyzerBase:
             estimate_tokens(prompt),
             len(batch.findings),
         )
-        if self._structured_llm:
+        llm, structured_llm = self._model_for_call()
+        if structured_llm:
             try:
-                response = _invoke_with_usage(self._structured_llm, prompt, self._usage_collector)
+                response = _invoke_with_usage(structured_llm, prompt, self._usage_collector)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
-            response = _raw_response_text(
-                _invoke_with_usage(self._llm, prompt, self._usage_collector)
-            )
+            response = _raw_response_text(_invoke_with_usage(llm, prompt, self._usage_collector))
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
@@ -609,6 +827,7 @@ class LLMAnalyzerBase:
                     structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS[structured_retries]
                 structured_retries += 1
@@ -619,7 +838,9 @@ class LLMAnalyzerBase:
                     structured_retries,
                     STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
-                time.sleep(delay)
+                self._sleep_before_retry(delay)
+            except LLMRuntimeLimitError:
+                raise
             except Exception as exc:
                 if (
                     not _is_retryable_api_connection_error(exc)
@@ -627,6 +848,7 @@ class LLMAnalyzerBase:
                     or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
                 connection_retries += 1
@@ -637,7 +859,7 @@ class LLMAnalyzerBase:
                     connection_retries,
                     API_CONNECTION_MAX_RETRIES,
                 )
-                time.sleep(delay)
+                self._sleep_before_retry(delay)
 
         raise AssertionError("bounded retry loop must return or raise")
 
@@ -649,16 +871,15 @@ class LLMAnalyzerBase:
             estimate_tokens(prompt),
             len(batch.findings),
         )
-        if self._structured_llm:
+        llm, structured_llm = self._model_for_call()
+        if structured_llm:
             try:
-                response = await _ainvoke_with_usage(
-                    self._structured_llm, prompt, self._usage_collector
-                )
+                response = await _ainvoke_with_usage(structured_llm, prompt, self._usage_collector)
             except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
             response = _raw_response_text(
-                await _ainvoke_with_usage(self._llm, prompt, self._usage_collector)
+                await _ainvoke_with_usage(llm, prompt, self._usage_collector)
             )
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
@@ -675,6 +896,7 @@ class LLMAnalyzerBase:
                     structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS[structured_retries]
                 structured_retries += 1
@@ -685,7 +907,9 @@ class LLMAnalyzerBase:
                     structured_retries,
                     STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
-                await asyncio.sleep(delay)
+                await self._asleep_before_retry(delay)
+            except LLMRuntimeLimitError:
+                raise
             except Exception as exc:
                 if (
                     not _is_retryable_api_connection_error(exc)
@@ -693,6 +917,7 @@ class LLMAnalyzerBase:
                     or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
+                    self._require_time_remaining()
                     raise
                 delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
                 connection_retries += 1
@@ -703,7 +928,7 @@ class LLMAnalyzerBase:
                     connection_retries,
                     API_CONNECTION_MAX_RETRIES,
                 )
-                await asyncio.sleep(delay)
+                await self._asleep_before_retry(delay)
 
         raise AssertionError("bounded retry loop must return or raise")
 
@@ -747,6 +972,14 @@ class LLMAnalyzerBase:
                         reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
                     )
                 )
+            except LLMRuntimeLimitError as exc:
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(exc).__name__,
+                        reason=LedgerReason.RUNTIME_LIMIT,
+                    )
+                )
             except (ValueError, NotImplementedError):
                 raise
             except Exception as exc:
@@ -785,9 +1018,10 @@ class LLMAnalyzerBase:
         Failures are isolated per batch: a provider ``APIConnectionError``
         receives three bounded exponential-backoff retries (500ms, then 1s,
         then 2s) when the chat model has no native retry support. OpenAI and
-        Anthropic chat models use their native three-retry policy instead;
-        native retry timing remains provider-managed. Unrecovered errors cost
-        only their own batch and are omitted from the result.
+        Anthropic chat models use their native three-retry policy instead when
+        the timeout is static. A dynamic workflow deadline disables native
+        retries so every coordinator retry can re-check remaining time.
+        Unrecovered errors cost only their own batch and are omitted from the result.
         Malformed structured responses (Pydantic ``ValidationError`` or CLI
         JSON parse failures) receive three bounded exponential-backoff retries
         and are then isolated to their batch. A batch makes at most seven outer
@@ -815,9 +1049,15 @@ class LLMAnalyzerBase:
         **kwargs: object,
     ) -> BatchExecutionResult:
         """Execute batches concurrently and retain sanitized per-batch failures."""
+        # Resolved from the environment: one budget for the whole process, because that is what
+        # the variable promises — "requests in parallel", not "requests in parallel per analyzer".
+        # An explicit argument keeps its documented meaning and stays local to this call: a caller
+        # that passes a number is asking for a fan-out width, not for a share of the budget.
+        sem: _GlobalLLMLimiter | asyncio.Semaphore
         if max_concurrency is None:
-            max_concurrency = resolve_max_concurrency()
-        sem = asyncio.Semaphore(max_concurrency)
+            sem = _shared_limiter(resolve_max_concurrency())
+        else:
+            sem = asyncio.Semaphore(max_concurrency)
 
         async def _process(batch: Batch) -> tuple[Batch, list]:
             async with sem:
@@ -838,6 +1078,15 @@ class LLMAnalyzerBase:
                         batch=batch,
                         error_class=ValidationError.__name__,
                         reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                    )
+                )
+                continue
+            if isinstance(result, LLMRuntimeLimitError):
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(result).__name__,
+                        reason=LedgerReason.RUNTIME_LIMIT,
                     )
                 )
                 continue

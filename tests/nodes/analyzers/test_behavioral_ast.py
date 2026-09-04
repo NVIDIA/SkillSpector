@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from skillspector.nodes.analyzers import behavioral_ast
+from skillspector.state import WorkflowResourceBudget
 
 
 def _run(code: str, filename: str = "script.py") -> list:
@@ -185,6 +186,109 @@ class TestDangerousChains:
         findings = _run(code)
         ast8 = [f for f in findings if f.rule_id == "AST8"]
         assert len(ast8) >= 1
+
+
+class TestInsecureDeserialization:
+    """AST10: deserializers that reconstruct arbitrary objects / execute code."""
+
+    def test_pickle_loads_produces_ast10(self):
+        findings = _run("import pickle\nobj = pickle.loads(data)")
+        ast10 = [f for f in findings if f.rule_id == "AST10"]
+        assert len(ast10) == 1
+        assert ast10[0].severity == "MEDIUM"
+        assert "pickle.loads" in ast10[0].message
+
+    def test_pickle_load_produces_ast10(self):
+        findings = _run('import pickle\nobj = pickle.load(open("f.pkl", "rb"))')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_marshal_loads_produces_ast10(self):
+        findings = _run("import marshal\nmarshal.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_dill_loads_produces_ast10(self):
+        findings = _run("import dill\ndill.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_jsonpickle_decode_produces_ast10(self):
+        findings = _run("import jsonpickle\njsonpickle.decode(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_pandas_read_pickle_produces_ast10(self):
+        findings = _run('import pandas as pd\ndf = pd.read_pickle("data.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_joblib_load_produces_ast10(self):
+        findings = _run('import joblib\nm = joblib.load("model.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_unsafe_load_produces_ast10(self):
+        findings = _run("import yaml\nyaml.unsafe_load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_from_import_alias_evasion(self):
+        findings = _run("from pickle import loads\nloads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    # ── yaml.load: argument-aware ─────────────────────────────────────
+
+    def test_yaml_load_without_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_kwarg_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_positional_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_unsafe_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.FullLoader)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_safe_load_no_finding(self):
+        findings = _run("import yaml\nyaml.safe_load(s)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── torch.load: argument-aware ────────────────────────────────────
+
+    def test_torch_load_without_weights_only_produces_ast10(self):
+        findings = _run('import torch\ntorch.load("model.pt")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_torch_load_with_weights_only_no_finding(self):
+        findings = _run('import torch\ntorch.load("model.pt", weights_only=True)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── numpy.load: argument-aware ────────────────────────────────────
+
+    def test_numpy_load_default_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", allow_pickle=True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_positional_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_mmap_mode_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", "r")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_false_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, False)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── no false positives on safe data parsing ───────────────────────
+
+    def test_json_loads_no_finding(self):
+        findings = _run("import json\njson.loads('{}')")
+        assert not any(f.rule_id == "AST10" for f in findings)
 
 
 class TestEdgeCases:
@@ -442,3 +546,48 @@ class TestInspectionLedgerResponse:
         assert event["emitted_finding_ids"] == [
             finding.finding_id for finding in result["findings"]
         ]
+
+
+class TestResourceBounds:
+    def test_finding_caps_stop_construction_and_account_remaining_work(self, monkeypatch) -> None:
+        monkeypatch.setattr(behavioral_ast, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        monkeypatch.setattr(behavioral_ast, "MAX_FINDINGS_PER_ANALYZER", 3)
+        result = behavioral_ast.node(
+            {
+                "components": ["a.py", "b.py", "c.py"],
+                "file_cache": {
+                    "a.py": "\n".join(f'exec("{index}")' for index in range(4)),
+                    "b.py": 'exec("b1")\nexec("b2")',
+                    "c.py": 'exec("c")',
+                },
+            }
+        )
+
+        assert len(result["findings"]) == 3
+        assert [event["outcome"] for event in result["inspection_ledger"]] == [
+            "partial",
+            "partial",
+            "partial",
+        ]
+        assert result["inspection_ledger"][0]["observed_findings"] == 3
+        assert result["inspection_ledger"][0]["limit_findings"] == 2
+        assert result["inspection_ledger"][1]["observed_findings"] == 4
+        assert result["inspection_ledger"][1]["limit_findings"] == 3
+        assert result["inspection_ledger"][2]["emitted_finding_ids"] == []
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_expired_workflow_deadline_marks_every_python_target_partial(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["a.py", "b.py"],
+                "file_cache": {"a.py": 'exec("a")', "b.py": 'exec("b")'},
+                "workflow_resource_budget": WorkflowResourceBudget(max_seconds=0.0),
+            }
+        )
+
+        assert result["findings"] == []
+        assert [event["reason_code"] for event in result["inspection_ledger"]] == [
+            "runtime_limit",
+            "runtime_limit",
+        ]
+        assert all("observed_seconds" in event for event in result["inspection_ledger"])

@@ -117,6 +117,8 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
@@ -135,15 +137,24 @@ class TestNvBuildProvider:
     @pytest.mark.parametrize(
         ("model", "context_length"),
         [
-            ("z-ai/glm-5.2", 1_000_000),
-            ("z-ai/glm-5.1", 205_000),
+            ("z-ai/glm-5.2", 202_749),
             ("moonshotai/kimi-k2.6", 256_000),
         ],
     )
     def test_nv_build_reported_model_metadata(self, model: str, context_length: int) -> None:
         provider = NvBuildProvider()
         assert provider.get_context_length(model) == context_length
-        assert provider.get_max_output_tokens(model) is None
+
+    def test_glm_declares_both_limits(self) -> None:
+        """max_output_tokens is optional, and its absence is not neutral.
+
+        Without it the output budget is derived as a percentage of the context
+        window, which is what produced a 250_000-token request against an
+        endpoint accepting 202_749 combined.
+        """
+        provider = NvBuildProvider()
+        assert provider.get_context_length("z-ai/glm-5.2") == 202_749
+        assert provider.get_max_output_tokens("z-ai/glm-5.2") == 32_768
 
     @pytest.mark.parametrize("model", ["glm-5.2", "z-ai/glm-5.2 "])
     def test_nv_build_model_near_match_stays_unresolved(self, model: str) -> None:
@@ -170,11 +181,20 @@ class TestNvBuildProvider:
         assert llm.max_tokens == 123
         assert str(llm.openai_api_base).rstrip("/") == BUILD_BASE_URL.rstrip("/")
 
-    def test_metadata_known_model_from_bundled_yaml(self) -> None:
-        """deepseek-v4-flash ships in nv_build/model_registry.yaml."""
+    def test_metadata_drops_end_of_life_model(self) -> None:
+        """deepseek-v4-flash reached end of life and returns 410 Gone.
+
+        Keeping it is worse than omitting it: an entry with a 1_000_000 window
+        makes model_info budget 250_000 output tokens, rejected on every call.
+        Absent, the conservative default applies instead.
+        """
         provider = NvBuildProvider()
-        assert provider.get_context_length("deepseek-ai/deepseek-v4-flash") == 1_000_000
-        assert provider.get_max_output_tokens("deepseek-ai/deepseek-v4-flash") == 128_000
+        assert provider.get_context_length("deepseek-ai/deepseek-v4-flash") is None
+
+    def test_default_model_is_in_the_bundled_registry(self) -> None:
+        """The invariant test_constants asserts, checked at the source too."""
+        provider = NvBuildProvider()
+        assert provider.get_context_length(NvBuildProvider.DEFAULT_MODEL) is not None
 
     def test_metadata_unknown_model_returns_none(self) -> None:
         provider = NvBuildProvider()
@@ -190,12 +210,9 @@ class TestNvBuildProvider:
         # Env override applies to every slot.
         assert NvBuildProvider().resolve_model("meta_analyzer") == "user/override"
 
-    def test_resolve_model_meta_analyzer_uses_slot_override(self) -> None:
-        # meta_analyzer is upgraded to deepseek-v4-pro on NvBuild.
-        assert (
-            NvBuildProvider().resolve_model("meta_analyzer")
-            == NvBuildProvider.SLOT_DEFAULTS["meta_analyzer"]
-        )
+    def test_resolve_model_meta_analyzer_falls_back_to_default(self) -> None:
+        # The former override named deepseek-v4-pro, absent from the catalogue.
+        assert NvBuildProvider().resolve_model("meta_analyzer") == NvBuildProvider.DEFAULT_MODEL
 
     def test_resolve_model_unknown_slot_falls_to_default(self) -> None:
         # Slots without an explicit override inherit DEFAULT_MODEL.
@@ -385,6 +402,25 @@ class TestAnthropicProvider:
 
         assert "effort" not in captured
 
+    def test_temperature_is_forwarded_without_openai_seed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_anthropic(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(anthropic_provider_module, "ChatAnthropic", fake_chat_anthropic)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+
+        assert captured["temperature"] == 0.0
+        assert "seed" not in captured
+
     def test_create_chat_model_returns_none_without_key(self) -> None:
         # No ANTHROPIC_API_KEY → no client, signalling the caller to fall back.
         assert AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123) is None
@@ -534,6 +570,49 @@ class TestOpenAICompatibleConstructor:
         )
 
         assert captured["reasoning_effort"] == "provider-specific-value"
+
+    def test_sampling_controls_are_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", " 0.25 ")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["temperature"] == 0.25
+        assert captured["seed"] == 42
+
+    @pytest.mark.parametrize(
+        ("name", "value", "message"),
+        [
+            ("SKILLSPECTOR_TEMPERATURE", "warm", "must be a number"),
+            ("SKILLSPECTOR_TEMPERATURE", "1.1", "must be between 0 and 1"),
+            ("SKILLSPECTOR_SEED", "4.2", "must be an integer"),
+        ],
+    )
+    def test_invalid_sampling_control_fails_before_model_construction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+        message: str,
+    ) -> None:
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValueError, match=message):
+            create_openai_compatible_chat_model(
+                model="gpt-5.4",
+                credentials=("sk-x", "http://localhost:1234/v1"),
+                max_tokens=123,
+            )
 
 
 class TestProviderSelection:

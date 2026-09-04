@@ -54,7 +54,7 @@ def _resolve_base_url() -> str:
 class MiniMaxProvider:
     """MiniMax credentials, regional routing, and bundled model metadata."""
 
-    DEFAULT_MODEL = "MiniMax-M3"
+    DEFAULT_MODEL = "MiniMax-M2.7"
     SLOT_DEFAULTS: dict[str, str] = {}
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:

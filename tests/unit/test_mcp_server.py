@@ -26,7 +26,11 @@ import pytest
 
 from skillspector import mcp_server
 from skillspector.mcp_server import run_scan
+from skillspector.models import Finding
+from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
+from skillspector.providers.openai import OpenAIProvider
+from skillspector.suppression import SuppressedFinding
 
 
 def _write_skill(tmp_path: Path, body: str = "# Safe skill") -> Path:
@@ -80,6 +84,41 @@ async def test_run_scan_reports_llm_available_with_credentials(
     assert result["llm_requested"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
+
+
+async def test_run_scan_openai_fallback_builds_matching_graph_model_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in (
+        "SKILLSPECTOR_PROVIDER",
+        "SKILLSPECTOR_MODEL",
+        "NVIDIA_INFERENCE_KEY",
+        "NVIDIA_INFERENCE_METADATA_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    _write_skill(tmp_path)
+    captured: dict[str, str] = {}
+
+    class _Graph:
+        async def ainvoke(self, state, config):
+            context = build_context({"skill_path": state["input_path"]})
+            captured.update(context["model_config"])
+            return {
+                "filtered_findings": [],
+                "risk_score": 0,
+                "risk_severity": "LOW",
+                "risk_recommendation": "OK",
+                "report_body": "report",
+            }
+
+    monkeypatch.setattr(mcp_server, "graph", _Graph())
+
+    result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+
+    assert result["llm_used"] is True
+    assert captured["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
 async def test_run_scan_uses_bound_provider_without_credentials(
@@ -222,6 +261,35 @@ async def test_mcp_blocks_install_when_execution_failed(monkeypatch: pytest.Monk
 
     assert verdict["safe_to_install"] is False
     assert verdict["execution_successful"] is False
+
+
+async def test_mcp_blocks_install_when_analysis_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful, low-risk but partial scan is never safe to install."""
+
+    async def incomplete_result(state: dict, config: dict) -> dict:
+        return {
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "risk_recommendation": "CAUTION",
+            "execution_successful": True,
+            "analysis_completeness": {
+                "is_complete": False,
+                "status": "partial",
+                "entirely_uninspected_files": 0,
+                "ledger_exceptions": [],
+            },
+            "filtered_findings": [],
+            "report_body": "{}",
+        }
+
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", incomplete_result)
+    verdict = await mcp_server.run_scan("fixture", use_llm=False)
+
+    assert verdict["safe_to_install"] is False
+    assert verdict["execution_successful"] is True
+    assert verdict["analysis_completeness"]["status"] == "partial"
 
 
 async def test_run_scan_rejects_local_target_when_disallowed(
@@ -441,6 +509,23 @@ async def test_build_server_disables_local_targets_by_default(
     assert graph_ainvoke.await_count == 0
 
 
+def test_build_server_reports_incompatible_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed package without FastMCP must not be reported as missing."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def import_without_fastmcp(name: str, *args: object, **kwargs: object) -> object:
+        if name == "mcp.server.fastmcp":
+            raise ModuleNotFoundError("No module named 'mcp.server.fastmcp'", name=name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_fastmcp)
+
+    with pytest.raises(ModuleNotFoundError, match="installed 'mcp' package is incompatible"):
+        mcp_server.build_server()
+
+
 async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
     """The real stdio CLI must initialize and expose the scan_skill tool."""
     pytest.importorskip("mcp")
@@ -461,3 +546,48 @@ async def test_mcp_stdio_initialize_registers_scan_skill() -> None:
             tools = await asyncio.wait_for(session.list_tools(), timeout=15)
 
     assert "scan_skill" in {tool.name for tool in tools.tools}
+
+
+async def test_run_scan_findings_exclude_the_suppressed_partition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MCP verdict lists the findings that drove the score, not kept+suppressed.
+
+    `run_scan` serialises this list straight to the calling agent, so a
+    baseline-suppressed finding leaking in tells the agent a skill is dirtier
+    than the risk score it is gating on.
+    """
+    kept = Finding(rule_id="SQP-1", message="kept")
+    dropped = Finding(rule_id="SQP-2", message="suppressed")
+    result = {
+        "findings": [kept, dropped],
+        "filtered_findings": [kept, dropped],
+        "suppressed_findings": [SuppressedFinding(finding=dropped, reason="baselined")],
+        "risk_score": 10,
+        "risk_severity": "LOW",
+        "report_body": "# report",
+    }
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan(str(_write_skill(tmp_path)), use_llm=False, output_format="json")
+
+    assert [finding["id"] for finding in verdict["findings"]] == ["SQP-1"]
+
+
+async def test_run_scan_respects_an_empty_filtered_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every-finding-filtered reports no findings, not the raw pre-filter list."""
+    result = {
+        "findings": [Finding(rule_id="SQP-1", message="one")],
+        "filtered_findings": [],
+        "suppressed_findings": [],
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "report_body": "# report",
+    }
+    monkeypatch.setattr(mcp_server.graph, "ainvoke", AsyncMock(return_value=result))
+
+    verdict = await run_scan(str(_write_skill(tmp_path)), use_llm=False, output_format="json")
+
+    assert verdict["findings"] == []

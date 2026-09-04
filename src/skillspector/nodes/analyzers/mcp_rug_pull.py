@@ -23,16 +23,26 @@ Detects supply-chain rug-pull risks in agent skills:
 from __future__ import annotations
 
 import re
+import time
+from dataclasses import dataclass, field
 
 from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
     analyzer_status_event,
+    analyzer_status_for_events,
     ledger_event,
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.state import (
+    AnalyzerNodeResponse,
+    SkillspectorState,
+    transitive_remaining_seconds,
+)
+
+from .static_runner import MAX_FINDINGS_PER_ANALYZER, MAX_FINDINGS_PER_ARTIFACT
 
 ANALYZER_ID = "mcp_rug_pull"
 logger = get_logger(__name__)
@@ -43,6 +53,72 @@ logger = get_logger(__name__)
 
 _CATEGORY = "MCP Rug Pull"
 _TAGS = ["ASI16"]
+
+
+class _RugPullResourceLimitError(RuntimeError):
+    """Internal fail-closed signal for construction-time resource ceilings."""
+
+    def __init__(self, reason: LedgerReason, metrics: dict[str, int | float]) -> None:
+        super().__init__(reason.value)
+        self.reason = reason
+        self.metrics = metrics
+
+
+@dataclass
+class _RugPullBudget:
+    """Retain a bounded prefix of evidence while enforcing shared runtime."""
+
+    state: SkillspectorState
+    started_at: float = field(default_factory=time.monotonic)
+    initial_allowance: float | None = None
+    findings: list[Finding] = field(default_factory=list)
+    artifact_findings: dict[str, int] = field(default_factory=dict)
+    completed_paths: set[str] = field(default_factory=set)
+    current_path: str = "SKILL.md"
+
+    def check_runtime(self, path: str | None = None) -> None:
+        if path is not None:
+            self.current_path = path
+        remaining = transitive_remaining_seconds(self.state)
+        if remaining is None:
+            return
+        if self.initial_allowance is None:
+            self.initial_allowance = max(0.0, remaining)
+        if remaining <= 0:
+            raise _RugPullResourceLimitError(
+                LedgerReason.RUNTIME_LIMIT,
+                {
+                    "observed_seconds": max(0.0, time.monotonic() - self.started_at),
+                    "limit_seconds": self.initial_allowance,
+                },
+            )
+
+    def emit(self, finding: Finding) -> None:
+        self.check_runtime(finding.file)
+        artifact_observed = self.artifact_findings.get(finding.file, 0) + 1
+        analyzer_observed = len(self.findings) + 1
+        if artifact_observed > MAX_FINDINGS_PER_ARTIFACT:
+            raise _RugPullResourceLimitError(
+                LedgerReason.OUTPUT_LIMIT,
+                {
+                    "observed_findings": artifact_observed,
+                    "limit_findings": MAX_FINDINGS_PER_ARTIFACT,
+                },
+            )
+        if analyzer_observed > MAX_FINDINGS_PER_ANALYZER:
+            raise _RugPullResourceLimitError(
+                LedgerReason.OUTPUT_LIMIT,
+                {
+                    "observed_findings": analyzer_observed,
+                    "limit_findings": MAX_FINDINGS_PER_ANALYZER,
+                },
+            )
+        self.findings.append(finding)
+        self.artifact_findings[finding.file] = artifact_observed
+
+    def analyzer_exhausted(self) -> bool:
+        return len(self.findings) >= MAX_FINDINGS_PER_ANALYZER
+
 
 # RP1: Unpinned MCP server references in code or manifest
 _RP1_NPX_CMD = re.compile(
@@ -80,26 +156,36 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 def _find_line(content: str, pos: int) -> int:
     """Return 1-based line number for character position *pos*."""
-    return content[:pos].count("\n") + 1
+    return content.count("\n", 0, pos) + 1
 
 
-def _normalize_string_list(lst: list[object] | None) -> list[str]:
+def _normalize_string_list(
+    lst: list[object] | None,
+    budget: _RugPullBudget | None = None,
+) -> list[str]:
     """Strip and lowercase all strings in the list. Returns sorted list of unique values."""
     if not lst:
         return []
     res = set()
     for item in lst:
+        if budget is not None:
+            budget.check_runtime("SKILL.md")
         if item is not None:
             res.add(str(item).strip().lower())
     return sorted(res)
 
 
-def _get_parameters_map(parameters: list[object] | None) -> dict[str, dict[str, object]]:
+def _get_parameters_map(
+    parameters: list[object] | None,
+    budget: _RugPullBudget | None = None,
+) -> dict[str, dict[str, object]]:
     """Convert parameters list of dicts to a map of lowercase parameter names -> properties."""
     param_map: dict[str, dict[str, object]] = {}
     if not parameters:
         return param_map
     for item in parameters:
+        if budget is not None:
+            budget.check_runtime("SKILL.md")
         if not isinstance(item, dict):
             continue
         name = item.get("name")
@@ -119,25 +205,32 @@ def _get_parameters_map(parameters: list[object] | None) -> dict[str, dict[str, 
 # ---------------------------------------------------------------------------
 
 
-def _check_rp1(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
+def _check_rp1(
+    manifest: dict,
+    file_cache: dict[str, str],
+    budget: _RugPullBudget,
+) -> None:
     """Detect unpinned MCP server command references in skill files."""
-    findings: list[Finding] = []
-
     for file_path, content in file_cache.items():
+        budget.check_runtime(file_path)
         # npx without @version
         for m in _RP1_NPX_CMD.finditer(content):
+            budget.check_runtime(file_path)
             full_match = m.group(0)
             line_end = content.find("\n", m.end())
             if line_end == -1:
                 line_end = len(content)
-            line_remainder = content[m.end() : line_end]
-            if _VERSION_PIN_RE.search(full_match + line_remainder):
+            line_remainder = content[m.end() : min(line_end, m.end() + 256)]
+            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
                 continue
             line_num = _find_line(content, m.start())
-            findings.append(
+            budget.emit(
                 Finding(
                     rule_id="RP1",
-                    message=f"MCP server referenced without pinned version: '{full_match.strip()}'.",
+                    message=(
+                        "MCP server referenced without pinned version: "
+                        f"'{full_match.strip()[:200]}'."
+                    ),
                     severity="MEDIUM",
                     confidence=0.70,
                     file=file_path,
@@ -156,18 +249,22 @@ def _check_rp1(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
 
         # uvx without ==version
         for m in _RP1_UVX_CMD.finditer(content):
+            budget.check_runtime(file_path)
             full_match = m.group(0)
             line_end = content.find("\n", m.end())
             if line_end == -1:
                 line_end = len(content)
-            line_remainder = content[m.end() : line_end]
-            if _VERSION_PIN_RE.search(full_match + line_remainder):
+            line_remainder = content[m.end() : min(line_end, m.end() + 256)]
+            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
                 continue
             line_num = _find_line(content, m.start())
-            findings.append(
+            budget.emit(
                 Finding(
                     rule_id="RP1",
-                    message=f"MCP server referenced without pinned version: '{full_match.strip()}'.",
+                    message=(
+                        "MCP server referenced without pinned version: "
+                        f"'{full_match.strip()[:200]}'."
+                    ),
                     severity="MEDIUM",
                     confidence=0.65,
                     file=file_path,
@@ -184,21 +281,25 @@ def _check_rp1(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
 
         # pip install without ==version
         for m in _RP1_PIP_INSTALL.finditer(content):
+            budget.check_runtime(file_path)
             full_match = m.group(0)
             line_end = content.find("\n", m.end())
             if line_end == -1:
                 line_end = len(content)
-            line_remainder = content[m.end() : line_end]
-            if _VERSION_PIN_RE.search(full_match + line_remainder):
+            line_remainder = content[m.end() : min(line_end, m.end() + 256)]
+            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
                 continue
             pkg = m.group(1)
             if "mcp" not in pkg.lower():
                 continue
             line_num = _find_line(content, m.start())
-            findings.append(
+            budget.emit(
                 Finding(
                     rule_id="RP1",
-                    message=f"MCP server dependency without pinned version: '{full_match.strip()}'.",
+                    message=(
+                        "MCP server dependency without pinned version: "
+                        f"'{full_match.strip()[:200]}'."
+                    ),
                     severity="LOW",
                     confidence=0.60,
                     file=file_path,
@@ -216,11 +317,12 @@ def _check_rp1(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
 
         # docker without tag or digest
         for m in _RP1_DOCKER_CMD.finditer(content):
+            budget.check_runtime(file_path)
             full_match = m.group(0)
             if _VERSION_PIN_RE.search(full_match):
                 continue
             line_num = _find_line(content, m.start())
-            findings.append(
+            budget.emit(
                 Finding(
                     rule_id="RP1",
                     message=f"Docker image referenced without tag or digest: '{full_match[:80]}'.",
@@ -240,14 +342,23 @@ def _check_rp1(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
                 )
             )
 
-    # Check manifest for unpinned MCP server references
+        if file_path != "SKILL.md":
+            budget.completed_paths.add(file_path)
+
+    if not manifest:
+        return
+
+    # Check manifest for unpinned MCP server references.
+    budget.check_runtime("SKILL.md")
     manifest_text = str(manifest)
     for m in _RP1_NPX_CMD.finditer(manifest_text):
-        findings.append(
+        budget.check_runtime("SKILL.md")
+        budget.emit(
             Finding(
                 rule_id="RP1",
                 message=(
-                    f"Manifest references MCP server without version pin: '{m.group(0).strip()}'."
+                    "Manifest references MCP server without version pin: "
+                    f"'{m.group(0).strip()[:200]}'."
                 ),
                 severity="MEDIUM",
                 confidence=0.70,
@@ -264,22 +375,20 @@ def _check_rp1(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
             )
         )
 
-    return findings
-
 
 # ---------------------------------------------------------------------------
 # RP2: Permission pre-staging
 # ---------------------------------------------------------------------------
 
 
-def _check_rp2(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
+def _check_rp2(manifest: dict, budget: _RugPullBudget) -> None:
     """Detect manifest permission patterns that suggest pre-staging for future abuse."""
-    findings: list[Finding] = []
-
+    budget.check_runtime("SKILL.md")
     manifest_text = str(manifest)
     for pattern, confidence in _PERMISSION_EXPANSION_PATTERNS:
         for m in re.finditer(pattern, manifest_text, re.IGNORECASE):
-            findings.append(
+            budget.check_runtime("SKILL.md")
+            budget.emit(
                 Finding(
                     rule_id="RP2",
                     message="Manifest language suggests future permission expansion.",
@@ -302,25 +411,22 @@ def _check_rp2(manifest: dict, file_cache: dict[str, str]) -> list[Finding]:
                 )
             )
 
-    return findings
-
 
 # ---------------------------------------------------------------------------
 # RP3: Version unpinned
 # ---------------------------------------------------------------------------
 
 
-def _check_rp3(manifest: dict) -> list[Finding]:
+def _check_rp3(manifest: dict, budget: _RugPullBudget) -> None:
     """Detect when skill version is unpinned or uses broad constraints."""
-    findings: list[Finding] = []
-
+    budget.check_runtime("SKILL.md")
     version_value = manifest.get("version") if isinstance(manifest, dict) else None
     if not version_value or not isinstance(version_value, str):
-        return findings
+        return
 
     version_str = str(version_value).strip()
     if version_str in ("*", "latest", "any"):
-        findings.append(
+        budget.emit(
             Finding(
                 rule_id="RP3",
                 message=f"Skill version is unpinned: '{version_str}'.",
@@ -339,7 +445,7 @@ def _check_rp3(manifest: dict) -> list[Finding]:
             )
         )
     elif version_str.startswith(">=") or version_str.startswith("^"):
-        findings.append(
+        budget.emit(
             Finding(
                 rule_id="RP3",
                 message=f"Skill version constraint may be too broad: '{version_str}'.",
@@ -358,7 +464,172 @@ def _check_rp3(manifest: dict) -> list[Finding]:
             )
         )
 
-    return findings
+
+# ---------------------------------------------------------------------------
+# Manifest comparison and terminal accounting
+# ---------------------------------------------------------------------------
+
+
+def _bounded_display(values: list[str], *, max_items: int = 32, max_chars: int = 1024) -> str:
+    """Render attacker-controlled change lists under a deterministic output cap."""
+    rendered = ", ".join(values[:max_items])
+    if len(values) > max_items:
+        rendered = f"{rendered}, ... ({len(values) - max_items} more)"
+    return rendered[:max_chars]
+
+
+def _check_manifest_changes(
+    manifest: dict,
+    previous_manifest: dict,
+    budget: _RugPullBudget,
+) -> None:
+    """Emit bounded RP1-RP3 findings for changes from a previous manifest."""
+    budget.check_runtime("SKILL.md")
+    curr_perms = _normalize_string_list(manifest.get("permissions"), budget)
+    prev_perms = _normalize_string_list(previous_manifest.get("permissions"), budget)
+    prev_perm_set = set(prev_perms)
+    added_perms = [permission for permission in curr_perms if permission not in prev_perm_set]
+    if added_perms:
+        budget.emit(
+            Finding(
+                rule_id="RP1",
+                message=(
+                    "Permissions expanded: current manifest requests permissions not present "
+                    f"in the previous version (added: {_bounded_display(added_perms)})."
+                ),
+                severity="HIGH",
+                confidence=0.90,
+                file="SKILL.md",
+                category=_CATEGORY,
+                tags=["ASI02"],
+                explanation=(
+                    "A skill version update added new permissions to the manifest. If unexpected, "
+                    "this could indicate a privilege escalation or rug-pull attack."
+                ),
+                remediation="Verify each added permission and remove any that are unnecessary.",
+            )
+        )
+
+    curr_triggers = _normalize_string_list(manifest.get("triggers"), budget)
+    prev_triggers = _normalize_string_list(previous_manifest.get("triggers"), budget)
+    prev_trigger_set = set(prev_triggers)
+    curr_trigger_set = set(curr_triggers)
+    added_triggers = [trigger for trigger in curr_triggers if trigger not in prev_trigger_set]
+    removed_triggers = [trigger for trigger in prev_triggers if trigger not in curr_trigger_set]
+    if added_triggers or removed_triggers:
+        changes: list[str] = []
+        if added_triggers:
+            changes.append(f"added: {_bounded_display(added_triggers)}")
+        if removed_triggers:
+            changes.append(f"removed: {_bounded_display(removed_triggers)}")
+        budget.emit(
+            Finding(
+                rule_id="RP2",
+                message=f"Trigger phrases modified ({'; '.join(changes)[:2048]}).",
+                severity="MEDIUM",
+                confidence=0.85,
+                file="SKILL.md",
+                category=_CATEGORY,
+                tags=["ASI02"],
+                explanation=(
+                    "Changing triggers can cause unintended invocation or bypass expected safety "
+                    "boundaries."
+                ),
+                remediation="Verify that every trigger remains aligned with the declared behavior.",
+            )
+        )
+
+    curr_params = _get_parameters_map(manifest.get("parameters"), budget)
+    prev_params = _get_parameters_map(previous_manifest.get("parameters"), budget)
+    added_params = [name for name in curr_params if name not in prev_params]
+    removed_params = [name for name in prev_params if name not in curr_params]
+    changed_params: list[str] = []
+    for name, curr_prop in curr_params.items():
+        budget.check_runtime("SKILL.md")
+        prev_prop = prev_params.get(name)
+        if prev_prop is None:
+            continue
+        prop_diffs: list[str] = []
+        if curr_prop["type"] != prev_prop["type"]:
+            prop_diffs.append(
+                f"type changed from {str(prev_prop['type'])[:128]} "
+                f"to {str(curr_prop['type'])[:128]}"
+            )
+        if curr_prop["default"] != prev_prop["default"]:
+            prop_diffs.append(
+                f"default changed from {str(prev_prop['default'])[:128]} "
+                f"to {str(curr_prop['default'])[:128]}"
+            )
+        if curr_prop["description"] != prev_prop["description"]:
+            prop_diffs.append("description changed")
+        if prop_diffs:
+            changed_params.append(f"{str(curr_prop['name'])[:128]} ({'; '.join(prop_diffs)})")
+
+    if added_params or removed_params or changed_params:
+        changes = []
+        if added_params:
+            changes.append(
+                "added: "
+                + _bounded_display([str(curr_params[name]["name"]) for name in added_params])
+            )
+        if removed_params:
+            changes.append(
+                "removed: "
+                + _bounded_display([str(prev_params[name]["name"]) for name in removed_params])
+            )
+        if changed_params:
+            changes.append("modified: " + _bounded_display(changed_params))
+        budget.emit(
+            Finding(
+                rule_id="RP3",
+                message=f"Parameter schema modified ({'; '.join(changes)[:3072]}).",
+                severity="MEDIUM",
+                confidence=0.80,
+                file="SKILL.md",
+                category=_CATEGORY,
+                tags=["ASI02"],
+                explanation=(
+                    "Parameter additions, removals, or changed defaults can alter tool input flow "
+                    "and behavior."
+                ),
+                remediation="Verify that every parameter change is safe and expected.",
+            )
+        )
+
+
+def _partial_limit_event(
+    path: str,
+    limit: _RugPullResourceLimitError,
+    emitted_finding_ids: list[str],
+) -> InspectionLedgerEvent:
+    return ledger_event(
+        analyzer_id=ANALYZER_ID,
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        path=path,
+        reason=limit.reason,
+        emitted_finding_ids=emitted_finding_ids,
+        observed_findings=(
+            int(limit.metrics["observed_findings"])
+            if limit.reason is LedgerReason.OUTPUT_LIMIT
+            else None
+        ),
+        limit_findings=(
+            int(limit.metrics["limit_findings"])
+            if limit.reason is LedgerReason.OUTPUT_LIMIT
+            else None
+        ),
+        observed_seconds=(
+            float(limit.metrics["observed_seconds"])
+            if limit.reason is LedgerReason.RUNTIME_LIMIT
+            else None
+        ),
+        limit_seconds=(
+            float(limit.metrics["limit_seconds"])
+            if limit.reason is LedgerReason.RUNTIME_LIMIT
+            else None
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +638,9 @@ def _check_rp3(manifest: dict) -> list[Finding]:
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Analyze skill for rug-pull risks (RP1–RP3)."""
+    """Analyze skill for rug-pull risks (RP1-RP3) within explicit bounds."""
     manifest: dict = state.get("manifest") or {}
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    file_cache: dict[str, str] = state.get("local_file_cache") or state.get("file_cache") or {}
     previous_manifest: dict | None = state.get("previous_manifest")
 
     if not manifest and not file_cache:
@@ -386,177 +657,48 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
             ],
         }
 
-    findings: list[Finding] = []
+    budget = _RugPullBudget(state)
+    resource_limit: _RugPullResourceLimitError | None = None
+    try:
+        _check_rp1(manifest, file_cache, budget)
+        if manifest:
+            _check_rp2(manifest, budget)
+            _check_rp3(manifest, budget)
+        if manifest and previous_manifest:
+            _check_manifest_changes(manifest, previous_manifest, budget)
+        budget.completed_paths.update(file_cache)
+        if manifest:
+            budget.completed_paths.add("SKILL.md")
+    except _RugPullResourceLimitError as exc:
+        resource_limit = exc
 
-    # 1. Static unpinned / pre-staging checks (always run if manifest/cache exists)
-    if manifest or file_cache:
-        rp1_findings = _check_rp1(manifest, file_cache)
-        findings.extend(rp1_findings)
-        logger.debug("%s: RP1 produced %d static findings", ANALYZER_ID, len(rp1_findings))
+    findings = budget.findings
+    findings_by_path: dict[str, list[str]] = {}
+    for finding in findings:
+        findings_by_path.setdefault(finding.file, []).append(finding.finding_id)
 
-        rp2_findings = _check_rp2(manifest, file_cache)
-        findings.extend(rp2_findings)
-        logger.debug("%s: RP2 produced %d static findings", ANALYZER_ID, len(rp2_findings))
-
-        rp3_findings = _check_rp3(manifest)
-        findings.extend(rp3_findings)
-        logger.debug("%s: RP3 produced %d static findings", ANALYZER_ID, len(rp3_findings))
-
-    # 2. Manifest comparison checks (if previous_manifest is available)
-    if manifest and previous_manifest:
-        curr_perms = _normalize_string_list(manifest.get("permissions"))
-        prev_perms = _normalize_string_list(previous_manifest.get("permissions"))
-
-        # --- RP1: Permission expansion / privilege escalation ---
-        added_perms = [p for p in curr_perms if p not in prev_perms]
-        if added_perms:
-            logger.debug("%s: RP1 permission expansion detected: %s", ANALYZER_ID, added_perms)
-            findings.append(
-                Finding(
-                    rule_id="RP1",
-                    message=(
-                        f"Permissions expanded: current manifest requests permissions not present in the "
-                        f"previous version (added: {', '.join(added_perms)})."
-                    ),
-                    severity="HIGH",
-                    confidence=0.90,
-                    file="SKILL.md",
-                    category=_CATEGORY,
-                    tags=["ASI02"],
-                    explanation=(
-                        "A skill version update added new permissions to the manifest. If unexpected, "
-                        "this could indicate a privilege escalation or 'rug pull' attack where the skill "
-                        "updates to gain unauthorized capabilities."
-                    ),
-                    remediation=(
-                        "Verify if the newly added permissions are indeed necessary for the skill's purpose. "
-                        "If not, downgrade or revert the skill version, or modify the manifest to remove the excess permissions."
-                    ),
+    planned_paths = list(file_cache)
+    if manifest and "SKILL.md" not in planned_paths:
+        planned_paths.append("SKILL.md")
+    events = []
+    for path in planned_paths:
+        emitted_ids = findings_by_path.get(path, [])
+        if resource_limit is None or path in budget.completed_paths:
+            events.append(
+                ledger_event(
+                    analyzer_id=ANALYZER_ID,
+                    outcome=LedgerOutcome.COMPLETED,
+                    phase="static",
+                    path=path,
+                    emitted_finding_ids=emitted_ids,
                 )
             )
-
-        # --- RP2: Trigger phrase modification ---
-        curr_triggers = _normalize_string_list(manifest.get("triggers"))
-        prev_triggers = _normalize_string_list(previous_manifest.get("triggers"))
-        added_triggers = [t for t in curr_triggers if t not in prev_triggers]
-        removed_triggers = [t for t in prev_triggers if t not in curr_triggers]
-        if added_triggers or removed_triggers:
-            changes = []
-            if added_triggers:
-                changes.append(f"added: {', '.join(added_triggers)}")
-            if removed_triggers:
-                changes.append(f"removed: {', '.join(removed_triggers)}")
-            logger.debug("%s: RP2 trigger modification detected: %s", ANALYZER_ID, changes)
-            findings.append(
-                Finding(
-                    rule_id="RP2",
-                    message=(
-                        f"Trigger phrases modified: triggers have changed from the previous version "
-                        f"({'; '.join(changes)})."
-                    ),
-                    severity="MEDIUM",
-                    confidence=0.85,
-                    file="SKILL.md",
-                    category=_CATEGORY,
-                    tags=["ASI02"],
-                    explanation=(
-                        "Trigger phrases determine when the AI agent will execute the skill. Modifying, "
-                        "adding, or deleting trigger phrases can hijack the agent's behavior, leading to "
-                        "unintended invocation of tools or bypassing safety triggers."
-                    ),
-                    remediation=(
-                        "Review the modified trigger phrases to ensure they align with the expected behavior "
-                        "of the skill and do not lead to accidental or malicious invocation."
-                    ),
-                )
-            )
-
-        # --- RP3: Parameter schema or default modification ---
-        curr_params = _get_parameters_map(manifest.get("parameters"))
-        prev_params = _get_parameters_map(previous_manifest.get("parameters"))
-        added_params = [name for name in curr_params if name not in prev_params]
-        removed_params = [name for name in prev_params if name not in curr_params]
-        changed_params = []
-
-        for name in curr_params:
-            if name in prev_params:
-                curr_prop = curr_params[name]
-                prev_prop = prev_params[name]
-                prop_diffs = []
-                if curr_prop["type"] != prev_prop["type"]:
-                    prop_diffs.append(
-                        f"type changed from {prev_prop['type']} to {curr_prop['type']}"
-                    )
-                if curr_prop["default"] != prev_prop["default"]:
-                    prop_diffs.append(
-                        f"default changed from {prev_prop['default']} to {curr_prop['default']}"
-                    )
-                if curr_prop["description"] != prev_prop["description"]:
-                    prop_diffs.append("description changed")
-                if prop_diffs:
-                    changed_params.append(f"{curr_prop['name']} ({'; '.join(prop_diffs)})")
-
-        if added_params or removed_params or changed_params:
-            changes = []
-            if added_params:
-                changes.append(
-                    f"added: {', '.join(str(curr_params[p]['name']) for p in added_params)}"
-                )
-            if removed_params:
-                changes.append(
-                    f"removed: {', '.join(str(prev_params[p]['name']) for p in removed_params)}"
-                )
-            if changed_params:
-                changes.append(f"modified: {', '.join(changed_params)}")
-
-            logger.debug("%s: RP3 parameter modification detected: %s", ANALYZER_ID, changes)
-            findings.append(
-                Finding(
-                    rule_id="RP3",
-                    message=(
-                        f"Parameter schema modified: parameters were added, removed, or had their attributes changed "
-                        f"({'; '.join(changes)})."
-                    ),
-                    severity="MEDIUM",
-                    confidence=0.80,
-                    file="SKILL.md",
-                    category=_CATEGORY,
-                    tags=["ASI02"],
-                    explanation=(
-                        "Modifying parameter schemas, parameter types, or default values can alter the input flow "
-                        "to tools. Specifically, changing a default value to a malicious payload or command execution "
-                        "vector can exploit the agent when the tool is invoked."
-                    ),
-                    remediation=(
-                        "Verify that parameter additions, removals, or schema and default value changes are safe "
-                        "and match the expected behavior of the updated skill."
-                    ),
-                )
-            )
+        else:
+            events.append(_partial_limit_event(path, resource_limit, emitted_ids))
 
     logger.info("%s: %d findings in total", ANALYZER_ID, len(findings))
-    event = ledger_event(
-        analyzer_id=ANALYZER_ID,
-        outcome=LedgerOutcome.COMPLETED,
-        phase="static",
-        path="SKILL.md",
-        emitted_finding_ids=[finding.finding_id for finding in findings],
-    )
     return {
         "findings": findings,
-        "inspection_ledger": [event],
-        "analyzer_status_events": [
-            analyzer_status_event(
-                analyzer_id=ANALYZER_ID,
-                status="completed",
-                planned_work=[
-                    {
-                        "work_id": event["work_id"],
-                        "path": event["path"],
-                        "start_line": event["start_line"],
-                        "end_line": event["end_line"],
-                    }
-                ],
-            )
-        ],
+        "inspection_ledger": events,
+        "analyzer_status_events": [analyzer_status_for_events(ANALYZER_ID, events)],
     }

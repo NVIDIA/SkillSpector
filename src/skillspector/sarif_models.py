@@ -40,6 +40,7 @@ class SarifArtifactLocation(BaseModel):
 
     uri: str
     index: int | None = None
+    properties: dict[str, object] | None = None
 
 
 class SarifPhysicalLocation(BaseModel):
@@ -142,6 +143,7 @@ class SarifInvocation(BaseModel):
     tool_execution_notifications: list[SarifNotification] | None = Field(
         default=None, alias="toolExecutionNotifications"
     )
+    properties: dict[str, object] | None = None
 
 
 class SarifRun(BaseModel):

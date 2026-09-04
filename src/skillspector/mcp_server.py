@@ -36,6 +36,7 @@ from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
+from skillspector.suppression import effective_findings
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -137,13 +138,16 @@ async def run_scan(
                 },
             },
         )
-        findings = result.get("filtered_findings") or result.get("findings") or []
+        findings = effective_findings(result)
         risk_score = int(result.get("risk_score") or 0)
         execution_successful = bool(result.get("execution_successful", True))
         analysis_completeness = result.get("analysis_completeness") or {}
         entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
         safe_to_install = (
-            risk_score <= RISK_THRESHOLD and execution_successful and entirely_uninspected == 0
+            risk_score <= RISK_THRESHOLD
+            and execution_successful
+            and entirely_uninspected == 0
+            and bool(analysis_completeness.get("is_complete", True))
         )
         return {
             "target": target,
@@ -176,6 +180,11 @@ def build_server(name: str = "skillspector", *, allow_local_targets: bool = Fals
     try:
         from mcp.server.fastmcp import FastMCP
     except ModuleNotFoundError as exc:
+        if exc.name != "mcp":
+            raise ModuleNotFoundError(
+                "The installed 'mcp' package is incompatible with the SkillSpector "
+                "MCP server. Reinstall with: pip install 'skillspector[mcp]'"
+            ) from exc
         raise ModuleNotFoundError(
             "The MCP server requires the optional 'mcp' dependency. "
             "Install it with: pip install 'skillspector[mcp]'"

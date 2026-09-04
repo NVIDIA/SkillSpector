@@ -32,7 +32,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -152,6 +152,43 @@ P8_PATTERNS = [
 ]
 
 _BENIGN_OUTPUT_RULES_HEADING = "## Output Rules (Both Modes)"
+_LOGICAL_BREAK = rf"(?:{LOGICAL_LINE_BREAK.pattern})"
+_BENIGN_PRINT_RULES_TAXONOMY = re.compile(
+    rf"(?:\A|{_LOGICAL_BREAK})[ \t]*[\"'`]{{0,3}}[ \t]*"
+    r"(?:single-class[ \t]+selectors[ \t]+are[ \t]+honored[ \t]+(?:—|--|-)[ \t]+)?"
+    r"descendant[ \t]*/[ \t]*compound[ \t]*/[ \t]*"
+    r"(?P<target>print[ \t]+rules)[ \t]+are"
+    rf"(?:[ \t]+|[ \t]*{_LOGICAL_BREAK}[ \t]+)(?:not|never)[ \t]+evaluated"
+    r"(?:[ \t]+\((?:avoids?|to[ \t]+avoid)[ \t]+over-stripping[ \t]+content"
+    r"[ \t]+behind[ \t]+e\.g\.[ \t]+`?\.a[ \t]+\.b`?[ \t]+rules\))?"
+    r"[ \t]*(?:[.!?][ \t]*)?[\"'`]{0,3}[ \t]*"
+    rf"(?=\Z|{_LOGICAL_BREAK})",
+    re.IGNORECASE,
+)
+_PRECEDING_DIRECTIVE = re.compile(
+    r"\b(?:you|your|agents?|assistants?|models?|llms?|bots?|must|shall|should|"
+    r"required|mandatory)\b"
+    r"|\bbefore[ \t]+(?:replying|responding)\b"
+    r"|\b(?:following|below|above|next|this|that|it|them|these|those|so|prior|"
+    r"previous|preceding|everything|all|former|latter|content|text|output|"
+    r"configuration|material)\b"
+    r"|\bthe[ \t]+same\b"
+    r"|\bwhat[ \t]+follows\b"
+    r"|:[ \t]*$",
+    re.IGNORECASE,
+)
+_NEXT_LINE_REFERENCE = re.compile(
+    r"\b(?:it|them|this|these|those|so|same|above|below|prior|previous|"
+    r"preceding|following|foregoing|everything|all|former|latter|content|text|"
+    r"output|configuration|material)\b"
+    r"|\b(?:the|this|that|these|those|same)[ \t]+(?:rules?|instructions?|prompts?|"
+    r"guidelines?|directives?|operations?|actions?)\b"
+    r"|\b(?:do|execute|perform|apply|follow|obey|use|print|output|show|display|"
+    r"reveal|expose|return|echo|repeat|share|disclose|publish|provide|send|copy|"
+    r"extract|dump|recite|summarize|translate|encode|write|save|forward|pipe)"
+    r"[ \t]+that\b",
+    re.IGNORECASE,
+)
 
 
 def _is_benign_output_rules_heading(content: str, match: re.Match[str], file_type: str) -> bool:
@@ -163,6 +200,66 @@ def _is_benign_output_rules_heading(content: str, match: re.Match[str], file_typ
     if line_end < 0:
         line_end = len(content)
     return content[line_start:line_end].strip() == _BENIGN_OUTPUT_RULES_HEADING
+
+
+def _bounded_previous_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
+    """Return the prior nonblank logical line and whether it was complete."""
+    window_start = max(0, offset - 512)
+    parts = LOGICAL_LINE_BREAK.split(content[window_start:offset])
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].strip():
+            return parts[index], index > 0 or window_start == 0
+    return "", window_start == 0
+
+
+def _bounded_next_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
+    """Return the next nonblank logical line and whether it was complete."""
+    window_end = min(len(content), offset + 512)
+    window = content[offset:window_end]
+    cursor = 0
+    for line_break in LOGICAL_LINE_BREAK.finditer(window):
+        line = window[cursor : line_break.start()]
+        if line.strip():
+            return line, True
+        cursor = line_break.end()
+    if window_end == len(content):
+        return window[cursor:], True
+    return "", False
+
+
+def _is_benign_print_rules_taxonomy(content: str, match: re.Match[str]) -> bool:
+    """Return True only for a bounded declarative selector-taxonomy clause."""
+    window_start = max(0, match.start() - 256)
+    window_end = min(len(content), match.end() + 256)
+    for candidate in _BENIGN_PRINT_RULES_TAXONOMY.finditer(content, window_start, window_end):
+        if candidate.span("target") != match.span():
+            continue
+        candidate_end = candidate.end()
+        if (
+            candidate_end != len(content)
+            and LOGICAL_LINE_BREAK.match(content, candidate_end) is None
+        ):
+            continue
+
+        if candidate_end != len(content):
+            line_break = LOGICAL_LINE_BREAK.match(content, candidate_end)
+            assert line_break is not None
+            next_line, next_complete = _bounded_next_nonblank_line(content, line_break.end())
+            if not next_complete:
+                continue
+            if _NEXT_LINE_REFERENCE.search(next_line):
+                continue
+
+        if candidate.start() == 0:
+            return True
+
+        previous_line, previous_complete = _bounded_previous_nonblank_line(
+            content, candidate.start()
+        )
+        if not previous_complete:
+            return False
+        return _PRECEDING_DIRECTIVE.search(previous_line) is None
+    return False
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -180,6 +277,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for pattern, confidence in P6_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             if _is_benign_output_rules_heading(content, match, file_type):
+                continue
+            if _is_benign_print_rules_taxonomy(content, match):
                 continue
             line_num = get_line_number(content, match.start())
             findings.append(

@@ -23,6 +23,7 @@ LangChain structured output for validated, schema-driven LLM responses.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -44,6 +45,8 @@ from skillspector.llm_analyzer_base import (
     BatchExecutionResult,
     BatchFailure,
     LLMAnalyzerBase,
+    LLMRuntimeLimitError,
+    append_output_language_instruction,
     estimate_tokens,
 )
 from skillspector.llm_utils import run_async
@@ -53,7 +56,12 @@ from skillspector.nodes.analyzers.pattern_defaults import (
     get_explanation,
     get_remediation,
 )
-from skillspector.state import MetaAnalyzerResponse, SkillspectorState, llm_call_record
+from skillspector.state import (
+    MetaAnalyzerResponse,
+    SkillspectorState,
+    llm_call_record,
+    transitive_remaining_seconds,
+)
 
 logger = get_logger(__name__)
 
@@ -232,41 +240,17 @@ def _format_findings_for_prompt(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-_NO_LLM_CONFIDENCE_THRESHOLD = 0.4
-_HIGH_SEVERITY_PASS_THROUGH = frozenset({"CRITICAL", "HIGH"})
-_CODE_EXAMPLE_DOWNWEIGHT = 0.5
-
-
 def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
-    """Heuristic fallback filter for --no-llm mode.
-
-    Applies rule-based filtering when LLM analysis is unavailable:
-    1. Drop findings with confidence below threshold (0.4), UNLESS severity
-       is CRITICAL or HIGH (high-severity findings are never dropped on
-       confidence alone)
-    2. Downweight findings whose context matches code-example indicators
-       (0.5x confidence reduction) — never hard-drop, as there is no LLM
-       safety net in this mode
-    3. Apply default remediations from pattern_defaults
-    """
-    from skillspector.nodes.analyzers.common import is_code_example
-
+    """Preserve deterministic findings and add defaults in --no-llm mode."""
     result: list[Finding] = []
     for f in findings:
-        severity_upper = (f.severity or "LOW").upper()
-        confidence = f.confidence
-        if f.context and is_code_example(f.context):
-            confidence *= _CODE_EXAMPLE_DOWNWEIGHT
-        if confidence < _NO_LLM_CONFIDENCE_THRESHOLD:
-            if severity_upper not in _HIGH_SEVERITY_PASS_THROUGH:
-                continue
         result.append(
             Finding(
                 rule_id=f.rule_id,
                 message=f.message,
                 finding_id=f.finding_id,
                 severity=f.severity,
-                confidence=confidence,
+                confidence=f.confidence,
                 file=f.file,
                 start_line=f.start_line,
                 end_line=f.end_line,
@@ -274,18 +258,24 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
                 tags=f.tags,
                 context=f.context,
                 matched_text=f.matched_text,
+                transitive_depth=f.transitive_depth,
+                source_url=f.source_url,
+                source_identity=f.source_identity,
+                source_digest=f.source_digest,
                 category=getattr(f, "category", None),
                 pattern=getattr(f, "pattern", None),
                 finding=getattr(f, "finding", None),
                 explanation=getattr(f, "explanation", None),
                 code_snippet=getattr(f, "code_snippet", None) or f.context,
-                intent=None,
+                evidence=dict(f.evidence),
+                intent=f.intent,
+                match_fingerprint=f.match_fingerprint,
+                occurrences=list(f.occurrences),
             )
         )
     logger.info(
-        "Heuristic fallback filter (--no-llm): %d → %d findings",
+        "Deterministic fallback (--no-llm): %d findings preserved",
         len(findings),
-        len(result),
     )
     return result
 
@@ -311,12 +301,19 @@ def _passthrough_with_defaults(findings: list[Finding]) -> list[Finding]:
             tags=f.tags,
             context=f.context,
             matched_text=f.matched_text,
+            transitive_depth=f.transitive_depth,
+            source_url=f.source_url,
+            source_identity=f.source_identity,
+            source_digest=f.source_digest,
             category=getattr(f, "category", None),
             pattern=getattr(f, "pattern", None),
             finding=getattr(f, "finding", None),
             explanation=getattr(f, "explanation", None),
             code_snippet=getattr(f, "code_snippet", None) or f.context,
-            intent=None,
+            evidence=dict(f.evidence),
+            intent=f.intent,
+            match_fingerprint=f.match_fingerprint,
+            occurrences=list(f.occurrences),
         )
         for f in findings
     ]
@@ -336,8 +333,18 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
     response_schema = MetaAnalyzerResult
 
-    def __init__(self, model: str):
-        super().__init__(base_prompt=PER_FILE_ANALYSIS_PROMPT, model=model, node="meta_analyzer")
+    def __init__(
+        self,
+        model: str,
+        *,
+        timeout: float | None | Callable[[], float | None] = None,
+    ):
+        super().__init__(
+            base_prompt=PER_FILE_ANALYSIS_PROMPT,
+            model=model,
+            node="meta_analyzer",
+            timeout=timeout,
+        )
 
     def _estimate_extra_overhead(self, findings: list[Finding]) -> int:
         if not findings:
@@ -347,11 +354,13 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
     def build_prompt(self, batch: Batch, **kwargs: object) -> str:
         metadata_text = kwargs.get("metadata_text", "No metadata available")
         findings_text = _format_findings_for_prompt(batch.findings)
-        return self.base_prompt.format(
-            metadata=metadata_text,
-            file_label=batch.file_label,
-            file_content=batch.content,
-            static_findings=findings_text,
+        return append_output_language_instruction(
+            self.base_prompt.format(
+                metadata=metadata_text,
+                file_label=batch.file_label,
+                file_content=batch.content,
+                static_findings=findings_text,
+            )
         )
 
     def parse_response(  # type: ignore[override]  # Base class permits custom parsed values.
@@ -369,20 +378,12 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
     # -- Apply filter (keyed by file + rule_id + start/end_line) -------------
 
-    # Severities that must never be silently dropped by LLM filtering.
-    # Because the LLM receives attacker-controlled skill content, a prompt-injection
-    # payload could cause it to omit or deny a real CRITICAL/HIGH static finding.
-    # For these severities a false-negative (hiding a real vulnerability) is far
-    # worse than a false-positive, so we keep the original static finding regardless
-    # of what the LLM says and mark it "llm-unconfirmed" via the tags field.
-    _HIGH_SEVERITY_FLOOR = frozenset({"CRITICAL", "HIGH"})
-
     def apply_filter(
         self,
         findings: list[Finding],
         batch_results: list[tuple[Batch, list[dict[str, Any]]]],
     ) -> list[Finding]:
-        """Keep only LLM-confirmed findings, enriched with explanation / remediation.
+        """Enrich deterministic findings without letting LLM output suppress them.
 
         Uses granular ``(file, rule_id, start_line, end_line)`` keying when the
         LLM provides a ``start_line``, so multiple findings with the same
@@ -391,14 +392,9 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         callers that omit it still match.  Falls back to coarse
         ``(file, rule_id)`` keying for LLM responses that omit ``start_line``.
 
-        Severity-gated floor (security invariant)
-        ------------------------------------------
-        CRITICAL and HIGH static findings are **always** kept in the output even
-        if the LLM did not confirm them.  When the LLM omits or denies such a
-        finding the original static finding is preserved unchanged and the tag
-        ``"llm-unconfirmed"`` is appended so consumers can distinguish it from
-        LLM-validated findings.  MEDIUM and LOW findings continue to be filtered
-        by the LLM as before (false-positive reduction).
+        Every deterministic finding remains in primary output. Unconfirmed
+        findings receive an annotation tag; confirmed findings may gain an
+        explanation or higher confidence, but are never downgraded.
         """
         _enrichment = tuple[str, str, float]
         confirmed_granular: dict[tuple[str, str, int, int | None], _enrichment] = {}
@@ -449,38 +445,38 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
             elif coarse_key in confirmed_coarse:
                 expl, rem, conf = confirmed_coarse[coarse_key]
             else:
-                # Security: CRITICAL/HIGH static findings must survive LLM filtering.
-                # A prompt-injection payload in the scanned skill could cause the LLM
-                # to deny or omit a real high-severity finding; silently dropping it
-                # would be a false-negative in a security gate.  Keep the original
-                # finding and tag it so consumers know it was not LLM-validated.
-                if f.severity in self._HIGH_SEVERITY_FLOOR:
-                    unconfirmed_tags = list(f.tags)
-                    if "llm-unconfirmed" not in unconfirmed_tags:
-                        unconfirmed_tags.append("llm-unconfirmed")
-                    result.append(
-                        Finding(
-                            rule_id=f.rule_id,
-                            message=f.message,
-                            finding_id=f.finding_id,
-                            severity=f.severity,
-                            confidence=f.confidence,
-                            file=f.file,
-                            start_line=f.start_line,
-                            end_line=f.end_line,
-                            remediation=f.remediation or get_remediation(f.rule_id),
-                            tags=unconfirmed_tags,
-                            context=f.context,
-                            matched_text=f.matched_text,
-                            category=getattr(f, "category", None),
-                            pattern=getattr(f, "pattern", None),
-                            finding=getattr(f, "finding", None),
-                            explanation=getattr(f, "explanation", None),
-                            code_snippet=getattr(f, "code_snippet", None) or f.context,
-                            intent=None,
-                        )
+                unconfirmed_tags = list(f.tags)
+                if "llm-unconfirmed" not in unconfirmed_tags:
+                    unconfirmed_tags.append("llm-unconfirmed")
+                result.append(
+                    Finding(
+                        rule_id=f.rule_id,
+                        message=f.message,
+                        finding_id=f.finding_id,
+                        severity=f.severity,
+                        confidence=f.confidence,
+                        file=f.file,
+                        start_line=f.start_line,
+                        end_line=f.end_line,
+                        remediation=f.remediation or get_remediation(f.rule_id),
+                        tags=unconfirmed_tags,
+                        context=f.context,
+                        matched_text=f.matched_text,
+                        transitive_depth=f.transitive_depth,
+                        source_url=f.source_url,
+                        source_identity=f.source_identity,
+                        source_digest=f.source_digest,
+                        category=getattr(f, "category", None),
+                        pattern=getattr(f, "pattern", None),
+                        finding=getattr(f, "finding", None),
+                        explanation=getattr(f, "explanation", None),
+                        code_snippet=getattr(f, "code_snippet", None) or f.context,
+                        evidence=dict(f.evidence),
+                        intent=f.intent,
+                        match_fingerprint=f.match_fingerprint,
+                        occurrences=list(f.occurrences),
                     )
-                # MEDIUM/LOW: preserve existing behaviour (LLM may filter as false-positive).
+                )
                 continue
             result.append(
                 Finding(
@@ -488,7 +484,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                     message=expl,
                     finding_id=f.finding_id,
                     severity=f.severity,
-                    confidence=conf,
+                    confidence=max(f.confidence, conf),
                     file=f.file,
                     start_line=f.start_line,
                     end_line=f.end_line,
@@ -496,12 +492,19 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                     tags=f.tags,
                     context=f.context,
                     matched_text=f.matched_text,
+                    transitive_depth=f.transitive_depth,
+                    source_url=f.source_url,
+                    source_identity=f.source_identity,
+                    source_digest=f.source_digest,
                     category=getattr(f, "category", None),
                     pattern=getattr(f, "pattern", None),
                     finding=getattr(f, "finding", None),
                     explanation=expl,
                     code_snippet=getattr(f, "code_snippet", None) or f.context,
-                    intent=None,
+                    evidence=dict(f.evidence),
+                    intent=f.intent,
+                    match_fingerprint=f.match_fingerprint,
+                    occurrences=list(f.occurrences),
                 )
             )
         return result
@@ -561,7 +564,11 @@ def _meta_ledger_response(
         events.append(
             ledger_event(
                 analyzer_id="meta_analyzer",
-                outcome=outcome_for_llm_batch_failure(failure.reason),
+                outcome=(
+                    LedgerOutcome.PARTIAL
+                    if failure.reason is LedgerReason.RUNTIME_LIMIT
+                    else outcome_for_llm_batch_failure(failure.reason)
+                ),
                 phase="meta",
                 path=batch.file_path,
                 start_line=batch.start_line if batch.end_line is not None else None,
@@ -575,6 +582,70 @@ def _meta_ledger_response(
     if not events:
         return events, analyzer_status_event(analyzer_id="meta_analyzer", status="completed")
     return events, analyzer_status_for_events("meta_analyzer", events)
+
+
+def _effective_finding_ids(findings: list[Finding]) -> list[str]:
+    """Return final finding identities in stable output order."""
+    return list(dict.fromkeys(finding.finding_id for finding in findings))
+
+
+def _is_llm_eligible(
+    finding: Finding,
+    provider_file_cache: dict[str, str],
+    local_only_paths: set[str],
+) -> bool:
+    """Return whether a finding and its content are safe to send to the provider."""
+    return (
+        finding.file in provider_file_cache
+        and finding.file not in local_only_paths
+        and "local-only" not in finding.tags
+        and finding.evidence.get("local_only") is not True
+    )
+
+
+def _local_only_events(findings: list[Finding]) -> list[InspectionLedgerEvent]:
+    """Account for findings retained locally without provider submission."""
+    events: list[InspectionLedgerEvent] = []
+    by_file: dict[str, list[Finding]] = {}
+    for finding in findings:
+        by_file.setdefault(finding.file, []).append(finding)
+    for path, path_findings in sorted(by_file.items()):
+        finding_ids = [finding.finding_id for finding in path_findings]
+        events.append(
+            ledger_event(
+                analyzer_id="meta_analyzer",
+                outcome=LedgerOutcome.COMPLETED,
+                phase="meta",
+                path=path,
+                input_finding_ids=finding_ids,
+                emitted_finding_ids=finding_ids,
+            )
+        )
+    return events
+
+
+def _runtime_limited_events(findings: list[Finding]) -> list[InspectionLedgerEvent]:
+    """Retain deterministic findings with partial evidence when time is exhausted."""
+    events: list[InspectionLedgerEvent] = []
+    by_file: dict[str, list[Finding]] = {}
+    for finding in findings:
+        by_file.setdefault(finding.file, []).append(finding)
+    for path, path_findings in sorted(by_file.items()):
+        finding_ids = [finding.finding_id for finding in path_findings]
+        events.append(
+            ledger_event(
+                analyzer_id="meta_analyzer",
+                outcome=LedgerOutcome.PARTIAL,
+                phase="meta",
+                path=path,
+                reason=LedgerReason.RUNTIME_LIMIT,
+                input_finding_ids=finding_ids,
+                emitted_finding_ids=finding_ids,
+                observed_seconds=0.0,
+                limit_seconds=0.0,
+            )
+        )
+    return events
 
 
 def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
@@ -604,11 +675,37 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             ],
         }
 
+    # The workflow deadline applies to the whole graph, including the
+    # deterministic fallback path.  Check it before partitioning or cloning
+    # findings so an already-expired scan does not spend bounded-but-material
+    # work copying evidence and occurrence payloads.  The canonical static
+    # findings are retained directly (fail closed) and the ledger records why
+    # meta processing did not start.
+    shared_remaining = transitive_remaining_seconds(state)
+    if shared_remaining is not None and shared_remaining <= 0:
+        events = _runtime_limited_events(findings)
+        response: MetaAnalyzerResponse = {
+            "findings": findings,
+            "effective_finding_ids": _effective_finding_ids(findings),
+            "inspection_ledger": events,
+            "analyzer_status_events": [analyzer_status_for_events("meta_analyzer", events)],
+        }
+        if state.get("use_llm", True) is not False:
+            response["llm_call_log"] = [
+                llm_call_record(
+                    "meta_analyzer",
+                    ok=False,
+                    error="shared runtime limit reached",
+                )
+            ]
+            response["inference_usage"] = []
+        return response
+
     if state.get("use_llm", True) is False:
         filtered = _fallback_filtered(findings)
         return {
             "findings": filtered,
-            "effective_finding_ids": [finding.finding_id for finding in filtered],
+            "effective_finding_ids": _effective_finding_ids(filtered),
             "inspection_ledger": [],
             "analyzer_status_events": [
                 analyzer_status_event(
@@ -619,7 +716,37 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             ],
         }
 
-    file_cache: dict[str, str] = state.get("file_cache") or {}
+    # Prefer the explicitly provider-safe cache. Falling back to file_cache
+    # preserves compatibility for callers that predate llm_file_cache.
+    llm_cache = state.get("llm_file_cache")
+    file_cache: dict[str, str] = (
+        llm_cache if isinstance(llm_cache, dict) else state.get("file_cache") or {}
+    )
+    local_only_paths = {
+        str(metadata.get("path", ""))
+        for metadata in state.get("component_metadata", []) or []
+        if metadata.get("local_only") is True
+    }
+    eligible_findings: list[Finding] = []
+    local_only_findings: list[Finding] = []
+    for finding in findings:
+        target = (
+            eligible_findings
+            if _is_llm_eligible(finding, file_cache, local_only_paths)
+            else local_only_findings
+        )
+        target.append(finding)
+    local_only_ids = {finding.finding_id for finding in local_only_findings}
+
+    if not eligible_findings:
+        filtered_local = _fallback_filtered(local_only_findings)
+        events = _local_only_events(filtered_local)
+        return {
+            "findings": filtered_local,
+            "effective_finding_ids": _effective_finding_ids(filtered_local),
+            "inspection_ledger": events,
+            "analyzer_status_events": [analyzer_status_for_events("meta_analyzer", events)],
+        }
     manifest: dict[str, object] = state.get("manifest") or {}
     model_config: dict[str, str] = state.get("model_config") or {}
     model = (
@@ -628,8 +755,12 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         or _SKILLSPECTOR_DEFAULT_MODEL
     )
 
+    timeout = (
+        (lambda: transitive_remaining_seconds(state)) if shared_remaining is not None else None
+    )
+
     metadata_text = _format_metadata(manifest)
-    files_with_findings = sorted({f.file for f in findings})
+    files_with_findings = sorted({f.file for f in eligible_findings})
 
     analyzer: LLMMetaAnalyzer | None = None
     batches: list[Batch] = []
@@ -637,8 +768,8 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
         # Construct inside the try so a chat-model construction failure is caught
         # and recorded as a degraded LLM call (consistent with the semantic
         # analyzers) rather than crashing the whole graph.
-        analyzer = LLMMetaAnalyzer(model=model)
-        batches = analyzer.get_batches(files_with_findings, file_cache, findings)
+        analyzer = LLMMetaAnalyzer(model=model, timeout=timeout)
+        batches = analyzer.get_batches(files_with_findings, file_cache, eligible_findings)
         batches = [batch for batch in batches if batch.findings]
         logger.debug(
             "Meta-analyzer: %d files -> %d batches (model=%s)",
@@ -681,10 +812,14 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             analysed_ids = {
                 finding.finding_id for batch, _ in batch_results for finding in batch.findings
             }
-            analysed = [finding for finding in findings if finding.finding_id in analysed_ids]
-            unanalysed = [finding for finding in findings if finding.finding_id not in analysed_ids]
+            analysed = [
+                finding for finding in eligible_findings if finding.finding_id in analysed_ids
+            ]
+            unanalysed = [
+                finding for finding in eligible_findings if finding.finding_id not in analysed_ids
+            ]
         else:
-            analysed, unanalysed = findings, []
+            analysed, unanalysed = eligible_findings, []
 
         filtered = analyzer.apply_filter(analysed, batch_results)
         if unanalysed:
@@ -697,6 +832,8 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 len({f.file for f in unanalysed}),
             )
             filtered.extend(_fallback_filtered(unanalysed))
+        filtered_local = _fallback_filtered(local_only_findings)
+        filtered.extend(filtered_local)
 
         logger.debug(
             "LLM filtering done: %d findings -> %d after filter",
@@ -704,26 +841,52 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(filtered),
         )
         ledger_events, status = _meta_ledger_response(batches, detailed, filtered)
+        ledger_events.extend(_local_only_events(filtered_local))
+        status = analyzer_status_for_events("meta_analyzer", ledger_events)
         return {
             "findings": filtered,
-            "effective_finding_ids": list(
-                dict.fromkeys(
-                    finding_id
-                    for event in ledger_events
-                    for finding_id in event["emitted_finding_ids"]
-                )
-            ),
+            "effective_finding_ids": _effective_finding_ids(filtered),
             "inspection_ledger": ledger_events,
             "analyzer_status_events": [status],
             "llm_call_log": [
-                llm_call_record(
-                    "meta_analyzer",
-                    ok=bool(detailed.successful) or not detailed.failures,
-                )
+                # A record is ok only when every submitted batch succeeded. A
+                # partial batch failure (e.g. one file's batch 429'd while
+                # another's succeeded) is still lost coverage, so it must not
+                # read as ok=True just because some batches came back.
+                llm_call_record("meta_analyzer", ok=not detailed.failures)
             ],
             "inference_usage": analyzer.inference_usage,
         }
     except Exception as e:
+        if isinstance(e, LLMRuntimeLimitError):
+            filtered = _passthrough_with_defaults(findings)
+            eligible_ids = {finding.finding_id for finding in eligible_findings}
+            filtered_eligible = [
+                finding for finding in filtered if finding.finding_id in eligible_ids
+            ]
+            filtered_local = [
+                finding for finding in filtered if finding.finding_id in local_only_ids
+            ]
+            ledger_events = [
+                *_runtime_limited_events(filtered_eligible),
+                *_local_only_events(filtered_local),
+            ]
+            return {
+                "findings": filtered,
+                "effective_finding_ids": _effective_finding_ids(filtered),
+                "inspection_ledger": ledger_events,
+                "analyzer_status_events": [
+                    analyzer_status_for_events("meta_analyzer", ledger_events)
+                ],
+                "llm_call_log": [
+                    llm_call_record(
+                        "meta_analyzer",
+                        ok=False,
+                        error="shared runtime limit reached",
+                    )
+                ],
+                "inference_usage": analyzer.inference_usage if analyzer is not None else [],
+            }
         post_response_value_error = (
             isinstance(e, ValueError) and analyzer is not None and analyzer.response_received
         )
@@ -731,6 +894,7 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             raise
         logger.warning("LLM call failed, passing all findings through (fail-closed): %s", e)
         filtered = _passthrough_with_defaults(findings)
+        filtered_local = [finding for finding in filtered if finding.finding_id in local_only_ids]
         if post_response_value_error:
             ledger_events, status = _meta_ledger_response(
                 batches,
@@ -741,12 +905,14 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
                 ),
                 filtered,
             )
+            ledger_events.extend(_local_only_events(filtered_local))
+            status = analyzer_status_for_events("meta_analyzer", ledger_events)
         else:
-            ledger_events = []
+            ledger_events = _local_only_events(filtered_local)
             status = analyzer_status_event(analyzer_id="meta_analyzer", status="unavailable")
         return {
             "findings": filtered,
-            "effective_finding_ids": [finding.finding_id for finding in filtered],
+            "effective_finding_ids": _effective_finding_ids(filtered),
             "inspection_ledger": ledger_events,
             "analyzer_status_events": [status],
             "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],

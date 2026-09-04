@@ -83,15 +83,15 @@ class TestMiniMaxProvider:
 
     def test_creates_chat_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
-        llm = MiniMaxProvider().create_chat_model("MiniMax-M3", max_tokens=123)
+        llm = MiniMaxProvider().create_chat_model("MiniMax-M2.7", max_tokens=123)
         assert isinstance(llm, ChatOpenAI)
-        assert llm.model_name == "MiniMax-M3"
+        assert llm.model_name == "MiniMax-M2.7"
         assert llm.max_tokens == 123
         assert str(llm.openai_api_base).rstrip("/") == MINIMAX_GLOBAL_BASE_URL
 
     def test_bundled_models_and_context_windows(self) -> None:
         provider = MiniMaxProvider()
-        assert provider.resolve_model() == "MiniMax-M3"
+        assert provider.resolve_model() == "MiniMax-M2.7"
         assert provider.get_context_length("MiniMax-M3") == 1_000_000
         assert provider.get_context_length("MiniMax-M2.7") == 204_800
         assert provider.get_max_output_tokens("MiniMax-M3") is None

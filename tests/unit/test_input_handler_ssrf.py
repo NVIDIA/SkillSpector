@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -80,19 +80,35 @@ class TestGitCloneSSRF:
             handler._clone_git("http://169.254.169.254/latest/meta-data/")
         handler.cleanup()
 
-    @patch("skillspector.input_handler.subprocess.run")
+    @patch("skillspector.input_handler.subprocess.Popen")
     def test_github_url_allowed(self, mock_run) -> None:
-        mock_run.return_value = None
+        def fake_clone(command: list[str], **_kwargs: object) -> MagicMock:
+            Path(command[-1]).mkdir(parents=True)
+            process = MagicMock()
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            return process
+
+        mock_run.side_effect = fake_clone
         handler = InputHandler()
-        handler._clone_git("https://github.com/NVIDIA/SkillSpector.git")
+        with patch("skillspector.input_handler._is_private_ip", return_value=False):
+            handler._clone_git("https://github.com/NVIDIA/SkillSpector.git")
         mock_run.assert_called_once()
         handler.cleanup()
 
-    @patch("skillspector.input_handler.subprocess.run")
+    @patch("skillspector.input_handler.subprocess.Popen")
     def test_gitlab_url_allowed(self, mock_run) -> None:
-        mock_run.return_value = None
+        def fake_clone(command: list[str], **_kwargs: object) -> MagicMock:
+            Path(command[-1]).mkdir(parents=True)
+            process = MagicMock()
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            return process
+
+        mock_run.side_effect = fake_clone
         handler = InputHandler()
-        handler._clone_git("https://gitlab.com/user/repo.git")
+        with patch("skillspector.input_handler._is_private_ip", return_value=False):
+            handler._clone_git("https://gitlab.com/user/repo.git")
         mock_run.assert_called_once()
         handler.cleanup()
 
@@ -128,9 +144,10 @@ class TestDownloadSSRF:
         mock_response.headers = {"content-type": "text/markdown"}
         mock_response.iter_bytes.return_value = iter([b"# SKILL.md content"])
         handler = InputHandler()
-        result = handler._download_file(
-            "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/SKILL.md"
-        )
+        with patch("skillspector.input_handler._is_private_ip", return_value=False):
+            result = handler._download_file(
+                "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/SKILL.md"
+            )
         assert result.is_dir()
         handler.cleanup()
 
@@ -143,9 +160,10 @@ class TestDownloadSSRF:
         mock_response.iter_bytes.return_value = iter([b"# content"])
         handler = InputHandler()
         try:
-            handler._download_file(
-                "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/SKILL.md"
-            )
+            with patch("skillspector.input_handler._is_private_ip", return_value=False):
+                handler._download_file(
+                    "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/SKILL.md"
+                )
         except Exception:
             pass
         mock_client_cls.assert_called_once_with(follow_redirects=False, timeout=30)

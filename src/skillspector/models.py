@@ -17,8 +17,13 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum
+from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
@@ -44,6 +49,12 @@ class Location:
     end_line: int | None = None
 
 
+_analyzer_finding_observer: ContextVar[Callable[[AnalyzerFinding], None] | None] = ContextVar(
+    "skillspector_analyzer_finding_observer",
+    default=None,
+)
+
+
 @dataclass
 class AnalyzerFinding:
     """
@@ -60,6 +71,32 @@ class AnalyzerFinding:
     tags: list[str] = field(default_factory=list)
     context: str | None = None
     matched_text: str | None = None
+    evidence: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Notify an optional runner-owned resource guard after construction.
+
+        Static analyzers are trusted code, but the number of findings they
+        construct is controlled by untrusted input.  A context-local observer
+        lets the shared runner stop an analyzer while it is still building its
+        private result list instead of waiting for that list to become large.
+        Other analyzer families pay no cost beyond this single context lookup.
+        """
+        observer = _analyzer_finding_observer.get()
+        if observer is not None:
+            observer(self)
+
+
+@contextmanager
+def observe_analyzer_findings(
+    observer: Callable[[AnalyzerFinding], None],
+) -> Iterator[None]:
+    """Install a task-local observer for newly constructed analyzer findings."""
+    token = _analyzer_finding_observer.set(observer)
+    try:
+        yield
+    finally:
+        _analyzer_finding_observer.reset(token)
 
 
 def _new_finding_id() -> str:
@@ -89,10 +126,88 @@ class Finding:
     tags: list[str] = field(default_factory=list)
     context: str | None = None
     matched_text: str | None = None
+    transitive_depth: int = 0
+    source_url: str | None = None
+    # ``source_url`` is display metadata and can be mutable (for example a
+    # branch URL). These values are the report-safe, immutable provenance
+    # attached by transitive traversal: an opaque source scope and the digest
+    # of the exact tree/content that was inspected.
+    source_identity: str | None = None
+    source_digest: str | None = None
+    evidence: dict[str, object] = field(default_factory=dict)
+    match_fingerprint: str | None = None
+    occurrences: list[dict[str, object]] = field(default_factory=list)
+
+    def fingerprint(self) -> str | None:
+        """Return a full-match fingerprint without exposing the matched payload."""
+        has_source_provenance = bool(
+            self.source_identity or self.source_digest or self.source_url or self.transitive_depth
+        )
+        if self.match_fingerprint and not has_source_provenance:
+            return self.match_fingerprint
+        if not self.match_fingerprint and not self.matched_text:
+            return None
+        provenance = {
+            "source_identity": self.source_identity or "",
+            "source_digest": self.source_digest or "",
+            # URL is only a compatibility discriminator when immutable source
+            # provenance is unavailable; it is display-only otherwise.
+            "source_url": (
+                self.source_url if not self.source_identity and not self.source_digest else ""
+            )
+            or "",
+            "transitive_depth": self.transitive_depth,
+        }
+        provenance_json = json.dumps(
+            provenance, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        provenance_hash = sha256(provenance_json.encode()).hexdigest()
+        source_prefix = f"source-sha256:{provenance_hash}:"
+        # A source-bound fingerprint is tagged with its provenance hash so
+        # compaction remains idempotent while a changed source is re-bound.
+        if self.match_fingerprint and self.match_fingerprint.startswith(source_prefix):
+            return self.match_fingerprint
+        normalized = (
+            self.match_fingerprint
+            if self.match_fingerprint
+            else " ".join((self.matched_text or "").strip().split())
+        )
+        if not has_source_provenance:
+            return sha256(f"{self.rule_id}\x1f{normalized}".encode()).hexdigest()
+        payload = {
+            "rule_id": self.rule_id,
+            "match": normalized,
+            "source": provenance,
+        }
+        canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return f"{source_prefix}{sha256(canonical.encode()).hexdigest()}"
+
+    def _serialized_occurrences(self) -> list[dict[str, object]]:
+        """Return locations with the finding's immutable provenance attached."""
+        occurrences = list(self.occurrences) or [
+            {
+                "file": self.file,
+                "start_line": self.start_line,
+                "end_line": self.end_line,
+            }
+        ]
+        serialized: list[dict[str, object]] = []
+        for raw in occurrences:
+            occurrence = dict(raw)
+            if self.source_identity:
+                occurrence.setdefault("source_identity", self.source_identity)
+            if self.source_digest:
+                occurrence.setdefault("source_digest", self.source_digest)
+            if self.source_url:
+                occurrence.setdefault("source_url", self.source_url)
+            if self.transitive_depth:
+                occurrence.setdefault("transitive_depth", self.transitive_depth)
+            serialized.append(occurrence)
+        return serialized
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dict representation (full finding shape)."""
-        return {
+        data: dict[str, object] = {
             "id": self.rule_id,
             "finding_id": self.finding_id,
             "category": self.category,
@@ -112,7 +227,19 @@ class Finding:
             # Tags surface markers like "llm-unconfirmed" (a high-severity static
             # finding the LLM filter did not confirm but which is preserved anyway).
             "tags": list(self.tags),
+            "evidence": dict(self.evidence),
+            "match_fingerprint": self.fingerprint(),
+            "occurrences": self._serialized_occurrences(),
         }
+        if self.transitive_depth:
+            data["transitive_depth"] = self.transitive_depth
+        if self.source_url:
+            data["source_url"] = self.source_url
+        if self.source_identity:
+            data["source_identity"] = self.source_identity
+        if self.source_digest:
+            data["source_digest"] = self.source_digest
+        return data
 
     def __str__(self) -> str:
         return f"{self.rule_id}: {self.message} ({self.file}:{self.start_line})"
