@@ -254,6 +254,60 @@ for key, val in os.environ.items():
 
         assert not any(finding.rule_id == "E2" for finding in findings)
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env | grep secret",
+            "env | grep -i -E 'token|key|secret' > /tmp/ctx.txt",
+            'env | grep -iE "aws_|secret"',
+            "env | grep --ignore-case token",
+            "env | egrep -e password -e token",
+            "env | grep AWS_SECRET_ACCESS_KEY",
+            "printenv | grep -i secret",
+            "env|grep KEY",
+        ],
+    )
+    def test_e2_shell_env_grep_forms(self, command: str) -> None:
+        """Piping the environment through grep for secrets is detected whatever the flags."""
+        content = f"# Setup\n\n```bash\n{command}\n```\n"
+
+        findings = data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+        e2 = [finding for finding in findings if finding.rule_id == "E2"]
+
+        assert len(e2) == 1
+        assert e2[0].location.start_line == 4
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env | grep PATH",
+            "env | grep -i home",
+            "env | grep MONKEY_PATCH",
+            "env | grep -v SECRET",
+            "printenv | grep -v -E 'KEY|SECRET|TOKEN'",
+            "dotenv | grep KEY",
+            "env | grep -i PATH  # the token lives elsewhere",
+            "Run `env | grep PATH` to check the search path before setting your API key.",
+            "printenv HOME",
+        ],
+    )
+    def test_e2_shell_env_grep_ordinary_or_inverted_is_not_harvesting(self, command: str) -> None:
+        """Grepping the environment for ordinary names, or excluding secrets, is not harvesting."""
+        content = f"{command}\n"
+
+        findings = data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+
+        assert not any(finding.rule_id == "E2" for finding in findings)
+
+    def test_e2_shell_env_grep_long_flag_run_terminates_quickly(self) -> None:
+        """A long run of grep flags cannot make the shell pattern backtrack."""
+        content = "```bash\nenv | grep " + "--ab-cd " * 60 + "x\n```\n"
+
+        started = time.perf_counter()
+        data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+
+        assert time.perf_counter() - started < 2.0
+
 
 class TestPrivilegeEscalation:
     """privilege_escalation.analyze() — PE3."""

@@ -71,7 +71,15 @@ E2_OTHER_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
-    (r"env\s*\|\s*grep\s+(?:-i\s+)?(?:key|secret|token|password)", 0.8),
+    # Shell: env/printenv piped to grep for secrets. The flag run is possessive so a long
+    # run of flags cannot backtrack, and -v is excluded because inverting the match is the
+    # redaction idiom rather than harvesting.
+    (
+        r"\b(?:printenv|env)\s*\|\s*[ef]?grep(?![^\n]*\s-(?:\w*v|-invert-match))"
+        r"\s+(?:--?[\w-]+\s+)*+['\"`]?[^'\"`\n;>&#]{0,40}?(?<![a-z0-9])"
+        r"(?:key|secret|token|password)",
+        0.8,
+    ),
     (r"printenv\s+(?:\w*(?:KEY|SECRET|TOKEN|PASSWORD)\w*)", 0.7),
     (r"collect\s+(?:all\s+)?(?:environment\s+variables?|env\s+vars?)", 0.7),
     (r"(?:extract|harvest|gather)\s+(?:api\s+)?keys?\s+from\s+environment", 0.8),
