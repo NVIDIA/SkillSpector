@@ -179,11 +179,13 @@ for distribution in importlib.metadata.distributions():
             parsed = urllib.parse.urlsplit(raw_url)
             if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
                 raise RuntimeError(f"editable dependency is not a local file target: {normalized_name}")
-            # Preserve the scheme-less URL rather than passing only parsed.path:
             # url2pathname needs the empty-authority delimiter for paths beginning
-            # with "//", while still removing a Windows drive path's leading slash.
-            schemeless_url = parsed._replace(scheme="", query="", fragment="").geturl()
-            editable_root = Path(urllib.request.url2pathname(schemeless_url)).resolve(strict=True)
+            # with "//". Build it explicitly because urlunsplit() normalizes this
+            # form differently across Python patch releases.
+            converter_input = parsed.path
+            if not parsed.netloc and converter_input.startswith("//"):
+                converter_input = f"//{converter_input}"
+            editable_root = Path(urllib.request.url2pathname(converter_input)).resolve(strict=True)
             if not editable_root.is_dir():
                 raise RuntimeError(f"editable dependency target is not a directory: {normalized_name}")
             for editable_path in sorted(editable_root.rglob("*")):
