@@ -179,9 +179,11 @@ for distribution in importlib.metadata.distributions():
             parsed = urllib.parse.urlsplit(raw_url)
             if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
                 raise RuntimeError(f"editable dependency is not a local file target: {normalized_name}")
-            # url2pathname, not unquote: a Windows file URL's path is "/C:/..."
-            # and Path() would read the leading slash as a root, producing "C:\C:\...".
-            editable_root = Path(urllib.request.url2pathname(parsed.path)).resolve(strict=True)
+            # Preserve the scheme-less URL rather than passing only parsed.path:
+            # url2pathname needs the empty-authority delimiter for paths beginning
+            # with "//", while still removing a Windows drive path's leading slash.
+            schemeless_url = parsed._replace(scheme="", query="", fragment="").geturl()
+            editable_root = Path(urllib.request.url2pathname(schemeless_url)).resolve(strict=True)
             if not editable_root.is_dir():
                 raise RuntimeError(f"editable dependency target is not a directory: {normalized_name}")
             for editable_path in sorted(editable_root.rglob("*")):
