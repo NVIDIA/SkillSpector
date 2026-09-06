@@ -91,6 +91,7 @@ _WEBSHELL_FIXTURES = {
     "behinder_php": "PD9waHAgQGVycm9yX3JlcG9ydGluZygwKTsgc2Vzc2lvbl9zdGFydCgpOyAka2V5PSJlNDVlMzI5ZmViNWQ5MjViIjsKJF9TRVNTSU9OWydrJ109JGtleTsgJHBvc3Q9ZmlsZV9nZXRfY29udGVudHMoInBocDovL2lucHV0Iik7CiRwb3N0PW9wZW5zc2xfZGVjcnlwdCgkcG9zdCwgIkFFUzEyOCIsICRrZXkpOyBldmFsKCRwb3N0KTsgPz4K",
     "behinder_jsp": "PCVAcGFnZSBpbXBvcnQ9ImphdmEudXRpbC4qLGphdmF4LmNyeXB0by4qIiU+CjwlIFN0cmluZyBrPSJlNDVlMzI5ZmViNWQ5MjViIjsgc2Vzc2lvbi5wdXRWYWx1ZSgidSIsayk7CkNpcGhlciBjPUNpcGhlci5nZXRJbnN0YW5jZSgiQUVTIik7ICU+Cg==",
     "wso_php": "PD9waHAgZGVmaW5lKCdXU09fVkVSU0lPTicsICcyLjUnKTsKZnVuY3Rpb24gd3NvRXgoJGluKSB7ICRvdXQ9Jyc7IGlmKGZ1bmN0aW9uX2V4aXN0cygnZXhlYycpKSB7IEBleGVjKCRpbiwkb3V0KTsgfQpyZXR1cm4gJG91dDsgfQo=",
+    "wso_mixed_case": "PD9waHAgZGVmaW5lKCJ3c29fdmVyc2lvbiIsICIyLjciKTsKZnVuY3Rpb24gV1NPRVgoJGluKSB7IHJldHVybiAkaW47IH0K",
 }
 
 
@@ -579,11 +580,26 @@ rule agent_skill_destructive_autonomous_actions {
         assert not _has_rule(findings, "php_webshell_known")
 
     @pytest.mark.parametrize(
+        "content",
+        [
+            "<?php define('WSO_VERSION', '0.5.2'); ?>\n",
+            "function wsoEx($input) { return $input; }\n",
+            "function wsoSecParam($name, $value) { return $value; }\n",
+            "Known indicator: e45e329feb5d925b\n",
+        ],
+        ids=["version_constant", "execution_helper", "security_helper", "key_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_isolated_family_markers(self, content):
+        findings = _run_builtin(content, "reference.php")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
         ("fixture", "filename"),
         [
             ("behinder_php", "shell.php"),
             ("behinder_jsp", "shell.jsp"),
             ("wso_php", "shell.php"),
+            ("wso_mixed_case", "shell.php"),
         ],
     )
     def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
