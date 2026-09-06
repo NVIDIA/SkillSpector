@@ -207,6 +207,17 @@ class TestCharacterLimit:
 
         assert not any(finding.rule_id == "EA1" for finding in findings)
 
+    def test_blank_line_breaks_dotall_static_pattern_match(self) -> None:
+        findings = static_runner.run_static_patterns(
+            {
+                "components": ["SKILL.md"],
+                "file_cache": {"SKILL.md": "<!-- harmless text\n\nsystem instruction -->"},
+            },
+            [pi_module],
+        )
+
+        assert not any(finding.rule_id == "P2" for finding in findings)
+
     def test_soft_wrapped_static_pattern_match_is_preserved(self) -> None:
         findings = static_runner.run_static_patterns(
             {

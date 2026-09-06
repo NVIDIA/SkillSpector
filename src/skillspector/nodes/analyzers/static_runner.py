@@ -163,9 +163,6 @@ def iter_paragraph_matches(
 ) -> Iterator[re.Match[str]]:
     """Yield matches without letting a pattern bridge a blank paragraph boundary."""
     regex = re.compile(pattern, flags)
-    if r"\s+" not in regex.pattern and r"\s*" not in regex.pattern:
-        yield from regex.finditer(content)
-        return
     ranges = _paragraph_ranges(content)
     if not ranges:
         yield from regex.finditer(content)
