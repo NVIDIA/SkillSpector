@@ -212,7 +212,7 @@ def _p2_pattern_matches(content: str, pattern: str) -> Iterator[re.Match[str]]:
     """Yield all structured matches or the first control signal on each line."""
     compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
-        yield from compiled.finditer(content)
+        yield from static_runner.iter_paragraph_matches(compiled, content)
         return
 
     cursor = 0
@@ -260,7 +260,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.PROMPT_INJECTION.value]
 
     for pattern, confidence in P1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -291,7 +293,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
     for pattern, confidence in P3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -306,7 +310,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in P4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

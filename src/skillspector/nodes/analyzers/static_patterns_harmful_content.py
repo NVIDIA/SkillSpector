@@ -92,7 +92,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.PROMPT_INJECTION.value]
 
     for pattern, confidence in DANGEROUS_ACTIONS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE | re.DOTALL):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE | re.DOTALL
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

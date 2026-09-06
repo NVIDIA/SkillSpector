@@ -122,6 +122,56 @@ _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
+_PARAGRAPH_BOUNDARY = re.compile(
+    rf"(?:{LOGICAL_LINE_BREAK.pattern})[ \t]*(?:{LOGICAL_LINE_BREAK.pattern})"
+)
+_PARAGRAPH_RANGE_CACHE: dict[int, tuple[str, tuple[tuple[int, int], ...]]] = {}
+_PARAGRAPH_RANGE_CACHE_SIZE = 2
+_PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS = 1_000_000
+_PARAGRAPH_RANGE_CACHE_MAX_RANGES = 4_096
+
+
+def _paragraph_ranges(content: str) -> tuple[tuple[int, int], ...]:
+    cache_key = id(content)
+    cached = _PARAGRAPH_RANGE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is content:
+        return cached[1]
+
+    start = 0
+    ranges: list[tuple[int, int]] = []
+    for boundary in _PARAGRAPH_BOUNDARY.finditer(content):
+        ranges.append((start, boundary.start()))
+        start = boundary.end()
+    if not ranges:
+        result = ()
+    else:
+        ranges.append((start, len(content)))
+        result = tuple(ranges)
+
+    if (
+        len(content) <= _PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS
+        and len(result) <= _PARAGRAPH_RANGE_CACHE_MAX_RANGES
+    ):
+        if len(_PARAGRAPH_RANGE_CACHE) >= _PARAGRAPH_RANGE_CACHE_SIZE:
+            _PARAGRAPH_RANGE_CACHE.clear()
+        _PARAGRAPH_RANGE_CACHE[cache_key] = (content, result)
+    return result
+
+
+def iter_paragraph_matches(
+    pattern: str | re.Pattern[str], content: str, flags: int = 0
+) -> Iterator[re.Match[str]]:
+    """Yield matches without letting a pattern bridge a blank paragraph boundary."""
+    regex = re.compile(pattern, flags)
+    if r"\s+" not in regex.pattern and r"\s*" not in regex.pattern:
+        yield from regex.finditer(content)
+        return
+    ranges = _paragraph_ranges(content)
+    if not ranges:
+        yield from regex.finditer(content)
+        return
+    for start, end in ranges:
+        yield from regex.finditer(content, start, end)
 
 
 def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:

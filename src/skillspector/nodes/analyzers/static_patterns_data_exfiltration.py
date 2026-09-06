@@ -289,7 +289,9 @@ def analyze(
     tag = [PatternCategory.DATA_EXFILTRATION.value]
 
     for pattern, confidence in E1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             adj = (
                 min(1.0, confidence + 0.1)
@@ -318,7 +320,9 @@ def analyze(
             e2_patterns = E2_OTHER_PATTERNS
 
     for pattern, confidence in e2_patterns:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -333,7 +337,9 @@ def analyze(
                 )
             )
     for pattern, confidence in E3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -348,7 +354,9 @@ def analyze(
                 )
             )
     for pattern, confidence in E4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -364,7 +372,9 @@ def analyze(
             )
     # E5: cloud-storage exfiltration. Example filtering is delegated to the runner.
     for pattern, confidence in E5_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
