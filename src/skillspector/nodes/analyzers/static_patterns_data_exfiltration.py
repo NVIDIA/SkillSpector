@@ -86,6 +86,20 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
+# Calls that hand an environment mapping to a child process. Materializing
+# ``os.environ`` for one of these is process launching, not harvesting: the child
+# receives the environment the skill already runs in, and no value leaves the host.
+_CHILD_PROCESS_ENV_CALLS = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+    }
+)
 E3_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -179,6 +193,47 @@ def _is_dynamic_copy_call(call: ast.Call, aliases: dict[str, str]) -> bool:
     )
 
 
+def _collect_child_process_environments(
+    tree: ast.AST, aliases: dict[str, str]
+) -> tuple[set[int], set[str]]:
+    """Collect environment mappings handed to a child process.
+
+    Returns the ids of expressions passed directly as ``env=`` and the names of
+    variables passed as ``env=``, so a mapping built on one line and launched on
+    another is recognized at the line that builds it.
+    """
+    node_ids: set[int] = set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if resolve_call_name(node, aliases) not in _CHILD_PROCESS_ENV_CALLS:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "env":
+                continue
+            node_ids.add(id(keyword.value))
+            if isinstance(keyword.value, ast.Name):
+                names.add(keyword.value.id)
+    return node_ids, names
+
+
+def _collect_assigned_names(tree: ast.AST) -> dict[int, set[str]]:
+    """Map each assigned expression to the plain names it is bound to."""
+    assigned: dict[int, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        else:
+            continue
+        names = {target.id for target in targets if isinstance(target, ast.Name)}
+        if names and node.value is not None:
+            assigned.setdefault(id(node.value), set()).update(names)
+    return assigned
+
+
 def _analyze_python_environment_reads(
     content: str,
     file_path: str,
@@ -204,6 +259,8 @@ def _analyze_python_environment_reads(
 
     aliases = python_ast.import_aliases
     lines = python_ast.lines
+    child_env_nodes, child_env_names = _collect_child_process_environments(tree, aliases)
+    assigned_names = _collect_assigned_names(tree)
     findings: list[AnalyzerFinding] = []
     emitted: set[int] = set()
     tag = [PatternCategory.DATA_EXFILTRATION.value]
@@ -211,6 +268,8 @@ def _analyze_python_environment_reads(
     def emit(node: ast.AST, confidence: float) -> None:
         node_id = id(node)
         if node_id in emitted:
+            return
+        if node_id in child_env_nodes or assigned_names.get(node_id, frozenset()) & child_env_names:
             return
         emitted.add(node_id)
         lineno = getattr(node, "lineno", 1)
