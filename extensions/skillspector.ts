@@ -15,7 +15,7 @@ const scanSchema = Type.Object({
   output: Type.Optional(Type.String({ description: "Optional report output path." })),
   noLlm: Type.Optional(Type.Boolean({ description: "Skip LLM analysis. Defaults to true." })),
   provider: Type.Optional(
-    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference"] as const, {
+    StringEnum(["openai", "anthropic", "anthropic_proxy", "nv_build", "nv_inference", "gemini"] as const, {
       description: "Optional SkillSpector LLM provider when noLlm is false.",
     }),
   ),

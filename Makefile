@@ -1,4 +1,4 @@
-.PHONY: help install install-dev langgraph-dev test test-unit test-provider openai anthropic nv_build test-integration test-cov test-ci lint lint-fix format format-check clean build docker-build docker-smoke
+.PHONY: help install install-dev langgraph-dev test test-unit test-provider openai anthropic nv_build gemini test-integration test-cov test-ci lint lint-fix format format-check clean build docker-build docker-smoke
 
 # Prefer uv if available, else use pip (set when Makefile is parsed)
 UV := $(shell command -v uv 2>/dev/null)
@@ -8,7 +8,7 @@ UV := $(shell command -v uv 2>/dev/null)
 #   make langgraph-dev LANGGRAPH_STUDIO_URL=https://your-studio.example
 LANGGRAPH_STUDIO_URL = https://smith.langchain.com
 
-PROVIDER_TEST_SELECTION := $(filter openai anthropic nv_build,$(MAKECMDGOALS))
+PROVIDER_TEST_SELECTION := $(filter openai anthropic nv_build gemini,$(MAKECMDGOALS))
 ifneq ($(PROVIDER_TEST_SELECTION),)
 PROVIDER_TEST_PROVIDERS := $(PROVIDER_TEST_SELECTION)
 PROVIDER_TEST_TARGETS :=
@@ -21,8 +21,11 @@ endif
 ifneq ($(filter nv_build,$(PROVIDER_TEST_SELECTION)),)
 PROVIDER_TEST_TARGETS += tests/provider/test_provider_endpoint.py::test_nv_build_provider_makes_live_structured_request
 endif
+ifneq ($(filter gemini,$(PROVIDER_TEST_SELECTION)),)
+PROVIDER_TEST_TARGETS += tests/provider/test_provider_endpoint.py::test_gemini_provider_makes_live_structured_request
+endif
 else
-PROVIDER_TEST_PROVIDERS := openai anthropic nv_build
+PROVIDER_TEST_PROVIDERS := openai anthropic nv_build gemini
 PROVIDER_TEST_TARGETS := tests/provider
 endif
 
@@ -34,7 +37,7 @@ help:
 	@echo "  make langgraph-dev  - Run LangGraph dev server (Studio at \$$LANGGRAPH_STUDIO_URL)"
 	@echo "  make test           - Run unit + integration tests"
 	@echo "  make test-unit      - Run unit tests only (no LLM calls)"
-	@echo "  make test-provider [openai|anthropic|nv_build] - Run live provider tests"
+	@echo "  make test-provider [openai|anthropic|nv_build|gemini] - Run live provider tests"
 	@echo "  make test-integration - Run integration tests only (invokes full graph, may call LLMs)"
 	@echo "  make test-cov       - Run tests with coverage report"
 	@echo "  make lint           - Run linters (ruff only)"
@@ -74,6 +77,7 @@ test-provider:
 			openai) env_name=OPENAI_API_KEY; label=OpenAI ;; \
 			anthropic) env_name=ANTHROPIC_API_KEY; label=Anthropic ;; \
 			nv_build) env_name=NVIDIA_INFERENCE_KEY; label="NV Build" ;; \
+			gemini) env_name=GOOGLE_CLOUD_PROJECT; label=Gemini ;; \
 		esac; \
 		eval "value=\$${$${env_name}:-}"; \
 		if [ -z "$$value" ]; then \
@@ -90,7 +94,7 @@ test-provider:
 		printf "missing provider keys\n" > "$$PROVIDER_TEST_MISSING_KEYS_FILE"; \
 	fi
 
-openai anthropic nv_build:
+openai anthropic nv_build gemini:
 	@:
 
 # Run integration tests only (invokes full graph, may call LLMs)

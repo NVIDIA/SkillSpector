@@ -103,6 +103,7 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         "ollama",
         "azure_openai",
         "openai_compatible",
+        "gemini",
         "claude_cli",
         "codex_cli",
         "gemini_cli",

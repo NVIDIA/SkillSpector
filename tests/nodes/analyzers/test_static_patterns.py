@@ -1281,7 +1281,7 @@ class TestLicenseFiles:
 
     @pytest.mark.parametrize(
         "start_line,match_line",
-        [(92, 2), (118, 2)],
+        [(98, 2), (124, 2)],
         ids=["mit_notice", "bsd_notice"],
     )
     def test_independent_third_party_ranges_suppress_ea3(

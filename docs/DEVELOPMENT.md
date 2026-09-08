@@ -318,6 +318,7 @@ The manual `test-provider` CI job and local `make test-provider` target perform 
 | `make test-provider openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `SKILLSPECTOR_OPENAI_TEST_MODEL` |
 | `make test-provider anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | `SKILLSPECTOR_ANTHROPIC_TEST_MODEL` |
 | `make test-provider nv_build` | `NVIDIA_INFERENCE_KEY` | `https://integrate.api.nvidia.com/v1` | `SKILLSPECTOR_NV_BUILD_TEST_MODEL` |
+| `make test-provider gemini` | `GOOGLE_CLOUD_PROJECT` | `https://aiplatform.googleapis.com/v1/...` | `SKILLSPECTOR_GEMINI_TEST_MODEL` |
 | `make test-provider` | Any/all of the provider keys above | All provider default URLs above | Any/all provider model overrides above |
 
 Base URL env vars are not needed for live provider tests; the tests intentionally use provider defaults.
@@ -332,6 +333,7 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `nv_build/` — build.nvidia.com (HTTP, `NVIDIA_INFERENCE_KEY`)
   - `openai/` — api.openai.com or any OpenAI-compatible URL (`OPENAI_API_KEY`)
   - `anthropic/` — api.anthropic.com (`ANTHROPIC_API_KEY`)
+  - `gemini/` — Google Cloud OpenAI-compatible Gemini endpoint (`GOOGLE_CLOUD_PROJECT`, ADC / Workload Identity)
   - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
   - `codex_cli/` — **local `codex` binary; no API key**. Uses the CLI's own auth session (`codex login`). Set `SKILLSPECTOR_PROVIDER=codex_cli`.
 
