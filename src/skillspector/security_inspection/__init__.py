@@ -5,7 +5,7 @@ NVIDIA Skill Inspector - Security Inspection Plugin
 __version__ = "1.0.0"
 __author__ = "Skill Inspector Security Plugin"
 
-from .scanner import SecurityScanner
 from .config import get_data_dir, get_db_path
+from .scanner import SecurityScanner
 
 __all__ = ["SecurityScanner", "get_data_dir", "get_db_path"]

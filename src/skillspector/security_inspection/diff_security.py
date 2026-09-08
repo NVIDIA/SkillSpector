@@ -3,11 +3,12 @@ diff_security.py - Compare skill versions and flag risky changes.
 Uses Git plumbing if available, else difflib (offline, deterministic).
 """
 from __future__ import annotations
+
 import difflib
 import re
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Any
 
 RISKY_CHANGE_PATTERNS = {
     "new_network": [r"requests\.", r"urllib\.", r"socket\.", r"aiohttp", r"httpx", r"http\.client"],
@@ -17,7 +18,7 @@ RISKY_CHANGE_PATTERNS = {
     "data_flow_change": [r"read_text", r"write_text", r"open\s*\(", r"json\.load", r"pickle\.load"],
 }
 
-def _git_diff(skill_path: Path, ref_a: str, ref_b: str) -> Optional[str]:
+def _git_diff(skill_path: Path, ref_a: str, ref_b: str) -> str | None:
     """Try git diff using plumbing, returns None if not git repo."""
     try:
         # find git root
@@ -72,8 +73,8 @@ def _difflib_dir_compare(dir_a: Path, dir_b: Path) -> str:
                 continue
     return "\n".join(diff_out)
 
-def analyze_diff_text(diff_text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def analyze_diff_text(diff_text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     added_lines = [l for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++")]
     added_text = "\n".join(added_lines)
 
@@ -122,12 +123,12 @@ def analyze_diff_text(diff_text: str) -> List[Dict[str, Any]]:
 
     return findings
 
-def compare_skill_versions(skill_path_a: Path, skill_path_b: Path, ref_a: str = "a", ref_b: str = "b") -> Dict[str, Any]:
+def compare_skill_versions(skill_path_a: Path, skill_path_b: Path, ref_a: str = "a", ref_b: str = "b") -> dict[str, Any]:
     """
     Compare two skill directories (or git refs). If git available, prefer git plumbing.
     Returns {diff_text, findings, stats}
     """
-    diff_text: Optional[str] = None
+    diff_text: str | None = None
     # if paths are same but refs differ, try git
     if skill_path_a == skill_path_b:
         diff_text = _git_diff(skill_path_a, ref_a, ref_b)
@@ -152,7 +153,7 @@ def compare_skill_versions(skill_path_a: Path, skill_path_b: Path, ref_a: str = 
     }
     return {"diff_text": diff_text, "findings": findings, "stats": stats}
 
-def diff_against_previous_version(skill_path: Path, previous_snapshot: Optional[Path] = None) -> Dict[str, Any]:
+def diff_against_previous_version(skill_path: Path, previous_snapshot: Path | None = None) -> dict[str, Any]:
     """Compare current skill against previous snapshot if provided; else try git diff."""
     if previous_snapshot and previous_snapshot.exists():
         return compare_skill_versions(previous_snapshot, skill_path)

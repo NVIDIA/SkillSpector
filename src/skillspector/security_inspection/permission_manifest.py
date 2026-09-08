@@ -3,11 +3,11 @@ permission_manifest.py - Declare and validate skill capabilities.
 Deterministic static analysis: regex/AST scan vs declared manifest.
 """
 from __future__ import annotations
+
 import json
 import re
-import ast
 from pathlib import Path
-from typing import Dict, List, Any, Tuple
+from typing import Any
 
 # Patterns for capability detection (deterministic)
 CAPABILITY_PATTERNS = {
@@ -36,7 +36,7 @@ CAPABILITY_PATTERNS = {
 # Allowed manifest schema
 MANIFEST_SCHEMA_KEYS = {"name", "version", "description", "author", "permissions", "dependencies", "capabilities"}
 
-def load_manifest(skill_path: Path) -> Tuple[Dict[str, Any], str]:
+def load_manifest(skill_path: Path) -> tuple[dict[str, Any], str]:
     """Load manifest dict and source path string."""
     candidates = [
         skill_path / "skill.json",
@@ -72,7 +72,7 @@ def load_manifest(skill_path: Path) -> Tuple[Dict[str, Any], str]:
                 return {"_parse_error": str(e)}, str(p)
     return {}, ""  # no manifest
 
-def validate_manifest(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     findings = []
     if not manifest:
         findings.append({
@@ -142,10 +142,10 @@ def validate_manifest(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     return findings
 
-def scan_capabilities(skill_path: Path) -> Dict[str, Any]:
+def scan_capabilities(skill_path: Path) -> dict[str, Any]:
     """Scan code for actual capabilities via deterministic regex/AST."""
-    detected: Dict[str, Any] = {"file_read": False, "file_write": False, "network": False, "subprocess": False, "env": False, "details": {}}
-    evidences: Dict[str, List[Dict[str, Any]]] = {k: [] for k in ["file_read", "file_write", "network", "subprocess", "env"]}
+    detected: dict[str, Any] = {"file_read": False, "file_write": False, "network": False, "subprocess": False, "env": False, "details": {}}
+    evidences: dict[str, list[dict[str, Any]]] = {k: [] for k in ["file_read", "file_write", "network", "subprocess", "env"]}
 
     # collect all text files
     for file in skill_path.rglob("*"):
@@ -182,9 +182,9 @@ def scan_capabilities(skill_path: Path) -> Dict[str, Any]:
     detected["details"] = evidences
     return detected
 
-def compare_manifest_vs_actual(manifest: Dict[str, Any], actual: Dict[str, Any], skill_path: Path) -> List[Dict[str, Any]]:
+def compare_manifest_vs_actual(manifest: dict[str, Any], actual: dict[str, Any], skill_path: Path) -> list[dict[str, Any]]:
     """Flag undeclared capabilities (manifest says none but code does network etc)."""
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     perms = manifest.get("permissions", {}) if manifest else {}
     # normalize
     declared_network = perms.get("network", "none") if perms else "none"

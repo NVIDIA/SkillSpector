@@ -1,8 +1,10 @@
 """correlation_engine.py - Attack-path correlation."""
 from __future__ import annotations
-from typing import List, Dict, Any
-from .event_model import SecurityEvent, EventGraph
+
 import re
+from typing import Any
+
+from .event_model import EventGraph, SecurityEvent
 
 # Define attack templates as ordered capability sequences
 ATTACK_TEMPLATES = [
@@ -39,8 +41,8 @@ ATTACK_TEMPLATES = [
     },
 ]
 
-def correlate(graph: EventGraph) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def correlate(graph: EventGraph) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     # Group events by capability order
     caps = [e.capability for e in graph.events]
     # Also consider category+action as capability
@@ -48,7 +50,7 @@ def correlate(graph: EventGraph) -> List[Dict[str, Any]]:
         seq = tmpl["sequence"]
         # Check if sequence appears in order (subsequence)
         idx = 0
-        matched: List[SecurityEvent] = []
+        matched: list[SecurityEvent] = []
         for ev in graph.events:
             if ev.capability == seq[idx] or ev.category in seq[idx] or seq[idx] in ev.capability:
                 matched.append(ev)
@@ -96,7 +98,7 @@ def correlate(graph: EventGraph) -> List[Dict[str, Any]]:
             })
     return findings
 
-def events_from_findings(findings: List[Dict[str, Any]], source: str, subject: str) -> List[SecurityEvent]:
+def events_from_findings(findings: list[dict[str, Any]], source: str, subject: str) -> list[SecurityEvent]:
     evs = []
     for f in findings:
         cat = f.get("category","correlation")

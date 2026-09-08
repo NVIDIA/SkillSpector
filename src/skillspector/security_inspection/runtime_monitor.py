@@ -7,19 +7,15 @@ Runs skill in isolated subprocess with temp dir, mocked network, timeout.
 Emits SecurityEvent for each observed action.
 """
 from __future__ import annotations
-import os
-import sys
-import json
-import tempfile
-import subprocess
-import pathlib
-import time
-import threading
-import queue
-from pathlib import Path
-from typing import Dict, List, Any, Optional
 
-from .event_model import SecurityEvent, EventGraph
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from .event_model import EventGraph, SecurityEvent
 
 # --- Monitor payload injected into subprocess ---
 MONITOR_PAYLOAD = r'''
@@ -250,7 +246,7 @@ def run_isolated(skill_path: Path, timeout: float = 10.0) -> EventGraph:
             graph.add(SecurityEvent(source="runtime", category="filesystem", action="read", subject=skill_path.name, target=str(skill_path), capability="filesystem.read", evidence=f"skill root {skill_path} accessed", severity="info", confidence=1.0))
     return graph
 
-def collect_runtime_capabilities(graph: EventGraph) -> Dict[str, bool]:
+def collect_runtime_capabilities(graph: EventGraph) -> dict[str, bool]:
     """Summarize runtime capabilities observed."""
     caps = {
         "filesystem_read": any(e.category == "filesystem" and "read" in e.capability for e in graph.events),

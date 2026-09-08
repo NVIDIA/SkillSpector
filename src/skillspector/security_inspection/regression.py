@@ -1,9 +1,10 @@
 """regression.py - Security Regression Engine."""
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, List, Any, Optional
 
-def compare_reports(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+from typing import Any
+
+
+def compare_reports(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     """Compare two scanner reports (old vs new)."""
     # Build rule -> findings map
     def findings_set(report):
@@ -76,7 +77,7 @@ def _grade(score: float) -> str:
     if score >= 45: return "D"
     return "F"
 
-def regression_to_findings(reg: Dict[str, Any]) -> List[Dict[str, Any]]:
+def regression_to_findings(reg: dict[str, Any]) -> list[dict[str, Any]]:
     findings = []
     for cap in reg["added_caps"]:
         findings.append({

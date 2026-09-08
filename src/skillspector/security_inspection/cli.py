@@ -3,15 +3,17 @@ cli.py - CLI for offline security inspection plugin.
 No cloud, no telemetry, 100% local.
 """
 from __future__ import annotations
+
 import argparse
 import json
 import sys
 from pathlib import Path
 
-from .scanner import SecurityScanner
-from .report_server import serve
 from .config import get_data_dir, get_db_path
-from .storage import init_db, get_latest_scan
+from .report_server import serve
+from .scanner import SecurityScanner
+from .storage import get_latest_scan
+
 
 def main():
     parser = argparse.ArgumentParser(description="NVIDIA Skill Inspector - Security Plugin (Offline, Local Only)")
@@ -132,7 +134,7 @@ def main():
                         print(f"  - {d['capability']}: {d['drift']} ({d['message']})")
 
     elif args.cmd == "policy":
-        from .policy import load_policy, evaluate_policy
+        from .policy import evaluate_policy, load_policy
         rp = Path(args.path)
         scanner = SecurityScanner(rp)
         result = scanner.scan(policy_path=Path(args.policy))

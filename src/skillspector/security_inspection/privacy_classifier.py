@@ -3,9 +3,10 @@ privacy_classifier.py - Classify data types each skill reads/writes/transmits.
 Deterministic pattern matching, no LLM.
 """
 from __future__ import annotations
+
 import re
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Any
 
 DATA_CATEGORIES = {
     "PII": {
@@ -52,10 +53,10 @@ READ_PATTERNS = [
     r"\bopen\s*\([^)]*['\"]r", r"read_text", r"read_bytes", r"\.read\s*\(", r"csv\.reader", r"json\.load", r"pickle\.load"
 ]
 
-def classify_skill_data(skill_path: Path) -> Dict[str, Any]:
+def classify_skill_data(skill_path: Path) -> dict[str, Any]:
     """Returns {categories: [...], flows: {reads, writes, transmits}, details: [...]}"""
     text_combined = ""
-    file_details: List[Dict[str, Any]] = []
+    file_details: list[dict[str, Any]] = []
     for file in skill_path.rglob("*"):
         if not file.is_file() or file.suffix not in (".py", ".js", ".ts", ".json", ".yaml", ".yml", ".md", ".txt", ".sh"):
             continue
@@ -76,8 +77,8 @@ def classify_skill_data(skill_path: Path) -> Dict[str, Any]:
         except Exception:
             continue
 
-    detected_cats: List[str] = []
-    cat_findings: List[Dict[str, Any]] = []
+    detected_cats: list[str] = []
+    cat_findings: list[dict[str, Any]] = []
     for cat, cfg in DATA_CATEGORIES.items():
         for pat in cfg["patterns"]:
             if re.search(pat, text_combined):
@@ -105,7 +106,7 @@ def classify_skill_data(skill_path: Path) -> Dict[str, Any]:
     }
 
     # Generate privacy findings for high-risk flows
-    findings: List[Dict[str, Any]] = list(cat_findings)
+    findings: list[dict[str, Any]] = list(cat_findings)
     if transmits and detected_cats:
         findings.append({
             "rule_id": "PRIV-001",

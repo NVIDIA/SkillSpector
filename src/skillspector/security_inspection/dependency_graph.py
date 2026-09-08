@@ -6,19 +6,21 @@ Parses:
  - file includes
 """
 from __future__ import annotations
-import re
-import json
+
 import ast
+import json
+import re
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Set
+from typing import Any
+
 import networkx as nx
 
 SKILL_MANIFEST_NAMES = ["skill.json", "manifest.json", "manifest.yaml", "manifest.yml", "SKILL.md", "skill.yaml", "skill.yml"]
 IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)")
 
-def discover_skills(root: Path) -> Dict[str, Path]:
+def discover_skills(root: Path) -> dict[str, Path]:
     """Each immediate subdirectory with at least one manifest or .py is a skill."""
-    skills: Dict[str, Path] = {}
+    skills: dict[str, Path] = {}
     if not root.exists():
         return skills
     for child in root.iterdir():
@@ -35,8 +37,8 @@ def discover_skills(root: Path) -> Dict[str, Path]:
             skills[root.name] = root
     return skills
 
-def parse_manifest_dependencies(skill_path: Path) -> List[str]:
-    deps: List[str] = []
+def parse_manifest_dependencies(skill_path: Path) -> list[str]:
+    deps: list[str] = []
     candidates = [skill_path / "skill.json", skill_path / "manifest.json", skill_path / "skill.yaml", skill_path / "skill.yml", skill_path / "manifest.yaml", skill_path / "manifest.yml"]
     for p in candidates:
         if p.exists():
@@ -84,8 +86,8 @@ def parse_manifest_dependencies(skill_path: Path) -> List[str]:
             pass
     return [d.strip().strip('"\'') for d in deps if d.strip()]
 
-def parse_python_imports(skill_path: Path, all_skill_names: Set[str]) -> List[str]:
-    deps: Set[str] = set()
+def parse_python_imports(skill_path: Path, all_skill_names: set[str]) -> list[str]:
+    deps: set[str] = set()
     for py_file in skill_path.rglob("*.py"):
         try:
             text = py_file.read_text(encoding="utf-8", errors="ignore")
@@ -130,7 +132,7 @@ def parse_python_imports(skill_path: Path, all_skill_names: Set[str]) -> List[st
         pass
     return sorted(deps)
 
-def build_dependency_graph(root: Path) -> Tuple[nx.DiGraph, Dict[str, Path]]:
+def build_dependency_graph(root: Path) -> tuple[nx.DiGraph, dict[str, Path]]:
     skills = discover_skills(root)
     G = nx.DiGraph()
     for name, path in skills.items():
@@ -151,7 +153,7 @@ def build_dependency_graph(root: Path) -> Tuple[nx.DiGraph, Dict[str, Path]]:
                     G.add_edge(name, dep, type="external")
     return G, skills
 
-def graph_to_cytoscape(G: nx.DiGraph) -> List[Dict[str, Any]]:
+def graph_to_cytoscape(G: nx.DiGraph) -> list[dict[str, Any]]:
     """Convert to cytoscape/visjs friendly JSON."""
     nodes = []
     for n, data in G.nodes(data=True):
@@ -161,14 +163,14 @@ def graph_to_cytoscape(G: nx.DiGraph) -> List[Dict[str, Any]]:
         edges.append({"data": {"source": u, "target": v, "type": data.get("type", "depends_on")}})
     return {"nodes": nodes, "edges": edges}
 
-def detect_cycles(G: nx.DiGraph) -> List[List[str]]:
+def detect_cycles(G: nx.DiGraph) -> list[list[str]]:
     try:
         cycles = list(nx.simple_cycles(G))
         return cycles
     except Exception:
         return []
 
-def compute_metrics(G: nx.DiGraph) -> Dict[str, Any]:
+def compute_metrics(G: nx.DiGraph) -> dict[str, Any]:
     return {
         "num_nodes": G.number_of_nodes(),
         "num_edges": G.number_of_edges(),

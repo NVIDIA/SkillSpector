@@ -3,14 +3,15 @@ provenance.py - Skill Reputation & Provenance (offline, local SQLite + hashing).
 Records origin, author, version history, integrity hashes.
 """
 from __future__ import annotations
+
 import hashlib
 import json
 import re
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Any
 
-from .storage import save_provenance, get_provenance_history
+from .storage import get_provenance_history, save_provenance
+
 
 def hash_skill_directory(skill_path: Path) -> str:
     """Deterministic SHA256 over all files sorted."""
@@ -32,8 +33,8 @@ def hash_skill_directory(skill_path: Path) -> str:
 def hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def extract_metadata(skill_path: Path) -> Dict[str, Any]:
-    meta: Dict[str, Any] = {"name": skill_path.name, "version": "0.0.0", "author": "unknown", "origin": "local", "description": ""}
+def extract_metadata(skill_path: Path) -> dict[str, Any]:
+    meta: dict[str, Any] = {"name": skill_path.name, "version": "0.0.0", "author": "unknown", "origin": "local", "description": ""}
     # Try manifests
     for cand in [skill_path / "skill.json", skill_path / "manifest.json"]:
         if cand.exists():
@@ -78,7 +79,7 @@ def extract_metadata(skill_path: Path) -> Dict[str, Any]:
             pass
     return meta
 
-def record_provenance(skill_path: Path, skills_root: Optional[Path] = None, db_path: Optional[Path] = None) -> Dict[str, Any]:
+def record_provenance(skill_path: Path, skills_root: Path | None = None, db_path: Path | None = None) -> dict[str, Any]:
     meta = extract_metadata(skill_path)
     sha = hash_skill_directory(skill_path)
     manifest_data = {}
@@ -92,7 +93,7 @@ def record_provenance(skill_path: Path, skills_root: Optional[Path] = None, db_p
     save_provenance(meta["name"], meta["version"], meta["author"], meta["origin"], sha, manifest_data, db_path=db_path)
     # check history for reputation signals
     history = get_provenance_history(meta["name"], db_path=db_path)
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     if len(history) > 1:
         hashes = set(r["hash_sha256"] for r in history)
         if len(hashes) > 1 and history[0]["hash_sha256"] != sha:

@@ -1,8 +1,10 @@
 """policy.py - Policy-as-Code enforcement."""
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, List, Any, Optional
+
 import re
+from pathlib import Path
+from typing import Any
+
 import yaml
 
 DEFAULT_POLICY = {
@@ -13,7 +15,7 @@ DEFAULT_POLICY = {
     "package": {"allow": []},
 }
 
-def load_policy(path: Optional[Path]) -> Dict[str, Any]:
+def load_policy(path: Path | None) -> dict[str, Any]:
     if not path or not Path(path).exists():
         return DEFAULT_POLICY
     txt = Path(path).read_text(encoding="utf-8")
@@ -29,8 +31,8 @@ def _match_glob(pattern: str, target: str) -> bool:
     regex = pattern.replace(".", r"\.").replace("**", ".*").replace("*", "[^/]*")
     return re.match(f"^{regex}$", target) is not None
 
-def evaluate_policy(events: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
-    violations: List[Dict[str, Any]] = []
+def evaluate_policy(events: list[dict[str, Any]], policy: dict[str, Any]) -> dict[str, Any]:
+    violations: list[dict[str, Any]] = []
     for e in events:
         # e is finding dict or event dict
         cat = e.get("category","")
@@ -71,7 +73,7 @@ def evaluate_policy(events: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dic
         decision = "PASS"
     return {"decision": decision, "violations": violations, "count": len(violations)}
 
-def policy_to_findings(policy_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+def policy_to_findings(policy_result: dict[str, Any]) -> list[dict[str, Any]]:
     findings = []
     for v in policy_result["violations"]:
         findings.append({

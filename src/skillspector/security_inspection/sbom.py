@@ -2,12 +2,14 @@
 sbom.py - Generate CycloneDX-format SBOM for installed skills (offline, deterministic).
 """
 from __future__ import annotations
-import json
+
 import hashlib
+import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Dict, List, Any
+from typing import Any
+
 
 def _hash_file(p: Path) -> str:
     try:
@@ -15,8 +17,8 @@ def _hash_file(p: Path) -> str:
     except Exception:
         return ""
 
-def _parse_requirements(skill_path: Path) -> List[Dict[str, str]]:
-    components: List[Dict[str, str]] = []
+def _parse_requirements(skill_path: Path) -> list[dict[str, str]]:
+    components: list[dict[str, str]] = []
     req_files = [skill_path / "requirements.txt", skill_path / "requirements.pip", skill_path / "pyproject.toml", skill_path / "setup.py", skill_path / "Pipfile", skill_path / "environment.yml"]
     for rf in req_files:
         if not rf.exists():
@@ -68,7 +70,7 @@ def _parse_requirements(skill_path: Path) -> List[Dict[str, str]]:
             uniq.append(c)
     return uniq
 
-def generate_sbom(skill_path: Path, skills_root: Path) -> Dict[str, Any]:
+def generate_sbom(skill_path: Path, skills_root: Path) -> dict[str, Any]:
     """Generate CycloneDX 1.5 SBOM for a single skill."""
     skill_name = skill_path.name
     # metadata
@@ -77,7 +79,7 @@ def generate_sbom(skill_path: Path, skills_root: Path) -> Dict[str, Any]:
         if p.is_file() and p.suffix in (".py", ".json", ".yaml", ".yml", ".txt", ".toml", ".cfg", ".md") and ".git" not in p.parts:
             meta_files.append(p)
 
-    components: List[Dict[str, Any]] = []
+    components: list[dict[str, Any]] = []
     # main skill component
     skill_hash = _hash_file(skill_path / "skill.json") or _hash_file(skill_path / "manifest.json") or hashlib.sha256(skill_name.encode()).hexdigest()[:16]
     # version from manifest
@@ -130,7 +132,7 @@ def generate_sbom(skill_path: Path, skills_root: Path) -> Dict[str, Any]:
         "serialNumber": f"urn:uuid:{hashlib.sha256((skill_name + version).encode()).hexdigest()[:32]}",
         "version": 1,
         "metadata": {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "component": {
                 "type": "application",
                 "name": skill_name,
@@ -142,7 +144,7 @@ def generate_sbom(skill_path: Path, skills_root: Path) -> Dict[str, Any]:
     }
     return bom
 
-def generate_aggregate_sbom(skills_root: Path, discovered: Dict[str, Path]) -> Dict[str, Any]:
+def generate_aggregate_sbom(skills_root: Path, discovered: dict[str, Path]) -> dict[str, Any]:
     """Aggregate SBOM for all skills."""
     all_components = []
     for name, path in discovered.items():
@@ -162,7 +164,7 @@ def generate_aggregate_sbom(skills_root: Path, discovered: Dict[str, Path]) -> D
         "serialNumber": f"urn:uuid:{hashlib.sha256(str(sorted(discovered.keys())).encode()).hexdigest()[:32]}",
         "version": 1,
         "metadata": {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "component": {"type": "application", "name": "agent-skills-aggregate", "version": "1.0"},
             "tools": [{"vendor": "NVIDIA", "name": "Skill Inspector Security Plugin", "version": "1.0.0"}],
         },
@@ -170,6 +172,6 @@ def generate_aggregate_sbom(skills_root: Path, discovered: Dict[str, Path]) -> D
     }
     return agg
 
-def save_sbom(bom: Dict[str, Any], out_path: Path):
+def save_sbom(bom: dict[str, Any], out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(bom, indent=2), encoding="utf-8")

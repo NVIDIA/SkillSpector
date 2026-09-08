@@ -16,8 +16,6 @@ All storage under ~/.skill-inspector/ (SQLite).
 
 from __future__ import annotations
 
-import json
-import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -117,8 +115,8 @@ def analyze(state: SkillspectorState) -> list[Finding]:
 
     # Import lazily to avoid circular deps and keep offline isolation
     try:
-        from skillspector.security_inspection.scanner import SecurityScanner
         from skillspector.security_inspection.config import get_data_dir
+        from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
         logger.error("offline_security_inspection: failed to import security_inspection package: %s", e)
         return []

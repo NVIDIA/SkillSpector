@@ -1,10 +1,11 @@
 """event_model.py - Normalized SecurityEvent for all analyzers."""
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+
 import hashlib
-import json
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
 
 @dataclass
 class SecurityEvent:
@@ -17,18 +18,18 @@ class SecurityEvent:
     evidence: str        # code snippet / trace
     severity: str = "medium"
     confidence: float = 0.9
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     rule_id: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def fingerprint(self) -> str:
         raw = f"{self.source}|{self.category}|{self.action}|{self.subject}|{self.target}|{self.capability}|{self.evidence[:200]}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    def to_finding(self) -> Dict[str, Any]:
+    def to_finding(self) -> dict[str, Any]:
         return {
             "rule_id": self.rule_id or f"EVT-{self.category.upper()}",
             "category": self.category,
@@ -46,14 +47,14 @@ class SecurityEvent:
 
 @dataclass
 class EventGraph:
-    events: List[SecurityEvent] = field(default_factory=list)
+    events: list[SecurityEvent] = field(default_factory=list)
     def add(self, e: SecurityEvent):
         self.events.append(e)
-    def by_category(self, cat: str) -> List[SecurityEvent]:
+    def by_category(self, cat: str) -> list[SecurityEvent]:
         return [e for e in self.events if e.category == cat]
-    def by_source(self, src: str) -> List[SecurityEvent]:
+    def by_source(self, src: str) -> list[SecurityEvent]:
         return [e for e in self.events if e.source == src]
-    def to_findings(self) -> List[Dict[str, Any]]:
+    def to_findings(self) -> list[dict[str, Any]]:
         return [e.to_finding() for e in self.events]
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {"events": [e.to_dict() for e in self.events], "count": len(self.events)}

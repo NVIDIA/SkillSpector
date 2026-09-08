@@ -4,6 +4,7 @@ All data under ~/.skill-inspector/ (or SKILL_INSPECTOR_DATA_DIR env).
 No cloud, no telemetry, no external calls.
 """
 from __future__ import annotations
+
 import os
 from pathlib import Path
 

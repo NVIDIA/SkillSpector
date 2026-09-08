@@ -1,7 +1,7 @@
 """drift_analyzer.py - Declared vs Static vs Runtime permission drift."""
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, List, Any, Set
+
+from typing import Any
 
 from .event_model import SecurityEvent
 
@@ -27,8 +27,8 @@ def normalize_cap(s: str) -> str:
         return "mcp.call"
     return s
 
-def capabilities_to_set(perms: Dict[str, Any], static_caps: Dict[str, Any], runtime_caps: Dict[str, bool]) -> tuple[Set[str], Set[str], Set[str]]:
-    declared: Set[str] = set()
+def capabilities_to_set(perms: dict[str, Any], static_caps: dict[str, Any], runtime_caps: dict[str, bool]) -> tuple[set[str], set[str], set[str]]:
+    declared: set[str] = set()
     # permissions manifest
     if perms.get("file_access") not in (None, "none"):
         # read always if file_access is read_only etc
@@ -45,14 +45,14 @@ def capabilities_to_set(perms: Dict[str, Any], static_caps: Dict[str, Any], runt
         if perms["env"]:
             declared.add("env.read")
     # static
-    static: Set[str] = set()
+    static: set[str] = set()
     if static_caps.get("file_read"): static.add("filesystem.read")
     if static_caps.get("file_write"): static.add("filesystem.write")
     if static_caps.get("network"): static.add("network.outbound"); static.add("network.dns")
     if static_caps.get("subprocess"): static.add("processes.execute")
     if static_caps.get("env"): static.add("env.read")
     # runtime
-    runtime: Set[str] = set()
+    runtime: set[str] = set()
     for k, v in runtime_caps.items():
         if not v: continue
         if k == "filesystem_read": runtime.add("filesystem.read")
@@ -65,7 +65,7 @@ def capabilities_to_set(perms: Dict[str, Any], static_caps: Dict[str, Any], runt
         if k == "mcp": runtime.add("mcp.call")
     return declared, static, runtime
 
-def classify_drift(declared: Set[str], static: Set[str], runtime: Set[str]) -> List[Dict[str, Any]]:
+def classify_drift(declared: set[str], static: set[str], runtime: set[str]) -> list[dict[str, Any]]:
     all_caps = declared | static | runtime
     # also include known universe to detect UNUSED
     universe = {"filesystem.read","filesystem.write","network.outbound","network.dns","processes.execute","env.read","executables.execute","package.install","mcp.call"}
@@ -104,7 +104,7 @@ def classify_drift(declared: Set[str], static: Set[str], runtime: Set[str]) -> L
             })
     return results
 
-def drift_to_findings(drifts: List[Dict[str, Any]], skill_name: str) -> List[Dict[str, Any]]:
+def drift_to_findings(drifts: list[dict[str, Any]], skill_name: str) -> list[dict[str, Any]]:
     findings = []
     for d in drifts:
         sev = d["severity"]
@@ -123,7 +123,7 @@ def drift_to_findings(drifts: List[Dict[str, Any]], skill_name: str) -> List[Dic
         })
     return findings
 
-def drift_to_events(drifts: List[Dict[str, Any]], subject: str) -> List[SecurityEvent]:
+def drift_to_events(drifts: list[dict[str, Any]], subject: str) -> list[SecurityEvent]:
     evs = []
     for d in drifts:
         if d["drift"] == "MATCH": continue

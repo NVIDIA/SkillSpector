@@ -2,9 +2,11 @@
 models.py - Dataclasses for findings, skills, manifests.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Any, Optional
+
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from typing import Any
+
 
 class Severity(str, Enum):
     CRITICAL = "critical"
@@ -32,11 +34,11 @@ class Finding:
     severity: str
     message: str
     file: str
-    line: Optional[int] = None
-    evidence: Optional[str] = None
-    fix: Optional[str] = None
+    line: int | None = None
+    evidence: str | None = None
+    fix: str | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 @dataclass
@@ -47,11 +49,11 @@ class SkillInfo:
     author: str = "unknown"
     description: str = ""
     hash_sha256: str = ""
-    manifest: Dict[str, Any] = field(default_factory=dict)
-    dependencies: List[str] = field(default_factory=list)
-    findings: List[Dict[str, Any]] = field(default_factory=list)
-    scorecard: Dict[str, Any] = field(default_factory=dict)
-    privacy: Dict[str, Any] = field(default_factory=dict)
+    manifest: dict[str, Any] = field(default_factory=dict)
+    dependencies: list[str] = field(default_factory=list)
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    scorecard: dict[str, Any] = field(default_factory=dict)
+    privacy: dict[str, Any] = field(default_factory=dict)
     sbom_ref: str = ""
 
 @dataclass
@@ -59,7 +61,7 @@ class PermissionManifest:
     """Declarative manifest of what skill is allowed to do."""
     name: str
     version: str = "1.0.0"
-    permissions: Dict[str, Any] = field(default_factory=dict)
+    permissions: dict[str, Any] = field(default_factory=dict)
     # permissions keys: file_access, network, subprocess, env, secrets
 
     ALLOWED_KEYS = {"file_access", "network", "subprocess", "env", "secrets", "capabilities"}
@@ -67,7 +69,7 @@ class PermissionManifest:
     FILE_VALUES = {"none", "read_only", "read_write", "unrestricted"}
 
     @staticmethod
-    def default_manifest(skill_name: str) -> Dict[str, Any]:
+    def default_manifest(skill_name: str) -> dict[str, Any]:
         return {
             "name": skill_name,
             "version": "1.0.0",

@@ -2,45 +2,50 @@
 scanner.py - Orchestrator: runs all analyzers deterministically, stores results.
 """
 from __future__ import annotations
+
 import json
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Any
 
-from .dependency_graph import build_dependency_graph, graph_to_cytoscape, compute_metrics
-from .permission_manifest import load_manifest, validate_manifest, scan_capabilities, compare_manifest_vs_actual
-from .provenance import record_provenance
-from .secrets_analyzer import scan_skill_secrets
-from .privacy_classifier import classify_skill_data
-from .diff_security import diff_against_previous_version
-from .sbom import generate_sbom, generate_aggregate_sbom, save_sbom
-from .scorecard import compute_scorecard
-from .storage import init_db, save_scan
 from .config import get_data_dir, get_db_path, get_sbom_dir
-from .event_model import SecurityEvent, EventGraph
-from .drift_analyzer import capabilities_to_set, classify_drift, drift_to_findings, drift_to_events
 from .correlation_engine import correlate
-from .policy import load_policy, evaluate_policy, policy_to_findings
+from .dependency_graph import build_dependency_graph, compute_metrics, graph_to_cytoscape
+from .diff_security import diff_against_previous_version
+from .drift_analyzer import capabilities_to_set, classify_drift, drift_to_events, drift_to_findings
+from .event_model import EventGraph, SecurityEvent
+from .permission_manifest import (
+    compare_manifest_vs_actual,
+    load_manifest,
+    scan_capabilities,
+    validate_manifest,
+)
+from .policy import evaluate_policy, load_policy, policy_to_findings
+from .privacy_classifier import classify_skill_data
+from .provenance import record_provenance
 from .regression import compare_reports
+from .sbom import generate_aggregate_sbom, generate_sbom, save_sbom
+from .scorecard import compute_scorecard
+from .secrets_analyzer import scan_skill_secrets
+from .storage import init_db, save_scan
 
-import networkx as nx
 
 class SecurityScanner:
-    def __init__(self, skills_root: Path, db_path: Optional[Path] = None):
+    def __init__(self, skills_root: Path, db_path: Path | None = None):
         self.skills_root = Path(skills_root).expanduser().resolve()
         self.db_path = db_path or get_db_path()
         init_db(self.db_path)
         self.data_dir = get_data_dir()
 
-    def scan(self, previous_snapshot: Optional[Path] = None, enable_runtime: bool = False, policy_path: Optional[Path] = None, old_report: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        scan_id = f"scan-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    def scan(self, previous_snapshot: Path | None = None, enable_runtime: bool = False, policy_path: Path | None = None, old_report: dict[str, Any] | None = None) -> dict[str, Any]:
+        scan_id = f"scan-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         # Dependency graph
         G, discovered = build_dependency_graph(self.skills_root)
         graph_json = graph_to_cytoscape(G)
         metrics = compute_metrics(G)
 
-        skills_results: List[Dict[str, Any]] = []
+        skills_results: list[dict[str, Any]] = []
         aggregate_sbom = generate_aggregate_sbom(self.skills_root, discovered)
         # Save aggregate SBOM
         save_sbom(aggregate_sbom, get_sbom_dir() / f"{scan_id}-aggregate.cdx.json")
@@ -50,7 +55,7 @@ class SecurityScanner:
         policy = load_policy(policy_path) if policy_path else None
 
         for name, skill_path in sorted(discovered.items()):
-            findings: List[Dict[str, Any]] = []
+            findings: list[dict[str, Any]] = []
             events = EventGraph()
 
             # Provenance
@@ -88,11 +93,11 @@ class SecurityScanner:
                 events.add(SecurityEvent(source="diff", category="diff", action="diff", subject=name, target=f.get("file",""), capability=f.get("rule_id",""), evidence=f.get("message",""), severity=f.get("severity","medium"), rule_id=f.get("rule_id","")))
 
             # Runtime monitor (optional, isolated)
-            runtime_caps: Dict[str, bool] = {}
+            runtime_caps: dict[str, bool] = {}
             runtime_graph = EventGraph()
             if enable_runtime:
                 try:
-                    from .runtime_monitor import run_isolated, collect_runtime_capabilities
+                    from .runtime_monitor import collect_runtime_capabilities, run_isolated
                     runtime_graph = run_isolated(skill_path, timeout=8.0)
                     runtime_caps = collect_runtime_capabilities(runtime_graph)
                     # Add runtime events
@@ -125,7 +130,7 @@ class SecurityScanner:
                 events.add(SecurityEvent(source="correlation", category="correlation", action="attack_path", subject=name, target=ev.get("rule_id",""), capability=ev.get("rule_id",""), evidence=ev.get("message",""), severity=ev.get("severity","high"), rule_id=ev.get("rule_id","")))
 
             # Policy enforcement
-            policy_findings: List[Dict[str, Any]] = []
+            policy_findings: list[dict[str, Any]] = []
             if policy:
                 pol_res = evaluate_policy(findings + [e.to_dict() for e in events.events], policy)
                 policy_findings = policy_to_findings(pol_res)
@@ -185,9 +190,9 @@ class SecurityScanner:
         if old_report:
             regression = compare_reports(old_report, {"skills": skills_results, "summary": {"avg_score": round(avg_score,1)}, "graph": graph_json})
 
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "scan_id": scan_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "skills_root": str(self.skills_root),
             "skills": skills_results,
             "graph": graph_json,
@@ -216,7 +221,7 @@ class SecurityScanner:
 
         return result
 
-    def scan_single(self, skill_path: Path) -> Dict[str, Any]:
+    def scan_single(self, skill_path: Path) -> dict[str, Any]:
         # Convenience: scan containing directory as root
         root = skill_path.parent if skill_path.parent != self.skills_root else self.skills_root
         return self.scan()

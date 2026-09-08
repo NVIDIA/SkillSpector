@@ -3,7 +3,8 @@ scorecard.py - Compute per-skill security rating from all findings.
 Deterministic, explainable scoring.
 """
 from __future__ import annotations
-from typing import Dict, List, Any
+
+from typing import Any
 
 SEVERITY_WEIGHTS = {
     "critical": 25,
@@ -35,14 +36,14 @@ def grade_from_score(score: int) -> str:
         return "D"
     return "F"
 
-def compute_scorecard(findings: List[Dict[str, Any]], provenance: Dict[str, Any] = None, privacy: Dict[str, Any] = None, sbom_components: int = 0) -> Dict[str, Any]:
+def compute_scorecard(findings: list[dict[str, Any]], provenance: dict[str, Any] = None, privacy: dict[str, Any] = None, sbom_components: int = 0) -> dict[str, Any]:
     """
     Findings each have severity/category.
     Score starts 100, deductions per finding weighted.
     """
     base = 100
     deductions = 0
-    breakdown: List[Dict[str, Any]] = []
+    breakdown: list[dict[str, Any]] = []
     severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
 
     for f in findings:
@@ -102,8 +103,8 @@ def compute_scorecard(findings: List[Dict[str, Any]], provenance: Dict[str, Any]
         "recommendations": generate_recommendations(findings, privacy, provenance),
     }
 
-def generate_recommendations(findings: List[Dict[str, Any]], privacy: Dict[str, Any] = None, provenance: Dict[str, Any] = None) -> List[str]:
-    recs: List[str] = []
+def generate_recommendations(findings: list[dict[str, Any]], privacy: dict[str, Any] = None, provenance: dict[str, Any] = None) -> list[str]:
+    recs: list[str] = []
     cats = set(f.get("category") for f in findings)
     sevs = set(f.get("severity") for f in findings)
     if "secrets" in cats:

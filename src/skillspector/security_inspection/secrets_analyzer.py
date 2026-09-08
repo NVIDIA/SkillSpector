@@ -3,11 +3,12 @@ secrets_analyzer.py - Deterministic regex + entropy checks for hardcoded credent
 No LLM, no cloud, reproducible.
 """
 from __future__ import annotations
-import re
+
 import math
-from pathlib import Path
+import re
 from collections import Counter
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import Any
 
 # Regex patterns for known secret formats
 SECRET_PATTERNS = [
@@ -53,8 +54,8 @@ def shannon_entropy(s: str) -> float:
 def is_allowlisted(value: str) -> bool:
     return bool(ALLOWLIST_RE.search(value))
 
-def scan_file_for_secrets(file_path: Path, skill_root: Path) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def scan_file_for_secrets(file_path: Path, skill_root: Path) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     try:
         if file_path.stat().st_size > 2_000_000:
             return findings
@@ -151,8 +152,8 @@ def scan_file_for_secrets(file_path: Path, skill_root: Path) -> List[Dict[str, A
 
     return findings
 
-def scan_skill_secrets(skill_path: Path) -> List[Dict[str, Any]]:
-    all_findings: List[Dict[str, Any]] = []
+def scan_skill_secrets(skill_path: Path) -> list[dict[str, Any]]:
+    all_findings: list[dict[str, Any]] = []
     for file in skill_path.rglob("*"):
         if not file.is_file():
             continue

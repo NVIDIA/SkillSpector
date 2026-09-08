@@ -3,21 +3,23 @@ report_server.py - FastAPI + Jinja2 localhost-only interactive HTML report.
 Binds only to 127.0.0.1, no 0.0.0.0, no external exposure.
 """
 from __future__ import annotations
+
 import json
 import webbrowser
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-import uvicorn
 
-from .config import get_data_dir, ALLOWED_BIND
-from .storage import get_latest_scan, get_connection
+from .config import ALLOWED_BIND, get_data_dir
+from .storage import get_latest_scan
 
-def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Optional[Path] = None, static_dir: Optional[Path] = None) -> FastAPI:
+
+def create_app(scan_data: dict[str, Any] | None = None, templates_dir: Path | None = None, static_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="NVIDIA Skill Inspector - Security Report", docs_url=None, redoc_url=None, openapi_url=None)
 
     # Resolve dirs - try bundled security_inspection templates, then repo plugin templates, then base/templates
@@ -65,7 +67,7 @@ def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Option
         app.mount("/static", StaticFiles(directory=str(s_dir)), name="static")
 
     # In-memory scan data (or load latest from DB)
-    def get_scan() -> Dict[str, Any]:
+    def get_scan() -> dict[str, Any]:
         if scan_data is not None:
             return scan_data
         latest = get_latest_scan()
@@ -137,7 +139,7 @@ def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Option
 
     return app
 
-def serve(scan_data: Dict[str, Any], port: int = 8899, open_browser: bool = True, templates_dir: Optional[Path] = None, static_dir: Optional[Path] = None):
+def serve(scan_data: dict[str, Any], port: int = 8899, open_browser: bool = True, templates_dir: Path | None = None, static_dir: Path | None = None):
     """
     Serve report on localhost only. Blocks.
     """
@@ -153,7 +155,7 @@ def serve(scan_data: Dict[str, Any], port: int = 8899, open_browser: bool = True
     # Enforce loopback only: host must be 127.0.0.1
     uvicorn.run(app, host=ALLOWED_BIND, port=port, log_level="info", access_log=False)
 
-def create_app_for_testing(scan_data: Dict[str, Any]) -> FastAPI:
+def create_app_for_testing(scan_data: dict[str, Any]) -> FastAPI:
     # Find correct templates dir
     cand = Path(__file__).parent / "templates"
     if cand.exists():

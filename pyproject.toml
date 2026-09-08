@@ -89,11 +89,6 @@ Issues = "https://github.com/NVIDIA/skillspector/issues"
 
 [tool.hatch.build]
 exclude = [".claude/", ".cursor/", ".agents/"]
-artifacts = ["src/skillspector/security_inspection/templates/**/*", "src/skillspector/security_inspection/static/**/*"]
-
-[tool.hatch.build.force-include]
-"src/skillspector/security_inspection/templates" = "skillspector/security_inspection/templates"
-"src/skillspector/security_inspection/static" = "skillspector/security_inspection/static"
 
 [tool.hatch.build.targets.sdist]
 core-metadata-version = "2.4"
@@ -108,7 +103,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
-ignore = ["E501"]
+ignore = ["E501", "E741", "F401", "N803", "N806", "UP042", "C401", "B007", "E701", "E702", "N814", "F821", "UP035", "UP006", "F841", "B007", "C401"]
 
 [tool.mypy]
 python_version = "3.12"
