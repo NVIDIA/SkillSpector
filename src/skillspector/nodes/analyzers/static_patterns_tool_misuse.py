@@ -50,9 +50,13 @@ _STATIC_BRACE_WORD_CHARS = 256
 _PRINTF_STATIC_CHARS = 256
 _PRINTF_STATIC_ARGUMENTS = 32
 _PRINTF_STATIC_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%]{0,64}")
+_PLAIN_BRACED_SHELL_PARAMETER_RE = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[*@#?$!-])\}")
 _DESTRUCTIVE_COMMAND_BASENAMES = frozenset({"rm", "del", "erase"})
 _QUOTED_GLOB_SENTINEL = "\ue000"
 _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
+# Distinguish plain parameter expansions from dynamic forms that can synthesize
+# an executable command word, such as ``${COMMAND:-printf}``.
+_DYNAMIC_SHELL_PARAM_SENTINEL = "\ue002"
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -691,6 +695,19 @@ def _is_ifs_expansion(content: str, start: int, end: int) -> bool:
     return content[start:end] in {"$IFS", "${IFS}"}
 
 
+def _is_plain_parameter_expansion(content: str, start: int, end: int) -> bool:
+    """Return whether an expansion is a parameter name without operators."""
+    return (
+        content[start + 1] != "{"
+        or _PLAIN_BRACED_SHELL_PARAMETER_RE.fullmatch(
+            content,
+            start,
+            end,
+        )
+        is not None
+    )
+
+
 def _consume_printf_invocation(
     next_word: Callable[[], str | None],
 ) -> tuple[bool, bool]:
@@ -702,8 +719,17 @@ def _consume_printf_invocation(
         if word is None:
             return False, False
         if _DYNAMIC_SHELL_WORD_SENTINEL in word:
-            # A runtime expansion participates in the invocation or wrapper
-            # command word. Its executable basename is not deterministic.
+            # A substitution or operator-bearing parameter expansion can
+            # synthesize a command name, so keep the fail-closed contract.
+            return True, False
+        if _DYNAMIC_SHELL_PARAM_SENTINEL in word:
+            # A word made entirely of plain parameters (a bare ``$ARGUMENTS``)
+            # does not statically identify an allowlisted command, so decline it
+            # rather than degrading the parse. A word that mixes literal text
+            # with a parameter (``cmd${VAR}``) may still be a wrapper whose
+            # basename is not deterministic.
+            if not word.replace(_DYNAMIC_SHELL_PARAM_SENTINEL, ""):
+                return False, False
             return True, False
         command = word.casefold().rsplit("/", 1)[-1]
         if command == "printf":
@@ -855,6 +881,7 @@ def _next_shell_invocation_word(
                 continue
             elif quote == '"' and character == "$":
                 inherited_quote_closed = [False]
+                dynamic_sentinel = _DYNAMIC_SHELL_WORD_SENTINEL
                 if cursor + 1 < limit and content[cursor + 1] == "(":
                     parameter_end = _skip_command_substitution(
                         content,
@@ -877,6 +904,12 @@ def _next_shell_invocation_word(
                         True,
                         inherited_quote_closed,
                     )
+                    if parameter_end is not None and _is_plain_parameter_expansion(
+                        content,
+                        cursor,
+                        parameter_end,
+                    ):
+                        dynamic_sentinel = _DYNAMIC_SHELL_PARAM_SENTINEL
                 if parameter_end is None:
                     if cursor + 1 < limit and content[cursor + 1] in "({":
                         return None, cursor, True
@@ -884,7 +917,7 @@ def _next_shell_invocation_word(
                     word_started = True
                     cursor += 1
                     continue
-                output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+                output.append(dynamic_sentinel)
                 word_started = True
                 cursor = parameter_end
                 if inherited_quote_closed[0]:
@@ -932,6 +965,7 @@ def _next_shell_invocation_word(
                 word_started = True
                 cursor += 2
                 continue
+            dynamic_sentinel = _DYNAMIC_SHELL_WORD_SENTINEL
             if cursor + 1 < limit and content[cursor + 1] == "(":
                 parameter_end = _skip_command_substitution(
                     content,
@@ -952,6 +986,12 @@ def _next_shell_invocation_word(
                     substitution_end_cache,
                     backtick_end_cache,
                 )
+                if parameter_end is not None and _is_plain_parameter_expansion(
+                    content,
+                    cursor,
+                    parameter_end,
+                ):
+                    dynamic_sentinel = _DYNAMIC_SHELL_PARAM_SENTINEL
             if parameter_end is None:
                 if cursor + 1 < limit and content[cursor + 1] in "({":
                     return None, cursor, True
@@ -959,7 +999,7 @@ def _next_shell_invocation_word(
                 word_started = True
                 cursor += 1
                 continue
-            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            output.append(dynamic_sentinel)
             word_started = True
             cursor = parameter_end
             continue

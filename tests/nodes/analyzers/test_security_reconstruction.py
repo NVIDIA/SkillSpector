@@ -1725,6 +1725,73 @@ def test_long_non_invocation_printf_mention_is_not_partial(content: str) -> None
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "`$ARGUMENTS`",
+        "$ARGUMENTS",
+        "${ARGUMENTS}",
+        "`${ARGUMENTS}`",
+        "`$@`",
+        "$(  $ARGUMENTS  )",
+    ],
+)
+def test_bare_variable_command_word_is_not_partial(content: str) -> None:
+    state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+
+    result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$ARGUMENTS",
+        "${ARGUMENTS}",
+        "$@$ARGUMENTS",
+    ],
+)
+def test_bare_variable_word_is_not_recognized_as_printf_invocation(content: str) -> None:
+    assert tm_module._printf_invocation_arguments(content) == (False, [])
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "cmd${VAR}",
+        "${VAR}cmd",
+        "$(command)",
+        "${COMMAND:-printf}",
+        "${!COMMAND}",
+    ],
+)
+def test_dynamic_printf_command_word_remains_inexact(content: str) -> None:
+    assert tm_module._printf_invocation_arguments(content) == (True, [])
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$(cmd${VAR})",
+        '$("cmd${VAR}")',
+        "$(${COMMAND:-printf} rm) -rf *",
+        '$("${COMMAND:-printf}" rm) -rf *',
+        "$(${!COMMAND} rm) -rf *",
+    ],
+)
+def test_dynamic_parameter_command_word_remains_partial(content: str) -> None:
+    state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+
+    result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
+
+    assert result["findings"] == []
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
 def test_nested_env_parameter_assignments_are_scanned_linearly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
