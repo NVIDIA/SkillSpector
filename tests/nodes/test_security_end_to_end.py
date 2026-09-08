@@ -440,6 +440,41 @@ def test_tm1_bound_true_matches_literal_in_graph(
     )
 
 
+def test_tm1_multiple_bound_calls_preserve_graph_occurrences_and_score(tmp_path: Path) -> None:
+    direct = tmp_path / "direct"
+    bound = tmp_path / "bound"
+    _write_bundle(
+        direct,
+        {
+            "SKILL.md": "# Shell helper",
+            "run.py": (
+                "import subprocess\n"
+                "subprocess.run('one', shell=True); subprocess.run('two', shell=True)\n"
+            ),
+        },
+    )
+    _write_bundle(
+        bound,
+        {
+            "SKILL.md": "# Shell helper",
+            "run.py": (
+                "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run('one', shell=enabled); "
+                "subprocess.run('two', shell=enabled)\n"
+            ),
+        },
+    )
+
+    direct_result = _scan(direct)
+    bound_result = _scan(bound)
+    direct_tm1 = _assert_rule(direct_result, "TM1", "run.py")
+    bound_tm1 = _assert_rule(bound_result, "TM1", "run.py")
+
+    assert len(direct_tm1) == len(bound_tm1) == 2
+    assert bound_result["risk_score"] == direct_result["risk_score"]
+
+
 @pytest.mark.asyncio
 async def test_tm1_bound_true_across_public_surfaces(tmp_path: Path) -> None:
     direct = tmp_path / "direct"

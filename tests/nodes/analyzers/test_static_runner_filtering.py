@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import pytest
 
+from skillspector.artifacts import SecurityTextView
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.nodes.analyzers import static_patterns_anti_refusal as ar_module
 from skillspector.nodes.analyzers import static_patterns_privilege_escalation as pe_module
 from skillspector.nodes.analyzers import static_patterns_prompt_injection as pi_module
 from skillspector.nodes.analyzers import static_patterns_rogue_agent as ra_module
+from skillspector.nodes.analyzers import static_patterns_supply_chain as sc_module
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
 from skillspector.nodes.analyzers import static_runner
 from skillspector.nodes.report import _compute_risk_score
@@ -162,6 +164,17 @@ class TestCharacterLimit:
         assert len(module.calls) >= 3  # raw plus at least two normalized slices
         assert all(len(call) <= static_runner.SECURITY_VIEW_WINDOW_CHARS for call in module.calls)
 
+    def test_identity_view_slices_preserve_whole_view_offsets(self) -> None:
+        content = "x" * (static_runner.SECURITY_VIEW_WINDOW_CHARS + 1)
+        first, second = tuple(static_runner._bounded_view_slices(SecurityTextView("raw", content)))
+
+        assert first.source_offset(0) == 0
+        assert first.right_boundary_is_fixed is True
+        assert second.source_offset(0) == (
+            static_runner.SECURITY_VIEW_WINDOW_CHARS - static_runner._WINDOW_OVERLAP_CHARS
+        )
+        assert second.right_boundary_is_fixed is False
+
     def test_cross_window_separator_retains_prompt_injection_contract(self) -> None:
         separator = " " * (static_runner.SECURITY_VIEW_WINDOW_CHARS + 10)
         content = (
@@ -239,6 +252,11 @@ class TestCharacterLimit:
             [module],
         )
         assert all(len(call) <= static_runner.SECURITY_VIEW_WINDOW_CHARS for call in module.calls)
+
+    def test_continuity_view_preserves_carriage_return_anchor_semantics(self) -> None:
+        content = "package" + "\r" * 9000 + "other"
+
+        assert _findings(content, "requirements.txt", sc_module) == set()
 
     def test_finding_output_limit_is_explicitly_partial(
         self, monkeypatch: pytest.MonkeyPatch
@@ -666,6 +684,390 @@ subprocess.run(["rm", "-rf", "/tmp/cache"])
 
 
 class TestInspectionLedgerResponse:
+    def test_postprocessor_time_is_included_in_runtime_ledger(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [0.0]
+        monkeypatch.setattr(static_runner.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(static_runner, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 30.0)
+
+        class SlowPostprocessingModule:
+            ANALYZER_ID = "slow_postprocessed_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=1),
+                    )
+                ]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list) -> list:
+                del content
+                now[0] = 31.0
+                return findings
+
+        response = static_runner.run_static_patterns_with_ledger(
+            {"components": ["input.md"], "file_cache": {"input.md": "input"}},
+            [SlowPostprocessingModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "runtime_limit"
+        assert event["observed_seconds"] == 31.0
+        assert event["limit_seconds"] == 30.0
+
+    def test_postprocessor_deadline_runs_private_evidence_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [0.0]
+        cleanup_calls = 0
+        monkeypatch.setattr(static_runner.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(static_runner, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 30.0)
+
+        class SlowPostprocessingModule:
+            ANALYZER_ID = "slow_postprocessed_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=1),
+                        evidence={"_private_intermediate": "scan"},
+                    )
+                ]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list) -> list:
+                del content
+                findings[0].evidence["_private_intermediate"] = "postprocess"
+                now[0] = 31.0
+                return findings
+
+            @staticmethod
+            def cleanup_path_findings(findings: list) -> list:
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+                for finding in findings:
+                    finding.evidence.pop("_private_intermediate", None)
+                return findings
+
+        response = static_runner.run_static_patterns_with_ledger(
+            {"components": ["input.md"], "file_cache": {"input.md": "input"}},
+            [SlowPostprocessingModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert cleanup_calls == 1
+        assert response["findings"][0].evidence == {}
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "runtime_limit"
+
+    def test_postprocessor_runtime_limit_supersedes_prior_output_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [0.0]
+        monkeypatch.setattr(static_runner.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(static_runner, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 30.0)
+        monkeypatch.setattr(static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+
+        class SlowLimitedModule:
+            ANALYZER_ID = "slow_limited_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=line),
+                    )
+                    for line in (1, 2)
+                ]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list) -> list:
+                del content
+                now[0] = 31.0
+                return findings
+
+        response = static_runner.run_static_patterns_with_ledger(
+            {"components": ["input.md"], "file_cache": {"input.md": "input"}},
+            [SlowLimitedModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "runtime_limit"
+        assert event["observed_seconds"] == 31.0
+        assert event["limit_seconds"] == 30.0
+
+    def test_postprocessor_is_skipped_after_scan_runtime_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [0.0]
+        postprocess_called = False
+        monkeypatch.setattr(static_runner.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(static_runner, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 30.0)
+
+        class ExpiredBeforePostprocessingModule:
+            ANALYZER_ID = "expired_before_postprocessing_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                finding = AnalyzerFinding(
+                    rule_id="T1",
+                    message="candidate",
+                    severity=Severity.HIGH,
+                    location=Location(file=file_path, start_line=1),
+                )
+                now[0] = 31.0
+                return [finding]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list) -> list:
+                nonlocal postprocess_called
+                del content
+                postprocess_called = True
+                raise AssertionError("postprocessor must not run after the shared deadline")
+
+        response = static_runner.run_static_patterns_with_ledger(
+            {"components": ["input.md"], "file_cache": {"input.md": "input"}},
+            [ExpiredBeforePostprocessingModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert not postprocess_called
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "runtime_limit"
+        assert event["observed_seconds"] == 31.0
+        assert event["limit_seconds"] == 30.0
+
+    def test_postprocessor_runs_before_findings_and_ledger_ids_are_committed(self) -> None:
+        class PostprocessingModule:
+            ANALYZER_ID = "postprocessed_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=line),
+                        matched_text=f"match-{line}",
+                    )
+                    for line in (1, 2)
+                ]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list) -> list:
+                assert content == "input\nsecond"
+                return findings[1:]
+
+        state = {
+            "components": ["input.md"],
+            "file_cache": {"input.md": "input\nsecond"},
+        }
+        response = static_runner.run_static_patterns_with_ledger(
+            state,
+            [PostprocessingModule],
+        )
+        findings = response["findings"]
+
+        assert len(findings) == 1
+        assert findings[0].start_line == 2
+        assert response["inspection_ledger"][0]["emitted_finding_ids"] == [findings[0].finding_id]
+        assert static_runner.run_static_patterns(state, [PostprocessingModule])[0].start_line == 2
+
+    def test_ast_aware_postprocessor_requests_shared_parse_without_ast_analyzer(self) -> None:
+        class AstPostprocessingModule:
+            ANALYZER_ID = "ast_postprocessed_static"
+            POSTPROCESS_USES_PYTHON_AST = True
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=1),
+                    )
+                ]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list, *, python_ast) -> list:
+                del content
+                assert python_ast is not None
+                assert python_ast.tree is not None
+                return findings
+
+        state = {"components": ["input.py"], "file_cache": {"input.py": "value = 1\n"}}
+
+        response = static_runner.run_static_patterns_with_ledger(
+            state,
+            [AstPostprocessingModule],
+        )
+
+        assert len(response["findings"]) == 1
+        assert response["inspection_ledger"][0]["outcome"] == "completed"
+
+    def test_ast_aware_postprocessor_marks_oversized_python_partial(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(static_runner, "MAX_FILE_CHARS", 4)
+
+        class AstPostprocessingModule:
+            ANALYZER_ID = "ast_postprocessed_static"
+            POSTPROCESS_USES_PYTHON_AST = True
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list:
+                del content, file_path, file_type
+                return []
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list, *, python_ast) -> list:
+                del content
+                assert python_ast is None
+                return findings
+
+        response = static_runner.run_static_patterns_with_ledger(
+            {"components": ["input.py"], "file_cache": {"input.py": "value = 1\n"}},
+            [AstPostprocessingModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "size_limit"
+        assert event["observed_characters"] == 10
+        assert event["limit_characters"] == 4
+
+    def test_nonledger_runner_counts_shared_python_parse_against_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [0.0]
+        analyzed = False
+
+        class AstModule:
+            USES_PYTHON_AST = True
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str, python_ast) -> list:
+                nonlocal analyzed
+                del content, file_path, file_type, python_ast
+                analyzed = True
+                return []
+
+        def delayed_parse(*_args, **_kwargs):
+            now[0] = 31.0
+            return type("Parsed", (), {"tree": object()})()
+
+        monkeypatch.setattr(static_runner.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(static_runner, "get_python_ast", delayed_parse)
+        monkeypatch.setattr(static_runner, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 30.0)
+
+        findings = static_runner.run_static_patterns(
+            {"components": ["input.py"], "file_cache": {"input.py": "value = 1\n"}},
+            [AstModule],
+        )
+
+        assert findings == []
+        assert analyzed is False
+
+    def test_nonledger_runner_discards_unfinished_postprocessing_after_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [0.0]
+        postprocessed = False
+
+        class PostprocessingModule:
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=1),
+                    )
+                ]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list) -> list:
+                nonlocal postprocessed
+                del content
+                postprocessed = True
+                now[0] = 31.0
+                return findings
+
+        monkeypatch.setattr(static_runner.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(static_runner, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 30.0)
+
+        findings = static_runner.run_static_patterns(
+            {"components": ["input.md"], "file_cache": {"input.md": "input"}},
+            [PostprocessingModule],
+        )
+
+        assert postprocessed is True
+        assert findings == []
+
+    def test_postprocessor_cannot_expand_past_per_artifact_output_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+
+        class ExpandingPostprocessorModule:
+            ANALYZER_ID = "expanding_postprocessed_static"
+
+            @staticmethod
+            def analyze(*, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                del content, file_type
+                return [
+                    AnalyzerFinding(
+                        rule_id="T1",
+                        message="candidate",
+                        severity=Severity.HIGH,
+                        location=Location(file=file_path, start_line=1),
+                    )
+                ]
+
+            @staticmethod
+            def postprocess_path_findings(content: str, findings: list) -> list:
+                del content
+                return findings * 4
+
+        state = {"components": ["input.md"], "file_cache": {"input.md": "input"}}
+        response = static_runner.run_static_patterns_with_ledger(
+            state,
+            [ExpandingPostprocessorModule],
+        )
+        event = response["inspection_ledger"][0]
+
+        assert len(response["findings"]) == 1
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "output_limit"
+        assert event["observed_findings"] == 4
+        assert event["limit_findings"] == 1
+        assert len(static_runner.run_static_patterns(state, [ExpandingPostprocessorModule])) == 1
+
     def test_static_runner_records_and_recovers_from_pattern_failure(self) -> None:
         class FailingPatternModule:
             ANALYZER_ID = "failing_static"

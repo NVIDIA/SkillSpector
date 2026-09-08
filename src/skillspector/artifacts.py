@@ -75,6 +75,8 @@ class SecurityTextView:
     name: str
     text: str
     source_offsets: array[int] | None = None
+    right_boundary_is_fixed: bool = False
+    right_boundary_recovery_start: int | None = None
 
     def source_offset(self, derived_offset: int) -> int:
         """Map a derived character offset to the corresponding source offset."""
@@ -1529,28 +1531,37 @@ def _contextual_default_ignorable_spans(text: str) -> Iterator[tuple[int, int]]:
                 yield span_start, end
 
 
+def _normalization_ignored_spans_in_gap(
+    text: str,
+    gap_start: int,
+    gap_end: int,
+) -> Iterator[tuple[int, int]]:
+    """Yield the normalized-view removals inside one contextual gap."""
+    for match in _DEFAULT_IGNORABLE_RUN_PATTERN.finditer(text, gap_start, gap_end):
+        start, end = match.span()
+        ignored_start = (
+            start
+            if _is_unconditionally_ignored(text[start])
+            or _is_contextual_default_ignorable_offset(text, start)
+            else start + 1
+        )
+        ignored_end = (
+            end
+            if _is_unconditionally_ignored(text[end - 1])
+            or _is_contextual_default_ignorable_offset(text, end - 1)
+            else end - 1
+        )
+        if ignored_start < ignored_end:
+            yield ignored_start, ignored_end
+
+
 def _normalization_ignored_spans(text: str) -> Iterator[tuple[int, int]]:
     """Yield whole default-ignorable runs removable by the normalized view."""
     for gap_start, gap_end in _token_bridging_gap_spans(
         text,
         require_word_boundaries=False,
     ):
-        for match in _DEFAULT_IGNORABLE_RUN_PATTERN.finditer(text, gap_start, gap_end):
-            start, end = match.span()
-            ignored_start = (
-                start
-                if _is_unconditionally_ignored(text[start])
-                or _is_contextual_default_ignorable_offset(text, start)
-                else start + 1
-            )
-            ignored_end = (
-                end
-                if _is_unconditionally_ignored(text[end - 1])
-                or _is_contextual_default_ignorable_offset(text, end - 1)
-                else end - 1
-            )
-            if ignored_start < ignored_end:
-                yield ignored_start, ignored_end
+        yield from _normalization_ignored_spans_in_gap(text, gap_start, gap_end)
 
 
 def _contextual_default_ignorable_offsets(text: str) -> Iterator[int]:
@@ -1628,6 +1639,55 @@ def normalized_security_view(text: str) -> SecurityTextView:
             offsets.append(source_offset)
         source_offset += 1
     return SecurityTextView("normalized", output.getvalue(), offsets)
+
+
+def normalized_security_prefix(text: str, max_chars: int) -> str:
+    """Return an exact bounded prefix of the normalized security projection."""
+    if max_chars <= 0:
+        return ""
+
+    output = StringIO()
+    output_chars = 0
+
+    def append(character: str) -> bool:
+        nonlocal output_chars
+        normalized = unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON)
+        remaining = max_chars - output_chars
+        output.write(normalized[:remaining])
+        output_chars += min(len(normalized), remaining)
+        return output_chars >= max_chars
+
+    source_offset = 0
+    while source_offset < len(text) and output_chars < max_chars:
+        if not _is_token_gap_character(text[source_offset]):
+            if append(text[source_offset]):
+                break
+            source_offset += 1
+            continue
+
+        gap_start = source_offset
+        while source_offset < len(text) and _is_token_gap_character(text[source_offset]):
+            source_offset += 1
+        gap_end = source_offset
+        before_is_word = gap_start > 0 and _is_word_character(text[gap_start - 1])
+        after_is_word = gap_end < len(text) and _is_word_character(text[gap_end])
+        ignored_spans = iter(
+            _normalization_ignored_spans_in_gap(text, gap_start, gap_end)
+            if before_is_word or after_is_word
+            else ()
+        )
+        next_ignored = next(ignored_spans, None)
+        gap_offset = gap_start
+        while gap_offset < gap_end and output_chars < max_chars:
+            if next_ignored is not None and gap_offset == next_ignored[0]:
+                gap_offset = next_ignored[1]
+                next_ignored = next(ignored_spans, None)
+                continue
+            if not _is_unconditionally_ignored(text[gap_offset]) and append(text[gap_offset]):
+                break
+            gap_offset += 1
+
+    return output.getvalue()
 
 
 def obfuscated_instruction_view(text: str) -> SecurityTextView:
@@ -1716,6 +1776,35 @@ def _requires_normalized_security_view(text: str) -> bool:
     # projection. Any other non-printable character still needs the exact
     # category-aware path in ``normalized_security_view``.
     return not text.translate(_REMOVE_ALLOWED_FORMAT_CHARACTERS).isprintable()
+
+
+def _has_derived_security_view(text: str) -> bool:
+    """Return whether security projection produces a distinct text view."""
+    if text.isascii():
+        return (
+            _IGNORED_ASCII_CONTROL.search(text) is not None
+            or _has_letter_spacing_run(text)
+            or next(_obfuscated_instruction_matches(text), None) is not None
+        )
+    if any(
+        unicodedata.normalize("NFKC", character).translate(ASCII_CONFUSABLE_SKELETON) != character
+        for character in text
+    ):
+        return True
+    if any(_is_unconditionally_ignored(character) for character in text):
+        return True
+    if next(_normalization_ignored_spans(text), None) is not None:
+        return True
+    if "\ufffd" in text or next(_compact_gap_offsets(text), None) is not None:
+        return True
+    return (
+        _has_letter_spacing_run(text)
+        or next(
+            _obfuscated_instruction_matches(text),
+            None,
+        )
+        is not None
+    )
 
 
 def security_text_views(text: str) -> tuple[SecurityTextView, ...]:

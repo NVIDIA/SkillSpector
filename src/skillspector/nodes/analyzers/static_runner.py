@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 import unicodedata
@@ -91,7 +92,24 @@ SECURITY_VIEW_WINDOW_CHARS = 256_000
 _WINDOW_OVERLAP_CHARS = 8192
 _RAW_WINDOW_OWNED_CHARS = SECURITY_VIEW_WINDOW_CHARS - 2 * _WINDOW_OVERLAP_CHARS
 _VIEW_START_EVIDENCE = "_security_view_start"
+_VIEW_ANCHOR_EVIDENCE = "_security_view_anchor"
+_VIEW_ALTERNATE_START_EVIDENCE = "_security_view_alternate_start"
+_VIEW_REACH_END_EVIDENCE = "_security_view_reach_end"
+_VIEW_REPLACEMENT_START_LIMIT_EVIDENCE = "_security_view_replacement_start_limit"
 _SOURCE_START_EVIDENCE = "_security_source_start"
+_SOURCE_ANCHOR_EVIDENCE = "_security_source_anchor"
+_SOURCE_ALTERNATE_START_EVIDENCE = "_security_source_alternate_start"
+_SOURCE_REACH_END_EVIDENCE = "_security_source_reach_end"
+_SOURCE_REPLACEMENT_START_LIMIT_EVIDENCE = "_security_source_replacement_start_limit"
+_SOURCE_REPLACEMENT_RECOVERY_START_EVIDENCE = "_security_source_replacement_recovery_start"
+_PRESERVE_SOURCE_START_EVIDENCE = "_security_preserve_source_start"
+_ABSOLUTE_START_EVIDENCE = "_security_absolute_start"
+_ABSOLUTE_ANCHOR_EVIDENCE = "_security_absolute_anchor"
+_ABSOLUTE_ALTERNATE_START_EVIDENCE = "_security_absolute_alternate_start"
+_ABSOLUTE_REACH_END_EVIDENCE = "_security_absolute_reach_end"
+_ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE = "_security_absolute_replacement_start_limit"
+_ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE = "_security_absolute_replacement_recovery_start"
+_ALTERNATE_MATCHED_TEXT_EVIDENCE = "_security_alternate_matched_text"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
 _BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
 _ViewFindingKey = tuple[str, str, int, str | None, tuple[object, ...]]
@@ -112,6 +130,7 @@ assert DECLARED_MARKER_OWNED_CHARS > 0
 # ordinary module-input ceiling.
 _CONTINUITY_SEPARATOR_CHARS = _WINDOW_OVERLAP_CHARS
 _CONTINUITY_CONTEXT_CHARS = 2048
+_CONTINUITY_RIGHT_CONTEXT_CHARS = _WINDOW_OVERLAP_CHARS
 _CONTINUITY_MAX_CHAIN_RUNS = 24
 MAX_FINDINGS_PER_ARTIFACT = 10_000
 MAX_FINDINGS_PER_ANALYZER = 10_000
@@ -121,7 +140,10 @@ _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
-_ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
+_RETAINED_CONTINUITY_NON_ASCII_WHITESPACE = re.compile(r"(?=[^\x00-\x7f])[^\S\x00-\x1f\x7f-\x9f]")
+_RETAINED_CONTINUITY_ASCII_WHITESPACE = re.compile(r"[ \t]")
+_RETAINED_CONTINUITY_REPLACEMENT = re.compile("\ufffd")
+_RETAINED_CONTINUITY_LINE_BREAK = re.compile(r"\r\n|[\r\n\u2028\u2029]")
 
 
 def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
@@ -196,7 +218,42 @@ def _window_view_with_markdown_context(
         offsets = array("I", (max(0, offset - prefix_length) for offset in range(len(view.text))))
     else:
         offsets = array("I", (max(0, offset - prefix_length) for offset in view.source_offsets))
-    return SecurityTextView(view.name, view.text, offsets)
+    return SecurityTextView(
+        view.name,
+        view.text,
+        offsets,
+        right_boundary_is_fixed=view.right_boundary_is_fixed,
+        right_boundary_recovery_start=(
+            max(0, view.right_boundary_recovery_start - prefix_length)
+            if view.right_boundary_recovery_start is not None
+            else None
+        ),
+    )
+
+
+def _with_fixed_right_boundary(
+    view: SecurityTextView,
+    is_fixed: bool,
+    recovery_start: int | None = None,
+) -> SecurityTextView:
+    """Attach a scanner right edge and any overlapping recovery coordinate."""
+    recovery_candidates = [
+        candidate
+        for candidate in (view.right_boundary_recovery_start, recovery_start)
+        if candidate is not None
+    ]
+    merged_recovery = min(recovery_candidates, default=None)
+    if (
+        not is_fixed or view.right_boundary_is_fixed
+    ) and merged_recovery == view.right_boundary_recovery_start:
+        return view
+    return SecurityTextView(
+        view.name,
+        view.text,
+        view.source_offsets,
+        right_boundary_is_fixed=(view.right_boundary_is_fixed or is_fixed),
+        right_boundary_recovery_start=merged_recovery,
+    )
 
 
 def _markdown_context_prefix(
@@ -428,6 +485,37 @@ def _uses_python_ast(module: object) -> bool:
     return getattr(module, "USES_PYTHON_AST", False) is True
 
 
+def _requires_python_ast(pattern_modules: list) -> bool:
+    """Return whether an analyzer or its postprocessor consumes the shared AST."""
+    return any(_uses_python_ast(module) for module in pattern_modules) or bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_PYTHON_AST") is True
+    )
+
+
+def _python_ast_for_path(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    python_ast_cache_key: str | None,
+) -> ParsedPythonFile | None:
+    """Return the shared parse needed by analyzer or postprocessor hooks."""
+    if (
+        _infer_file_type(path) != "python"
+        or len(content) > MAX_FILE_CHARS
+        or not _requires_python_ast(pattern_modules)
+    ):
+        return None
+    return get_python_ast(python_ast_cache_key, content, path)
+
+
+def _explicit_module_hook(module: object, name: str) -> object | None:
+    """Return a hook only when the module or its class actually declares it."""
+    if inspect.getattr_static(module, name, None) is None:
+        return None
+    return getattr(module, name, None)
+
+
 class _StaticResourceLimitError(RuntimeError):
     """Internal control-flow signal for one attacker-controlled work ceiling."""
 
@@ -504,10 +592,11 @@ class _FindingBudget:
 
 @dataclass(frozen=True)
 class _ContinuityView:
-    """One bounded cross-window projection with exact raw line locations."""
+    """One bounded cross-window projection with exact raw coordinates."""
 
     view: SecurityTextView
     source_lines: tuple[int, ...]
+    source_offsets: array[int]
 
 
 @dataclass(frozen=True)
@@ -576,6 +665,7 @@ def _scan_path(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
@@ -586,10 +676,9 @@ def _scan_path(
         if _is_license_basename(path, file_type)
         else None
     )
-    python_ast: ParsedPythonFile | None = None
     if file_type == "python" and any(_uses_python_ast(module) for module in pattern_modules):
         finding_budget.check_runtime()
-        python_ast = get_python_ast(python_ast_cache_key, content, path)
+        python_ast = python_ast or get_python_ast(python_ast_cache_key, content, path)
         finding_budget.check_runtime()
 
     for module in pattern_modules:
@@ -667,6 +756,7 @@ def _extend_unique_findings(
     candidates: list[Finding],
     *,
     max_findings: int,
+    coalesce: Callable[[list[Finding]], list[Finding]] | None = None,
 ) -> _StaticResourceLimitError | None:
     """Append distinct final findings and enforce the user-visible output cap."""
     for finding in candidates:
@@ -675,7 +765,7 @@ def _extend_unique_findings(
             continue
         seen.add(key)
         result.append(finding)
-        if len(result) > max_findings:
+        if coalesce is None and len(result) > max_findings:
             return _StaticResourceLimitError(
                 LedgerReason.OUTPUT_LIMIT,
                 {
@@ -683,6 +773,16 @@ def _extend_unique_findings(
                     "limit_findings": max_findings,
                 },
             )
+    if len(result) > max_findings and coalesce is not None:
+        result[:] = coalesce(result)
+    if len(result) > max_findings:
+        return _StaticResourceLimitError(
+            LedgerReason.OUTPUT_LIMIT,
+            {
+                "observed_findings": len(result),
+                "limit_findings": max_findings,
+            },
+        )
     return None
 
 
@@ -733,10 +833,68 @@ def _scan_view_windows(
         finding_budget,
         python_ast_cache_key,
     )
+
+    def source_boundary(derived_offset: int) -> int:
+        if view.source_offsets is None:
+            return derived_offset
+        if derived_offset < len(view.source_offsets):
+            return view.source_offsets[derived_offset]
+        return view.source_offsets[-1] + 1 if view.source_offsets else 0
+
     for finding in findings:
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
             finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
+        local_anchor = finding.evidence.pop(_VIEW_ANCHOR_EVIDENCE, None)
+        if isinstance(local_anchor, int) and 0 <= local_anchor < len(view.text):
+            finding.evidence[_SOURCE_ANCHOR_EVIDENCE] = view.source_offset(local_anchor)
+        local_alternate = finding.evidence.pop(_VIEW_ALTERNATE_START_EVIDENCE, None)
+        if isinstance(local_alternate, int) and 0 <= local_alternate < len(view.text):
+            finding.evidence[_SOURCE_ALTERNATE_START_EVIDENCE] = view.source_offset(local_alternate)
+        local_reach_end = finding.evidence.pop(_VIEW_REACH_END_EVIDENCE, None)
+        if isinstance(local_reach_end, int) and 0 <= local_reach_end <= len(view.text):
+            finding.evidence[_SOURCE_REACH_END_EVIDENCE] = source_boundary(local_reach_end)
+        local_replacement_start_limit = finding.evidence.pop(
+            _VIEW_REPLACEMENT_START_LIMIT_EVIDENCE,
+            None,
+        )
+        replacement_width = (
+            len(view.text) - local_replacement_start_limit
+            if isinstance(local_replacement_start_limit, int)
+            else 0
+        )
+        prospective_slice_boundary = (
+            not view.right_boundary_is_fixed
+            and 0 < replacement_width <= len(view.text)
+            and len(view.text) < SECURITY_VIEW_WINDOW_CHARS
+            and len(view.text) + max(0, replacement_width - 1) > SECURITY_VIEW_WINDOW_CHARS
+        )
+        if (
+            (view.right_boundary_is_fixed or prospective_slice_boundary)
+            and isinstance(local_replacement_start_limit, int)
+            and 0 <= local_replacement_start_limit < len(view.text)
+        ):
+            if prospective_slice_boundary:
+                local_replacement_start_limit += SECURITY_VIEW_WINDOW_CHARS - len(view.text)
+            finding.evidence[_SOURCE_REPLACEMENT_START_LIMIT_EVIDENCE] = view.source_offset(
+                local_replacement_start_limit
+            )
+            recovery_candidates = [
+                candidate
+                for candidate in (
+                    view.right_boundary_recovery_start,
+                    (
+                        view.source_offset(SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS)
+                        if prospective_slice_boundary
+                        else None
+                    ),
+                )
+                if candidate is not None
+            ]
+            if recovery_candidates:
+                finding.evidence[_SOURCE_REPLACEMENT_RECOVERY_START_EVIDENCE] = min(
+                    recovery_candidates
+                )
     if view.name != "raw":
         for finding in findings:
             if "normalized-view" not in finding.tags:
@@ -751,16 +909,44 @@ def _scan_view_windows(
 def _bounded_view_slices(view: SecurityTextView) -> Iterator[SecurityTextView]:
     """Split an expanded derived view before any pattern module sees it."""
     if len(view.text) <= SECURITY_VIEW_WINDOW_CHARS:
-        yield view
+        exact_ceiling_recovery = (
+            view.source_offset(SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS)
+            if len(view.text) == SECURITY_VIEW_WINDOW_CHARS
+            else None
+        )
+        yield _with_fixed_right_boundary(
+            view,
+            len(view.text) == SECURITY_VIEW_WINDOW_CHARS,
+            exact_ceiling_recovery,
+        )
         return
     step = SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS
     for start in range(0, len(view.text), step):
         end = min(len(view.text), start + SECURITY_VIEW_WINDOW_CHARS)
-        offsets = None if view.source_offsets is None else view.source_offsets[start:end]
+        has_following_slice = end < len(view.text)
+        fills_ceiling = end - start == SECURITY_VIEW_WINDOW_CHARS
+        slice_recovery = (
+            view.source_offset(start + step) if has_following_slice or fills_ceiling else None
+        )
+        inherited_recovery = (
+            view.right_boundary_recovery_start if view.right_boundary_is_fixed else None
+        )
+        recovery_candidates = [
+            candidate for candidate in (slice_recovery, inherited_recovery) if candidate is not None
+        ]
+        offsets = (
+            array("I", range(start, end))
+            if view.source_offsets is None
+            else view.source_offsets[start:end]
+        )
         yield SecurityTextView(
             name=view.name,
             text=view.text[start:end],
             source_offsets=offsets,
+            right_boundary_is_fixed=(
+                view.right_boundary_is_fixed or has_following_slice or fills_ceiling
+            ),
+            right_boundary_recovery_start=min(recovery_candidates, default=None),
         )
         if end == len(view.text):
             break
@@ -777,16 +963,78 @@ def _is_continuity_separator(character: str) -> bool:
     )
 
 
+def _continuity_runs_for_anchors(
+    content: str,
+    anchors: set[int],
+    check_runtime: Callable[[], None],
+) -> dict[int, tuple[int, int]]:
+    """Find each anchor's nearest relevant long run in merged local ranges."""
+    ordered_anchors = sorted(anchor for anchor in anchors if 0 <= anchor < len(content))
+    if not ordered_anchors:
+        return {}
+
+    search_ranges: list[tuple[int, int]] = []
+    for anchor in ordered_anchors:
+        left = max(0, anchor - _CONTINUITY_RIGHT_CONTEXT_CHARS)
+        if search_ranges and left <= search_ranges[-1][1]:
+            search_ranges[-1] = (search_ranges[-1][0], anchor)
+        else:
+            search_ranges.append((left, anchor))
+
+    examined = 0
+
+    def is_separator(index: int) -> bool:
+        nonlocal examined
+        examined += 1
+        if examined % _WINDOW_OVERLAP_CHARS == 0:
+            check_runtime()
+        return _is_continuity_separator(content[index])
+
+    runs: set[tuple[int, int]] = set()
+    for left, right in search_ranges:
+        # A merged search range may begin inside the only relevant long run.
+        # Extend through that run once so its full length remains observable.
+        while left > 0 and is_separator(left - 1):
+            left -= 1
+        cursor = left
+        while cursor < right:
+            if not is_separator(cursor):
+                cursor += 1
+                continue
+            run_start = cursor
+            cursor += 1
+            while cursor < right and is_separator(cursor):
+                cursor += 1
+            if cursor - run_start > _WINDOW_OVERLAP_CHARS:
+                runs.add((run_start, cursor))
+
+    check_runtime()
+    ordered_runs = sorted(runs, key=lambda run: run[1])
+    run_ends = [run[1] for run in ordered_runs]
+    relevant: dict[int, tuple[int, int]] = {}
+    for anchor in ordered_anchors:
+        run_index = bisect_right(run_ends, anchor) - 1
+        if run_index < 0:
+            continue
+        run = ordered_runs[run_index]
+        if anchor - run[1] < _CONTINUITY_RIGHT_CONTEXT_CHARS:
+            relevant[anchor] = run
+    return relevant
+
+
 def _continuity_separator_runs(
     content: str,
     finding_budget: _FindingBudget,
+    *,
+    search_end: int | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield long separator runs without allocating a whole-file projection."""
+    limit = len(content) if search_end is None else min(len(content), max(0, search_end))
     if content.isascii():
         # Keep ordinary source files on the regex engine's bounded C-level
         # fast path.  Unicode category inspection below is reserved for input
         # that can actually contain normalized-away format characters.
-        for match in _ASCII_CONTINUITY_SEPARATOR_RUN.finditer(content):
+        for match in _ASCII_CONTINUITY_SEPARATOR_RUN.finditer(content, 0, limit):
             finding_budget.check_runtime()
             if match.end() - match.start() > _WINDOW_OVERLAP_CHARS:
                 yield match.start(), match.end()
@@ -797,7 +1045,7 @@ def _continuity_separator_runs(
     # character accepted by ``_is_continuity_separator``. Keep that common
     # multilingual-text case on C-level predicates instead of walking every
     # code point in Python.
-    if (
+    if limit == len(content) and (
         content.isprintable()
         and _ASCII_CONTINUITY_SEPARATOR_RUN.search(content) is None
         and "\ufffd" not in content
@@ -807,7 +1055,8 @@ def _continuity_separator_runs(
         return
 
     run_start: int | None = None
-    for index, character in enumerate(content):
+    for index in range(limit):
+        character = content[index]
         if index % _WINDOW_OVERLAP_CHARS == 0:
             finding_budget.check_runtime()
         if _is_continuity_separator(character):
@@ -817,27 +1066,137 @@ def _continuity_separator_runs(
         if run_start is not None and index - run_start > _WINDOW_OVERLAP_CHARS:
             yield run_start, index
         run_start = None
-    if run_start is not None and len(content) - run_start > _WINDOW_OVERLAP_CHARS:
-        yield run_start, len(content)
+    if run_start is not None and limit - run_start > _WINDOW_OVERLAP_CHARS:
+        yield run_start, limit
 
 
 def _append_projected_piece(
     text_parts: list[str],
     source_lines: list[int],
+    source_offsets: array[int],
     piece: str,
+    source_start: int,
     source_line: int,
 ) -> int:
-    """Append one contiguous raw piece and extend its exact line projection."""
+    """Append one contiguous raw piece and extend its exact projections."""
     text_parts.append(piece)
+    source_offsets.extend(range(source_start, source_start + len(piece)))
     for _ in LOGICAL_LINE_BREAK.finditer(piece):
         source_line += 1
         source_lines.append(source_line)
     return source_line
 
 
+def _retained_continuity_separator(
+    content: str,
+    start: int,
+    end: int,
+) -> tuple[str, int] | None:
+    """Return one representative retained by the same security-view classes."""
+    for pattern in (
+        _RETAINED_CONTINUITY_ASCII_WHITESPACE,
+        _RETAINED_CONTINUITY_NON_ASCII_WHITESPACE,
+        _RETAINED_CONTINUITY_REPLACEMENT,
+    ):
+        if match := pattern.search(content, start, end):
+            return match.group(0), match.start()
+    return None
+
+
+def _anchored_continuity_view(
+    content: str,
+    anchor: int,
+    check_runtime: Callable[[], None],
+) -> SecurityTextView | None:
+    """Project the long-separator chain immediately preceding *anchor*.
+
+    This mirrors the ordinary continuity chain bound while searching backward
+    from one already-retained finding. It therefore avoids rediscovering every
+    unrelated separator in the artifact during output-limit finalization.
+    """
+    anchor = min(max(0, anchor), len(content))
+    search_end = anchor
+    reverse_runs: list[tuple[int, int]] = []
+    examined = 0
+    while search_end > 0 and len(reverse_runs) < _CONTINUITY_MAX_CHAIN_RUNS:
+        search_span = (
+            _CONTINUITY_RIGHT_CONTEXT_CHARS
+            if not reverse_runs
+            # The forward producer compares the exclusive prior-run end with
+            # the next-run start. Include the prior run's final character when
+            # that gap is exactly the configured chain limit.
+            else _CONTINUITY_CONTEXT_CHARS + 1
+        )
+        search_start = max(0, search_end - search_span)
+        cursor = search_end
+        prior_run: tuple[int, int] | None = None
+        while cursor > search_start:
+            cursor -= 1
+            examined += 1
+            if examined % _WINDOW_OVERLAP_CHARS == 0:
+                check_runtime()
+            if not _is_continuity_separator(content[cursor]):
+                continue
+            run_end = cursor + 1
+            while cursor > 0 and _is_continuity_separator(content[cursor - 1]):
+                cursor -= 1
+                examined += 1
+                if examined % _WINDOW_OVERLAP_CHARS == 0:
+                    check_runtime()
+            if run_end - cursor > _WINDOW_OVERLAP_CHARS:
+                prior_run = (cursor, run_end)
+                break
+        if prior_run is None:
+            break
+        reverse_runs.append(prior_run)
+        search_end = prior_run[0]
+    check_runtime()
+    if not reverse_runs:
+        return None
+
+    separator_runs = list(reversed(reverse_runs))
+    left = max(0, separator_runs[0][0] - _CONTINUITY_CONTEXT_CHARS)
+    right = min(len(content), separator_runs[-1][1] + _CONTINUITY_RIGHT_CONTEXT_CHARS)
+    source_offsets = array("I")
+    text_parts: list[str] = []
+
+    def append(piece: str, source_start: int) -> None:
+        text_parts.append(piece)
+        source_offsets.extend(range(source_start, source_start + len(piece)))
+
+    cursor = left
+    for run_start, run_end in separator_runs:
+        append(content[cursor:run_start], cursor)
+        run_length = run_end - run_start
+        if run_length <= _CONTINUITY_SEPARATOR_CHARS:
+            append(content[run_start:run_end], run_start)
+        else:
+            head_length = _CONTINUITY_SEPARATOR_CHARS // 2
+            tail_length = _CONTINUITY_SEPARATOR_CHARS - head_length
+            head_end = run_start + head_length
+            tail_start = run_end - tail_length
+            append(content[run_start:head_end], run_start)
+            if newline := _RETAINED_CONTINUITY_LINE_BREAK.search(content, head_end, tail_start):
+                append(newline.group(0), newline.start())
+            elif retained := _retained_continuity_separator(content, head_end, tail_start):
+                character, source_offset = retained
+                text_parts.append(character)
+                source_offsets.append(source_offset)
+            append(content[tail_start:run_end], tail_start)
+        cursor = run_end
+    append(content[cursor:right], cursor)
+
+    projected = "".join(text_parts)
+    assert len(projected) <= SECURITY_VIEW_WINDOW_CHARS
+    assert len(source_offsets) == len(projected)
+    return SecurityTextView("anchored-continuity", projected, source_offsets)
+
+
 def _continuity_views(
     content: str,
     finding_budget: _FindingBudget,
+    *,
+    separator_search_end: int | None = None,
 ) -> Iterator[_ContinuityView]:
     """Build bounded neighborhoods that preserve lexical state across raw windows.
 
@@ -849,7 +1208,13 @@ def _continuity_views(
     map is constructed per view, so neither a whole-file normalized copy nor a
     whole-file offset table exists.
     """
-    separator_runs = list(_continuity_separator_runs(content, finding_budget))
+    separator_runs = list(
+        _continuity_separator_runs(
+            content,
+            finding_budget,
+            search_end=separator_search_end,
+        )
+    )
     previous_left = 0
     previous_left_line = 1
     for run_index, (run_start, _) in enumerate(separator_runs):
@@ -864,12 +1229,13 @@ def _continuity_views(
             last_run_index += 1
         selected_runs = separator_runs[run_index : last_run_index + 1]
         left = max(0, run_start - _CONTINUITY_CONTEXT_CHARS)
-        right = min(len(content), selected_runs[-1][1] + _CONTINUITY_CONTEXT_CHARS)
+        right = min(len(content), selected_runs[-1][1] + _CONTINUITY_RIGHT_CONTEXT_CHARS)
         previous_left_line += sum(
             1 for _ in LOGICAL_LINE_BREAK.finditer(content, previous_left, left)
         )
         previous_left = left
         source_lines = [previous_left_line]
+        source_offsets = array("I")
         text_parts: list[str] = []
         current_line = previous_left_line
         cursor = left
@@ -877,7 +1243,9 @@ def _continuity_views(
             current_line = _append_projected_piece(
                 text_parts,
                 source_lines,
+                source_offsets,
                 content[cursor:selected_start],
+                cursor,
                 current_line,
             )
             run_length = selected_end - selected_start
@@ -885,7 +1253,9 @@ def _continuity_views(
                 current_line = _append_projected_piece(
                     text_parts,
                     source_lines,
+                    source_offsets,
                     content[selected_start:selected_end],
+                    selected_start,
                     current_line,
                 )
             else:
@@ -896,33 +1266,57 @@ def _continuity_views(
                 current_line = _append_projected_piece(
                     text_parts,
                     source_lines,
+                    source_offsets,
                     content[selected_start:head_end],
+                    selected_start,
                     current_line,
                 )
                 skipped_newlines = sum(
                     1 for _ in LOGICAL_LINE_BREAK.finditer(content, head_end, tail_start)
                 )
-                if skipped_newlines:
+                retained_line_break = _RETAINED_CONTINUITY_LINE_BREAK.search(
+                    content, head_end, tail_start
+                )
+                if retained_line_break is not None:
                     # Retain a line boundary so DOT-without-DOTALL and anchors
                     # do not acquire semantics absent from the original source.
-                    text_parts.append("\n")
+                    line_break = retained_line_break.group(0)
+                    text_parts.append(line_break)
+                    source_offsets.extend(
+                        range(retained_line_break.start(), retained_line_break.end())
+                    )
+                if skipped_newlines:
                     current_line += skipped_newlines
-                    source_lines.append(current_line)
-                elif _ASCII_NON_NEWLINE_WHITESPACE.search(content, head_end, tail_start):
-                    # Never let truncation erase a real word boundary and turn
-                    # separated tokens into a normalized security match.
-                    text_parts.append(" ")
+                    if retained_line_break is not None:
+                        source_lines.append(current_line)
+                retained_separator = (
+                    None
+                    if retained_line_break is not None
+                    else _retained_continuity_separator(content, head_end, tail_start)
+                )
+                if retained_separator is not None:
+                    # Preserve a representative which the normalized view
+                    # retains.  Keeping the original character also lets the
+                    # compact view make the same contextual decision as it
+                    # would over the complete separator run.
+                    character, source_offset = retained_separator
+                    text_parts.append(character)
+                    source_offsets.append(source_offset)
                 current_line = _append_projected_piece(
                     text_parts,
                     source_lines,
+                    source_offsets,
                     content[tail_start:selected_end],
+                    tail_start,
                     current_line,
                 )
             cursor = selected_end
         _append_projected_piece(
             text_parts,
             source_lines,
+            source_offsets,
             content[cursor:right],
+            cursor,
             current_line,
         )
 
@@ -930,9 +1324,15 @@ def _continuity_views(
         # Context, the retained separators, and the bounded text between
         # chained runs remain below the ordinary module-input ceiling.
         assert len(projected) <= SECURITY_VIEW_WINDOW_CHARS
+        assert len(source_offsets) == len(projected)
         yield _ContinuityView(
-            view=SecurityTextView("continuity", projected),
+            view=SecurityTextView(
+                "continuity",
+                projected,
+                right_boundary_is_fixed=right < len(content),
+            ),
             source_lines=tuple(source_lines),
+            source_offsets=source_offsets,
         )
 
 
@@ -986,6 +1386,7 @@ def _restore_source_lines(
     view: SecurityTextView,
     window_start: int = 0,
     source_line_starts: tuple[int, ...] | None = None,
+    start_source_offsets: array[int] | None = None,
 ) -> None:
     """Map normalized/window-relative locations to raw whole-file lines."""
 
@@ -1002,7 +1403,63 @@ def _restore_source_lines(
             derived_end = _line_start_offset(view.text, finding.end_line)
             raw_end = view.source_offset(derived_end)
             finding.end_line = source_line(raw_end)
-        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+        source_start = finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+        source_anchor = finding.evidence.pop(_SOURCE_ANCHOR_EVIDENCE, None)
+        source_alternate_start = finding.evidence.pop(_SOURCE_ALTERNATE_START_EVIDENCE, None)
+        source_reach_end = finding.evidence.pop(_SOURCE_REACH_END_EVIDENCE, None)
+        source_replacement_start_limit = finding.evidence.pop(
+            _SOURCE_REPLACEMENT_START_LIMIT_EVIDENCE,
+            None,
+        )
+        source_replacement_recovery_start = finding.evidence.pop(
+            _SOURCE_REPLACEMENT_RECOVERY_START_EVIDENCE,
+            None,
+        )
+        preserve_start = finding.evidence.pop(_PRESERVE_SOURCE_START_EVIDENCE, None) is True
+
+        def absolute_offset(source_offset: object) -> int | None:
+            if not isinstance(source_offset, int) or source_offset < 0:
+                return None
+            if start_source_offsets is None:
+                return window_start + source_offset
+            if source_offset < len(start_source_offsets):
+                return start_source_offsets[source_offset]
+            return None
+
+        def absolute_boundary(source_offset: object) -> int | None:
+            if not isinstance(source_offset, int) or source_offset < 0:
+                return None
+            if start_source_offsets is None:
+                return window_start + source_offset
+            if source_offset < len(start_source_offsets):
+                return start_source_offsets[source_offset]
+            if source_offset == len(start_source_offsets) and start_source_offsets:
+                return start_source_offsets[-1] + 1
+            return None
+
+        if preserve_start:
+            absolute_start = absolute_offset(source_start)
+            if absolute_start is not None:
+                finding.evidence[_ABSOLUTE_START_EVIDENCE] = absolute_start
+            absolute_anchor = absolute_offset(source_anchor)
+            if absolute_anchor is not None:
+                finding.evidence[_ABSOLUTE_ANCHOR_EVIDENCE] = absolute_anchor
+            absolute_alternate_start = absolute_offset(source_alternate_start)
+            if absolute_alternate_start is not None:
+                finding.evidence[_ABSOLUTE_ALTERNATE_START_EVIDENCE] = absolute_alternate_start
+            absolute_reach_end = absolute_boundary(source_reach_end)
+            if absolute_reach_end is not None:
+                finding.evidence[_ABSOLUTE_REACH_END_EVIDENCE] = absolute_reach_end
+            absolute_replacement_start_limit = absolute_offset(source_replacement_start_limit)
+            if absolute_replacement_start_limit is not None:
+                finding.evidence[_ABSOLUTE_REPLACEMENT_START_LIMIT_EVIDENCE] = (
+                    absolute_replacement_start_limit
+                )
+            absolute_replacement_recovery_start = absolute_offset(source_replacement_recovery_start)
+            if absolute_replacement_recovery_start is not None:
+                finding.evidence[_ABSOLUTE_REPLACEMENT_RECOVERY_START_EVIDENCE] = (
+                    absolute_replacement_recovery_start
+                )
 
 
 def _scan_declared_marker_views(
@@ -1064,12 +1521,18 @@ def _scan_declared_marker_views(
             )
             projection_limited = projection_limited or reconstruction.limited
             for marker_view in reconstruction.views:
-                if not marker_view.source_offsets:
+                marker_offsets = marker_view.source_offsets
+                if not marker_offsets:
                     continue
+                marker_view = _with_fixed_right_boundary(
+                    marker_view,
+                    reconstruction.limited
+                    or (raw_end < len(content) and marker_offsets[-1] >= len(raw_window) - 1),
+                )
                 marker_key = (
                     marker_view.text,
-                    raw_start + marker_view.source_offsets[0],
-                    raw_start + marker_view.source_offsets[-1],
+                    raw_start + marker_offsets[0],
+                    raw_start + marker_offsets[-1],
                 )
                 if marker_key in seen_views:
                     continue
@@ -1132,13 +1595,24 @@ def _scan_all_views_detailed(
     *,
     max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
     timeout_seconds: float | None = None,
+    started_at: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
+    started_at = time.monotonic() if started_at is None else started_at
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
+    python_ast_eligible = _infer_file_type(path) == "python" and len(content) <= MAX_FILE_CHARS
+    if python_ast_eligible and _requires_python_ast(pattern_modules) and python_ast is None:
+        python_ast = get_python_ast(python_ast_cache_key, content, path)
+    python_syntax_error = bool(
+        python_ast_eligible
+        and _requires_python_ast(pattern_modules)
+        and python_ast is not None
+        and python_ast.tree is None
+    )
     findings: list[Finding] = []
     seen_findings: set[_ViewFindingKey] = set()
-    started_at = time.monotonic()
     runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
     if timeout_seconds is not None:
         runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
@@ -1150,6 +1624,19 @@ def _scan_all_views_detailed(
         clock=time.monotonic,
     )
     marker_projection_limited = False
+    coalesce_hook = (
+        _explicit_module_hook(pattern_modules[0], "coalesce_path_findings")
+        if pattern_modules
+        else None
+    )
+    coalesce: Callable[[list[Finding]], list[Finding]] | None = (
+        (lambda candidates: coalesce_hook(content, candidates)) if callable(coalesce_hook) else None
+    )
+    retained_reconciliation_hook = (
+        _explicit_module_hook(pattern_modules[0], "reconcile_retained_findings")
+        if pattern_modules
+        else None
+    )
     modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     bounded_parse_limited = False
     marker_owned_starts: tuple[int, ...] = ()
@@ -1158,6 +1645,64 @@ def _scan_all_views_detailed(
     raw_starts: tuple[int, ...] = ()
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
+    deferred_output_limit: _StaticResourceLimitError | None = None
+    defers_mixed_output_limit = bool(
+        coalesce is not None
+        and ast_modules
+        and modules_for_windows
+        and python_ast_eligible
+        and python_ast is not None
+        and python_ast.tree is not None
+    )
+
+    def defer_output_limit(resource_limit: _StaticResourceLimitError) -> bool:
+        """Delay mixed-producer caps until their source prefixes can reconcile."""
+        nonlocal deferred_output_limit
+        if not (defers_mixed_output_limit and resource_limit.reason is LedgerReason.OUTPUT_LIMIT):
+            return False
+        if deferred_output_limit is None:
+            deferred_output_limit = resource_limit
+        else:
+            observed = max(
+                int(deferred_output_limit.metrics.get("observed_findings", 0)),
+                int(resource_limit.metrics.get("observed_findings", 0)),
+            )
+            deferred_output_limit = _StaticResourceLimitError(
+                LedgerReason.OUTPUT_LIMIT,
+                {
+                    "observed_findings": observed,
+                    "limit_findings": max_findings,
+                },
+            )
+        return True
+
+    def reconciled_findings() -> list[Finding]:
+        """Coalesce mixed owners before selecting any early-return prefix."""
+        candidates = coalesce(findings) if coalesce is not None else findings
+        return _deduplicate_view_findings(candidates)
+
+    def reconciled_prefix() -> list[Finding]:
+        return reconciled_findings()[:max_findings]
+
+    def limited_result(
+        resource_limit: _StaticResourceLimitError,
+    ) -> tuple[list[Finding], LedgerReason, dict[str, int | float]]:
+        """Finalize retained identity without discovering work beyond a hard cap."""
+        if (
+            resource_limit.reason is LedgerReason.OUTPUT_LIMIT
+            and callable(retained_reconciliation_hook)
+            and source_context is not None
+        ):
+            try:
+                retained_reconciliation_hook(
+                    content,
+                    reconciled_prefix(),
+                    finding_budget.check_runtime,
+                    source_context,
+                )
+            except _StaticResourceLimitError as exc:
+                return reconciled_prefix(), exc.reason, exc.metrics
+        return reconciled_prefix(), resource_limit.reason, resource_limit.metrics
 
     if modules_for_windows:
         marker_owned_starts = tuple(range(0, max(1, len(content)), DECLARED_MARKER_OWNED_CHARS))
@@ -1206,26 +1751,22 @@ def _scan_all_views_detailed(
                 seen_findings,
                 exc.partial_findings,
                 max_findings=max_findings,
+                coalesce=coalesce,
             )
-            return (
-                findings[:max_findings],
-                exc.reason,
-                exc.metrics,
-            )
+            return limited_result(exc)
         unique_limit = _extend_unique_findings(
             findings,
             seen_findings,
             marker_findings,
             max_findings=max_findings,
+            coalesce=coalesce,
         )
         if unique_limit is not None:
-            return findings[:max_findings], unique_limit.reason, unique_limit.metrics
+            if not defer_output_limit(unique_limit):
+                return limited_result(unique_limit)
         if resource_limit is not None:
-            return (
-                _deduplicate_view_findings(findings)[:max_findings],
-                resource_limit.reason,
-                resource_limit.metrics,
-            )
+            if not defer_output_limit(resource_limit):
+                return limited_result(resource_limit)
 
     if ast_modules and len(content) <= MAX_FILE_CHARS:
         try:
@@ -1235,23 +1776,29 @@ def _scan_all_views_detailed(
                 ast_modules,
                 finding_budget,
                 python_ast_cache_key,
+                python_ast,
             )
         except _StaticResourceLimitError as exc:
-            return _deduplicate_view_findings(findings), exc.reason, exc.metrics
+            return reconciled_prefix(), exc.reason, exc.metrics
         unique_limit = _extend_unique_findings(
             findings,
             seen_findings,
             ast_findings,
             max_findings=max_findings,
+            coalesce=coalesce,
         )
         if unique_limit is not None:
-            return findings[:max_findings], unique_limit.reason, unique_limit.metrics
+            if not defer_output_limit(unique_limit):
+                return limited_result(unique_limit)
         if resource_limit is not None:
-            return (
-                _deduplicate_view_findings(findings)[:max_findings],
-                resource_limit.reason,
-                resource_limit.metrics,
-            )
+            if defer_output_limit(resource_limit):
+                # AST and lexical producers can own the same logical finding,
+                # and AST traversal alone cannot decide the earliest public
+                # prefix. Retain its bounded prefix and let the lexical producer
+                # enter reconciliation before enforcing the shared cap.
+                pass
+            else:
+                return limited_result(resource_limit)
 
     if modules_for_windows:
         assert source_context is not None
@@ -1259,7 +1806,7 @@ def _scan_all_views_detailed(
             now = time.monotonic()
             if now >= deadline:
                 return (
-                    _deduplicate_view_findings(findings),
+                    reconciled_prefix(),
                     LedgerReason.RUNTIME_LIMIT,
                     {
                         "observed_seconds": max(0.0, now - started_at),
@@ -1287,8 +1834,26 @@ def _scan_all_views_detailed(
                 source_context.fence_states,
                 source_context.fence_transitions,
             )
+            outer_right_boundary_is_fixed = raw_end < len(content) or (
+                whole_artifact_window and len(content) == SECURITY_VIEW_WINDOW_CHARS
+            )
+            if raw_end < len(content):
+                next_owned_start = owned_start + _RAW_WINDOW_OWNED_CHARS
+                right_boundary_recovery_start = next_owned_start - raw_start
+            elif whole_artifact_window and len(content) > SECURITY_VIEW_WINDOW_CHARS - len("True"):
+                # Replacing a short terminal value can move an exact-ceiling
+                # artifact into the multi-window regime. Its next raw window
+                # owns calls from the standard owned boundary onward.
+                right_boundary_recovery_start = _RAW_WINDOW_OWNED_CHARS
+            else:
+                right_boundary_recovery_start = None
             for full_view in security_text_views(context_prefix + raw_window):
                 full_view = _window_view_with_markdown_context(full_view, len(context_prefix))
+                full_view = _with_fixed_right_boundary(
+                    full_view,
+                    outer_right_boundary_is_fixed,
+                    right_boundary_recovery_start,
+                )
                 try:
                     for module in modules_for_windows:
                         exhaustion_hook = getattr(
@@ -1306,7 +1871,7 @@ def _scan_all_views_detailed(
                             )
                 except _StaticResourceLimitError as exc:
                     return (
-                        _deduplicate_view_findings(findings)[:max_findings],
+                        reconciled_prefix(),
                         exc.reason,
                         exc.metrics,
                     )
@@ -1328,7 +1893,7 @@ def _scan_all_views_detailed(
                         )
                     except _StaticResourceLimitError as exc:
                         return (
-                            _deduplicate_view_findings(findings)[:max_findings],
+                            reconciled_prefix(),
                             exc.reason,
                             exc.metrics,
                         )
@@ -1338,7 +1903,21 @@ def _scan_all_views_detailed(
                         if isinstance(source_start, int) and not (
                             owned_source_start <= source_start < owned_source_end
                         ):
-                            continue
+                            alternate_start = finding.evidence.get(_SOURCE_ALTERNATE_START_EVIDENCE)
+                            if not (
+                                isinstance(alternate_start, int)
+                                and owned_source_start <= alternate_start < owned_source_end
+                            ):
+                                continue
+                            finding.evidence[_SOURCE_START_EVIDENCE] = alternate_start
+                            finding.evidence[_SOURCE_ALTERNATE_START_EVIDENCE] = source_start
+                            alternate_matched_text = finding.evidence.pop(
+                                _ALTERNATE_MATCHED_TEXT_EVIDENCE,
+                                None,
+                            )
+                            if isinstance(alternate_matched_text, str):
+                                finding.matched_text = alternate_matched_text
+                                finding.finding = alternate_matched_text
                         owned_findings.append(finding)
                     view_findings = owned_findings
                     _restore_source_lines(
@@ -1354,15 +1933,14 @@ def _scan_all_views_detailed(
                         seen_findings,
                         view_findings,
                         max_findings=max_findings,
+                        coalesce=coalesce,
                     )
                     if unique_limit is not None:
-                        return findings[:max_findings], unique_limit.reason, unique_limit.metrics
+                        if not defer_output_limit(unique_limit):
+                            return limited_result(unique_limit)
                     if resource_limit is not None:
-                        return (
-                            _deduplicate_view_findings(findings)[:max_findings],
-                            resource_limit.reason,
-                            resource_limit.metrics,
-                        )
+                        if not defer_output_limit(resource_limit):
+                            return limited_result(resource_limit)
             if owned_end == len(content):
                 break
 
@@ -1374,12 +1952,16 @@ def _scan_all_views_detailed(
         # all resource accounting remains on the same artifact budget.
         continuity_seen = {_continuity_finding_key(finding) for finding in findings}
         try:
-            for continuity in _continuity_views(content, finding_budget):
+            for continuity in _continuity_views(
+                content,
+                finding_budget,
+            ):
                 for full_view in security_text_views(continuity.view.text):
                     named_view = SecurityTextView(
                         name=f"continuity-{full_view.name}",
                         text=full_view.text,
                         source_offsets=full_view.source_offsets,
+                        right_boundary_is_fixed=continuity.view.right_boundary_is_fixed,
                     )
                     for view in _bounded_view_slices(named_view):
                         finding_budget.check_runtime()
@@ -1401,6 +1983,7 @@ def _scan_all_views_detailed(
                             raw_window=continuity.view.text,
                             window_line=1,
                             view=view,
+                            start_source_offsets=continuity.source_offsets,
                         )
                         _restore_continuity_lines(
                             view_findings,
@@ -1416,27 +1999,22 @@ def _scan_all_views_detailed(
                                 seen_findings,
                                 [finding],
                                 max_findings=max_findings,
+                                coalesce=coalesce,
                             )
                             if unique_limit is not None:
-                                return (
-                                    findings[:max_findings],
-                                    unique_limit.reason,
-                                    unique_limit.metrics,
-                                )
+                                if not defer_output_limit(unique_limit):
+                                    return limited_result(unique_limit)
                         if resource_limit is not None:
-                            return (
-                                _deduplicate_view_findings(findings)[:max_findings],
-                                resource_limit.reason,
-                                resource_limit.metrics,
-                            )
+                            if not defer_output_limit(resource_limit):
+                                return limited_result(resource_limit)
         except _StaticResourceLimitError as exc:
             return (
-                _deduplicate_view_findings(findings)[:max_findings],
+                reconciled_prefix(),
                 exc.reason,
                 exc.metrics,
             )
 
-    deduplicated = _deduplicate_view_findings(findings)
+    deduplicated = reconciled_findings()
     if len(deduplicated) > max_findings:
         return (
             deduplicated[:max_findings],
@@ -1446,10 +2024,18 @@ def _scan_all_views_detailed(
                 "limit_findings": max_findings,
             },
         )
+    if deferred_output_limit is not None:
+        return (
+            deduplicated,
+            deferred_output_limit.reason,
+            deferred_output_limit.metrics,
+        )
     return (
         deduplicated,
         (
-            LedgerReason.STATIC_PARSE_LIMIT
+            LedgerReason.SYNTAX_ERROR
+            if python_syntax_error
+            else LedgerReason.STATIC_PARSE_LIMIT
             if bounded_parse_limited
             else LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
             if marker_projection_limited
@@ -1467,6 +2053,7 @@ def _scan_all_views(
     *,
     max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
     timeout_seconds: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -1475,8 +2062,71 @@ def _scan_all_views(
         python_ast_cache_key,
         max_findings=max_findings,
         timeout_seconds=timeout_seconds,
+        python_ast=python_ast,
     )
     return findings
+
+
+def _postprocess_path_findings(
+    content: str,
+    pattern_modules: list,
+    findings: list[Finding],
+    *,
+    python_ast: ParsedPythonFile | None = None,
+    started_at: float | None = None,
+    timeout_seconds: float | None = None,
+) -> list[Finding]:
+    """Let one analyzer family reconcile findings after every view has run."""
+    hook = (
+        _explicit_module_hook(pattern_modules[0], "postprocess_path_findings")
+        if pattern_modules
+        else None
+    )
+    if not callable(hook):
+        return findings
+    uses_python_ast = (
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_PYTHON_AST") is True
+    )
+    uses_runtime_budget = bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_RUNTIME_BUDGET") is True
+    )
+    if uses_python_ast or uses_runtime_budget:
+        kwargs: dict[str, object] = {}
+        if uses_python_ast:
+            kwargs["python_ast"] = python_ast
+        if uses_runtime_budget:
+            kwargs.update(
+                {
+                    "started_at": started_at,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+        return cast(list[Finding], hook(content, findings, **kwargs))
+    return cast(list[Finding], hook(content, findings))
+
+
+def _cleanup_expired_path_findings(
+    pattern_modules: list,
+    findings: list[Finding],
+) -> list[Finding]:
+    """Run only a module's bounded private-evidence cleanup after a deadline."""
+    hook = (
+        _explicit_module_hook(pattern_modules[0], "cleanup_path_findings")
+        if pattern_modules
+        else None
+    )
+    if callable(hook):
+        return cast(list[Finding], hook(findings))
+    has_postprocessor = bool(
+        pattern_modules
+        and callable(_explicit_module_hook(pattern_modules[0], "postprocess_path_findings"))
+    )
+    # A module requiring postprocessing owns the contract that turns its private
+    # intermediate findings into public objects. Without an explicit bounded
+    # cleanup hook, dropping that partial prefix is safer than leaking it.
+    return [] if has_postprocessor else findings
 
 
 def run_static_patterns(
@@ -1528,16 +2178,48 @@ def run_static_patterns(
         shared_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
         if shared_remaining is not None and shared_remaining <= 0:
             break
-        findings.extend(
-            _scan_all_views(
-                path,
+        path_started_at = time.monotonic()
+        python_ast = _python_ast_for_path(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+        )
+        path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
+        path_findings, resource_limit, _ = _scan_all_views_detailed(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+            max_findings=path_limit,
+            timeout_seconds=shared_remaining,
+            started_at=path_started_at,
+            python_ast=python_ast,
+        )
+        runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+        if shared_remaining is not None:
+            runtime_limit = min(runtime_limit, max(0.0, shared_remaining))
+        expired = (
+            resource_limit is LedgerReason.RUNTIME_LIMIT
+            or time.monotonic() - path_started_at >= runtime_limit
+        )
+        if expired:
+            path_findings = _cleanup_expired_path_findings(pattern_modules, path_findings)
+        else:
+            path_findings = _postprocess_path_findings(
                 content,
                 pattern_modules,
-                python_ast_cache_key,
-                max_findings=min(MAX_FINDINGS_PER_ARTIFACT, remaining),
-                timeout_seconds=shared_remaining,
+                path_findings,
+                python_ast=python_ast,
+                started_at=path_started_at,
+                timeout_seconds=runtime_limit,
             )
-        )
+            if time.monotonic() - path_started_at >= runtime_limit:
+                path_findings = _cleanup_expired_path_findings(
+                    pattern_modules,
+                    path_findings,
+                )
+        findings.extend(path_findings[:path_limit])
 
     return findings
 
@@ -1637,14 +2319,95 @@ def run_static_patterns_with_ledger(
                     }
                 else:
                     try:
+                        path_started_at = time.monotonic()
+                        python_ast = _python_ast_for_path(
+                            path,
+                            content,
+                            pattern_modules,
+                            python_ast_cache_key,
+                        )
+                        path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
                         path_findings, resource_limit, resource_metrics = _scan_all_views_detailed(
                             path,
                             content,
                             pattern_modules,
                             python_ast_cache_key,
-                            max_findings=min(MAX_FINDINGS_PER_ARTIFACT, remaining),
+                            max_findings=path_limit,
                             timeout_seconds=shared_remaining,
+                            started_at=path_started_at,
+                            python_ast=python_ast,
                         )
+                        has_postprocessor = bool(
+                            pattern_modules
+                            and callable(
+                                _explicit_module_hook(
+                                    pattern_modules[0],
+                                    "postprocess_path_findings",
+                                )
+                            )
+                        )
+                        runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+                        if shared_remaining is not None:
+                            runtime_limit = min(runtime_limit, max(0.0, shared_remaining))
+                        observed_seconds = (
+                            float(resource_metrics.get("observed_seconds", 0.0))
+                            if resource_limit is LedgerReason.RUNTIME_LIMIT
+                            else max(0.0, time.monotonic() - path_started_at)
+                        )
+                        expired = (
+                            resource_limit is LedgerReason.RUNTIME_LIMIT
+                            or observed_seconds >= runtime_limit
+                        )
+                        if expired:
+                            resource_limit = LedgerReason.RUNTIME_LIMIT
+                            resource_metrics = {
+                                "observed_seconds": observed_seconds,
+                                "limit_seconds": runtime_limit,
+                            }
+                            path_findings = _cleanup_expired_path_findings(
+                                pattern_modules,
+                                path_findings,
+                            )
+                        elif has_postprocessor:
+                            path_findings = _postprocess_path_findings(
+                                content,
+                                pattern_modules,
+                                path_findings,
+                                python_ast=python_ast,
+                                started_at=path_started_at,
+                                timeout_seconds=runtime_limit,
+                            )
+                            observed_seconds = max(0.0, time.monotonic() - path_started_at)
+                            if observed_seconds >= runtime_limit:
+                                resource_limit = LedgerReason.RUNTIME_LIMIT
+                                resource_metrics = {
+                                    "observed_seconds": observed_seconds,
+                                    "limit_seconds": runtime_limit,
+                                }
+                                path_findings = _cleanup_expired_path_findings(
+                                    pattern_modules,
+                                    path_findings,
+                                )
+                        if len(path_findings) > path_limit:
+                            postprocessed_count = len(path_findings)
+                            path_findings = path_findings[:path_limit]
+                            if resource_limit is not LedgerReason.RUNTIME_LIMIT:
+                                if remaining < MAX_FINDINGS_PER_ARTIFACT:
+                                    observed_findings = len(findings) + postprocessed_count
+                                    limit_findings = MAX_FINDINGS_PER_ANALYZER
+                                else:
+                                    observed_findings = postprocessed_count
+                                    limit_findings = MAX_FINDINGS_PER_ARTIFACT
+                                if resource_limit is LedgerReason.OUTPUT_LIMIT:
+                                    observed_findings = max(
+                                        observed_findings,
+                                        int(resource_metrics.get("observed_findings", 0)),
+                                    )
+                                resource_limit = LedgerReason.OUTPUT_LIMIT
+                                resource_metrics = {
+                                    "observed_findings": observed_findings,
+                                    "limit_findings": limit_findings,
+                                }
                     except Exception as exc:
                         logger.warning("%s: scan error on %s: %s", analyzer_id, path, exc)
                         event = ledger_event(
@@ -1668,7 +2431,7 @@ def run_static_patterns_with_ledger(
                 partial = resource_limit is not None or (
                     _infer_file_type(path) == "python"
                     and len(content) > MAX_FILE_CHARS
-                    and any(_uses_python_ast(module) for module in pattern_modules)
+                    and _requires_python_ast(pattern_modules)
                 )
                 partial_reason = resource_limit or LedgerReason.SIZE_LIMIT
                 event = ledger_event(
