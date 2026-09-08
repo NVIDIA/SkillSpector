@@ -2123,6 +2123,26 @@ def _line_containing(content: str, start: int, end: int) -> str:
     return content[line_start:line_end]
 
 
+def _classify_tm1(
+    context: str,
+    matched_text: str,
+    matched_line: str,
+    confidence: float,
+    file_type: str,
+) -> tuple[Severity, float]:
+    """Apply the existing TM1 contextual classification to one candidate."""
+    if (
+        _is_safe_container_command(context)
+        or _is_safe_dockerfile_idiom(context, matched_text)
+        or _is_safe_cache_cleanup(matched_line)
+    ):
+        return Severity.LOW, min(confidence, 0.15)
+    adjusted = (
+        min(1.0, confidence + 0.1) if file_type in ("python", "shell", "javascript") else confidence
+    )
+    return Severity.HIGH, adjusted
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
     findings: list[AnalyzerFinding] = []
@@ -2142,20 +2162,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         matched = matched_text[:200]
         matched_line = _line_containing(content, match_start, match_end)
 
-        if (
-            _is_safe_container_command(context_text)
-            or _is_safe_dockerfile_idiom(context_text, matched)
-            or _is_safe_cache_cleanup(matched_line)
-        ):
-            adj = min(confidence, 0.15)
-            sev = Severity.LOW
-        else:
-            adj = (
-                min(1.0, confidence + 0.1)
-                if file_type in ("python", "shell", "javascript")
-                else confidence
-            )
-            sev = Severity.HIGH
+        sev, adj = _classify_tm1(
+            context_text,
+            matched,
+            matched_line,
+            confidence,
+            file_type,
+        )
         candidate_key = (line_num, " ".join(matched.strip().split()))
         existing = tm1_findings_by_key.get(candidate_key)
         if existing is not None:
@@ -2176,6 +2189,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         )
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
+
     for pattern, confidence in TM2_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
@@ -2236,6 +2250,34 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run tool_misuse patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    from . import static_python_shell_truthiness
+
+    response = static_runner.run_static_patterns_with_ledger(
+        state,
+        [sys.modules[__name__], static_python_shell_truthiness],
+    )
+    file_cache = state.get("file_cache", {})
+    for finding in response["findings"]:
+        if (
+            finding.evidence.pop(
+                static_python_shell_truthiness.BOUND_SHELL_EVIDENCE,
+                None,
+            )
+            is not True
+        ):
+            continue
+        content = file_cache.get(finding.file, "")
+        content_lines = content.splitlines()
+        line_index = max(0, finding.start_line - 1)
+        matched = (finding.matched_text or "")[:200]
+        matched_line = content_lines[line_index] if line_index < len(content_lines) else matched
+        severity, finding.confidence = _classify_tm1(
+            finding.context or "",
+            matched,
+            matched_line,
+            finding.confidence,
+            "python",
+        )
+        finding.severity = severity.value
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response

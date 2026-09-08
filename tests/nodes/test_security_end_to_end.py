@@ -111,7 +111,7 @@ async def _assert_rules_across_public_surfaces(
     *,
     expected_locations: dict[str, set[str]],
     python_result: dict,
-) -> None:
+) -> dict:
     """Verify static-only finding contracts on every supported public surface."""
     expected_score = python_result["risk_score"]
     expected_recommendation = python_result["risk_recommendation"]
@@ -198,6 +198,7 @@ async def _assert_rules_across_public_surfaces(
     assert verdict["risk_score"] == expected_score
     assert verdict["recommendation"] == expected_recommendation
     assert verdict["analysis_completeness"]["is_complete"] is True
+    return verdict
 
 
 async def _assert_incomplete_across_public_surfaces(root: Path, python_result: dict) -> None:
@@ -384,6 +385,91 @@ async def test_static_only_normal_and_bypass_pairs(
         expected_locations={rule_id: {bypass_path}},
         python_result=bypass_result,
     )
+
+
+@pytest.mark.parametrize(
+    "bound_value",
+    [
+        pytest.param("True", id="boolean"),
+        pytest.param("'True'", id="reporter-truthy-string"),
+    ],
+)
+def test_tm1_bound_true_matches_literal_in_graph(
+    tmp_path: Path,
+    bound_value: str,
+) -> None:
+    direct = tmp_path / "direct"
+    bound = tmp_path / "bound"
+    _write_bundle(
+        direct,
+        {
+            "SKILL.md": "# Shell helper",
+            "run.py": "import subprocess\nsubprocess.run(command, shell=True)\n",
+        },
+    )
+    _write_bundle(
+        bound,
+        {
+            "SKILL.md": "# Shell helper",
+            "run.py": (
+                "import subprocess\n"
+                f"use_shell = {bound_value}\n"
+                "subprocess.run(command, shell=use_shell)\n"
+            ),
+        },
+    )
+
+    direct_result = _scan(direct)
+    bound_result = _scan(bound)
+    direct_tm1 = _assert_rule(direct_result, "TM1", "run.py")
+    bound_tm1 = _assert_rule(bound_result, "TM1", "run.py")
+
+    assert len(direct_tm1) == len(bound_tm1) == 1
+    assert (bound_tm1[0].severity, bound_tm1[0].confidence) == (
+        direct_tm1[0].severity,
+        direct_tm1[0].confidence,
+    )
+    assert (
+        bound_result["risk_score"],
+        bound_result["risk_severity"],
+        bound_result["risk_recommendation"],
+    ) == (
+        direct_result["risk_score"],
+        direct_result["risk_severity"],
+        direct_result["risk_recommendation"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_tm1_bound_true_across_public_surfaces(tmp_path: Path) -> None:
+    direct = tmp_path / "direct"
+    bound = tmp_path / "bound"
+    _write_bundle(
+        direct,
+        {
+            "SKILL.md": "# Shell helper",
+            "run.py": "import subprocess\nsubprocess.run(command, shell=True)\n",
+        },
+    )
+    _write_bundle(
+        bound,
+        {
+            "SKILL.md": "# Shell helper",
+            "run.py": (
+                "import subprocess\nuse_shell = True\nsubprocess.run(command, shell=use_shell)\n"
+            ),
+        },
+    )
+
+    result = _scan(bound)
+    _assert_rule(result, "TM1", "run.py")
+    verdict = await _assert_rules_across_public_surfaces(
+        bound,
+        expected_locations={"TM1": {"run.py"}},
+        python_result=result,
+    )
+    direct_verdict = await run_scan(str(direct), use_llm=False, output_format="json")
+    assert verdict["safe_to_install"] == direct_verdict["safe_to_install"]
 
 
 @pytest.mark.asyncio
