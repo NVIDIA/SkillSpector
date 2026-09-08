@@ -278,7 +278,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
             child = Path(entry.path)
             try:
                 if entry.is_symlink() or _is_link_or_junction(child):
-                    continue
+                    raise _read_error("multi_skill_symlinked_entry")
                 if not entry.is_dir(follow_symlinks=False):
                     continue
             except OSError as exc:
