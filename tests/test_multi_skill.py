@@ -316,8 +316,8 @@ class TestDetectSkills:
         }
         assert [skill.local_only for skill in result.skills] == [True, False, False]
 
-    def test_symlinked_skill_directory_is_skipped(self, tmp_path: Path) -> None:
-        """Detection must not read a skill manifest through a directory symlink."""
+    def test_symlinked_skill_directory_marks_discovery_incomplete(self, tmp_path: Path) -> None:
+        """Detection must not silently claim complete coverage through a directory symlink."""
         for name in ("skill-a", "skill-b"):
             sub = tmp_path / name
             sub.mkdir()
@@ -332,8 +332,11 @@ class TestDetectSkills:
 
         result = detect_skills(tmp_path)
 
-        assert result.is_multi_skill is True
-        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.is_multi_skill is False
+        assert result.skills == []
+        assert result.complete is False
+        assert result.limitations[0].reason_code == "read_error"
+        assert result.limitations[0].resource == "multi_skill_symlinked_entry"
 
     def test_symlinked_root_is_not_detected(self, tmp_path: Path) -> None:
         """Direct callers cannot use detection to inspect a symlinked root."""
