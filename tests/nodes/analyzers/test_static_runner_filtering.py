@@ -400,6 +400,23 @@ class TestSemanticStringDocumentationFiltering:
 class TestCodeExampleFiltering:
     """Example framing cannot suppress deterministic findings."""
 
+    def test_tm1_detects_shell_name_definitely_bound_true(self) -> None:
+        result = tm_module.node(
+            {
+                "components": ["run.py"],
+                "file_cache": {
+                    "run.py": (
+                        "import subprocess\n"
+                        "use_shell = True\n"
+                        "subprocess.run(command, shell=use_shell)\n"
+                    )
+                },
+            }
+        )
+
+        tm1 = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+        assert len(tm1) == 1
+
     def test_curl_in_fenced_code_block_is_preserved(self) -> None:
         content = """\
 # Usage Guide
