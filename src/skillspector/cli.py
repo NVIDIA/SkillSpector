@@ -2543,9 +2543,9 @@ def security_report(
 ) -> None:
     """Serve Offline Security Inspection report (100% local, no cloud)."""
     try:
-        from skillspector.security_inspection.scanner import SecurityScanner
-        from skillspector.security_inspection.report_server import serve
         from skillspector.security_inspection.config import get_data_dir
+        from skillspector.security_inspection.report_server import serve
+        from skillspector.security_inspection.scanner import SecurityScanner
         from skillspector.security_inspection.storage import get_latest_scan
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] Offline security plugin not available: {e}")
@@ -2602,8 +2602,9 @@ def offline_scan(
     """Run standalone offline security inspection (no cloud, no LLM, deterministic)."""
     try:
         from pathlib import Path as _P
-        from skillspector.security_inspection.scanner import SecurityScanner
+
         from skillspector.security_inspection.report_server import serve as _serve
+        from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] Offline plugin not available: {e}")
         raise typer.Exit(code=2) from e
@@ -2639,9 +2640,10 @@ def policy_check(
 ) -> None:
     """Policy-as-Code check: skillspector policy check <skill> --policy policy.yaml"""
     try:
-        from skillspector.security_inspection.scanner import SecurityScanner
-        from skillspector.security_inspection.policy import load_policy, evaluate_policy
         from pathlib import Path as _P
+
+        from skillspector.security_inspection.policy import evaluate_policy, load_policy
+        from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
@@ -2671,10 +2673,11 @@ def security_diff(
 ) -> None:
     """Security Regression Engine: skillspector security-diff old/ new/"""
     try:
-        from skillspector.security_inspection.scanner import SecurityScanner
-        from skillspector.security_inspection.regression import compare_reports
-        from pathlib import Path as _P
         import json as _json
+        from pathlib import Path as _P
+
+        from skillspector.security_inspection.regression import compare_reports
+        from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
@@ -2712,9 +2715,10 @@ def runtime_scan(
 ) -> None:
     """Runtime Behavior Monitor (highest priority): isolated execution + collectors."""
     try:
-        from skillspector.security_inspection.runtime_monitor import run_isolated
-        from pathlib import Path as _P
         import json as _json
+        from pathlib import Path as _P
+
+        from skillspector.security_inspection.runtime_monitor import run_isolated
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
