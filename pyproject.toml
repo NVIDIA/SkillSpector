@@ -47,7 +47,11 @@ dependencies = [
     "langchain-openai>=1.1.10",
     "boto3>=1.34.0",
     "langsmith>=0.7.30",
-    "yara-python>=4.5.0",
+    "yara-python>=4.5.0; sys_platform != 'win32'",
+    "networkx>=3.0",
+    "jinja2>=3.1",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -85,6 +89,11 @@ Issues = "https://github.com/NVIDIA/skillspector/issues"
 
 [tool.hatch.build]
 exclude = [".claude/", ".cursor/", ".agents/"]
+artifacts = ["src/skillspector/security_inspection/templates/**/*", "src/skillspector/security_inspection/static/**/*"]
+
+[tool.hatch.build.force-include]
+"src/skillspector/security_inspection/templates" = "skillspector/security_inspection/templates"
+"src/skillspector/security_inspection/static" = "skillspector/security_inspection/static"
 
 [tool.hatch.build.targets.sdist]
 core-metadata-version = "2.4"

@@ -18,7 +18,10 @@
 import warnings
 from importlib.metadata import version as _pkg_version
 
-__version__ = _pkg_version("skillspector")
+try:
+    __version__ = _pkg_version("skillspector")
+except Exception:
+    __version__ = "2.11.1"
 
 # ponytail: langgraph deserializes with langchain's allowed_objects default,
 # which warns. langchain_core's import re-enables that warning via
@@ -32,6 +35,10 @@ warnings.filterwarnings(
     category=Warning,
 )
 
-from skillspector.graph import create_graph, graph  # noqa: E402 (after filter setup)
+try:
+    from skillspector.graph import create_graph, graph  # noqa: E402 (after filter setup)
+except Exception as _e:
+    create_graph = None  # type: ignore
+    graph = None  # type: ignore
 
 __all__ = ["create_graph", "graph", "__version__"]

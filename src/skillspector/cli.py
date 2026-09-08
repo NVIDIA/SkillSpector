@@ -2530,5 +2530,206 @@ def baseline(
             cleanup_result(result)
 
 
+@app.command("security-report")
+def security_report(
+    input_path: Annotated[
+        str | None,
+        typer.Argument(help="Optional path/URL to scan before serving. If omitted, serves latest scan from ~/.skill-inspector/"),
+    ] = None,
+    port: Annotated[int, typer.Option("--port", "-p", help="Localhost port (loopback only)")] = 8899,
+    no_browser: Annotated[bool, typer.Option("--no-browser", help="Do not open browser")] = False,
+    no_llm: Annotated[bool, typer.Option("--no-llm", help="Skip LLM when scanning input_path")] = False,
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write offline JSON report to path")] = None,
+) -> None:
+    """Serve Offline Security Inspection report (100% local, no cloud)."""
+    try:
+        from skillspector.security_inspection.scanner import SecurityScanner
+        from skillspector.security_inspection.report_server import serve
+        from skillspector.security_inspection.config import get_data_dir
+        from skillspector.security_inspection.storage import get_latest_scan
+    except ImportError as e:
+        err_console.print(f"[red]Error:[/red] Offline security plugin not available: {e}")
+        raise typer.Exit(code=2) from e
+    result = None
+    if input_path is not None:
+        try:
+            state = _scan_state(input_path, FormatChoice.json, no_llm)
+            result = graph.invoke(state) if graph else None
+            offline = result.get("offline_report") if isinstance(result, dict) else None
+            if offline is None:
+                sp = Path(input_path).resolve() if not input_path.startswith(("http://", "https://")) else Path(str(result.get("skill_path", ".")) if isinstance(result, dict) else ".")
+                if not sp.exists():
+                    sp = Path(str(result.get("skill_path", "."))) if isinstance(result, dict) else Path(".")
+                scanner = SecurityScanner(sp if sp.exists() else Path("."))
+                offline = scanner.scan()
+            result = offline
+            if output:
+                output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+                console.print(f"[green]Offline report saved to:[/green] {output}")
+        except Exception as e:
+            if isinstance(e, typer.Exit):
+                raise
+            err_console.print(f"[red]Error during scan:[/red] {e}")
+            raise typer.Exit(code=2) from e
+        finally:
+            if result is not None and isinstance(result, dict) and "temp_dir_for_cleanup" in result:
+                try:
+                    cleanup_result(result)
+                except Exception:
+                    pass
+    else:
+        latest = get_latest_scan()
+        if latest is None:
+            err_console.print("[red]Error:[/red] No offline scans found in ~/.skill-inspector/. Run `skillspector security-report <path>` first.")
+            raise typer.Exit(code=2)
+        result = latest["results"]
+    if result is None:
+        err_console.print("[red]Error:[/red] No data to serve")
+        raise typer.Exit(code=2)
+    console.print(f"[green]Serving offline security report at http://127.0.0.1:{port} (loopback only, offline)[/green]")
+    console.print(f"[dim]Data dir: {get_data_dir()} | Skills: {len(result.get('skills', []))} | Findings: {result.get('summary', {}).get('total_findings', 0)}[/dim]")
+    serve(result, port=port, open_browser=not no_browser)
+
+
+@app.command("offline-scan")
+def offline_scan(
+    input_path: Annotated[str, typer.Argument(help="Path or URL to scan (offline, deterministic, no LLM)")],
+    port: Annotated[int, typer.Option("--port", "-p", help="Serve report on this port after scan (0 to disable)")] = 0,
+    no_browser: Annotated[bool, typer.Option("--no-browser", help="Do not open browser")] = False,
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write offline JSON report to path")] = None,
+    enable_runtime: Annotated[bool, typer.Option("--runtime", help="Enable runtime behavior monitor (isolated execution)")] = False,
+) -> None:
+    """Run standalone offline security inspection (no cloud, no LLM, deterministic)."""
+    try:
+        from pathlib import Path as _P
+        from skillspector.security_inspection.scanner import SecurityScanner
+        from skillspector.security_inspection.report_server import serve as _serve
+    except ImportError as e:
+        err_console.print(f"[red]Error:[/red] Offline plugin not available: {e}")
+        raise typer.Exit(code=2) from e
+    p = _P(input_path).resolve()
+    if not p.exists():
+        err_console.print(f"[red]Error:[/red] Path not found: {p}")
+        raise typer.Exit(code=2)
+    scanner = SecurityScanner(p)
+    result = scanner.scan(enable_runtime=enable_runtime)
+    console.print(f"[green]Offline scan complete:[/green] {result['scan_id']} | Skills={result['summary']['total_skills']} Findings={result['summary']['total_findings']} AvgScore={result['summary']['avg_score']}")
+    for s in result.get("skills", []):
+        sc = s.get("scorecard", {})
+        drift = len(s.get("drift", []))
+        corr = len(s.get("correlation", []))
+        console.print(f"  - {s['name']}: {sc.get('score')}/100 {sc.get('grade')} | {len(s.get('findings', []))} findings | drift {drift} | attack-paths {corr}")
+    if result.get("attack_paths"):
+        console.print(f"[yellow]Attack paths:[/yellow] {len(result['attack_paths'])}")
+        for ap in result["attack_paths"][:2]:
+            console.print(f"  - {ap['rule_id']}: {ap['message'][:100]}")
+    if output:
+        output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        console.print(f"[green]Report saved to:[/green] {output}")
+    if port != 0:
+        console.print(f"[green]Serving at http://127.0.0.1:{port}[/green]")
+        _serve(result, port=port, open_browser=not no_browser)
+
+
+@app.command("policy")
+def policy_check(
+    input_path: Annotated[str, typer.Argument(help="Skill path to check")],
+    policy_file: Annotated[Path, typer.Option("--policy", "-p", help="Policy YAML file")] = Path("policy.yaml"),
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write policy result JSON")] = None,
+) -> None:
+    """Policy-as-Code check: skillspector policy check <skill> --policy policy.yaml"""
+    try:
+        from skillspector.security_inspection.scanner import SecurityScanner
+        from skillspector.security_inspection.policy import load_policy, evaluate_policy
+        from pathlib import Path as _P
+    except ImportError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    p = _P(input_path).resolve()
+    if not p.exists():
+        err_console.print(f"[red]Error:[/red] Path not found: {p}")
+        raise typer.Exit(code=2)
+    scanner = SecurityScanner(p)
+    result = scanner.scan(policy_path=policy_file)
+    pol = result.get("policy_decision") or evaluate_policy([f for s in result["skills"] for f in s["findings"]], load_policy(policy_file))
+    console.print(f"[bold]Policy decision: {pol['decision']}[/bold] | violations {pol['count']}")
+    for v in pol["violations"][:5]:
+        console.print(f"  - {v['rule_id']}: {v['message']}")
+    if output:
+        output.write_text(json.dumps(pol, indent=2), encoding="utf-8")
+    if pol["decision"] == "BLOCK":
+        raise typer.Exit(code=1)
+    elif pol["decision"] == "WARN":
+        console.print("[yellow]WARN — review violations[/yellow]")
+
+
+@app.command("security-diff")
+def security_diff(
+    old_path: Annotated[str, typer.Argument(help="Old skill path or previous scan JSON")],
+    new_path: Annotated[str, typer.Argument(help="New skill path or scan JSON")],
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write diff JSON")] = None,
+) -> None:
+    """Security Regression Engine: skillspector security-diff old/ new/"""
+    try:
+        from skillspector.security_inspection.scanner import SecurityScanner
+        from skillspector.security_inspection.regression import compare_reports
+        from pathlib import Path as _P
+        import json as _json
+    except ImportError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    def load_report(path: str) -> Dict[str, Any]:
+        p = _P(path)
+        if p.is_file() and p.suffix == ".json":
+            try:
+                data = _json.loads(p.read_text(encoding="utf-8"))
+                if "scan_id" in data or "skills" in data:
+                    return data
+            except Exception:
+                pass
+        # treat as skill path, scan
+        scanner = SecurityScanner(_P(path))
+        return scanner.scan()
+    old = load_report(old_path)
+    new = load_report(new_path)
+    reg = compare_reports(old, new)
+    console.print(f"[bold]Regression:[/bold] {reg['summary']}")
+    console.print(f"  Added caps: {reg['added_caps']}")
+    console.print(f"  Removed caps: {reg['removed_caps']}")
+    console.print(f"  Decision: {reg['decision']}")
+    if output:
+        output.write_text(json.dumps(reg, indent=2), encoding="utf-8")
+        console.print(f"[green]Diff saved to {output}[/green]")
+    if reg["decision"] == "BLOCK":
+        raise typer.Exit(code=1)
+
+
+@app.command("runtime-scan")
+def runtime_scan(
+    input_path: Annotated[str, typer.Argument(help="Skill path to run in isolated sandbox")],
+    timeout: Annotated[int, typer.Option("--timeout", help="Sandbox timeout seconds")] = 10,
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write runtime events JSON")] = None,
+) -> None:
+    """Runtime Behavior Monitor (highest priority): isolated execution + collectors."""
+    try:
+        from skillspector.security_inspection.runtime_monitor import run_isolated
+        from pathlib import Path as _P
+        import json as _json
+    except ImportError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=2) from e
+    p = _P(input_path).resolve()
+    if not p.exists():
+        err_console.print(f"[red]Error:[/red] Path not found: {p}")
+        raise typer.Exit(code=2)
+    graph = run_isolated(p, timeout=float(timeout))
+    console.print(f"[green]Runtime events:[/green] {len(graph.events)}")
+    for e in graph.events[:10]:
+        console.print(f"  - [{e.source}] {e.category}/{e.action} {e.subject} -> {e.target} ({e.capability})")
+    if output:
+        output.write_text(json.dumps([e.to_dict() for e in graph.events], indent=2), encoding="utf-8")
+        console.print(f"[green]Events saved to {output}[/green]")
+
+
 if __name__ == "__main__":
     app()

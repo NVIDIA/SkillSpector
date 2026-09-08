@@ -108,3 +108,8 @@ credentials.json
 
 # LangGraph API server
 .langgraph_api/
+
+# FreeFileSync
+sync.ffs_db
+*.ffs_db
+
