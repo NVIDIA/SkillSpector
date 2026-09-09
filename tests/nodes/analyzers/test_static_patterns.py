@@ -939,6 +939,55 @@ class TestRunStaticPatternsAgentSnooping:
         )
         assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
 
+    def test_as3_literal_self_path_stays_suppressed_when_other_text_is_normalized(self):
+        """Unrelated normalization does not turn a literal self path into snooping."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": (
+                    "Root skill: skills/example-skill/SKILL.md\nUnrelated compatibility text: ｘ"
+                )
+            },
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(finding.rule_id == "AS3" for finding in result["findings"])
+
+    def test_as3_raw_view_scope_does_not_extend_to_transformed_content(self):
+        """Raw-view authorization is bound to the runner-provided text object."""
+
+        class TransformedAnalyzer:
+            ANALYZER_ID = agent_snooping_module.ANALYZER_ID
+
+            @staticmethod
+            def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                assert content == "placeholder"
+                transformed = "skills/example-skill/SKILL.md"
+                analyzer = agent_snooping_module._CurrentSkillScopedAnalyzer(
+                    frozenset({"example-skill"})
+                )
+                return analyzer.analyze(transformed, file_path, file_type)
+
+        result = static_runner.run_static_patterns_with_ledger(
+            {
+                "components": ["README.md"],
+                "file_cache": {"README.md": "placeholder"},
+            },
+            [TransformedAnalyzer()],
+        )
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        readme_event = result["inspection_ledger"][0]
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
     def test_as3_missing_current_identity_fails_closed(self):
         """Without a path or manifest identity, a skill path remains suspicious."""
         state = {
