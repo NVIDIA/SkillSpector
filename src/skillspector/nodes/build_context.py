@@ -41,7 +41,12 @@ from skillspector.artifacts import (
     classify_artifact,
     decode_text,
 )
-from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MAX_FILE_BYTES, build_model_config
+from skillspector.constants import (
+    MAX_ANALYZABLE_FILE_BYTES,
+    MAX_FILE_BYTES,
+    MAX_LLM_TRUNCATED_FILE_CHARS,
+    build_model_config,
+)
 from skillspector.input_handler import (
     _FileOpenError,
     _open_regular_file_no_follow,
@@ -754,6 +759,25 @@ def _is_hidden_path(path: str) -> bool:
     return any(part.startswith(".") for part in Path(path).parts)
 
 
+def _llm_view_of_truncated_file(content: str, *, total_size: int, read_bytes: int) -> str:
+    """Bound a truncated file's LLM view and mark the unreviewed region.
+
+    A truncated file must not vanish from the LLM stage: with exclusion, a
+    payload placed past the read cap is invisible to every analyzer while the
+    report still shows zero findings.  The view is capped so token cost stays
+    bounded, and the marker makes the audit gap explicit to the model.
+    """
+    marker = (
+        f"\n\n[SKILLSPECTOR: this file is {total_size} bytes; only the first "
+        f"{read_bytes} bytes were readable and the excerpt above is capped at "
+        f"{MAX_LLM_TRUNCATED_FILE_CHARS} characters. The remaining bytes were "
+        "not reviewed by any analyzer - treat the unseen region as an audit "
+        "gap.]\n"
+    )
+    budget = max(MAX_LLM_TRUNCATED_FILE_CHARS - len(marker), 0)
+    return content[:budget] + marker
+
+
 def _opaque_artifact_record(
     path: str,
     *,
@@ -1089,7 +1113,13 @@ def _read_file_cache(
                         )
                     )
             inventory.append(artifact)
-            if not truncated and not _is_hidden_path(path) and artifact["content_kind"] == "text":
+            if not _is_hidden_path(path) and artifact["content_kind"] == "text":
+                if truncated:
+                    content = _llm_view_of_truncated_file(
+                        content,
+                        total_size=max(file_stat.st_size, len(observed)),
+                        read_bytes=len(raw),
+                    )
                 llm_file_cache[path] = _redact_for_external_model(path, content)
             if aggregate_truncated:
                 inventory.extend(
