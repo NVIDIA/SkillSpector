@@ -28,8 +28,10 @@ Framework: OWASP LLMT09 (Misinformation), ASI-SR-003 (Least Knowledge).
 
 from __future__ import annotations
 
+import os
 import re
-import sys
+from collections.abc import Mapping
+from contextvars import ContextVar
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -42,6 +44,12 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_agent_snooping"
+
+_AS3_SKILL_PATH_PATTERN = r"skills?/(?P<skill_name>(?!CURRENT)[A-Z][A-Za-z0-9_-]+)/SKILL\.md"
+_AS3_SKILL_PATH_FULLMATCH = re.compile(_AS3_SKILL_PATH_PATTERN, re.IGNORECASE)
+_CURRENT_SKILL_IDENTIFIERS: ContextVar[frozenset[str]] = ContextVar(
+    "agent_snooping_current_skill_identifiers", default=frozenset()
+)
 
 # AS1: Agent Config Directory Access
 # Matches code/instructions that read from well-known agent config directories.
@@ -111,7 +119,7 @@ AS3_PATTERNS = [
         0.85,
     ),
     # Accessing skills/CURRENT or adjacent skill directories
-    (r"skills?/(?:(?!CURRENT)[A-Z][A-Za-z0-9_-]+)/SKILL\.md", 0.8),
+    (_AS3_SKILL_PATH_PATTERN, 0.8),
     # Reading tool manifests of other agents
     (
         r"(?:read|access|load)\s+(?:the\s+)?(?:SKILL|skill)\.md\s+(?:file\s+)?(?:of|from|for)\s+(?:another|other|different|all)\s+(?:skill|agent|tool)",
@@ -166,6 +174,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     for pattern, confidence in AS3_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            matched_text = match.group(0)[:200]
+            if _is_current_skill_path_reference(matched_text, _CURRENT_SKILL_IDENTIFIERS.get()):
+                continue
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -176,15 +187,81 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     confidence=confidence,
                     tags=tag,
                     context=ctx(match.start()),
-                    matched_text=match.group(0)[:200],
+                    matched_text=matched_text,
                 )
             )
 
     return findings
 
 
+def _normalize_skill_identifier(value: object) -> str | None:
+    """Return the comparison form for a usable skill identifier."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold().replace("_", "-")
+    return normalized or None
+
+
+def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
+    """Derive fail-closed identities for the skill currently being inspected."""
+    identifiers: set[str] = set()
+
+    skill_path: object = state.get("skill_path")
+    path_text: str | bytes | None = None
+    if isinstance(skill_path, str):
+        path_text = skill_path
+    elif isinstance(skill_path, os.PathLike):
+        try:
+            path_text = os.fspath(skill_path)
+        except Exception:
+            path_text = None
+    if isinstance(path_text, str):
+        normalized_path = path_text.replace("\\", "/").rstrip("/")
+        path_identifier = _normalize_skill_identifier(normalized_path.rsplit("/", 1)[-1])
+        if path_identifier is not None:
+            identifiers.add(path_identifier)
+
+    manifest = state.get("manifest")
+    if isinstance(manifest, Mapping):
+        manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
+        if manifest_identifier is not None:
+            identifiers.add(manifest_identifier)
+
+    return frozenset(identifiers)
+
+
+def _is_current_skill_path_reference(
+    matched_text: object, current_skill_identifiers: frozenset[str]
+) -> bool:
+    """Return whether an exact AS3 path match names the current skill."""
+    if not current_skill_identifiers or not isinstance(matched_text, str):
+        return False
+    match = _AS3_SKILL_PATH_FULLMATCH.fullmatch(matched_text)
+    if match is None:
+        return False
+    matched_identifier = _normalize_skill_identifier(match.group("skill_name"))
+    return matched_identifier in current_skill_identifiers
+
+
+class _CurrentSkillScopedAnalyzer:
+    """Delegate AS checks while excluding exact current-skill path references."""
+
+    ANALYZER_ID = ANALYZER_ID
+
+    def __init__(self, current_skill_identifiers: frozenset[str]) -> None:
+        self._current_skill_identifiers = current_skill_identifiers
+
+    def analyze(self, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+        token = _CURRENT_SKILL_IDENTIFIERS.set(self._current_skill_identifiers)
+        try:
+            return analyze(content, file_path, file_type)
+        finally:
+            _CURRENT_SKILL_IDENTIFIERS.reset(token)
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run agent_snooping patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    analyzer = _CurrentSkillScopedAnalyzer(_current_skill_identifiers(state))
+    response = static_runner.run_static_patterns_with_ledger(state, [analyzer])
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
