@@ -610,6 +610,76 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["is_complete"] is False
 
 
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize(
+    "locations",
+    [
+        [("a.md", 4, 8), ("a.md", 4, 24)],
+        [("a.md", 4, 8), ("b.md", 4, 24)],
+        [("a.md", 4, 8), ("a.md", 7, 8)],
+        [("a.md", 4, 8), ("a.md", 4, 24), ("b.md", 4, 40), ("a.md", 7, 8)],
+    ],
+)
+def test_reference_findings_share_one_terminal_event_per_source_line(
+    locations: list[tuple[str, int, int]], failed: bool
+) -> None:
+    paths = sorted({path for path, _, _ in locations})
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md", *paths],
+            "findings": [],
+            "effective_finding_ids": [],
+            "artifact_inventory": [
+                {"path": path, "disposition": "analyzed", "content_kind": "text"} for path in paths
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": line,
+                    "column": column,
+                    "evidence": f"Read [{path}]({path}).",
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "analyzed",
+                }
+                for path, line, column in locations
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED if failed else LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.READ_ERROR if failed else LedgerReason.STATIC_PARSE_LIMIT,
+                )
+                for path in paths
+            ],
+            "analyzer_status_events": [],
+        }
+    )
+
+    findings = result["findings"]
+    expected_locations = {(line, path) for path, line, _ in locations}
+    assert len(findings) == len(expected_locations)
+    assert {
+        (finding.start_line, finding.matched_text) for finding in findings
+    } == expected_locations
+    events = result["inspection_ledger"]
+    assert len(events) == len({line for _, line, _ in locations})
+    for event in events:
+        assert set(event["emitted_finding_ids"]) == {
+            finding.finding_id for finding in findings if finding.start_line == event["start_line"]
+        }
+    completeness = result["analysis_completeness"]
+    assert completeness["status"] == ("failed" if failed else "partial")
+    assert result["execution_successful"] is (not failed)
+    assert len(result["effective_finding_ids"]) == len(expected_locations)
+    assert not any(
+        row["reason_code"] in {"unaccounted_work", "finding_accounting_error"}
+        for row in completeness["ledger_exceptions"]
+    )
+
+
 @pytest.mark.parametrize("use_llm", [False, True])
 @pytest.mark.parametrize(
     ("disposition", "outcome", "reason", "expected_ae1"),

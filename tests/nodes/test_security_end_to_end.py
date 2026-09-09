@@ -1005,6 +1005,59 @@ async def test_printf_wrapper_depth_limit_fails_closed_across_public_surfaces(
     await _assert_incomplete_across_public_surfaces(tmp_path, result)
 
 
+def test_markdown_reference_to_parser_limited_target_keeps_cli_execution_successful(
+    tmp_path: Path,
+) -> None:
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": (
+                "---\nname: reference-coverage\ndescription: Reference coverage regression\n---\n"
+                "Read [references/commands.md](references/commands.md).\n"
+            ),
+            "references/commands.md": "$(env env env env printf rm) -rf /\n",
+        },
+    )
+
+    report = _scan_cli(tmp_path)
+
+    assert report["execution_successful"] is True
+    completeness = report["analysis_completeness"]
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    assert any(
+        row["reason_code"] == "static_parse_limit" for row in completeness["ledger_exceptions"]
+    )
+    assert not any(row["fatal"] for row in completeness["ledger_exceptions"])
+    ae1 = [issue for issue in report["issues"] if issue["id"] == "AE1"]
+    assert len(ae1) == 1
+    assert ae1[0]["location"]["file"] == "SKILL.md"
+    assert ae1[0]["location"]["start_line"] == 5
+
+
+def test_referenced_variable_documentation_does_not_create_coverage_gaps(tmp_path: Path) -> None:
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": (
+                "---\nname: reference-variables\ndescription: Variable documentation\n---\n"
+                "Read [references/usage.md](references/usage.md).\n"
+            ),
+            "references/usage.md": (
+                "Interpret `$ARGUMENTS` as the requested input.\n"
+                'In PowerShell, use `Test-Path "$($_.FullName)\\cli-path"`.\n'
+            ),
+        },
+    )
+
+    report = _scan_cli(tmp_path)
+
+    assert report["execution_successful"] is True
+    assert report["analysis_completeness"]["status"] == "complete"
+    assert report["analysis_completeness"]["ledger_exceptions"] == []
+    assert not any(issue["id"] == "AE1" for issue in report["issues"])
+
+
 @pytest.mark.asyncio
 async def test_changed_rule_family_negative_controls(tmp_path: Path) -> None:
     _write_bundle(
