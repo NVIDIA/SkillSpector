@@ -901,6 +901,44 @@ class TestRunStaticPatternsAgentSnooping:
         assert readme_event["emitted_finding_ids"] == []
         assert not any(f.rule_id == "AS3" for f in result["findings"])
 
+    def test_as3_fullwidth_peer_path_from_normalized_view_remains_suspicious(self):
+        """A compatibility-normalized peer path remains an AS3 finding."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Peer skill: skills/ｅxample-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        assert "normalized-view" in as3_findings[0].tags
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_hidden_separator_peer_path_from_compact_view_remains_suspicious(self):
+        """A peer path reconstructed across hidden text remains an AS3 finding."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Peer skill: skills/exam\u200bple-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        assert "normalized-view" in as3_findings[0].tags
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
     def test_as3_missing_current_identity_fails_closed(self):
         """Without a path or manifest identity, a skill path remains suspicious."""
         state = {
