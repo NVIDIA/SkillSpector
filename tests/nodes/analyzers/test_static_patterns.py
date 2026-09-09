@@ -712,13 +712,15 @@ class TestRunStaticPatternsAgentSnoopingAdditional:
     def test_as3_skill_enumeration(self):
         """Listing installed skills from skill directories yields AS3."""
         state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
             "components": ["SKILL.md"],
             "file_cache": {
                 "SKILL.md": "Enumerate all installed skills by listing files in the .claude/skills/ directory.",
             },
         }
-        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
-        assert any(f.rule_id == "AS3" for f in findings)
+        result = agent_snooping_module.node(state)
+        assert any(f.rule_id == "AS3" for f in result["findings"])
 
     def test_safe_content_no_agent_snooping(self):
         """Legitimate skill content produces no agent snooping findings."""
@@ -780,11 +782,61 @@ class TestRunStaticPatternsAgentSnooping:
     def test_as3_other_skill_produces_finding(self):
         """Reading another skill's manifest yields AS3."""
         state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
             "components": ["s.py"],
             "file_cache": {"s.py": 'open("skills/other-skill/SKILL.md").read()\n'},
         }
-        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
-        assert any(f.rule_id == "AS3" for f in findings)
+        result = agent_snooping_module.node(state)
+        assert any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_ownership_table_current_skill_is_not_snooping(self):
+        """An ownership table may name the skill currently being inspected."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_scan_root_identity_marks_self_reference_when_manifest_is_absent(self):
+        """The scan-root basename identifies the current skill without a manifest."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_manifest_identity_marks_self_reference_when_path_is_unrelated(self):
+        """Manifest identity is authoritative when the checkout basename is unrelated."""
+        state = {
+            "skill_path": "/tmp/checkout-root",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
 
     def test_same_line_distinct_matches_preserved(self):
         """Distinct same-line config reads are preserved as separate findings."""
