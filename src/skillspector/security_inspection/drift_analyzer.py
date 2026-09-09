@@ -1,4 +1,5 @@
 """drift_analyzer.py - Declared vs Static vs Runtime permission drift."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -7,11 +8,13 @@ from .event_model import SecurityEvent
 
 DRIFT_CLASS = ["MATCH", "UNDER_DECLARED", "OVER_DECLARED", "UNUSED", "UNKNOWN"]
 
+
 def normalize_cap(s: str) -> str:
     s = s.lower().strip()
     # map to canonical: filesystem.read, filesystem.write, network.outbound, network.dns, processes.execute, env.read, etc
     if "filesystem" in s or "file" in s:
-        if "write" in s: return "filesystem.write"
+        if "write" in s:
+            return "filesystem.write"
         return "filesystem.read"
     if "network" in s or "outbound" in s or "dns" in s:
         return "network.outbound" if "outbound" in s or "network" in s else "network.dns"
@@ -27,7 +30,10 @@ def normalize_cap(s: str) -> str:
         return "mcp.call"
     return s
 
-def capabilities_to_set(perms: dict[str, Any], static_caps: dict[str, Any], runtime_caps: dict[str, bool]) -> tuple[set[str], set[str], set[str]]:
+
+def capabilities_to_set(
+    perms: dict[str, Any], static_caps: dict[str, Any], runtime_caps: dict[str, bool]
+) -> tuple[set[str], set[str], set[str]]:
     declared: set[str] = set()
     # permissions manifest
     if perms.get("file_access") not in (None, "none"):
@@ -46,29 +52,55 @@ def capabilities_to_set(perms: dict[str, Any], static_caps: dict[str, Any], runt
             declared.add("env.read")
     # static
     static: set[str] = set()
-    if static_caps.get("file_read"): static.add("filesystem.read")
-    if static_caps.get("file_write"): static.add("filesystem.write")
-    if static_caps.get("network"): static.add("network.outbound"); static.add("network.dns")
-    if static_caps.get("subprocess"): static.add("processes.execute")
-    if static_caps.get("env"): static.add("env.read")
+    if static_caps.get("file_read"):
+        static.add("filesystem.read")
+    if static_caps.get("file_write"):
+        static.add("filesystem.write")
+    if static_caps.get("network"):
+        static.add("network.outbound")
+        static.add("network.dns")
+    if static_caps.get("subprocess"):
+        static.add("processes.execute")
+    if static_caps.get("env"):
+        static.add("env.read")
     # runtime
     runtime: set[str] = set()
     for k, v in runtime_caps.items():
-        if not v: continue
-        if k == "filesystem_read": runtime.add("filesystem.read")
-        if k == "filesystem_write": runtime.add("filesystem.write")
-        if k == "network": runtime.add("network.outbound")
-        if k == "subprocess": runtime.add("processes.execute")
-        if k == "env": runtime.add("env.read")
-        if k == "executables": runtime.add("executables.execute")
-        if k == "package": runtime.add("package.install")
-        if k == "mcp": runtime.add("mcp.call")
+        if not v:
+            continue
+        if k == "filesystem_read":
+            runtime.add("filesystem.read")
+        if k == "filesystem_write":
+            runtime.add("filesystem.write")
+        if k == "network":
+            runtime.add("network.outbound")
+        if k == "subprocess":
+            runtime.add("processes.execute")
+        if k == "env":
+            runtime.add("env.read")
+        if k == "executables":
+            runtime.add("executables.execute")
+        if k == "package":
+            runtime.add("package.install")
+        if k == "mcp":
+            runtime.add("mcp.call")
     return declared, static, runtime
+
 
 def classify_drift(declared: set[str], static: set[str], runtime: set[str]) -> list[dict[str, Any]]:
     all_caps = declared | static | runtime
     # also include known universe to detect UNUSED
-    universe = {"filesystem.read","filesystem.write","network.outbound","network.dns","processes.execute","env.read","executables.execute","package.install","mcp.call"}
+    universe = {
+        "filesystem.read",
+        "filesystem.write",
+        "network.outbound",
+        "network.dns",
+        "processes.execute",
+        "env.read",
+        "executables.execute",
+        "package.install",
+        "mcp.call",
+    }
     all_caps |= universe
     results = []
     for cap in sorted(all_caps):
@@ -95,50 +127,68 @@ def classify_drift(declared: set[str], static: set[str], runtime: set[str]) -> l
             severity = "info"
         # Determine evidence
         if drift != "MATCH":
-            results.append({
-                "capability": cap,
-                "drift": drift,
-                "severity": severity,
-                "declared": in_decl, "static": in_static, "runtime": in_runtime,
-                "message": f"{cap}: declared={in_decl} static={in_static} runtime={in_runtime} -> {drift}",
-            })
+            results.append(
+                {
+                    "capability": cap,
+                    "drift": drift,
+                    "severity": severity,
+                    "declared": in_decl,
+                    "static": in_static,
+                    "runtime": in_runtime,
+                    "message": f"{cap}: declared={in_decl} static={in_static} runtime={in_runtime} -> {drift}",
+                }
+            )
     return results
+
 
 def drift_to_findings(drifts: list[dict[str, Any]], skill_name: str) -> list[dict[str, Any]]:
     findings = []
     for d in drifts:
         sev = d["severity"]
         rule = f"DRIFT-{d['drift']}"
-        findings.append({
-            "rule_id": rule,
-            "category": "permission",
-            "severity": sev,
-            "message": f"Permission drift {d['drift']} for {d['capability']} ({skill_name})",
-            "file": "manifest",
-            "line": None,
-            "evidence": d["message"],
-            "fix": "Align manifest.json permissions with observed static+runtime capabilities" if d["drift"]=="UNDER_DECLARED" else "Remove unused permission declaration",
-            "drift": d["drift"],
-            "capability": d["capability"],
-        })
+        findings.append(
+            {
+                "rule_id": rule,
+                "category": "permission",
+                "severity": sev,
+                "message": f"Permission drift {d['drift']} for {d['capability']} ({skill_name})",
+                "file": "manifest",
+                "line": None,
+                "evidence": d["message"],
+                "fix": "Align manifest.json permissions with observed static+runtime capabilities"
+                if d["drift"] == "UNDER_DECLARED"
+                else "Remove unused permission declaration",
+                "drift": d["drift"],
+                "capability": d["capability"],
+            }
+        )
     return findings
+
 
 def drift_to_events(drifts: list[dict[str, Any]], subject: str) -> list[SecurityEvent]:
     evs = []
     for d in drifts:
-        if d["drift"] == "MATCH": continue
+        if d["drift"] == "MATCH":
+            continue
         cat = d["capability"].split(".")[0]
-        evs.append(SecurityEvent(
-            source="drift",
-            category=cat,
-            action="drift",
-            subject=subject,
-            target=d["capability"],
-            capability=d["capability"],
-            evidence=d["message"],
-            severity=d["severity"],
-            confidence=0.9,
-            rule_id=f"DRIFT-{d['drift']}",
-            metadata={"drift": d["drift"], "declared": d["declared"], "static": d["static"], "runtime": d["runtime"]},
-        ))
+        evs.append(
+            SecurityEvent(
+                source="drift",
+                category=cat,
+                action="drift",
+                subject=subject,
+                target=d["capability"],
+                capability=d["capability"],
+                evidence=d["message"],
+                severity=d["severity"],
+                confidence=0.9,
+                rule_id=f"DRIFT-{d['drift']}",
+                metadata={
+                    "drift": d["drift"],
+                    "declared": d["declared"],
+                    "static": d["static"],
+                    "runtime": d["runtime"],
+                },
+            )
+        )
     return evs

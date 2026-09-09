@@ -115,10 +115,11 @@ def analyze(state: SkillspectorState) -> list[Finding]:
 
     # Import lazily to avoid circular deps and keep offline isolation
     try:
-        from skillspector.security_inspection.config import get_data_dir
         from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
-        logger.error("offline_security_inspection: failed to import security_inspection package: %s", e)
+        logger.error(
+            "offline_security_inspection: failed to import security_inspection package: %s", e
+        )
         return []
 
     # Run scanner (deterministic, offline). This populates ~/.skill-inspector/ SQLite + SBOM + report
@@ -148,7 +149,9 @@ def analyze(state: SkillspectorState) -> list[Finding]:
     try:
         state["offline_report"] = result  # type: ignore
         state["offline_graph"] = result.get("graph", {})
-        state["offline_scorecard"] = {s["name"]: s.get("scorecard", {}) for s in result.get("skills", [])}
+        state["offline_scorecard"] = {
+            s["name"]: s.get("scorecard", {}) for s in result.get("skills", [])
+        }
     except Exception:
         pass
 
@@ -158,7 +161,12 @@ def analyze(state: SkillspectorState) -> list[Finding]:
         # Convert each plugin finding
         for pf in skill.get("findings", []):
             # Skip info-only provenance findings that would be noisy, but keep them as LOW with tag
-            f = _to_finding(pf, default_file=f"{skill_name}/SKILL.md" if len(result.get("skills", [])) > 1 else "SKILL.md")
+            f = _to_finding(
+                pf,
+                default_file=f"{skill_name}/SKILL.md"
+                if len(result.get("skills", [])) > 1
+                else "SKILL.md",
+            )
             # If multi-skill, prefix file with skill name for clarity
             if len(result.get("skills", [])) > 1 and not f.file.startswith(skill_name):
                 f.file = f"{skill_name}/{f.file}"
@@ -170,17 +178,25 @@ def analyze(state: SkillspectorState) -> list[Finding]:
             findings.append(
                 Finding(
                     rule_id="OFFLINE-SCORE",
-                    message=f"Skill '{skill_name}' security score {sc.get('score')}/100 (grade {sc.get('grade')}) - {sc.get('explanation','')}",
-                    severity=Severity.HIGH.value if sc.get("score", 0) < 45 else Severity.MEDIUM.value,
+                    message=f"Skill '{skill_name}' security score {sc.get('score')}/100 (grade {sc.get('grade')}) - {sc.get('explanation', '')}",
+                    severity=Severity.HIGH.value
+                    if sc.get("score", 0) < 45
+                    else Severity.MEDIUM.value,
                     confidence=0.95,
-                    file=f"{skill_name}/skill.json" if len(result.get("skills", [])) > 1 else "skill.json",
+                    file=f"{skill_name}/skill.json"
+                    if len(result.get("skills", [])) > 1
+                    else "skill.json",
                     start_line=1,
                     category="supply_chain",
                     pattern="OFFLINE-SCORE",
                     explanation=sc.get("explanation", ""),
                     remediation="; ".join(sc.get("recommendations", [])[:2]),
-                    tags=["offline", "scorecard", f"grade-{sc.get('grade','F')}"],
-                    evidence={"score": sc.get("score"), "grade": sc.get("grade"), "breakdown": sc.get("breakdown", [])[:3]},
+                    tags=["offline", "scorecard", f"grade-{sc.get('grade', 'F')}"],
+                    evidence={
+                        "score": sc.get("score"),
+                        "grade": sc.get("grade"),
+                        "breakdown": sc.get("breakdown", [])[:3],
+                    },
                 )
             )
 
@@ -209,7 +225,12 @@ def analyze(state: SkillspectorState) -> list[Finding]:
         logger.warning("offline_security_inspection truncated %d findings to 5000", len(findings))
         findings = findings[:5000]
 
-    logger.info("%s: %d findings from %d skills (offline, deterministic)", ANALYZER_ID, len(findings), len(result.get("skills", [])))
+    logger.info(
+        "%s: %d findings from %d skills (offline, deterministic)",
+        ANALYZER_ID,
+        len(findings),
+        len(result.get("skills", [])),
+    )
     return findings
 
 

@@ -1,4 +1,5 @@
 """event_model.py - Normalized SecurityEvent for all analyzers."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,13 +10,13 @@ from typing import Any
 
 @dataclass
 class SecurityEvent:
-    source: str          # runtime | static | secrets | privacy | permission | dependency | diff | provenance | sbom
-    category: str        # filesystem | network | processes | env | executables | package | mcp | dns | outbound | secrets | privacy
-    action: str          # read | write | connect | execute | install | call | resolve | exfiltrate
-    subject: str         # skill.py / skill name
-    target: str          # file path, domain, package, env var
-    capability: str      # capability identifier e.g. filesystem.write, network.outbound
-    evidence: str        # code snippet / trace
+    source: str  # runtime | static | secrets | privacy | permission | dependency | diff | provenance | sbom
+    category: str  # filesystem | network | processes | env | executables | package | mcp | dns | outbound | secrets | privacy
+    action: str  # read | write | connect | execute | install | call | resolve | exfiltrate
+    subject: str  # skill.py / skill name
+    target: str  # file path, domain, package, env var
+    capability: str  # capability identifier e.g. filesystem.write, network.outbound
+    evidence: str  # code snippet / trace
     severity: str = "medium"
     confidence: float = 0.9
     timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -45,16 +46,22 @@ class SecurityEvent:
             "target": self.target,
         }
 
+
 @dataclass
 class EventGraph:
     events: list[SecurityEvent] = field(default_factory=list)
+
     def add(self, e: SecurityEvent):
         self.events.append(e)
+
     def by_category(self, cat: str) -> list[SecurityEvent]:
         return [e for e in self.events if e.category == cat]
+
     def by_source(self, src: str) -> list[SecurityEvent]:
         return [e for e in self.events if e.source == src]
+
     def to_findings(self) -> list[dict[str, Any]]:
         return [e.to_finding() for e in self.events]
+
     def to_dict(self) -> dict[str, Any]:
         return {"events": [e.to_dict() for e in self.events], "count": len(self.events)}

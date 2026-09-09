@@ -2,8 +2,10 @@
 scorecard.py - Compute per-skill security rating from all findings.
 Deterministic, explainable scoring.
 """
+
 from __future__ import annotations
-from typing import Dict, List, Any
+
+from typing import Any, Dict, List
 
 SEVERITY_WEIGHTS = {
     "critical": 25,
@@ -24,6 +26,7 @@ CATEGORY_WEIGHTS = {
     "dependency": 0.9,
 }
 
+
 def grade_from_score(score: int) -> str:
     if score >= 90:
         return "A"
@@ -35,7 +38,13 @@ def grade_from_score(score: int) -> str:
         return "D"
     return "F"
 
-def compute_scorecard(findings: List[Dict[str, Any]], provenance: Dict[str, Any] = None, privacy: Dict[str, Any] = None, sbom_components: int = 0) -> Dict[str, Any]:
+
+def compute_scorecard(
+    findings: List[Dict[str, Any]],
+    provenance: Dict[str, Any] = None,
+    privacy: Dict[str, Any] = None,
+    sbom_components: int = 0,
+) -> Dict[str, Any]:
     """
     Findings each have severity/category.
     Score starts 100, deductions per finding weighted.
@@ -54,22 +63,40 @@ def compute_scorecard(findings: List[Dict[str, Any]], provenance: Dict[str, Any]
         # cap individual deductions to avoid negative overflow; we sum then cap total
         deductions += deduct
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
-        breakdown.append({
-            "rule_id": f.get("rule_id"),
-            "severity": sev,
-            "category": cat,
-            "message": f.get("message"),
-            "deduction": deduct,
-            "evidence": f.get("evidence", "")[:120],
-        })
+        breakdown.append(
+            {
+                "rule_id": f.get("rule_id"),
+                "severity": sev,
+                "category": cat,
+                "message": f.get("message"),
+                "deduction": deduct,
+                "evidence": f.get("evidence", "")[:120],
+            }
+        )
 
     # Additional penalties
     if provenance and provenance.get("author") == "unknown":
         deductions += 3
-        breakdown.append({"rule_id": "SCORE-PROV", "severity": "low", "category": "provenance", "message": "Missing author", "deduction": 3})
+        breakdown.append(
+            {
+                "rule_id": "SCORE-PROV",
+                "severity": "low",
+                "category": "provenance",
+                "message": "Missing author",
+                "deduction": 3,
+            }
+        )
     if privacy and privacy.get("flows", {}).get("risk") == "high":
         deductions += 10
-        breakdown.append({"rule_id": "SCORE-PRIVACY", "severity": "high", "category": "privacy", "message": "High-risk data transmission", "deduction": 10})
+        breakdown.append(
+            {
+                "rule_id": "SCORE-PRIVACY",
+                "severity": "high",
+                "category": "privacy",
+                "message": "High-risk data transmission",
+                "deduction": 10,
+            }
+        )
 
     score = max(0, base - deductions)
     grade = grade_from_score(score)
@@ -102,14 +129,21 @@ def compute_scorecard(findings: List[Dict[str, Any]], provenance: Dict[str, Any]
         "recommendations": generate_recommendations(findings, privacy, provenance),
     }
 
-def generate_recommendations(findings: List[Dict[str, Any]], privacy: Dict[str, Any] = None, provenance: Dict[str, Any] = None) -> List[str]:
+
+def generate_recommendations(
+    findings: List[Dict[str, Any]],
+    privacy: Dict[str, Any] = None,
+    provenance: Dict[str, Any] = None,
+) -> List[str]:
     recs: List[str] = []
     cats = set(f.get("category") for f in findings)
     sevs = set(f.get("severity") for f in findings)
     if "secrets" in cats:
         recs.append("Remove hardcoded credentials; use environment variables or vault")
     if "permission" in cats:
-        recs.append("Declare least-privilege permissions in skill.json (file_access, network, subprocess)")
+        recs.append(
+            "Declare least-privilege permissions in skill.json (file_access, network, subprocess)"
+        )
     if "privacy" in cats or (privacy and privacy.get("flows", {}).get("transmits")):
         recs.append("Minimize sensitive data handling; ensure TLS and audit data flows")
     if "provenance" in cats or (provenance and provenance.get("author") == "unknown"):

@@ -2,23 +2,35 @@
 report_server.py - FastAPI + Jinja2 localhost-only interactive HTML report.
 Binds only to 127.0.0.1, no 0.0.0.0, no external exposure.
 """
+
 from __future__ import annotations
+
 import json
 import webbrowser
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-import uvicorn
 
-from .config import get_data_dir, ALLOWED_BIND
-from .storage import get_latest_scan, get_connection
+from .config import ALLOWED_BIND, get_data_dir
+from .storage import get_connection, get_latest_scan
 
-def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Optional[Path] = None, static_dir: Optional[Path] = None) -> FastAPI:
-    app = FastAPI(title="NVIDIA Skill Inspector - Security Report", docs_url=None, redoc_url=None, openapi_url=None)
+
+def create_app(
+    scan_data: Dict[str, Any] | None = None,
+    templates_dir: Path | None = None,
+    static_dir: Path | None = None,
+) -> FastAPI:
+    app = FastAPI(
+        title="NVIDIA Skill Inspector - Security Report",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     # Resolve dirs
     base = Path(__file__).parent.parent
@@ -26,8 +38,7 @@ def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Option
     s_dir = static_dir or (base / "static")
 
     env = Environment(
-        loader=FileSystemLoader(str(t_dir)),
-        autoescape=select_autoescape(["html", "xml"])
+        loader=FileSystemLoader(str(t_dir)), autoescape=select_autoescape(["html", "xml"])
     )
 
     # Mount static only if exists
@@ -40,7 +51,19 @@ def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Option
             return scan_data
         latest = get_latest_scan()
         if not latest:
-            return {"skills": [], "summary": {"total_skills": 0, "total_findings": 0, "severity_counts": {}, "avg_score": 0}, "graph": {"nodes": [], "edges": []}, "graph_metrics": {}, "scan_id": "none", "timestamp": ""}
+            return {
+                "skills": [],
+                "summary": {
+                    "total_skills": 0,
+                    "total_findings": 0,
+                    "severity_counts": {},
+                    "avg_score": 0,
+                },
+                "graph": {"nodes": [], "edges": []},
+                "graph_metrics": {},
+                "scan_id": "none",
+                "timestamp": "",
+            }
         return latest["results"]
 
     @app.get("/", response_class=HTMLResponse)
@@ -49,7 +72,10 @@ def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Option
         try:
             tmpl = env.get_template("report.html")
         except Exception as e:
-            return HTMLResponse(f"<h1>Template missing</h1><pre>{e}</pre><pre>{json.dumps(data, indent=2)[:4000]}</pre>", status_code=500)
+            return HTMLResponse(
+                f"<h1>Template missing</h1><pre>{e}</pre><pre>{json.dumps(data, indent=2)[:4000]}</pre>",
+                status_code=500,
+            )
         # Prepare JSON for JS
         graph_json = json.dumps(data.get("graph", {"nodes": [], "edges": []}))
         skills_json = json.dumps(data.get("skills", []))
@@ -98,7 +124,9 @@ def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Option
             if s.get("name") == skill_name:
                 p = Path(s.get("sbom_path", ""))
                 if p.exists():
-                    return FileResponse(str(p), media_type="application/json", filename=f"{skill_name}.cdx.json")
+                    return FileResponse(
+                        str(p), media_type="application/json", filename=f"{skill_name}.cdx.json"
+                    )
         raise HTTPException(status_code=404, detail="SBOM not found")
 
     @app.get("/health")
@@ -107,7 +135,14 @@ def create_app(scan_data: Optional[Dict[str, Any]] = None, templates_dir: Option
 
     return app
 
-def serve(scan_data: Dict[str, Any], port: int = 8899, open_browser: bool = True, templates_dir: Optional[Path] = None, static_dir: Optional[Path] = None):
+
+def serve(
+    scan_data: Dict[str, Any],
+    port: int = 8899,
+    open_browser: bool = True,
+    templates_dir: Path | None = None,
+    static_dir: Path | None = None,
+):
     """
     Serve report on localhost only. Blocks.
     """
@@ -122,6 +157,7 @@ def serve(scan_data: Dict[str, Any], port: int = 8899, open_browser: bool = True
             pass
     # Enforce loopback only: host must be 127.0.0.1
     uvicorn.run(app, host=ALLOWED_BIND, port=port, log_level="info", access_log=False)
+
 
 def create_app_for_testing(scan_data: Dict[str, Any]) -> FastAPI:
     base = Path(__file__).parent.parent

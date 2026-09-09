@@ -5,6 +5,7 @@ Parses:
  - Python imports referencing other skills
  - file includes
 """
+
 from __future__ import annotations
 
 import ast
@@ -15,8 +16,17 @@ from typing import Any
 
 import networkx as nx
 
-SKILL_MANIFEST_NAMES = ["skill.json", "manifest.json", "manifest.yaml", "manifest.yml", "SKILL.md", "skill.yaml", "skill.yml"]
+SKILL_MANIFEST_NAMES = [
+    "skill.json",
+    "manifest.json",
+    "manifest.yaml",
+    "manifest.yml",
+    "SKILL.md",
+    "skill.yaml",
+    "skill.yml",
+]
 IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)")
+
 
 def discover_skills(root: Path) -> dict[str, Path]:
     """Each immediate subdirectory with at least one manifest or .py is a skill."""
@@ -37,15 +47,24 @@ def discover_skills(root: Path) -> dict[str, Path]:
             skills[root.name] = root
     return skills
 
+
 def parse_manifest_dependencies(skill_path: Path) -> list[str]:
     deps: list[str] = []
-    candidates = [skill_path / "skill.json", skill_path / "manifest.json", skill_path / "skill.yaml", skill_path / "skill.yml", skill_path / "manifest.yaml", skill_path / "manifest.yml"]
+    candidates = [
+        skill_path / "skill.json",
+        skill_path / "manifest.json",
+        skill_path / "skill.yaml",
+        skill_path / "skill.yml",
+        skill_path / "manifest.yaml",
+        skill_path / "manifest.yml",
+    ]
     for p in candidates:
         if p.exists():
             try:
                 if p.suffix in (".yaml", ".yml"):
                     try:
                         import yaml  # optional, but we try regex fallback if not present
+
                         data = yaml.safe_load(p.read_text(encoding="utf-8", errors="ignore"))
                     except ImportError:
                         text = p.read_text(encoding="utf-8", errors="ignore")
@@ -84,7 +103,8 @@ def parse_manifest_dependencies(skill_path: Path) -> list[str]:
                 deps.extend(re.findall(r"-\s*([a-zA-Z0-9_\-]+)", fm))
         except Exception:
             pass
-    return [d.strip().strip('"\'') for d in deps if d.strip()]
+    return [d.strip().strip("\"'") for d in deps if d.strip()]
+
 
 def parse_python_imports(skill_path: Path, all_skill_names: set[str]) -> list[str]:
     deps: set[str] = set()
@@ -124,13 +144,18 @@ def parse_python_imports(skill_path: Path, all_skill_names: set[str]) -> list[st
         for f in skill_path.rglob("*"):
             if f.is_file() and f.suffix in (".py", ".md", ".json", ".yaml", ".yml"):
                 t = f.read_text(encoding="utf-8", errors="ignore")
-                for pat in [r"skill://([a-zA-Z0-9_\-]+)", r"use_skill\(\s*['\"]([^'\"]+)['\"]", r"load_skill\(\s*['\"]([^'\"]+)['\"]"]:
+                for pat in [
+                    r"skill://([a-zA-Z0-9_\-]+)",
+                    r"use_skill\(\s*['\"]([^'\"]+)['\"]",
+                    r"load_skill\(\s*['\"]([^'\"]+)['\"]",
+                ]:
                     for m in re.findall(pat, t):
                         if m in all_skill_names and m != skill_path.name:
                             deps.add(m)
     except Exception:
         pass
     return sorted(deps)
+
 
 def build_dependency_graph(root: Path) -> tuple[nx.DiGraph, dict[str, Path]]:
     skills = discover_skills(root)
@@ -153,15 +178,25 @@ def build_dependency_graph(root: Path) -> tuple[nx.DiGraph, dict[str, Path]]:
                     G.add_edge(name, dep, type="external")
     return G, skills
 
+
 def graph_to_cytoscape(G: nx.DiGraph) -> list[dict[str, Any]]:
     """Convert to cytoscape/visjs friendly JSON."""
     nodes = []
     for n, data in G.nodes(data=True):
-        nodes.append({"data": {"id": n, "label": data.get("label", n), "external": data.get("external", False)}})
+        nodes.append(
+            {
+                "data": {
+                    "id": n,
+                    "label": data.get("label", n),
+                    "external": data.get("external", False),
+                }
+            }
+        )
     edges = []
     for u, v, data in G.edges(data=True):
         edges.append({"data": {"source": u, "target": v, "type": data.get("type", "depends_on")}})
     return {"nodes": nodes, "edges": edges}
+
 
 def detect_cycles(G: nx.DiGraph) -> list[list[str]]:
     try:
@@ -169,6 +204,7 @@ def detect_cycles(G: nx.DiGraph) -> list[list[str]]:
         return cycles
     except Exception:
         return []
+
 
 def compute_metrics(G: nx.DiGraph) -> dict[str, Any]:
     return {
@@ -179,5 +215,7 @@ def compute_metrics(G: nx.DiGraph) -> dict[str, Any]:
         "isolated": list(nx.isolates(G)),
         "in_degree": dict(G.in_degree()),
         "out_degree": dict(G.out_degree()),
-        "most_depended": sorted(G.in_degree(), key=lambda x: x[1], reverse=True)[:5] if G.number_of_nodes() else [],
+        "most_depended": sorted(G.in_degree(), key=lambda x: x[1], reverse=True)[:5]
+        if G.number_of_nodes()
+        else [],
     }

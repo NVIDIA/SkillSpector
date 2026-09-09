@@ -6,6 +6,7 @@ Collectors (all via audit hook / monkey-patch, Windows+Linux, offline):
 Runs skill in isolated subprocess with temp dir, mocked network, timeout.
 Emits SecurityEvent for each observed action.
 """
+
 from __future__ import annotations
 
 import json
@@ -18,7 +19,7 @@ from pathlib import Path
 from .event_model import EventGraph, SecurityEvent
 
 # --- Monitor payload injected into subprocess ---
-MONITOR_PAYLOAD = r'''
+MONITOR_PAYLOAD = r"""
 import os, sys, json, pathlib, socket, subprocess, builtins
 from pathlib import Path
 
@@ -171,7 +172,8 @@ if entry:
 out = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("runtime_events.json")
 out.write_text(json.dumps(_events, indent=2), encoding="utf-8")
 print(f"[runtime_monitor] {len(_events)} events -> {out}")
-'''
+"""
+
 
 def run_isolated(skill_path: Path, timeout: float = 10.0) -> EventGraph:
     """Run skill in isolated subprocess and collect SecurityEvent."""
@@ -199,60 +201,122 @@ def run_isolated(skill_path: Path, timeout: float = 10.0) -> EventGraph:
         try:
             proc = subprocess.run(
                 [sys.executable, str(payload), str(skill_path), str(isolated), str(out)],
-                capture_output=True, text=True, timeout=timeout, cwd=str(skill_path), env=env
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(skill_path),
+                env=env,
             )
             # Collect stdout/stderr as events if needed
             if proc.stderr:
                 # Don't fail, just record
                 pass
         except subprocess.TimeoutExpired:
-            graph.add(SecurityEvent(source="runtime", category="processes", action="timeout", subject=skill_path.name, target="timeout", capability="processes.timeout", evidence=f"timeout {timeout}s", severity="medium", rule_id="RUNTIME-TIMEOUT"))
+            graph.add(
+                SecurityEvent(
+                    source="runtime",
+                    category="processes",
+                    action="timeout",
+                    subject=skill_path.name,
+                    target="timeout",
+                    capability="processes.timeout",
+                    evidence=f"timeout {timeout}s",
+                    severity="medium",
+                    rule_id="RUNTIME-TIMEOUT",
+                )
+            )
         except Exception as e:
-            graph.add(SecurityEvent(source="runtime", category="processes", action="error", subject=skill_path.name, target=str(e), capability="processes.error", evidence=str(e), severity="low"))
+            graph.add(
+                SecurityEvent(
+                    source="runtime",
+                    category="processes",
+                    action="error",
+                    subject=skill_path.name,
+                    target=str(e),
+                    capability="processes.error",
+                    evidence=str(e),
+                    severity="low",
+                )
+            )
         # Load events with filtering for noisy stdlib
         if out.exists():
             try:
                 data = json.loads(out.read_text(encoding="utf-8"))
                 skill_lower = str(skill_path).lower()
                 for d in data:
-                    tgt = str(d.get("target","")).lower()
-                    subj = str(d.get("subject","")).lower()
+                    tgt = str(d.get("target", "")).lower()
+                    subj = str(d.get("subject", "")).lower()
                     # Aggressive filter: skip any stdlib/lib reads unless skill-related or sensitive
                     if "lib" in tgt or "site-packages" in tgt or "conda" in tgt:
                         if skill_lower not in tgt:
-                            if not any(s in tgt for s in [".aws",".ssh",".env","credential","secret","token","skill"]):
+                            if not any(
+                                s in tgt
+                                for s in [
+                                    ".aws",
+                                    ".ssh",
+                                    ".env",
+                                    "credential",
+                                    "secret",
+                                    "token",
+                                    "skill",
+                                ]
+                            ):
                                 continue
                     if "site-packages" in tgt and skill_lower not in tgt:
-                        if not any(s in tgt for s in [".aws",".ssh",".env","credential","secret","token"]):
+                        if not any(
+                            s in tgt
+                            for s in [".aws", ".ssh", ".env", "credential", "secret", "token"]
+                        ):
                             continue
                     # Normalize to SecurityEvent
-                    graph.add(SecurityEvent(
-                        source=d.get("source", "runtime"),
-                        category=d.get("category", "filesystem"),
-                        action=d.get("action", "unknown"),
-                        subject=d.get("subject", skill_path.name),
-                        target=d.get("target", ""),
-                        capability=d.get("capability", d.get("category", "")),
-                        evidence=d.get("evidence", ""),
-                        severity=d.get("severity", "medium"),
-                        confidence=d.get("confidence", 0.85),
-                        rule_id=d.get("rule_id", ""),
-                        metadata=d.get("metadata", {}),
-                    ))
+                    graph.add(
+                        SecurityEvent(
+                            source=d.get("source", "runtime"),
+                            category=d.get("category", "filesystem"),
+                            action=d.get("action", "unknown"),
+                            subject=d.get("subject", skill_path.name),
+                            target=d.get("target", ""),
+                            capability=d.get("capability", d.get("category", "")),
+                            evidence=d.get("evidence", ""),
+                            severity=d.get("severity", "medium"),
+                            confidence=d.get("confidence", 0.85),
+                            rule_id=d.get("rule_id", ""),
+                            metadata=d.get("metadata", {}),
+                        )
+                    )
             except Exception:
                 pass
         # Also add synthetic filesystem event for skill root read
         if not graph.events:
-            graph.add(SecurityEvent(source="runtime", category="filesystem", action="read", subject=skill_path.name, target=str(skill_path), capability="filesystem.read", evidence=f"skill root {skill_path} accessed", severity="info", confidence=1.0))
+            graph.add(
+                SecurityEvent(
+                    source="runtime",
+                    category="filesystem",
+                    action="read",
+                    subject=skill_path.name,
+                    target=str(skill_path),
+                    capability="filesystem.read",
+                    evidence=f"skill root {skill_path} accessed",
+                    severity="info",
+                    confidence=1.0,
+                )
+            )
     return graph
+
 
 def collect_runtime_capabilities(graph: EventGraph) -> dict[str, bool]:
     """Summarize runtime capabilities observed."""
     caps = {
-        "filesystem_read": any(e.category == "filesystem" and "read" in e.capability for e in graph.events),
-        "filesystem_write": any(e.category == "filesystem" and "write" in e.capability for e in graph.events),
+        "filesystem_read": any(
+            e.category == "filesystem" and "read" in e.capability for e in graph.events
+        ),
+        "filesystem_write": any(
+            e.category == "filesystem" and "write" in e.capability for e in graph.events
+        ),
         "network": any(e.category in ("network", "outbound", "dns") for e in graph.events),
-        "subprocess": any(e.category == "processes" and e.action == "execute" for e in graph.events),
+        "subprocess": any(
+            e.category == "processes" and e.action == "execute" for e in graph.events
+        ),
         "env": any(e.category == "env" for e in graph.events),
         "executables": any(e.category == "executables" for e in graph.events),
         "package": any(e.category == "package" for e in graph.events),

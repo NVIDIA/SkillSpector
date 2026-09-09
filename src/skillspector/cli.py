@@ -2534,12 +2534,20 @@ def baseline(
 def security_report(
     input_path: Annotated[
         str | None,
-        typer.Argument(help="Optional path/URL to scan before serving. If omitted, serves latest scan from ~/.skill-inspector/"),
+        typer.Argument(
+            help="Optional path/URL to scan before serving. If omitted, serves latest scan from ~/.skill-inspector/"
+        ),
     ] = None,
-    port: Annotated[int, typer.Option("--port", "-p", help="Localhost port (loopback only)")] = 8899,
+    port: Annotated[
+        int, typer.Option("--port", "-p", help="Localhost port (loopback only)")
+    ] = 8899,
     no_browser: Annotated[bool, typer.Option("--no-browser", help="Do not open browser")] = False,
-    no_llm: Annotated[bool, typer.Option("--no-llm", help="Skip LLM when scanning input_path")] = False,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write offline JSON report to path")] = None,
+    no_llm: Annotated[
+        bool, typer.Option("--no-llm", help="Skip LLM when scanning input_path")
+    ] = False,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Write offline JSON report to path")
+    ] = None,
 ) -> None:
     """Serve Offline Security Inspection report (100% local, no cloud)."""
     try:
@@ -2557,9 +2565,19 @@ def security_report(
             result = graph.invoke(state) if graph else None
             offline = result.get("offline_report") if isinstance(result, dict) else None
             if offline is None:
-                sp = Path(input_path).resolve() if not input_path.startswith(("http://", "https://")) else Path(str(result.get("skill_path", ".")) if isinstance(result, dict) else ".")
+                sp = (
+                    Path(input_path).resolve()
+                    if not input_path.startswith(("http://", "https://"))
+                    else Path(
+                        str(result.get("skill_path", ".")) if isinstance(result, dict) else "."
+                    )
+                )
                 if not sp.exists():
-                    sp = Path(str(result.get("skill_path", "."))) if isinstance(result, dict) else Path(".")
+                    sp = (
+                        Path(str(result.get("skill_path", ".")))
+                        if isinstance(result, dict)
+                        else Path(".")
+                    )
                 scanner = SecurityScanner(sp if sp.exists() else Path("."))
                 offline = scanner.scan()
             result = offline
@@ -2580,24 +2598,39 @@ def security_report(
     else:
         latest = get_latest_scan()
         if latest is None:
-            err_console.print("[red]Error:[/red] No offline scans found in ~/.skill-inspector/. Run `skillspector security-report <path>` first.")
+            err_console.print(
+                "[red]Error:[/red] No offline scans found in ~/.skill-inspector/. Run `skillspector security-report <path>` first."
+            )
             raise typer.Exit(code=2)
         result = latest["results"]
     if result is None:
         err_console.print("[red]Error:[/red] No data to serve")
         raise typer.Exit(code=2)
-    console.print(f"[green]Serving offline security report at http://127.0.0.1:{port} (loopback only, offline)[/green]")
-    console.print(f"[dim]Data dir: {get_data_dir()} | Skills: {len(result.get('skills', []))} | Findings: {result.get('summary', {}).get('total_findings', 0)}[/dim]")
+    console.print(
+        f"[green]Serving offline security report at http://127.0.0.1:{port} (loopback only, offline)[/green]"
+    )
+    console.print(
+        f"[dim]Data dir: {get_data_dir()} | Skills: {len(result.get('skills', []))} | Findings: {result.get('summary', {}).get('total_findings', 0)}[/dim]"
+    )
     serve(result, port=port, open_browser=not no_browser)
 
 
 @app.command("offline-scan")
 def offline_scan(
-    input_path: Annotated[str, typer.Argument(help="Path or URL to scan (offline, deterministic, no LLM)")],
-    port: Annotated[int, typer.Option("--port", "-p", help="Serve report on this port after scan (0 to disable)")] = 0,
+    input_path: Annotated[
+        str, typer.Argument(help="Path or URL to scan (offline, deterministic, no LLM)")
+    ],
+    port: Annotated[
+        int,
+        typer.Option("--port", "-p", help="Serve report on this port after scan (0 to disable)"),
+    ] = 0,
     no_browser: Annotated[bool, typer.Option("--no-browser", help="Do not open browser")] = False,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write offline JSON report to path")] = None,
-    enable_runtime: Annotated[bool, typer.Option("--runtime", help="Enable runtime behavior monitor (isolated execution)")] = False,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Write offline JSON report to path")
+    ] = None,
+    enable_runtime: Annotated[
+        bool, typer.Option("--runtime", help="Enable runtime behavior monitor (isolated execution)")
+    ] = False,
 ) -> None:
     """Run standalone offline security inspection (no cloud, no LLM, deterministic)."""
     try:
@@ -2614,12 +2647,16 @@ def offline_scan(
         raise typer.Exit(code=2)
     scanner = SecurityScanner(p)
     result = scanner.scan(enable_runtime=enable_runtime)
-    console.print(f"[green]Offline scan complete:[/green] {result['scan_id']} | Skills={result['summary']['total_skills']} Findings={result['summary']['total_findings']} AvgScore={result['summary']['avg_score']}")
+    console.print(
+        f"[green]Offline scan complete:[/green] {result['scan_id']} | Skills={result['summary']['total_skills']} Findings={result['summary']['total_findings']} AvgScore={result['summary']['avg_score']}"
+    )
     for s in result.get("skills", []):
         sc = s.get("scorecard", {})
         drift = len(s.get("drift", []))
         corr = len(s.get("correlation", []))
-        console.print(f"  - {s['name']}: {sc.get('score')}/100 {sc.get('grade')} | {len(s.get('findings', []))} findings | drift {drift} | attack-paths {corr}")
+        console.print(
+            f"  - {s['name']}: {sc.get('score')}/100 {sc.get('grade')} | {len(s.get('findings', []))} findings | drift {drift} | attack-paths {corr}"
+        )
     if result.get("attack_paths"):
         console.print(f"[yellow]Attack paths:[/yellow] {len(result['attack_paths'])}")
         for ap in result["attack_paths"][:2]:
@@ -2635,8 +2672,12 @@ def offline_scan(
 @app.command("policy")
 def policy_check(
     input_path: Annotated[str, typer.Argument(help="Skill path to check")],
-    policy_file: Annotated[Path, typer.Option("--policy", "-p", help="Policy YAML file")] = Path("policy.yaml"),
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write policy result JSON")] = None,
+    policy_file: Annotated[Path, typer.Option("--policy", "-p", help="Policy YAML file")] = Path(
+        "policy.yaml"
+    ),
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Write policy result JSON")
+    ] = None,
 ) -> None:
     """Policy-as-Code check: skillspector policy check <skill> --policy policy.yaml"""
     try:
@@ -2653,7 +2694,9 @@ def policy_check(
         raise typer.Exit(code=2)
     scanner = SecurityScanner(p)
     result = scanner.scan(policy_path=policy_file)
-    pol = result.get("policy_decision") or evaluate_policy([f for s in result["skills"] for f in s["findings"]], load_policy(policy_file))
+    pol = result.get("policy_decision") or evaluate_policy(
+        [f for s in result["skills"] for f in s["findings"]], load_policy(policy_file)
+    )
     console.print(f"[bold]Policy decision: {pol['decision']}[/bold] | violations {pol['count']}")
     for v in pol["violations"][:5]:
         console.print(f"  - {v['rule_id']}: {v['message']}")
@@ -2681,6 +2724,7 @@ def security_diff(
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
+
     def load_report(path: str) -> Dict[str, Any]:
         p = _P(path)
         if p.is_file() and p.suffix == ".json":
@@ -2693,6 +2737,7 @@ def security_diff(
         # treat as skill path, scan
         scanner = SecurityScanner(_P(path))
         return scanner.scan()
+
     old = load_report(old_path)
     new = load_report(new_path)
     reg = compare_reports(old, new)
@@ -2711,7 +2756,9 @@ def security_diff(
 def runtime_scan(
     input_path: Annotated[str, typer.Argument(help="Skill path to run in isolated sandbox")],
     timeout: Annotated[int, typer.Option("--timeout", help="Sandbox timeout seconds")] = 10,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Write runtime events JSON")] = None,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Write runtime events JSON")
+    ] = None,
 ) -> None:
     """Runtime Behavior Monitor (highest priority): isolated execution + collectors."""
     try:
@@ -2729,9 +2776,13 @@ def runtime_scan(
     graph = run_isolated(p, timeout=float(timeout))
     console.print(f"[green]Runtime events:[/green] {len(graph.events)}")
     for e in graph.events[:10]:
-        console.print(f"  - [{e.source}] {e.category}/{e.action} {e.subject} -> {e.target} ({e.capability})")
+        console.print(
+            f"  - [{e.source}] {e.category}/{e.action} {e.subject} -> {e.target} ({e.capability})"
+        )
     if output:
-        output.write_text(json.dumps([e.to_dict() for e in graph.events], indent=2), encoding="utf-8")
+        output.write_text(
+            json.dumps([e.to_dict() for e in graph.events], indent=2), encoding="utf-8"
+        )
         console.print(f"[green]Events saved to {output}[/green]")
 
 

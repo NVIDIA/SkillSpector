@@ -2,13 +2,16 @@
 storage.py - SQLite local storage (offline, no cloud).
 Stores: scan results, provenance records, scorecard history.
 """
+
 from __future__ import annotations
-import sqlite3
-import json
+
 import hashlib
+import json
+import sqlite3
+from datetime import UTC, datetime, timezone
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
 from .config import get_db_path
 
 SCHEMA = """
@@ -56,7 +59,8 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 """
 
-def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
+
+def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or get_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
@@ -65,7 +69,8 @@ def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
-def init_db(db_path: Optional[Path] = None) -> Path:
+
+def init_db(db_path: Path | None = None) -> Path:
     path = db_path or get_db_path()
     conn = get_connection(path)
     try:
@@ -75,10 +80,11 @@ def init_db(db_path: Optional[Path] = None) -> Path:
         conn.close()
     return path
 
-def save_scan(scan_id: str, skills_root: str, results: Dict[str, Any], db_path: Optional[Path] = None):
+
+def save_scan(scan_id: str, skills_root: str, results: Dict[str, Any], db_path: Path | None = None):
     conn = get_connection(db_path)
     try:
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         total_skills = len(results.get("skills", []))
         total_findings = sum(len(s.get("findings", [])) for s in results.get("skills", []))
         conn.execute(
@@ -91,7 +97,17 @@ def save_scan(scan_id: str, skills_root: str, results: Dict[str, Any], db_path: 
             for f in skill.get("findings", []):
                 conn.execute(
                     "INSERT INTO findings (scan_id, skill_name, category, severity, rule_id, message, file_path, line, evidence) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (scan_id, skill.get("name"), f.get("category"), f.get("severity"), f.get("rule_id"), f.get("message"), f.get("file"), f.get("line"), f.get("evidence")),
+                    (
+                        scan_id,
+                        skill.get("name"),
+                        f.get("category"),
+                        f.get("severity"),
+                        f.get("rule_id"),
+                        f.get("message"),
+                        f.get("file"),
+                        f.get("line"),
+                        f.get("evidence"),
+                    ),
                 )
         # save scorecard history
         for skill in results.get("skills", []):
@@ -99,16 +115,32 @@ def save_scan(scan_id: str, skills_root: str, results: Dict[str, Any], db_path: 
             if sc:
                 conn.execute(
                     "INSERT INTO scorecard_history (skill_name, version, score, grade, timestamp, details_json) VALUES (?,?,?,?,?,?)",
-                    (skill.get("name"), skill.get("version", "unknown"), sc.get("score", 0), sc.get("grade", "F"), ts, json.dumps(sc)),
+                    (
+                        skill.get("name"),
+                        skill.get("version", "unknown"),
+                        sc.get("score", 0),
+                        sc.get("grade", "F"),
+                        ts,
+                        json.dumps(sc),
+                    ),
                 )
         conn.commit()
     finally:
         conn.close()
 
-def save_provenance(skill_name: str, version: str, author: str, origin: str, hash_sha256: str, manifest: Dict[str, Any], db_path: Optional[Path] = None):
+
+def save_provenance(
+    skill_name: str,
+    version: str,
+    author: str,
+    origin: str,
+    hash_sha256: str,
+    manifest: Dict[str, Any],
+    db_path: Path | None = None,
+):
     conn = get_connection(db_path)
     try:
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         conn.execute(
             "INSERT OR REPLACE INTO provenance (skill_name, version, author, origin, hash_sha256, timestamp, manifest_json) VALUES (?,?,?,?,?,?,?)",
             (skill_name, version, author, origin, hash_sha256, ts, json.dumps(manifest)),
@@ -117,23 +149,31 @@ def save_provenance(skill_name: str, version: str, author: str, origin: str, has
     finally:
         conn.close()
 
-def get_provenance_history(skill_name: str, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+
+def get_provenance_history(skill_name: str, db_path: Path | None = None) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
-        cur = conn.execute("SELECT * FROM provenance WHERE skill_name=? ORDER BY timestamp DESC", (skill_name,))
+        cur = conn.execute(
+            "SELECT * FROM provenance WHERE skill_name=? ORDER BY timestamp DESC", (skill_name,)
+        )
         return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
-def get_scorecard_history(skill_name: str, db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+
+def get_scorecard_history(skill_name: str, db_path: Path | None = None) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
-        cur = conn.execute("SELECT * FROM scorecard_history WHERE skill_name=? ORDER BY timestamp DESC", (skill_name,))
+        cur = conn.execute(
+            "SELECT * FROM scorecard_history WHERE skill_name=? ORDER BY timestamp DESC",
+            (skill_name,),
+        )
         return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
-def get_latest_scan(db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+
+def get_latest_scan(db_path: Path | None = None) -> Dict[str, Any] | None:
     conn = get_connection(db_path)
     try:
         cur = conn.execute("SELECT * FROM scans ORDER BY timestamp DESC LIMIT 1")

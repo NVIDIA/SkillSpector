@@ -1,6 +1,7 @@
 """
 models.py - Dataclasses for findings, skills, manifests.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -15,6 +16,7 @@ class Severity(str, Enum):
     LOW = "low"
     INFO = "info"
 
+
 class Category(str, Enum):
     SECRETS = "secrets"
     PERMISSION = "permission"
@@ -26,6 +28,7 @@ class Category(str, Enum):
     PROVENANCE = "provenance"
     SBOM = "sbom"
     DIFF = "diff"
+
 
 @dataclass
 class Finding:
@@ -40,6 +43,7 @@ class Finding:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
 
 @dataclass
 class SkillInfo:
@@ -56,9 +60,11 @@ class SkillInfo:
     privacy: dict[str, Any] = field(default_factory=dict)
     sbom_ref: str = ""
 
+
 @dataclass
 class PermissionManifest:
     """Declarative manifest of what skill is allowed to do."""
+
     name: str
     version: str = "1.0.0"
     permissions: dict[str, Any] = field(default_factory=dict)
@@ -78,6 +84,6 @@ class PermissionManifest:
                 "network": "none",
                 "subprocess": False,
                 "env": [],
-                "capabilities": []
-            }
+                "capabilities": [],
+            },
         }

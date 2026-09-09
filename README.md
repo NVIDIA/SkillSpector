@@ -806,11 +806,13 @@ Based on research from "Agent Skills in the Wild: An Empirical Study of Security
 from skillspector import graph
 
 # Invoke the LangGraph workflow
-result = graph.invoke({
-    "input_path": "/path/to/skill",
-    "output_format": "json",   # terminal, json, markdown, or sarif
-    "use_llm": True,           # False for static-only analysis
-})
+result = graph.invoke(
+    {
+        "input_path": "/path/to/skill",
+        "output_format": "json",  # terminal, json, markdown, or sarif
+        "use_llm": True,  # False for static-only analysis
+    }
+)
 
 # Access results
 print(f"Risk Score: {result['risk_score']}/100")

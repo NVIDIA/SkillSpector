@@ -1,9 +1,10 @@
 """Comprehensive offline security plugin tests — all features, integration, offline guarantees."""
+
 import json
 import re
+import sys
 import tempfile
 from pathlib import Path
-import sys
 
 # Ensure src import for analyzer wrapper
 SRC = Path(__file__).parents[2] / "src"
@@ -13,17 +14,30 @@ if str(SRC) not in sys.path:
 if str(PLUGIN) not in sys.path:
     sys.path.insert(0, str(PLUGIN))
 
-from skill_inspector_security.scanner import SecurityScanner
-from skill_inspector_security.config import get_data_dir, get_db_path, ALLOWED_BIND
-from skill_inspector_security.storage import init_db, save_scan, get_latest_scan
-from skill_inspector_security.dependency_graph import build_dependency_graph, graph_to_cytoscape, compute_metrics
-from skill_inspector_security.permission_manifest import load_manifest, validate_manifest, scan_capabilities, compare_manifest_vs_actual
-from skill_inspector_security.provenance import hash_skill_directory, extract_metadata, record_provenance
-from skill_inspector_security.secrets_analyzer import scan_skill_secrets, shannon_entropy
+from skill_inspector_security.config import ALLOWED_BIND, get_data_dir, get_db_path
+from skill_inspector_security.dependency_graph import (
+    build_dependency_graph,
+    compute_metrics,
+    graph_to_cytoscape,
+)
+from skill_inspector_security.diff_security import analyze_diff_text, compare_skill_versions
+from skill_inspector_security.permission_manifest import (
+    compare_manifest_vs_actual,
+    load_manifest,
+    scan_capabilities,
+    validate_manifest,
+)
 from skill_inspector_security.privacy_classifier import classify_skill_data
-from skill_inspector_security.diff_security import compare_skill_versions, analyze_diff_text
-from skill_inspector_security.sbom import generate_sbom, generate_aggregate_sbom
+from skill_inspector_security.provenance import (
+    extract_metadata,
+    hash_skill_directory,
+    record_provenance,
+)
+from skill_inspector_security.sbom import generate_aggregate_sbom, generate_sbom
+from skill_inspector_security.scanner import SecurityScanner
 from skill_inspector_security.scorecard import compute_scorecard, grade_from_score
+from skill_inspector_security.secrets_analyzer import scan_skill_secrets, shannon_entropy
+from skill_inspector_security.storage import get_latest_scan, init_db, save_scan
 
 ROOT = Path(__file__).parents[2]  # SkillSpector root
 FIXTURE_SAFE = ROOT / "tests" / "fixtures" / "safe_skill"
@@ -31,6 +45,7 @@ FIXTURE_MALICIOUS = ROOT / "tests" / "fixtures" / "malicious_skill"
 SAMPLE_SKILLS = Path(__file__).parent / "sample_skills"
 SKILL_A = SAMPLE_SKILLS / "skill-a"
 SKILL_B = SAMPLE_SKILLS / "skill-b"
+
 
 # ---------- Config / Storage ----------
 def test_config_offline():
@@ -42,16 +57,28 @@ def test_config_offline():
     assert db.parent.exists()
     assert "skill-inspector" in str(db)
 
+
 def test_storage_init_and_persistence():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "test.db"
         init_db(db)
         # save dummy scan
-        dummy = {"skills": [], "graph": {"nodes": [], "edges": []}, "graph_metrics": {}, "summary": {"total_skills": 0, "total_findings": 0, "severity_counts": {}, "avg_score": 0}}
+        dummy = {
+            "skills": [],
+            "graph": {"nodes": [], "edges": []},
+            "graph_metrics": {},
+            "summary": {
+                "total_skills": 0,
+                "total_findings": 0,
+                "severity_counts": {},
+                "avg_score": 0,
+            },
+        }
         save_scan("scan-test-001", str(SAMPLE_SKILLS), dummy, db_path=db)
         latest = get_latest_scan(db_path=db)
         assert latest is not None
         assert latest["scan_id"] == "scan-test-001"
+
 
 # ---------- Dependency Graph ----------
 def test_dependency_graph_discovery():
@@ -61,6 +88,7 @@ def test_dependency_graph_discovery():
     assert G.has_node("skill-a")
     assert G.has_node("skill-b")
 
+
 def test_dependency_graph_edges():
     G, _ = build_dependency_graph(SAMPLE_SKILLS)
     # skill-a declares depends on skill-b and imports skill_b
@@ -69,6 +97,7 @@ def test_dependency_graph_edges():
     for _, data in G.nodes(data=True):
         if data.get("external"):
             assert "path" in data
+
 
 def test_dependency_graph_cytoscape_and_metrics():
     G, _ = build_dependency_graph(SAMPLE_SKILLS)
@@ -82,14 +111,18 @@ def test_dependency_graph_cytoscape_and_metrics():
     assert "cycles" in metrics
     assert "isolated" in metrics
 
+
 def test_dependency_graph_cycle_detection():
     import networkx as nx
+
     G = nx.DiGraph()
     G.add_edge("a", "b")
     G.add_edge("b", "a")
     from skill_inspector_security.dependency_graph import detect_cycles
+
     cycles = detect_cycles(G)
     assert len(cycles) == 1
+
 
 # ---------- Permission Manifest ----------
 def test_permission_manifest_load():
@@ -98,6 +131,7 @@ def test_permission_manifest_load():
     assert "permissions" in manifest
     manifest2, _ = load_manifest(SKILL_B)
     assert manifest2["name"] == "skill-b"
+
 
 def test_permission_manifest_validate():
     ok = validate_manifest({"permissions": {"network": "none", "file_access": "read_only"}})
@@ -108,6 +142,7 @@ def test_permission_manifest_validate():
     assert any(f["rule_id"] == "PERM-001" for f in missing)
     unrestricted = validate_manifest({"permissions": {"network": "unrestricted"}})
     assert any(f["rule_id"] == "PERM-004" for f in unrestricted)
+
 
 def test_permission_manifest_capabilities_and_mismatch():
     caps_a = scan_capabilities(SKILL_A)
@@ -123,6 +158,7 @@ def test_permission_manifest_capabilities_and_mismatch():
     assert any(m["rule_id"] == "PERM-102" for m in mism)  # subprocess
     assert any(m["rule_id"] == "PERM-103" for m in mism)  # file_write
 
+
 # ---------- Provenance ----------
 def test_provenance_hash_deterministic():
     h1 = hash_skill_directory(SKILL_A)
@@ -132,11 +168,13 @@ def test_provenance_hash_deterministic():
     h3 = hash_skill_directory(SKILL_B)
     assert h1 != h3
 
+
 def test_provenance_metadata():
     meta = extract_metadata(SKILL_A)
     assert meta["name"] == "skill-a"
     assert meta["version"] == "1.0.0"
     assert meta["author"] == "alice@local"
+
 
 def test_provenance_record_and_history():
     with tempfile.TemporaryDirectory() as tmp:
@@ -149,10 +187,12 @@ def test_provenance_record_and_history():
         rec2 = record_provenance(SKILL_A, db_path=db)
         assert rec2["history_count"] >= 1
 
+
 # ---------- Secrets ----------
 def test_secrets_entropy():
     assert shannon_entropy("aaaa") < 1.0
     assert shannon_entropy("sk-proj-1234567890abcdefXYZ") > 3.5
+
 
 def test_secrets_patterns():
     findings = scan_skill_secrets(SKILL_A)
@@ -163,34 +203,44 @@ def test_secrets_patterns():
     # check high-entropy detection
     assert any(f["rule_id"] == "SEC-201" for f in findings)  # logging secret
 
+
 def test_secrets_allowlist():
     # dummy allowlisted value should not be flagged
     from skill_inspector_security.secrets_analyzer import is_allowlisted
+
     assert is_allowlisted("example_key")
     assert is_allowlisted("placeholder")
     assert not is_allowlisted("AKIAIOSFODNN7QWERTY12")
     # EXAMPLE is allowlisted intentionally (to avoid flagging docs)
     assert is_allowlisted("AKIAIOSFODNN7EXAMPLE")
 
+
 def test_secrets_benign_no_false_positive():
     findings_b = scan_skill_secrets(SKILL_B)
     # skill-b is benign, should have no critical secrets
     assert not any(f["severity"] == "critical" for f in findings_b)
 
+
 # ---------- Privacy ----------
 def test_privacy_classification():
     priv_a = classify_skill_data(SKILL_A)
     # skill-a has email, credit_card, api_key
-    assert "Credentials" in priv_a["categories"] or "PII" in priv_a["categories"] or "Financial" in priv_a["categories"]
+    assert (
+        "Credentials" in priv_a["categories"]
+        or "PII" in priv_a["categories"]
+        or "Financial" in priv_a["categories"]
+    )
     assert priv_a["flows"]["transmits"] is True
     assert priv_a["flows"]["writes"] is True
     assert len(priv_a["findings"]) >= 1
+
 
 def test_privacy_benign():
     priv_b = classify_skill_data(SKILL_B)
     assert priv_b["flows"]["transmits"] is False
     # benign skill should have low risk
     assert priv_b["flows"]["risk"] in ("low", "medium")
+
 
 # ---------- Diff Security ----------
 def test_diff_security_risky_patterns():
@@ -199,21 +249,25 @@ def test_diff_security_risky_patterns():
     assert any(f["rule_id"] == "DIFF-NEW_NETWORK" for f in findings)
     assert any(f["rule_id"] == "DIFF-NEW_SUBPROCESS" for f in findings)
 
+
 def test_diff_security_permission_escalation():
     diff_text = '+    "network": "unrestricted"\n'
     findings = analyze_diff_text(diff_text)
     assert any(f["rule_id"] == "DIFF-PERM-ESCALATE" for f in findings)
 
+
 def test_diff_compare_skill_versions():
     with tempfile.TemporaryDirectory() as tmp:
         a = Path(tmp) / "a"
         b = Path(tmp) / "b"
-        a.mkdir(); b.mkdir()
+        a.mkdir()
+        b.mkdir()
         (a / "main.py").write_text("print('hello')")
         (b / "main.py").write_text("import requests\nrequests.get('http://example.com')")
         res = compare_skill_versions(a, b)
         assert res["stats"]["added_lines"] > 0
         assert any(f["category"] == "diff" for f in res["findings"])
+
 
 # ---------- SBOM ----------
 def test_sbom_structure():
@@ -229,8 +283,10 @@ def test_sbom_structure():
     assert "purl" in comp
     assert "hashes" in comp
 
+
 def test_sbom_aggregate():
     from skill_inspector_security.dependency_graph import discover_skills
+
     discovered = {p.name: p for p in [SKILL_A, SKILL_B]}
     agg = generate_aggregate_sbom(SAMPLE_SKILLS, discovered)
     assert agg["bomFormat"] == "CycloneDX"
@@ -238,6 +294,7 @@ def test_sbom_aggregate():
     # should contain both skills as application components
     app_comps = [c for c in agg["components"] if c["type"] == "application"]
     assert len(app_comps) >= 1
+
 
 # ---------- Scorecard ----------
 def test_scorecard_grading():
@@ -247,22 +304,37 @@ def test_scorecard_grading():
     assert grade_from_score(50) == "D"
     assert grade_from_score(20) == "F"
 
+
 def test_scorecard_deductions():
     findings = [
-        {"rule_id": "SEC-001", "severity": "critical", "category": "secrets", "message": "x", "evidence": ""},
-        {"rule_id": "PERM-101", "severity": "high", "category": "permission", "message": "y", "evidence": ""},
+        {
+            "rule_id": "SEC-001",
+            "severity": "critical",
+            "category": "secrets",
+            "message": "x",
+            "evidence": "",
+        },
+        {
+            "rule_id": "PERM-101",
+            "severity": "high",
+            "category": "permission",
+            "message": "y",
+            "evidence": "",
+        },
     ]
     sc = compute_scorecard(findings)
     assert sc["score"] < 100
-    assert sc["grade"] in ("A","B","C","D","F")
+    assert sc["grade"] in ("A", "B", "C", "D", "F")
     assert sc["deductions"] > 0
     assert len(sc["top_risks"]) > 0
     assert len(sc["recommendations"]) > 0
+
 
 def test_scorecard_empty_is_perfect():
     sc = compute_scorecard([])
     assert sc["score"] == 100
     assert sc["grade"] == "A"
+
 
 # ---------- Scanner (end-to-end) ----------
 def test_scanner_single_skill():
@@ -282,6 +354,7 @@ def test_scanner_single_skill():
             assert Path(s["sbom_path"]).exists()
             assert Path(s["sbom_path"]).read_text().strip().startswith("{")
 
+
 def test_scanner_multi_skill_and_graph():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "scan.db"
@@ -298,14 +371,16 @@ def test_scanner_multi_skill_and_graph():
         r2 = scanner2.scan()
         assert r2["summary"]["avg_score"] < result["summary"]["avg_score"]
 
+
 # ---------- Report Server ----------
 def test_report_server_offline():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "scan.db"
         scanner = SecurityScanner(SAMPLE_SKILLS, db_path=db)
         scan = scanner.scan()
-        from skill_inspector_security.report_server import create_app_for_testing
         from fastapi.testclient import TestClient
+        from skill_inspector_security.report_server import create_app_for_testing
+
         app = create_app_for_testing(scan)
         client = TestClient(app)
         # health loopback only
@@ -328,18 +403,24 @@ def test_report_server_offline():
         assert sbom_resp.status_code == 200
         assert sbom_resp.json()["bomFormat"] == "CycloneDX"
 
+
 def test_report_server_templates_exist():
     # both plugin and src copies should have templates
-    for p in [ROOT / "plugin" / "templates" / "report.html", ROOT / "src" / "skillspector" / "security_inspection" / "templates" / "report.html"]:
+    for p in [
+        ROOT / "plugin" / "templates" / "report.html",
+        ROOT / "src" / "skillspector" / "security_inspection" / "templates" / "report.html",
+    ]:
         assert p.exists(), f"missing {p}"
         txt = p.read_text(encoding="utf-8")
         assert "Skill Inspector" in txt
         assert "cytoscape.min.js" in txt
         assert "unpkg.com" not in txt, "offline violation: CDN found"
 
+
 # ---------- Offline Analyzer Wrapper ----------
 def test_offline_analyzer_wrapper():
-    from skillspector.nodes.analyzers.offline_security_inspection import analyze, ANALYZER_ID
+    from skillspector.nodes.analyzers.offline_security_inspection import ANALYZER_ID, analyze
+
     assert ANALYZER_ID == "offline_security_inspection"
     # safe_skill should have fewer findings than malicious
     safe_findings = analyze({"skill_path": str(FIXTURE_SAFE)})
@@ -347,27 +428,33 @@ def test_offline_analyzer_wrapper():
     assert len(mal_findings) > len(safe_findings)
     # check severity mapping
     for f in mal_findings:
-        assert f.severity in ("LOW","MEDIUM","HIGH","CRITICAL")
+        assert f.severity in ("LOW", "MEDIUM", "HIGH", "CRITICAL")
         assert f.category  # mapped category
         assert f.rule_id
 
+
 def test_offline_analyzer_scorecard_finding():
     from skillspector.nodes.analyzers.offline_security_inspection import analyze
+
     # malicious sample should trigger OFFLINE-SCORE finding (score <50)
     findings = analyze({"skill_path": str(SAMPLE_SKILLS)})
     assert any(f.rule_id == "OFFLINE-SCORE" for f in findings)
     # cycle detection not present in sample, but should not error
 
+
 # ---------- CLI Integration ----------
 def test_cli_scan_and_audit():
-    from typer.testing import CliRunner
+    import typer
+
     # Plugin CLI
     from skill_inspector_security.cli import main as plugin_cli
-    import typer
+    from typer.testing import CliRunner
+
     runner = CliRunner()
     # Need to test via plugin cli module directly
     # Instead test via direct scanner + audit logic
     from skill_inspector_security.cli import main
+
     # Audit should pass on security_inspection package
     # We test audit logic without invoking typer exit
     proj = ROOT / "src" / "skillspector" / "security_inspection"
@@ -376,6 +463,7 @@ def test_cli_scan_and_audit():
     # No actual 0.0.0.0 binding in code (docstring mentions are allowed)
     code_only = "\n".join(l for l in txt.splitlines() if "no 0.0.0.0" not in l.lower())
     assert not any('"0.0.0.0"' in l and "host" in l for l in code_only)
+
 
 def test_offline_compliance_no_external_urls():
     proj = ROOT / "src" / "skillspector" / "security_inspection"
@@ -386,11 +474,14 @@ def test_offline_compliance_no_external_urls():
         if "openai" in txt.lower():
             # legitimate use is pattern "openai[_-]?api[_-]?key" for detection
             # flag only actual LLM usage: import openai or client calls
-            assert not re.search(r"^\s*import\s+openai", txt, re.MULTILINE), f"LLM import leak in {py}"
+            assert not re.search(r"^\s*import\s+openai", txt, re.MULTILINE), (
+                f"LLM import leak in {py}"
+            )
             assert not re.search(r"from\s+openai\s+import", txt), f"LLM import leak in {py}"
             assert "ChatCompletion" not in txt, f"LLM leak in {py}"
             # secrets_analyzer contains sk- as part of pattern string, allow that
             assert "openai" in txt.lower()  # pattern is allowed
+
 
 # ---------- Data Quality ----------
 def test_report_data_show_well():

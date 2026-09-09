@@ -1,10 +1,13 @@
 """
 models.py - Dataclasses for findings, skills, manifests.
 """
+
 from __future__ import annotations
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Any, Optional
+
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from typing import Any, Dict, List, Optional
+
 
 class Severity(str, Enum):
     CRITICAL = "critical"
@@ -12,6 +15,7 @@ class Severity(str, Enum):
     MEDIUM = "medium"
     LOW = "low"
     INFO = "info"
+
 
 class Category(str, Enum):
     SECRETS = "secrets"
@@ -25,6 +29,7 @@ class Category(str, Enum):
     SBOM = "sbom"
     DIFF = "diff"
 
+
 @dataclass
 class Finding:
     rule_id: str
@@ -32,12 +37,13 @@ class Finding:
     severity: str
     message: str
     file: str
-    line: Optional[int] = None
-    evidence: Optional[str] = None
-    fix: Optional[str] = None
+    line: int | None = None
+    evidence: str | None = None
+    fix: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
 
 @dataclass
 class SkillInfo:
@@ -54,9 +60,11 @@ class SkillInfo:
     privacy: Dict[str, Any] = field(default_factory=dict)
     sbom_ref: str = ""
 
+
 @dataclass
 class PermissionManifest:
     """Declarative manifest of what skill is allowed to do."""
+
     name: str
     version: str = "1.0.0"
     permissions: Dict[str, Any] = field(default_factory=dict)
@@ -76,6 +84,6 @@ class PermissionManifest:
                 "network": "none",
                 "subprocess": False,
                 "env": [],
-                "capabilities": []
-            }
+                "capabilities": [],
+            },
         }

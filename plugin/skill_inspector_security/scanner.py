@@ -1,40 +1,54 @@
 """
 scanner.py - Orchestrator: runs all analyzers deterministically, stores results.
 """
+
 from __future__ import annotations
+
 import json
 import uuid
+from datetime import UTC, datetime, timezone
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
-
-from .dependency_graph import build_dependency_graph, graph_to_cytoscape, compute_metrics
-from .permission_manifest import load_manifest, validate_manifest, scan_capabilities, compare_manifest_vs_actual
-from .provenance import record_provenance
-from .secrets_analyzer import scan_skill_secrets
-from .privacy_classifier import classify_skill_data
-from .diff_security import diff_against_previous_version
-from .sbom import generate_sbom, generate_aggregate_sbom, save_sbom
-from .scorecard import compute_scorecard
-from .storage import init_db, save_scan
-from .config import get_data_dir, get_db_path, get_sbom_dir
-from .event_model import SecurityEvent, EventGraph
-from .drift_analyzer import capabilities_to_set, classify_drift, drift_to_findings, drift_to_events
-from .correlation_engine import correlate
-from .policy import load_policy, evaluate_policy, policy_to_findings
-from .regression import compare_reports
+from typing import Any, Dict, List, Optional
 
 import networkx as nx
 
+from .config import get_data_dir, get_db_path, get_sbom_dir
+from .correlation_engine import correlate
+from .dependency_graph import build_dependency_graph, compute_metrics, graph_to_cytoscape
+from .diff_security import diff_against_previous_version
+from .drift_analyzer import capabilities_to_set, classify_drift, drift_to_events, drift_to_findings
+from .event_model import EventGraph, SecurityEvent
+from .permission_manifest import (
+    compare_manifest_vs_actual,
+    load_manifest,
+    scan_capabilities,
+    validate_manifest,
+)
+from .policy import evaluate_policy, load_policy, policy_to_findings
+from .privacy_classifier import classify_skill_data
+from .provenance import record_provenance
+from .regression import compare_reports
+from .sbom import generate_aggregate_sbom, generate_sbom, save_sbom
+from .scorecard import compute_scorecard
+from .secrets_analyzer import scan_skill_secrets
+from .storage import init_db, save_scan
+
+
 class SecurityScanner:
-    def __init__(self, skills_root: Path, db_path: Optional[Path] = None):
+    def __init__(self, skills_root: Path, db_path: Path | None = None):
         self.skills_root = Path(skills_root).expanduser().resolve()
         self.db_path = db_path or get_db_path()
         init_db(self.db_path)
         self.data_dir = get_data_dir()
 
-    def scan(self, previous_snapshot: Optional[Path] = None, enable_runtime: bool = False, policy_path: Optional[Path] = None, old_report: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        scan_id = f"scan-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    def scan(
+        self,
+        previous_snapshot: Path | None = None,
+        enable_runtime: bool = False,
+        policy_path: Path | None = None,
+        old_report: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        scan_id = f"scan-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         # Dependency graph
         G, discovered = build_dependency_graph(self.skills_root)
         graph_json = graph_to_cytoscape(G)
@@ -57,7 +71,19 @@ class SecurityScanner:
             prov = record_provenance(skill_path, self.skills_root, db_path=self.db_path)
             findings.extend(prov.get("findings", []))
             for f in prov.get("findings", []):
-                events.add(SecurityEvent(source="provenance", category=f.get("category","provenance"), action="provenance", subject=name, target=f.get("file",""), capability=f.get("rule_id",""), evidence=f.get("message",""), severity=f.get("severity","low"), rule_id=f.get("rule_id","")))
+                events.add(
+                    SecurityEvent(
+                        source="provenance",
+                        category=f.get("category", "provenance"),
+                        action="provenance",
+                        subject=name,
+                        target=f.get("file", ""),
+                        capability=f.get("rule_id", ""),
+                        evidence=f.get("message", ""),
+                        severity=f.get("severity", "low"),
+                        rule_id=f.get("rule_id", ""),
+                    )
+                )
 
             # Permission manifest
             manifest, manifest_src = load_manifest(skill_path)
@@ -67,45 +93,108 @@ class SecurityScanner:
             perm_mismatch = compare_manifest_vs_actual(manifest, actual_caps, skill_path)
             findings.extend(perm_mismatch)
             for f in manifest_findings + perm_mismatch:
-                events.add(SecurityEvent(source="permission", category="permission", action="mismatch", subject=name, target=f.get("file",""), capability=f.get("rule_id",""), evidence=f.get("message",""), severity=f.get("severity","medium"), rule_id=f.get("rule_id","")))
+                events.add(
+                    SecurityEvent(
+                        source="permission",
+                        category="permission",
+                        action="mismatch",
+                        subject=name,
+                        target=f.get("file", ""),
+                        capability=f.get("rule_id", ""),
+                        evidence=f.get("message", ""),
+                        severity=f.get("severity", "medium"),
+                        rule_id=f.get("rule_id", ""),
+                    )
+                )
 
             # Secrets
             secret_findings = scan_skill_secrets(skill_path)
             findings.extend(secret_findings)
             for f in secret_findings:
-                events.add(SecurityEvent(source="static", category="secrets", action="detect", subject=f.get("file",""), target=f.get("evidence","")[:60], capability="secrets.detect", evidence=f.get("message",""), severity=f.get("severity","high"), rule_id=f.get("rule_id","")))
+                events.add(
+                    SecurityEvent(
+                        source="static",
+                        category="secrets",
+                        action="detect",
+                        subject=f.get("file", ""),
+                        target=f.get("evidence", "")[:60],
+                        capability="secrets.detect",
+                        evidence=f.get("message", ""),
+                        severity=f.get("severity", "high"),
+                        rule_id=f.get("rule_id", ""),
+                    )
+                )
 
             # Privacy
             privacy = classify_skill_data(skill_path)
             findings.extend(privacy.get("findings", []))
             for f in privacy.get("findings", []):
-                events.add(SecurityEvent(source="privacy", category="privacy", action="classify", subject=name, target=",".join(privacy.get("categories",[])), capability="privacy."+f.get("rule_id",""), evidence=f.get("message",""), severity=f.get("severity","medium"), rule_id=f.get("rule_id","")))
+                events.add(
+                    SecurityEvent(
+                        source="privacy",
+                        category="privacy",
+                        action="classify",
+                        subject=name,
+                        target=",".join(privacy.get("categories", [])),
+                        capability="privacy." + f.get("rule_id", ""),
+                        evidence=f.get("message", ""),
+                        severity=f.get("severity", "medium"),
+                        rule_id=f.get("rule_id", ""),
+                    )
+                )
 
             # Diff (if previous snapshot or git)
-            diff_res = diff_against_previous_version(skill_path, previous_snapshot / name if previous_snapshot else None)
+            diff_res = diff_against_previous_version(
+                skill_path, previous_snapshot / name if previous_snapshot else None
+            )
             findings.extend(diff_res.get("findings", []))
             for f in diff_res.get("findings", []):
-                events.add(SecurityEvent(source="diff", category="diff", action="diff", subject=name, target=f.get("file",""), capability=f.get("rule_id",""), evidence=f.get("message",""), severity=f.get("severity","medium"), rule_id=f.get("rule_id","")))
+                events.add(
+                    SecurityEvent(
+                        source="diff",
+                        category="diff",
+                        action="diff",
+                        subject=name,
+                        target=f.get("file", ""),
+                        capability=f.get("rule_id", ""),
+                        evidence=f.get("message", ""),
+                        severity=f.get("severity", "medium"),
+                        rule_id=f.get("rule_id", ""),
+                    )
+                )
 
             # Runtime monitor (optional, isolated)
             runtime_caps: Dict[str, bool] = {}
             runtime_graph = EventGraph()
             if enable_runtime:
                 try:
-                    from .runtime_monitor import run_isolated, collect_runtime_capabilities
+                    from .runtime_monitor import collect_runtime_capabilities, run_isolated
+
                     runtime_graph = run_isolated(skill_path, timeout=8.0)
                     runtime_caps = collect_runtime_capabilities(runtime_graph)
                     # Add runtime events
                     for ev in runtime_graph.events:
                         events.add(ev)
                         global_graph.add(ev)
-                    findings.extend([e.to_finding() for e in runtime_graph.events if e.severity in ("high","critical")])
+                    findings.extend(
+                        [
+                            e.to_finding()
+                            for e in runtime_graph.events
+                            if e.severity in ("high", "critical")
+                        ]
+                    )
                 except Exception:
                     runtime_caps = {}
 
             # Drift analysis: declared vs static vs runtime
-            perms = manifest.get("permissions", {}) if isinstance(manifest.get("permissions"), dict) else {}
-            declared_set, static_set, runtime_set = capabilities_to_set(perms, actual_caps, runtime_caps)
+            perms = (
+                manifest.get("permissions", {})
+                if isinstance(manifest.get("permissions"), dict)
+                else {}
+            )
+            declared_set, static_set, runtime_set = capabilities_to_set(
+                perms, actual_caps, runtime_caps
+            )
             drifts = classify_drift(declared_set, static_set, runtime_set)
             drift_findings = drift_to_findings(drifts, name)
             findings.extend(drift_findings)
@@ -122,7 +211,19 @@ class SecurityScanner:
             findings.extend(corr_findings)
             for ev in corr_findings:
                 # also add as event
-                events.add(SecurityEvent(source="correlation", category="correlation", action="attack_path", subject=name, target=ev.get("rule_id",""), capability=ev.get("rule_id",""), evidence=ev.get("message",""), severity=ev.get("severity","high"), rule_id=ev.get("rule_id","")))
+                events.add(
+                    SecurityEvent(
+                        source="correlation",
+                        category="correlation",
+                        action="attack_path",
+                        subject=name,
+                        target=ev.get("rule_id", ""),
+                        capability=ev.get("rule_id", ""),
+                        evidence=ev.get("message", ""),
+                        severity=ev.get("severity", "high"),
+                        rule_id=ev.get("rule_id", ""),
+                    )
+                )
 
             # Policy enforcement
             policy_findings: List[Dict[str, Any]] = []
@@ -137,33 +238,37 @@ class SecurityScanner:
             save_sbom(sbom, sbom_path)
 
             # Scorecard (include drift/correlation in score)
-            scorecard = compute_scorecard(findings, provenance=prov, privacy=privacy, sbom_components=len(sbom["components"]))
+            scorecard = compute_scorecard(
+                findings, provenance=prov, privacy=privacy, sbom_components=len(sbom["components"])
+            )
 
             # Privacy summary already
 
-            skills_results.append({
-                "name": name,
-                "path": str(skill_path),
-                "version": prov.get("version", "unknown"),
-                "author": prov.get("author", "unknown"),
-                "origin": prov.get("origin", "local"),
-                "hash_sha256": prov.get("hash_sha256", ""),
-                "manifest": manifest,
-                "manifest_source": manifest_src,
-                "capabilities": actual_caps,
-                "runtime_capabilities": runtime_caps,
-                "privacy": privacy,
-                "findings": findings,
-                "scorecard": scorecard,
-                "sbom_path": str(sbom_path),
-                "sbom_components": len(sbom["components"]),
-                "diff_stats": diff_res.get("stats", {}),
-                "events": [e.to_dict() for e in events.events],
-                "drift": drifts,
-                "correlation": corr_findings,
-                "policy": policy_findings,
-                "runtime_events": len(runtime_graph.events) if enable_runtime else 0,
-            })
+            skills_results.append(
+                {
+                    "name": name,
+                    "path": str(skill_path),
+                    "version": prov.get("version", "unknown"),
+                    "author": prov.get("author", "unknown"),
+                    "origin": prov.get("origin", "local"),
+                    "hash_sha256": prov.get("hash_sha256", ""),
+                    "manifest": manifest,
+                    "manifest_source": manifest_src,
+                    "capabilities": actual_caps,
+                    "runtime_capabilities": runtime_caps,
+                    "privacy": privacy,
+                    "findings": findings,
+                    "scorecard": scorecard,
+                    "sbom_path": str(sbom_path),
+                    "sbom_components": len(sbom["components"]),
+                    "diff_stats": diff_res.get("stats", {}),
+                    "events": [e.to_dict() for e in events.events],
+                    "drift": drifts,
+                    "correlation": corr_findings,
+                    "policy": policy_findings,
+                    "runtime_events": len(runtime_graph.events) if enable_runtime else 0,
+                }
+            )
 
         # Global summary
         all_findings = [f for s in skills_results for f in s["findings"]]
@@ -171,7 +276,11 @@ class SecurityScanner:
         for f in all_findings:
             sev_counts[f.get("severity", "info")] = sev_counts.get(f.get("severity", "info"), 0) + 1
 
-        avg_score = sum(s["scorecard"]["score"] for s in skills_results) / len(skills_results) if skills_results else 0
+        avg_score = (
+            sum(s["scorecard"]["score"] for s in skills_results) / len(skills_results)
+            if skills_results
+            else 0
+        )
 
         # Global correlation across all skills
         global_attack_paths = correlate(global_graph)
@@ -183,11 +292,18 @@ class SecurityScanner:
         # Regression vs old report
         regression = None
         if old_report:
-            regression = compare_reports(old_report, {"skills": skills_results, "summary": {"avg_score": round(avg_score,1)}, "graph": graph_json})
+            regression = compare_reports(
+                old_report,
+                {
+                    "skills": skills_results,
+                    "summary": {"avg_score": round(avg_score, 1)},
+                    "graph": graph_json,
+                },
+            )
 
         result: Dict[str, Any] = {
             "scan_id": scan_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "skills_root": str(self.skills_root),
             "skills": skills_results,
             "graph": graph_json,

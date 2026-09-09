@@ -38,7 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from skillspector.graph import graph
-from skillspector.llm_analyzer_base import LLMAnalyzerBase, LLMAnalysisResult
+from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMAnalyzerBase
 from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
@@ -50,12 +50,12 @@ logger = get_logger(__name__)
 # API Key Pool — shared across graph-internal and gap-fill LLM calls
 # ═══════════════════════════════════════════════════════════════════════════
 
-_api_pool: "ApiKeyPool | None" = None
+_api_pool: ApiKeyPool | None = None
 
 _original_get_chat_model = None  # saved on first set_api_pool call
 
 
-def set_api_pool(pool: "ApiKeyPool | None") -> None:
+def set_api_pool(pool: ApiKeyPool | None) -> None:
     """Replace the LLM chat-model factory with a pooled version.
 
     When *pool* is set, every call to :func:`skillspector.llm_utils.get_chat_model`
@@ -67,8 +67,8 @@ def set_api_pool(pool: "ApiKeyPool | None") -> None:
     """
     global _api_pool, _original_get_chat_model
 
-    import skillspector.llm_utils as _llm_utils
     import skillspector.llm_analyzer_base as _llm_analyzer_base
+    import skillspector.llm_utils as _llm_utils
 
     if pool is None:
         _api_pool = None
@@ -86,6 +86,7 @@ def set_api_pool(pool: "ApiKeyPool | None") -> None:
     def _pooled_get_chat_model(model=None):
         if _api_pool:
             from .api_pool import PooledChatModel
+
             pooled_model = PooledChatModel(_api_pool)
             _llm_utils.register_chat_model_provider(pooled_model, "openai")
             return pooled_model
@@ -95,12 +96,13 @@ def set_api_pool(pool: "ApiKeyPool | None") -> None:
     _llm_analyzer_base.get_chat_model = _pooled_get_chat_model
     logger.info("API key pool wired — all LLM calls will use PooledChatModel")
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # HTTP timeout — stop hung connections from blocking workers forever
 # ═══════════════════════════════════════════════════════════════════════════
 
 _DEFAULT_REQUEST_TIMEOUT = 30.0  # total request ceiling
-_DEFAULT_CONNECT_TIMEOUT = 8.0   # TCP / TLS handshake
+_DEFAULT_CONNECT_TIMEOUT = 8.0  # TCP / TLS handshake
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Compatibility patches (DeepSeek / non-OpenAI providers)
@@ -215,7 +217,7 @@ _JSON_OUTPUT_INSTRUCTION = (
     '"severity": "LOW|MEDIUM|HIGH|CRITICAL", "start_line": 1, '
     '"end_line": null, "confidence": 0.0-1.0, '
     '"explanation": "...", "remediation": "..."}]}\n'
-    "If no issues found, return: {\"findings\": []}"
+    'If no issues found, return: {"findings": []}'
 )
 
 _original_base_build_prompt = LLMAnalyzerBase.build_prompt
@@ -254,6 +256,7 @@ def _patched_meta_build_prompt(self, batch, **kwargs):
 # patches ChatOpenAI would corrupt the capture inside _apply_patches).
 try:
     from langchain_openai import ChatOpenAI as _CO_for_original
+
     _original_chatopenai_init = _CO_for_original.__init__
 except ImportError:
     _original_chatopenai_init = None
@@ -282,13 +285,16 @@ _original_asyncio_run = _asyncio.run
 def _patched_asyncio_run(main, *, debug=None, loop_factory=None):
     def _make_quiet_loop():
         loop = (loop_factory or _asyncio.new_event_loop)()
+
         def _handler(loop, context):
             exc = context.get("exception")
             if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
                 return
             loop.default_exception_handler(context)
+
         loop.set_exception_handler(_handler)
         return loop
+
     return _original_asyncio_run(main, debug=debug, loop_factory=_make_quiet_loop)
 
 
@@ -419,9 +425,7 @@ def _verify_patch_targets() -> None:
         from langchain_openai import ChatOpenAI as _ChatOpenAI
 
         sig6 = inspect.signature(_ChatOpenAI.__init__)
-        if not any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig6.parameters.values()
-        ):
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig6.parameters.values()):
             raise RuntimeError(
                 "Patch 6 target changed: ChatOpenAI.__init__ no longer "
                 "accepts **kwargs.  Upstream may have removed the Pydantic "
@@ -539,6 +543,7 @@ def _restore_patches() -> None:
     if _original_chatopenai_init is not None:
         try:
             from langchain_openai import ChatOpenAI as _ChatOpenAI
+
             _ChatOpenAI.__init__ = _original_chatopenai_init
         except ImportError:
             pass
@@ -593,7 +598,7 @@ def _strip_markdown_fences(text: str) -> str:
     if text.startswith("```"):
         nl = text.find("\n")
         if nl != -1:
-            text = text[nl + 1:]
+            text = text[nl + 1 :]
         if text.rstrip().endswith("```"):
             text = text.rstrip()[:-3].rstrip()
     return text.strip()
@@ -656,9 +661,7 @@ def entry_from_result(
     findings = result.get("filtered_findings", result.get("findings", []))
     manifest = result.get("manifest") or {}
     component_metadata = result.get("component_metadata") or []
-    skill_name = (
-        (manifest.get("name") or skill_dir.name) if manifest else skill_dir.name
-    )
+    skill_name = (manifest.get("name") or skill_dir.name) if manifest else skill_dir.name
 
     try:
         rel_path = str(skill_dir.relative_to(root))
@@ -689,9 +692,7 @@ def entry_from_result(
         "risk_assessment": {
             "score": result.get("risk_score", 0),
             "severity": result.get("risk_severity", "LOW"),
-            "recommendation": (result.get("risk_recommendation") or "SAFE").replace(
-                "_", " "
-            ),
+            "recommendation": (result.get("risk_recommendation") or "SAFE").replace("_", " "),
         },
         "components": [
             {
@@ -710,9 +711,7 @@ def entry_from_result(
         "enhancements": {
             "gap_fill_applied": gap_fill_applied,
             "gap_fill_findings": gap_fill_findings,
-            "english_keyword_rules_skipped": (
-                _ENGLISH_KEYWORD_RULE_COUNT if is_non_en else 0
-            ),
+            "english_keyword_rules_skipped": (_ENGLISH_KEYWORD_RULE_COUNT if is_non_en else 0),
         },
     }
 

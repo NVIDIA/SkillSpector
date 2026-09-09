@@ -1,10 +1,14 @@
 """regression.py - Security Regression Engine."""
+
 from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional
+
 
 def compare_reports(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
     """Compare two scanner reports (old vs new)."""
+
     # Build rule -> findings map
     def findings_set(report):
         s = set()
@@ -12,6 +16,7 @@ def compare_reports(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
             for f in skill.get("findings", []):
                 s.add((f.get("rule_id"), f.get("file"), f.get("message")[:60]))
         return s
+
     old_set = findings_set(old)
     new_set = findings_set(new)
 
@@ -28,9 +33,10 @@ def compare_reports(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
                     c.add(k)
             # also drift
             for f in skill.get("findings", []):
-                if f.get("rule_id","").startswith("DRIFT"):
-                    c.add(f.get("capability",""))
+                if f.get("rule_id", "").startswith("DRIFT"):
+                    c.add(f.get("capability", ""))
         return c
+
     old_caps = caps(old)
     new_caps = caps(new)
 
@@ -45,8 +51,8 @@ def compare_reports(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
     # Decision
     if new_score < old_score - 10 or new_grade > old_grade:  # grade worsened (F > A)
         # grade comparison: F is worse, need ordinal
-        order = {"A":0,"B":1,"C":2,"D":3,"F":4}
-        if order.get(new_grade,0) > order.get(old_grade,0) or new_score < 45:
+        order = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+        if order.get(new_grade, 0) > order.get(old_grade, 0) or new_score < 45:
             decision = "BLOCK"
         else:
             decision = "WARN"
@@ -69,33 +75,43 @@ def compare_reports(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
         "summary": f"NEW {len(added)} REMOVED {len(removed)} RISK {old_score}->{new_score} Grade {old_grade}->{new_grade} Decision {decision}",
     }
 
+
 def _grade(score: float) -> str:
-    if score >= 90: return "A"
-    if score >= 80: return "B"
-    if score >= 65: return "C"
-    if score >= 45: return "D"
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 65:
+        return "C"
+    if score >= 45:
+        return "D"
     return "F"
+
 
 def regression_to_findings(reg: Dict[str, Any]) -> List[Dict[str, Any]]:
     findings = []
     for cap in reg["added_caps"]:
-        findings.append({
-            "rule_id": "REG-NEW-CAP",
-            "category": "regression",
-            "severity": "high",
-            "message": f"New capability added: {cap}",
-            "file": "regression",
-            "line": None,
-            "evidence": f"old {reg['old_score']} -> new {reg['new_score']}",
-        })
+        findings.append(
+            {
+                "rule_id": "REG-NEW-CAP",
+                "category": "regression",
+                "severity": "high",
+                "message": f"New capability added: {cap}",
+                "file": "regression",
+                "line": None,
+                "evidence": f"old {reg['old_score']} -> new {reg['new_score']}",
+            }
+        )
     if reg["decision"] == "BLOCK":
-        findings.append({
-            "rule_id": "REG-BLOCK",
-            "category": "regression",
-            "severity": "critical",
-            "message": f"Security regression: {reg['summary']}",
-            "file": "regression",
-            "line": None,
-            "evidence": reg["summary"],
-        })
+        findings.append(
+            {
+                "rule_id": "REG-BLOCK",
+                "category": "regression",
+                "severity": "critical",
+                "message": f"Security regression: {reg['summary']}",
+                "file": "regression",
+                "line": None,
+                "evidence": reg["summary"],
+            }
+        )
     return findings

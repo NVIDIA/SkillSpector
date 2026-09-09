@@ -2,6 +2,7 @@
 NVIDIA Skill Inspector - Security Inspection Plugin
 100% local, offline, deterministic static analysis.
 """
+
 __version__ = "1.0.0"
 __author__ = "Skill Inspector Security Plugin"
 
