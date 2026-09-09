@@ -175,7 +175,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for pattern, confidence in AS3_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             full_match = match.group(0)
-            if _is_current_skill_path_reference(full_match, _CURRENT_SKILL_IDENTIFIERS.get()):
+            if _is_current_skill_path_reference(
+                full_match, _CURRENT_SKILL_IDENTIFIERS.get()
+            ) and static_runner.security_view_match_is_literal(content, match.start(), match.end()):
                 continue
             matched_text = full_match[:200]
             line_num = get_line_number(content, match.start())

@@ -23,6 +23,7 @@ import unicodedata
 from array import array
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -94,6 +95,10 @@ _VIEW_START_EVIDENCE = "_security_view_start"
 _SOURCE_START_EVIDENCE = "_security_source_start"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
 _BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
+_ActiveSecurityView = tuple[SecurityTextView, str]
+_ACTIVE_SECURITY_VIEW: ContextVar[_ActiveSecurityView | None] = ContextVar(
+    "static_runner_active_security_view", default=None
+)
 _ViewFindingKey = tuple[str, str, int, str | None, tuple[object, ...]]
 _ViewScopeKey = tuple[str, str, int, str | None]
 assert _RAW_WINDOW_OWNED_CHARS > 0
@@ -122,6 +127,31 @@ _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
+
+
+def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
+    """Return whether an active-view span is unchanged from its source text."""
+    active_view = _ACTIVE_SECURITY_VIEW.get()
+    if active_view is None or not 0 <= start < end <= len(content):
+        return False
+    view, source_text = active_view
+    if view.text is not content:
+        return False
+    if view.source_offsets is None:
+        return view.text is source_text
+    if end > len(view.source_offsets):
+        return False
+
+    source_start = view.source_offsets[start]
+    match_length = end - start
+    source_end = source_start + match_length
+    if source_end > len(source_text):
+        return False
+    if any(
+        view.source_offsets[index] != source_start + index - start for index in range(start, end)
+    ):
+        return False
+    return source_text[source_start:source_end] == content[start:end]
 
 
 def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
@@ -724,15 +754,21 @@ def _scan_view_windows(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None,
+    *,
+    source_text: str,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Scan one already-bounded view."""
-    findings, resource_limit = _scan_path(
-        path,
-        view.text,
-        pattern_modules,
-        finding_budget,
-        python_ast_cache_key,
-    )
+    view_token = _ACTIVE_SECURITY_VIEW.set((view, source_text))
+    try:
+        findings, resource_limit = _scan_path(
+            path,
+            view.text,
+            pattern_modules,
+            finding_budget,
+            python_ast_cache_key,
+        )
+    finally:
+        _ACTIVE_SECURITY_VIEW.reset(view_token)
     for finding in findings:
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
@@ -1088,6 +1124,7 @@ def _scan_declared_marker_views(
                         pattern_modules,
                         view_budget,
                         None,
+                        source_text=raw_window,
                     )
                     _restore_source_lines(
                         view_findings,
@@ -1325,6 +1362,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            source_text=raw_window,
                         )
                     except _StaticResourceLimitError as exc:
                         return (
@@ -1395,6 +1433,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            source_text=continuity.view.text,
                         )
                         _restore_source_lines(
                             view_findings,
