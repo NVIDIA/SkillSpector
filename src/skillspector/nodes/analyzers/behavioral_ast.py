@@ -326,6 +326,38 @@ def _deserialization_message(call_name: str, node: ast.Call) -> str | None:
     return None
 
 
+def _reflective_module_dict_base(node: ast.Subscript, aliases: dict[str, str]) -> str | None:
+    """Return the module name when *node* subscripts an imported module's namespace.
+
+    Matches ``<module>.__dict__[key]`` and ``vars(<module>)[key]``, the subscript
+    equivalents of ``getattr(<module>, key)``: both index the module namespace,
+    so anything AST7/AST9 catch through ``getattr`` must not become invisible by
+    changing spelling. The base must resolve through the import-alias map to a
+    plain (non-dotted) module (``import os`` / ``import os as o``), which keeps
+    idiomatic instance attribute bags (``self.__dict__[...]``) and from-imported
+    classes out of scope.
+    """
+    target = node.value
+    base: ast.expr
+    if isinstance(target, ast.Attribute) and target.attr == "__dict__":
+        base = target.value
+    elif (
+        isinstance(target, ast.Call)
+        and isinstance(target.func, ast.Name)
+        and target.func.id == "vars"
+        and len(target.args) == 1
+    ):
+        base = target.args[0]
+    else:
+        return None
+    if not isinstance(base, ast.Name):
+        return None
+    resolved = aliases.get(base.id)
+    if resolved is None or "." in resolved:
+        return None
+    return resolved
+
+
 def _analyze_python(
     python_ast: ParsedPythonFile,
     file_path: str,
@@ -363,6 +395,29 @@ def _analyze_python(
     for ast_node in ast.walk(tree):
         if budget is not None:
             budget.check_runtime()
+        if isinstance(ast_node, ast.Subscript):
+            module = _reflective_module_dict_base(ast_node, aliases)
+            if module is not None:
+                key = ast_node.slice
+                lineno = getattr(ast_node, "lineno", 1)
+                end_lineno = getattr(ast_node, "end_lineno", None)
+                if isinstance(key, ast.Constant):
+                    if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
+                        _emit(
+                            "AST9",
+                            lineno,
+                            end_lineno,
+                            f"Reflective dangerous access via {module}.__dict__ subscript "
+                            "with a literal sink name",
+                        )
+                else:
+                    _emit(
+                        "AST7",
+                        lineno,
+                        end_lineno,
+                        f"Dynamic attribute access via {module}.__dict__ subscript",
+                    )
+            continue
         if not isinstance(ast_node, ast.Call):
             continue
 

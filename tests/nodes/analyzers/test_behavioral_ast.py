@@ -159,6 +159,51 @@ class TestReflectiveGetattrExec:
             assert not any(f.rule_id == "AST9" for f in findings), name
 
 
+class TestModuleDictSubscript:
+    """<module>.__dict__[key] / vars(<module>)[key] are subscript getattr equivalents.
+
+    Both index the module namespace, so they must get the same AST7/AST9
+    treatment as getattr(module, key); changing only the spelling must not
+    change the verdict.
+    """
+
+    def test_dunder_dict_computed_key_produces_ast7(self):
+        code = 'import os\nhandle = os.__dict__["po" + "pen"]("id")'
+        findings = _run(code)
+        ast7 = [f for f in findings if f.rule_id == "AST7"]
+        assert len(ast7) == 1
+        assert ast7[0].severity == "LOW"
+        assert "__dict__" in ast7[0].message
+
+    def test_dunder_dict_literal_sink_produces_ast9(self):
+        code = 'import os\nhandle = os.__dict__["popen"]("whoami")'
+        findings = _run(code)
+        ast9 = [f for f in findings if f.rule_id == "AST9"]
+        assert len(ast9) == 1
+        assert ast9[0].severity == "HIGH"
+
+    def test_vars_module_computed_key_produces_ast7(self):
+        code = "import os\nkey = 'po' + 'pen'\nhandle = vars(os)[key]"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    def test_aliased_module_dunder_dict_produces_ast7(self):
+        code = "import os as o\nkey = 'system'\nhandle = o.__dict__[key]"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    def test_instance_dunder_dict_no_finding(self):
+        # Instance attribute bags are idiomatic and must stay unflagged.
+        code = "class C:\n    def set(self, key, value):\n        self.__dict__[key] = value"
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    def test_dunder_dict_safe_literal_no_finding(self):
+        code = 'import os\nenv = os.__dict__["environ"]'
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+
 class TestDangerousChains:
     def test_exec_compile_chain_produces_ast8(self):
         code = 'exec(compile("x = 1", "<string>", "exec"))'
