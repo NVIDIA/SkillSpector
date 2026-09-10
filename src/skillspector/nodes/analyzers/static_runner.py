@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 import re
 import time
 import unicodedata
@@ -115,7 +117,31 @@ _CONTINUITY_CONTEXT_CHARS = 2048
 _CONTINUITY_MAX_CHAIN_RUNS = 24
 MAX_FINDINGS_PER_ARTIFACT = 10_000
 MAX_FINDINGS_PER_ANALYZER = 10_000
-MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = 30.0
+DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = 300.0
+
+
+def _static_max_seconds_from_environment(value: str | None) -> float:
+    """Read the static artifact allowance using the workflow setting's convention."""
+    if value is None:
+        return DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0.0
+    if not math.isfinite(seconds) or seconds <= 0:
+        logger.warning(
+            "SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT=%r must be finite "
+            "and positive, using default %.1fs",
+            value,
+            DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT,
+        )
+        return DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+    return seconds
+
+
+MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = _static_max_seconds_from_environment(
+    os.environ.get("SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT")
+)
 
 _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")

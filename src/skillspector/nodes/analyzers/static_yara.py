@@ -591,7 +591,7 @@ def _match_file(
         data=data,
         callback=_match_callback,
         which_callbacks=yara.CALLBACK_MATCHES,
-        # Round down so the engine timeout never exceeds min(shared, 30s).
+        # Round down so the engine timeout never exceeds the effective allowance.
         timeout=max(1, math.floor(runtime_limit)),
         # YARA still evaluates full rule conditions, but stops retaining every
         # repeated string instance after the condition is decided. Without
