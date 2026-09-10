@@ -32,7 +32,12 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
+from .common import (
+    LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
+    get_context,
+    get_line_number,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -151,7 +156,31 @@ P8_PATTERNS = [
     ),
 ]
 
-_BENIGN_OUTPUT_RULES_HEADING = "## Output Rules (Both Modes)"
+_LEGACY_OUTPUT_RULES_HEADING = "## Output Rules (Both Modes)"
+_BENIGN_OUTPUT_RULES_HEADING = re.compile(
+    r"[ ]{0,3}#{1,6}[ \t]+"
+    r"(?:HTML|JSON|CSV|Markdown)[ \t]+"
+    r"(?P<target>output[ \t]+rules)"
+    r"(?:[ \t]+\(offline-safe\))?"
+    r"(?:[ \t]+#+)?[ \t]*",
+    re.IGNORECASE,
+)
+_HEADING_DIRECTIVE = re.compile(
+    r"\b(?:interpret|treat|read|execute|perform|follow|obey|do|carry[ \t]+out)\b.*"
+    r"\b(?:heading|title|label|command|instruction|operation|following|below|above)\b"
+    r"|\b(?:heading|title|label)\b.*\b(?:command|instruction)\b"
+    r"|\b(?:system|developer|hidden|internal|secret|governing)[ \t]+"
+    r"(?:prompts?|instructions?|rules?)\b",
+    re.IGNORECASE,
+)
+_HEADING_REFERENCE = re.compile(
+    r"\b(?:print|output|show|display|reveal|expose|return|echo|repeat|share|disclose|"
+    r"publish|provide|send|copy|extract|dump|recite|summarize|translate|encode|"
+    r"forward|pipe|write|save|store|log|do)[ \t]+"
+    r"(?:it|them|so|this|that|these|those|above|below|previous|preceding|foregoing|"
+    r"former|latter|(?:the|same)[ \t]+(?:rules?|instructions?|prompts?))\b",
+    re.IGNORECASE,
+)
 _LOGICAL_BREAK = rf"(?:{LOGICAL_LINE_BREAK.pattern})"
 _BENIGN_PRINT_RULES_TAXONOMY = re.compile(
     rf"(?:\A|{_LOGICAL_BREAK})[ \t]*[\"'`]{{0,3}}[ \t]*"
@@ -191,15 +220,39 @@ _NEXT_LINE_REFERENCE = re.compile(
 )
 
 
-def _is_benign_output_rules_heading(content: str, match: re.Match[str], file_type: str) -> bool:
-    """Return True only for the reported benign Markdown heading."""
-    if file_type != "markdown" or match.group(0) != "Output Rules":
-        return False
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end < 0:
-        line_end = len(content)
-    return content[line_start:line_end].strip() == _BENIGN_OUTPUT_RULES_HEADING
+def _benign_output_rules_heading_spans(content: str, file_type: str) -> set[tuple[int, int]]:
+    """Locate complete formatting labels, preserving adjacent extraction instructions.
+
+    A format-qualified label remains a noun phrase in a fenced example. No whole
+    heading, code block, or file is skipped; only its bare noun span is exempted.
+    """
+    spans: set[tuple[int, int]] = set()
+    if file_type != "markdown":
+        return spans
+
+    offset = 0
+    for raw_line in content.splitlines(keepends=True):
+        line = raw_line.rstrip(LINE_BREAK_CHARS)
+        line_end = offset + len(raw_line)
+        # Preserve the existing exact exception independently of the new grammar.
+        if line.strip() == _LEGACY_OUTPUT_RULES_HEADING:
+            start = offset + line.index("Output Rules")
+            spans.add((start, start + len("Output Rules")))
+        elif heading := _BENIGN_OUTPUT_RULES_HEADING.fullmatch(line):
+            _, previous_complete = _bounded_previous_nonblank_line(content, offset)
+            previous = LOGICAL_LINE_BREAK.sub(" ", content[max(0, offset - 512) : offset])
+            _, following_complete = _bounded_next_nonblank_line(content, line_end)
+            following = LOGICAL_LINE_BREAK.sub(" ", content[line_end : line_end + 512])
+            if (
+                previous_complete
+                and following_complete
+                and not _HEADING_DIRECTIVE.search(previous)
+                and not _HEADING_REFERENCE.search(following)
+            ):
+                start, end = heading.span("target")
+                spans.add((offset + start, offset + end))
+        offset = line_end
+    return spans
 
 
 def _bounded_previous_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
@@ -273,10 +326,11 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         return get_context(content, start)
 
     tag = [PatternCategory.SYSTEM_PROMPT_LEAKAGE.value]
+    benign_heading_spans = _benign_output_rules_heading_spans(content, file_type)
 
     for pattern, confidence in P6_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            if _is_benign_output_rules_heading(content, match, file_type):
+            if match.span() in benign_heading_spans:
                 continue
             if _is_benign_print_rules_taxonomy(content, match):
                 continue
@@ -291,6 +345,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    # The runner owns overlapping windows by exact source offset.
+                    evidence={static_runner._VIEW_START_EVIDENCE: match.start()},
                 )
             )
     for pattern, confidence in P7_PATTERNS:
