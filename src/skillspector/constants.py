@@ -18,7 +18,12 @@
 import logging
 import os
 
-from skillspector.providers import get_metadata_provider, get_model_config_provider
+from skillspector.providers import (
+    ModelMetadataProvider,
+    UnknownProviderError,
+    get_metadata_provider,
+    get_model_config_provider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +45,17 @@ MAX_ANALYZABLE_FILE_BYTES = 16 * 1024 * 1024
 # ``resolve_model`` runs the waterfall: ``SKILLSPECTOR_MODEL`` env > slot
 # default > general default.  OSS users pointing at build.nvidia.com or
 # stock OpenAI inherit ``NvBuildProvider``'s default model automatically.
-_provider = get_metadata_provider()
+_provider: ModelMetadataProvider | None
+try:
+    _provider = get_metadata_provider()
+except UnknownProviderError:
+    # Importing static checks and CLI help must not require a valid LLM provider.
+    # Runtime model configuration still validates the selector in build_model_config.
+    _provider = None
 
 # Exposed for analyzers that need a final fallback symbol (e.g.,
 # ``model = state.model or MODEL_CONFIG[ANALYZER_ID] or _SKILLSPECTOR_DEFAULT_MODEL``).
-_SKILLSPECTOR_DEFAULT_MODEL = _provider.DEFAULT_MODEL
+_SKILLSPECTOR_DEFAULT_MODEL = _provider.DEFAULT_MODEL if _provider is not None else ""
 
 _MODEL_SLOTS: tuple[str, ...] = (
     "default",
@@ -79,7 +90,11 @@ def build_model_config() -> dict[str, str]:
     return {slot: _resolve_slot_model(slot, provider) for slot in _MODEL_SLOTS}
 
 
-MODEL_CONFIG: dict[str, str] = {slot: _resolve_slot_model(slot, _provider) for slot in _MODEL_SLOTS}
+MODEL_CONFIG: dict[str, str] = (
+    {slot: _resolve_slot_model(slot, _provider) for slot in _MODEL_SLOTS}
+    if _provider is not None
+    else {}
+)
 
 
 def _validate_model_config() -> None:
@@ -88,6 +103,8 @@ def _validate_model_config() -> None:
     When ``SKILLSPECTOR_STRICT_MODEL_VALIDATION=true``, raises
     ``ValueError`` instead of logging warnings.
     """
+    if _provider is None:
+        return
     unknown: list[str] = []
     for slot, model in MODEL_CONFIG.items():
         ctx = _provider.get_context_length(model)  # type: ignore[attr-defined]
