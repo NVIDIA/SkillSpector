@@ -73,6 +73,9 @@ _PERL_LITERAL_PRINT_RE = re.compile(
 )
 _PERL_QUOTE_OPERATOR_RE = re.compile(r"\b(?:q[qwxr]?|m|s|tr|y)(?:\s+\S|[^\w\s])")
 _PERL_AMBIGUOUS_SIGIL_RE = re.compile(r"[$@%&*]\s*+[{#'\"`]")
+_PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
+_RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
+_FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -737,6 +740,8 @@ def _is_ifs_expansion(content: str, start: int, end: int) -> bool:
 
 def _consume_printf_invocation(
     next_word: Callable[[], str | None],
+    *,
+    runtime_command_context: bool = False,
 ) -> tuple[bool, bool]:
     """Resolve an allowlisted invocation; return ``(recognized, exact)``."""
     pending: str | None = None
@@ -758,6 +763,28 @@ def _consume_printf_invocation(
         }:
             # A known basename does not make a runtime-selected executable exact.
             return True, False
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in command:
+            # An opaque basename can still participate in printf reconstruction.
+            # Require bounded invocation evidence or destructive outer operands,
+            # rather than reclassifying ordinary runtime-parameter notation.
+            if runtime_command_context:
+                return True, False
+            characters = 0
+            for _ in range(_PRINTF_STATIC_ARGUMENTS):
+                operand = next_word()
+                if operand is None:
+                    break
+                characters += len(operand)
+                if characters > _PRINTF_STATIC_CHARS:
+                    return True, False
+                if (
+                    operand.casefold().rsplit("/", 1)[-1] == "printf"
+                    or _PRINTF_FORMAT_CONVERSION_RE.search(operand) is not None
+                ):
+                    return True, False
+            else:
+                return True, False
+            return False, False
         if command == "printf":
             return True, True
         if command == "command":
@@ -813,7 +840,9 @@ def _consume_printf_invocation(
     return True, False
 
 
-def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
+def _printf_invocation_arguments(
+    inner: str, *, runtime_command_context: bool = False
+) -> tuple[bool, list[str]]:
     """Parse direct or allowlisted wrapper invocations of shell ``printf``."""
     cursor = 0
     limited = False
@@ -828,7 +857,9 @@ def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
         limited = limited or word_limited or (word is None and cursor < len(inner))
         return word
 
-    recognized, exact = _consume_printf_invocation(next_word)
+    recognized, exact = _consume_printf_invocation(
+        next_word, runtime_command_context=runtime_command_context
+    )
     if not recognized or not exact or limited:
         return recognized, []
 
@@ -1101,7 +1132,7 @@ def _has_printf_invocation_prefix(
         limited = limited or word_limited
         return word
 
-    recognized, _ = _consume_printf_invocation(next_word)
+    recognized, _ = _consume_printf_invocation(next_word, runtime_command_context=True)
     return recognized or limited
 
 
@@ -1174,12 +1205,44 @@ def _is_printf_substitution(
     end: int,
     *,
     backtick: bool = False,
+    check_command_context: bool = True,
 ) -> bool:
     """Return whether a substitution invokes the bounded ``printf`` evaluator."""
     inner_start = start + (1 if backtick else 2)
     inner_end = end - 1
-    recognized, _ = _printf_invocation_arguments(content[inner_start:inner_end])
-    return recognized
+    inner = content[inner_start:inner_end]
+    recognized, _ = _printf_invocation_arguments(inner)
+    if recognized or not check_command_context:
+        return recognized
+    if "$" not in inner:
+        return False
+    command_start, body_start = start, end
+    if start > 0 and content[start - 1] == '"' and end < len(content) and content[end] == '"':
+        command_start -= 1
+        body_start += 1
+    tail = content[body_start : body_start + _ROOT_GLOB_COMMAND_CHARS]
+    if "\\" not in tail and ("-" not in tail or not any(marker in tail for marker in "/~*?")):
+        # Without option and target characters the bounded tokenizer cannot
+        # produce a destructive root command. Keep repeated parameter notation
+        # cheap; escapes still require tokenization because they can encode both.
+        return False
+    if (
+        not any(marker in tail for marker in ("\\", "'", '"', "{", "}"))
+        and "printf" not in tail.casefold()
+        and (
+            _RECURSIVE_OPTION_SOURCE_RE.search(tail) is None
+            or _FORCE_OPTION_SOURCE_RE.search(tail) is None
+        )
+    ):
+        # Plain options must contain recursive and force spelling in the source.
+        # Quoting, escapes, braces, or printf can construct those spellings, so
+        # keep those cases on the full tokenizer path.
+        return False
+    possible_runtime, _ = _printf_invocation_arguments(inner, runtime_command_context=True)
+    if not possible_runtime:
+        return False
+    tokens, _, _ = _bounded_shell_tokens(content, command_start, body_start)
+    return _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens)
 
 
 def _skip_backtick_substitution(
@@ -1823,7 +1886,9 @@ def _bounded_shell_tokens(
                     )
                     parse_limited = parse_limited or (
                         static_value is None
-                        and _is_printf_substitution(content, cursor, substitution_end)
+                        and _is_printf_substitution(
+                            content, cursor, substitution_end, check_command_context=False
+                        )
                     )
                     append_piece(
                         "$DYNAMIC" if static_value is None else static_value,
@@ -1867,6 +1932,7 @@ def _bounded_shell_tokens(
                         cursor,
                         substitution_end,
                         backtick=True,
+                        check_command_context=False,
                     )
                 )
                 append_piece(
@@ -1927,6 +1993,7 @@ def _bounded_shell_tokens(
                     cursor,
                     substitution_end,
                     backtick=True,
+                    check_command_context=False,
                 )
             )
             append_piece(
@@ -1942,7 +2009,10 @@ def _bounded_shell_tokens(
                 return tuple(tokens), limit, True
             static_value = _static_printf_substitution(content, cursor, substitution_end)
             parse_limited = parse_limited or (
-                static_value is None and _is_printf_substitution(content, cursor, substitution_end)
+                static_value is None
+                and _is_printf_substitution(
+                    content, cursor, substitution_end, check_command_context=False
+                )
             )
             append_piece(
                 "$DYNAMIC" if static_value is None else static_value,
