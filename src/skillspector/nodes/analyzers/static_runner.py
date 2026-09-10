@@ -799,6 +799,32 @@ def _bounded_view_slices(view: SecurityTextView) -> Iterator[SecurityTextView]:
             break
 
 
+@dataclass(frozen=True, kw_only=True)
+class _AbsoluteSourceView(SecurityTextView):
+    """Resolve absolute coordinates only for findings that need a source lookup.
+
+    This secondary view is used by prepared analysis and line restoration, never
+    by text transformations that inspect or slice ``source_offsets`` directly.
+    """
+
+    derived_view: SecurityTextView
+    parent_view: SecurityTextView | None
+    source_start: int
+
+    def source_offset(self, derived_offset: int) -> int:
+        offsets = self.derived_view.source_offsets
+        size = len(self.text) if offsets is None else len(offsets)
+        if size == 0:
+            return 0
+        # Materialized absolute maps clamp at the final character, including
+        # identity-derived maps whose own endpoint lookup permits len(text).
+        index = min(max(derived_offset, 0), size - 1)
+        offset = self.derived_view.source_offset(index)
+        if self.parent_view is not None:
+            offset = self.parent_view.source_offset(offset)
+        return self.source_start + offset
+
+
 def _absolute_source_view(
     view: SecurityTextView,
     *,
@@ -808,12 +834,13 @@ def _absolute_source_view(
     """Compose one bounded view's coordinates with its whole-artifact origin."""
     if parent is None and source_start == 0:
         return view
-    offsets = view.source_offsets if view.source_offsets is not None else range(len(view.text))
-    if parent is not None:
-        mapped = array("I", (source_start + parent.source_offset(offset) for offset in offsets))
-    else:
-        mapped = array("I", (source_start + offset for offset in offsets))
-    return SecurityTextView(view.name, view.text, mapped)
+    return _AbsoluteSourceView(
+        name=view.name,
+        text=view.text,
+        derived_view=view,
+        parent_view=parent,
+        source_start=source_start,
+    )
 
 
 def _whitespace_continuity_tokens(

@@ -196,3 +196,76 @@ def test_ignorable_separator_view_does_not_expand_p7_or_p8(command: str) -> None
     )
     assert findings == []
     assert reason is None
+
+
+@pytest.mark.parametrize("with_parent", [False, True], ids=["window", "parent"])
+def test_absolute_source_mapping_does_no_per_character_work_at_construction(
+    monkeypatch: pytest.MonkeyPatch, with_parent: bool
+) -> None:
+    class RecordingView(SecurityTextView):
+        def source_offset(self, derived_offset: int) -> int:
+            calls.append(derived_offset)
+            return super().source_offset(derived_offset)
+
+    calls: list[int] = []
+    view = SecurityTextView("raw", "x" * runner.SECURITY_VIEW_WINDOW_CHARS)
+    parent = RecordingView("parent", view.text) if with_parent else None
+
+    def forbidden_array(*args, **kwargs):
+        pytest.fail("Source mapping allocated an eager per-character array")
+
+    monkeypatch.setattr(runner, "array", forbidden_array)
+    absolute = runner._absolute_source_view(view, source_start=123, parent=parent)
+    assert calls == []
+    assert absolute.source_offset(17) == 140
+    assert calls == ([17] if with_parent else [])
+
+
+@pytest.mark.parametrize(
+    ("text", "source_offsets", "parent_offsets", "expected"),
+    [
+        ("abc", None, None, [100, 100, 101, 102, 102, 102]),
+        ("abc", [2, 4, 7], None, [102, 102, 104, 107, 107, 107]),
+        ("abc", [0, 1, 1], [2, 4, 7], [102, 102, 104, 104, 104, 104]),
+        ("", [], [2, 4, 7], [0, 0, 0, 0, 0, 0]),
+    ],
+    ids=["identity", "derived", "parent", "empty"],
+)
+def test_absolute_source_mapping_preserves_clamping_and_composition(
+    text: str,
+    source_offsets: list[int] | None,
+    parent_offsets: list[int] | None,
+    expected: list[int],
+) -> None:
+    from array import array
+
+    view = SecurityTextView(
+        "derived", text, None if source_offsets is None else array("I", source_offsets)
+    )
+    parent = (
+        None
+        if parent_offsets is None
+        else SecurityTextView("parent", "abc", array("I", parent_offsets))
+    )
+    absolute = runner._absolute_source_view(view, source_start=100, parent=parent)
+    assert absolute.name == view.name
+    assert absolute.text == view.text
+    assert [absolute.source_offset(i) for i in [-3, 0, 1, 2, 3, 99]] == expected
+
+
+def test_absolute_source_mapping_composes_bounded_derived_slice() -> None:
+    text = "x" * (runner.SECURITY_VIEW_WINDOW_CHARS + 100)
+    second = list(runner._bounded_view_slices(SecurityTextView("raw", text)))[1]
+    absolute = runner._absolute_source_view(second, source_start=250_000)
+    expected_start = 250_000 + runner.SECURITY_VIEW_WINDOW_CHARS - runner._WINDOW_OVERLAP_CHARS
+    assert absolute.source_offset(0) == expected_start
+    assert absolute.source_offset(len(second.text) - 1) == 250_000 + len(text) - 1
+
+
+def test_absolute_source_mapping_preserves_unshifted_identity_view() -> None:
+    view = SecurityTextView("raw", "abc")
+    absolute = runner._absolute_source_view(view)
+    assert absolute is view
+    assert absolute.source_offset(-1) == 0
+    assert absolute.source_offset(3) == 3
+    assert absolute.source_offset(99) == 3
