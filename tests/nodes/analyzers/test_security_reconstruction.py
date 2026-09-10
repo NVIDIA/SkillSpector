@@ -1718,12 +1718,16 @@ def test_runtime_printf_arguments_and_nested_reconstruction_stay_partial(content
     ],
 )
 @pytest.mark.parametrize("substitution", ["$({invocation} %s r m)", "`{invocation} %s r m`"])
+@pytest.mark.parametrize("container", ["shell", "inline"])
 def test_runtime_selected_reconstruction_command_is_partial(
-    invocation: str, substitution: str
+    invocation: str, substitution: str, container: str
 ) -> None:
     content = substitution.format(invocation=invocation) + " -rf /"
+    path = "example.sh" if container == "shell" else "SKILL.md"
+    if container == "inline":
+        content = f"Run ``{content}``."
     result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+        {"components": [path], "file_cache": {path: content}}, [tm_module]
     )
 
     assert not any(finding.rule_id == "TM1" for finding in result["findings"])
@@ -1757,9 +1761,13 @@ def test_runtime_selected_reconstruction_command_is_partial(
         "Render `$$$(printf $FORMAT)$$` as math.",
     ],
 )
-def test_runtime_reconstruction_evidence_is_partial(content: str) -> None:
+@pytest.mark.parametrize("container", ["shell", "inline"])
+def test_runtime_reconstruction_evidence_is_partial(content: str, container: str) -> None:
+    path = "example.sh" if container == "shell" else "SKILL.md"
+    if container == "inline":
+        content = f"Literal shell example: ``{content}``."
     result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+        {"components": [path], "file_cache": {path: content}}, [tm_module]
     )
 
     event = result["inspection_ledger"][0]
