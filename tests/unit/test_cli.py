@@ -1760,14 +1760,16 @@ def test_recursive_transitive_roots_consume_child_time_budget(tmp_path: Path, mo
         show_suppressed: bool = False,
         transitive_traversal=None,
     ) -> dict[str, object]:
-        fake_time["value"] += 61.0
+        fake_time["value"] += cli._TRANSITIVE_MAX_SECONDS + 1.0
         return _mock_graph_result(file_cache={"SKILL.md": "https://github.com/org/dep.git"})
 
     def fake_scan_transitive(*args, traversal=None, **kwargs) -> dict[str, object]:
         assert traversal is not None
         assert traversal.remaining_seconds() == 0.0
         assert traversal.can_scan_more() is False
-        assert traversal.truncation_reasons == ["time budget 60s reached"]
+        assert traversal.truncation_reasons == [
+            f"time budget {cli._TRANSITIVE_MAX_SECONDS:g}s reached"
+        ]
         return {
             "report_body": "{}",
             "filtered_findings": [],

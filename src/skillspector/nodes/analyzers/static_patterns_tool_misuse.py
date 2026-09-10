@@ -53,6 +53,8 @@ _PRINTF_STATIC_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%]{0,64}")
 _DESTRUCTIVE_COMMAND_BASENAMES = frozenset({"rm", "del", "erase"})
 _QUOTED_GLOB_SENTINEL = "\ue000"
 _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
+_RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
+_SIMPLE_BRACED_PARAMETER_RE = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}")
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -702,10 +704,18 @@ def _consume_printf_invocation(
         if word is None:
             return False, False
         if _DYNAMIC_SHELL_WORD_SENTINEL in word:
-            # A runtime expansion participates in the invocation or wrapper
-            # command word. Its executable basename is not deterministic.
+            # A command substitution or complex expansion participates in the
+            # invocation or wrapper word. Its basename is not deterministic.
             return True, False
         command = word.casefold().rsplit("/", 1)[-1]
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in word and command in {
+            "printf",
+            "command",
+            "builtin",
+            "env",
+        }:
+            # A known basename does not make a runtime-selected executable exact.
+            return True, False
         if command == "printf":
             return True, True
         if command == "command":
@@ -789,6 +799,17 @@ def _printf_invocation_arguments(inner: str) -> tuple[bool, list[str]]:
     return True, arguments
 
 
+def _invocation_expansion_marker(content: str, start: int, end: int) -> str:
+    """Distinguish runtime-only parameters from possible command reconstruction."""
+    if content.startswith("$(", start) or (
+        content.startswith("${", start)
+        and _SIMPLE_BRACED_PARAMETER_RE.fullmatch(content, start, end) is None
+    ):
+        # Complex parameter expansions may contain nested command substitutions.
+        return _DYNAMIC_SHELL_WORD_SENTINEL
+    return _RUNTIME_SHELL_PARAMETER_SENTINEL
+
+
 def _next_shell_invocation_word(
     content: str,
     start: int,
@@ -820,6 +841,7 @@ def _next_shell_invocation_word(
     quote: str | None = None
     ansi_c_quote = False
     word_started = False
+    unquoted_characters = 0
     while cursor < limit:
         if cursor % 4096 == 0:
             check_runtime()
@@ -884,7 +906,7 @@ def _next_shell_invocation_word(
                     word_started = True
                     cursor += 1
                     continue
-                output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+                output.append(_invocation_expansion_marker(content, cursor, parameter_end))
                 word_started = True
                 cursor = parameter_end
                 if inherited_quote_closed[0]:
@@ -959,7 +981,8 @@ def _next_shell_invocation_word(
                 word_started = True
                 cursor += 1
                 continue
-            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            # A simple runtime parameter does not invoke the printf evaluator.
+            output.append(_invocation_expansion_marker(content, cursor, parameter_end))
             word_started = True
             cursor = parameter_end
             continue
@@ -1002,7 +1025,8 @@ def _next_shell_invocation_word(
         else:
             output.append(character)
             word_started = True
-            if len(output) > _SHELL_COMMAND_WORD_CHARS:
+            unquoted_characters += 1
+            if unquoted_characters > _SHELL_COMMAND_WORD_CHARS:
                 return None, cursor, True
         cursor += 1
     if quote is not None:
@@ -1151,6 +1175,7 @@ def _parse_shell_command_word(
     ansi_c_quote = False
     dynamic = False
     limited = False
+    unquoted_characters = 0
     cursor = start
     limit = len(content)
     while cursor < limit:
@@ -1354,7 +1379,11 @@ def _parse_shell_command_word(
             break
         else:
             output.append(character)
-            if len(output) > _SHELL_COMMAND_WORD_CHARS:
+            # Quoted spans have already been consumed in full. Their decoded
+            # length must not exhaust the budget for the following literal
+            # suffix, which can resolve the candidate as an ordinary word.
+            unquoted_characters += 1
+            if unquoted_characters > _SHELL_COMMAND_WORD_CHARS:
                 return _ShellCommandWord("".join(output), cursor, dynamic, limited=True)
         cursor += 1
     if quote is not None:
