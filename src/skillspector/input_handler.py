@@ -778,7 +778,9 @@ class InputHandler:
             self._truncate("time_budget_exhausted", source_type)
         raise IngestLimitExceededError(f"{source_type.title()} ingest exceeded its time limit")
 
-    def _bounded_tree_measurement(self, root: Path, deadline: float) -> _TreeMeasurement:
+    def _bounded_tree_measurement(
+        self, root: Path, deadline: float, *, allow_missing_git_entries: bool = False
+    ) -> _TreeMeasurement:
         """Measure a clone using iterative, deterministic, bounded ``scandir``.
 
         Directory entries are retained only up to ``INGEST_MAX_TREE_ENTRIES``.
@@ -812,6 +814,8 @@ class InputHandler:
                         directory_entries.append(entry)
                         self._check_deadline(deadline, "git")
             except OSError as exc:
+                if allow_missing_git_entries and inside_git and isinstance(exc, FileNotFoundError):
+                    continue
                 raise ValueError("Could not safely inspect cloned repository") from exc
 
             child_directories: list[tuple[Path, bool]] = []
@@ -819,12 +823,18 @@ class InputHandler:
                 directory_entries, key=lambda item: (item.name.casefold(), item.name)
             ):
                 self._check_deadline(deadline, "git")
+                entry_inside_git = inside_git or (directory == root and entry.name == ".git")
                 try:
                     entry_stat = entry.stat(follow_symlinks=False)
                 except OSError as exc:
+                    if (
+                        allow_missing_git_entries
+                        and entry_inside_git
+                        and isinstance(exc, FileNotFoundError)
+                    ):
+                        continue
                     raise ValueError("Could not safely inspect cloned repository") from exc
                 entry_path = Path(entry.path)
-                entry_inside_git = inside_git or (directory == root and entry.name == ".git")
                 if S_ISLNK(entry_stat.st_mode):
                     continue
                 if S_ISDIR(entry_stat.st_mode):
@@ -1031,7 +1041,12 @@ class InputHandler:
                     # Measure the materializing tree while Git is still running
                     # so an oversized pack/worktree is terminated, not merely
                     # rejected after the subprocess has filled the disk.
-                    final_measurement = self._bounded_tree_measurement(clone_dir, deadline)
+                    # Git can rename temporary metadata during this walk. Only
+                    # tolerate missing .git entries while the process is live;
+                    # the iteration after exit always performs a strict walk.
+                    final_measurement = self._bounded_tree_measurement(
+                        clone_dir, deadline, allow_missing_git_entries=return_code is None
+                    )
                 if return_code is not None:
                     if return_code != 0:
                         raise ValueError("Failed to clone repository")
