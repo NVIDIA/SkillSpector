@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,12 @@ from skillspector.models import Finding
 from skillspector.nodes.analyzers import static_runner
 from skillspector.nodes.report import _compute_risk_score
 from skillspector.nodes.report import report as render_report
+from skillspector.python_ast import MAX_PYTHON_SHEBANG_CHARS
+
+_AMBIGUOUS_PYTHON_MESSAGE = (
+    "Python execution intent depends on runtime or platform-specific shebang semantics."
+)
+_PYTHON_DECODE_MESSAGE = "Python source bytes could not be decoded under their declared encoding."
 
 
 def _write_bundle(root: Path, files: dict[str, str | bytes]) -> None:
@@ -168,7 +176,8 @@ async def _assert_rules_across_public_surfaces(
             "--fail-on-incomplete",
         ],
     )
-    assert default_cli.exit_code in {0, 1}, default_cli.output
+    expected_default_exit = 1 if expected_recommendation == "DO_NOT_INSTALL" else 0
+    assert default_cli.exit_code == expected_default_exit, default_cli.output
     assert strict_cli.exit_code == default_cli.exit_code, strict_cli.output
     for cli_result in (default_cli, strict_cli):
         parsed = json.loads(cli_result.output)
@@ -204,13 +213,14 @@ async def _assert_rules_across_public_surfaces(
 async def _assert_incomplete_across_public_surfaces(root: Path, python_result: dict) -> None:
     """Verify that a coverage limit cannot become a clean or install-safe verdict."""
     expected_score = python_result["risk_score"]
+    expected_recommendation = python_result["risk_recommendation"]
     assert python_result["analysis_completeness"]["is_complete"] is False
-    assert python_result["risk_recommendation"] == "CAUTION"
+    assert expected_recommendation in {"CAUTION", "DO_NOT_INSTALL"}
 
     for output_format in ("json", "markdown", "sarif", "terminal"):
         result = render_report({**python_result, "output_format": output_format})
         assert result["risk_score"] == expected_score
-        assert result["risk_recommendation"] == "CAUTION"
+        assert result["risk_recommendation"] == expected_recommendation
         if output_format == "json":
             parsed = json.loads(result["report_body"])
             assert parsed["analysis_completeness"]["is_complete"] is False
@@ -239,17 +249,18 @@ async def _assert_incomplete_across_public_surfaces(root: Path, python_result: d
             "--fail-on-incomplete",
         ],
     )
-    assert default_cli.exit_code == 0, default_cli.output
+    expected_default_exit = 1 if expected_recommendation == "DO_NOT_INSTALL" else 0
+    assert default_cli.exit_code == expected_default_exit, default_cli.output
     assert strict_cli.exit_code == 1, strict_cli.output
     for cli_result in (default_cli, strict_cli):
         parsed = json.loads(cli_result.output)
         assert parsed["risk_assessment"]["score"] == expected_score
-        assert parsed["risk_assessment"]["recommendation"] == "CAUTION"
+        assert parsed["risk_assessment"]["recommendation"] == expected_recommendation
         assert parsed["analysis_completeness"]["is_complete"] is False
 
     verdict = await run_scan(str(root), use_llm=False, output_format="json")
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["recommendation"] == expected_recommendation
     assert verdict["analysis_completeness"]["is_complete"] is False
     assert verdict["safe_to_install"] is False
 
@@ -505,6 +516,390 @@ async def test_tm1_bound_true_across_public_surfaces(tmp_path: Path) -> None:
     )
     direct_verdict = await run_scan(str(direct), use_llm=False, output_format="json")
     assert verdict["safe_to_install"] == direct_verdict["safe_to_install"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "prefix"),
+    [
+        pytest.param("run.pyw", "", id="pyw"),
+        pytest.param("runner", "#!/usr/bin/env python3\n", id="env-shebang"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tm1_python_execution_surfaces_match_literal_across_public_outputs(
+    tmp_path: Path, filename: str, prefix: str
+) -> None:
+    direct = tmp_path / "direct"
+    bound = tmp_path / "bound"
+    _write_bundle(
+        direct,
+        {
+            "SKILL.md": "# Shell helper",
+            filename: prefix + "import subprocess\nsubprocess.run(command, shell=True)\n",
+        },
+    )
+    _write_bundle(
+        bound,
+        {
+            "SKILL.md": "# Shell helper",
+            filename: (
+                prefix + "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run(command, shell=enabled)\n"
+            ),
+        },
+    )
+
+    direct_result = _scan(direct)
+    bound_result = _scan(bound)
+    direct_tm1 = _assert_rule(direct_result, "TM1", filename)
+    bound_tm1 = _assert_rule(bound_result, "TM1", filename)
+
+    assert len(direct_tm1) == len(bound_tm1) == 1
+    assert (bound_tm1[0].severity, bound_tm1[0].confidence) == (
+        direct_tm1[0].severity,
+        direct_tm1[0].confidence,
+    )
+    assert bound_tm1[0].fingerprint() == direct_tm1[0].fingerprint()
+    assert (
+        bound_result["risk_score"],
+        bound_result["risk_severity"],
+        bound_result["risk_recommendation"],
+    ) == (
+        direct_result["risk_score"],
+        direct_result["risk_severity"],
+        direct_result["risk_recommendation"],
+    )
+    assert bound_result["risk_recommendation"] == "CAUTION"
+    assert bound_result["analysis_completeness"]["is_complete"] is True
+
+    verdict = await _assert_rules_across_public_surfaces(
+        bound,
+        expected_locations={"TM1": {filename}},
+        python_result=bound_result,
+    )
+    direct_verdict = await run_scan(str(direct), use_llm=False, output_format="json")
+    assert verdict["safe_to_install"] == direct_verdict["safe_to_install"]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        pytest.param(
+            "#!/usr/bin/env -S ${SKILLSPECTOR_INTERPRETER}\n",
+            id="dynamic-env-utility",
+        ),
+        pytest.param(
+            r"#!/usr/bin/env -S PATH=/usr/bin:${PATH} python3" "\n",
+            id="dynamic-env-assignment-value",
+        ),
+        pytest.param(
+            r"#!/usr/bin/env -S -u${SKILLSPECTOR_MAYBE} python3" "\n",
+            id="dynamic-env-unset-operand",
+        ),
+        pytest.param(
+            "#!/usr/bin/python3"
+            + " " * (MAX_PYTHON_SHEBANG_CHARS - len("#!/usr/bin/python3") + 1)
+            + "\n",
+            id="over-maximum-length-shebang",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -i python3\n",
+            id="platform-dependent-env-multi-argument-shebang",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S --split-string=python3\n",
+            id="gnu-only-nested-env-option",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S =x python3\n",
+            id="gnu-only-empty-name-assignment",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S -- - python3\n",
+            id="gnu-only-post-terminator-legacy-dash",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S -i -u A=B python3\n",
+            id="gnu-clear-environment-skips-invalid-unset",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S -L root python3\n",
+            id="freebsd-only-login-class-option",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S PYTHONINSPECT=1 python3 -c\n",
+            id="pythoninspect-forced-repl-after-command-error",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_ambiguous_python_intent_is_analyzed_but_incomplete_across_public_outputs(
+    tmp_path: Path, prefix: str
+) -> None:
+    filename = "runner"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Runtime-selected helper",
+            filename: (
+                prefix + "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run(command, shell=enabled)\n"
+            ),
+        },
+    )
+
+    result = _scan(tmp_path)
+    tm1 = _assert_rule(result, "TM1", filename)
+    assert len(tm1) == 1
+    assert tm1[0].start_line == 4
+    metadata = next(item for item in result["component_metadata"] if item["path"] == filename)
+    assert metadata["type"] == "other"
+    completeness = result["analysis_completeness"]
+    assert completeness["is_complete"] is False
+    exception = next(
+        row
+        for row in completeness["ledger_exceptions"]
+        if row["path"] == filename and row["reason_code"] == "python_source_ambiguous"
+    )
+    assert exception["message"] == _AMBIGUOUS_PYTHON_MESSAGE
+
+    await _assert_incomplete_across_public_surfaces(tmp_path, result)
+
+
+@pytest.mark.asyncio
+async def test_active_bare_command_filename_is_analyzed_as_partial_across_public_outputs(
+    tmp_path: Path,
+) -> None:
+    filename = "eval(input())"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Command-shaped helper",
+            filename: (
+                "#!/usr/bin/env -S python3 -c\n"
+                "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run(command, shell=enabled)\n"
+            ),
+        },
+    )
+
+    result = _scan(tmp_path)
+
+    tm1 = _assert_rule(result, "TM1", filename)
+    assert [finding.start_line for finding in tm1] == [4]
+    exception = next(
+        row
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+        if row["path"] == filename and row["reason_code"] == "python_source_ambiguous"
+    )
+    assert exception["message"] == _AMBIGUOUS_PYTHON_MESSAGE
+    await _assert_incomplete_across_public_surfaces(tmp_path, result)
+
+
+def test_platform_ambiguous_python_reason_is_rendered_publicly(tmp_path: Path) -> None:
+    filename = "runner"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Platform-dependent helper",
+            filename: (
+                "#!/usr/bin/env -S - -i python3\n"
+                "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run(command, shell=enabled)\n"
+            ),
+        },
+    )
+
+    result = _scan(tmp_path)
+    exception = next(
+        row
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+        if row["path"] == filename and row["reason_code"] == "python_source_ambiguous"
+    )
+    assert exception["message"] == _AMBIGUOUS_PYTHON_MESSAGE
+
+    json_report = json.loads(render_report({**result, "output_format": "json"})["report_body"])
+    rendered_exception = next(
+        row
+        for row in json_report["analysis_completeness"]["ledger_exceptions"]
+        if row["path"] == filename and row["reason_code"] == "python_source_ambiguous"
+    )
+    assert rendered_exception["message"] == _AMBIGUOUS_PYTHON_MESSAGE
+    markdown = render_report({**result, "output_format": "markdown"})["report_body"]
+    assert _AMBIGUOUS_PYTHON_MESSAGE in markdown
+
+
+@pytest.mark.asyncio
+async def test_nested_extensionless_python_tm1_is_complete_across_public_outputs(
+    tmp_path: Path,
+) -> None:
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr(
+            "runner",
+            "#!/usr/bin/env python3\n"
+            "import subprocess\n"
+            "enabled = True\n"
+            "subprocess.run(command, shell=enabled)\n",
+        )
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Nested shell helper",
+            "bundle.zip": archive_bytes.getvalue(),
+        },
+    )
+
+    result = _scan(tmp_path)
+    virtual_path = "bundle.zip!/runner"
+    tm1 = _assert_rule(result, "TM1", virtual_path)
+    assert len(tm1) == 1
+    assert tm1[0].start_line == 4
+    assert result["analysis_completeness"]["is_complete"] is True
+
+    json_report = json.loads(render_report({**result, "output_format": "json"})["report_body"])
+    json_tm1 = next(
+        issue
+        for issue in json_report["issues"]
+        if issue["id"] == "TM1" and issue["location"]["file"] == virtual_path
+    )
+    assert json_tm1["location"]["start_line"] == 4
+
+    sarif_report = json.loads(render_report({**result, "output_format": "sarif"})["report_body"])
+    sarif_tm1 = next(
+        item
+        for item in sarif_report["runs"][0]["results"]
+        if item["ruleId"] == "TM1"
+        and item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == virtual_path
+    )
+    assert sarif_tm1["locations"][0]["physicalLocation"]["region"]["startLine"] == 4
+
+    await _assert_rules_across_public_surfaces(
+        tmp_path,
+        expected_locations={"TM1": {virtual_path}},
+        python_result=result,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pep263_python_tm1_is_complete_across_public_outputs(tmp_path: Path) -> None:
+    filename = "runner"
+    raw = (
+        b"#!/usr/bin/env python3\n"
+        b"# coding: latin-1\n"
+        b"# " + b"\xff" * 1_000 + b"\nimport subprocess\n"
+        b"enabled = True\n"
+        b"subprocess.run(command, shell=enabled)\n"
+    )
+    _write_bundle(tmp_path, {"SKILL.md": "# Encoded helper", filename: raw})
+
+    result = _scan(tmp_path)
+    tm1 = _assert_rule(result, "TM1", filename)
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == filename)
+
+    assert len(tm1) == 1
+    assert tm1[0].start_line == 6
+    assert artifact["content_kind"] == "text"
+    assert artifact["disposition"] == "analyzed"
+    assert result["analysis_completeness"]["is_complete"] is True
+
+    await _assert_rules_across_public_surfaces(
+        tmp_path,
+        expected_locations={"TM1": {filename}},
+        python_result=result,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "member_bytes",
+    [
+        pytest.param(
+            b"#!/usr/bin/env python3\n"
+            b"# coding: definitely-unknown\n"
+            b"import subprocess\n"
+            b"enabled = True\n"
+            b"subprocess.run(command, shell=enabled)\n",
+            id="unknown-cookie",
+        ),
+        pytest.param(
+            b"#!/usr/bin/env python3\n# coding: raw_unicode_escape\nvalue = '\\ud800'\n",
+            id="decoder-produced-surrogate",
+        ),
+    ],
+)
+async def test_nested_python_decode_failure_is_incomplete_across_public_outputs(
+    tmp_path: Path,
+    member_bytes: bytes,
+) -> None:
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr(
+            "runner",
+            member_bytes,
+        )
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Opaque nested helper",
+            "bundle.zip": archive_bytes.getvalue(),
+        },
+    )
+
+    result = _scan(tmp_path)
+    virtual_path = "bundle.zip!/runner"
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == virtual_path)
+    exception = next(
+        row
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+        if row["path"] == virtual_path and row["reason_code"] == "python_source_decode_error"
+    )
+
+    assert artifact["disposition"] == "partial"
+    assert artifact["reason"] == "python_source_decode_error"
+    assert exception["message"] == _PYTHON_DECODE_MESSAGE
+    assert result["analysis_completeness"]["status"] == "partial"
+    assert result["analysis_completeness"]["execution_successful"] is True
+    assert not any(
+        finding.rule_id == "TM1" and virtual_path in _finding_locations(finding)
+        for finding in result["filtered_findings"]
+    )
+
+    await _assert_incomplete_across_public_surfaces(tmp_path, result)
+
+
+@pytest.mark.asyncio
+async def test_mixed_newline_python_decode_failure_is_incomplete_across_public_outputs(
+    tmp_path: Path,
+) -> None:
+    filename = "mixed.py"
+    raw = b"\r\n\t#coding:utf_16be\rx=1\n"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Mixed newline helper",
+            filename: raw,
+        },
+    )
+
+    result = _scan(tmp_path)
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == filename)
+    exception = next(
+        row
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+        if row["path"] == filename and row["reason_code"] == "python_source_decode_error"
+    )
+
+    assert artifact["disposition"] == "partial"
+    assert artifact["reason"] == "python_source_decode_error"
+    assert exception["message"] == _PYTHON_DECODE_MESSAGE
+    assert result["analysis_completeness"]["status"] == "partial"
+    assert result["analysis_completeness"]["execution_successful"] is True
+    await _assert_incomplete_across_public_surfaces(tmp_path, result)
 
 
 @pytest.mark.asyncio

@@ -523,6 +523,8 @@ def test_expired_shared_deadline_blocks_all_post_cache_prework(
     monkeypatch.setattr(build_context_module, "_read_file_cache", expiring_read_cache)
     monkeypatch.setattr(build_context_module, "decode_text", guarded_decode)
     monkeypatch.setattr(build_context_module, "_is_valid_oms_signature_bytes", forbidden_prework)
+    monkeypatch.setattr(build_context_module, "classify_python_source", forbidden_prework)
+    monkeypatch.setattr(python_ast_module, "may_be_python_source", forbidden_prework)
     monkeypatch.setattr(python_ast_module, "parse_python_source", forbidden_prework)
     monkeypatch.setattr(build_context_module, "_infer_file_type", forbidden_prework)
 
@@ -532,6 +534,7 @@ def test_expired_shared_deadline_blocks_all_post_cache_prework(
     assert {
         "signature_recognition",
         "reference_resolution",
+        "python_source_classification",
         "manifest",
         "python_ast_prewarm",
         "component_metadata",
@@ -546,6 +549,78 @@ def test_expired_shared_deadline_blocks_all_post_cache_prework(
         event.get("reason_code") == LedgerReason.OMS_SIGNATURE
         for event in result["inspection_ledger"]
     )
+
+
+def test_python_classification_overrun_has_one_runtime_work_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    fake_clock = FakeClock()
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (tmp_path / "runner").write_text(
+        "#!/usr/bin/env -S ${SKILLSPECTOR_INTERPRETER}\npass\n",
+        encoding="utf-8",
+    )
+    original_classify = build_context_module.classify_python_source
+
+    def expiring_classification(path: str, content: str) -> object:
+        result = original_classify(path, content)
+        if path == "runner":
+            fake_clock.now = 1.0
+        return result
+
+    monkeypatch.setattr(build_context_module, "MAX_BUNDLE_CACHE_SECONDS", 1.0)
+    monkeypatch.setattr(build_context_module, "monotonic", fake_clock)
+    monkeypatch.setattr(
+        build_context_module,
+        "classify_python_source",
+        expiring_classification,
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+    events = [
+        event
+        for event in result["inspection_ledger"]
+        if event["phase"] == "python_source_classification" and event["path"] == "runner"
+    ]
+
+    assert len(events) == 1
+    assert events[0]["reason_code"] == LedgerReason.RUNTIME_LIMIT
+    work_ids = [event["work_id"] for event in result["inspection_ledger"]]
+    assert len(work_ids) == len(set(work_ids))
+
+
+def test_python_prewarm_runtime_downgrade_reaches_artifact_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "SKILL.md").write_text("[runner](runner)\n", encoding="utf-8")
+    (tmp_path / "runner").write_text(
+        "#!/usr/bin/env python3\npass\n",
+        encoding="utf-8",
+    )
+
+    def limited_prewarm(*_args: object, **kwargs: object) -> None:
+        limitations = kwargs["runtime_limitations"]
+        assert isinstance(limitations, list)
+        limitations.append(("runner", 5.1))
+        return None
+
+    monkeypatch.setattr(build_context_module, "prewarm_python_ast_cache", limited_prewarm)
+
+    result = build_context({"skill_path": str(tmp_path)})
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "runner")
+    reference = next(
+        item for item in result["artifact_references"] if item["target_path"] == "runner"
+    )
+
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.RUNTIME_LIMIT.value
+    assert reference["disposition"] == ArtifactDisposition.PARTIAL
 
 
 def test_reference_limit_cannot_produce_complete_clean_graph_verdict(tmp_path: Path) -> None:

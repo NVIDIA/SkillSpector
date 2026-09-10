@@ -180,6 +180,7 @@ _TEXT_EXTENSIONS = frozenset(
         ".markdown",
         ".txt",
         ".py",
+        ".pyw",
         ".sh",
         ".json",
         ".yaml",
@@ -327,6 +328,20 @@ def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> Ar
         "misleading_extension": misleading,
         "referenced": referenced,
     }
+
+
+def promote_artifact_to_decoded_text(artifact: ArtifactRecord) -> None:
+    """Apply a successful format-aware text decode without erasing prior limits."""
+    generic_binary_scope = artifact["content_kind"] is ContentKind.BINARY and (
+        artifact["disposition"] is ArtifactDisposition.OUT_OF_SCOPE
+        or artifact["disposition"] is ArtifactDisposition.PARTIAL
+        and "reason" not in artifact
+    )
+    artifact["content_kind"] = ContentKind.TEXT
+    artifact["decodable"] = True
+    artifact["misleading_extension"] = _suffix(artifact["path"]) in _BINARY_EXTENSIONS
+    if generic_binary_scope:
+        artifact["disposition"] = ArtifactDisposition.ANALYZED
 
 
 def decode_text(data: bytes) -> str:

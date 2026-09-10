@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections import Counter
 
 import pytest
@@ -12,7 +13,13 @@ import pytest
 from skillspector.artifacts import normalized_security_view
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
+from skillspector.nodes.analyzers import static_python_shell_truthiness as shell_truthiness
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.python_ast import (
+    MAX_PYTHON_SHEBANG_CHARS,
+    PythonSourceClassification,
+    classify_python_source,
+)
 
 
 def _run(content: str, path: str = "run.py") -> dict:
@@ -26,6 +33,35 @@ def _run(content: str, path: str = "run.py") -> dict:
 
 def _tm1(content: str, path: str = "run.py") -> list:
     return [finding for finding in _run(content, path)["findings"] if finding.rule_id == "TM1"]
+
+
+def test_function_finalizer_safety_requires_retained_name_provenance() -> None:
+    statement = ast.parse(
+        "def holder(value=opaque, *, other=marker) -> annotation:\n    pass\n"
+    ).body[0]
+
+    assert isinstance(statement, ast.FunctionDef)
+    assert not shell_truthiness._function_result_is_finalizer_safe(statement, set())
+    assert shell_truthiness._function_result_is_finalizer_safe(
+        statement,
+        {"opaque", "marker", "annotation"},
+    )
+
+
+def test_class_finalizer_safety_requires_retained_member_provenance() -> None:
+    statement = ast.parse(
+        "class Holder:\n"
+        "    values = [opaque]\n"
+        "    def method(self, marker=default):\n"
+        "        pass\n"
+    ).body[0]
+
+    assert isinstance(statement, ast.ClassDef)
+    assert not shell_truthiness._class_result_is_finalizer_safe(statement, set())
+    assert shell_truthiness._class_result_is_finalizer_safe(
+        statement,
+        {"opaque", "default"},
+    )
 
 
 @pytest.mark.parametrize(
@@ -53,6 +89,1001 @@ def test_issue_475_multiline_binding_matches_direct_tm1(value: str) -> None:
     assert findings[0].severity == "HIGH"
     assert findings[0].confidence == pytest.approx(0.9)
     assert "shell=a" in findings[0].matched_text
+
+
+@pytest.mark.parametrize(
+    ("path", "prefix", "expected_line"),
+    [
+        pytest.param("run.pyw", "", 3, id="pyw"),
+        pytest.param("runner", "#!/usr/bin/python3\n", 4, id="direct-python"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3.14t\n",
+            4,
+            id="direct-free-threaded-python",
+        ),
+        pytest.param("runner", "#!/usr/bin/env python3\n", 4, id="env-python"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3# xnu comment\n",
+            4,
+            id="darwin-direct-python-comment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 -W ignore /tmp/other.py\n",
+            4,
+            id="platform-dependent-python-warning-argument",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -i python3\n",
+            4,
+            id="darwin-env-ignore-environment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -u SKILLSPECTOR_NAME python3\n",
+            4,
+            id="darwin-env-unset",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3 -I\n",
+            4,
+            id="darwin-python-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3 -vv\n",
+            4,
+            id="darwin-python-repeated-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3 -IB\n",
+            4,
+            id="darwin-python-clustered-options",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3 -bbb\n",
+            4,
+            id="darwin-python-repeated-bytes-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3 -OOO\n",
+            4,
+            id="darwin-python-repeated-optimize-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -i python3 # xnu comment\n",
+            4,
+            id="darwin-env-comment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3.13t\n",
+            4,
+            id="env-free-threaded-python",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -B\n",
+            4,
+            id="env-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 -t\n",
+            4,
+            id="direct-legacy-tab-compatibility-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -tt\n",
+            4,
+            id="env-legacy-tab-compatibility-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -tEB\n",
+            4,
+            id="env-clustered-legacy-tab-compatibility-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -Spython3 -B\n",
+            4,
+            id="env-attached-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S 'python3' -B\n",
+            4,
+            id="env-single-quoted-interpreter",
+        ),
+        pytest.param(
+            "runner",
+            '#!/usr/bin/env -S "python3" -B\n',
+            4,
+            id="env-double-quoted-interpreter",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S-P/usr/bin:/bin python3\n",
+            4,
+            id="env-split-attached-path-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -i python3\n",
+            4,
+            id="env-split-ignore-environment-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -i-v python3\n",
+            4,
+            id="env-freebsd-clustered-compatibility-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S-iv -P/usr/bin:/bin python3\n",
+            4,
+            id="env-split-clustered-flags",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -a alternate python3\n",
+            4,
+            id="env-split-argv0-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --argv0=alternate python3\n",
+            4,
+            id="env-split-long-argv0-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --argv0= python3\n",
+            4,
+            id="env-split-empty-argv0-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -L root python3\n",
+            4,
+            id="env-split-freebsd-login-class-separate-operand",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -Lroot python3\n",
+            4,
+            id="env-split-freebsd-login-class-attached-operand",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -ivLroot python3\n",
+            4,
+            id="env-split-freebsd-clustered-login-class-operand",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S =x python3\n",
+            4,
+            id="env-split-gnu-empty-name-assignment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S FOO=bar =x python3\n",
+            4,
+            id="env-split-gnu-empty-name-assignment-after-assignment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -i =x python3\n",
+            4,
+            id="env-split-gnu-empty-name-assignment-after-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -- - python3\n",
+            4,
+            id="env-split-gnu-post-terminator-legacy-dash",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -- - FOO=bar python3\n",
+            4,
+            id="env-split-gnu-post-terminator-dash-before-assignment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --env0-from=environment python3\n",
+            4,
+            id="env-split-gnu-environment-file-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S PYTHONSAFEPATH=1 python3\n",
+            4,
+            id="env-split-assignment",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S PATH=/usr/bin:${PATH} python3" "\n",
+            4,
+            id="env-split-dynamic-assignment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -- python3\n",
+            4,
+            id="env-split-option-terminator",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -- PYTHONSAFEPATH=1 python3\n",
+            4,
+            id="env-split-assignment-after-option-terminator",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -u PYTHONPATH python3\n",
+            4,
+            id="env-split-separate-option-operand",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -vS python3\n",
+            4,
+            id="env-verbose-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -iS python3\n",
+            4,
+            id="env-ignore-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -ivS python3\n",
+            4,
+            id="env-clustered-outer-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -i-vSpython3\n",
+            4,
+            id="env-freebsd-clustered-outer-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env --split-string=python3\n",
+            4,
+            id="env-long-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env --spl=python3\n",
+            4,
+            id="gnu-only-outer-abbreviated-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --split-string=python3\n",
+            4,
+            id="gnu-only-nested-long-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --ignore-environment python3\n",
+            4,
+            id="gnu-only-ignore-environment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --unset=FOO python3\n",
+            4,
+            id="gnu-only-unset",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env --split=python3\n",
+            4,
+            id="env-abbreviated-long-split-string",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --chd=/tmp python3\n",
+            4,
+            id="env-abbreviated-long-chdir",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --i python3\n",
+            4,
+            id="env-freebsd-double-dash-cluster",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --unknown python3\n",
+            4,
+            id="env-freebsd-double-dash-unset-operand",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S FOO=bar\\ baz python3\n",
+            4,
+            id="env-freebsd-escaped-space",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S FOO=café python3\n",
+            4,
+            id="env-unicode-assignment",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S python3\_-B" "\n",
+            4,
+            id="env-escaped-argument-separator",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S python3\c node" "\n",
+            4,
+            id="env-escaped-string-terminator",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -Spython3\n",
+            4,
+            id="nested-env-split-string",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -i${SKILLSPECTOR_EMPTY} python3" "\n",
+            4,
+            id="env-dynamic-empty-option-suffix",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -u${SKILLSPECTOR_MAYBE} python3" "\n",
+            4,
+            id="env-dynamic-attached-unset-operand",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -u ${SKILLSPECTOR_MAYBE} python3" "\n",
+            4,
+            id="env-dynamic-separate-unset-operand",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S py${SKILLSPECTOR_EMPTY}thon3" "\n",
+            4,
+            id="env-dynamic-empty-interpreter-fragment",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -P${PATH} python3" "\n",
+            4,
+            id="env-dynamic-bsd-path-operand",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -C${PWD} /usr/bin/python3" "\n",
+            4,
+            id="env-dynamic-chdir-operand",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -P ${PATH} /usr/bin/python3" "\n",
+            4,
+            id="env-dynamic-separate-path-operand",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -u ${SKILLSPECTOR_NAME}#suffix python3" "\n",
+            4,
+            id="env-dynamic-prefix-before-comment-marker",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S /opt/${SKILLSPECTOR_ROOT}/python3" "\n",
+            4,
+            id="env-fixed-python-basename-after-dynamic-path",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S /opt/${SKILLSPECTOR_ROOT}/pypy3" "\n",
+            4,
+            id="env-fixed-pypy-basename-after-dynamic-path",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -- -X${SKILLSPECTOR_VALUE}=1 python3" "\n",
+            4,
+            id="env-dynamic-dash-assignment-after-terminator",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -- -x${SKILLSPECTOR_ROOT}/python3" "\n",
+            4,
+            id="env-dynamic-dash-path-after-terminator",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -u${SKILLSPECTOR_NAME} /usr/bin/true python3" "\n",
+            4,
+            id="env-dynamic-attached-operand-python-after-shift",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -u ${SKILLSPECTOR_NAME} /usr/bin/true python3" "\n",
+            4,
+            id="env-dynamic-separate-operand-python-after-shift",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S --unset ${SKILLSPECTOR_NAME} python3 /usr/bin/true"
+            "\n",
+            4,
+            id="env-dynamic-long-operand-python-before-shift",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S - -i python3\n",
+            4,
+            id="platform-dependent-lone-dash",
+        ),
+        pytest.param("runner", "#!/bin/env python3\n", 4, id="bin-env-python"),
+        pytest.param(
+            "runner",
+            r'#!/usr/bin/env -S -S "FOO=a\\\nb /usr/bin/python3"' "\n",
+            4,
+            id="nested-env-split-freebsd-escaped-newline",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --unset /usr/bin/true python3\n",
+            4,
+            id="platform-dependent-double-dash-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3"
+            + " " * (MAX_PYTHON_SHEBANG_CHARS - len("#!/usr/bin/python3") + 1)
+            + "\n",
+            4,
+            id="over-maximum-length-shebang",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S ${SKILLSPECTOR_INTERPRETER}" "\n",
+            4,
+            id="dynamic-env-utility",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S X${SKILLSPECTOR_ASSIGNMENT} python3" "\n",
+            4,
+            id="dynamic-env-token-role",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S python3 ${SKILLSPECTOR_ARGUMENT}" "\n",
+            4,
+            id="dynamic-python-pre-script-argument",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S python3 -- ${SKILLSPECTOR_ARGUMENT}" "\n",
+            4,
+            id="dynamic-python-argument-after-option-terminator",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S python3 -- ${SKILLSPECTOR_ARGUMENT} /tmp/other.py"
+            "\n",
+            4,
+            id="dynamic-python-argument-before-fixed-other-script",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env /tmp/a b/python3\n",
+            4,
+            id="plain-env-opaque-python-path-with-spaces",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 -c__import__('builtins').exec(open(__import__('sys').argv[1]).read())\n",
+            4,
+            id="python-command-can-load-appended-source",
+        ),
+        pytest.param(
+            "eval(input())",
+            "#!/usr/bin/env -S python3 -c\n",
+            4,
+            id="python-command-executes-active-appended-source-spelling",
+        ),
+        pytest.param(
+            "evilmod",
+            "#!/usr/bin/env -S python3 -m\n",
+            4,
+            id="python-module-can-select-sibling-module",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 -ic\n",
+            4,
+            id="python-forced-interactive-command-can-recover-appended-source",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -i -m\n",
+            4,
+            id="env-python-forced-interactive-module-can-recover-appended-source",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 -\n",
+            4,
+            id="python-stdin-can-load-appended-source",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -\n",
+            4,
+            id="env-python-stdin-can-load-appended-source",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 -X\n",
+            4,
+            id="python-xoption-operand-exposes-appended-source",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -X\n",
+            4,
+            id="env-python-xoption-operand-exposes-appended-source",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 -W\n",
+            4,
+            id="python-warning-operand-exposes-appended-source",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -W\n",
+            4,
+            id="env-python-warning-operand-exposes-appended-source",
+        ),
+        pytest.param(
+            "default",
+            "#!/usr/bin/python3 --check-hash-based-pycs\n",
+            4,
+            id="python-hash-option-consumes-default-source-name",
+        ),
+        pytest.param(
+            "tools/always",
+            "#!/usr/bin/env -S python3 --check-hash-based-pycs\n",
+            4,
+            id="env-python-hash-option-consumes-subdirectory-source-name",
+        ),
+        pytest.param(
+            "bundle.zip!/never",
+            "#!/usr/bin/env -S python3 --check-hash-based-pycs\n",
+            4,
+            id="env-python-hash-option-consumes-nested-source-name",
+        ),
+        pytest.param(
+            "-h",
+            "#!/usr/bin/python3\n",
+            4,
+            id="direct-implicit-source-can-be-help-option",
+        ),
+        pytest.param(
+            "tools/-V",
+            "#!/usr/bin/env -S python3\n",
+            4,
+            id="env-implicit-source-can-be-version-option",
+        ),
+        pytest.param(
+            "tools/-options/runner",
+            "#!/usr/bin/python3 -B\n",
+            4,
+            id="direct-implicit-source-has-dash-intermediate-component",
+        ),
+        pytest.param(
+            "bundle.zip!/-nested/runner",
+            "#!/usr/bin/env -S python3\n",
+            4,
+            id="env-implicit-nested-source-has-dash-component",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 --check-hash-based-pycs default\n",
+            4,
+            id="unversioned-python-hash-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 -P\n",
+            4,
+            id="unversioned-python-safe-path-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 runner\n",
+            4,
+            id="python-selects-analyzed-source-explicitly",
+        ),
+        pytest.param(
+            "Runner",
+            "#!/usr/bin/python3 runner\n",
+            4,
+            id="python-selects-case-insensitive-source-alias",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/Python3\n",
+            4,
+            id="python-interpreter-case-alias",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/Env python3\n",
+            4,
+            id="env-path-case-alias",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/../bin/env python3\n",
+            4,
+            id="env-path-dot-segment-alias",
+        ),
+        pytest.param(
+            "runner",
+            "#!//usr/bin/env python3\n",
+            4,
+            id="env-path-double-leading-slash-alias",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3 node\n",
+            4,
+            id="external-python-script-via-plain-env",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/python3 /tmp/other.py\n",
+            4,
+            id="external-python-script-direct",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S python3 /tmp/other.py\n",
+            4,
+            id="external-python-script-via-env-split",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S python3 argument\ with-space" "\n",
+            4,
+            id="external-python-script-with-escaped-space",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -u${SKILLSPECTOR_NAME} python3 /usr/bin/true" "\n",
+            4,
+            id="external-script-after-dynamic-env-option",
+        ),
+        pytest.param(
+            "runner",
+            r'#!/usr/bin/env -S -u "${SKILLSPECTOR_NAME}" python3 /usr/bin/true' "\n",
+            4,
+            id="external-script-after-quoted-env-option",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -uPREFIX${SKILLSPECTOR_NAME} python3 /usr/bin/true"
+            "\n",
+            4,
+            id="external-script-after-literal-env-option",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S /opt/${SKILLSPECTOR_ROOT}/python3 /usr/bin/true" "\n",
+            4,
+            id="external-script-after-dynamic-python-path",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S -- -x${SKILLSPECTOR_ROOT}/python3 /usr/bin/true" "\n",
+            4,
+            id="external-script-after-dynamic-dash-path",
+        ),
+    ],
+)
+def test_bound_shell_truthiness_covers_python_execution_surfaces(
+    path: str, prefix: str, expected_line: int
+) -> None:
+    bound_content = (
+        prefix + "import subprocess\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    direct = _tm1(
+        prefix + "import subprocess\nsubprocess.run(command, shell=True)\n",
+        path,
+    )
+    result = _run(bound_content, path)
+    bound = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(direct) == len(bound) == 1
+    assert bound[0].severity == direct[0].severity == "HIGH"
+    assert bound[0].confidence == direct[0].confidence == pytest.approx(0.9)
+    assert bound[0].fingerprint() == direct[0].fingerprint()
+    assert bound[0].start_line == expected_line
+    classification = classify_python_source(path, bound_content)
+    expected_outcome = (
+        LedgerOutcome.PARTIAL
+        if classification is PythonSourceClassification.AMBIGUOUS
+        else LedgerOutcome.COMPLETED
+    )
+    assert result["inspection_ledger"][0]["outcome"] is expected_outcome
+    if expected_outcome is LedgerOutcome.PARTIAL:
+        assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        pytest.param(
+            "#!/usr/bin/python3 -t\n",
+            id="direct",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S python3 -tt\n",
+            id="env-split",
+        ),
+        pytest.param(
+            "#!/usr/bin/env -S python3 -tEB\n",
+            id="clustered",
+        ),
+    ],
+)
+def test_legacy_tab_compatibility_option_tm1_ledger_is_complete(prefix: str) -> None:
+    content = prefix + "enabled = True\nsubprocess.run(command, shell=enabled)\n"
+
+    result = _run(content, "runner")
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(findings) == 1
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["inspection_ledger"][0].get("reason_code") is None
+
+
+@pytest.mark.parametrize(
+    ("path", "prefix"),
+    [
+        pytest.param("-h", "#!/usr/bin/python3\n", id="root-dash-basename"),
+        pytest.param(
+            "tools/-V",
+            "#!/usr/bin/env -S python3\n",
+            id="subdirectory-dash-basename",
+        ),
+        pytest.param(
+            "tools/-options/runner",
+            "#!/usr/bin/python3 -B\n",
+            id="dash-intermediate-component",
+        ),
+        pytest.param(
+            "bundle.zip!/-nested/runner",
+            "#!/usr/bin/env -S python3\n",
+            id="nested-dash-component",
+        ),
+    ],
+)
+def test_implicit_dash_source_path_tm1_ledger_is_partial(path: str, prefix: str) -> None:
+    content = prefix + "enabled = True\nsubprocess.run(command, shell=enabled)\n"
+
+    result = _run(content, path)
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(findings) == 1
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+
+
+def test_python_option_terminator_dash_source_tm1_ledger_is_complete() -> None:
+    content = (
+        "#!/usr/bin/env -S python3 --\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+
+    result = _run(content, "tools/-h")
+    findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
+
+    assert len(findings) == 1
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["inspection_ledger"][0].get("reason_code") is None
+
+
+@pytest.mark.parametrize(
+    ("path", "prefix"),
+    [
+        pytest.param("runner", "#!/usr/bin/env node\n", id="env-node"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env X=/tmp/python3\n",
+            id="plain-env-assignment-not-utility",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -P/tmp/python3\n",
+            id="plain-env-option-operand-not-utility",
+        ),
+        pytest.param("runner", "#!/usr/bin/env node python3\n", id="deceptive-env"),
+        pytest.param("runner", "#!/usr/bin/env -S node python3\n", id="deceptive-env-s"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -L default python3\n",
+            id="darwin-rejects-freebsd-login-class-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -L python3\n",
+            id="env-split-freebsd-login-class-missing-utility",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -iL python3\n",
+            id="env-split-freebsd-clustered-ignore-login-class-operand",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -vL python3\n",
+            id="env-split-freebsd-clustered-verbose-login-class-operand",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -iLSpython3\n",
+            id="env-freebsd-login-class-operand-is-not-outer-split",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -U name python3\n",
+            id="darwin-rejects-freebsd-unset-alt-option",
+        ),
+        pytest.param("runner", "#!/usr/bin/env python3 -h\n", id="darwin-python-help"),
+        pytest.param("runner", "#!/usr/bin/env python3 -?\n", id="darwin-python-help-alias"),
+        pytest.param("runner", "#!/usr/bin/env python3 -VV\n", id="darwin-python-version"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env python3 --check-hash-based-pycs=default\n",
+            id="darwin-python-invalid-hash-option-equals-form",
+        ),
+        pytest.param("runner", "#!/usr/bin/env -Snode python3\n", id="deceptive-attached-s"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S PYTHONSAFEPATH=1 -i python3\n",
+            id="env-option-after-assignment",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S - node python3\n",
+            id="lone-dash-still-selects-node",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --zunknown python3\n",
+            id="unknown-long-and-freebsd-cluster-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S -a alternate -P/usr/bin python3\n",
+            id="mixed-gnu-freebsd-short-options",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S --debug -P/usr/bin python3\n",
+            id="mixed-gnu-long-freebsd-short-options",
+        ),
+        pytest.param(
+            "runner",
+            '#!/usr/bin/env -S -S "-a alternate -P/usr/bin python3"\n',
+            id="nested-mixed-gnu-freebsd-options",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S FOO=bar\\ baz -a alternate python3\n",
+            id="mixed-freebsd-lexer-gnu-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env --S-a alternate python3\n",
+            id="mixed-freebsd-outer-gnu-inner-option",
+        ),
+        pytest.param(
+            "runner",
+            r"#!/usr/bin/env -S pyth\on3" "\n",
+            id="invalid-env-escape",
+        ),
+        pytest.param(
+            "runner",
+            r'#!/usr/bin/env -S "python3\c"' "\n",
+            id="env-string-terminator-in-double-quotes",
+        ),
+        pytest.param(
+            "runner",
+            r'#!/usr/bin/env -S "python3\_-I"' "\n",
+            id="env-quoted-escaped-separator",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -xS python3\n",
+            id="unknown-outer-env-option",
+        ),
+        pytest.param("runner", "#!/usr/bin/env -S -P\n", id="missing-env-option-operand"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S 'python3 -I'\n",
+            id="quoted-interpreter-with-option",
+        ),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/env -S 'python3\n",
+            id="unterminated-env-quote",
+        ),
+        pytest.param("runner", "#!/bin/sh python3\n", id="shell-with-python-argument"),
+        pytest.param(
+            "runner",
+            "#!/usr/bin/node\0/usr/bin/python3\n",
+            id="nul-terminated-node-before-python",
+        ),
+        pytest.param("typing.pyi", "", id="pyi-without-shebang"),
+    ],
+)
+def test_bound_shell_truthiness_rejects_non_python_execution_surfaces(
+    path: str, prefix: str
+) -> None:
+    assert not _tm1(
+        prefix + "import subprocess\nenabled = True\nsubprocess.run(command, shell=enabled)\n",
+        path,
+    )
+
+
+def test_non_python_shebang_keeps_direct_lexical_tm1_only() -> None:
+    prefix = "#!/usr/bin/env node python3\n"
+
+    assert (
+        len(_tm1(prefix + "import subprocess\nsubprocess.run(command, shell=True)\n", "runner"))
+        == 1
+    )
+    assert not _tm1(
+        prefix + "import subprocess\nenabled = True\nsubprocess.run(command, shell=enabled)\n",
+        "runner",
+    )
+
+
+def test_python_shebang_file_type_reaches_later_static_windows() -> None:
+    content = (
+        "#!/usr/bin/env python3\n"
+        + "#"
+        + "x" * (tm_module.static_runner.SECURITY_VIEW_WINDOW_CHARS + 1)
+        + "\nsubprocess.run(command, shell=True)\n"
+    )
+
+    findings = _tm1(content, "runner")
+
+    assert len(findings) == 1
+    assert findings[0].confidence == pytest.approx(0.9)
 
 
 @pytest.mark.parametrize(
@@ -118,7 +1149,7 @@ def test_explicit_popen_definition_rejects_bound_calls() -> None:
 
 def test_explicit_popen_import_reestablishes_bare_receiver() -> None:
     findings = _tm1(
-        "Popen = proxy\n"
+        "Popen = None\n"
         "from subprocess import Popen\n"
         "enabled = True\n"
         "Popen(command, shell=enabled)\n"
@@ -163,14 +1194,16 @@ def test_wildcard_import_clears_all_facts() -> None:
 
 def test_function_local_binding_is_tracked_without_erasing_outer_fact() -> None:
     findings = _tm1(
+        "import subprocess\n"
         "outer = True\n"
         "def execute(command):\n"
         "    enabled = 'True'\n"
-        "    subprocess.run(command, shell=enabled)\n"
-        "subprocess.run(command, shell=outer)\n"
+        "    subprocess.run('true', shell=enabled)\n"
+        "subprocess.run('true', shell=outer)\n"
+        "execute('true')\n"
     )
 
-    assert [finding.start_line for finding in findings] == [4, 5]
+    assert [finding.start_line for finding in findings] == [5, 6]
 
 
 @pytest.mark.parametrize(
@@ -278,9 +1311,722 @@ def test_later_global_receiver_mutation_suppresses_function_body(
     )
 
 
+@pytest.mark.parametrize(
+    "later_binding",
+    [
+        pytest.param("subprocess = Proxy()", id="assignment"),
+        pytest.param("import other as subprocess", id="import-alias"),
+        pytest.param("subprocess.run = Proxy()", id="attribute-mutation"),
+    ],
+)
+def test_function_call_before_later_global_receiver_mutation_is_reported(
+    later_binding: str,
+) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "def execute(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "execute(command)\n"
+        f"{later_binding}\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 4
+
+
+@pytest.mark.parametrize(
+    "call_statement",
+    [
+        pytest.param("result = execute(command)", id="assignment"),
+        pytest.param("result: object = execute(command)", id="annotated-assignment"),
+    ],
+)
+def test_function_call_in_assignment_before_receiver_mutation_is_reported(
+    call_statement: str,
+) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "def execute(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{call_statement}\n"
+        "subprocess = Proxy()\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 4
+
+
+def test_function_alias_called_before_receiver_mutation_is_reported() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "def execute(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "alias = execute\n"
+        "alias(command)\n"
+        "subprocess = Proxy()\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 4
+
+
+@pytest.mark.parametrize(
+    "unknown_call",
+    [
+        pytest.param("unknown()", id="expression"),
+        pytest.param("result = unknown()", id="assignment"),
+        pytest.param("result: object = unknown()", id="annotated-assignment"),
+    ],
+)
+def test_unknown_call_before_local_function_invalidates_receiver_generation(
+    unknown_call: str,
+) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def victim(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{unknown_call}\n"
+        "victim(command)\n"
+        "subprocess = Proxy()\n"
+    )
+
+
+def test_called_local_mutator_invalidates_receiver_before_later_function_call() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def victim(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "def mutate():\n"
+        "    global subprocess\n"
+        "    subprocess = Proxy()\n"
+        "mutate()\n"
+        "victim(command)\n"
+        "subprocess = Proxy()\n"
+    )
+
+
+def test_called_local_mutator_invalidates_later_callable_identity() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def victim(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "def mutate():\n"
+        "    global victim\n"
+        "    victim = lambda command: None\n"
+        "mutate()\n"
+        "import subprocess\n"
+        "victim(command)\n"
+        "subprocess = Proxy()\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "import_statement",
+    [
+        pytest.param("import attacker", id="import"),
+        pytest.param("from attacker import hook", id="import-from"),
+    ],
+)
+def test_import_hook_invalidates_later_callable_identity(import_statement: str) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def victim(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{import_statement}\n"
+        "victim(command)\n"
+        "subprocess = None\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "import_statement",
+    [
+        pytest.param("import attacker", id="import"),
+        pytest.param("from attacker import hook", id="import-from"),
+        pytest.param("import subprocess, attacker", id="later-alias"),
+    ],
+)
+def test_import_hook_invalidates_direct_receiver_trust(import_statement: str) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        f"{import_statement}\n"
+        "enabled = True\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+
+def test_arbitrary_import_alias_prevents_later_exact_reestablishment() -> None:
+    assert not _tm1(
+        "import attacker, subprocess\nenabled = True\nsubprocess.run('true', shell=enabled)\n"
+    )
+
+
+def test_import_from_hook_clears_other_receiver_before_reestablishing_popen() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from subprocess import Popen\n"
+        "enabled = True\n"
+        "Popen('true', shell=enabled)\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+    assert len(findings) == 1
+    assert (findings[0].matched_text or "").startswith("Popen(")
+
+
+@pytest.mark.parametrize(
+    ("imports", "call"),
+    [
+        pytest.param(
+            "import subprocess\nimport subprocess",
+            "subprocess.run('true', shell=enabled)",
+            id="subprocess",
+        ),
+        pytest.param(
+            "from subprocess import Popen\nfrom subprocess import Popen",
+            "Popen('true', shell=enabled)",
+            id="popen",
+        ),
+    ],
+)
+def test_repeated_exact_import_keeps_finalizer_safe_receiver(
+    imports: str,
+    call: str,
+) -> None:
+    findings = _tm1(f"{imports}\nenabled = True\n{call}\n")
+
+    assert len(findings) == 1
+
+
+@pytest.mark.parametrize(
+    "import_statement",
+    [
+        pytest.param(
+            "from subprocess import PIPE as x, Popen",
+            id="unsafe-release-before-popen",
+        ),
+        pytest.param(
+            "from subprocess import Popen, PIPE as x",
+            id="unsafe-release-after-popen",
+        ),
+    ],
+)
+def test_mixed_import_from_never_reestablishes_receiver(import_statement: str) -> None:
+    assert not _tm1(
+        "class Evil:\n"
+        "    def __del__(self):\n"
+        "        global Popen\n"
+        "        Popen = None\n"
+        "x = Evil()\n"
+        f"{import_statement}\n"
+        "enabled = True\n"
+        "Popen('true', shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "arbitrary_effect",
+    [
+        pytest.param("unknown()", id="call"),
+        pytest.param("import attacker", id="import"),
+    ],
+)
+def test_arbitrary_effect_prevents_later_exact_import_reestablishment(
+    arbitrary_effect: str,
+) -> None:
+    assert not _tm1(
+        f"{arbitrary_effect}\n"
+        "import subprocess\n"
+        "enabled = True\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+
+def test_import_hook_poisoned_value_remains_finalizer_unsafe() -> None:
+    assert not _tm1(
+        "x = None\n"
+        "import subprocess\n"
+        "import attacker\n"
+        "import subprocess\n"
+        "x = None\n"
+        "enabled = True\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param("x = None", id="assignment"),
+        pytest.param("del x", id="delete"),
+        pytest.param("x = subprocess.run('true')", id="subprocess-result-assignment"),
+        pytest.param("def x():\n    pass", id="function-definition"),
+        pytest.param("class x:\n    pass", id="class-definition"),
+        pytest.param("import math as x", id="import"),
+        pytest.param("from math import pi as x", id="import-from"),
+    ],
+)
+def test_releasing_unsafe_prior_binding_invalidates_receiver(replacement: str) -> None:
+    assert not _tm1(
+        "class Proxy:\n"
+        "    pass\n"
+        "class Evil:\n"
+        "    def __del__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = Proxy()\n"
+        "x = Evil()\n"
+        "import subprocess\n"
+        f"{replacement}\n"
+        "enabled = True\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+
+def test_import_cannot_reestablish_receiver_while_releasing_unsafe_prior_value() -> None:
+    assert not _tm1(
+        "class Proxy:\n"
+        "    pass\n"
+        "class Evil:\n"
+        "    def __del__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = Proxy()\n"
+        "subprocess = Evil()\n"
+        "import subprocess\n"
+        "enabled = True\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("signature", "declaration", "call"),
+    [
+        pytest.param("x", "", "victim(value)", id="parameter"),
+        pytest.param("", "global x\n    ", "victim()", id="global"),
+    ],
+)
+def test_rebinding_unsafe_parameter_or_global_invalidates_receiver(
+    signature: str,
+    declaration: str,
+    call: str,
+) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        f"def victim({signature}):\n"
+        f"    {declaration}x = None\n"
+        "    enabled = True\n"
+        "    subprocess.run('true', shell=enabled)\n"
+        f"{call}\n"
+        "subprocess = None\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "binder",
+    [
+        pytest.param("(x := Evil())", id="named-expression"),
+        pytest.param("for x in values:\n    pass", id="for-target"),
+        pytest.param("with manager as x:\n    pass", id="with-target"),
+        pytest.param(
+            "try:\n    unknown()\nexcept Error as caught:\n    x = caught",
+            id="except-body-assignment",
+        ),
+        pytest.param("match value:\n    case x:\n        pass", id="match-capture"),
+    ],
+)
+def test_compound_or_expression_binding_retains_unsafe_finalizer_state(binder: str) -> None:
+    assert not _tm1(
+        f"{binder}\n"
+        "import subprocess\n"
+        "x = None\n"
+        "enabled = True\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+
+def test_class_global_store_releasing_unsafe_value_invalidates_receiver() -> None:
+    assert not _tm1(
+        "x = Evil()\n"
+        "import subprocess\n"
+        "class Container:\n"
+        "    global x\n"
+        "    x = None\n"
+        "enabled = True\n"
+        "subprocess.run('true', shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("setup", "trailing"),
+    [
+        pytest.param(
+            "def execute(command):\n"
+            "    enabled = True\n"
+            "    subprocess.run(command, shell=enabled)\n"
+            "subprocess = None\n"
+            "import subprocess\n",
+            "",
+            id="reimport-after-definition",
+        ),
+        pytest.param(
+            "subprocess = Proxy()\n"
+            "def execute(command):\n"
+            "    enabled = True\n"
+            "    subprocess.run(command, shell=enabled)\n"
+            "import subprocess\n",
+            "subprocess = Proxy()\n",
+            id="definition-before-reimport-and-later-mutation",
+        ),
+    ],
+)
+def test_import_reestablishes_receiver_but_not_prior_callable_identity(
+    setup: str,
+    trailing: str,
+) -> None:
+    assert not _tm1(f"{setup}execute(command)\n{trailing}")
+
+
+def test_local_call_defined_after_receiver_reimport_is_trusted() -> None:
+    findings = _tm1(
+        "subprocess = None\n"
+        "import subprocess\n"
+        "def execute(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "execute(command)\n"
+        "subprocess = None\n"
+    )
+
+    assert len(findings) == 1
+    assert "subprocess.run" in (findings[0].matched_text or "")
+
+
+def test_receiver_reimport_does_not_restore_callable_after_unsafe_assignment() -> None:
+    assert not _tm1(
+        "def execute(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "subprocess = Proxy()\n"
+        "import subprocess\n"
+        "execute(command)\n"
+        "subprocess = Proxy()\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "unknown_call",
+    [
+        pytest.param("unknown()", id="expression"),
+        pytest.param("result = unknown()", id="assignment"),
+        pytest.param("result: object = unknown()", id="annotated-assignment"),
+    ],
+)
+def test_unknown_top_level_call_invalidates_direct_receiver_trust(
+    unknown_call: str,
+) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        f"{unknown_call}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_statement",
+    [
+        pytest.param("result = (unknown(), 1)", id="nested-call-assignment"),
+        pytest.param("result = [unknown()]", id="nested-list-call-assignment"),
+        pytest.param("holder.value = 1", id="attribute-setter"),
+        pytest.param("holder[0] = 1", id="subscript-setter"),
+        pytest.param(
+            "holder[0] = subprocess.run(command, shell=False)",
+            id="trusted-call-subscript-setter",
+        ),
+        pytest.param("counter += 1", id="augmented-assignment"),
+        pytest.param("holder.value += 1", id="attribute-augmented-assignment"),
+        pytest.param("if unknown():\n    pass", id="compound-call"),
+        pytest.param("if condition:\n    unknown()", id="compound-body-call"),
+        pytest.param("with unknown():\n    pass", id="context-manager-call"),
+        pytest.param("class Container:\n    unknown()", id="class-body-call"),
+        pytest.param(
+            "class Container(unknown()):\n    pass",
+            id="class-base-call",
+        ),
+        pytest.param("del holder.item", id="descriptor-delete"),
+        pytest.param("left + right", id="operator-expression"),
+        pytest.param("holder.value", id="attribute-expression"),
+    ],
+)
+def test_unsafe_evaluation_invalidates_direct_receiver_trust(
+    unsafe_statement: str,
+) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        f"{unsafe_statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_statement",
+    [
+        pytest.param("result = (unknown(), 1)", id="nested-call-assignment"),
+        pytest.param("result = [unknown()]", id="nested-list-call-assignment"),
+        pytest.param("holder.value = 1", id="attribute-setter"),
+        pytest.param("holder[0] = 1", id="subscript-setter"),
+        pytest.param(
+            "holder[0] = subprocess.run(command, shell=False)",
+            id="trusted-call-subscript-setter",
+        ),
+        pytest.param("counter += 1", id="augmented-assignment"),
+        pytest.param("holder.value += 1", id="attribute-augmented-assignment"),
+        pytest.param("if unknown():\n    pass", id="compound-call"),
+        pytest.param("if condition:\n    unknown()", id="compound-body-call"),
+        pytest.param("with unknown():\n    pass", id="context-manager-call"),
+        pytest.param("class Container:\n    unknown()", id="class-body-call"),
+        pytest.param(
+            "class Container(unknown()):\n    pass",
+            id="class-base-call",
+        ),
+        pytest.param("del holder.item", id="descriptor-delete"),
+        pytest.param("left + right", id="operator-expression"),
+        pytest.param("holder.value", id="attribute-expression"),
+    ],
+)
+def test_unsafe_evaluation_invalidates_receiver_generation(
+    unsafe_statement: str,
+) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def victim(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{unsafe_statement}\n"
+        "victim(command)\n"
+        "subprocess = Proxy()\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "trusted_call",
+    [
+        pytest.param("subprocess.run('true', shell=False)", id="expression"),
+        pytest.param("subprocess.run(['true'], shell=False)", id="literal-container"),
+        pytest.param("subprocess.run('tr' + 'ue', shell=False)", id="constant-operator"),
+        pytest.param(
+            "result = subprocess.run('true', shell=False)",
+            id="assignment",
+        ),
+    ],
+)
+def test_passive_trusted_subprocess_call_preserves_direct_receiver(
+    trusted_call: str,
+) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        f"{trusted_call}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 4
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_lines"),
+    [
+        pytest.param(
+            "enabled = True\n"
+            "subprocess.run('one', shell=enabled)\n"
+            "subprocess.run('two', shell=enabled)\n",
+            [2, 3],
+            id="consecutive-bound-calls",
+        ),
+        pytest.param(
+            "disabled = False\n"
+            "subprocess.run('one', shell=disabled)\n"
+            "enabled = True\n"
+            "subprocess.run('two', shell=enabled)\n",
+            [4],
+            id="known-false-shell-then-bound-call",
+        ),
+        pytest.param(
+            "enabled = True\n"
+            "subprocess.run('one', check=enabled, shell=False)\n"
+            "subprocess.run('two', shell=enabled)\n",
+            [3],
+            id="safe-name-in-other-keyword",
+        ),
+        pytest.param(
+            "command = 'one'\n"
+            "subprocess.run(command, shell=False)\n"
+            "enabled = True\n"
+            "subprocess.run('two', shell=enabled)\n",
+            [4],
+            id="safe-command-name",
+        ),
+        pytest.param(
+            "enabled = True\n"
+            "alias = enabled\n"
+            "subprocess.run('one', shell=alias)\n"
+            "subprocess.run('two', shell=enabled)\n",
+            [3, 4],
+            id="safe-shell-alias",
+        ),
+        pytest.param(
+            "enabled = True\nsubprocess.run('one', shell=enabled)\nPopen('two', shell=enabled)\n",
+            [2, 3],
+            id="cross-receiver-bound-calls",
+        ),
+        pytest.param(
+            "enabled = True\n"
+            "subprocess.run('one', shell=enabled)\n"
+            "subprocess.run(command, shell=enabled)\n"
+            "subprocess.run('three', shell=enabled)\n",
+            [2, 3],
+            id="bound-then-dynamic-command-barrier",
+        ),
+    ],
+)
+def test_protocol_safe_name_provenance_preserves_receiver_trust(
+    content: str,
+    expected_lines: list[int],
+) -> None:
+    assert [finding.start_line for finding in _tm1(content)] == expected_lines
+
+
+def test_unknown_name_inside_safe_container_does_not_preserve_receiver_trust() -> None:
+    assert not _tm1(
+        "item = unknown\n"
+        "command = (item,)\n"
+        "subprocess.run(command, shell=False)\n"
+        "enabled = True\n"
+        "subprocess.run('later', shell=enabled)\n"
+    )
+
+
+def test_safe_bound_call_preserves_receiver_generation_for_local_call() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "def victim():\n"
+        "    enabled = True\n"
+        "    subprocess.run('victim', shell=enabled)\n"
+        "enabled = True\n"
+        "subprocess.run('safe', shell=enabled)\n"
+        "victim()\n"
+        "subprocess = None\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [4, 6]
+
+
+@pytest.mark.parametrize(
+    ("victim_call", "safe_call", "later_binding"),
+    [
+        pytest.param(
+            "Popen(command, shell=enabled)",
+            "subprocess.run('true', shell=False)",
+            "Popen = Proxy()",
+            id="subprocess-call-preserves-popen",
+        ),
+        pytest.param(
+            "subprocess.run(command, shell=enabled)",
+            "Popen('true', shell=False)",
+            "subprocess = Proxy()",
+            id="popen-call-preserves-subprocess",
+        ),
+    ],
+)
+def test_passive_direct_call_preserves_other_receiver_generation(
+    victim_call: str,
+    safe_call: str,
+    later_binding: str,
+) -> None:
+    findings = _tm1(
+        "def victim(command):\n"
+        "    enabled = True\n"
+        f"    {victim_call}\n"
+        f"{safe_call}\n"
+        "victim(command)\n"
+        f"{later_binding}\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 3
+
+
+@pytest.mark.parametrize(
+    "trusted_call",
+    [
+        pytest.param("subprocess.run(path, shell=False)", id="positional"),
+        pytest.param("result = subprocess.run(path, shell=False)", id="assignment"),
+        pytest.param(
+            "subprocess.run('true', cwd=path, shell=False)",
+            id="keyword",
+        ),
+    ],
+)
+def test_pathlike_protocol_hook_invalidates_receiver_after_trusted_call(
+    trusted_call: str,
+) -> None:
+    assert not _tm1(
+        "class EvilPath:\n"
+        "    def __fspath__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = Proxy()\n"
+        "path = EvilPath()\n"
+        "import subprocess\n"
+        f"{trusted_call}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param("execute = replacement", id="direct-name"),
+        pytest.param("alias = execute\nalias = replacement", id="alias"),
+    ],
+)
+def test_rebound_function_name_before_call_does_not_mark_old_body(
+    replacement: str,
+) -> None:
+    called_name = "alias" if replacement.startswith("alias") else "execute"
+    assert not _tm1(
+        "import subprocess\n"
+        "def execute(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{replacement}\n"
+        f"{called_name}(command)\n"
+        "subprocess = Proxy()\n"
+    )
+
+
+def test_function_called_only_after_global_receiver_mutation_is_suppressed() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def execute(command):\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "subprocess = Proxy()\n"
+        "execute(command)\n"
+    )
+
+
 def test_reestablished_receiver_before_function_body_is_trusted() -> None:
     findings = _tm1(
-        "subprocess = Proxy()\n"
+        "subprocess = None\n"
         "import subprocess\n"
         "def execute(command):\n"
         "    enabled = True\n"
@@ -331,7 +2077,7 @@ def test_later_nested_function_return_annotation_binds_outer_subprocess() -> Non
 
 def test_explicit_subprocess_import_reestablishes_direct_receiver() -> None:
     findings = _tm1(
-        "subprocess = Proxy()\n"
+        "subprocess = None\n"
         "import subprocess\n"
         "enabled = True\n"
         "subprocess.run(command, shell=enabled)\n"
@@ -381,8 +2127,8 @@ def test_nested_class_body_mutation_invalidates_subprocess_receiver(nested_body:
     )
 
 
-def test_nested_class_local_binding_preserves_subprocess_receiver() -> None:
-    findings = _tm1(
+def test_nested_class_initializer_call_invalidates_subprocess_receiver() -> None:
+    assert not _tm1(
         "import subprocess\n"
         "class Outer:\n"
         "    class Inner:\n"
@@ -390,8 +2136,6 @@ def test_nested_class_local_binding_preserves_subprocess_receiver() -> None:
         "enabled = True\n"
         "subprocess.run(command, shell=enabled)\n"
     )
-
-    assert len(findings) == 1
 
 
 @pytest.mark.parametrize(
@@ -413,8 +2157,8 @@ def test_class_local_genuine_receiver_mutation_invalidates_outer_receiver(
     )
 
 
-def test_class_local_proxy_receiver_mutation_preserves_outer_receiver() -> None:
-    findings = _tm1(
+def test_class_local_proxy_calls_invalidate_outer_receiver() -> None:
+    assert not _tm1(
         "import subprocess\n"
         "class Container:\n"
         "    subprocess = Proxy()\n"
@@ -422,8 +2166,6 @@ def test_class_local_proxy_receiver_mutation_preserves_outer_receiver() -> None:
         "enabled = True\n"
         "subprocess.run(command, shell=enabled)\n"
     )
-
-    assert len(findings) == 1
 
 
 def test_passive_class_body_preserves_subprocess_receiver() -> None:
@@ -436,6 +2178,21 @@ def test_passive_class_body_preserves_subprocess_receiver() -> None:
     )
 
     assert len(findings) == 1
+
+
+def test_class_descriptor_name_assignment_invalidates_subprocess_receiver() -> None:
+    assert not _tm1(
+        "class Descriptor:\n"
+        "    def __set_name__(self, owner, name):\n"
+        "        global subprocess\n"
+        "        subprocess = Proxy()\n"
+        "descriptor = Descriptor()\n"
+        "import subprocess\n"
+        "class Container:\n"
+        "    value = descriptor\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
 
 
 def test_deep_class_expression_does_not_fail_later_module_scan() -> None:
@@ -455,12 +2212,12 @@ def test_deep_class_expression_does_not_fail_later_module_scan() -> None:
 @pytest.mark.parametrize(
     "imports",
     [
-        pytest.param("import subprocess\nimport os", id="later-unrelated-import"),
-        pytest.param("import subprocess, os", id="multi-import"),
+        pytest.param("import subprocess", id="single-exact-import"),
+        pytest.param("import subprocess\nimport subprocess", id="repeated-exact-import"),
         pytest.param("import subprocess\nsubprocess = subprocess", id="self-assignment"),
     ],
 )
-def test_ordinary_import_order_preserves_subprocess_receiver(imports: str) -> None:
+def test_exact_subprocess_import_last_preserves_receiver(imports: str) -> None:
     findings = _tm1(f"{imports}\nenabled = True\nsubprocess.run(command, shell=enabled)\n")
 
     assert len(findings) == 1
@@ -1006,7 +2763,7 @@ def test_unowned_direct_metadata_does_not_displace_later_bound_finding(monkeypat
 def test_duplicate_direct_metadata_does_not_displace_later_bound_finding(monkeypatch) -> None:
     monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
     result = _run(
-        "subprocess.run(command, shell=True); subprocess.run(command, shell=True)\n"
+        'subprocess.run("command", shell=True); subprocess.run("command", shell=True)\n'
         "enabled = True\n"
         'subprocess.run("later", shell=enabled)\n'
     )
@@ -1072,8 +2829,8 @@ def test_different_true_aliases_compact_as_one_semantic_match() -> None:
     findings = _tm1(
         "a = True\n"
         "b = True\n"
-        "subprocess.run(command, shell=a, capture_output=True)\n"
-        "subprocess.run(command, shell=b, text=True)\n"
+        'subprocess.run("command", shell=a, capture_output=True)\n'
+        'subprocess.run("command", shell=b, text=True)\n'
     )
 
     compacted = deduplicate(findings)
@@ -1087,8 +2844,8 @@ def test_nfkc_callee_uses_the_same_direct_and_bound_fingerprint() -> None:
     fullwidth_subprocess = "ｓｕｂｐｒｏｃｅｓｓ"
     findings = _tm1(
         "a = True\n"
-        f"{fullwidth_subprocess}.run(command, shell=True)\n"
-        f"{fullwidth_subprocess}.run(command, shell=a)\n"
+        f'{fullwidth_subprocess}.run("command", shell=True)\n'
+        f'{fullwidth_subprocess}.run("command", shell=a)\n'
     )
 
     compacted = deduplicate(findings)
@@ -2479,8 +4236,8 @@ def test_normalized_slice_prefers_later_complete_shell_anchor(monkeypatch) -> No
 def test_continued_qualified_popen_keeps_direct_bound_fingerprint_parity() -> None:
     findings = _tm1(
         "enabled = True\n"
-        "subprocess.\\\nPopen(command, shell=True)\n"
-        "subprocess.\\\nPopen(command, shell=enabled)\n"
+        'subprocess.\\\nPopen("command", shell=True)\n'
+        'subprocess.\\\nPopen("command", shell=enabled)\n'
     )
 
     compacted = deduplicate(findings)
@@ -3094,7 +4851,15 @@ def test_malformed_python_does_not_defer_lexical_output_limit(
     scanned_views: list[str] = []
     original = tm_module.static_runner._scan_view_windows
 
-    def record_view(path, view, pattern_modules, finding_budget, python_ast_cache_key):
+    def record_view(
+        path,
+        view,
+        pattern_modules,
+        finding_budget,
+        python_ast_cache_key,
+        *,
+        python_source,
+    ):
         scanned_views.append(view.text)
         return original(
             path,
@@ -3102,6 +4867,7 @@ def test_malformed_python_does_not_defer_lexical_output_limit(
             pattern_modules,
             finding_budget,
             python_ast_cache_key,
+            python_source=python_source,
         )
 
     monkeypatch.setattr(tm_module.static_runner, "_scan_view_windows", record_view)
@@ -3166,8 +4932,9 @@ def test_many_same_line_calls_keep_classification_context_bounded(monkeypatch) -
     monkeypatch.setattr(tm_module, "_is_safe_container_command", record("container"))
     monkeypatch.setattr(tm_module, "_is_safe_dockerfile_idiom", record("dockerfile"))
     monkeypatch.setattr(tm_module, "_is_safe_cache_cleanup", record("cache"))
-    content = "true_value=True;" + "".join(
-        f"subprocess.run({index},shell=true_value);" for index in range(50)
+    content = "".join(
+        f"true_value=True;subprocess.run({index},shell=true_value);import subprocess;"
+        for index in range(50)
     )
 
     findings = _tm1(content)

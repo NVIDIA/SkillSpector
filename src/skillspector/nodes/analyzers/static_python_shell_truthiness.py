@@ -79,6 +79,13 @@ class BoundShellMetadata:
     normalized_view: bool
 
 
+@dataclass(slots=True)
+class _BlockEffectState:
+    """Monotonic fail-closed state for arbitrary effects in one lexical block."""
+
+    arbitrary_effects_seen: bool = False
+
+
 def _truth_value(
     expression: ast.expr | None,
     facts: dict[str, bool],
@@ -127,30 +134,75 @@ def _truth_value(
 def _update_trusted_names_from_import(
     statement: ast.Import | ast.ImportFrom,
     trusted_names: set[str],
+    bound_names: set[str],
+    finalizer_safe_names: set[str],
+    effect_state: _BlockEffectState,
 ) -> None:
-    """Update only direct names that an import statement actually binds."""
+    """Apply import-hook and sequential STORE effects to receiver trust."""
     if isinstance(statement, ast.Import):
         for imported in statement.names:
+            # Each IMPORT_NAME can run a distinct finder/loader before its
+            # corresponding STORE.  Once an arbitrary alias has run, retain a
+            # monotonic taint so a later exact spelling cannot certify state
+            # that the earlier hook may have poisoned.
+            trusted_names.clear()
             bound = imported.asname or imported.name.partition(".")[0]
-            if imported.name == "subprocess" and bound == "subprocess":
+            releases_unsafe = bound in bound_names and bound not in finalizer_safe_names
+            trusted_alias = imported.name == "subprocess" and bound == "subprocess"
+            if not trusted_alias:
+                effect_state.arbitrary_effects_seen = True
+                finalizer_safe_names.clear()
+            bound_names.add(bound)
+            finalizer_safe_names.discard(bound)
+            if trusted_alias and not releases_unsafe and not effect_state.arbitrary_effects_seen:
                 trusted_names.add(bound)
-            elif bound in trusted_names:
-                trusted_names.discard(bound)
+                finalizer_safe_names.add(bound)
+            if releases_unsafe:
+                # STORE_NAME decrefs the displaced value after installing the
+                # import result; its finalizer can overwrite even this exact
+                # trusted binding.
+                trusted_names.clear()
+                finalizer_safe_names.clear()
+                effect_state.arbitrary_effects_seen = True
         return
+    # ImportFrom performs one arbitrary module import, followed by ordered
+    # IMPORT_FROM/STORE pairs without another hook between them.
+    trusted_names.clear()
+    trusted_only = (
+        statement.level == 0
+        and statement.module == "subprocess"
+        and bool(statement.names)
+        and all(
+            imported.name == "Popen" and (imported.asname or imported.name) == "Popen"
+            for imported in statement.names
+        )
+    )
+    if not trusted_only:
+        effect_state.arbitrary_effects_seen = True
+        finalizer_safe_names.clear()
     if any(imported.name == "*" for imported in statement.names):
-        trusted_names.clear()
         return
     for imported in statement.names:
         bound = imported.asname or imported.name
+        releases_unsafe = bound in bound_names and bound not in finalizer_safe_names
+        bound_names.add(bound)
+        finalizer_safe_names.discard(bound)
         if (
             statement.level == 0
             and statement.module == "subprocess"
             and imported.name == "Popen"
             and bound == "Popen"
+            and not releases_unsafe
+            and not effect_state.arbitrary_effects_seen
         ):
             trusted_names.add(bound)
+            finalizer_safe_names.add(bound)
         elif bound in trusted_names:
             trusted_names.discard(bound)
+        if releases_unsafe:
+            trusted_names.clear()
+            finalizer_safe_names.clear()
+            effect_state.arbitrary_effects_seen = True
 
 
 class _DirectBindingCollector:
@@ -499,6 +551,295 @@ def _call_arguments_are_passive(call: ast.Call) -> bool:
     )
 
 
+def _is_protocol_safe_argument(
+    expression: ast.expr,
+    protocol_safe_names: set[str],
+) -> bool:
+    """Accept only exact built-in values that cannot dispatch protocol hooks."""
+    pending = [expression]
+    while pending:
+        current = pending.pop()
+        if _is_constant_operator_expression(current):
+            continue
+        if isinstance(current, ast.Name):
+            if current.id not in protocol_safe_names:
+                return False
+            continue
+        if isinstance(current, (ast.List, ast.Tuple, ast.Set)):
+            if any(isinstance(item, ast.Starred) for item in current.elts):
+                return False
+            pending.extend(current.elts)
+            continue
+        if isinstance(current, ast.Dict):
+            if any(key is None for key in current.keys):
+                return False
+            pending.extend(key for key in current.keys if key is not None)
+            pending.extend(current.values)
+            continue
+        if isinstance(current, ast.JoinedStr) and all(
+            isinstance(item, ast.Constant) for item in current.values
+        ):
+            continue
+        return False
+    return True
+
+
+def _call_arguments_are_protocol_safe(
+    call: ast.Call,
+    facts: dict[str, bool],
+    protocol_safe_names: set[str],
+) -> bool:
+    """Return whether call execution cannot invoke hooks on supplied values."""
+    if not all(_is_protocol_safe_argument(argument, protocol_safe_names) for argument in call.args):
+        return False
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            return False
+        if (
+            keyword.arg == "shell"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id in facts
+        ):
+            # A proven truth value is sufficient for ``shell`` itself: Python
+            # tests only the outer value, so exact built-in container truth
+            # does not inspect potentially opaque elements.
+            continue
+        if not _is_protocol_safe_argument(keyword.value, protocol_safe_names):
+            return False
+    return True
+
+
+def _target_names(target: ast.expr) -> set[str]:
+    """Return simple names stored or deleted through one assignment target."""
+    names: set[str] = set()
+    pending = [target]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.Name):
+            names.add(current.id)
+        elif isinstance(current, ast.Starred):
+            pending.append(current.value)
+        elif isinstance(current, (ast.List, ast.Tuple)):
+            pending.extend(current.elts)
+    return names
+
+
+def _current_scope_bound_names(statement: ast.stmt) -> set[str]:
+    """Collect every name STORE reachable in this lexical scope."""
+    candidates: set[str] = set()
+    for node in ast.walk(statement):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            candidates.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            candidates.add(node.name)
+        elif isinstance(node, ast.Import):
+            candidates.update(
+                imported.asname or imported.name.partition(".")[0] for imported in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            candidates.update(
+                imported.asname or imported.name for imported in node.names if imported.name != "*"
+            )
+        elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
+            candidates.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and isinstance(node.name, str):
+            candidates.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and isinstance(node.rest, str):
+            candidates.add(node.rest)
+    collector = _DirectBindingCollector(candidates)
+    collector.visit(statement)
+    return collector.bound
+
+
+def _statement_name_transitions(statement: ast.stmt) -> tuple[set[str], set[str]]:
+    """Return direct name stores and deletes performed by one statement."""
+    stored = _current_scope_bound_names(statement)
+    deleted: set[str] = set()
+    if isinstance(statement, ast.AnnAssign) and statement.value is None:
+        stored.difference_update(_target_names(statement.target))
+    if isinstance(statement, ast.Delete):
+        for target in statement.targets:
+            deleted.update(_target_names(target))
+        stored.difference_update(deleted)
+    return stored, deleted
+
+
+def _statement_releases_unsafe_binding(
+    statement: ast.stmt,
+    bound_names: set[str],
+    finalizer_safe_names: set[str],
+) -> bool:
+    """Return whether a STORE/DELETE can invoke an opaque prior finalizer."""
+    stored, deleted = _statement_name_transitions(statement)
+    unsafe_bound_names = bound_names.difference(finalizer_safe_names)
+    if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Name):
+        # ``x = x`` keeps the loaded object alive across STORE_NAME, so the
+        # displaced reference cannot be its final reference at that point.
+        stored.difference_update(
+            target.id
+            for target in statement.targets
+            if isinstance(target, ast.Name) and target.id == statement.value.id
+        )
+    if isinstance(statement, ast.ImportFrom) and any(
+        imported.name == "*" for imported in statement.names
+    ):
+        # A wildcard import may overwrite any existing module binding.
+        return bool(unsafe_bound_names)
+    return bool((stored | deleted).intersection(unsafe_bound_names))
+
+
+def _advance_finalizer_provenance(
+    statement: ast.stmt,
+    bound_names: set[str],
+    finalizer_safe_names: set[str],
+    *,
+    invalidated: bool,
+) -> None:
+    """Track bindings whose later release cannot dispatch ``__del__`` hooks."""
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        # Import receiver handling applies each hook and STORE in runtime order
+        # and updates these sets in place.
+        return
+    stored, deleted = _statement_name_transitions(statement)
+    prior_safe_names = set(finalizer_safe_names)
+    if invalidated:
+        # Arbitrary evaluation can replace any currently known binding through
+        # frame/global access.  Retain that it is bound, but no longer certify
+        # the value released by a later STORE/DELETE.
+        finalizer_safe_names.clear()
+
+    new_safe_names: set[str] = set()
+    if not invalidated:
+        if isinstance(statement, ast.Assign) and all(
+            isinstance(target, ast.Name) for target in statement.targets
+        ):
+            if _is_protocol_safe_argument(statement.value, prior_safe_names):
+                new_safe_names.update(stored)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            _function_result_is_finalizer_safe(statement, prior_safe_names)
+        ):
+            new_safe_names.update(stored)
+        elif isinstance(statement, ast.ClassDef) and _class_result_is_finalizer_safe(
+            statement,
+            prior_safe_names,
+        ):
+            new_safe_names.update(stored)
+
+    finalizer_safe_names.difference_update(stored | deleted)
+    bound_names.difference_update(deleted)
+    bound_names.update(stored)
+    finalizer_safe_names.update(new_safe_names)
+
+
+def _is_immediate_function(statement: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return whether a direct call starts executing this body immediately."""
+    if isinstance(statement, ast.AsyncFunctionDef):
+        return False
+    pending: list[ast.AST] = list(statement.body)
+    while pending:
+        current = pending.pop()
+        if isinstance(current, (ast.Yield, ast.YieldFrom)):
+            return False
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        pending.extend(ast.iter_child_nodes(current))
+    return True
+
+
+def _direct_call_value(statement: ast.stmt) -> ast.Call | None:
+    """Return a call evaluated directly by this simple statement, if any."""
+    value: ast.expr | None = None
+    if isinstance(statement, (ast.Expr, ast.Assign)):
+        value = statement.value
+    elif isinstance(statement, ast.AnnAssign):
+        value = statement.value
+    if not isinstance(value, ast.Call):
+        return None
+    return value
+
+
+def _passive_direct_call(statement: ast.stmt) -> ast.Call | None:
+    """Return a definitely evaluated simple-name call with passive arguments."""
+    value = _direct_call_value(statement)
+    if value is None:
+        return None
+    if not isinstance(value.func, ast.Name) or not _call_arguments_are_passive(value):
+        return None
+    return value
+
+
+def _is_constant_operator_expression(expression: ast.expr) -> bool:
+    """Accept operator trees whose operands are exact built-in constants."""
+    pending = [expression]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.Constant):
+            continue
+        if isinstance(current, ast.BinOp):
+            pending.extend((current.left, current.right))
+            continue
+        if isinstance(current, ast.UnaryOp):
+            pending.append(current.operand)
+            continue
+        return False
+    return True
+
+
+def _expression_preserves_receiver_trust(
+    expression: ast.expr,
+    trusted_names: set[str],
+    facts: dict[str, bool],
+    protocol_safe_names: set[str],
+) -> bool:
+    """Return whether evaluating an expression cannot mutate receiver globals."""
+    if _is_passive_argument(expression) or _is_constant_operator_expression(expression):
+        return True
+    return (
+        isinstance(expression, ast.Call)
+        and _is_direct_subprocess_call(expression, trusted_names)
+        and _call_arguments_are_protocol_safe(expression, facts, protocol_safe_names)
+    )
+
+
+def _statement_requires_receiver_barrier(
+    statement: ast.stmt,
+    trusted_names: set[str],
+    facts: dict[str, bool],
+    protocol_safe_names: set[str],
+) -> bool:
+    """Return whether statement evaluation may mutate either trusted receiver."""
+    if isinstance(statement, ast.Assign):
+        return any(not isinstance(target, ast.Name) for target in statement.targets) or not (
+            _expression_preserves_receiver_trust(
+                statement.value,
+                trusted_names,
+                facts,
+                protocol_safe_names,
+            )
+        )
+    if isinstance(statement, ast.AnnAssign):
+        # Module annotations write through a replaceable ``__annotations__``
+        # mapping, even when the value and target otherwise look passive.
+        return True
+    if isinstance(statement, ast.AugAssign):
+        # In-place operators and attribute/subscript stores can invoke user code.
+        return True
+    if isinstance(statement, ast.Delete):
+        return any(not isinstance(target, ast.Name) for target in statement.targets)
+    if isinstance(statement, ast.Expr):
+        return not _expression_preserves_receiver_trust(
+            statement.value,
+            trusted_names,
+            facts,
+            protocol_safe_names,
+        )
+    if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
+        return False
+    # Unsupported control flow and runtime statements are outside this
+    # deliberately straight-line, side-effect-free subset.
+    return True
+
+
 def _annotation_is_passive(annotation: ast.expr) -> bool:
     """Accept only annotation spellings whose evaluation cannot rebind a name."""
     return all(
@@ -530,15 +871,191 @@ def _function_header_is_passive(
     return all(_annotation_is_passive(annotation) for annotation in annotations)
 
 
-def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None:
+def _function_initial_bound_names(
+    statement: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    """Return parameters and outer-scope declarations bound on body entry."""
+    arguments = statement.args
+    names = {
+        argument.arg
+        for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    }
+    if arguments.vararg is not None:
+        names.add(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.add(arguments.kwarg.arg)
+    declaration_collector = _DirectBindingCollector(frozenset())
+    for child in statement.body:
+        declaration_collector.visit(child)
+    names.update(declaration_collector.nonlocal_names)
+    return names
+
+
+def _function_result_is_finalizer_safe(
+    statement: ast.FunctionDef | ast.AsyncFunctionDef,
+    finalizer_safe_names: set[str],
+) -> bool:
+    """Return whether releasing the created function retains only safe values."""
+    if not _function_header_is_passive(statement):
+        return False
+    retained = [
+        *statement.args.defaults,
+        *(item for item in statement.args.kw_defaults if item is not None),
+    ]
+    arguments = (
+        *statement.args.posonlyargs,
+        *statement.args.args,
+        *statement.args.kwonlyargs,
+    )
+    retained.extend(
+        argument.annotation for argument in arguments if argument.annotation is not None
+    )
+    if statement.args.vararg is not None and statement.args.vararg.annotation is not None:
+        retained.append(statement.args.vararg.annotation)
+    if statement.args.kwarg is not None and statement.args.kwarg.annotation is not None:
+        retained.append(statement.args.kwarg.annotation)
+    if statement.returns is not None:
+        retained.append(statement.returns)
+    return all(
+        _is_protocol_safe_argument(expression, finalizer_safe_names) for expression in retained
+    )
+
+
+def _class_definition_is_passive(statement: ast.ClassDef) -> bool:
+    """Accept class execution only when every evaluated form is passive."""
+    pending = [statement]
+    while pending:
+        current = pending.pop()
+        if (
+            current.decorator_list
+            or current.bases
+            or current.keywords
+            or getattr(current, "type_params", [])
+        ):
+            return False
+        for child in current.body:
+            if isinstance(child, ast.Pass):
+                continue
+            if isinstance(child, (ast.Global, ast.Nonlocal)):
+                # A later simple-looking class-body STORE can then replace an
+                # outer opaque value and run its finalizer during class
+                # execution.  Keep this boundary outside the passive subset.
+                return False
+            if isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant):
+                continue
+            if isinstance(child, ast.Assign) and all(
+                isinstance(target, ast.Name) for target in child.targets
+            ):
+                if not isinstance(child.value, ast.Name) and (
+                    _is_passive_argument(child.value)
+                    or _is_constant_operator_expression(child.value)
+                ):
+                    continue
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                _function_header_is_passive(child)
+            ):
+                continue
+            if isinstance(child, ast.ClassDef):
+                pending.append(child)
+                continue
+            return False
+    return True
+
+
+def _class_result_is_finalizer_safe(
+    statement: ast.ClassDef,
+    finalizer_safe_names: set[str],
+) -> bool:
+    """Return whether releasing a passive class retains only safe members."""
+    if not _class_definition_is_passive(statement):
+        return False
+    pending = [statement]
+    while pending:
+        current = pending.pop()
+        for child in current.body:
+            if isinstance(child, (ast.Pass, ast.Expr, ast.Global, ast.Nonlocal)):
+                continue
+            if isinstance(child, ast.Assign):
+                if not _is_protocol_safe_argument(child.value, finalizer_safe_names):
+                    return False
+                continue
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not _function_result_is_finalizer_safe(child, finalizer_safe_names):
+                    return False
+                continue
+            if isinstance(child, ast.ClassDef):
+                pending.append(child)
+                continue
+            return False
+    return True
+
+
+def _statement_requires_callable_barrier(
+    statement: ast.stmt,
+    trusted_names: set[str],
+    facts: dict[str, bool],
+    protocol_safe_names: set[str],
+) -> bool:
+    """Return whether statement evaluation may rebind tracked local callables."""
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        # Import finders, loaders, and imported module code are arbitrary
+        # Python.  Even when the statement explicitly reestablishes a trusted
+        # subprocess receiver, it cannot preserve a previously tracked local
+        # function identity across that execution boundary.
+        return True
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return not _function_header_is_passive(statement)
+    if isinstance(statement, ast.ClassDef):
+        return not _class_definition_is_passive(statement)
+    return _statement_requires_receiver_barrier(
+        statement,
+        trusted_names,
+        facts,
+        protocol_safe_names,
+    )
+
+
+def _advance_trusted_names(
+    statement: ast.stmt,
+    trusted_names: set[str],
+    facts: dict[str, bool],
+    protocol_safe_names: set[str],
+    bound_names: set[str],
+    finalizer_safe_names: set[str],
+    effect_state: _BlockEffectState,
+) -> None:
     """Apply one statement's explicit receiver-binding effects."""
     if isinstance(statement, (ast.Import, ast.ImportFrom)):
-        _update_trusted_names_from_import(statement, trusted_names)
+        _update_trusted_names_from_import(
+            statement,
+            trusted_names,
+            bound_names,
+            finalizer_safe_names,
+            effect_state,
+        )
         return
     if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
         if not _function_header_is_passive(statement):
             trusted_names.clear()
         trusted_names.discard(statement.name)
+        return
+    if isinstance(statement, ast.ClassDef):
+        if not _class_definition_is_passive(statement):
+            trusted_names.clear()
+            return
+        trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+        trusted_names.difference_update(_class_body_changed_direct_names(statement, trusted_names))
+        return
+    if _statement_requires_receiver_barrier(
+        statement,
+        trusted_names,
+        facts,
+        protocol_safe_names,
+    ):
+        # The call-site prepass records an eligible local body before applying
+        # this post-evaluation barrier, so a genuine call before a later
+        # mutation remains reportable without trusting subsequent generations.
+        trusted_names.clear()
         return
     if isinstance(statement, ast.Assign):
         changed = _changed_direct_names(
@@ -555,11 +1072,79 @@ def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None
         }
         trusted_names.difference_update(changed.difference(preserved))
         return
-    if isinstance(statement, ast.ClassDef):
-        trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
-        trusted_names.difference_update(_class_body_changed_direct_names(statement, trusted_names))
-        return
     trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+
+
+def _advance_value_provenance(
+    statement: ast.stmt,
+    facts: dict[str, bool],
+    protocol_safe_names: set[str],
+    trusted_names_before: set[str],
+) -> None:
+    """Apply one statement's straight-line truth and exact-value effects."""
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        facts.clear()
+        protocol_safe_names.clear()
+        return
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if _function_header_is_passive(statement):
+            facts.pop(statement.name, None)
+            protocol_safe_names.discard(statement.name)
+        else:
+            facts.clear()
+            protocol_safe_names.clear()
+        return
+    if isinstance(statement, ast.Assign):
+        if any(not isinstance(target, ast.Name) for target in statement.targets):
+            facts.clear()
+            protocol_safe_names.clear()
+            return
+        value = statement.value
+        if (
+            isinstance(value, ast.Call)
+            and _is_direct_subprocess_call(value, trusted_names_before)
+            and _call_arguments_are_passive(value)
+        ):
+            if not _call_arguments_are_protocol_safe(value, facts, protocol_safe_names):
+                facts.clear()
+                protocol_safe_names.clear()
+                return
+            resolved = None
+            protocol_safe_value = False
+        else:
+            resolved = _truth_value(value, facts)
+            if resolved is None and not _is_passive_argument(value):
+                facts.clear()
+                protocol_safe_names.clear()
+                return
+            protocol_safe_value = _is_protocol_safe_argument(value, protocol_safe_names)
+        for target in statement.targets:
+            assert isinstance(target, ast.Name)
+            if resolved is None:
+                facts.pop(target.id, None)
+            else:
+                facts[target.id] = resolved
+            if protocol_safe_value:
+                protocol_safe_names.add(target.id)
+            else:
+                protocol_safe_names.discard(target.id)
+        return
+    if isinstance(statement, ast.Expr):
+        value = statement.value
+        if (
+            isinstance(value, ast.Call)
+            and _is_direct_subprocess_call(value, trusted_names_before)
+            and _call_arguments_are_passive(value)
+            and _call_arguments_are_protocol_safe(value, facts, protocol_safe_names)
+        ) or isinstance(value, ast.Constant):
+            return
+        facts.clear()
+        protocol_safe_names.clear()
+        return
+    if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
+        return
+    facts.clear()
+    protocol_safe_names.clear()
 
 
 class _Analyzer:
@@ -824,20 +1409,49 @@ class _Analyzer:
         targets: list[ast.expr],
         value: ast.expr,
         facts: dict[str, bool],
+        protocol_safe_names: set[str],
         trusted_names: set[str],
     ) -> None:
         if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
             resolved = None
             safe_value = _call_arguments_are_passive(value)
+            protocol_safe_value = False
             if safe_value:
                 self._inspect_call(value, facts)
+                if not _call_arguments_are_protocol_safe(
+                    value,
+                    facts,
+                    protocol_safe_names,
+                ):
+                    # The receiver and argument expressions were resolved
+                    # safely, but subprocess may now dispatch ``__fspath__``,
+                    # mapping, iterator, or other hooks on supplied objects.
+                    facts.clear()
+                    protocol_safe_names.clear()
+                    trusted_names.clear()
+                    return
         else:
             resolved = _truth_value(value, facts)
             safe_value = resolved is not None or _is_passive_argument(value)
+            protocol_safe_value = _is_protocol_safe_argument(value, protocol_safe_names)
 
         if not safe_value or any(not isinstance(target, ast.Name) for target in targets):
+            preserves_receiver_trust = _expression_preserves_receiver_trust(
+                value,
+                trusted_names,
+                facts,
+                protocol_safe_names,
+            )
             facts.clear()
-            trusted_names.difference_update(_changed_direct_names([value, *targets], trusted_names))
+            protocol_safe_names.clear()
+            if any(not isinstance(target, ast.Name) for target in targets) or not (
+                preserves_receiver_trust
+            ):
+                trusted_names.clear()
+            else:
+                trusted_names.difference_update(
+                    _changed_direct_names([value, *targets], trusted_names)
+                )
             return
         for target in targets:
             assert isinstance(target, ast.Name)
@@ -845,6 +1459,10 @@ class _Analyzer:
                 facts.pop(target.id, None)
             else:
                 facts[target.id] = resolved
+            if protocol_safe_value:
+                protocol_safe_names.add(target.id)
+            else:
+                protocol_safe_names.discard(target.id)
             preserves_binding = (
                 isinstance(value, ast.Name) and value.id == target.id and value.id in trusted_names
             )
@@ -856,32 +1474,200 @@ class _Analyzer:
         statements: list[ast.stmt],
         *,
         trusted_names: set[str] | None = None,
+        initially_bound_names: set[str] | None = None,
     ) -> None:
         trusted_names = set(_DIRECT_CALL_NAMES if trusted_names is None else trusted_names)
+        initial_bound_names = set(initially_bound_names or ())
         facts: dict[str, bool] = {}
+        protocol_safe_names: set[str] = set()
+        bound_names = set(initial_bound_names)
+        finalizer_safe_names: set[str] = set()
+        effect_state = _BlockEffectState()
         last_invalidation_by_name: dict[str, int] = {}
+        receiver_trust = set(trusted_names)
+        prepass_facts: dict[str, bool] = {}
+        prepass_protocol_safe_names: set[str] = set()
+        prepass_bound_names = set(initial_bound_names)
+        prepass_finalizer_safe_names: set[str] = set()
+        prepass_effect_state = _BlockEffectState()
+        for candidate_index, candidate in enumerate(statements):
+            release_hazard = _statement_releases_unsafe_binding(
+                candidate,
+                prepass_bound_names,
+                prepass_finalizer_safe_names,
+            )
+            provenance_invalidated = release_hazard or _statement_requires_callable_barrier(
+                candidate,
+                receiver_trust,
+                prepass_facts,
+                prepass_protocol_safe_names,
+            )
+            before = set(receiver_trust)
+            _advance_trusted_names(
+                candidate,
+                receiver_trust,
+                prepass_facts,
+                prepass_protocol_safe_names,
+                prepass_bound_names,
+                prepass_finalizer_safe_names,
+                prepass_effect_state,
+            )
+            if release_hazard and not isinstance(candidate, (ast.Import, ast.ImportFrom)):
+                receiver_trust.clear()
+            _advance_value_provenance(
+                candidate,
+                prepass_facts,
+                prepass_protocol_safe_names,
+                before,
+            )
+            _advance_finalizer_provenance(
+                candidate,
+                prepass_bound_names,
+                prepass_finalizer_safe_names,
+                invalidated=provenance_invalidated,
+            )
+            if provenance_invalidated and not isinstance(candidate, (ast.Import, ast.ImportFrom)):
+                prepass_effect_state.arbitrary_effects_seen = True
+            for name in before.difference(receiver_trust):
+                last_invalidation_by_name[name] = candidate_index
 
         def last_invalidation(name: str) -> int:
-            cached = last_invalidation_by_name.get(name)
-            if cached is not None:
-                return cached
-            last = -1
+            return last_invalidation_by_name.get(name, -1)
+
+        def calls_before_invalidation() -> dict[int, set[str]]:
+            receiver_trust = set(trusted_names)
+            trusted_by_definition: dict[int, set[str]] = {}
+            active_functions: dict[str, int] = {}
+            prepass_facts: dict[str, bool] = {}
+            prepass_protocol_safe_names: set[str] = set()
+            prepass_bound_names = set(initial_bound_names)
+            prepass_finalizer_safe_names: set[str] = set()
+            prepass_effect_state = _BlockEffectState()
+            tracked_callable_names = {
+                candidate.name
+                for candidate in statements
+                if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+
             for candidate_index, candidate in enumerate(statements):
-                probe = {name}
-                _advance_trusted_names(candidate, probe)
-                if name not in probe:
-                    last = candidate_index
-            last_invalidation_by_name[name] = last
-            return last
+                if self._check_runtime is not None:
+                    self._check_runtime()
+                release_hazard = _statement_releases_unsafe_binding(
+                    candidate,
+                    prepass_bound_names,
+                    prepass_finalizer_safe_names,
+                )
+                callable_barrier = release_hazard or _statement_requires_callable_barrier(
+                    candidate,
+                    receiver_trust,
+                    prepass_facts,
+                    prepass_protocol_safe_names,
+                )
+
+                call = _passive_direct_call(candidate)
+                if call is not None:
+                    assert isinstance(call.func, ast.Name)
+                    owner = active_functions.get(call.func.id)
+                    if owner is not None:
+                        trusted_by_definition.setdefault(owner, set()).update(receiver_trust)
+
+                alias_owner: int | None = None
+                alias_names: list[str] = []
+                if (
+                    isinstance(candidate, ast.Assign)
+                    and isinstance(candidate.value, ast.Name)
+                    and all(isinstance(target, ast.Name) for target in candidate.targets)
+                ):
+                    alias_owner = active_functions.get(candidate.value.id)
+                    if alias_owner is not None:
+                        alias_names = [
+                            target.id
+                            for target in candidate.targets
+                            if isinstance(target, ast.Name)
+                        ]
+
+                if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef)) and not (
+                    _function_header_is_passive(candidate)
+                ):
+                    active_functions.clear()
+                changed_callable_names = _changed_direct_names(
+                    [candidate],
+                    tracked_callable_names,
+                )
+                if isinstance(candidate, ast.ClassDef):
+                    changed_callable_names.update(
+                        _class_body_changed_direct_names(candidate, tracked_callable_names)
+                    )
+                for name in changed_callable_names:
+                    active_functions.pop(name, None)
+
+                if alias_owner is not None:
+                    for name in alias_names:
+                        tracked_callable_names.add(name)
+                        active_functions[name] = alias_owner
+
+                if (
+                    isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and _function_header_is_passive(candidate)
+                    and _is_immediate_function(candidate)
+                ):
+                    active_functions[candidate.name] = candidate_index
+
+                if callable_barrier:
+                    active_functions.clear()
+                trusted_names_before = set(receiver_trust)
+                _advance_trusted_names(
+                    candidate,
+                    receiver_trust,
+                    prepass_facts,
+                    prepass_protocol_safe_names,
+                    prepass_bound_names,
+                    prepass_finalizer_safe_names,
+                    prepass_effect_state,
+                )
+                if release_hazard and not isinstance(candidate, (ast.Import, ast.ImportFrom)):
+                    receiver_trust.clear()
+                _advance_value_provenance(
+                    candidate,
+                    prepass_facts,
+                    prepass_protocol_safe_names,
+                    trusted_names_before,
+                )
+                _advance_finalizer_provenance(
+                    candidate,
+                    prepass_bound_names,
+                    prepass_finalizer_safe_names,
+                    invalidated=callable_barrier,
+                )
+                if callable_barrier and not isinstance(candidate, (ast.Import, ast.ImportFrom)):
+                    prepass_effect_state.arbitrary_effects_seen = True
+
+            return trusted_by_definition
+
+        trusted_at_call_by_definition = calls_before_invalidation()
 
         for index, statement in enumerate(statements):
             if self._check_runtime is not None:
                 self._check_runtime()
+            release_hazard = _statement_releases_unsafe_binding(
+                statement,
+                bound_names,
+                finalizer_safe_names,
+            )
+            provenance_invalidated = release_hazard or _statement_requires_callable_barrier(
+                statement,
+                trusted_names,
+                facts,
+                protocol_safe_names,
+            )
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 passive_header = _function_header_is_passive(statement)
-                nested_trusted_names = set(trusted_names)
+                trusted_at_call = trusted_at_call_by_definition.get(index, set())
+                nested_trusted_names = set(trusted_names).union(trusted_at_call)
                 nested_trusted_names = {
-                    name for name in nested_trusted_names if last_invalidation(name) <= index
+                    name
+                    for name in nested_trusted_names
+                    if last_invalidation(name) <= index or name in trusted_at_call
                 }
                 nested_trusted_names.difference_update(
                     _function_bound_direct_names(statement, nested_trusted_names)
@@ -889,26 +1675,42 @@ class _Analyzer:
                 nested_trusted_names.discard(statement.name)
                 if not passive_header:
                     nested_trusted_names.clear()
+                if release_hazard:
+                    # The function object is stored only after its header is
+                    # evaluated.  Releasing an opaque prior binding can then
+                    # mutate every global used by a later call to this body.
+                    nested_trusted_names.clear()
                 self._scan_block(
                     statement.body,
                     trusted_names=nested_trusted_names,
+                    initially_bound_names=_function_initial_bound_names(statement),
                 )
                 if passive_header:
                     facts.pop(statement.name, None)
+                    protocol_safe_names.discard(statement.name)
                 else:
                     facts.clear()
+                    protocol_safe_names.clear()
                     trusted_names.clear()
                 trusted_names.discard(statement.name)
             elif isinstance(statement, (ast.Import, ast.ImportFrom)):
                 # Import hooks execute arbitrary Python before bindings are
                 # committed, so no truth fact survives an import boundary.
                 facts.clear()
-                _update_trusted_names_from_import(statement, trusted_names)
+                protocol_safe_names.clear()
+                _update_trusted_names_from_import(
+                    statement,
+                    trusted_names,
+                    bound_names,
+                    finalizer_safe_names,
+                    effect_state,
+                )
             elif isinstance(statement, ast.Assign):
                 self._scan_assignment(
                     list(statement.targets),
                     statement.value,
                     facts,
+                    protocol_safe_names,
                     trusted_names,
                 )
             elif isinstance(statement, ast.AnnAssign):
@@ -923,37 +1725,80 @@ class _Analyzer:
                 ):
                     self._inspect_call(value, facts)
                 facts.clear()
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+                protocol_safe_names.clear()
+                trusted_names.clear()
             elif isinstance(statement, ast.AugAssign):
                 facts.clear()
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+                protocol_safe_names.clear()
+                trusted_names.clear()
             elif isinstance(statement, ast.Delete):
                 facts.clear()
-                trusted_names.difference_update(
-                    _changed_direct_names(list(statement.targets), trusted_names)
+                protocol_safe_names.clear()
+                if any(not isinstance(target, ast.Name) for target in statement.targets):
+                    trusted_names.clear()
+                else:
+                    trusted_names.difference_update(
+                        _changed_direct_names(list(statement.targets), trusted_names)
+                    )
+            elif isinstance(statement, ast.Expr):
+                value = statement.value
+                preserves_receiver_trust = _expression_preserves_receiver_trust(
+                    value,
+                    trusted_names,
+                    facts,
+                    protocol_safe_names,
                 )
-            elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
-                call = statement.value
-                if _is_direct_subprocess_call(call, trusted_names) and _call_arguments_are_passive(
-                    call
+                if (
+                    isinstance(value, ast.Call)
+                    and _is_direct_subprocess_call(value, trusted_names)
+                    and _call_arguments_are_passive(value)
                 ):
-                    self._inspect_call(call, facts)
+                    self._inspect_call(value, facts)
+                    if not _call_arguments_are_protocol_safe(
+                        value,
+                        facts,
+                        protocol_safe_names,
+                    ):
+                        facts.clear()
+                        protocol_safe_names.clear()
+                elif isinstance(value, ast.Constant):
+                    continue
                 else:
                     facts.clear()
-                    trusted_names.difference_update(_changed_direct_names([call], trusted_names))
-            elif isinstance(statement, ast.Pass) or (
-                isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
-            ):
+                    protocol_safe_names.clear()
+                if not preserves_receiver_trust:
+                    trusted_names.clear()
+            elif isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
                 continue
             elif isinstance(statement, ast.ClassDef):
                 facts.clear()
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
-                trusted_names.difference_update(
-                    _class_body_changed_direct_names(statement, trusted_names)
-                )
+                protocol_safe_names.clear()
+                if not _class_definition_is_passive(statement):
+                    trusted_names.clear()
+                else:
+                    trusted_names.difference_update(
+                        _changed_direct_names([statement], trusted_names)
+                    )
+                    trusted_names.difference_update(
+                        _class_body_changed_direct_names(statement, trusted_names)
+                    )
             else:
                 facts.clear()
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+                protocol_safe_names.clear()
+                trusted_names.clear()
+
+            if release_hazard and not isinstance(statement, (ast.Import, ast.ImportFrom)):
+                facts.clear()
+                protocol_safe_names.clear()
+                trusted_names.clear()
+            _advance_finalizer_provenance(
+                statement,
+                bound_names,
+                finalizer_safe_names,
+                invalidated=provenance_invalidated,
+            )
+            if provenance_invalidated and not isinstance(statement, (ast.Import, ast.ImportFrom)):
+                effect_state.arbitrary_effects_seen = True
 
     def run(self, tree: ast.Module) -> list[AnalyzerFinding]:
         self._scan_block(tree.body)

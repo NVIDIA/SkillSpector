@@ -39,6 +39,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
+from skillspector.python_ast import PythonSourceClassification, classify_python_source
 
 ARCHIVE_MAX_DEPTH = 3
 ARCHIVE_MAX_MEMBERS = 1_000
@@ -65,6 +66,7 @@ _EXECUTABLE_SUFFIXES = frozenset(
         ".pl",
         ".ps1",
         ".py",
+        ".pyw",
         ".pyc",
         ".pyo",
         ".rb",
@@ -95,6 +97,11 @@ class NestedInspectionResult:
     components: list[str] = field(default_factory=list)
     file_cache: dict[str, str] = field(default_factory=dict)
     raw_file_cache: dict[str, bytes] = field(default_factory=dict)
+    # Classify with the archive member's execution path, while retaining the
+    # virtual path as the stable cache/report key used by downstream analyzers.
+    python_source_classifications: dict[str, PythonSourceClassification] = field(
+        default_factory=dict
+    )
     artifact_inventory: list[ArtifactRecord] = field(default_factory=list)
     metadata: list[dict[str, object]] = field(default_factory=list)
     outer_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -387,14 +394,22 @@ def _record_outer_metadata(
     }
 
 
-def _virtual_type(path: str, data: bytes, nested_type: str | None) -> str:
+def _virtual_type(
+    path: str,
+    data: bytes,
+    nested_type: str | None,
+    source_classification: PythonSourceClassification,
+) -> str:
     if nested_type is not None:
         return nested_type
+    if source_classification is PythonSourceClassification.PYTHON:
+        return "python"
     suffix = Path(path).suffix.lower()
     return {
         ".md": "markdown",
         ".markdown": "markdown",
         ".py": "python",
+        ".pyw": "python",
         ".sh": "shell",
         ".bash": "shell",
         ".zsh": "shell",
@@ -944,10 +959,17 @@ def _inspect_zip_bytes(
             executable = _member_executable(info, safe_name, member_data)
             member_hidden = _is_hidden_path(safe_name)
             concealed = executable and bool(concealment_reasons)
-            virtual_type = _virtual_type(safe_name, member_data, nested_type)
+            source_classification = classify_python_source(safe_name, member_data)
+            virtual_type = _virtual_type(
+                safe_name,
+                member_data,
+                nested_type,
+                source_classification,
+            )
             result.components.append(virtual_path)
             result.file_cache[virtual_path] = member_data.decode("utf-8", errors="replace")
             result.raw_file_cache[virtual_path] = member_data
+            result.python_source_classifications[virtual_path] = source_classification
             result.artifact_inventory.append(classify_artifact(virtual_path, member_data))
             result.metadata.append(
                 {

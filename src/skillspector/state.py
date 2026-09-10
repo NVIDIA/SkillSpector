@@ -250,6 +250,12 @@ class SkillspectorState(TypedDict, total=False):
     local_file_cache: dict[str, str]
     # Raw bytes remain the canonical source for YARA and content classification.
     raw_file_cache: dict[str, bytes]
+    # Byte-derived Python execution identity shared by every analyzer branch.
+    python_source_classifications: dict[str, str]
+    # Paths whose Python applicability could not be resolved before the shared deadline.
+    python_source_classification_limitations: dict[str, str]
+    # Paths withheld from text/AST consumers after strict PEP 263 decode failure.
+    python_source_decode_failures: dict[str, str]
     # External-model consumers use the redacted projection for sensitive local files.
     llm_file_cache: dict[str, str]
     artifact_inventory: list[ArtifactRecord]
