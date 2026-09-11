@@ -310,8 +310,8 @@ class TestDetectSkills:
 
         result = detect_skills(tmp_path)
 
-        assert result.is_multi_skill is False
-        assert result.skills == []
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
         assert result.complete is False
         assert result.limitations[0].reason_code == "read_error"
         assert result.limitations[0].resource == "multi_skill_symlinked_entry"

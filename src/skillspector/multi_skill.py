@@ -231,10 +231,10 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
 
     A directory is considered multi-skill when it has no root ``SKILL.md`` and
     at least two immediate child directories contain a manifest or supported
-    structured skill bundle. Any discovery limit or filesystem ambiguity
-    discards all partial classifications and returns ``complete == False``.
-    Callers can then fall back to a bounded monolithic scan and propagate the
-    supplied limitation to their public completeness surfaces.
+    structured skill bundle. Discovery limits and filesystem ambiguities return
+    ``complete == False``. A symlinked immediate child is the narrow exception:
+    it is never traversed, but already classified non-link siblings remain
+    available for a bounded recursive scan with the supplied limitation.
     """
     absolute_directory = Path(os.path.abspath(directory))
     try:
@@ -273,12 +273,19 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
             return MultiSkillDetectionResult(is_multi_skill=False, has_root_skill=True)
 
         skills: list[SkillDirectory] = []
+        limitations: list[MultiSkillDetectionLimitation] = []
         for entry in _bounded_scandir(directory, budget=budget):
             budget.check_runtime()
             child = Path(entry.path)
             try:
                 if entry.is_symlink() or _is_link_or_junction(child):
-                    raise _read_error("multi_skill_symlinked_entry")
+                    limitations.append(
+                        MultiSkillDetectionLimitation(
+                            reason_code="read_error",
+                            resource="multi_skill_symlinked_entry",
+                        )
+                    )
+                    continue
                 if not entry.is_dir(follow_symlinks=False):
                     continue
             except OSError as exc:
@@ -310,6 +317,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
         is_multi_skill=len(skills) >= 2,
         skills=skills,
         has_root_skill=False,
+        limitations=tuple(limitations),
         entries_examined=budget.entries,
         structured_candidates_examined=budget.structured_candidates,
         structured_input_bytes_examined=budget.structured_bytes,
