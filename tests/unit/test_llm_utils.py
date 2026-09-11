@@ -755,9 +755,7 @@ class TestBedrockAvailabilityWithoutApiKey:
     made ``create_graph()`` drop every analyzer with ``requires_api_key``.
     """
 
-    def test_provider_is_authoritative_for_bedrock(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_provider_is_authoritative_for_bedrock(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
         assert provider_is_authoritative(get_metadata_provider()) is True
 
@@ -773,9 +771,7 @@ class TestBedrockAvailabilityWithoutApiKey:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
-        with patch(
-            "skillspector.llm_utils.create_chat_model", return_value=MagicMock()
-        ) as create:
+        with patch("skillspector.llm_utils.create_chat_model", return_value=MagicMock()) as create:
             ok, msg = is_llm_available()
         assert ok is True
         assert msg is None

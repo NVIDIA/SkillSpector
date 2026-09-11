@@ -53,7 +53,6 @@ from skillspector.providers import (
     get_active_provider,
     get_metadata_provider,
     has_cli_capability,
-    has_provider_binding,
     provider_is_authoritative,
     raise_no_llm_api_key_configured,
     resolve_chat_model_credentials,
