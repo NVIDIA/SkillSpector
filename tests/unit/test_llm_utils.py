@@ -51,11 +51,14 @@ from skillspector.llm_utils import (
 )
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
+    get_metadata_provider,
+    provider_is_authoritative,
     reset_provider,
     resolve_chat_model_credentials,
     resolve_provider_credentials,
     use_provider,
 )
+from skillspector.providers.bedrock import BEDROCK_DEFAULT_MODEL
 from skillspector.providers.nv_build import NvBuildProvider
 from skillspector.providers.openai import OpenAIProvider
 
@@ -739,3 +742,63 @@ class TestRunAsync:
         """Test run_async correctly handles async functions with await calls."""
         result = run_async(self._test_async_function(5, delay=0.01))
         assert result == 10
+
+
+class TestBedrockAvailabilityWithoutApiKey:
+    """Bedrock selected by env var must count as an available LLM.
+
+    Bedrock authenticates through the boto3 credential chain and returns
+    ``None`` from ``resolve_credentials()`` by design, so the API-key path
+    cannot see it. Before ``provider_is_authoritative`` was consulted here,
+    ``is_llm_available()`` fell through to that path and reported
+    ``NO_LLM_API_KEY_MESSAGE`` for a working Bedrock configuration — which
+    made ``create_graph()`` drop every analyzer with ``requires_api_key``.
+    """
+
+    def test_provider_is_authoritative_for_bedrock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        assert provider_is_authoritative(get_metadata_provider()) is True
+
+    def test_provider_is_not_authoritative_for_unbound_api_key_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The fallback behaviour this must not disturb: an unbound API-key
+        # provider is still judged on its credentials.
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "anthropic")
+        assert provider_is_authoritative(get_metadata_provider()) is False
+
+    def test_is_llm_available_true_for_bedrock_with_no_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        with patch(
+            "skillspector.llm_utils.create_chat_model", return_value=MagicMock()
+        ) as create:
+            ok, msg = is_llm_available()
+        assert ok is True
+        assert msg is None
+        # It must have probed the real chat-model path rather than asking for
+        # an API key.
+        assert create.call_count == 1
+
+    def test_is_llm_available_false_when_bedrock_cannot_build_a_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No AWS credentials: the probe fails, and the reported reason is the
+        # provider's own rather than a misleading "no API key".
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        with patch(
+            "skillspector.llm_utils.create_chat_model",
+            side_effect=ValueError("boto3 chain resolved nothing"),
+        ):
+            ok, msg = is_llm_available()
+        assert ok is False
+        assert msg == "boto3 chain resolved nothing"
+
+    def test_default_chat_model_resolves_for_bedrock_with_no_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        assert llm_utils._resolve_default_chat_model() == BEDROCK_DEFAULT_MODEL
