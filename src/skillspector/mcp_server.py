@@ -34,6 +34,7 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.inspection_ledger import LedgerReason
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.suppression import effective_findings
@@ -143,11 +144,26 @@ async def run_scan(
         execution_successful = bool(result.get("execution_successful", True))
         analysis_completeness = result.get("analysis_completeness") or {}
         entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
+        partially_inspected = int(analysis_completeness.get("partially_inspected_files", 0))
+        # An unresolved reference names a path the bundle does not carry, such
+        # as a file the skill writes at runtime. Every discovered file is still
+        # inspected, so on its own it hides no bytes and must not fail this
+        # gate; any other exceptional reason still does.
+        ledger_exceptions = analysis_completeness.get("ledger_exceptions") or []
+        reference_caveat_only = (
+            bool(ledger_exceptions)
+            and not analysis_completeness.get("limitations")
+            and all(
+                exception.get("reason_code") == LedgerReason.REFERENCE_UNRESOLVED
+                for exception in ledger_exceptions
+            )
+        )
         safe_to_install = (
             risk_score <= RISK_THRESHOLD
             and execution_successful
             and entirely_uninspected == 0
-            and bool(analysis_completeness.get("is_complete", True))
+            and partially_inspected == 0
+            and (bool(analysis_completeness.get("is_complete", True)) or reference_caveat_only)
         )
         return {
             "target": target,
