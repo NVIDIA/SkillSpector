@@ -48,6 +48,14 @@ dependencies = [
     "boto3>=1.34.0",
     "langsmith>=0.7.30",
     "yara-python>=4.5.0",
+    # Python 3.14 compat: jsonschema-rs (pulled in transitively via
+    # langgraph-cli[inmem] -> langgraph-api) only ships prebuilt cp314 wheels
+    # continuously from 0.40.4 onward. Releases 0.35.0-0.40.3 have no cp314
+    # wheels, so an unlocked fresh resolve could pick one and be force-built
+    # from source against an outdated pyo3 that does not support 3.14, breaking
+    # the install. langgraph-api caps jsonschema-rs at <0.45, so >=0.40.4 keeps
+    # a 3.14-compatible wheel while staying within the cap.
+    "jsonschema-rs>=0.40.4",
 ]
 
 [project.optional-dependencies]
