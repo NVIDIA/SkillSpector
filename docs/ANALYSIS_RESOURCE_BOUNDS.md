@@ -206,6 +206,8 @@ When relevant analysis is incomplete:
 - `skillspector scan --fail-on-incomplete` exits with status 1. Without this option, the CLI retains
   its compatibility behavior and still applies its ordinary risk-score exit policy. Execution
   failures exit with status 2.
+- `skillspector scan --min-coverage PERCENT` exits with status 1 when canonical coverage is below
+  `PERCENT`; equality passes and recursive scans evaluate each child.
 - MCP responses set `safe_to_install` to `false` when analysis is incomplete, any relevant file is
   entirely uninspected, execution failed, or the risk score exceeds the installation threshold.
 
