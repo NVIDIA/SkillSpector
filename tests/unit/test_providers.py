@@ -835,6 +835,52 @@ class TestAgentCLIProviderMetadata:
     """Shared model-registry behavior for supported agent CLI providers."""
 
     @pytest.mark.parametrize(
+        "provider_type", [ClaudeCLIProvider, CodexCLIProvider, GeminiCLIProvider]
+    )
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            "models: [test-model]\n",
+            "models:\n  test-model: 42\n",
+            "models:\n  test-model:\n    context_length: lots\n    max_output_tokens: lots\n",
+            "models:\n  test-model:\n    context_length: -1\n    max_output_tokens: -1\n",
+            "models:\n  test-model:\n    context_length: 0\n    max_output_tokens: 0\n",
+            "models:\n  test-model:\n    context_length: .inf\n    max_output_tokens: .inf\n",
+        ],
+        ids=["models-list", "scalar-entry", "bad-string", "negative", "zero", "infinite"],
+    )
+    def test_malformed_registry_returns_none(
+        self,
+        provider_type: type[ClaudeCLIProvider | CodexCLIProvider | GeminiCLIProvider],
+        contents: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(contents, encoding="utf-8")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = provider_type()
+        assert provider.get_context_length("test-model") is None
+        assert provider.get_max_output_tokens("test-model") is None
+
+    @pytest.mark.parametrize("invalid_field", ["context_length", "max_output_tokens"])
+    def test_invalid_budget_preserves_other_field(
+        self, invalid_field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        valid_field = "max_output_tokens" if invalid_field == "context_length" else "context_length"
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            f'models:\n  test-model:\n    {invalid_field}: lots\n    {valid_field}: "32000"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = ClaudeCLIProvider()
+        assert getattr(provider, f"get_{invalid_field}")("test-model") is None
+        assert getattr(provider, f"get_{valid_field}")("test-model") == 32_000
+
+    @pytest.mark.parametrize(
         "provider_type",
         [ClaudeCLIProvider, CodexCLIProvider, GeminiCLIProvider],
     )

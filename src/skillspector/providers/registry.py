@@ -53,7 +53,12 @@ def _load(yaml_path: str) -> dict[str, dict[str, Any]]:
     try:
         raw = Path(yaml_path).read_text(encoding="utf-8")
         data = yaml.safe_load(raw) or {}
-        return data.get("models") or {}
+        models = data.get("models")
+        if models is None:
+            return {}
+        if not isinstance(models, dict):
+            raise ValueError("model registry 'models' must be a mapping")
+        return models
     except Exception:
         logger.warning("Could not load model registry at %s", yaml_path, exc_info=True)
         return {}
@@ -67,18 +72,33 @@ def _resolve_path(default_yaml_path: str) -> str:
 
 def lookup_context_length(default_yaml_path: str, model: str) -> int | None:
     """Return ``context_length`` for *model* from the resolved YAML registry."""
-    entry = _load(_resolve_path(default_yaml_path)).get(model)
-    if entry and entry.get("context_length"):
-        return int(entry["context_length"])
-    return None
+    return _lookup_token_limit(default_yaml_path, model, "context_length")
 
 
 def lookup_max_output_tokens(default_yaml_path: str, model: str) -> int | None:
     """Return ``max_output_tokens`` for *model* from the resolved YAML registry."""
-    entry = _load(_resolve_path(default_yaml_path)).get(model)
-    if entry and entry.get("max_output_tokens"):
-        return int(entry["max_output_tokens"])
-    return None
+    return _lookup_token_limit(default_yaml_path, model, "max_output_tokens")
+
+
+def _lookup_token_limit(default_yaml_path: str, model: str, field: str) -> int | None:
+    """Read a positive budget, falling back for malformed entries or values."""
+    yaml_path = _resolve_path(default_yaml_path)
+    entry = _load(yaml_path).get(model)
+    if entry is None:
+        return None
+    try:
+        if not isinstance(entry, dict):
+            raise ValueError("model registry entry must be a mapping")
+        value = entry.get(field)
+        if value is None:
+            return None
+        limit = int(value)
+        if limit <= 0:
+            raise ValueError("model token budget must be positive")
+        return limit
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Invalid %s for model %s in registry %s", field, model, yaml_path)
+        return None
 
 
 # Back-compat alias for tests that previously called ``_load_registry``.
