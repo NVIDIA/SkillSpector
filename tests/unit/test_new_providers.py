@@ -49,6 +49,8 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
         "AZURE_OPENAI_API_VERSION",
         "SKILLSPECTOR_COMPAT_API_KEY",
         "SKILLSPECTOR_COMPAT_BASE_URL",
+        "SKILLSPECTOR_TEMPERATURE",
+        "SKILLSPECTOR_SEED",
     ):
         monkeypatch.delenv(key, raising=False)
     registry._load.cache_clear()
@@ -169,6 +171,27 @@ class TestAzureOpenAIProvider:
         llm = AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024)
         assert isinstance(llm, AzureChatOpenAI)
         assert llm.openai_api_version == "2025-01-01"
+
+    def test_sampling_controls_are_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_azure_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(
+            "skillspector.providers.azure_openai.provider.AzureChatOpenAI",
+            fake_azure_chat_openai,
+        )
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://myorg.openai.azure.com/")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "7")
+
+        AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024)
+
+        assert captured["temperature"] == 0.2
+        assert captured["seed"] == 7
 
     def test_default_model(self) -> None:
         assert AzureOpenAIProvider().resolve_model() == "gpt-4o"

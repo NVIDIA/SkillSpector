@@ -35,13 +35,16 @@ from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MODEL_CONFIG
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
+from skillspector.providers.openai import OpenAIProvider
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import (
+    DEFAULT_MAX_WORKFLOW_SECONDS,
     MAX_WORKFLOW_ARTIFACTS,
     MAX_WORKFLOW_BYTES,
     MAX_WORKFLOW_SECONDS,
     SkillspectorState,
     WorkflowResourceBudget,
+    _workflow_max_seconds_from_environment,
 )
 
 _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
@@ -179,12 +182,29 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
 
     budget = result["workflow_resource_budget"]
     assert isinstance(budget, WorkflowResourceBudget)
-    assert budget.max_seconds == MAX_WORKFLOW_SECONDS == 60.0
+    assert DEFAULT_MAX_WORKFLOW_SECONDS == 600.0
+    assert budget.max_seconds == MAX_WORKFLOW_SECONDS
     assert budget.max_bytes == MAX_WORKFLOW_BYTES == 64 * 1024 * 1024
     assert budget.max_artifacts == MAX_WORKFLOW_ARTIFACTS == 10_000
     assert budget.started_at is not None
     assert budget.scanned_bytes == len(payload)
     assert budget.scanned_artifacts == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("120", 120.0),
+        ("0.5", 0.5),
+        ("0", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("-1", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("nan", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("not-a-number", DEFAULT_MAX_WORKFLOW_SECONDS),
+    ],
+)
+def test_workflow_budget_seconds_environment_parsing(value: str | None, expected: float) -> None:
+    assert _workflow_max_seconds_from_environment(value) == expected
 
 
 def test_build_context_reuses_supplied_stricter_transitive_budget(tmp_path: Path) -> None:
@@ -582,6 +602,23 @@ def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
     assert result["model_config"]["meta_analyzer"] == "bound-meta"
 
 
+def test_build_context_model_config_matches_openai_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in (
+        "SKILLSPECTOR_PROVIDER",
+        "SKILLSPECTOR_MODEL",
+        "NVIDIA_INFERENCE_KEY",
+        "NVIDIA_INFERENCE_METADATA_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["model_config"]["default"] == OpenAIProvider.DEFAULT_MODEL
+
+
 def test_build_context_inventories_but_excludes_valid_root_oms_signature(
     tmp_path: Path,
 ) -> None:
@@ -872,6 +909,39 @@ def test_build_context_parses_allowed_tools_comma_string(tmp_path: Path) -> None
     state: SkillspectorState = {"skill_path": str(tmp_path)}
     result = build_context(state)
     assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
+
+
+def test_build_context_parses_allowed_tools_space_string(tmp_path: Path) -> None:
+    """`allowed-tools` space-separated string form is normalized to a list."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: Bash Read\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash", "Read"]
+
+
+def test_build_context_parses_allowed_tools_mixed_whitespace(tmp_path: Path) -> None:
+    """`allowed-tools` string with mixed whitespace (multiple spaces) is normalized."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: Bash  Read   Write\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash", "Read", "Write"]
+
+
+def test_build_context_parses_allowed_tools_single_space_string(tmp_path: Path) -> None:
+    """`allowed-tools` single tool as space-separated string yields one item."""
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: deployer\ndescription: deploys services\nallowed-tools: Bash\n---\n",
+        encoding="utf-8",
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+    assert result["manifest"]["allowed-tools"] == ["Bash"]
 
 
 def test_build_context_reports_exclusion_boundary_without_descendants(tmp_path: Path) -> None:

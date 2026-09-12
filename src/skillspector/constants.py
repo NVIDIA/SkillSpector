@@ -18,7 +18,7 @@
 import logging
 import os
 
-from skillspector.providers import get_metadata_provider
+from skillspector.providers import get_metadata_provider, get_model_config_provider
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +74,8 @@ def _resolve_slot_model(slot: str, provider=None) -> str:
 
 
 def build_model_config() -> dict[str, str]:
-    """Resolve the model map for the currently active provider."""
-    provider = get_metadata_provider()
+    """Resolve the model map for the provider that will build chat models."""
+    provider = get_model_config_provider()
     return {slot: _resolve_slot_model(slot, provider) for slot in _MODEL_SLOTS}
 
 

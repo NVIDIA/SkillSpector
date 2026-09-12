@@ -51,6 +51,8 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
     registry._load.cache_clear()
     yield
     registry._load.cache_clear()
@@ -242,6 +244,28 @@ class TestBedrockProviderCreateChatModel:
         )
 
         assert "provider" not in mock_chat.call_args.kwargs
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_temperature_is_forwarded_without_openai_seed(
+        self,
+        mock_session: MagicMock,
+        mock_chat: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.3")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        BedrockProvider().create_chat_model(
+            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            max_tokens=1024,
+        )
+
+        kwargs = mock_chat.call_args.kwargs
+        assert kwargs["temperature"] == 0.3
+        assert "seed" not in kwargs
 
 
 class TestBedrockProviderSelection:

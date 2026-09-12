@@ -1,7 +1,52 @@
-### Unreleased
+### 2.11.2 (Thursday, September 10, 2026)
+### Features/Bug Fixes
+* fix: prevent duplicate reference coverage from causing fatal scan-accounting errors (#507)
+* fix: avoid false shell-parser limits on ordinary documentation (#507)
+* fix: preserve partial coverage for runtime-selected printf and wrapper paths (#508)
+---
+### 2.11.1 (Monday, September 07, 2026)
+### Features/Bug Fixes
+* fix: parse space-separated allowed-tools strings (fixes #327) (#330)
+* fix(security): normalize concealed instruction text (#408)
+* fix(llm): bound total in-flight LLM requests, not one analyzer's fan-out (#401)
+* fix: preserve finding classification during deduplication (#462)
+* feat: make workflow deadline configurable (#468)
+---
+### 2.11.0 (Friday, August 28, 2026)
+### Features/Bug Fixes
+* feat: analyze bundled permission grants (#429)
+* feat(supply-chain): resolve npm dependencies through the lockfile (#344)
+* feat(providers): add LLM sampling controls (#427)
+* fix(provider): align OpenAI fallback model config (#325)
+* fix(input-handler): traverse ancestors with O_PATH where available (#443)
+* fix(analyzers): avoid nominal MP3 and P6 matches (#453)
+* docs(cli): list all supported LLM providers (#432)
+---
+### 2.10.0 (Wednesday, August 26, 2026)
 ### Features/Bug Fixes
 * Inspect hidden and nested ZIP-compatible artifacts under cumulative safety bounds.
 * Report HIGH SC9 findings for executables concealed in documents or hidden/disguised artifacts.
+* feat(scan): add opt-in transitive reference scanning (#225)
+* feat(analyzer): add phase-1 structured skill summaries (#211)
+* feat(analyzer): detect external model and provider selection as EA5 (#426)
+* feat(llm): support configurable human-readable output language (#425)
+* feat(report): expose the highest reported issue severity (#398)
+* feat: dynamically discover analyzers and validate risk-score inputs (#74)
+* fix(security): strengthen bounded inspection and fail-closed completeness handling (#393)
+* fix(report): mark partial or unavailable requested LLM analysis as degraded (#291) (#362)
+* fix(cli): report only the findings that drove the risk score (#375)
+* fix(cli): normalize multi-skill risk scores before aggregate exit-code checks (#368)
+* fix(scanner): preserve eligible findings from SKILL.md files (#381)
+* fix(cli,supply-chain): parse package.json as JSON and send fatal errors to stderr (#323)
+* fix(analyzer): detect whitespace variants and all os.environ read forms for E2 (1d379dc)
+* fix(analyzers): reduce false positives across AE3, AE4, EA1, EA3, E5, PE3, and TM4 (#237) (#328) (#415) (#417) (#422)
+* fix(pe3): require credential-store operations instead of flagging bare keyring or keychain nouns (#424)
+* fix(scan): exclude inactive Git hook samples from executable analysis (#412)
+* fix(nv_build): update the default served model and its token limits (#390) (#391)
+* fix(lp1): tailor least-privilege remediation to the manifest type (#402)
+* fix(provider): preserve the original custom CLI-provider call contract for ordinary scans
+* build: move LangGraph Studio tooling to the langgraph-dev optional extra (550b9f0)
+* ci: keep eligible pull-request branches current after main changes (#376)
 ---
 ### 2.9.6 (Tuesday, August 18, 2026)
 ### Features/Bug Fixes
