@@ -329,6 +329,28 @@ class TestOpenAIProvider:
 class TestAnthropicProvider:
     """Anthropic provider — Claude credentials + bundled YAML metadata."""
 
+    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5-1", "claude-fable-5"])
+    def test_structured_output_method_is_json_schema_for_registry_models(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize("model", ["claude-fable-6", "claude-mythos-7-2"])
+    def test_structured_output_method_falls_back_to_the_family_prefix(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-5", "gpt-5.4"]
+    )
+    def test_structured_output_method_is_default_elsewhere(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) is None
+
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-4-8"]
+    )
+    def test_current_generation_models_carry_token_limits(self, model: str) -> None:
+        provider = AnthropicProvider()
+        assert provider.get_context_length(model) == 1_000_000
+        assert provider.get_max_output_tokens(model) == 128_000
+
     def test_returns_none_without_env_var(self) -> None:
         assert AnthropicProvider().resolve_credentials() is None
 

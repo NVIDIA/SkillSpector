@@ -327,3 +327,16 @@ class TestProviderSelection:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-fallback")
         llm = create_chat_model("gpt-5.4", max_tokens=1024)
         assert isinstance(llm, ChatOpenAI)
+
+
+class TestAnthropicProxyProviderStructuredOutput:
+    """Proxy provider mirrors the native provider's structured-output hint."""
+
+    def test_json_schema_for_models_that_reject_forced_tool_calls(self) -> None:
+        assert (
+            AnthropicProxyProvider().structured_output_method("claude-fable-5-1") == "json_schema"
+        )
+        assert AnthropicProxyProvider().structured_output_method("claude-mythos-9") == "json_schema"
+
+    def test_default_for_other_models(self) -> None:
+        assert AnthropicProxyProvider().structured_output_method("claude-sonnet-4-6") is None

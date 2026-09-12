@@ -39,6 +39,9 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
+# Families that reject a forced tool call (HTTP 400); they need the JSON-schema response format.
+JSON_SCHEMA_ONLY_MODEL_PREFIXES = ("claude-fable-", "claude-mythos-")
+
 
 class AnthropicProvider:
     """Anthropic credentials + bundled-YAML metadata provider."""
@@ -93,3 +96,10 @@ class AnthropicProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > ``DEFAULT_MODEL``."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method for *model*: registry entry, then family prefix, else ``None``."""
+        declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
+        if declared:
+            return declared
+        return "json_schema" if model.startswith(JSON_SCHEMA_ONLY_MODEL_PREFIXES) else None

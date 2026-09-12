@@ -7,6 +7,7 @@
 #     "<model-label>":
 #       context_length: <int>          # total context window in tokens (required)
 #       max_output_tokens: <int>       # model's max output cap (optional)
+#       structured_output: json_schema # when the model rejects a forced tool call (optional)
 #
 # Bare Anthropic API model IDs (no provider prefix) — Anthropic accepts
 # these directly.  Same models served by NvInferenceProvider; sourced
@@ -24,3 +25,34 @@ models:
   "claude-opus-4-6":
     context_length: 1000000
     max_output_tokens: 128000
+
+  "claude-opus-4-7":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-opus-4-8":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-sonnet-5":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-opus-5":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-fable-5":
+    context_length: 1000000
+    max_output_tokens: 128000
+    structured_output: json_schema
+
+  "claude-fable-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    structured_output: json_schema
+
+  "claude-mythos-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    structured_output: json_schema
