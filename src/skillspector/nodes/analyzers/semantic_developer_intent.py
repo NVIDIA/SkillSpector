@@ -30,6 +30,7 @@ from skillspector.llm_analyzer_base import (
     BatchFailure,
     LLMAnalyzerBase,
     LLMRuntimeLimitError,
+    _compact_prompts_enabled,
     ledger_events_for_batches,
 )
 from skillspector.llm_utils import run_async
@@ -160,6 +161,47 @@ Use rule ID **SDI-4** for all intent-code-divergence findings.
   (e.g. MCP schema violations, regex-detected patterns).
 """
 
+_COMPACT_ANALYZER_PROMPT = """\
+You are a developer-intent auditor for AI agent skills. Detect mismatches \
+between what a skill *claims* to do and what it *actually* does, plus \
+capabilities unjustified by its stated purpose.
+
+Skill manifest context:
+{manifest_section}
+
+Use the exact rule IDs. Reference L-prefixed line numbers.
+
+| Rule ID | Detection |
+|---------|-----------|
+| SDI-1   | Description-behavior mismatch |
+| SDI-2   | Context-inappropriate capability |
+| SDI-3   | Scope creep beyond declared permissions |
+| SDI-4   | Intent-code divergence (comments contradict code) |
+
+### SDI-1  Description-Behavior Mismatch
+Manifest description claims limited scope but code does more.
+Examples: "summarize text" but sends HTTP requests; "local file reader" but modifies remote resources.
+Do NOT flag obviously expected implementation details (e.g. "web search" making HTTP requests).
+
+### SDI-2  Context-Inappropriate Capability
+Code implements capabilities unjustified by stated purpose.
+Examples: "text formatter" spawning subprocesses; "calendar reminder" reading credentials.
+Do NOT flag if the capability is a direct requirement of the stated purpose or explicitly declared.
+
+### SDI-3  Scope Creep
+Code accesses/modifies more than declared permissions cover.
+Examples: permissions say "read:files" but code writes; no network permissions but code makes HTTP calls.
+Do NOT flag if behavior matches declared permissions or no permissions section exists.
+
+### SDI-4  Intent-Code Divergence
+Comments/docstrings actively contradict code behavior.
+Examples: docstring says "no side effects" but function writes to disk; "# read-only" above a delete.
+Do NOT flag merely incomplete comments or minor implementation details.
+
+Skip behavior obviously expected for the skill's purpose. Focus on semantic \
+mismatches, not static patterns already covered by other analyzers.
+"""
+
 
 def _format_manifest(manifest: dict) -> str:
     """Format manifest dict into a readable string for the prompt."""
@@ -246,7 +288,8 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         (lambda: transitive_remaining_seconds(state)) if shared_remaining is not None else None
     )
     try:
-        prompt = ANALYZER_PROMPT.format(manifest_section=_format_manifest(manifest))
+        base = _COMPACT_ANALYZER_PROMPT if _compact_prompts_enabled() else ANALYZER_PROMPT
+        prompt = base.format(manifest_section=_format_manifest(manifest))
         analyzer = LLMAnalyzerBase(
             base_prompt=prompt,
             model=model,
