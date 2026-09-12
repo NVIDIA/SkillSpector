@@ -631,7 +631,7 @@ def scan(
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
                 "detected. Scanning as single skill."
             )
@@ -644,7 +644,7 @@ def scan(
                 "with a bounded scan and reporting partial coverage."
             )
         if detection.is_multi_skill:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
@@ -1864,7 +1864,9 @@ def _scan_skill(
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
     if verbose:
-        console.print("[dim]Running scan...[/dim]")
+        (err_console if format == FormatChoice.json else console).print(
+            "[dim]Running scan...[/dim]"
+        )
     logger.debug(
         "Scan started: input_path=%s, format=%s, use_llm=%s, transitive=%s",
         input_path,
@@ -2081,7 +2083,10 @@ def _scan_multi_skill(
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
-    console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
+    status_console = err_console if format == FormatChoice.json and output is None else console
+    status_console.print(
+        f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n"
+    )
 
     shared_transitive_cache: dict[str, _CachedTransitiveResult] = {}
     shared_transitive_traversal = _TransitiveTraversalState(
@@ -2130,7 +2135,7 @@ def _scan_multi_skill(
             analysis_incomplete = True
             aggregate_limitations.extend(shared_transitive_traversal.truncation_reasons)
             break
-        console.print(
+        status_console.print(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
         try:
@@ -2204,7 +2209,7 @@ def _scan_multi_skill(
             for source in _coerce_str_path_list(result.get("transitive_sources")):
                 transitive_sources.add(source)
             severity = result.get("risk_severity") or "LOW"
-            console.print(f"         Score: {score}/100 ({severity})\n")
+            status_console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
             error_message = str(e)[:1_024]
             err_console.print(f"         [red]Error:[/red] {error_message}\n")
@@ -2230,33 +2235,35 @@ def _scan_multi_skill(
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
 
-    console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
-    console.print(
+    status_console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
+    status_console.print(
         f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10} {'Execution':<10}"
     )
-    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
+    status_console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
 
     for skill, result in zip(processed_skills, results, strict=True):
         if "error" in result:
-            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}")
+            status_console.print(
+                f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}"
+            )
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
         finding_count = len(effective_findings(result))
         execution = "failed" if result.get("execution_successful") is False else "successful"
-        console.print(
+        status_console.print(
             f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
         )
     if omitted_skill_count:
-        console.print(
+        status_console.print(
             f"  {'<omitted>':<30} {'—':<8} {'—':<12} {omitted_skill_count:<10} {'partial':<10}"
         )
-        console.print(
+        status_console.print(
             "[yellow]Recursive scan incomplete:[/yellow] one or more skills were omitted "
             "after an aggregate safety limit."
         )
 
-    if output and format == FormatChoice.json:
+    if format == FormatChoice.json:
         combined: dict[str, object] = {
             "multi_skill": True,
             "skill_count": len(skills),
@@ -2346,8 +2353,11 @@ def _scan_multi_skill(
             }
             rendered = json.dumps(combined, indent=2)
         _ensure_recursive_output_bound(rendered)
-        Path(output).write_text(rendered, encoding="utf-8")
-        console.print(f"[green]Combined report saved to:[/green] {output}")
+        if output:
+            Path(output).write_text(rendered, encoding="utf-8")
+            console.print(f"[green]Combined report saved to:[/green] {output}")
+        else:
+            print(rendered)
     elif output and format == FormatChoice.sarif:
         merged_sarif = _multi_skill_sarif_report(
             processed_skills,
