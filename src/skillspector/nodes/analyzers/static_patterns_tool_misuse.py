@@ -31,10 +31,17 @@ from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    LINE_BREAK_CHARS,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+    get_context,
+    get_line_number,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -1450,6 +1457,9 @@ def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
 def _has_shell_command_word_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    structural_quote_closers: set[int] | None = None,
+    structural_quote_openers: set[int] | None = None,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound."""
     parsed_through = 0
@@ -1459,7 +1469,14 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
-        if start < parsed_through or not _is_shell_command_word_start(content, start):
+        if structural_quote_closers is not None and start in structural_quote_closers:
+            continue
+        json_string_start = structural_quote_openers is not None and (
+            start in structural_quote_openers or start - 1 in structural_quote_openers
+        )
+        if start < parsed_through or (
+            not json_string_start and not _is_shell_command_word_start(content, start)
+        ):
             continue
         if _has_quoted_assignment_prefix(content, start):
             continue
@@ -2115,12 +2132,375 @@ def _tm1_candidates(
             yield command_start, command_end, command, 0.9
 
 
+def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
+    """Recognize Setext underlines/thematic breaks with bounded, linear work."""
+    line = line.strip(" \t")
+    marker = line[:1]
+    if marker not in {"=", "-", "*", "_"}:
+        return False
+    count = 0
+    internal_gap = False
+    for index, character in enumerate(line):
+        if index % 256 == 0:
+            check_runtime()
+        if character == marker:
+            count += 1
+        elif character in " \t" and marker != "=":
+            internal_gap = True
+        else:
+            return False
+    return count >= (3 if internal_gap or marker in {"*", "_"} else 1)
+
+
+def _markdown_table_cells(
+    line: str, start: int, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Locate GFM cells without copying content or changing source offsets."""
+    end = len(line)
+    while start < end and line[start] in " \t":
+        if start % 256 == 0:
+            check_runtime()
+        start += 1
+    while end > start and line[end - 1] in " \t":
+        if end % 256 == 0:
+            check_runtime()
+        end -= 1
+    if start == end:
+        return []
+    # Edge pipes are optional. In cmark-gfm a backslash immediately before a
+    # pipe escapes it even when that backslash follows another backslash.
+    if line[start] == "|":
+        start += 1
+    if line[end - 1] == "|" and (end == 1 or line[end - 2] != "\\"):
+        end -= 1
+    if start > end:
+        return []
+    cells: list[tuple[int, int]] = []
+    cell_start = start
+    for cursor in range(start, end):
+        if (cursor - start) % 256 == 0:
+            check_runtime()
+        if line[cursor] == "|" and (cursor == start or line[cursor - 1] != "\\"):
+            cells.append((cell_start, cursor))
+            cell_start = cursor + 1
+    cells.append((cell_start, end))
+    return cells
+
+
+def _markdown_table_delimiter_columns(
+    line: str, minimum_indent: int, check_runtime: Callable[[], None]
+) -> int | None:
+    """Prove a compatible delimiter row under the existing container scope."""
+    line = line.rstrip(LINE_BREAK_CHARS)
+    prefix = 0
+    column = 0
+    while prefix < len(line) and line[prefix] in " \t":
+        if prefix % 256 == 0:
+            check_runtime()
+        column += 4 - column % 4 if line[prefix] == "\t" else 1
+        prefix += 1
+    if column < minimum_indent or column >= 4 or prefix == len(line):
+        return None
+    if line[prefix] not in "|:-":
+        return None
+    # A new list item or a bare Setext/thematic underline takes precedence
+    # over table recognition, including a pipe-bearing preceding header.
+    if (
+        line[prefix] == "-" and prefix + 1 < len(line) and line[prefix + 1] in " \t"
+    ) or _markdown_block_separator(line, check_runtime):
+        return None
+    cells = _markdown_table_cells(line, prefix, check_runtime)
+    if not cells:
+        return None
+    for start, end in cells:
+        check_runtime()
+        while start < end and line[start] in " \t":
+            if start % 256 == 0:
+                check_runtime()
+            start += 1
+        while end > start and line[end - 1] in " \t":
+            if end % 256 == 0:
+                check_runtime()
+            end -= 1
+        if start < end and line[start] == ":":
+            start += 1
+        hyphen_start = start
+        while start < end and line[start] == "-":
+            if (start - hyphen_start) % 256 == 0:
+                check_runtime()
+            start += 1
+        if start == hyphen_start:
+            return None
+        if start < end and line[start] == ":":
+            start += 1
+        if start != end:
+            return None
+    return len(cells)
+
+
+def _markdown_shell_text(
+    content: str, check_runtime: Callable[[], None], *, complete_context: bool = True
+) -> str:
+    """Mask Markdown delimiters while retaining code and exact source offsets.
+
+    Inline code delimiters are not legacy shell substitutions. Fenced and
+    indented code stays literal; longer inline delimiters preserve backticks
+    inside their bodies. Pair equal-length runs in linear time.
+    """
+    output = list(content)
+    runs: list[tuple[int, int]] = []
+    list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
+    backtick_runs = re.compile(r"`+")
+
+    def mask_inline_delimiters() -> None:
+        if not complete_context:
+            runs.clear()
+            return
+        next_by_length: dict[int, int] = {}
+        closing: dict[int, int] = {}
+        for index in range(len(runs) - 1, -1, -1):
+            check_runtime()
+            start, end = runs[index]
+            length = end - start
+            if length in next_by_length:
+                closing[index] = next_by_length[length]
+            next_by_length[length] = index
+        index = 0
+        while index < len(runs):
+            check_runtime()
+            start, end = runs[index]
+            escape_start = start
+            while escape_start > 0 and content[escape_start - 1] == "\\":
+                escape_start -= 1
+            close_index = closing.get(index)
+            if (start - escape_start) % 2 or close_index is None:
+                index += 1
+                continue
+            close_start, close_end = runs[close_index]
+            output[start:end] = " " * (end - start)
+            output[close_start:close_end] = " " * (close_end - close_start)
+            index = close_index + 1
+        runs.clear()
+
+    # This is a conservative projection, not a general Markdown renderer.
+    # Container/HTML bodies with uncertain inline ownership remain literal.
+    fence: tuple[str, int, int] | None = None
+    quoted_block = False
+    html_end: str | None = None
+    paragraph_open = False
+    paragraph_in_list = False
+    paragraph_list_indent = 0
+    table_columns: int | None = None
+    table_minimum_indent = 0
+    table_delimiter_line = -1
+    offset = 0
+    lines = content.splitlines(keepends=True)
+    for line_index, line in enumerate(lines):
+        check_runtime()
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        leading = stripped.lstrip(" \t")
+        indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        # Interpret list padding in columns, preserving the original offsets.
+        # More than four columns after a marker can introduce indented code.
+        prefix = len(stripped) - len(leading)
+        column = indentation
+        list_indented = False
+        has_list_marker = False
+        list_markers = 0
+        if indentation < 4:
+            while marker := list_marker.match(stripped, prefix):
+                check_runtime()
+                if (
+                    not has_list_marker
+                    and paragraph_open
+                    and not paragraph_in_list
+                    and marker[0][0].isdigit()
+                    and int(marker[0][:-1]) != 1
+                ):
+                    # Only a list starting at 1 can interrupt a paragraph.
+                    # Other numbers may be literal text within an inline span.
+                    break
+                has_list_marker = True
+                list_markers += 1
+                column += marker.end() - prefix
+                prefix = marker.end()
+                padding_start = column
+                while prefix < len(stripped) and stripped[prefix] in " \t":
+                    check_runtime()
+                    column += 4 - column % 4 if stripped[prefix] == "\t" else 1
+                    prefix += 1
+                if column - padding_start > 4:
+                    list_indented = True
+                    break
+            leading = stripped[prefix:]
+        quote_start = indentation < 4 and leading.startswith(">")
+        heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
+        separator = indentation < 4 and _markdown_block_separator(stripped, check_runtime)
+        setext_only = separator and (leading.startswith("=") or leading.rstrip(" \t") == "--")
+        empty_list_item = (
+            not paragraph_open and re.fullmatch(r"(?:[-+*]|[0-9]{1,9}[.)])", leading) is not None
+        )
+        if table_columns is not None and setext_only:
+            # A table row has no paragraph for a Setext underline to close.
+            # Single '-' still starts an empty item; '---' remains thematic.
+            separator = False
+        html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
+        continuing_paragraph = False
+        if table_columns is not None and (
+            html_end is not None
+            or fence is not None
+            or quote_start
+            or quoted_block
+            or html_open
+            or not leading
+            or indentation >= 4
+            or indentation < table_minimum_indent
+            or list_indented
+            or has_list_marker
+            or empty_list_item
+            or heading
+            or separator
+        ):
+            table_columns = None
+        if html_end is not None:
+            mask_inline_delimiters()
+            if (html_end and html_end in leading.lower()) or (not html_end and not leading):
+                html_end = None
+        elif fence is not None:
+            fence_body = stripped.lstrip(" \t")
+            closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(fence_body)
+            if (
+                closing_fence
+                and 0 <= indentation - fence[2] <= 3
+                and closing_fence[1][0] == fence[0]
+                and len(closing_fence[1]) >= fence[1]
+            ):
+                begin, end = closing_fence.span(1)
+                body_start = offset + len(stripped) - len(fence_body)
+                output[body_start + begin : body_start + end] = " " * (end - begin)
+                fence = None
+        elif quote_start or quoted_block:
+            mask_inline_delimiters()
+            quoted_block = bool(leading)
+        elif html_open:
+            mask_inline_delimiters()
+            raw_tag = re.match(r"<(pre|script|style|textarea)(?=[\s/>]|$)", leading, re.I)
+            terminator = (
+                f"</{raw_tag[1].lower()}>"
+                if raw_tag
+                else "-->"
+                if leading.startswith("<!--")
+                else "?>"
+                if leading.startswith("<?")
+                else "]]>"
+                if leading.startswith("<![CDATA[")
+                else ">"
+                if re.match(r"<![A-Z]", leading)
+                else ""
+            )
+            html_end = None if terminator and terminator in leading.lower() else terminator
+        elif not leading or indentation >= 4 or list_indented:
+            mask_inline_delimiters()
+        else:
+            # Inline code may continue within a paragraph/list item, but cannot
+            # pair with delimiters in a new item, heading, or following block.
+            if has_list_marker or heading or separator:
+                mask_inline_delimiters()
+            # The body after any list markers can begin a fenced block.
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
+            if opening:
+                mask_inline_delimiters()
+                fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
+                begin, end = opening.span(1)
+                output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
+            else:
+                minimum_indent = (
+                    column if has_list_marker else paragraph_list_indent if paragraph_in_list else 0
+                )
+                if (
+                    table_columns is None
+                    and not heading
+                    and not empty_list_item
+                    and (not separator or setext_only and not paragraph_open)
+                    and list_markers <= 1
+                    and (has_list_marker or indentation >= minimum_indent)
+                    and line_index + 1 < len(lines)
+                ):
+                    columns = _markdown_table_delimiter_columns(
+                        lines[line_index + 1], minimum_indent, check_runtime
+                    )
+                    if (
+                        columns is not None
+                        and len(_markdown_table_cells(stripped, prefix, check_runtime)) == columns
+                    ):
+                        # Establish the header boundary before pairing any
+                        # opener from the preceding paragraph with this row.
+                        mask_inline_delimiters()
+                        # A Setext-looking line at a fresh block boundary is
+                        # a header only after the next row proves that role.
+                        separator = False
+                        table_columns = columns
+                        table_minimum_indent = minimum_indent
+                        table_delimiter_line = line_index + 1
+                if table_columns is not None:
+                    mask_inline_delimiters()
+                    if line_index != table_delimiter_line:
+                        cells = _markdown_table_cells(stripped, prefix, check_runtime)
+                        for cell_index, (cell_start, cell_end) in enumerate(cells):
+                            if cell_index >= table_columns:
+                                # GFM drops excess body cells: no rendered
+                                # inline node can grant ownership to their ticks.
+                                break
+                            for match in backtick_runs.finditer(stripped, cell_start, cell_end):
+                                check_runtime()
+                                runs.append((offset + match.start(), offset + match.end()))
+                            mask_inline_delimiters()
+                        if not cells:
+                            table_columns = None
+                elif not separator and not empty_list_item:
+                    for match in backtick_runs.finditer(line):
+                        check_runtime()
+                        runs.append((offset + match.start(), offset + match.end()))
+                    if heading:
+                        mask_inline_delimiters()
+                    else:
+                        continuing_paragraph = True
+                        paragraph_in_list = has_list_marker or paragraph_in_list
+                        if has_list_marker:
+                            paragraph_list_indent = column
+        paragraph_open = continuing_paragraph
+        if not paragraph_open:
+            paragraph_in_list = False
+            paragraph_list_indent = 0
+        offset += len(line)
+    mask_inline_delimiters()
+    return "".join(output)
+
+
 def has_bounded_parse_exhaustion(
     content: str,
     check_runtime: Callable[[], None],
+    *,
+    file_type: str = "shell",
+    complete_context: bool = True,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
-    if _has_shell_command_word_exhaustion(content, check_runtime):
+    structural_quote_closers = None
+    structural_quote_openers = None
+    json_strings: list[tuple[int, int]] = []
+    raw_content = content
+    if file_type == "markdown":
+        if complete_context:
+            json_strings = validated_json_string_spans(content, check_runtime)
+            structural_quote_closers = {end - 1 for _, end in json_strings}
+            structural_quote_openers = {start for start, _ in json_strings}
+        content = _markdown_shell_text(content, check_runtime, complete_context=complete_context)
+    if _has_shell_command_word_exhaustion(
+        content,
+        check_runtime,
+        structural_quote_closers=structural_quote_closers,
+        structural_quote_openers=structural_quote_openers,
+    ):
         return True
     covered_until = 0
     for command_start, body_start in _destructive_command_words(content):
@@ -2139,6 +2519,22 @@ def has_bounded_parse_exhaustion(
         )
         covered_until = max(covered_until, command_end)
         if exhausted or _has_unsupported_brace_expansion(tokens):
+            return True
+    # A literal candidate outside a JSON string can consume it before the
+    # whole-content parser reaches its structural opener. Recover each proven
+    # string independently, without bypassing that parser's forward watermark
+    # and reparsing overlapping suffixes. These raw spans are disjoint and
+    # bounded by JSON validation; their projection retains both outer quotes
+    # and escaped bytes while preserving ordinary inline-code documentation.
+    for start, end in json_strings:
+        check_runtime()
+        projected = _markdown_shell_text(raw_content[start:end], check_runtime)
+        if _has_shell_command_word_exhaustion(
+            projected,
+            check_runtime,
+            structural_quote_openers={0},
+            structural_quote_closers={len(projected) - 1},
+        ):
             return True
     return False
 
