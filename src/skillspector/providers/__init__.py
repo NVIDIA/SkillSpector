@@ -30,6 +30,7 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     ollama            → OllamaProvider               (local Ollama instance)
     azure_openai      → AzureOpenAIProvider          (Azure OpenAI Service)
     openai_compatible → OpenAICompatibleProvider     (Groq, Together AI, Mistral, etc.)
+    gemini            → GeminiProvider               (Google Cloud ADC / Workload Identity)
     claude_cli        → ClaudeCLIProvider            (local ``claude`` binary, no API key)
     codex_cli         → CodexCLIProvider             (local ``codex`` binary, no API key)
     gemini_cli        → GeminiCLIProvider            (local ``gemini`` binary, no API key)
@@ -133,6 +134,10 @@ def _select_active_provider() -> LLMProvider:
         from .openai_compatible import OpenAICompatibleProvider
 
         return OpenAICompatibleProvider()
+    if name == "gemini":
+        from .gemini import GeminiProvider
+
+        return GeminiProvider()
     if name == "nv_build":
         return NvBuildProvider()
     if name == "claude_cli":
@@ -164,7 +169,7 @@ def _select_active_provider() -> LLMProvider:
     raise ValueError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
         "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
-        "ollama, azure_openai, openai_compatible, "
+        "ollama, azure_openai, openai_compatible, gemini, "
         "claude_cli, codex_cli, gemini_cli, antigravity_cli (or unset)."
     )
 
@@ -216,20 +221,25 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
 def get_model_config_provider() -> ModelMetadataProvider:
     """Return the provider whose model defaults match graph chat-model routing.
 
-    Explicit bindings, CLI providers, and Bedrock's native AWS credential path
-    remain authoritative. Unbound API-key providers use OpenAI metadata only
-    when their own credentials are absent and the OpenAI fallback is configured.
+    Explicit bindings, CLI providers, Bedrock's native AWS credential path,
+    and Gemini's ADC path remain authoritative. Unbound API-key providers use
+    OpenAI metadata only when their own credentials are absent and the OpenAI
+    fallback is configured.
     """
     provider = _select_active_provider()
     from .bedrock import BedrockProvider
+    from .gemini import GeminiProvider
 
     if (
         has_provider_binding()
         or has_cli_capability(provider)
-        or isinstance(provider, BedrockProvider)
+        or isinstance(provider, (BedrockProvider, GeminiProvider))
     ):
         return provider
-    if provider.resolve_credentials() is not None:
+    try:
+        if provider.resolve_credentials() is not None:
+            return provider
+    except ValueError:
         return provider
 
     fallback = _openai_fallback_provider()

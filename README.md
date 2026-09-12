@@ -237,6 +237,7 @@ inference gateways.
 | `anthropic_proxy` | `ANTHROPIC_PROXY_API_KEY` + `ANTHROPIC_PROXY_ENDPOINT_URL` | Any Vertex-style raw-predict proxy | `claude-sonnet-4-6` |
 | `bedrock` | `AWS_PROFILE` (optional) + `AWS_REGION` — SigV4 via boto3 | AWS Bedrock Runtime | `us.anthropic.claude-sonnet-4-6-20250915-v1:0` |
 | `nv_build` | `NVIDIA_INFERENCE_KEY` | build.nvidia.com | `deepseek-ai/deepseek-v4-flash` |
+| `gemini` | `GOOGLE_CLOUD_PROJECT` (+ optional `GOOGLE_CLOUD_LOCATION`) via ADC | Google Cloud OpenAI-compatible Gemini endpoint | `gemini-3.8-flash` |
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 
@@ -273,6 +274,31 @@ skillspector scan ./my-skill/
 # NVIDIA build.nvidia.com
 export SKILLSPECTOR_PROVIDER=nv_build
 export NVIDIA_INFERENCE_KEY=nvapi-...
+skillspector scan ./my-skill/
+
+# Gemini on Google Cloud (Application Default Credentials / Workload Identity)
+# Prerequisites:
+#   1. Google Cloud project with billing enabled.
+#   2. Enable Gemini Enterprise Agent Platform / Vertex AI API: `aiplatform.googleapis.com`.
+#   3. IAM permission: grant `roles/aiplatform.user` (or at minimum `aiplatform.endpoints.predict`)
+#      to your user account or Kubernetes service account.
+#   4. Local authentication: run `gcloud auth application-default login`.
+#      Configure a quota project if needed: `gcloud auth application-default set-quota-project PROJECT_ID`.
+#   5. Kubernetes / GKE: configure Workload Identity and leave GOOGLE_APPLICATION_CREDENTIALS unset
+#      rather than exporting service account keys.
+# Note on Data Residency:
+#   The default `global` endpoint does not support data-residency requirements. While you can target
+#   `us`, `eu`, or regional endpoints (e.g. `us-central1`), endpoint selection alone does not guarantee
+#   data residency or in-region processing without appropriate organizational policies. Always verify
+#   that your selected model is supported in your target location.
+# Optional credentials:
+#   GOOGLE_APPLICATION_CREDENTIALS is optional and can reference Workload or Workforce Identity Federation
+#   configuration files; exporting long-lived service account keys is discouraged.
+export SKILLSPECTOR_PROVIDER=gemini
+export GOOGLE_CLOUD_PROJECT=my-project-id
+# export GOOGLE_CLOUD_LOCATION=global  # default is global; or us, eu, or specific region (e.g. us-central1)
+# Default model: gemini-3.8-flash
+# export SKILLSPECTOR_MODEL=gemini-3.7-flash
 skillspector scan ./my-skill/
 
 # Local Claude CLI — no API key; uses your existing `claude auth login` session
@@ -581,7 +607,10 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `claude_cli`, `codex_cli`, or `gemini_cli`. Hosted providers use bundled `model_registry.yaml` defaults; `claude_cli` and `codex_cli` fall back to the local CLI runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `gemini`, `claude_cli`, `codex_cli`, or `gemini_cli`. Hosted providers use bundled `model_registry.yaml` defaults; `claude_cli` and `codex_cli` fall back to the local CLI runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to the NVIDIA path (`nv_inference`, falling back to `nv_build` in OSS builds). | Optional |
+| `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID for the `gemini` provider. Authenticates via Google Cloud Application Default Credentials (ADC) or GKE Workload Identity. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=gemini` |
+| `GOOGLE_CLOUD_LOCATION` | Google Cloud location for the `gemini` provider endpoint (e.g. `global`, `us`, `eu`, `us-central1`). Defaults to `global`. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Optional path to ADC credential/config file (e.g. Workload or Workforce Identity Federation config; exported service account keys are discouraged). For local development, use `gcloud auth application-default login`; for GKE, use Workload Identity. | Optional (used when `SKILLSPECTOR_PROVIDER=gemini`) |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |

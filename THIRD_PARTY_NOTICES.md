@@ -72,6 +72,12 @@ and project URL.
 - **Copyright:** Copyright (c) 2007-2022 The YARA Authors
 - **URL:** https://github.com/VirusTotal/yara-python
 
+### google-auth
+
+- **License:** Apache-2.0
+- **Copyright:** Copyright 2014 Google Inc.
+- **URL:** https://github.com/googleapis/google-auth-library-python
+
 ---
 
 ## License Texts
