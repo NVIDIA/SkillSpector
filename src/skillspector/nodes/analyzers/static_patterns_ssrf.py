@@ -113,7 +113,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         rule_id: str, message: str, severity: Severity, patterns: list[tuple[str, float]]
     ) -> None:
         for pattern, confidence in patterns:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            for match in static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            ):
                 if rule_id == "SSRF1" and _is_defensive_reference(content, match):
                     continue
                 line_num = get_line_number(content, match.start())

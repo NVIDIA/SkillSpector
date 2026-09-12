@@ -2104,7 +2104,9 @@ def _tm1_candidates(
     content: str,
 ) -> Iterator[tuple[int, int, str, float]]:
     for pattern, confidence in TM1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             yield match.start(), match.end(), match.group(0), confidence
 
     seen_commands: set[tuple[int, int]] = set()
@@ -2602,7 +2604,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
     for pattern, confidence in TM2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
@@ -2626,7 +2630,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in TM3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -2642,7 +2648,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     # TM4: privileged K8s workload. Example filtering is delegated to the runner.
     for pattern, confidence in TM4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
