@@ -730,7 +730,7 @@ class TestHelpers:
 
     @pytest.mark.parametrize("payload", ["not base64", "not base64 é"])
     def test_malformed_extra_encoded_rule_does_not_block_builtin_rules(self, tmp_path, payload):
-        (tmp_path / "bad.yar.b64").write_text(payload)
+        (tmp_path / "bad.yar.b64").write_text(payload, encoding="utf-8")
 
         findings = _run(_reverse_shell_fixture(), "shell.sh", str(tmp_path))
 
