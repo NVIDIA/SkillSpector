@@ -1455,6 +1455,9 @@ def _project_manifest(
             raise _ManifestSchemaError(type(description).__name__)
         _consume(description)
         manifest["description"] = description
+    version = data.get("version")
+    if version is not None:
+        manifest["version"] = _scalar_text(version)
 
     manifest["triggers"] = _string_list(data.get("triggers", []))
     manifest["permissions"] = _string_list(data.get("permissions", []))
@@ -1515,8 +1518,9 @@ def _parse_manifest(
 ) -> dict[str, object]:
     """Parse SKILL.md or skill.md YAML frontmatter into a manifest dict.
 
-    Returns dict with name, description, triggers (list), permissions (list),
-    allowed-tools (list), parameters (list). Returns {} if no file or parse fails.
+    Returns dict with name, description, version, triggers (list), permissions
+    (list), allowed-tools (list), parameters (list). Returns {} if no file or
+    parse fails.
     Parsing is restricted to a bounded byte prefix, including for direct helper
     callers that do not provide the bundle's already-bounded raw cache.
     """
