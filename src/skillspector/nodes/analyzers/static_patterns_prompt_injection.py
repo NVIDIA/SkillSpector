@@ -22,7 +22,7 @@ import re
 import sys
 from collections.abc import Iterator
 
-from skillspector.artifacts import _is_emoji_base
+from skillspector.artifacts import _is_emoji_base, prompt_injection_letter_spacing_view
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -290,36 +290,66 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         matched_text=match.group(0)[:200],
                     )
                 )
-    for pattern, confidence in P3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
-            findings.append(
-                AnalyzerFinding(
-                    rule_id="P3",
-                    message="Exfiltration Commands",
-                    severity=Severity.HIGH,
-                    location=loc(line_num),
-                    confidence=confidence,
-                    tags=tag,
-                    context=ctx(match.start()),
-                    matched_text=match.group(0)[:200],
+    prompt_rules = (
+        ("P3", "Exfiltration Commands", Severity.HIGH, P3_PATTERNS),
+        ("P4", "Behavior Manipulation", Severity.MEDIUM, P4_PATTERNS),
+    )
+    seen_prompt_matches: set[tuple[str, int, int]] = set()
+    for rule_id, message, severity, patterns in prompt_rules:
+        for pattern, confidence in patterns:
+            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                source_start = match.start()
+                source_end = match.end()
+                seen_prompt_matches.add((rule_id, source_start, source_end))
+                findings.append(
+                    AnalyzerFinding(
+                        rule_id=rule_id,
+                        message=message,
+                        severity=severity,
+                        location=loc(get_line_number(content, source_start)),
+                        confidence=confidence,
+                        tags=tag,
+                        context=ctx(source_start),
+                        matched_text=match.group(0)[:200],
+                    )
                 )
-            )
-    for pattern, confidence in P4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
-            findings.append(
-                AnalyzerFinding(
-                    rule_id="P4",
-                    message="Behavior Manipulation",
-                    severity=Severity.MEDIUM,
-                    location=loc(line_num),
-                    confidence=confidence,
-                    tags=tag,
-                    context=ctx(match.start()),
-                    matched_text=match.group(0)[:200],
-                )
-            )
+
+    # This projection is intentionally local to P3/P4. Other static rules keep
+    # their established text-view contract and cannot inherit classifications
+    # from letter-spacing reconstruction.
+    prompt_view = prompt_injection_letter_spacing_view(content)
+    if prompt_view.source_offsets is not None:
+        for rule_id, message, severity, patterns in prompt_rules:
+            for pattern, confidence in patterns:
+                for match in re.finditer(
+                    pattern,
+                    prompt_view.text,
+                    re.IGNORECASE | re.MULTILINE,
+                ):
+                    source_start = prompt_view.source_offset(match.start())
+                    source_end = prompt_view.source_offset(max(match.start(), match.end() - 1)) + 1
+                    key = (rule_id, source_start, source_end)
+                    if key in seen_prompt_matches:
+                        continue
+                    seen_prompt_matches.add(key)
+                    evidence: dict[str, object] = (
+                        {static_runner._VIEW_START_EVIDENCE: source_start}
+                        if source_end - source_start <= static_runner._WINDOW_OVERLAP_CHARS
+                        else {}
+                    )
+                    findings.append(
+                        AnalyzerFinding(
+                            rule_id=rule_id,
+                            message=message,
+                            severity=severity,
+                            location=loc(get_line_number(content, source_start)),
+                            confidence=confidence,
+                            tags=tag,
+                            context=ctx(source_start),
+                            matched_text=match.group(0)[:200],
+                            evidence=evidence,
+                        )
+                    )
 
     # P2 (extended): Unicode Tag-block "ASCII smuggling". Runs regardless of
     # file_type — invisible instructions are dangerous in scripts and config
