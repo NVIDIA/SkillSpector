@@ -1,0 +1,5 @@
+networkx>=3.0
+fastapi>=0.110
+uvicorn>=0.27
+jinja2>=3.1
+pyyaml>=6.0; python_version >= "3.9"

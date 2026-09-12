@@ -28,9 +28,17 @@ from __future__ import annotations
 # Rule IDs from LLM-based semantic analyzers — inherently multilingual.
 _SEMANTIC_RULES: frozenset[str] = frozenset(
     {
-        "SSD1", "SSD2", "SSD3", "SSD4",
-        "SDI1", "SDI2", "SDI3", "SDI4",
-        "SQP1", "SQP2", "SQP3",
+        "SSD1",
+        "SSD2",
+        "SSD3",
+        "SSD4",
+        "SDI1",
+        "SDI2",
+        "SDI3",
+        "SDI4",
+        "SQP1",
+        "SQP2",
+        "SQP3",
         "TP4",
     }
 )
@@ -44,13 +52,39 @@ _GAP_FILL_RULES: frozenset[str] = frozenset(
 # Rule IDs from code-level analyzers — language-independent by design.
 _CODE_RULES: frozenset[str] = frozenset(
     {
-        "AST1", "AST2", "AST3", "AST4", "AST5", "AST6", "AST7", "AST8",
-        "TT1", "TT2", "TT3", "TT4", "TT5",
-        "YR1", "YR2", "YR3", "YR4",
-        "SC1", "SC2", "SC3", "SC4", "SC5", "SC6",
-        "LP1", "LP2", "LP3", "LP4",
-        "TP1", "TP2", "TP3",
-        "TM1", "TM2", "TM3",
+        "AST1",
+        "AST2",
+        "AST3",
+        "AST4",
+        "AST5",
+        "AST6",
+        "AST7",
+        "AST8",
+        "TT1",
+        "TT2",
+        "TT3",
+        "TT4",
+        "TT5",
+        "YR1",
+        "YR2",
+        "YR3",
+        "YR4",
+        "SC1",
+        "SC2",
+        "SC3",
+        "SC4",
+        "SC5",
+        "SC6",
+        "LP1",
+        "LP2",
+        "LP3",
+        "LP4",
+        "TP1",
+        "TP2",
+        "TP3",
+        "TM1",
+        "TM2",
+        "TM3",
     }
 )
 
@@ -60,12 +94,27 @@ _CODE_RULES: frozenset[str] = frozenset(
 # when the detected language is non-English.
 _ENGLISH_KEYWORD_RULES: frozenset[str] = frozenset(
     {
-        "P1", "P2", "P3", "P4",
-        "E1", "E2", "E3", "E4",
-        "PE1", "PE2", "PE3",
-        "EA1", "EA2", "EA3", "EA4",
-        "OH1", "OH2", "OH3",
-        "TR1", "TR2", "TR3",
+        "P1",
+        "P2",
+        "P3",
+        "P4",
+        "E1",
+        "E2",
+        "E3",
+        "E4",
+        "PE1",
+        "PE2",
+        "PE3",
+        "EA1",
+        "EA2",
+        "EA3",
+        "EA4",
+        "OH1",
+        "OH2",
+        "OH3",
+        "TR1",
+        "TR2",
+        "TR3",
     }
 )
 
