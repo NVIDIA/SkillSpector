@@ -56,13 +56,15 @@ rule php_webshell_known
         $c99v2    = "c99_sess_put" nocase
         $r57      = "r57shell" nocase
         $wso      = "Web Shell by oRb" nocase
-        $wso2     = "WSO " nocase
+        $wso_ex   = "wsoEx(" ascii
+        $wso_ver  = "WSO_VERSION" ascii
+        $wso_sec  = "wsoSecParam" ascii
         $b374k    = "b374k" nocase
         $alfa     = "STARTER ALFA" nocase
         $weevely  = "weevely" nocase
         $p0wny    = "p0wny" nocase
         $antsword = "antSword" nocase
-        $behinder = "behinder" nocase
+        $behinder_key = { 65 34 35 65 33 32 39 66 65 62 35 64 39 32 35 62 } // AES key, md5("rebeyond")[:16]
         $godzilla = "GodzillaShell" nocase
         $china_chopper = "China Chopper" nocase
     condition:
