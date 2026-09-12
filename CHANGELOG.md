@@ -1,3 +1,9 @@
+### 2.11.2 (Thursday, September 10, 2026)
+### Features/Bug Fixes
+* fix: prevent duplicate reference coverage from causing fatal scan-accounting errors (#507)
+* fix: avoid false shell-parser limits on ordinary documentation (#507)
+* fix: preserve partial coverage for runtime-selected printf and wrapper paths (#508)
+---
 ### 2.11.1 (Monday, September 07, 2026)
 ### Features/Bug Fixes
 * fix: parse space-separated allowed-tools strings (fixes #327) (#330)
