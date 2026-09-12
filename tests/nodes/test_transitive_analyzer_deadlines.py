@@ -17,6 +17,8 @@ from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.mcp_server import run_scan
 from skillspector.models import AnalyzerFinding, Finding, Location, Severity
 from skillspector.nodes.analyzers import (
+    behavioral_ast,
+    behavioral_taint_tracking,
     mcp_tool_poisoning,
     semantic_developer_intent,
     semantic_quality_policy,
@@ -25,6 +27,7 @@ from skillspector.nodes.analyzers import (
 )
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.meta_analyzer import meta_analyzer
+from skillspector.python_ast import PythonSourceClassification
 from skillspector.state import WorkflowResourceBudget
 
 
@@ -164,6 +167,24 @@ def test_default_build_budget_is_shared_with_downstream_analyzers(tmp_path) -> N
     assert result["analyzer_status_events"][0]["status"] == "degraded"
 
 
+@pytest.mark.parametrize("analyzer", [behavioral_ast, behavioral_taint_tracking])
+def test_behavioral_deadline_excludes_cached_non_python_work(analyzer: object) -> None:
+    state = {
+        "components": ["notes.md", "script.py"],
+        "local_file_cache": {"notes.md": "# Notes\n", "script.py": "pass\n"},
+        "python_source_classifications": {
+            "notes.md": "non_python",
+            "script.py": "python",
+        },
+        "workflow_resource_budget": _expired_workflow_budget(),
+    }
+
+    result = analyzer.node(state)  # type: ignore[attr-defined]
+
+    assert [event["path"] for event in result["inspection_ledger"]] == ["script.py"]
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.RUNTIME_LIMIT
+
+
 def test_static_per_artifact_runtime_is_minimum_of_local_and_shared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,6 +205,39 @@ def test_static_per_artifact_runtime_is_minimum_of_local_and_shared(
     assert reason is LedgerReason.RUNTIME_LIMIT
     assert metrics["limit_seconds"] == pytest.approx(0.5)
     analyze.assert_not_called()
+
+
+def test_static_classification_time_is_not_subtracted_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = SimpleNamespace(
+        ANALYZER_ID="deadline_static",
+        USES_PYTHON_SOURCE_TYPE=True,
+        analyze=MagicMock(return_value=[]),
+    )
+    state = {
+        "components": ["runner"],
+        "file_cache": {"runner": "#!/usr/bin/env python3\npass\n"},
+    }
+    scan = MagicMock(return_value=([], None, {}))
+    monkeypatch.setattr(
+        static_runner,
+        "transitive_remaining_seconds",
+        MagicMock(side_effect=[1.0, 0.6]),
+    )
+    monkeypatch.setattr(
+        static_runner,
+        "resolve_python_source_classification",
+        MagicMock(return_value=PythonSourceClassification.PYTHON),
+    )
+    monkeypatch.setattr(static_runner, "_scan_all_views_detailed", scan)
+    monkeypatch.setattr(static_runner.time, "monotonic", MagicMock(side_effect=[0.0, 0.7]))
+
+    result = static_runner.run_static_patterns_with_ledger(state, [module])
+
+    assert scan.call_args.kwargs["started_at"] == 0.0
+    assert scan.call_args.kwargs["timeout_seconds"] == 1.0
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
 @pytest.mark.parametrize(
