@@ -114,3 +114,165 @@ class TestEA1GenuineWildcardStillFlagged:
             "markdown",
         )
         assert any(f.rule_id == "EA1" for f in findings)
+
+
+class TestEA1FootnoteAndPreColonNotFlagged:
+    """Remaining false-positive paths from #444: a footnote legend after a
+    'Tools:' label, and a blank-line gap before the colon."""
+
+    def test_footnote_legend_after_tools_label_not_flagged(self) -> None:
+        findings = ea_module.analyze(
+            "Tools: * = requires authentication\n",
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_footnote_prose_after_tools_label_not_flagged(self) -> None:
+        findings = ea_module.analyze(
+            "Tools: * marks optional parameters\n",
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_blank_line_before_definition_list_colon_not_flagged(self) -> None:
+        """The gap before the colon must stay on one line too — a markdown
+        definition list two paragraphs later is not a grant."""
+        findings = ea_module.analyze(
+            "several tools\n\n: * item\n",
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_bare_wildcard_with_trailing_comment_still_flagged(self) -> None:
+        """A '#' comment after the bare wildcard is still a grant, not prose."""
+        findings = ea_module.analyze(
+            "tools: * # allow everything\n",
+            "SKILL.md",
+            "markdown",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+
+class TestEA1BlockListAndJsonFormsFlagged:
+    """Detection gaps from #445: the idiomatic YAML block-list and JSON
+    quoted-key encodings of a wildcard grant."""
+
+    def test_yaml_block_list_quoted_wildcard_flagged(self) -> None:
+        findings = ea_module.analyze(
+            'tools:\n  - "*"\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_yaml_block_list_bare_wildcard_flagged(self) -> None:
+        findings = ea_module.analyze(
+            "tools:\n  - *\n",
+            "SKILL.md",
+            "markdown",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_yaml_block_list_zero_indent_flagged(self) -> None:
+        findings = ea_module.analyze(
+            'permissions:\n- "*"\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_json_quoted_key_list_wildcard_flagged(self) -> None:
+        findings = ea_module.analyze(
+            '"tools": ["*"]\n',
+            "config.json",
+            "json",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_json_quoted_key_scalar_wildcard_flagged(self) -> None:
+        findings = ea_module.analyze(
+            '"permissions": "*"\n',
+            "config.json",
+            "json",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_inline_list_wildcard_not_first_flagged(self) -> None:
+        findings = ea_module.analyze(
+            'tools: ["search", "*"]\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_markdown_dash_list_of_bold_tools_not_flagged(self) -> None:
+        """The block-list branch must not collide with a markdown list of
+        specific bolded tool names."""
+        findings = ea_module.analyze(
+            "Tools:\n- **Read**\n- **Write**\n",
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_blank_line_before_dash_item_not_flagged(self) -> None:
+        """A blank line between the key and a dash item breaks the block-list
+        association — the cross-paragraph bridge from #405 must not return."""
+        findings = ea_module.analyze(
+            'tools:\n\n  - "*"\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+
+class TestEA1NestedObjectArgumentNotFlagged:
+    """A '*' nested inside an explicit tool object is an argument value for a
+    specifically named tool, not a wildcard grant — the wildcard must be a
+    top-level list element."""
+
+    def test_json_tool_object_with_wildcard_argument_not_flagged(self) -> None:
+        findings = ea_module.analyze(
+            'tools: [{"name": "grep", "pattern": "*"}]\n',
+            "config.json",
+            "json",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_yaml_flow_tool_object_with_wildcard_argument_not_flagged(self) -> None:
+        findings = ea_module.analyze(
+            'tools: [{name: search, glob: "*"}]\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_top_level_wildcard_after_named_element_still_flagged(self) -> None:
+        """Narrowing to top-level elements must not lose the plain mixed list."""
+        findings = ea_module.analyze(
+            'tools: ["search", "*"]\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_nested_array_wildcard_not_flagged(self) -> None:
+        """A '*' inside a nested array is not a top-level tool-list element."""
+        findings = ea_module.analyze(
+            'tools: ["search", ["grep", "*"]]\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_json_tool_object_with_nested_arguments_not_flagged(self) -> None:
+        """A '*' buried in a named tool's argument object is not a grant."""
+        findings = ea_module.analyze(
+            '"tools": [{"name": "search", "arguments": {"glob": "*"}}]\n',
+            "config.json",
+            "json",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
