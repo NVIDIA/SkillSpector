@@ -16,11 +16,12 @@
 """Tests for the Skillspector LangGraph workflow."""
 
 import json
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-from skillspector.graph import graph
+from skillspector.graph import create_graph, graph
 
 
 def test_graph_invoke_with_output_format_json(tmp_path: Path) -> None:
@@ -189,7 +190,14 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
         "skillspector.nodes.analyzers.mcp_tool_poisoning._TP4Analyzer", FailingTP4Analyzer
     )
 
-    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"})
+    # Build after configuring availability so the mocked semantic transports
+    # are exercised even when the test environment has no provider credentials.
+    monkeypatch.setattr(
+        import_module("skillspector.graph"), "is_llm_available", lambda: (True, None)
+    )
+    result = create_graph().invoke(
+        {"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"}
+    )
 
     log = result["llm_call_log"]
     assert log, "expected LLM telemetry records"
