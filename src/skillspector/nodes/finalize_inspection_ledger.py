@@ -94,14 +94,66 @@ def _reference_coverage_findings(
     return findings
 
 
+def _size_coverage_findings(
+    state: SkillspectorState,
+    covered_paths: set[str],
+) -> list[Finding]:
+    """Create AE7 for artifacts truncated by the per-file size cap.
+
+    A file too large to fully analyze must not be able to produce a
+    zero-finding report: the unreviewed region is itself the finding.
+    Scoped to the per-file cap (``size_limit``); aggregate budget
+    exhaustion already fails closed through the completeness projection.
+    Paths already reported by AE1 (referenced artifacts) are skipped.
+    """
+    findings: list[Finding] = []
+    for item in state.get("artifact_inventory") or []:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("disposition", "")) != "partial":
+            continue
+        if str(item.get("reason", "")) != LedgerReason.SIZE_LIMIT.value:
+            continue
+        if str(item.get("path", "")) in covered_paths:
+            continue
+        path = str(item.get("path", ""))
+        size_bytes = item.get("size_bytes", 0)
+        findings.append(
+            Finding(
+                rule_id="AE7",
+                message=(
+                    "File exceeds the analyzable size limit; trailing content was not inspected"
+                ),
+                severity="HIGH",
+                confidence=1.0,
+                file=path,
+                start_line=1,
+                category="analysis-evasion",
+                tags=["coverage", "size-limit"],
+                finding=f"{path} ({size_bytes} bytes, partially inspected)"[:200],
+                matched_text=path,
+                remediation=(
+                    "Keep analyzable files under the per-file size limit, or "
+                    "split oversized content so every byte can be inspected."
+                ),
+            )
+        )
+    return findings
+
+
 def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
     """Validate full internal facts and derive the public completeness projection."""
     reference_findings = _reference_coverage_findings(state)
+    size_findings = _size_coverage_findings(
+        state,
+        covered_paths={str(finding.matched_text or "") for finding in reference_findings},
+    )
+    coverage_findings = [*reference_findings, *size_findings]
     # Work IDs are scoped to analyzer, source file and line range. Distinct
     # targets on one line must share a terminal row with all emitted findings.
-    reference_ids_by_line: dict[tuple[str, int | None], list[str]] = {}
-    for finding in reference_findings:
-        reference_ids_by_line.setdefault((finding.file, finding.start_line), []).append(
+    coverage_ids_by_line: dict[tuple[str, int | None], list[str]] = {}
+    for finding in coverage_findings:
+        coverage_ids_by_line.setdefault((finding.file, finding.start_line), []).append(
             finding.finding_id
         )
     reference_events: list[InspectionLedgerEvent] = [
@@ -114,10 +166,10 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
             end_line=line,
             emitted_finding_ids=finding_ids,
         )
-        for (path, line), finding_ids in reference_ids_by_line.items()
+        for (path, line), finding_ids in coverage_ids_by_line.items()
     ]
     merged_state = dict(state)
-    all_findings = [*(state.get("findings") or []), *reference_findings]
+    all_findings = [*(state.get("findings") or []), *coverage_findings]
     output_events: list[InspectionLedgerEvent] = []
     finding_output_records = sum(max(1, len(finding.occurrences)) for finding in all_findings)
     if finding_output_records > MAX_FINDING_OUTPUT_RECORDS:
@@ -140,7 +192,7 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
     merged_state["findings"] = all_findings
     merged_state["effective_finding_ids"] = [
         *(state.get("effective_finding_ids") or []),
-        *(finding.finding_id for finding in reference_findings),
+        *(finding.finding_id for finding in coverage_findings),
     ]
     merged_state["inspection_ledger"] = [
         *(state.get("inspection_ledger") or []),
@@ -157,15 +209,15 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         *reference_statuses,
     ]
     completeness, effective_finding_ids = finalize_ledger(merged_state)
-    if reference_findings and completeness["status"] == "complete":
+    if coverage_findings and completeness["status"] == "complete":
         completeness["status"] = "partial"
         completeness["is_complete"] = False
         limitations = completeness.setdefault("limitations", [])
-        limitations.append("One or more referenced artifacts were not completely inspected.")
+        limitations.append("One or more artifacts were not completely inspected.")
     return {
         "analysis_completeness": completeness,
         "execution_successful": completeness["execution_successful"],
-        "findings": reference_findings,
+        "findings": coverage_findings,
         "effective_finding_ids": effective_finding_ids,
         "inspection_ledger": [*reference_events, *output_events],
         "analyzer_status_events": reference_statuses,

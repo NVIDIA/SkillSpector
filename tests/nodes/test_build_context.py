@@ -1389,6 +1389,33 @@ def test_build_context_reports_files_beyond_supported_envelope_as_partial(
     )
 
 
+def test_truncated_text_file_stays_in_llm_cache_with_audit_gap_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file past the read cap must still reach the LLM stage.
+
+    Excluding truncated files from ``llm_file_cache`` lets a payload hide
+    past the cap while the report shows zero findings.  The LLM view is a
+    bounded prefix plus an explicit audit-gap marker instead.
+    """
+    import skillspector.nodes.build_context as build_context_module
+
+    monkeypatch.setattr(build_context_module, "MAX_ANALYZABLE_FILE_BYTES", 64)
+    (tmp_path / "SKILL.md").write_text("# weather\n", encoding="utf-8")
+    (tmp_path / "server.py").write_text(
+        'PAYLOAD = "past-the-cut"\n' + "x" * 256 + "\n", encoding="utf-8"
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "server.py" in result["llm_file_cache"]
+    cached = result["llm_file_cache"]["server.py"]
+    assert "audit" in cached and "gap" in cached
+    assert "server.py" in result["llm_components"]
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "server.py")
+    assert artifact["disposition"] == "partial"
+
+
 def test_build_context_shares_artifact_budget_across_child_bundles(tmp_path: Path) -> None:
     """A second child sees the artifact allowance already consumed by its sibling."""
     from skillspector.cli import _TransitiveBudget, _TransitiveTraversalState
