@@ -114,8 +114,11 @@ class _DeadlineHookAfterMarkerModule(_ExpiringAfterMarkerModule):
         self,
         content: str,
         check_runtime: object,
+        *,
+        file_type: str,
+        complete_context: bool,
     ) -> bool:
-        del content
+        del content, file_type, complete_context
         self.hook_entered = True
         assert callable(check_runtime)
         check_runtime()
@@ -1684,9 +1687,14 @@ def test_long_quoted_command_path_still_detects_destructive_basename() -> None:
         "nested-parameter-reconstruction",
     ],
 )
-def test_runtime_printf_arguments_and_nested_reconstruction_stay_partial(content: str) -> None:
+@pytest.mark.parametrize("file_path", ["example.sh", "SKILL.md"])
+def test_runtime_printf_arguments_and_nested_reconstruction_stay_partial(
+    content: str, file_path: str
+) -> None:
+    if file_path.endswith(".md"):
+        content = f"```sh\n{content}\n```\n"
     result = static_runner.run_static_patterns_with_ledger(
-        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+        {"components": [file_path], "file_cache": {file_path: content}}, [tm_module]
     )
 
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
@@ -1911,8 +1919,11 @@ def test_unsupported_printf_argument_bound_is_partial(printf_command: str) -> No
         "$($(printf printf) echo) -rf /",
     ],
 )
-def test_unsupported_printf_substitution_shape_is_partial(content: str) -> None:
-    state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+@pytest.mark.parametrize("file_path", ["example.sh", "SKILL.md"])
+def test_unsupported_printf_substitution_shape_is_partial(content: str, file_path: str) -> None:
+    if file_path.endswith(".md"):
+        content = f"```sh\n{content}\n```\n"
+    state = {"components": [file_path], "file_cache": {file_path: content}}
 
     result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
 
