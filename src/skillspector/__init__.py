@@ -17,6 +17,9 @@
 
 import warnings
 from importlib.metadata import version as _pkg_version
+from typing import Any
+
+from skillspector.graph_proxy import graph
 
 __version__ = _pkg_version("skillspector")
 
@@ -32,6 +35,12 @@ warnings.filterwarnings(
     category=Warning,
 )
 
-from skillspector.graph import create_graph, graph  # noqa: E402 (after filter setup)
+
+def create_graph() -> Any:
+    """Build and return a new SkillSpector workflow graph."""
+    from skillspector.graph import create_graph as build_graph
+
+    return build_graph()
+
 
 __all__ = ["create_graph", "graph", "__version__"]
