@@ -155,7 +155,7 @@ removes the rejected partial checkout.
 | Build-context ledger events | 10,000 | One bundle context |
 | Static findings | 10,000 | One artifact |
 | Static findings | 10,000 | One analyzer |
-| Static-analysis time | 30 seconds | One artifact |
+| Static-analysis time | 300 seconds | One artifact, within the workflow deadline |
 | YARA rule-directory entries | 10,000 | Built-in and optional directories combined |
 | YARA rule files | 1,024 | One rule load |
 | YARA rule source bytes | 1 MiB | One rule file |
@@ -223,3 +223,16 @@ change that aggregate deadline. The setting applies to direct,
 CLI, recursive, and multi-skill scans; byte and artifact ceilings remain in
 effect. Invalid, zero, negative, infinite, or NaN values safely keep the
 600-second default.
+
+## Configuring the static analysis deadline
+
+Static pattern analysis and YARA matching allow up to 300 seconds per artifact by
+default. Set `SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT` to a positive
+finite number of seconds to change that allowance. Invalid, zero, negative,
+infinite, or NaN values log a warning and retain the 300-second default.
+
+Each operation still uses the smaller of this allowance and the remaining workflow
+time. Increasing it does not extend the aggregate workflow deadline. A limit
+reached during analysis retains existing findings and reports partial work through
+the inspection ledger. Both environment settings are read when their modules are
+imported, so restart the SkillSpector process after changing them.
