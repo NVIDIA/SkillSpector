@@ -327,6 +327,17 @@ class TestComputeRiskScoreEdgeCases:
         # Sorted: CRITICAL first (50*1.0) + LOW second (5*0.5=2.5) = 52.5 -> 52
         assert score == 52
 
+    def test_weak_critical_does_not_lower_score_by_displacing_stronger_high(self) -> None:
+        """Weight allocation follows score strength, not severity alone."""
+        stronger_high = _finding("TM1", "HIGH", confidence=0.1)
+        weak_critical = _finding("TM1", "CRITICAL", confidence=0.01)
+
+        before, _, _ = _compute_risk_score([stronger_high], False)
+        after, _, _ = _compute_risk_score([stronger_high, weak_critical], False)
+
+        assert before == 2
+        assert after == 2
+
     def test_exact_band_boundary_21_is_medium(self) -> None:
         findings = [
             _finding("R1", "MEDIUM", confidence=1.0),
