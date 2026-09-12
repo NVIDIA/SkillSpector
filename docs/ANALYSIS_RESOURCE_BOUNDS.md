@@ -16,7 +16,7 @@ Values below are implementation defaults. MiB means 1,048,576 bytes.
 | Discovery time | 30 seconds | One skill bundle |
 | Canonical cached source bytes | 64 MiB | Ordinary files and expanded nested members combined |
 | Cached bytes from one filesystem artifact | 16 MiB | One artifact |
-| End-to-end workflow time | 60 seconds | One graph execution |
+| End-to-end workflow time | 600 seconds | One graph execution |
 | Cache and context-processing time | 60 seconds | One skill bundle, within the workflow deadline |
 
 The 64 MiB ceiling accounts for the canonical raw bytes retained for analysis. Local decoded text
@@ -130,7 +130,7 @@ work consume the same allowance.
 | External targets | 32 | One traversal |
 | Downloaded and cached source bytes | 10 MiB | Root and dependencies combined |
 | Discovered and expanded artifacts | 10,000 | Root and dependencies combined |
-| Traversal time | 60 seconds | Root and dependencies combined |
+| Traversal time | 600 seconds | Root and dependencies combined |
 | Reference source records | 1,024 | One extraction |
 | Reference source bytes | 1,000,000 | One extraction |
 | Raw reference candidates | 4,096 | One extraction |
@@ -211,3 +211,13 @@ When relevant analysis is incomplete:
 
 A low score or zero findings must not be interpreted as complete coverage when
 `analysis_completeness.is_complete` is false.
+
+
+## Configuring the aggregate workflow deadline
+
+The scanner limits one complete workflow to 600 seconds by default. Set
+`SKILLSPECTOR_MAX_WORKFLOW_SECONDS` to a positive finite number of seconds to
+change that aggregate deadline. The setting applies to direct,
+CLI, recursive, and multi-skill scans; byte and artifact ceilings remain in
+effect. Invalid, zero, negative, infinite, or NaN values safely keep the
+600-second default.

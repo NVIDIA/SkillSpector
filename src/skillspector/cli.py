@@ -56,7 +56,7 @@ from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
-from skillspector.state import MAX_WORKFLOW_BYTES
+from skillspector.state import MAX_WORKFLOW_BYTES, MAX_WORKFLOW_SECONDS
 from skillspector.suppression import (
     Baseline,
     build_baseline_dict,
@@ -100,7 +100,7 @@ err_console = Console(stderr=True)
 
 _TRANSITIVE_MAX_TARGETS = 32
 _TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
-_TRANSITIVE_MAX_SECONDS = 60.0
+_TRANSITIVE_MAX_SECONDS = MAX_WORKFLOW_SECONDS
 _TRANSITIVE_MAX_ARTIFACTS = 10_000
 _TRANSITIVE_MAX_FINDINGS = 10_000
 _TRANSITIVE_MAX_COMPONENTS = 10_000
