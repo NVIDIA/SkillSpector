@@ -984,6 +984,7 @@ class TestInspectionLedgerResponse:
 
     def test_yara_uses_fast_match_mode_and_engine_timeout(self, monkeypatch) -> None:
         calls = []
+        monkeypatch.setattr(static_yara, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 300.0)
 
         class RecordingRules:
             def match(self, **kwargs):
@@ -997,7 +998,7 @@ class TestInspectionLedgerResponse:
 
         assert result["inspection_ledger"][0]["outcome"] == "completed"
         assert calls[0]["fast"] is True
-        assert calls[0]["timeout"] == 30
+        assert calls[0]["timeout"] == 300
         assert callable(calls[0]["callback"])
 
     def test_expired_shared_deadline_accounts_for_every_unstarted_path(self, monkeypatch) -> None:
