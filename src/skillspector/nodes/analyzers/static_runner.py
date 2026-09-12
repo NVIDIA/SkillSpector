@@ -24,6 +24,8 @@ from array import array
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from inspect import getattr_static
+from itertools import chain
 from typing import cast
 
 from skillspector.artifacts import (
@@ -428,6 +430,14 @@ def _uses_python_ast(module: object) -> bool:
     return getattr(module, "USES_PYTHON_AST", False) is True
 
 
+def _explicit_analysis_hook(target: object, name: str) -> Callable | None:
+    """Require a declared hook rather than one manufactured by dynamic lookup."""
+    if getattr_static(target, name, None) is None:
+        return None
+    hook = getattr(target, name, None)
+    return hook if callable(hook) else None
+
+
 class _StaticResourceLimitError(RuntimeError):
     """Internal control-flow signal for one attacker-controlled work ceiling."""
 
@@ -576,6 +586,10 @@ def _scan_path(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None = None,
+    *,
+    prepared_analyses: Mapping[int, object] | None = None,
+    source_view: SecurityTextView | None = None,
+    analysis_method: str = "analyze",
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
@@ -597,7 +611,15 @@ def _scan_path(
         finding_budget.begin_module()
         try:
             with observe_analyzer_findings(finding_budget.observe_creation):
-                if file_type == "python" and _uses_python_ast(module):
+                prepared = (prepared_analyses or {}).get(id(module))
+                if prepared is not None:
+                    raw = getattr(prepared, analysis_method)(
+                        content=content,
+                        file_path=path,
+                        file_type=file_type,
+                        source_view=source_view or SecurityTextView("raw", content),
+                    )
+                elif file_type == "python" and _uses_python_ast(module):
                     raw = module.analyze(
                         content=content,
                         file_path=path,
@@ -724,6 +746,10 @@ def _scan_view_windows(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None,
+    *,
+    prepared_analyses: Mapping[int, object] | None = None,
+    source_view: SecurityTextView | None = None,
+    analysis_method: str = "analyze",
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Scan one already-bounded view."""
     findings, resource_limit = _scan_path(
@@ -732,6 +758,9 @@ def _scan_view_windows(
         pattern_modules,
         finding_budget,
         python_ast_cache_key,
+        prepared_analyses=prepared_analyses,
+        source_view=source_view,
+        analysis_method=analysis_method,
     )
     for finding in findings:
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
@@ -756,7 +785,11 @@ def _bounded_view_slices(view: SecurityTextView) -> Iterator[SecurityTextView]:
     step = SECURITY_VIEW_WINDOW_CHARS - _WINDOW_OVERLAP_CHARS
     for start in range(0, len(view.text), step):
         end = min(len(view.text), start + SECURITY_VIEW_WINDOW_CHARS)
-        offsets = None if view.source_offsets is None else view.source_offsets[start:end]
+        offsets = (
+            array("I", range(start, end))
+            if view.source_offsets is None
+            else view.source_offsets[start:end]
+        )
         yield SecurityTextView(
             name=view.name,
             text=view.text[start:end],
@@ -764,6 +797,149 @@ def _bounded_view_slices(view: SecurityTextView) -> Iterator[SecurityTextView]:
         )
         if end == len(view.text):
             break
+
+
+@dataclass(frozen=True, kw_only=True)
+class _AbsoluteSourceView(SecurityTextView):
+    """Resolve absolute coordinates only for findings that need a source lookup.
+
+    This secondary view is used by prepared analysis and line restoration, never
+    by text transformations that inspect or slice ``source_offsets`` directly.
+    """
+
+    derived_view: SecurityTextView
+    parent_view: SecurityTextView | None
+    source_start: int
+
+    def source_offset(self, derived_offset: int) -> int:
+        offsets = self.derived_view.source_offsets
+        size = len(self.text) if offsets is None else len(offsets)
+        if size == 0:
+            return 0
+        # Materialized absolute maps clamp at the final character, including
+        # identity-derived maps whose own endpoint lookup permits len(text).
+        index = min(max(derived_offset, 0), size - 1)
+        offset = self.derived_view.source_offset(index)
+        if self.parent_view is not None:
+            offset = self.parent_view.source_offset(offset)
+        return self.source_start + offset
+
+
+def _absolute_source_view(
+    view: SecurityTextView,
+    *,
+    source_start: int = 0,
+    parent: SecurityTextView | None = None,
+) -> SecurityTextView:
+    """Compose one bounded view's coordinates with its whole-artifact origin."""
+    if parent is None and source_start == 0:
+        return view
+    return _AbsoluteSourceView(
+        name=view.name,
+        text=view.text,
+        derived_view=view,
+        parent_view=parent,
+        source_start=source_start,
+    )
+
+
+def _whitespace_continuity_tokens(
+    content: str,
+    finding_budget: _FindingBudget,
+    *,
+    default_ignorables_as_separators: bool,
+) -> Iterator[tuple[int, int, bool]]:
+    """Yield source spans, optionally interpreting pinned ignorables as separators.
+
+    The alternative uses bounded, length-preserving chunks. Separator spans are
+    joined across chunk boundaries before projection, without a whole-file copy.
+    """
+    chunk_size = 65_536 if default_ignorables_as_separators else max(1, len(content))
+    pending_separator: tuple[int, int] | None = None
+    for chunk_start in range(0, len(content), chunk_size):
+        finding_budget.check_runtime()
+        chunk = content[chunk_start : chunk_start + chunk_size]
+        if default_ignorables_as_separators and _contains_default_ignorable(chunk):
+            chunk = "".join(" " if is_default_ignorable(ch) else ch for ch in chunk)
+        finding_budget.check_runtime()
+        for token in re.finditer(r"\s+|\S+", chunk):
+            start = chunk_start + token.start()
+            end = chunk_start + token.end()
+            if chunk[token.start()].isspace():
+                pending_separator = (
+                    pending_separator[0] if pending_separator is not None else start,
+                    end,
+                )
+                continue
+            if pending_separator is not None:
+                yield *pending_separator, True
+                pending_separator = None
+            yield start, end, False
+    if pending_separator is not None:
+        yield *pending_separator, True
+
+
+def _whitespace_continuity_views(
+    content: str,
+    finding_budget: _FindingBudget,
+    *,
+    default_ignorables_as_separators: bool = False,
+) -> Iterator[SecurityTextView]:
+    """Project unbounded whitespace for explicitly opted-in analyzer methods.
+
+    Each whitespace run becomes one separator. Logical line boundaries remain
+    boundaries, and offsets stay absolute. Ordinary pattern modules must never
+    receive this projection: it changes the meaning of bounded-gap expressions.
+    """
+    finding_budget.check_runtime()
+    needs_projection = (
+        _contains_default_ignorable(content)
+        if default_ignorables_as_separators
+        else re.search(r"\s{2,}", content) is not None
+    )
+    finding_budget.check_runtime()
+    if not needs_projection:
+        # Single separators already fit in the ordinary window overlap. Avoid
+        # rebuilding and rescanning the entire artifact when nothing can shrink.
+        return
+    view_name = (
+        "ignorable-separator-continuity"
+        if default_ignorables_as_separators
+        else "whitespace-continuity"
+    )
+    parts: list[str] = []
+    offsets = array("I")
+    size = 0
+    fresh = False
+    for start, end, whitespace in _whitespace_continuity_tokens(
+        content,
+        finding_budget,
+        default_ignorables_as_separators=default_ignorables_as_separators,
+    ):
+        finding_budget.check_runtime()
+        while start < end:
+            finding_budget.check_runtime()
+            if whitespace:
+                parts.append("\n" if LOGICAL_LINE_BREAK.search(content, start, end) else " ")
+                offsets.append(start)
+                size += 1
+                start = end
+            else:
+                stop = min(end, start + SECURITY_VIEW_WINDOW_CHARS - size)
+                parts.append(content[start:stop])
+                offsets.extend(range(start, stop))
+                size += stop - start
+                start = stop
+            fresh = True
+            if size == SECURITY_VIEW_WINDOW_CHARS:
+                text = "".join(parts)
+                yield SecurityTextView(view_name, text, offsets)
+                parts = [text[-_WINDOW_OVERLAP_CHARS:]]
+                offsets = offsets[-_WINDOW_OVERLAP_CHARS:]
+                size = _WINDOW_OVERLAP_CHARS
+                fresh = False
+    if fresh:
+        yield SecurityTextView(view_name, "".join(parts), offsets)
 
 
 def _is_continuity_separator(character: str) -> bool:
@@ -826,9 +1002,13 @@ def _append_projected_piece(
     source_lines: list[int],
     piece: str,
     source_line: int,
+    source_offsets: array[int] | None = None,
+    source_start: int = 0,
 ) -> int:
     """Append one contiguous raw piece and extend its exact line projection."""
     text_parts.append(piece)
+    if source_offsets is not None:
+        source_offsets.extend(range(source_start, source_start + len(piece)))
     for _ in LOGICAL_LINE_BREAK.finditer(piece):
         source_line += 1
         source_lines.append(source_line)
@@ -838,6 +1018,8 @@ def _append_projected_piece(
 def _continuity_views(
     content: str,
     finding_budget: _FindingBudget,
+    *,
+    include_source_offsets: bool = False,
 ) -> Iterator[_ContinuityView]:
     """Build bounded neighborhoods that preserve lexical state across raw windows.
 
@@ -871,6 +1053,7 @@ def _continuity_views(
         previous_left = left
         source_lines = [previous_left_line]
         text_parts: list[str] = []
+        source_offsets = array("I") if include_source_offsets else None
         current_line = previous_left_line
         cursor = left
         for selected_start, selected_end in selected_runs:
@@ -879,6 +1062,8 @@ def _continuity_views(
                 source_lines,
                 content[cursor:selected_start],
                 current_line,
+                source_offsets,
+                cursor,
             )
             run_length = selected_end - selected_start
             if run_length <= _CONTINUITY_SEPARATOR_CHARS:
@@ -887,6 +1072,8 @@ def _continuity_views(
                     source_lines,
                     content[selected_start:selected_end],
                     current_line,
+                    source_offsets,
+                    selected_start,
                 )
             else:
                 head_length = _CONTINUITY_SEPARATOR_CHARS // 2
@@ -898,6 +1085,8 @@ def _continuity_views(
                     source_lines,
                     content[selected_start:head_end],
                     current_line,
+                    source_offsets,
+                    selected_start,
                 )
                 skipped_newlines = sum(
                     1 for _ in LOGICAL_LINE_BREAK.finditer(content, head_end, tail_start)
@@ -906,17 +1095,23 @@ def _continuity_views(
                     # Retain a line boundary so DOT-without-DOTALL and anchors
                     # do not acquire semantics absent from the original source.
                     text_parts.append("\n")
+                    if source_offsets is not None:
+                        source_offsets.append(head_end)
                     current_line += skipped_newlines
                     source_lines.append(current_line)
                 elif _ASCII_NON_NEWLINE_WHITESPACE.search(content, head_end, tail_start):
                     # Never let truncation erase a real word boundary and turn
                     # separated tokens into a normalized security match.
                     text_parts.append(" ")
+                    if source_offsets is not None:
+                        source_offsets.append(head_end)
                 current_line = _append_projected_piece(
                     text_parts,
                     source_lines,
                     content[tail_start:selected_end],
                     current_line,
+                    source_offsets,
+                    tail_start,
                 )
             cursor = selected_end
         _append_projected_piece(
@@ -924,6 +1119,8 @@ def _continuity_views(
             source_lines,
             content[cursor:right],
             current_line,
+            source_offsets,
+            cursor,
         )
 
         projected = "".join(text_parts)
@@ -931,7 +1128,7 @@ def _continuity_views(
         # chained runs remain below the ordinary module-input ceiling.
         assert len(projected) <= SECURITY_VIEW_WINDOW_CHARS
         yield _ContinuityView(
-            view=SecurityTextView("continuity", projected),
+            view=SecurityTextView("continuity", projected, source_offsets),
             source_lines=tuple(source_lines),
         )
 
@@ -1014,6 +1211,7 @@ def _scan_declared_marker_views(
     owned_starts: tuple[int, ...],
     raw_starts: tuple[int, ...],
     source_context: _WindowSourceContext,
+    prepared_analyses: Mapping[int, object] | None = None,
 ) -> tuple[list[Finding], bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -1088,6 +1286,12 @@ def _scan_declared_marker_views(
                         pattern_modules,
                         view_budget,
                         None,
+                        prepared_analyses=prepared_analyses,
+                        source_view=(
+                            _absolute_source_view(view, source_start=raw_start)
+                            if prepared_analyses
+                            else None
+                        ),
                     )
                     _restore_source_lines(
                         view_findings,
@@ -1158,6 +1362,7 @@ def _scan_all_views_detailed(
     raw_starts: tuple[int, ...] = ()
     source_context: _WindowSourceContext | None = None
     whole_artifact_window = False
+    prepared_analyses: dict[int, object] = {}
 
     if modules_for_windows:
         marker_owned_starts = tuple(range(0, max(1, len(content)), DECLARED_MARKER_OWNED_CHARS))
@@ -1183,6 +1388,15 @@ def _scan_all_views_detailed(
         )
         try:
             finding_budget.check_runtime()
+            for module in modules_for_windows:
+                prepare = _explicit_analysis_hook(module, "prepare_analysis")
+                if prepare is not None:
+                    prepared_analyses[id(module)] = prepare(
+                        content=content,
+                        file_type=_infer_file_type(path),
+                        check_runtime=finding_budget.check_runtime,
+                    )
+                    finding_budget.check_runtime()
             source_context = _build_window_source_context(
                 path,
                 content,
@@ -1198,6 +1412,7 @@ def _scan_all_views_detailed(
                     owned_starts=marker_owned_starts,
                     raw_starts=marker_raw_starts,
                     source_context=source_context,
+                    prepared_analyses=prepared_analyses,
                 )
             )
         except _StaticResourceLimitError as exc:
@@ -1325,6 +1540,12 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            prepared_analyses=prepared_analyses,
+                            source_view=(
+                                _absolute_source_view(view, source_start=raw_start)
+                                if prepared_analyses
+                                else None
+                            ),
                         )
                     except _StaticResourceLimitError as exc:
                         return (
@@ -1374,7 +1595,79 @@ def _scan_all_views_detailed(
         # all resource accounting remains on the same artifact budget.
         continuity_seen = {_continuity_finding_key(finding) for finding in findings}
         try:
-            for continuity in _continuity_views(content, finding_budget):
+            whitespace_modules = [
+                module
+                for module in modules_for_windows
+                if _explicit_analysis_hook(
+                    prepared_analyses.get(id(module)), "analyze_whitespace_continuity"
+                )
+                is not None
+            ]
+            if whitespace_modules:
+                for projection in chain(
+                    _whitespace_continuity_views(content, finding_budget),
+                    _whitespace_continuity_views(
+                        content, finding_budget, default_ignorables_as_separators=True
+                    ),
+                ):
+                    for full_view in security_text_views(projection.text):
+                        named_view = SecurityTextView(
+                            f"{projection.name}-{full_view.name}",
+                            full_view.text,
+                            full_view.source_offsets,
+                        )
+                        for view in _bounded_view_slices(named_view):
+                            finding_budget.check_runtime()
+                            source_view = _absolute_source_view(view, parent=projection)
+                            view_budget = _FindingBudget(
+                                max_findings=max(0, max_findings),
+                                started_at=started_at,
+                                deadline=deadline,
+                                clock=finding_budget.clock,
+                            )
+                            view_findings, resource_limit = _scan_view_windows(
+                                path,
+                                view,
+                                whitespace_modules,
+                                view_budget,
+                                None,
+                                prepared_analyses=prepared_analyses,
+                                source_view=source_view,
+                                analysis_method="analyze_whitespace_continuity",
+                            )
+                            _restore_source_lines(
+                                view_findings,
+                                raw_window=content,
+                                window_line=1,
+                                view=source_view,
+                                source_line_starts=source_context.line_starts,
+                            )
+                            for finding in view_findings:
+                                key = _continuity_finding_key(finding)
+                                if key in continuity_seen:
+                                    continue
+                                continuity_seen.add(key)
+                                unique_limit = _extend_unique_findings(
+                                    findings,
+                                    seen_findings,
+                                    [finding],
+                                    max_findings=max_findings,
+                                )
+                                if unique_limit is not None:
+                                    return (
+                                        findings[:max_findings],
+                                        unique_limit.reason,
+                                        unique_limit.metrics,
+                                    )
+                            if resource_limit is not None:
+                                return (
+                                    _deduplicate_view_findings(findings)[:max_findings],
+                                    resource_limit.reason,
+                                    resource_limit.metrics,
+                                )
+            for continuity in _continuity_views(
+                content, finding_budget, include_source_offsets=bool(prepared_analyses)
+            ):
                 for full_view in security_text_views(continuity.view.text):
                     named_view = SecurityTextView(
                         name=f"continuity-{full_view.name}",
@@ -1395,6 +1688,12 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            prepared_analyses=prepared_analyses,
+                            source_view=(
+                                _absolute_source_view(view, parent=continuity.view)
+                                if prepared_analyses
+                                else None
+                            ),
                         )
                         _restore_source_lines(
                             view_findings,

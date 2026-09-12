@@ -2211,7 +2211,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "python_ast_cache_key": python_ast_cache_key,
         "manifest": manifest,
         "previous_manifest": None,
-        "model_config": build_model_config(),
+        "model_config": build_model_config() if state.get("use_llm", True) else {},
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
         "workflow_resource_budget": workflow_budget,
