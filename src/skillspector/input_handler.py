@@ -443,6 +443,41 @@ def _windows_last_error() -> OSError:
     return cast(OSError, ctypes.WinError(ctypes.get_last_error()))  # type: ignore[attr-defined]
 
 
+def _windows_long_path_name(path: str) -> str:
+    """Expand any 8.3 short components of a Windows path to their long form.
+
+    ``GetFinalPathNameByHandleW`` always answers with long components, while the
+    requested path may carry short ones: Windows keeps an 8.3 alias for a
+    directory whose name holds a space, so a profile directory such as
+    ``C:\\Users\\Hoang Pham`` reaches the scanner as ``C:\\Users\\HOANGP~1`` by way
+    of ``%TEMP%``. Comparing the two spellings without expanding them first
+    rejects every file below such a path.
+
+    The short name is an alias the filesystem keeps for one directory entry, so
+    expanding it names that same entry and does not resolve symlinks or
+    junctions; the reparse-point checks around the caller keep their meaning. A
+    path that no longer resolves comes back unchanged, which leaves that caller
+    fail-closed.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    get_long_path_name = kernel32.GetLongPathNameW
+    get_long_path_name.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_long_path_name.restype = wintypes.DWORD
+
+    buffer_size = 260
+    while True:
+        buffer = ctypes.create_unicode_buffer(buffer_size)
+        result = cast(int, get_long_path_name(path, buffer, buffer_size))
+        if result == 0:
+            return path
+        if result < buffer_size:
+            return buffer.value
+        buffer_size = result + 1
+
+
 def _windows_normalized_path(path: str) -> str:
     """Normalize a Windows DOS path for an exact opened-handle comparison."""
     long_path_prefix = "\\\\?\\"
@@ -451,7 +486,8 @@ def _windows_normalized_path(path: str) -> str:
         path = "\\\\" + path[len(long_unc_prefix) :]
     elif path.startswith(long_path_prefix):
         path = path[len(long_path_prefix) :]
-    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    absolute = os.path.normpath(os.path.abspath(path))
+    return os.path.normcase(_windows_long_path_name(absolute))
 
 
 def _close_fd_safely(fd: int) -> None:
