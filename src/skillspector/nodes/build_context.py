@@ -1458,22 +1458,28 @@ def _project_manifest(
 
     manifest["triggers"] = _string_list(data.get("triggers", []))
     manifest["permissions"] = _string_list(data.get("permissions", []))
+    # `allowed-tools` (Agent Skills standard) — accept list, comma string, or space-separated string.
     allowed_tools = data.get("allowed-tools", [])
     if isinstance(allowed_tools, str):
-        tools: list[str] = []
-        cursor = 0
-        while cursor <= len(allowed_tools):
-            _check()
-            separator = allowed_tools.find(",", cursor)
-            if separator < 0:
-                separator = len(allowed_tools)
-            item = allowed_tools[cursor:separator].strip()
-            if item:
-                tools.append(_scalar_text(item))
-            if separator == len(allowed_tools):
-                break
-            cursor = separator + 1
-        manifest["allowed-tools"] = tools
+        if "," in allowed_tools:
+            tools: list[str] = []
+            cursor = 0
+            while cursor <= len(allowed_tools):
+                _check()
+                separator = allowed_tools.find(",", cursor)
+                if separator < 0:
+                    separator = len(allowed_tools)
+                item = allowed_tools[cursor:separator].strip()
+                if item:
+                    tools.append(_scalar_text(item))
+                if separator == len(allowed_tools):
+                    break
+                cursor = separator + 1
+            manifest["allowed-tools"] = tools
+        else:
+            manifest["allowed-tools"] = [
+                _scalar_text(t) for t in allowed_tools.split() if t.strip()
+            ]
     elif isinstance(allowed_tools, list):
         manifest["allowed-tools"] = [
             item.strip() for item in _string_list(allowed_tools) if item.strip()

@@ -57,7 +57,7 @@ from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
-from skillspector.state import MAX_WORKFLOW_BYTES
+from skillspector.state import MAX_WORKFLOW_BYTES, MAX_WORKFLOW_SECONDS
 from skillspector.suppression import (
     Baseline,
     build_baseline_dict,
@@ -101,7 +101,7 @@ err_console = Console(stderr=True)
 
 _TRANSITIVE_MAX_TARGETS = 32
 _TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
-_TRANSITIVE_MAX_SECONDS = 60.0
+_TRANSITIVE_MAX_SECONDS = MAX_WORKFLOW_SECONDS
 _TRANSITIVE_MAX_ARTIFACTS = 10_000
 _TRANSITIVE_MAX_FINDINGS = 10_000
 _TRANSITIVE_MAX_COMPONENTS = 10_000
@@ -555,7 +555,9 @@ def scan(
 
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
-                               nv_inference. Defaults to the NVIDIA path
+                               nv_inference | ollama | azure_openai |
+                               openai_compatible | claude_cli | codex_cli |
+                               gemini_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
@@ -566,10 +568,19 @@ def scan(
 
         OPENAI_API_KEY [+ OPENAI_BASE_URL]   for SKILLSPECTOR_PROVIDER=openai
         ANTHROPIC_API_KEY                    for SKILLSPECTOR_PROVIDER=anthropic
+        ANTHROPIC_PROXY_API_KEY +
+          ANTHROPIC_PROXY_ENDPOINT_URL       for anthropic_proxy
         AWS_PROFILE (optional) + AWS_REGION  for SKILLSPECTOR_PROVIDER=bedrock
                                              (AWS_PROFILE: standard boto3 credential
                                              chain when unset; AWS_REGION default: us-west-2)
         NVIDIA_INFERENCE_KEY                 for the NVIDIA providers
+        AZURE_OPENAI_API_KEY +
+          AZURE_OPENAI_ENDPOINT              for azure_openai
+        SKILLSPECTOR_COMPAT_API_KEY +
+          SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
+
+        ollama uses the local Ollama service. claude_cli, codex_cli, and
+        gemini_cli use their CLI's existing local authentication session.
     """
     if mcp_registry:
         if (
@@ -634,7 +645,7 @@ def scan(
                 "[yellow]Warning:[/yellow] Recursive skill discovery was incomplete; "
                 "continuing with a bounded scan and reporting partial coverage."
             )
-        if detection.is_multi_skill:
+        if detection.skills:
             if baseline is not None:
                 err_console.print(
                     "[red]Error:[/red] --baseline is not supported for recursive "
@@ -2226,7 +2237,11 @@ def _scan_multi_skill(
             elif not child_failed:
                 complete_skill_count += 1
             score = result.get("risk_score") or 0
-            if isinstance(score, int) and score > max_score:
+            try:
+                score = int(score)
+            except (TypeError, ValueError):
+                score = 0
+            if score > max_score:
                 max_score = score
             child_transitive_count = result.get("transitive_finding_count")
             if isinstance(child_transitive_count, int):

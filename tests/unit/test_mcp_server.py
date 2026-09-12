@@ -27,7 +27,9 @@ import pytest
 from skillspector import mcp_server
 from skillspector.mcp_server import run_scan
 from skillspector.models import Finding
+from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
+from skillspector.providers.openai import OpenAIProvider
 from skillspector.suppression import SuppressedFinding
 
 
@@ -82,6 +84,41 @@ async def test_run_scan_reports_llm_available_with_credentials(
     assert result["llm_requested"] is False
     assert result["llm_used"] is False
     assert result["scan_mode"] == "static-only"
+
+
+async def test_run_scan_openai_fallback_builds_matching_graph_model_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in (
+        "SKILLSPECTOR_PROVIDER",
+        "SKILLSPECTOR_MODEL",
+        "NVIDIA_INFERENCE_KEY",
+        "NVIDIA_INFERENCE_METADATA_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (True, None))
+    _write_skill(tmp_path)
+    captured: dict[str, str] = {}
+
+    class _Graph:
+        async def ainvoke(self, state, config):
+            context = build_context({"skill_path": state["input_path"]})
+            captured.update(context["model_config"])
+            return {
+                "filtered_findings": [],
+                "risk_score": 0,
+                "risk_severity": "LOW",
+                "risk_recommendation": "OK",
+                "report_body": "report",
+            }
+
+    monkeypatch.setattr(mcp_server, "graph", _Graph())
+
+    result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
+
+    assert result["llm_used"] is True
+    assert captured["default"] == OpenAIProvider.DEFAULT_MODEL
 
 
 async def test_run_scan_uses_bound_provider_without_credentials(

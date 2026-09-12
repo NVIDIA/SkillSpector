@@ -44,6 +44,24 @@ def test_deadline_during_content_marks_current_and_remaining_partial() -> None:
     assert result["analyzer_status_events"][0]["status"] == "degraded"
 
 
+def test_deadline_inside_large_separator_gap_marks_artifact_partial() -> None:
+    workflow_budget = _ExpiringWorkflowBudget(5)
+    content = "i" + "." * 300_000 + "g.n.o.r.e"
+
+    result = artifact_integrity.node(
+        {
+            "components": ["SKILL.md"],
+            "local_file_cache": {"SKILL.md": content},
+            "artifact_inventory": [{"path": "SKILL.md"}],
+            "workflow_resource_budget": workflow_budget,
+        }
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] == "partial"
+    assert result["inspection_ledger"][0]["reason_code"] == "runtime_limit"
+    assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+
 def test_finding_cap_stops_construction_and_marks_affected_suffix_partial(
     monkeypatch,
 ) -> None:

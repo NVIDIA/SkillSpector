@@ -246,16 +246,20 @@ def _normalize_allowed_tools(
 ) -> list[str]:
     """Coerce a manifest ``allowed-tools`` value into a list of tool names.
 
-    Accepts the list form (``[Bash, Read]``) and the comma-separated string
-    form (``"Bash, Read"``). Anything else yields an empty list.
+    Accepts the list form (``[Bash, Read]``), the comma-separated string
+    form (``"Bash, Read"``), and the space-separated string form
+    (``"Bash Read"``). Anything else yields an empty list.
     """
     tools: list[str] = []
     if isinstance(value, list):
         candidates = iter(value)
     elif isinstance(value, str):
-        # A bounded split prevents a comma-dense declaration from creating an
-        # arbitrarily large temporary list before the analyzer can stop it.
-        candidates = iter(value.split(",", _MAX_DECLARATION_VALUES))
+        if "," in value:
+            # A bounded split prevents a comma-dense declaration from creating an
+            # arbitrarily large temporary list before the analyzer can stop it.
+            candidates = iter(value.split(",", _MAX_DECLARATION_VALUES))
+        else:
+            candidates = iter(value.split(None, _MAX_DECLARATION_VALUES))
     else:
         return tools
 

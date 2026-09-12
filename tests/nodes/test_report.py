@@ -40,6 +40,7 @@ def _finding(
     message: str = "test",
     confidence: float = 1.0,
     file: str = "SKILL.md",
+    evidence: dict[str, object] | None = None,
 ) -> Finding:
     return Finding(
         rule_id=rule_id,
@@ -48,6 +49,7 @@ def _finding(
         confidence=confidence,
         file=file,
         start_line=1,
+        evidence=evidence or {},
     )
 
 
@@ -109,6 +111,63 @@ class TestComputeRiskScoreBasic:
         assert score == 51
         assert band == "HIGH"
         assert recommendation == "DO_NOT_INSTALL"
+
+    @pytest.mark.parametrize(
+        ("finding", "expected_score"),
+        [
+            (
+                _finding(
+                    "BH2",
+                    "CRITICAL",
+                    evidence={
+                        "activation_state": "conditional",
+                        "proof_status": "closed",
+                    },
+                ),
+                51,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "CRITICAL",
+                    evidence={"activation_state": "conditional"},
+                ),
+                51,
+            ),
+            (
+                _finding(
+                    "BH2",
+                    "CRITICAL",
+                    evidence={
+                        "activation_state": "conditional",
+                        "proof_status": "unmodeled",
+                    },
+                ),
+                50,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "CRITICAL",
+                    evidence={"activation_state": "ignored_by_surface"},
+                ),
+                50,
+            ),
+            (
+                _finding(
+                    "BH3",
+                    "LOW",
+                    evidence={"activation_state": "ignored_by_surface"},
+                ),
+                5,
+            ),
+        ],
+    )
+    def test_bundled_surface_floor_requires_closed_effective_critical_evidence(
+        self, finding: Finding, expected_score: int
+    ) -> None:
+        score, _, _ = _compute_risk_score([finding], False)
+        assert score == expected_score
 
     def test_unknown_severity_defaults_to_low_points(self) -> None:
         f = _finding("R1", "LOW")
@@ -847,6 +906,77 @@ class TestReportNode:
         assert len(body["issues"]) == 4
         assert result["risk_score"] < 4 * 25
 
+    @pytest.mark.parametrize("output_format", ["json", "sarif"])
+    def test_report_keeps_occurrence_local_pe3_classification(
+        self,
+        output_format: str,
+    ) -> None:
+        safe = Finding(
+            rule_id="PE3",
+            message="Credential Access",
+            severity="HIGH",
+            confidence=0.9,
+            file="scripts/build.sh",
+            start_line=6,
+            matched_text="/etc/passwd",
+            code_snippet="docker run -v /etc/passwd:/etc/passwd:ro image",
+            tags=["Privilege Escalation", "contextual-triage", "likely-benign-context"],
+        )
+        unsafe = Finding(
+            rule_id="PE3",
+            message="Credential Access",
+            severity="HIGH",
+            confidence=0.9,
+            file="scripts/unsafe-passwd.sh",
+            start_line=5,
+            matched_text="/etc/passwd",
+            code_snippet="cat /etc/passwd",
+            tags=["Privilege Escalation"],
+        )
+        state: SkillspectorState = {
+            "filtered_findings": [safe, unsafe],
+            "component_metadata": [],
+            "has_executable_scripts": True,
+            "manifest": {},
+            "output_format": output_format,
+        }
+
+        result = report(state)
+        if output_format == "json":
+            rows = json.loads(result["report_body"])["issues"]
+            actual = {
+                row["location"]["file"]: (
+                    row["finding_id"],
+                    row["code_snippet"],
+                    row["tags"],
+                )
+                for row in rows
+            }
+        else:
+            rows = result["sarif_report"]["runs"][0]["results"]
+            actual = {
+                row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]: (
+                    row["properties"]["findingId"],
+                    row["properties"]["code_snippet"],
+                    row["properties"]["tags"],
+                )
+                for row in rows
+            }
+
+        assert len(rows) == 2
+        assert actual == {
+            "scripts/build.sh": (
+                safe.finding_id,
+                safe.code_snippet,
+                safe.tags,
+            ),
+            "scripts/unsafe-passwd.sh": (
+                unsafe.finding_id,
+                unsafe.code_snippet,
+                unsafe.tags,
+            ),
+        }
+
 
 def test_report_baseline_suppresses_finding_and_lowers_score() -> None:
     """A baseline-suppressed CRITICAL finding does not count toward the risk score."""
@@ -907,6 +1037,29 @@ def test_report_baseline_keeps_unmatched_finding() -> None:
     }
     result = report(state)
     assert result["risk_score"] == 50  # only the CRITICAL counts
+    assert len(result["suppressed_findings"]) == 1
+
+
+def test_report_suppressed_bh2_does_not_apply_blocking_floor() -> None:
+    finding = _finding(
+        "BH2",
+        "CRITICAL",
+        evidence={"activation_state": "conditional", "proof_status": "closed"},
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": "json",
+        "baseline": Baseline(rules=[SuppressionRule(rule_id="BH2", reason="accepted")]),
+    }
+
+    result = report(state)
+
+    assert result["risk_score"] == 0
+    assert result["risk_recommendation"] == "SAFE"
     assert len(result["suppressed_findings"]) == 1
 
 

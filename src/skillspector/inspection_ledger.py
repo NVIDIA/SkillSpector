@@ -91,6 +91,8 @@ class LedgerReason(StrEnum):
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
     OUTPUT_LIMIT = "output_limit"
+    STATIC_PARSE_LIMIT = "static_parse_limit"
+    OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
 REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
@@ -176,6 +178,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.TOTAL_BYTES_LIMIT: "Bundle caching reached its aggregate byte limit.",
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
+    LedgerReason.STATIC_PARSE_LIMIT: (
+        "A security-relevant expression exceeded a bounded static parser's span limit."
+    ),
+    LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
+        "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
+    ),
 }
 
 

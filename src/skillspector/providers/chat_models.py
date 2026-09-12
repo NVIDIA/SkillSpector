@@ -34,6 +34,28 @@ def resolve_reasoning_effort() -> str | None:
     return reasoning_effort or None
 
 
+def resolve_sampling_parameters(*, include_seed: bool = False) -> dict[str, float | int]:
+    """Resolve optional, validated sampling controls for hosted providers."""
+    parameters: dict[str, float | int] = {}
+    raw_temperature = os.environ.get("SKILLSPECTOR_TEMPERATURE", "").strip()
+    if raw_temperature:
+        try:
+            temperature = float(raw_temperature)
+        except ValueError as exc:
+            raise ValueError("SKILLSPECTOR_TEMPERATURE must be a number between 0 and 1") from exc
+        if not 0 <= temperature <= 1:
+            raise ValueError("SKILLSPECTOR_TEMPERATURE must be between 0 and 1")
+        parameters["temperature"] = temperature
+
+    raw_seed = os.environ.get("SKILLSPECTOR_SEED", "").strip()
+    if include_seed and raw_seed:
+        try:
+            parameters["seed"] = int(raw_seed)
+        except ValueError as exc:
+            raise ValueError("SKILLSPECTOR_SEED must be an integer") from exc
+    return parameters
+
+
 def validate_base_url(url: str | None) -> None:
     """Warn if *url* is not a well-formed http(s) URL.
 
@@ -82,4 +104,5 @@ def create_openai_compatible_chat_model(
     reasoning_effort = resolve_reasoning_effort()
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
+    kwargs.update(resolve_sampling_parameters(include_seed=True))
     return ChatOpenAI(**kwargs)

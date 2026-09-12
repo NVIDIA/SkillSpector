@@ -213,6 +213,31 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
     return _openai_fallback_provider().resolve_credentials()
 
 
+def get_model_config_provider() -> ModelMetadataProvider:
+    """Return the provider whose model defaults match graph chat-model routing.
+
+    Explicit bindings, CLI providers, and Bedrock's native AWS credential path
+    remain authoritative. Unbound API-key providers use OpenAI metadata only
+    when their own credentials are absent and the OpenAI fallback is configured.
+    """
+    provider = _select_active_provider()
+    from .bedrock import BedrockProvider
+
+    if (
+        has_provider_binding()
+        or has_cli_capability(provider)
+        or isinstance(provider, BedrockProvider)
+    ):
+        return provider
+    if provider.resolve_credentials() is not None:
+        return provider
+
+    fallback = _openai_fallback_provider()
+    if fallback.resolve_credentials() is not None:
+        return fallback
+    return provider
+
+
 def create_chat_model_with_provider(
     model: str,
     *,
@@ -281,6 +306,7 @@ __all__ = [
     "create_chat_model",
     "create_chat_model_with_provider",
     "get_active_provider",
+    "get_model_config_provider",
     "get_metadata_provider",
     "has_cli_capability",
     "has_provider_binding",
