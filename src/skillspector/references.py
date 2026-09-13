@@ -130,6 +130,12 @@ def _normalize_candidate(raw: str, source_path: str) -> str | None:
         return None
     if len(path_part) >= 2 and path_part[1] == ":":
         return None
+    # A purely numeric "extension" (e.g. "1.2", "v1.2", "1.2.0-beta.1") is a
+    # version number, indistinguishable from a root-level file name without
+    # another path signal: real file extensions are never all digits.
+    basename = path_part.rsplit("/", 1)[-1]
+    if "." in basename and basename.rsplit(".", 1)[-1].isdigit():
+        return None
     source_parent = PurePosixPath(source_path).parent.as_posix()
     joined = posixpath.normpath(posixpath.join(source_parent, path_part))
     if joined in {"", ".", ".."} or joined.startswith("../"):

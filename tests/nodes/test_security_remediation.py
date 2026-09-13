@@ -364,6 +364,19 @@ def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -
     assert all(record["target_path"] is None for record in records)
 
 
+def test_quoted_version_number_is_not_a_reference(tmp_path: Path) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=('metadata:\n  version: "1.2"\n  build: "v1.2"\n  release: "1.2.0-beta.1"\n'),
+        known_paths=["SKILL.md"],
+    )
+
+    assert records
+    assert all(record["status"] == "rejected" for record in records)
+    assert all(record["target_path"] is None for record in records)
+
+
 def test_rejected_candidates_do_not_consume_accepted_reference_budget(tmp_path: Path) -> None:
     (tmp_path / ".hidden.md").write_text("hidden", encoding="utf-8")
     rejected = "\n".join(
