@@ -701,7 +701,7 @@ def test_build_context_scans_nested_oms_signature(tmp_path: Path) -> None:
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_text(encoding="utf-8")
+    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "nested/skill.oms.sig"
     )
