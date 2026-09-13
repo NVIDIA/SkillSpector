@@ -14,3 +14,34 @@ models:
   "claude-opus-4-6":
     context_length: 1000000
     max_output_tokens: 128000
+
+  "claude-opus-4-7":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-opus-4-8":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-sonnet-5":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-opus-5":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-fable-5":
+    context_length: 1000000
+    max_output_tokens: 128000
+    structured_output: json_schema
+
+  "claude-fable-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    structured_output: json_schema
+
+  "claude-mythos-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    structured_output: json_schema

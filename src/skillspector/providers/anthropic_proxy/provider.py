@@ -57,6 +57,9 @@ from skillspector.providers.chat_models import resolve_reasoning_effort, resolve
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
+# Families that reject a forced tool call (HTTP 400); they need the JSON-schema response format.
+JSON_SCHEMA_ONLY_MODEL_PREFIXES = ("claude-fable-", "claude-mythos-")
+
 DEFAULT_API_VERSION = "vertex-2023-10-16"
 _PROXY_STRIPPED_HEADERS = frozenset({"x-api-key", "anthropic-version", "host", "content-length"})
 
@@ -257,3 +260,10 @@ class AnthropicProxyProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > DEFAULT_MODEL."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method for *model*: registry entry, then family prefix, else ``None``."""
+        declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
+        if declared:
+            return declared
+        return "json_schema" if model.startswith(JSON_SCHEMA_ONLY_MODEL_PREFIXES) else None

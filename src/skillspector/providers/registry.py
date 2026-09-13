@@ -82,4 +82,13 @@ def lookup_max_output_tokens(default_yaml_path: str, model: str) -> int | None:
 
 
 # Back-compat alias for tests that previously called ``_load_registry``.
+def lookup_structured_output_method(default_yaml_path: str, model: str) -> str | None:
+    """Return the registry's ``structured_output`` method for *model*, if declared."""
+    entry = _load(_resolve_path(default_yaml_path)).get(model)
+    if not entry:
+        return None
+    value = entry.get("structured_output")
+    return str(value) if value else None
+
+
 _load_registry = _load

@@ -244,6 +244,15 @@ inference gateways.
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
 
+Structured output is requested through LangChain's `with_structured_output`,
+whose default forces a tool call. Some models reject a forced tool call with
+HTTP 400 (`tool_choice: type "tool" and "any" are not supported for this
+model`); the `anthropic` and `anthropic_proxy` providers route those model
+families (`claude-fable-*`, `claude-mythos-*`, or any registry entry with
+`structured_output: json_schema`) to the native JSON-schema response format
+automatically. `SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=json_schema|function_calling`
+overrides the choice for any provider.
+
 ```bash
 # Stock OpenAI
 export SKILLSPECTOR_PROVIDER=openai

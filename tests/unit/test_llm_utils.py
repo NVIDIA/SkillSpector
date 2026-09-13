@@ -41,6 +41,7 @@ from skillspector.llm_utils import (
     _extract_json_object,
     _invoke_with_usage,
     _resolve_llm_credentials,
+    bind_structured_output,
     chat_completion,
     chat_model_provider_name,
     fetch_model_token_limits,
@@ -48,6 +49,7 @@ from skillspector.llm_utils import (
     is_llm_available,
     new_inference_usage_collector,
     run_async,
+    structured_output_kwargs,
 )
 from skillspector.providers import (
     NO_LLM_API_KEY_MESSAGE,
@@ -739,3 +741,68 @@ class TestRunAsync:
         """Test run_async correctly handles async functions with await calls."""
         result = run_async(self._test_async_function(5, delay=0.01))
         assert result == 10
+
+
+class _HintingProvider:
+    def structured_output_method(self, model: str) -> str | None:
+        return "json_schema" if model.startswith("needs-json-") else None
+
+
+class _PlainProvider:
+    pass
+
+
+class _RecordingLLM:
+    def __init__(self) -> None:
+        self.calls: list[tuple[type, dict]] = []
+
+    def with_structured_output(self, schema: type, **kwargs):
+        self.calls.append((schema, kwargs))
+        return self
+
+
+class TestStructuredOutputMethod:
+    """``with_structured_output`` binding follows env > provider hint > LangChain default."""
+
+    def test_default_when_provider_has_no_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert structured_output_kwargs("any-model", provider=_PlainProvider()) == {}
+
+    def test_provider_hint_selects_json_schema(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert structured_output_kwargs("needs-json-1", provider=_HintingProvider()) == {
+            "method": "json_schema"
+        }
+        assert structured_output_kwargs("other", provider=_HintingProvider()) == {}
+
+    def test_env_override_wins_over_the_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
+        assert structured_output_kwargs("needs-json-1", provider=_HintingProvider()) == {
+            "method": "function_calling"
+        }
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", " JSON_SCHEMA ")
+        assert structured_output_kwargs("other", provider=_PlainProvider()) == {
+            "method": "json_schema"
+        }
+
+    def test_unknown_env_value_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "xml")
+        with pytest.raises(ValueError, match="SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD"):
+            structured_output_kwargs("any", provider=_PlainProvider())
+
+    def test_bind_passes_the_method_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        llm = _RecordingLLM()
+        bind_structured_output(llm, dict, "needs-json-1", provider=_HintingProvider())
+        bind_structured_output(llm, dict, "plain", provider=_HintingProvider())
+        assert llm.calls == [(dict, {"method": "json_schema"}), (dict, {})]
+
+    def test_cli_adapter_accepts_the_method_keyword(self) -> None:
+        from skillspector.llm_utils import AgentCLIChatModel
+
+        adapter = AgentCLIChatModel.__new__(AgentCLIChatModel)
+        adapter._provider = object()
+        adapter._model = "m"
+        adapter._max_output_tokens = 10
+        adapter._timeout = None
+        assert adapter.with_structured_output(dict, method="json_schema") is not None

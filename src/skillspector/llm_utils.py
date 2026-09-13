@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import threading
 import weakref
 from collections.abc import Coroutine
@@ -355,10 +356,49 @@ class AgentCLIChatModel:
     async def ainvoke(self, prompt: str) -> _AgentCLIMessage:
         return await asyncio.to_thread(self.invoke, prompt)
 
-    def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
+    def with_structured_output(
+        self, schema: type, method: str | None = None
+    ) -> _StructuredAgentCLIModel:
+        del method  # parity with LangChain chat models; the CLI transport always asks for JSON
         return _StructuredAgentCLIModel(
             self._provider, self._model, self._max_output_tokens, schema, self._timeout
         )
+
+
+STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
+
+
+def structured_output_kwargs(model: str, provider: object | None = None) -> dict[str, str]:
+    """Keyword arguments for ``with_structured_output`` when binding a schema for *model*.
+
+    ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`` wins, then the active provider's
+    ``structured_output_method(model)`` hint, else LangChain's default (no kwargs).
+
+    Raises:
+        ValueError: when the environment override is not a known method.
+    """
+    override = os.environ.get("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
+    if override:
+        if override not in STRUCTURED_OUTPUT_METHODS:
+            raise ValueError(
+                "SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD must be one of "
+                f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {override!r}"
+            )
+        return {"method": override}
+    if provider is None:
+        provider = get_active_provider()
+    hint = getattr(provider, "structured_output_method", None)
+    method = hint(model) if callable(hint) else None
+    return {"method": method} if method else {}
+
+
+def bind_structured_output(
+    llm: object, schema: type, model: str, provider: object | None = None
+) -> object:
+    """``llm.with_structured_output(schema)`` with the method *model* needs."""
+    return llm.with_structured_output(  # type: ignore[attr-defined]
+        schema, **structured_output_kwargs(model, provider)
+    )
 
 
 def get_chat_model(
