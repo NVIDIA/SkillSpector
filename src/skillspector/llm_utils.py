@@ -252,19 +252,11 @@ class _StructuredAgentCLIModel:
     ``complete()``, then parses and validates the response into *schema*.
     """
 
-    def __init__(
-        self,
-        provider: object,
-        model: str,
-        max_output_tokens: int,
-        schema: type,
-        timeout: float | None = None,
-    ) -> None:
-        self._provider = provider
-        self._model = model
-        self._max_output_tokens = max_output_tokens
+    def __init__(self, owner: AgentCLIChatModel, schema: type) -> None:
+        # Read transport settings through the owner so a structured wrapper does not pin the
+        # deadline it happened to be created with.
+        self._owner = owner
         self._schema = schema
-        self._timeout = timeout
 
     def _augment(self, prompt: str) -> str:
         schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
@@ -278,11 +270,11 @@ class _StructuredAgentCLIModel:
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""
         return _complete_agent_cli(
-            self._provider,
+            self._owner._provider,
             self._augment(prompt),
-            model=self._model,
-            max_output_tokens=self._max_output_tokens,
-            timeout=self._timeout,
+            model=self._owner._model,
+            max_output_tokens=self._owner._max_output_tokens,
+            timeout=self._owner._timeout,
         )
 
     def invoke(self, prompt: str) -> object:
@@ -356,9 +348,11 @@ class AgentCLIChatModel:
         return await asyncio.to_thread(self.invoke, prompt)
 
     def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
-        return _StructuredAgentCLIModel(
-            self._provider, self._model, self._max_output_tokens, schema, self._timeout
-        )
+        return _StructuredAgentCLIModel(self, schema)
+
+    def set_timeout(self, timeout: float | None) -> None:
+        """Retarget this adapter, and its structured wrappers, at a new deadline."""
+        self._timeout = timeout
 
 
 def get_chat_model(
