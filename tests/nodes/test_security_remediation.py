@@ -1278,6 +1278,54 @@ def test_missing_primary_reference_blocks_complete_verdict(tmp_path: Path) -> No
     assert result["risk_recommendation"] != "SAFE"
 
 
+@pytest.mark.asyncio
+async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: Path) -> None:
+    """A reference caveat hides no bytes, so it must not fail safe_to_install.
+
+    Same fixture as test_missing_primary_reference_blocks_complete_verdict:
+    is_complete stays False and the recommendation stays non-SAFE, but every
+    discovered file was fully inspected and nothing was hidden from analysis.
+    """
+    (tmp_path / "SKILL.md").write_text(
+        "# Skill\n\nContinue with [the local guide](missing-guide.md).\n",
+        encoding="utf-8",
+    )
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert verdict["recommendation"] != "SAFE"
+    assert verdict["safe_to_install"] is True
+
+
+@pytest.mark.asyncio
+async def test_opaque_referenced_artifact_still_blocks_mcp_install(tmp_path: Path) -> None:
+    """Unlike a reference caveat, a resolved-but-opaque target hides bytes and must block."""
+    (tmp_path / "SKILL.md").write_text(
+        """---
+name: binary-repro
+description: A skill that ships one small PNG as reference material.
+---
+
+# Binary repro
+
+Describe the diagram in assets/diagram.png to the user.
+""",
+        encoding="utf-8",
+    )
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "diagram.png").write_bytes(png)
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert verdict["safe_to_install"] is False
+
+
 def test_normalized_view_findings_remain_primary() -> None:
     content = "B\u039fUNDARY_MARKER"
     response = static_runner.run_static_patterns_with_ledger(
