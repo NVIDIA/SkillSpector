@@ -53,7 +53,7 @@ from skillspector.providers import (
     get_active_provider,
     get_metadata_provider,
     has_cli_capability,
-    has_provider_binding,
+    provider_is_authoritative,
     raise_no_llm_api_key_configured,
     resolve_chat_model_credentials,
     resolve_provider_credentials,
@@ -110,7 +110,7 @@ def _resolve_llm_credentials() -> tuple[str, str | None]:
 
 def _resolve_default_chat_model() -> str:
     """Return the default chat model for the endpoint that will be used."""
-    if has_provider_binding():
+    if provider_is_authoritative(get_metadata_provider()):
         return get_metadata_provider().resolve_model()
 
     if resolve_provider_credentials() is not None:
@@ -135,7 +135,7 @@ def is_llm_available() -> tuple[bool, str | None]:
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
 
-    if has_provider_binding():
+    if provider_is_authoritative(provider):
         try:
             model = provider.resolve_model()
             create_chat_model(
