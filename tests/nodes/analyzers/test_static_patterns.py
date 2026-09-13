@@ -712,13 +712,15 @@ class TestRunStaticPatternsAgentSnoopingAdditional:
     def test_as3_skill_enumeration(self):
         """Listing installed skills from skill directories yields AS3."""
         state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
             "components": ["SKILL.md"],
             "file_cache": {
                 "SKILL.md": "Enumerate all installed skills by listing files in the .claude/skills/ directory.",
             },
         }
-        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
-        assert any(f.rule_id == "AS3" for f in findings)
+        result = agent_snooping_module.node(state)
+        assert any(f.rule_id == "AS3" for f in result["findings"])
 
     def test_safe_content_no_agent_snooping(self):
         """Legitimate skill content produces no agent snooping findings."""
@@ -780,11 +782,228 @@ class TestRunStaticPatternsAgentSnooping:
     def test_as3_other_skill_produces_finding(self):
         """Reading another skill's manifest yields AS3."""
         state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
             "components": ["s.py"],
             "file_cache": {"s.py": 'open("skills/other-skill/SKILL.md").read()\n'},
         }
-        findings = static_runner.run_static_patterns(state, [agent_snooping_module])
-        assert any(f.rule_id == "AS3" for f in findings)
+        result = agent_snooping_module.node(state)
+        assert any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_ownership_table_current_skill_is_not_snooping(self):
+        """An ownership table may name the skill currently being inspected."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_scan_root_identity_marks_self_reference_when_manifest_is_absent(self):
+        """The scan-root basename identifies the current skill without a manifest."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_manifest_identity_marks_self_reference_when_path_is_unrelated(self):
+        """Manifest identity is authoritative when the checkout basename is unrelated."""
+        state = {
+            "skill_path": "/tmp/checkout-root",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_long_current_skill_path_is_not_snooping(self):
+        """Self-reference comparison uses the full path before evidence truncation."""
+        skill_name = f"example-{'a' * 190}"
+        path_reference = f"skills/{skill_name}/SKILL.md"
+        assert len(path_reference) > 200
+        state = {
+            "skill_path": f"/tmp/checkout-root/{skill_name}",
+            "manifest": {"name": skill_name},
+            "components": ["README.md"],
+            "file_cache": {"README.md": f"Root skill: {path_reference}"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_filtered_self_references_do_not_consume_output_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Filtered self paths neither consume output budget nor enter the ledger."""
+        monkeypatch.setattr(static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        peer_reference = "skills/other-skill/SKILL.md"
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": "\n".join(["skills/example-skill/SKILL.md"] * 3 + [peer_reference])
+            },
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [peer_reference]
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_current_identity_normalizes_case_hyphens_and_underscores(self):
+        """Manifest and path identifiers compare across supported spelling variants."""
+        state = {
+            "skill_path": "/tmp/checkout-root",
+            "manifest": {"name": "Example_Skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/eXaMpLe-SkIlL/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_fullwidth_peer_path_from_normalized_view_remains_suspicious(self):
+        """A compatibility-normalized peer path remains an AS3 finding."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Peer skill: skills/ｅxample-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        assert "normalized-view" in as3_findings[0].tags
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_hidden_separator_peer_path_from_compact_view_remains_suspicious(self):
+        """A peer path reconstructed across hidden text remains an AS3 finding."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Peer skill: skills/exam\u200bple-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        assert "normalized-view" in as3_findings[0].tags
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_literal_self_path_stays_suppressed_when_other_text_is_normalized(self):
+        """Unrelated normalization does not turn a literal self path into snooping."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": (
+                    "Root skill: skills/example-skill/SKILL.md\nUnrelated compatibility text: ｘ"
+                )
+            },
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(finding.rule_id == "AS3" for finding in result["findings"])
+
+    def test_as3_raw_view_scope_does_not_extend_to_transformed_content(self):
+        """Raw-view authorization is bound to the runner-provided text object."""
+
+        class TransformedAnalyzer:
+            ANALYZER_ID = agent_snooping_module.ANALYZER_ID
+
+            @staticmethod
+            def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                assert content == "placeholder"
+                transformed = "skills/example-skill/SKILL.md"
+                analyzer = agent_snooping_module._CurrentSkillScopedAnalyzer(
+                    frozenset({"example-skill"})
+                )
+                return analyzer.analyze(transformed, file_path, file_type)
+
+        result = static_runner.run_static_patterns_with_ledger(
+            {
+                "components": ["README.md"],
+                "file_cache": {"README.md": "placeholder"},
+            },
+            [TransformedAnalyzer()],
+        )
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        readme_event = result["inspection_ledger"][0]
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_missing_current_identity_fails_closed(self):
+        """Without a path or manifest identity, a skill path remains suspicious."""
+        state = {
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
 
     def test_same_line_distinct_matches_preserved(self):
         """Distinct same-line config reads are preserved as separate findings."""
