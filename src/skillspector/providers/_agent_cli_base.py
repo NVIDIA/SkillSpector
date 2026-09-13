@@ -39,7 +39,7 @@ class AgentCLIProviderBase:
     #: ``_provider.DEFAULT_MODEL`` lookup has an attribute; never pins a version.
     DEFAULT_MODEL: str = ""
     #: Optional path to a bundled ``model_registry.yaml`` for token budgets. CLI
-    #: providers leave this empty and fall back to package-wide default budgets.
+    #: providers leave this empty, but users can supply a global registry override.
     REGISTRY_PATH: str = ""
 
     # -- Credentials ---------------------------------------------------------
@@ -81,13 +81,9 @@ class AgentCLIProviderBase:
     # -- Metadata ------------------------------------------------------------
 
     def get_context_length(self, model: str) -> int | None:
-        if not self.REGISTRY_PATH:
-            return None  # no registry -> caller uses the package-wide default budget
         return registry.lookup_context_length(self.REGISTRY_PATH, model)
 
     def get_max_output_tokens(self, model: str) -> int | None:
-        if not self.REGISTRY_PATH:
-            return None
         return registry.lookup_max_output_tokens(self.REGISTRY_PATH, model)
 
     def resolve_model(self, slot: str = "default") -> str:
