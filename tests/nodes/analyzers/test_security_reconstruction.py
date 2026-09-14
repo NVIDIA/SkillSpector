@@ -114,8 +114,11 @@ class _DeadlineHookAfterMarkerModule(_ExpiringAfterMarkerModule):
         self,
         content: str,
         check_runtime: object,
+        *,
+        file_type: str,
+        complete_context: bool,
     ) -> bool:
-        del content
+        del content, file_type, complete_context
         self.hook_entered = True
         assert callable(check_runtime)
         check_runtime()
@@ -1619,6 +1622,86 @@ def test_shell_command_word_cap_exhaustion_is_partial() -> None:
 
 
 @pytest.mark.parametrize(
+    "content",
+    [
+        "Interpret `$ARGUMENTS` as the user's input.",
+        "Interpret `${ARGUMENTS}` as the user's input.",
+        "Use `$example:task FILE_PATH|--all` to invoke the skill.",
+        "Read the token from `$SERVICE_TOKEN` or a configured file.",
+        'Test-Path "$($_.FullName)\\cli-path"',
+        r"Render `$$\int_0^1 x \, dx$$` as math.",
+        "The reader's " + "ordinary documentation\n" * 220 + " author's guide.\n",
+        '"""Reader documentation.\n' + "ordinary documentation\n" * 220 + '"""\nreturn None\n',
+    ],
+    ids=[
+        "parameter",
+        "braced-parameter",
+        "skill-invocation",
+        "token",
+        "powershell",
+        "math",
+        "apostrophe",
+        "docstring",
+    ],
+)
+def test_documentation_is_not_a_bounded_shell_reconstruction(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+def test_long_quoted_command_path_still_detects_destructive_basename() -> None:
+    content = 'r"' + "directory/" * 500 + '"rm -rf /'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    assert any(finding.rule_id == "TM1" for finding in result["findings"])
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$(printf $FORMAT) -rf /",
+        "$(printf ${FORMAT}) -rf /",
+        "$($BIN/printf echo) -rf /",
+        "$(${BIN}/printf echo) -rf /",
+        '$("$BIN/printf" echo) -rf /',
+        "$($BIN/env printf echo) -rf /",
+        "$($BIN/command printf echo) -rf /",
+        "$($BIN/builtin printf echo) -rf /",
+        '`"${TOOL:-$(printf rm ' + " " * 300 + ')}"` -rf /',
+    ],
+    ids=[
+        "runtime-format",
+        "braced-runtime-format",
+        "runtime-path",
+        "braced-runtime-path",
+        "quoted-runtime-path",
+        "runtime-env-path",
+        "runtime-command-path",
+        "runtime-builtin-path",
+        "nested-parameter-reconstruction",
+    ],
+)
+@pytest.mark.parametrize("file_path", ["example.sh", "SKILL.md"])
+def test_runtime_printf_arguments_and_nested_reconstruction_stay_partial(
+    content: str, file_path: str
+) -> None:
+    if file_path.endswith(".md"):
+        content = f"```sh\n{content}\n```\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [file_path], "file_cache": {file_path: content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
     "printf_command",
     ["printf", 'p"rintf"', "p'rintf'", '"pri"ntf', r"p\rintf", "env printf"],
 )
@@ -1683,8 +1766,11 @@ def test_unsupported_printf_argument_bound_is_partial(printf_command: str) -> No
         "$($(printf printf) echo) -rf /",
     ],
 )
-def test_unsupported_printf_substitution_shape_is_partial(content: str) -> None:
-    state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+@pytest.mark.parametrize("file_path", ["example.sh", "SKILL.md"])
+def test_unsupported_printf_substitution_shape_is_partial(content: str, file_path: str) -> None:
+    if file_path.endswith(".md"):
+        content = f"```sh\n{content}\n```\n"
+    state = {"components": [file_path], "file_cache": {file_path: content}}
 
     result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
 

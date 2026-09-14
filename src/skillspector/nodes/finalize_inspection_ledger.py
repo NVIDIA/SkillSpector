@@ -39,6 +39,7 @@ def _reference_coverage_findings(
         if outcome in {"partial", "failed", "out_of_scope"}:
             exceptional_outcomes.setdefault(str(event.get("path", "")), set()).add(outcome)
     findings: list[Finding] = []
+    seen_locations: set[tuple[str, int, str]] = set()
     for reference in raw_references:
         if not isinstance(reference, dict):
             continue
@@ -62,6 +63,14 @@ def _reference_coverage_findings(
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
             continue
         line_value = reference.get("line", 1)
+        source_path = str(reference.get("source_path", "SKILL.md"))
+        line = line_value if isinstance(line_value, int) else 1
+        # A Markdown label and destination may resolve to the same artifact.
+        # Findings identify source lines, so emit that coverage gap only once.
+        location = (source_path, line, target_path)
+        if location in seen_locations:
+            continue
+        seen_locations.add(location)
         evidence = str(reference.get("evidence", ""))[:160]
         findings.append(
             Finding(
@@ -69,8 +78,8 @@ def _reference_coverage_findings(
                 message="Referenced artifact was not completely inspected",
                 severity="HIGH",
                 confidence=1.0,
-                file=str(reference.get("source_path", "SKILL.md")),
-                start_line=line_value if isinstance(line_value, int) else 1,
+                file=source_path,
+                start_line=line,
                 category="analysis-evasion",
                 tags=["coverage", "reference", f"target-disposition:{final_disposition}"],
                 finding=f"{target_path} ({final_disposition})"[:200],
@@ -88,17 +97,24 @@ def _reference_coverage_findings(
 def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
     """Validate full internal facts and derive the public completeness projection."""
     reference_findings = _reference_coverage_findings(state)
+    # Work IDs are scoped to analyzer, source file and line range. Distinct
+    # targets on one line must share a terminal row with all emitted findings.
+    reference_ids_by_line: dict[tuple[str, int | None], list[str]] = {}
+    for finding in reference_findings:
+        reference_ids_by_line.setdefault((finding.file, finding.start_line), []).append(
+            finding.finding_id
+        )
     reference_events: list[InspectionLedgerEvent] = [
         ledger_event(
             outcome=LedgerOutcome.COMPLETED,
             phase="reference",
             analyzer_id="reference_coverage",
-            path=finding.file,
-            start_line=finding.start_line,
-            end_line=finding.start_line,
-            emitted_finding_ids=[finding.finding_id],
+            path=path,
+            start_line=line,
+            end_line=line,
+            emitted_finding_ids=finding_ids,
         )
-        for finding in reference_findings
+        for (path, line), finding_ids in reference_ids_by_line.items()
     ]
     merged_state = dict(state)
     all_findings = [*(state.get("findings") or []), *reference_findings]
