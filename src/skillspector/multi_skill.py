@@ -71,6 +71,9 @@ class SkillDirectory:
     path: Path
     name: str
     relative_path: str
+    # Frozen discovery provenance. Re-rooting a dot-prefixed child must not
+    # erase the hidden ancestry that keeps its content out of external models.
+    local_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +304,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
                     path=child,
                     name=name,
                     relative_path=_sanitize_display_component(entry.name),
+                    local_only=entry.name.startswith("."),
                 )
             )
     except _DetectionIncompleteError as exc:

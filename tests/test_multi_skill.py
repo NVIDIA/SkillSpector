@@ -314,6 +314,7 @@ class TestDetectSkills:
             "skill-a",
             "skill-b",
         }
+        assert [skill.local_only for skill in result.skills] == [True, False, False]
 
     def test_symlinked_skill_directory_is_skipped(self, tmp_path: Path) -> None:
         """Detection must not read a skill manifest through a directory symlink."""

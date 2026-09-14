@@ -5,7 +5,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerReason,
+    LedgerRecordType,
+    ledger_event,
+)
 
 CANONICAL_SEMANTIC_ANALYZER_IDS = frozenset(
     {
@@ -14,6 +22,15 @@ CANONICAL_SEMANTIC_ANALYZER_IDS = frozenset(
         "semantic_security_discovery",
     }
 )
+
+SEMANTIC_PREFLIGHT_UNAVAILABLE_MESSAGE = (
+    "Requested semantic analysis was unavailable before execution."
+)
+SEMANTIC_RUNTIME_INCOMPLETE_MESSAGE = (
+    "Requested semantic analysis did not produce complete per-source runtime telemetry."
+)
+
+_ROOT_SOURCE_SCOPE = "<root>"
 
 
 def required_semantic_analyzer_ids(
@@ -28,6 +45,16 @@ def required_semantic_analyzer_ids(
     return CANONICAL_SEMANTIC_ANALYZER_IDS | discovered
 
 
+def semantic_runtime_intent(result: Mapping[str, object]) -> tuple[bool, bool]:
+    """Return strict ``(requested, enabled)`` semantic-analysis intent."""
+    if "use_llm" not in result and "llm_requested" not in result:
+        return False, False
+    enabled = result.get("use_llm") is not False
+    raw_requested = result.get("llm_requested")
+    requested = raw_requested if isinstance(raw_requested, bool) else enabled
+    return requested, enabled
+
+
 def successful_llm_record(record: object) -> bool:
     """Return whether ``record`` is a well-formed successful LLM call."""
     return (
@@ -37,6 +64,16 @@ def successful_llm_record(record: object) -> bool:
         and record.get("ok") is True
         and record.get("error") is None
     )
+
+
+def _source_scope(record: Mapping[str, object]) -> str | None:
+    """Return a stable scope key, rejecting malformed explicit identities."""
+    source_identity = record.get("source_identity")
+    if source_identity is None:
+        return _ROOT_SOURCE_SCOPE
+    if isinstance(source_identity, str) and source_identity:
+        return source_identity
+    return None
 
 
 def _has_effective_findings(result: Mapping[str, object]) -> bool:
@@ -90,42 +127,65 @@ def semantic_runtime_accounting(
     if not all(successful_llm_record(record) for record in raw_call_log):
         return used, False
 
+    calls_by_scope_and_node: dict[tuple[str, str], int] = {}
+    for record in raw_call_log:
+        # successful_llm_record() above established the Mapping and node shape.
+        assert isinstance(record, Mapping)
+        scope = _source_scope(record)
+        node = record.get("node")
+        if scope is None or not isinstance(node, str):
+            return used, False
+        key = (scope, node)
+        calls_by_scope_and_node[key] = calls_by_scope_and_node.get(key, 0) + 1
+
     raw_statuses = result.get("analyzer_status_events")
     if not isinstance(raw_statuses, list):
         return used, False
     required_analyzer_ids = required_semantic_analyzer_ids(discovered_modules)
-    statuses_by_analyzer: dict[str, list[str]] = {}
+    statuses_by_scope_and_analyzer: dict[tuple[str, str], list[str]] = {}
+    semantic_scopes: set[str] = set()
     for status in raw_statuses:
         if not isinstance(status, Mapping):
             return used, False
+        scope = _source_scope(status)
         analyzer_id = status.get("analyzer_id")
         analyzer_status = status.get("status")
         if (
-            not isinstance(analyzer_id, str)
+            scope is None
+            or not isinstance(analyzer_id, str)
             or not analyzer_id
             or not isinstance(analyzer_status, str)
             or not analyzer_status
         ):
             return used, False
         if analyzer_id in required_analyzer_ids:
-            statuses_by_analyzer.setdefault(analyzer_id, []).append(analyzer_status)
+            semantic_scopes.add(scope)
+            statuses_by_scope_and_analyzer.setdefault((scope, analyzer_id), []).append(
+                analyzer_status
+            )
 
-    for analyzer_id in required_analyzer_ids:
-        statuses = statuses_by_analyzer.get(analyzer_id)
-        if statuses is None or len(statuses) != 1:
-            return used, False
-        status = statuses[0]
-        has_successful_call = any(
-            successful_llm_record(record) and record.get("node") == analyzer_id
-            for record in raw_call_log
-        )
-        if status == "completed":
-            if not has_successful_call:
+    if not semantic_scopes:
+        return used, False
+
+    for scope in semantic_scopes:
+        for analyzer_id in required_analyzer_ids:
+            statuses = statuses_by_scope_and_analyzer.get((scope, analyzer_id))
+            if statuses is None or len(statuses) != 1:
                 return used, False
-        elif status == "not_applicable":
-            if has_successful_call:
+            status = statuses[0]
+            successful_calls = calls_by_scope_and_node.get((scope, analyzer_id), 0)
+            if status == "completed":
+                if successful_calls != 1:
+                    return used, False
+            elif status == "not_applicable":
+                if successful_calls != 0:
+                    return used, False
+            else:
                 return used, False
-        else:
+
+    # A call must never borrow an identically named status from another source.
+    for (scope, analyzer_id), _count in calls_by_scope_and_node.items():
+        if analyzer_id in required_analyzer_ids and scope not in semantic_scopes:
             return used, False
 
     if _has_effective_findings(result) and not any(
@@ -135,3 +195,81 @@ def semantic_runtime_accounting(
         return used, False
 
     return used, True
+
+
+def semantic_runtime_limitation(
+    *,
+    requested: bool,
+    enabled: bool,
+    result: Mapping[str, object],
+    discovered_modules: Mapping[str, object],
+) -> str | None:
+    """Return the canonical limitation for an unmet requested semantic pass."""
+    if not requested:
+        return None
+    if not enabled:
+        return SEMANTIC_PREFLIGHT_UNAVAILABLE_MESSAGE
+    _used, complete = semantic_runtime_accounting(
+        enabled=True,
+        result=result,
+        discovered_modules=discovered_modules,
+    )
+    return None if complete else SEMANTIC_RUNTIME_INCOMPLETE_MESSAGE
+
+
+def semantic_runtime_ledger_event(
+    *,
+    requested: bool,
+    enabled: bool,
+    result: Mapping[str, object],
+    discovered_modules: Mapping[str, object],
+) -> InspectionLedgerEvent | None:
+    """Project an unmet semantic requirement into the canonical inspection ledger."""
+    # Finalization is also used by focused analyzers and compatibility callers
+    # that predate semantic intent telemetry.  Only graph states that explicitly
+    # declare that intent can owe semantic work.
+    if "use_llm" not in result and "llm_requested" not in result:
+        return None
+    limitation = semantic_runtime_limitation(
+        requested=requested,
+        enabled=enabled,
+        result=result,
+        discovered_modules=discovered_modules,
+    )
+    if limitation is None:
+        return None
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="semantic_runtime",
+        path="SKILL.md",
+        reason=(
+            LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+            if enabled
+            else LedgerReason.MISSING_CREDENTIALS
+        ),
+        stage="runtime_telemetry" if enabled else "preflight",
+    )
+    event["message"] = limitation
+    return event
+
+
+def semantic_runtime_event_key(event: Mapping[str, object]) -> tuple[str, str, str, str]:
+    """Return the stable identity used to deduplicate semantic runtime gaps."""
+    return (
+        str(event.get("work_id", "")),
+        str(event.get("reason_code", "")),
+        str(event.get("stage", "")),
+        str(event.get("source_identity", _ROOT_SOURCE_SCOPE)),
+    )
+
+
+def has_semantic_runtime_event(events: Iterable[object], candidate: Mapping[str, object]) -> bool:
+    """Return whether ``events`` already contain this exact runtime limitation."""
+    candidate_key = semantic_runtime_event_key(candidate)
+    return any(
+        isinstance(event, Mapping)
+        and event.get("phase") == "semantic_runtime"
+        and semantic_runtime_event_key(event) == candidate_key
+        for event in events
+    )

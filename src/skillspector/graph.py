@@ -24,6 +24,7 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from skillspector.inspection_ledger import guard_analyzer_node
+from skillspector.llm_utils import is_llm_available as is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS, ANALYZER_NODES
 from skillspector.nodes.build_context import build_context
@@ -34,6 +35,10 @@ from skillspector.nodes.resolve_input import resolve_input
 from skillspector.state import SkillspectorState
 
 logger = get_logger(__name__)
+
+# ``is_llm_available`` remains a compatibility export for callers that patched
+# provider preflight here. Graph construction is deliberately credential-independent
+# so requested analyzers emit explicit statuses instead of disappearing.
 
 
 def create_graph():

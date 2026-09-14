@@ -37,7 +37,11 @@ from rich.table import Table
 
 from skillspector import __version__ as skillspector_version
 from skillspector.inference_usage import sanitize_inference_usage
-from skillspector.inspection_ledger import MAX_FINDING_OUTPUT_RECORDS, AnalysisCompleteness
+from skillspector.inspection_ledger import (
+    MAX_FINDING_OUTPUT_RECORDS,
+    AnalysisCompleteness,
+    finalize_ledger,
+)
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -63,8 +67,11 @@ from skillspector.sarif_models import (
     validate_sarif_report,
 )
 from skillspector.semantic_runtime import (
+    has_semantic_runtime_event,
     llm_runtime_available,
     semantic_runtime_accounting,
+    semantic_runtime_intent,
+    semantic_runtime_ledger_event,
     successful_llm_record,
 )
 from skillspector.state import SkillspectorState
@@ -764,19 +771,34 @@ def _build_sarif(
             properties=properties,
         )
 
+    raw_ledger_exceptions = completeness.get("ledger_exceptions", [])
+    ledger_exceptions = (
+        [item for item in raw_ledger_exceptions if isinstance(item, Mapping)]
+        if isinstance(raw_ledger_exceptions, list)
+        else []
+    )
+    # Fatal execution facts retain highest priority. The degradation notice
+    # then precedes its non-fatal canonical runtime detail, preserving the
+    # established first-notification contract without hiding fatal failures.
+    for exception in ledger_exceptions:
+        if exception.get("fatal"):
+            append_notification(notification_from_exception(exception, "error"))
+    if degraded_notice:
+        append_notification(
+            SarifNotification(
+                message=SarifMessage(text=degraded_notice),
+                level="warning",
+                properties={"kind": "llm_degradation"},
+            )
+        )
     scope_exclusions = completeness.get("scope_exclusions", [])
     if isinstance(scope_exclusions, list):
         for exception in scope_exclusions:
             if isinstance(exception, Mapping):
                 append_notification(notification_from_exception(exception, "note"))
-    ledger_exceptions = completeness.get("ledger_exceptions", [])
-    if isinstance(ledger_exceptions, list):
-        for exception in ledger_exceptions:
-            if isinstance(exception, Mapping):
-                level: Literal["error", "warning", "note"] = (
-                    "error" if exception.get("fatal") else "warning"
-                )
-                append_notification(notification_from_exception(exception, level))
+    for exception in ledger_exceptions:
+        if not exception.get("fatal"):
+            append_notification(notification_from_exception(exception, "warning"))
     limitations = completeness.get("limitations", [])
     if isinstance(limitations, list):
         for limitation in limitations:
@@ -787,14 +809,6 @@ def _build_sarif(
                     properties={"kind": "inspection_limitation"},
                 )
             )
-    if degraded_notice:
-        append_notification(
-            SarifNotification(
-                message=SarifMessage(text=degraded_notice),
-                level="warning",
-                properties={"kind": "llm_degradation"},
-            )
-        )
     if notifications_truncated:
         completeness_projection["notificationsTruncated"] = True
         sentinel = SarifNotification(
@@ -1496,9 +1510,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     manifest = state.get("manifest") or {}
     skill_path = state.get("skill_path")
     output_format = state.get("output_format") or "sarif"
-    use_llm = state.get("use_llm") is not False
-    raw_llm_requested = state.get("llm_requested")
-    llm_requested = raw_llm_requested if isinstance(raw_llm_requested, bool) else use_llm
+    llm_requested, use_llm = semantic_runtime_intent(state)
     raw_llm_call_log = state.get("llm_call_log")
     llm_call_log: list[Mapping[str, object]] = (
         [record for record in raw_llm_call_log if isinstance(record, Mapping)]
@@ -1513,22 +1525,40 @@ def report(state: SkillspectorState) -> dict[str, object]:
         for reason in state.get("transitive_truncation_reasons", [])
         if isinstance(reason, str)
     ]
-    if transitive_truncation_reasons:
-        analysis_completeness = dict(analysis_completeness)
-        raw_limitations = analysis_completeness.get("limitations")
-        limitations = list(raw_limitations) if isinstance(raw_limitations, list) else []
-        limitations.append(
-            "Transitive traversal truncated: " + "; ".join(transitive_truncation_reasons)
-        )
-        analysis_completeness["limitations"] = limitations
-        analysis_completeness["is_complete"] = False
-
     _llm_used, semantic_runtime_complete = semantic_runtime_accounting(
         enabled=bool(llm_requested and use_llm),
         result=state,
         discovered_modules=ANALYZER_MODULES,
     )
     semantic_runtime_incomplete = bool(llm_requested and use_llm and not semantic_runtime_complete)
+    runtime_event = semantic_runtime_ledger_event(
+        requested=llm_requested,
+        enabled=use_llm,
+        result=state,
+        discovered_modules=ANALYZER_MODULES,
+    )
+    raw_inspection_ledger = state.get("inspection_ledger")
+    inspection_ledger = raw_inspection_ledger if isinstance(raw_inspection_ledger, list) else []
+    if runtime_event is not None and not has_semantic_runtime_event(
+        inspection_ledger, runtime_event
+    ):
+        finalized_state = dict(state)
+        finalized_state["inspection_ledger"] = [*inspection_ledger, runtime_event]
+        analysis_completeness, _effective_ids = finalize_ledger(finalized_state)
+        execution_successful = bool(analysis_completeness["execution_successful"])
+    if transitive_truncation_reasons:
+        analysis_completeness = dict(analysis_completeness)
+        raw_limitations = analysis_completeness.get("limitations")
+        limitations = list(raw_limitations) if isinstance(raw_limitations, list) else []
+        transitive_limitation = "Transitive traversal truncated: " + "; ".join(
+            transitive_truncation_reasons
+        )
+        if transitive_limitation not in limitations:
+            limitations.append(transitive_limitation)
+        analysis_completeness["limitations"] = limitations
+        analysis_completeness["is_complete"] = False
+        if analysis_completeness.get("status", "complete") == "complete":
+            analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
     provider_available, provider_error = is_llm_available()
     runtime_available = llm_runtime_available(
@@ -1721,6 +1751,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "filtered_findings": reported_findings,
         "suppressed_findings": suppressed,
         "execution_successful": execution_successful,
+        "analysis_completeness": dict(analysis_completeness),
         "transitive_targets_scanned": transitive_targets_scanned,
         "transitive_bytes_scanned": transitive_bytes_scanned,
         "transitive_truncated": bool(transitive_truncation_reasons),

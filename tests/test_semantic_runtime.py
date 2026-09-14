@@ -72,3 +72,66 @@ def test_incomplete_registry_cannot_make_incomplete_canonical_telemetry_complete
         result=result,
         discovered_modules={},
     ) == (False, False)
+
+
+def _semantic_statuses(source_identity: str | None = None) -> list[dict[str, object]]:
+    provenance = {"source_identity": source_identity} if source_identity is not None else {}
+    return [
+        {"analyzer_id": analyzer_id, "status": "completed", **provenance}
+        for analyzer_id in sorted(required_semantic_analyzer_ids({}))
+    ]
+
+
+def _semantic_calls(source_identity: str | None = None) -> list[dict[str, object]]:
+    provenance = {"source_identity": source_identity} if source_identity is not None else {}
+    return [
+        {"node": analyzer_id, "ok": True, "error": None, **provenance}
+        for analyzer_id in sorted(required_semantic_analyzer_ids({}))
+    ]
+
+
+def test_complete_root_and_child_telemetry_is_validated_per_source_scope() -> None:
+    """Identical analyzer IDs in independent complete sources are not duplicates."""
+    child_scope = "external/child-digest"
+    result = {
+        "analyzer_status_events": [
+            *_semantic_statuses(),
+            *_semantic_statuses(child_scope),
+        ],
+        "llm_call_log": [
+            *_semantic_calls(),
+            *_semantic_calls(child_scope),
+        ],
+    }
+
+    assert semantic_runtime_accounting(
+        enabled=True,
+        result=result,
+        discovered_modules={},
+    ) == (True, True)
+
+
+def test_duplicate_semantic_status_within_one_source_scope_is_rejected() -> None:
+    """Source scoping must not weaken duplicate-within-scope detection."""
+    statuses = _semantic_statuses()
+    statuses.append(dict(statuses[0]))
+
+    assert semantic_runtime_accounting(
+        enabled=True,
+        result={"analyzer_status_events": statuses, "llm_call_log": _semantic_calls()},
+        discovered_modules={},
+    ) == (True, False)
+
+
+def test_child_call_cannot_borrow_an_unscoped_root_status() -> None:
+    """Call evidence and terminal status must carry the same structural scope key."""
+    child_scope = "external/child-digest"
+
+    assert semantic_runtime_accounting(
+        enabled=True,
+        result={
+            "analyzer_status_events": _semantic_statuses(child_scope),
+            "llm_call_log": _semantic_calls(),
+        },
+        discovered_modules={},
+    ) == (True, False)

@@ -772,7 +772,8 @@ async def test_run_scan_openai_fallback_builds_matching_graph_model_config(
 
     result = await run_scan(str(tmp_path), use_llm=True, output_format="json")
 
-    assert result["llm_used"] is True
+    # Provider selection succeeding does not prove that semantic work ran.
+    assert result["llm_used"] is False
     assert captured["default"] == OpenAIProvider.DEFAULT_MODEL
 
 

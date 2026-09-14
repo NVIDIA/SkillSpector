@@ -325,6 +325,9 @@ class SkillspectorState(TypedDict, total=False):
     # Report generation uses this to distinguish unavailable requested analysis from an
     # explicit static-only scan while analyzers continue to honor use_llm.
     llm_requested: bool
+    # Monotonic provenance flag: content rooted beneath a hidden/local-only
+    # source remains in deterministic analysis but never enters provider input.
+    source_local_only: bool
 
     # Risk: report node sets these from risk_score
     risk_severity: str
@@ -355,6 +358,9 @@ class LLMCallRecord(TypedDict):
     node: str
     ok: bool
     error: str | None
+    source_url: NotRequired[str]
+    source_identity: NotRequired[str]
+    source_digest: NotRequired[str]
 
 
 def llm_call_record(node_id: str, *, ok: bool, error: str | None = None) -> LLMCallRecord:
