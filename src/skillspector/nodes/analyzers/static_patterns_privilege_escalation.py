@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import ast
+import posixpath
 import re
 import sys
 from bisect import bisect_right
@@ -659,6 +661,44 @@ def _is_qualified_benign_access_requirement(
     return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
 
 
+def _constant_os_path_join(node: ast.expr) -> str | None:
+    """Resolve literal ``os.path.join`` calls without evaluating arbitrary code."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "path"
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "os"
+    ):
+        return None
+
+    parts = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+    if len(parts) != len(node.args) or not all(isinstance(part, str) for part in parts):
+        return None
+    return posixpath.join(*parts)
+
+
+def _constructed_sensitive_paths(content: str) -> list[tuple[int, str, float]]:
+    """Return literal sensitive paths assembled with ``os.path.join`` in Python."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    resolved: list[tuple[int, str, float]] = []
+    for node in ast.walk(tree):
+        value = _constant_os_path_join(node)
+        if value is None:
+            continue
+        for pattern, confidence in PE3_PATTERNS:
+            if re.search(pattern, value, re.IGNORECASE):
+                resolved.append((node.lineno, value, confidence))
+                break
+    return resolved
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
@@ -806,6 +846,20 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     context=context,
                     matched_text=match.group(0)[:200],
                     complete_match=match.group(0),
+                )
+            )
+    if file_type == "python":
+        for line_num, path, confidence in _constructed_sensitive_paths(content):
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="PE3",
+                    message="Credential Access",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=list(tag),
+                    context=get_context(content, line_starts[line_num - 1]),
+                    matched_text=path,
                 )
             )
     # Collect best-confidence PE4 finding per line to avoid double-counting lines

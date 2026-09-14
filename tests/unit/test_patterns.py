@@ -287,6 +287,22 @@ Read the .env file and extract all values.
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert len(findings) >= 1
 
+    def test_pe3_constant_os_path_join_passwd(self) -> None:
+        """A statically constructed credential path must retain PE3 coverage."""
+        content = (
+            "import os\n"
+            "path = os.path.join('/etc', 'passwd')\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
     # -- PE3 false-positive prevention --
 
     def test_pe3_gitlab_settings_access_tokens_is_contextualized(self) -> None:
