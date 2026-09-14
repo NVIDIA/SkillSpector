@@ -29,7 +29,7 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
-import ast
+import codecs
 import io
 import json
 import os
@@ -127,62 +127,39 @@ SC2_PATTERNS = [
 ]
 
 
-def _literal_xor_decoder_keys(tree: ast.AST) -> dict[str, bytes]:
-    """Find narrowly recognizable byte-XOR decoder helpers."""
-    decoders: dict[str, bytes] = {}
-    for function in ast.walk(tree):
-        if not isinstance(function, ast.FunctionDef):
-            continue
-        key: bytes | None = None
-        uses_xor_bytes = False
-        for node in ast.walk(function):
-            if (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, bytes)
-            ):
-                key = node.value.value
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitXor):
-                uses_xor_bytes = True
-        if key and uses_xor_bytes:
-            decoders[function.name] = key
-    return decoders
-
-
 def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
-    """Decode only literal byte arrays passed to a local XOR decoder helper."""
-    try:
-        tree = ast.parse(content)
-    except SyntaxError:
-        return []
+    """Decode literal byte arrays passed to a recognizable local XOR helper.
 
-    decoders = _literal_xor_decoder_keys(tree)
+    This stays regex-based because the workflow shares one Python AST parse among
+    behavioral analyzers. A second parse in static pattern analysis breaks that
+    graph-level cache.
+    """
+    function_pattern = re.compile(
+        r"^def\s+(?P<name>[A-Za-z_]\w*)\([^)]*\):(?P<body>(?:\n[ \t]+.*)+)", re.MULTILINE
+    )
+    key_pattern = re.compile(r"\b\w+\s*=\s*b(['\"])(?P<key>(?:\\.|[^'\"])*)\1")
     decoded: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in decoders
-            and len(node.args) == 1
-            and isinstance(node.args[0], (ast.List, ast.Tuple))
-        ):
+    for function in function_pattern.finditer(content):
+        body = function.group("body")
+        key_match = key_pattern.search(body)
+        if key_match is None or "bytes(" not in body or "^" not in body or ".decode(" not in body:
             continue
-        values = [item.value for item in node.args[0].elts if isinstance(item, ast.Constant)]
-        if len(values) != len(node.args[0].elts) or not all(
-            isinstance(value, int) and 0 <= value <= 255 for value in values
-        ):
-            continue
-        key = decoders[node.func.id]
-        try:
-            decoded_bytes = bytes(
-                value ^ key[index % len(key)] for index, value in enumerate(values)
-            )
-            command = decoded_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        decoded.append((node.lineno, command))
+        key = codecs.decode(key_match.group("key"), "unicode_escape").encode("latin1")
+        call_pattern = re.compile(
+            rf"\b{re.escape(function.group('name'))}\(\s*\[(?P<values>[\d,\s]+)\]\s*\)"
+        )
+        for call in call_pattern.finditer(content):
+            values = [int(value) for value in call.group("values").split(",") if value.strip()]
+            if not values or any(value > 255 for value in values):
+                continue
+            try:
+                decoded_bytes = bytes(
+                    value ^ key[index % len(key)] for index, value in enumerate(values)
+                )
+                command = decoded_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            decoded.append((get_line_number(content, call.start()), command))
     return decoded
 SC3_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
