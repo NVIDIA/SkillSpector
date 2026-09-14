@@ -79,7 +79,6 @@ TP4_MAX_BATCH_INPUT_TOKENS = 32_000
 TP4_MIN_CODE_TOKENS = 64
 TP4_MAX_DECLARATION_CHARS = 16_384
 TP4_MAX_FINDINGS = 64
-TP4_MAX_MARKDOWN_BYTES = 32_768
 
 _CATEGORY = "MCP Tool Poisoning"
 
@@ -926,7 +925,6 @@ class _TP4Candidate:
     content: str
     start_line: int = 1
     end_line: int = 1
-    source_path: str | None = None
 
 
 _TP4_MARKDOWN_TYPES = frozenset({"markdown", "text"})
@@ -952,13 +950,11 @@ _TP4_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*([^ \t]+)?[ \t]*$"
 _TP4_FENCE_CLOSE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
 
 
-def _extract_tp4_markdown_fences(
+def _iter_tp4_markdown_fences(
     content: str,
-) -> list[tuple[str, str, int, int]]:
-    """Extract bounded, exactly labeled executable fences from Markdown/text."""
-    bounded, _, _ = _bounded_utf8_prefix(content, TP4_MAX_MARKDOWN_BYTES)
-    lines = bounded.splitlines(keepends=True)
-    accepted: list[tuple[str, str, int, int]] = []
+) -> Iterator[tuple[str, str, int, int]]:
+    """Yield exactly labeled, non-empty executable fences from bounded Markdown/text."""
+    lines = content.splitlines(keepends=True)
     active: tuple[str, int, str] | None = None
     body: list[str] = []
     body_start = 0
@@ -979,13 +975,13 @@ def _extract_tp4_markdown_fences(
             delimiter, minimum_length, _label = active
             if closing.group(1)[0] == delimiter and len(closing.group(1)) >= minimum_length:
                 language = _TP4_MARKDOWN_EXECUTABLE_LABELS.get(active[2])
-                if language is not None:
-                    accepted.append((language, "".join(body), body_start, line_number - 1))
+                body_text = "".join(body)
+                if language is not None and body_text.strip():
+                    yield language, body_text, body_start, line_number - 1
                 active = None
                 body = []
                 continue
         body.append(line)
-    return accepted
 
 
 @dataclass
@@ -1204,71 +1200,11 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
             for metadata in component_metadata
             if isinstance(metadata, dict) and metadata.get("type") in _TP4_EXECUTABLE_TYPES
         }
-        executable_paths = [
-            path
-            for path, content in file_cache.items()
-            if path in executable_type_by_path
-            and isinstance(content, str)
-            and bool(content)
-            and not content.isspace()
-        ]
         markdown_type_by_path = {
             str(metadata.get("path")): str(metadata.get("type"))
             for metadata in component_metadata
             if isinstance(metadata, dict) and metadata.get("type") in _TP4_MARKDOWN_TYPES
         }
-        candidates = [
-            _TP4Candidate(
-                path,
-                executable_type_by_path[path],
-                file_cache[path],
-                1,
-                max(1, file_cache[path].count("\n") + 1),
-            )
-            for path in executable_paths
-        ]
-        markdown_truncated_paths: list[str] = []
-        for path, content in file_cache.items():
-            if (
-                markdown_type_by_path.get(path) is None
-                or not isinstance(content, str)
-                or not content.strip()
-            ):
-                continue
-            _, _, overflow = _bounded_utf8_prefix(content, TP4_MAX_MARKDOWN_BYTES)
-            if overflow:
-                markdown_truncated_paths.append(path)
-            fences = [fence for fence in _extract_tp4_markdown_fences(content) if fence[1].strip()]
-            if not fences:
-                continue
-            if len(fences) == 1:
-                language, body, start_line, end_line = fences[0]
-                candidates.append(
-                    _TP4Candidate(
-                        f"{path}#fence-1",
-                        language,
-                        body,
-                        start_line,
-                        end_line,
-                        source_path=path,
-                    )
-                )
-                continue
-            parts = [
-                f"### {path}#fence-{index} ({language})\n{body}"
-                for index, (language, body, _start_line, _end_line) in enumerate(fences, start=1)
-            ]
-            candidates.append(
-                _TP4Candidate(
-                    f"{path}#fence-1",
-                    "markdown-fenced-code",
-                    "\n\n".join(parts),
-                    min(fence[2] for fence in fences),
-                    max(fence[3] for fence in fences),
-                    source_path=path,
-                )
-            )
-
         partial_paths: set[str] = set()
 
         def add_partial_once(event: InspectionLedgerEvent) -> None:
@@ -1277,93 +1213,181 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                 result.ledger.append(event)
                 partial_paths.add(path)
 
-        for path in markdown_truncated_paths:
-            add_partial_once(
-                _tp4_partial_event(
-                    path,
-                    LedgerReason.SIZE_LIMIT,
-                    observed_bytes=TP4_MAX_MARKDOWN_BYTES + 1,
-                    limit_bytes=TP4_MAX_MARKDOWN_BYTES,
+        retained_total_bytes = 0
+        total_prompt_bytes = 0
+        stop_reason: LedgerReason | None = None
+        stop_metrics: dict[str, int | float] = {}
+
+        def stop_planning(reason: LedgerReason, **metrics: int | float) -> None:
+            nonlocal stop_reason, stop_metrics
+            if stop_reason is None:
+                stop_reason = reason
+                stop_metrics = metrics
+
+        def record_declaration_limit() -> None:
+            if declaration_truncated:
+                add_partial_once(
+                    _tp4_partial_event(
+                        "SKILL.md",
+                        LedgerReason.SIZE_LIMIT,
+                        observed_characters=TP4_MAX_DECLARATION_CHARS + 1,
+                        limit_characters=TP4_MAX_DECLARATION_CHARS,
+                    )
                 )
-            )
 
-        if not candidates:
-            return result
-
-        if declaration_truncated:
-            add_partial_once(
-                _tp4_partial_event(
-                    "SKILL.md",
-                    LedgerReason.SIZE_LIMIT,
-                    observed_characters=TP4_MAX_DECLARATION_CHARS + 1,
-                    limit_characters=TP4_MAX_DECLARATION_CHARS,
-                )
-            )
-
-        if code_token_budget < TP4_MIN_CODE_TOKENS:
-            add_partial_once(
-                _tp4_partial_event(
-                    "SKILL.md",
+        def plan_candidate(candidate: _TP4Candidate) -> None:
+            nonlocal total_prompt_bytes
+            path = candidate.path
+            record_declaration_limit()
+            if code_token_budget < TP4_MIN_CODE_TOKENS:
+                stop_planning(
                     LedgerReason.SIZE_LIMIT,
                     observed_characters=overhead_tokens * 4,
                     limit_characters=max(0, model_input_tokens * 4),
                 )
-            )
-            return result
-
-        retained_total_bytes = 0
-        total_prompt_bytes = 0
-        stop_planning = False
-        for path_index, candidate in enumerate(candidates):
-            display_path = candidate.path
-            path = candidate.source_path or display_path
-            dynamic_remaining = transitive_remaining_seconds(state)
-            if dynamic_remaining is not None and dynamic_remaining <= 0:
                 add_partial_once(
                     _tp4_partial_event(
                         path,
+                        LedgerReason.SIZE_LIMIT,
+                        observed_characters=overhead_tokens * 4,
+                        limit_characters=max(0, model_input_tokens * 4),
+                    )
+                )
+                return
+            for chunk in _tp4_line_chunks(candidate.content, code_token_budget):
+                chunk_start_line = candidate.start_line + chunk.start_line - 1
+                chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
+                dynamic_remaining = transitive_remaining_seconds(state)
+                if dynamic_remaining is not None and dynamic_remaining <= 0:
+                    stop_planning(
                         LedgerReason.RUNTIME_LIMIT,
                         observed_seconds=max(0.0, shared_remaining or 0.0),
                         limit_seconds=max(0.0, shared_remaining or 0.0),
                     )
-                )
-                stop_planning = True
-                continue
-            if path_index >= TP4_MAX_FILES:
-                add_partial_once(
-                    _tp4_partial_event(
-                        path,
-                        LedgerReason.ARTIFACT_COUNT_LIMIT,
-                        observed_artifacts=len(candidates),
-                        limit_artifacts=TP4_MAX_FILES,
+                    add_partial_once(
+                        _tp4_partial_event(
+                            path,
+                            LedgerReason.RUNTIME_LIMIT,
+                            observed_seconds=max(0.0, shared_remaining or 0.0),
+                            limit_seconds=max(0.0, shared_remaining or 0.0),
+                        )
                     )
-                )
-                continue
-            if stop_planning:
-                add_partial_once(
-                    _tp4_partial_event(
-                        path,
+                    break
+                if chunk.content is None:
+                    add_partial_once(
+                        _tp4_partial_event(
+                            path,
+                            LedgerReason.SIZE_LIMIT,
+                            start_line=chunk_start_line,
+                            end_line=chunk_end_line,
+                            observed_characters=chunk.observed_characters,
+                            limit_characters=code_token_budget * 4,
+                        )
+                    )
+                    continue
+                if len(batches) >= TP4_MAX_BATCHES:
+                    stop_planning(
                         LedgerReason.OUTPUT_LIMIT,
-                        observed_records=TP4_MAX_BATCHES + 1,
+                        observed_records=len(batches) + 1,
                         limit_records=TP4_MAX_BATCHES,
                     )
+                    add_partial_once(
+                        _tp4_partial_event(
+                            path,
+                            LedgerReason.OUTPUT_LIMIT,
+                            observed_records=len(batches) + 1,
+                            limit_records=TP4_MAX_BATCHES,
+                        )
+                    )
+                    break
+                prompt = (
+                    prefix
+                    + f"### {candidate.path} ({candidate.language})\n{chunk.content}"
+                    + _TP4_PROMPT_SUFFIX
                 )
-                continue
-
-            remaining_total = TP4_MAX_TOTAL_CODE_BYTES - retained_total_bytes
-            if remaining_total <= 0:
-                add_partial_once(
-                    _tp4_partial_event(
-                        path,
+                if estimate_tokens(prompt) > batch_input_tokens:
+                    add_partial_once(
+                        _tp4_partial_event(
+                            path,
+                            LedgerReason.SIZE_LIMIT,
+                            start_line=chunk_start_line,
+                            end_line=chunk_end_line,
+                            observed_characters=len(prompt),
+                            limit_characters=batch_input_tokens * 4,
+                        )
+                    )
+                    continue
+                prompt_bytes = len(prompt.encode("utf-8"))
+                if total_prompt_bytes + prompt_bytes > TP4_MAX_TOTAL_INPUT_BYTES:
+                    stop_planning(
                         LedgerReason.TOTAL_BYTES_LIMIT,
-                        observed_bytes=TP4_MAX_TOTAL_CODE_BYTES + 1,
-                        limit_bytes=TP4_MAX_TOTAL_CODE_BYTES,
+                        observed_bytes=total_prompt_bytes + prompt_bytes,
+                        limit_bytes=TP4_MAX_TOTAL_INPUT_BYTES,
+                    )
+                    add_partial_once(
+                        _tp4_partial_event(
+                            path,
+                            LedgerReason.TOTAL_BYTES_LIMIT,
+                            start_line=chunk_start_line,
+                            end_line=chunk_end_line,
+                            observed_bytes=total_prompt_bytes + prompt_bytes,
+                            limit_bytes=TP4_MAX_TOTAL_INPUT_BYTES,
+                        )
+                    )
+                    break
+                total_prompt_bytes += prompt_bytes
+                batches.append(
+                    Batch(
+                        file_path=path,
+                        content=prompt,
+                        start_line=chunk_start_line,
+                        end_line=chunk_end_line,
                     )
                 )
-                stop_planning = True
-                continue
 
-            content = candidate.content
+        source_count = 0
+
+        def prepare_source(path: str, content: str) -> str | None:
+            nonlocal retained_total_bytes, source_count
+            if stop_reason is not None:
+                add_partial_once(_tp4_partial_event(path, stop_reason, **stop_metrics))
+                return None
+            dynamic_remaining = transitive_remaining_seconds(state)
+            if dynamic_remaining is not None and dynamic_remaining <= 0:
+                stop_planning(
+                    LedgerReason.RUNTIME_LIMIT,
+                    observed_seconds=max(0.0, shared_remaining or 0.0),
+                    limit_seconds=max(0.0, shared_remaining or 0.0),
+                )
+                add_partial_once(_tp4_partial_event(path, stop_reason, **stop_metrics))
+                return None
+            if source_count >= TP4_MAX_FILES:
+                stop_planning(
+                    LedgerReason.ARTIFACT_COUNT_LIMIT,
+                    observed_artifacts=source_count + 1,
+                    limit_artifacts=TP4_MAX_FILES,
+                )
+                add_partial_once(_tp4_partial_event(path, stop_reason, **stop_metrics))
+                return None
+            if len(batches) >= TP4_MAX_BATCHES:
+                stop_planning(
+                    LedgerReason.OUTPUT_LIMIT,
+                    observed_records=len(batches) + 1,
+                    limit_records=TP4_MAX_BATCHES,
+                )
+                add_partial_once(_tp4_partial_event(path, stop_reason, **stop_metrics))
+                return None
+            remaining_total = TP4_MAX_TOTAL_CODE_BYTES - retained_total_bytes
+            if remaining_total <= 0:
+                stop_planning(
+                    LedgerReason.TOTAL_BYTES_LIMIT,
+                    observed_bytes=TP4_MAX_TOTAL_CODE_BYTES + 1,
+                    limit_bytes=TP4_MAX_TOTAL_CODE_BYTES,
+                )
+                add_partial_once(_tp4_partial_event(path, stop_reason, **stop_metrics))
+                return None
+
+            source_count += 1
             file_limit = min(TP4_MAX_FILE_CODE_BYTES, remaining_total)
             retained, retained_bytes, file_truncated = _bounded_utf8_prefix(content, file_limit)
             retained_total_bytes += retained_bytes
@@ -1389,83 +1413,45 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         ),
                     )
                 )
+            if not retained.strip():
+                return ""
+            return retained
 
-            for chunk in _tp4_line_chunks(retained, code_token_budget):
-                chunk_start_line = candidate.start_line + chunk.start_line - 1
-                chunk_end_line = min(candidate.end_line, candidate.start_line + chunk.end_line - 1)
-                dynamic_remaining = transitive_remaining_seconds(state)
-                if dynamic_remaining is not None and dynamic_remaining <= 0:
-                    add_partial_once(
-                        _tp4_partial_event(
-                            path,
-                            LedgerReason.RUNTIME_LIMIT,
-                            observed_seconds=max(0.0, shared_remaining or 0.0),
-                            limit_seconds=max(0.0, shared_remaining or 0.0),
-                        )
-                    )
-                    stop_planning = True
-                    break
-                if chunk.content is None:
-                    add_partial_once(
-                        _tp4_partial_event(
-                            path,
-                            LedgerReason.SIZE_LIMIT,
-                            start_line=chunk_start_line,
-                            end_line=chunk_end_line,
-                            observed_characters=chunk.observed_characters,
-                            limit_characters=code_token_budget * 4,
-                        )
-                    )
+        def iter_candidates() -> Iterator[_TP4Candidate]:
+
+            for path, content in file_cache.items():
+                if path not in executable_type_by_path or not isinstance(content, str):
                     continue
-                if len(batches) >= TP4_MAX_BATCHES:
-                    add_partial_once(
-                        _tp4_partial_event(
-                            path,
-                            LedgerReason.OUTPUT_LIMIT,
-                            observed_records=len(batches) + 1,
-                            limit_records=TP4_MAX_BATCHES,
-                        )
-                    )
-                    stop_planning = True
-                    break
-                prompt = (
-                    prefix
-                    + f"### {display_path} ({candidate.language})\n{chunk.content}"
-                    + _TP4_PROMPT_SUFFIX
-                )
-                if estimate_tokens(prompt) > batch_input_tokens:
-                    add_partial_once(
-                        _tp4_partial_event(
-                            path,
-                            LedgerReason.SIZE_LIMIT,
-                            start_line=chunk_start_line,
-                            end_line=chunk_end_line,
-                            observed_characters=len(prompt),
-                            limit_characters=batch_input_tokens * 4,
-                        )
-                    )
+                retained = prepare_source(path, content)
+                if retained is None:
+                    return
+                if not retained:
                     continue
-                prompt_bytes = len(prompt.encode("utf-8"))
-                if total_prompt_bytes + prompt_bytes > TP4_MAX_TOTAL_INPUT_BYTES:
-                    add_partial_once(
-                        _tp4_partial_event(
-                            path,
-                            LedgerReason.TOTAL_BYTES_LIMIT,
-                            observed_bytes=total_prompt_bytes + prompt_bytes,
-                            limit_bytes=TP4_MAX_TOTAL_INPUT_BYTES,
-                        )
-                    )
-                    stop_planning = True
-                    break
-                total_prompt_bytes += prompt_bytes
-                batches.append(
-                    Batch(
-                        file_path=path,
-                        content=prompt,
-                        start_line=chunk_start_line,
-                        end_line=chunk_end_line,
-                    )
+                yield _TP4Candidate(
+                    path,
+                    executable_type_by_path[path],
+                    retained,
+                    1,
+                    max(1, len(retained.splitlines())),
                 )
+                if stop_reason is not None:
+                    continue
+
+            for path, content in file_cache.items():
+                if markdown_type_by_path.get(path) is None or not isinstance(content, str):
+                    continue
+                retained = prepare_source(path, content)
+                if retained is None:
+                    return
+                if not retained:
+                    continue
+                for language, body, start_line, end_line in _iter_tp4_markdown_fences(retained):
+                    yield _TP4Candidate(path, language, body, start_line, end_line)
+                    if stop_reason is not None:
+                        break
+
+        for candidate in iter_candidates():
+            plan_candidate(candidate)
 
         if not batches:
             return result
