@@ -353,10 +353,12 @@ def _edit_distance(a: str, b: str) -> int:
 def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> str | None:
     """Return the popular package name if pkg_name is a close-but-not-exact match."""
     normalized = pkg_name.lower().replace("_", "-")
+    # A known package must win over any earlier, similar name (e.g. gunicorn
+    # sorts before uvicorn). Apply the same normalization on both sides.
+    if any(normalized == name.lower().replace("_", "-") for name in popular):
+        return None
     for popular_name in sorted(popular):
         pop_norm = popular_name.lower().replace("_", "-")
-        if normalized == pop_norm:
-            return None
         if len(normalized) < 3 or len(pop_norm) < 3:
             continue
         dist = _edit_distance(normalized, pop_norm)
