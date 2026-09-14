@@ -52,9 +52,13 @@ export default tool({
       ? (isUrlOrAbsolute(args.output) ? args.output : path.resolve(baseDir, args.output))
       : undefined
     const bin = resolveBinary(context.worktree ?? baseDir)
-    const cliArgs = ["scan", target, "--format", args.format]
+    // The host may omit declared defaults, so re-apply them here. noLlm
+    // defaults to true: LLM analysis must stay strictly opt-in.
+    const format = args.format ?? "json"
+    const noLlm = args.noLlm ?? true
+    const cliArgs = ["scan", target, "--format", format]
     // LLM runs only on explicit opt-out of --no-llm; provider/model/credentials come from the inherited environment.
-    if (args.noLlm) cliArgs.push("--no-llm")
+    if (noLlm) cliArgs.push("--no-llm")
     if (output) cliArgs.push("--output", output)
 
     let result: { stdout: string; stderr: string }
