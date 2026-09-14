@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import ast
 import posixpath
 import re
 import sys
@@ -505,40 +504,26 @@ def _is_qualified_benign_access_requirement(
     return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
 
 
-def _constant_os_path_join(node: ast.expr) -> str | None:
-    """Resolve literal ``os.path.join`` calls without evaluating arbitrary code."""
-    if not (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "join"
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "path"
-        and isinstance(node.func.value.value, ast.Name)
-        and node.func.value.value.id == "os"
-    ):
-        return None
-
-    parts = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
-    if len(parts) != len(node.args) or not all(isinstance(part, str) for part in parts):
-        return None
-    return posixpath.join(*parts)
-
-
 def _constructed_sensitive_paths(content: str) -> list[tuple[int, str, float]]:
-    """Return literal sensitive paths assembled with ``os.path.join`` in Python."""
-    try:
-        tree = ast.parse(content)
-    except SyntaxError:
-        return []
+    """Return literal sensitive paths assembled with ``os.path.join`` in Python.
+
+    Keep this expression-level recognizer regex-based: Python AST parsing is shared
+    across the analyzer graph, so a second parse here would defeat that cache.
+    """
+    call_pattern = re.compile(r"os\.path\.join\((?P<args>[^()\n]+)\)")
+    string_pattern = re.compile(r"(['\"])(?P<value>[^'\"]*)\1")
 
     resolved: list[tuple[int, str, float]] = []
-    for node in ast.walk(tree):
-        value = _constant_os_path_join(node)
-        if value is None:
+    for match in call_pattern.finditer(content):
+        args = match.group("args")
+        parts = [item.group("value") for item in string_pattern.finditer(args)]
+        residual = string_pattern.sub("", args).replace(",", "").strip()
+        if len(parts) < 2 or residual:
             continue
+        value = posixpath.join(*parts)
         for pattern, confidence in PE3_PATTERNS:
             if re.search(pattern, value, re.IGNORECASE):
-                resolved.append((node.lineno, value, confidence))
+                resolved.append((get_line_number(content, match.start()), value, confidence))
                 break
     return resolved
 
