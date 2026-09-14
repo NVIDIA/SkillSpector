@@ -322,8 +322,35 @@ class TestOpenAIProvider:
 
     def test_metadata_known_model(self) -> None:
         provider = OpenAIProvider()
-        assert provider.get_context_length("gpt-5.4") == 1_000_000
+        assert provider.get_context_length("gpt-5.4") == 1_050_000
         assert provider.get_max_output_tokens("gpt-5.4") == 128_000
+
+    def test_metadata_gpt5_generation(self) -> None:
+        provider = OpenAIProvider()
+        for model in (
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5.1",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.2",
+        ):
+            assert provider.get_context_length(model) == 400_000
+            assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_metadata_flagship_generation(self) -> None:
+        provider = OpenAIProvider()
+        for model in (
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6",
+            "gpt-6-astra",
+        ):
+            assert provider.get_context_length(model) == 1_050_000
+            assert provider.get_max_output_tokens(model) == 128_000
 
 
 class TestAnthropicProvider:
