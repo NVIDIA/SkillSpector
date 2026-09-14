@@ -86,6 +86,7 @@ def _constant_string(node: ast.expr) -> str | None:
             return node.func.value.value.join(part for part in parts if part is not None)
     return None
 
+
 _SUBPROCESS_CALLS = frozenset(
     {
         "call",
