@@ -306,6 +306,11 @@ class TestNumberLines:
         assert result.startswith("L01: line0")
         assert "L11: line10" in result
 
+    def test_compact_prompts_disable_zero_padding(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", "true")
+        lines = "\n".join(f"line{i}" for i in range(11))
+        assert number_lines(lines).startswith("L1: line0")
+
 
 # ---------------------------------------------------------------------------
 # LLMAnalyzerBase.build_prompt (default implementation)
