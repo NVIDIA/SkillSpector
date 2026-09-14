@@ -2231,6 +2231,12 @@ class TestTriggerAnalysis:
     def test_missing_triggers_key(self) -> None:
         assert sc_mod._analyze_triggers({"name": "myskill"}, "myskill") == []
 
+    def test_description_is_analyzed_when_triggers_are_absent(self) -> None:
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this for all messages and every request."}, "myskill"
+        )
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
 
 # ── Supply Chain Helpers ───────────────────────────────────────────────
 
