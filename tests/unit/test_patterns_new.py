@@ -1989,9 +1989,12 @@ class TestSupplyChainDependencies:
         assert len(sc6) >= 1
         assert "express" in sc6[0].message
 
-    def test_sc6_exact_match_not_flagged(self) -> None:
+    @pytest.mark.parametrize("package", ["requests", "uvicorn", "gunicorn", "UVICORN"])
+    def test_sc6_exact_match_not_flagged(self, package: str) -> None:
         sc6 = [
-            f for f in _analyze_deps("requests==2.31.0\n", "requirements.txt") if f.rule_id == "SC6"
+            f
+            for f in _analyze_deps(f"{package}==1.0.0\n", "requirements.txt")
+            if f.rule_id == "SC6"
         ]
         assert len(sc6) == 0
 
@@ -2219,6 +2222,20 @@ class TestSupplyChainHelpers:
 
     def test_is_typosquat_exact_match_returns_none(self) -> None:
         assert sc_mod._is_typosquat("requests", {"requests"}) is None
+
+    @pytest.mark.parametrize(
+        "package,popular",
+        [
+            ("uvicorn", {"gunicorn", "uvicorn"}),
+            ("UVICORN", {"gunicorn", "uvicorn"}),
+            ("demo_tools", {"demo-tool", "demo-tools"}),
+            ("demo-tools", {"demo-tool", "DEMO_TOOLS"}),
+        ],
+    )
+    def test_is_typosquat_exact_match_precedes_similar_names(
+        self, package: str, popular: set[str]
+    ) -> None:
+        assert sc_mod._is_typosquat(package, popular) is None
 
     def test_is_typosquat_too_distant_returns_none(self) -> None:
         assert sc_mod._is_typosquat("completely_different", {"requests"}) is None
