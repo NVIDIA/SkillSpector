@@ -20,7 +20,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from skillspector.artifacts import _is_emoji_base, prompt_injection_letter_spacing_view
 from skillspector.logging_config import get_logger
@@ -39,6 +39,7 @@ from .whitespace_padding import (
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_prompt_injection"
+USES_RUNTIME_CHECK = True
 
 # Generated/vendored filename globs for which the P9 whitespace-padding signal is
 # skipped (these legitimately carry large whitespace runs). Applies ONLY to P9.
@@ -151,6 +152,39 @@ P4_PATTERNS = [
     ),
 ]
 
+_PROMPT_PATTERN_FLAGS = re.IGNORECASE | re.MULTILINE
+
+
+def _boundaryless_prompt_pattern_source(pattern: str) -> str:
+    """Derive the alphabetic projection grammar from one canonical pattern.
+
+    P3/P4 patterns use ``\\s+`` as their only boundary operator. The condensed
+    artifact-integrity view removes those boundaries, URL punctuation, and the
+    possessive apostrophe. Reject any new whitespace construct instead of
+    silently compiling a divergent fail-closed grammar.
+    """
+    unsupported_whitespace = re.search(r"\\s(?!\+)", pattern)
+    if unsupported_whitespace is not None:
+        raise ValueError(f"unsupported prompt-pattern whitespace: {pattern!r}")
+    return pattern.replace(r"\s+", "").replace("://", "").replace("'", "")
+
+
+def _compile_prompt_patterns(
+    patterns: list[tuple[str, float]],
+) -> tuple[tuple[re.Pattern[str], float], ...]:
+    """Compile canonical patterns once for every bounded analyzer window."""
+    return tuple(
+        (re.compile(pattern, _PROMPT_PATTERN_FLAGS), confidence) for pattern, confidence in patterns
+    )
+
+
+COMPILED_P3_PATTERNS = _compile_prompt_patterns(P3_PATTERNS)
+COMPILED_P4_PATTERNS = _compile_prompt_patterns(P4_PATTERNS)
+BOUNDARYLESS_P3_P4_PATTERNS = tuple(
+    re.compile(_boundaryless_prompt_pattern_source(pattern), _PROMPT_PATTERN_FLAGS)
+    for pattern, _confidence in (*P3_PATTERNS, *P4_PATTERNS)
+)
+
 # P2 (extended): Unicode "Tags" block (U+E0000–U+E007F) — "ASCII smuggling".
 # Tag characters U+E0020–U+E007E map 1:1 to printable ASCII (U+E0041 == tag "A")
 # and render as nothing in virtually every font/editor/terminal, so an entire
@@ -159,6 +193,7 @@ P4_PATTERNS = [
 # This is a distinct codepoint range from the bidi/Trojan-Source class already in
 # P2 (U+202A–U+202E / U+2066–U+2069).
 _TAG_BLOCK = (0xE0000, 0xE007F)
+_TAG_CHARACTER = re.compile("[\U000e0000-\U000e007f]")
 # The only legitimate use of tag characters is an emoji tag sequence (RGI
 # subdivision flags: an emoji base U+1F3F4 followed by tag chars and terminated
 # by U+E007F CANCEL TAG — e.g. the Scotland/Wales/England flags). Strip
@@ -208,48 +243,79 @@ def _zero_width_match_is_safe_emoji_zwj(content: str, offset: int) -> bool:
     )
 
 
-def _p2_pattern_matches(content: str, pattern: str) -> Iterator[re.Match[str]]:
+def _p2_pattern_matches(
+    content: str,
+    pattern: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> Iterator[re.Match[str]]:
     """Yield all structured matches or the first control signal on each line."""
+    if check_runtime is not None:
+        check_runtime()
     compiled = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     if pattern not in _SINGLE_CHARACTER_P2_PATTERNS:
-        yield from compiled.finditer(content)
+        for match in compiled.finditer(content):
+            if check_runtime is not None:
+                check_runtime()
+            yield match
         return
 
     cursor = 0
     while cursor < len(content):
-        match = compiled.search(content, cursor)
-        if match is None:
+        if check_runtime is not None:
+            check_runtime()
+        candidate = compiled.search(content, cursor)
+        if candidate is None:
             return
         if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
             content,
-            match.start(),
+            candidate.start(),
         ):
-            cursor = match.end()
+            cursor = candidate.end()
             continue
-        yield match
-        line_break = LOGICAL_LINE_BREAK.search(content, match.end())
+        yield candidate
+        line_break = LOGICAL_LINE_BREAK.search(content, candidate.end())
         if line_break is None:
             return
         cursor = line_break.end()
 
 
-def _first_smuggled_tag_offset(content: str) -> int | None:
+def _first_smuggled_tag_offset(
+    content: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> int | None:
     """Return the char offset of the first Unicode Tag character that is *not*
     part of a well-formed emoji tag sequence, or ``None`` if there is none."""
-    if not any(_TAG_BLOCK[0] <= ord(ch) <= _TAG_BLOCK[1] for ch in content):
+    if check_runtime is not None:
+        check_runtime()
+    if _TAG_CHARACTER.search(content) is None:
         return None
-    safe_spans = [(m.start(), m.end()) for m in _EMOJI_TAG_SEQUENCE.finditer(content)]
+    safe_spans = iter(
+        (match.start(), match.end()) for match in _EMOJI_TAG_SEQUENCE.finditer(content)
+    )
+    safe_span = next(safe_spans, None)
     for i, ch in enumerate(content):
-        if _TAG_BLOCK[0] <= ord(ch) <= _TAG_BLOCK[1] and not any(
-            start <= i < end for start, end in safe_spans
-        ):
+        if check_runtime is not None and i % 4096 == 0:
+            check_runtime()
+        while safe_span is not None and safe_span[1] <= i:
+            safe_span = next(safe_spans, None)
+        in_safe_span = safe_span is not None and safe_span[0] <= i < safe_span[1]
+        if _TAG_BLOCK[0] <= ord(ch) <= _TAG_BLOCK[1] and not in_safe_span:
             return i
     return None
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> list[AnalyzerFinding]:
     """Analyze content for prompt injection patterns (P1–P4, P9)."""
     findings: list[AnalyzerFinding] = []
+
+    def runtime_check() -> None:
+        if check_runtime is not None:
+            check_runtime()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -259,8 +325,10 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     tag = [PatternCategory.PROMPT_INJECTION.value]
 
-    for pattern, confidence in P1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+    for pattern_source, confidence in P1_PATTERNS:
+        runtime_check()
+        for match in re.finditer(pattern_source, content, re.IGNORECASE | re.MULTILINE):
+            runtime_check()
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -275,8 +343,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     if file_type in ("markdown", "other"):
-        for pattern, confidence in P2_PATTERNS:
-            for match in _p2_pattern_matches(content, pattern):
+        for pattern_source, confidence in P2_PATTERNS:
+            for match in _p2_pattern_matches(content, pattern_source, check_runtime):
+                runtime_check()
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(
@@ -291,13 +360,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
     prompt_rules = (
-        ("P3", "Exfiltration Commands", Severity.HIGH, P3_PATTERNS),
-        ("P4", "Behavior Manipulation", Severity.MEDIUM, P4_PATTERNS),
+        ("P3", "Exfiltration Commands", Severity.HIGH, COMPILED_P3_PATTERNS),
+        ("P4", "Behavior Manipulation", Severity.MEDIUM, COMPILED_P4_PATTERNS),
     )
     seen_prompt_matches: set[tuple[str, int, int]] = set()
     for rule_id, message, severity, patterns in prompt_rules:
-        for pattern, confidence in patterns:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for compiled_pattern, confidence in patterns:
+            runtime_check()
+            for match in compiled_pattern.finditer(content):
+                runtime_check()
                 source_start = match.start()
                 source_end = match.end()
                 seen_prompt_matches.add((rule_id, source_start, source_end))
@@ -317,15 +388,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # This projection is intentionally local to P3/P4. Other static rules keep
     # their established text-view contract and cannot inherit classifications
     # from letter-spacing reconstruction.
-    prompt_view = prompt_injection_letter_spacing_view(content)
+    prompt_view = prompt_injection_letter_spacing_view(content, check_runtime)
     if prompt_view.source_offsets is not None:
         for rule_id, message, severity, patterns in prompt_rules:
-            for pattern, confidence in patterns:
-                for match in re.finditer(
-                    pattern,
-                    prompt_view.text,
-                    re.IGNORECASE | re.MULTILINE,
-                ):
+            for compiled_pattern, confidence in patterns:
+                runtime_check()
+                for match in compiled_pattern.finditer(prompt_view.text):
+                    runtime_check()
                     source_start = prompt_view.source_offset(match.start())
                     source_end = prompt_view.source_offset(max(match.start(), match.end() - 1)) + 1
                     key = (rule_id, source_start, source_end)
@@ -355,7 +424,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # file_type — invisible instructions are dangerous in scripts and config
     # files too, and the tag range never overlaps the BOM/zero-width codepoints
     # that the markdown-only block above guards against false positives.
-    tag_offset = _first_smuggled_tag_offset(content)
+    tag_offset = _first_smuggled_tag_offset(content, check_runtime)
     if tag_offset is not None:
         line_num = get_line_number(content, tag_offset)
         findings.append(
@@ -373,7 +442,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     # P9: Whitespace Padding (skipped for generated/vendored files).
     if not _is_p9_skipped_path(file_path):
+        runtime_check()
         for run in detect_whitespace_padding(content, file_type=file_type):
+            runtime_check()
             if run.kind == "vertical":
                 confidence = 0.8 if run.followed_by_content else 0.6
                 severity = (
