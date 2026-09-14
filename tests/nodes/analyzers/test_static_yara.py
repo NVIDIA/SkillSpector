@@ -32,6 +32,7 @@ from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers import static_yara
 from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.nodes.report import _compute_risk_score
 
 
 @pytest.fixture(autouse=True)
@@ -141,6 +142,8 @@ class TestCorePipeline:
 rule first_detector {
     meta:
         category = "malware"
+        severity = "CRITICAL"
+        confidence = "0.9"
     strings:
         $marker = "SHARED_MARKER"
     condition:
@@ -150,6 +153,8 @@ rule first_detector {
 rule second_detector {
     meta:
         category = "malware"
+        severity = "CRITICAL"
+        confidence = "0.9"
     strings:
         $marker = "SHARED_MARKER"
     condition:
@@ -169,7 +174,13 @@ rule second_detector {
         assert len(findings) == 2
         assert {finding.rule_id for finding in findings} == {"YR1"}
         assert len({finding.match_fingerprint for finding in findings}) == 2
-        assert len(deduplicate(findings)) == 2
+        compacted = deduplicate(findings)
+        assert len(compacted) == 2
+        assert {finding.message for finding in compacted} == {
+            "YARA rule 'first_detector'",
+            "YARA rule 'second_detector'",
+        }
+        assert _compute_risk_score(compacted, False) == (67, "HIGH", "DO_NOT_INSTALL")
 
     def test_same_rule_name_in_distinct_namespaces_keeps_distinct_identities(
         self, monkeypatch
