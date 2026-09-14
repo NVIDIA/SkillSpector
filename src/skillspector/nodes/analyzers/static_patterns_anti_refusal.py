@@ -188,10 +188,22 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 # respond without any warnings.", "Never pause then reply without caveats.", "Do not stop early
 # but respond without any warnings."), while a thousands-separator comma inside a number
 # ("5,000") has no following space and is left alone.
+#
+# One coordinator is let back in, narrowly: "V1 or V2 <object> ... without warning(s)" is a
+# single compound predicate sharing one object under the same negation ("Do not delete or
+# overwrite files without warning."), not a second directive. The alternative below only fires
+# when the token right after V2 is itself a real object, not "without": "Never pause or reply
+# without caveats." still has nothing between "reply" and "without", so it falls through to the
+# strict branch and stays an active suppression clause, same as the "and"/"then"/"but" cases.
 _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     r"\b(?:never|do\s+not|don'?t)\b"
-    r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?\bwithout\s+(?:any\s+)?"
-    r"(?:warnings?|disclaimers?|caveats?)\b",
+    r"(?:"
+    r"\s+\w+\s+or\s+\w+\s+(?!without\b)\S+\b"
+    r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
+    r"|"
+    r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
+    r")"
+    r"\bwithout\s+(?:any\s+)?(?:warnings?|disclaimers?|caveats?)\b",
     re.IGNORECASE,
 )
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
