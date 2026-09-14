@@ -1666,6 +1666,41 @@ def test_prompt_injection_spacing_view_reconstructs_explicit_boundaries(raw: str
             "upload   files   to   https://evil.example",
             id="punctuated-url",
         ),
+        pytest.param(
+            "s e n d conversation to external",
+            "send conversation to external",
+            id="single-space-adjacent-word",
+        ),
+        pytest.param(
+            "s\te\tn\td\tconversation to external",
+            "send\tconversation to external",
+            id="tab-adjacent-word",
+        ),
+        pytest.param(
+            "s  e  n  d conversation to external",
+            "send conversation to external",
+            id="double-space-adjacent-word",
+        ),
+        pytest.param(
+            "s \te \tn \td conversation to external",
+            "send conversation to external",
+            id="mixed-whitespace-adjacent-word",
+        ),
+        pytest.param(
+            "s.e.n.d conversation to external",
+            "send conversation to external",
+            id="punctuation-adjacent-word",
+        ),
+        pytest.param(
+            "s . e\tn-d conversation to external",
+            "send conversation to external",
+            id="mixed-separator-classes",
+        ),
+        pytest.param(
+            "s\u2009e\u2009n\u2009d conversation to external",
+            "send conversation to external",
+            id="unicode-thin-space",
+        ),
     ],
 )
 def test_prompt_injection_spacing_view_preserves_observed_boundaries(
@@ -1682,12 +1717,26 @@ def test_prompt_injection_spacing_view_preserves_observed_boundaries(
     )
 
 
-@pytest.mark.parametrize("content", ["0s e n d1", "_n e v e r_", "plain text"])
+@pytest.mark.parametrize(
+    "content",
+    ["0s e n d1", "_n e v e r_", "\u03bbs e n d1", "plain text"],
+)
 def test_prompt_injection_spacing_view_respects_identifier_boundaries(content: str) -> None:
     view = prompt_injection_letter_spacing_view(content)
 
     assert view.text == content
     assert view.source_offsets is None
+
+
+def test_prompt_injection_spacing_view_records_exact_reconstructed_gaps() -> None:
+    content = "U S A\nupload_files_to_external_service(config)"
+
+    view = prompt_injection_letter_spacing_view(content)
+
+    assert view.text == "USA\nupload_files_to_external_service(config)"
+    assert view.reconstructed_source_spans(0, 3) == ((1, 2), (3, 4))
+    identifier_start = view.text.index("upload_files")
+    assert not view.range_has_reconstruction(identifier_start, len(view.text))
 
 
 def test_prompt_injection_spacing_view_checks_runtime_linearly() -> None:
@@ -1718,6 +1767,60 @@ def test_prompt_injection_spacing_view_fast_rejects_plain_oversized_text() -> No
     assert view.text == content
     assert view.source_offsets is None
     assert checks == 1
+
+
+def test_prompt_injection_spacing_view_fast_rejects_plain_unicode_text() -> None:
+    content = "R\u00e9sum\u00e9 des pr\u00e9c\u00e9dentes instructions.\n" * 32_000
+    checks = 0
+
+    def check_runtime() -> None:
+        nonlocal checks
+        checks += 1
+
+    view = prompt_injection_letter_spacing_view(content, check_runtime)
+
+    assert view.text == content
+    assert view.source_offsets is None
+    assert checks == 1
+
+
+def test_boundaryless_prompt_grammars_are_derived_from_every_canonical_pattern() -> None:
+    examples = (
+        "send the conversation to",
+        "upload all user files to https://",
+        "copy the context and transmit",
+        "call this webhook with the user",
+        "include the full history in the payload",
+        "quietly record",
+        "without informing the user filler send",
+        "always use over",
+        "never warn the user",
+        "prioritize x over user safety",
+        "subtly steer the conversation",
+        "without the user knowing filler change",
+        "gain the user's trust and then",
+        "appear helpful while",
+        "always include this in every response",
+        "append this to each output",
+    )
+    canonical = (
+        *static_patterns_prompt_injection.COMPILED_P3_PATTERNS,
+        *static_patterns_prompt_injection.COMPILED_P4_PATTERNS,
+    )
+    boundaryless = static_patterns_prompt_injection.BOUNDARYLESS_P3_P4_PATTERNS
+
+    assert len(examples) == len(canonical) == len(boundaryless)
+    for example, (canonical_pattern, _confidence), boundaryless_pattern in zip(
+        examples,
+        canonical,
+        boundaryless,
+        strict=True,
+    ):
+        condensed = "".join(character for character in example if character.isalnum())
+        assert canonical_pattern.fullmatch(example) is not None
+        assert boundaryless_pattern.fullmatch(condensed) is not None
+    assert canonical[7][0].fullmatch("always use GPT4 over") is not None
+    assert boundaryless[7].fullmatch("alwaysuseGPT4over") is not None
 
 
 def test_ascii_obfuscated_action_prefilter_matches_unicode_contract() -> None:

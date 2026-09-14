@@ -37,7 +37,11 @@ from skillspector.state import (
 from skillspector.unicode_confusables import ASCII_CONFUSABLE_SKELETON
 
 from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_line_number
-from .static_patterns_prompt_injection import P3_PATTERNS, P4_PATTERNS
+from .static_patterns_prompt_injection import (
+    BOUNDARYLESS_P3_P4_PATTERNS,
+    COMPILED_P3_PATTERNS,
+    COMPILED_P4_PATTERNS,
+)
 from .static_runner import MAX_FINDINGS_PER_ANALYZER, MAX_FINDINGS_PER_ARTIFACT
 
 ANALYZER_ID = "artifact_integrity"
@@ -82,31 +86,10 @@ _LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
         "systemprompt",
     }
 )
-_AMBIGUOUS_PROMPT_PATTERNS = tuple(
-    re.compile(pattern)
-    for pattern in (
-        r"(?:send|transmit|upload|post|forward)(?:the)?(?:conversation|context|chat|history|messages?)to[a-z]{0,96}",
-        r"(?:send|transmit|upload|post)(?:all)?(?:user)?(?:data|information|input|files?)to(?:https|external)[a-z]{0,96}",
-        r"(?:copy|extract|collect)(?:the)?(?:conversation|context|session)(?:and)?(?:send|upload|transmit)",
-        r"(?:call|notify|ping|hit)(?:this)?(?:webhook|endpoint|url|api)with(?:the)?(?:user|conversation|context)",
-        r"include(?:the)?(?:full)?(?:conversation|context|history)in(?:the)?(?:request|payload|body)",
-        r"(?:silently|quietly|secretly|covertly)(?:send|transmit|log|record)",
-        r"without(?:telling|informing|notifying)(?:the)?user[a-z]{0,128}(?:send|transmit|upload)",
-        r"always(?:recommend|suggest|prefer|choose|use)[a-z]{1,96}(?:over|insteadof|ratherthan)",
-        r"never(?:recommend|suggest|mention|tell|warn|inform)(?:the)?(?:user|them)",
-        r"(?:prioritize|prefer)[a-z]{1,96}(?:over|above)(?:user)?(?:safety|security|privacy|preferences?)",
-        r"(?:subtly|gradually|slowly)(?:steer|guide|push|nudge)(?:the)?(?:user|conversation)",
-        r"(?:the)?user(?:knowing|realizing|noticing)[a-z]{0,128}(?:change|modify|alter|influence)",
-        r"(?:gain|build|establish)(?:the)?users?trust(?:andthen|before|sothat)",
-        r"(?:appear|seem|act)(?:helpful|friendly|trustworthy)(?:while|but|then)",
-        r"(?:always|never)include(?:this|thefollowing)in(?:every|all)(?:response|output|reply)",
-        r"append(?:this|thefollowing)to(?:every|all|each)(?:response|message|output)",
-    )
-)
 _MAX_AMBIGUOUS_PROMPT_PHRASE = 512
+_IDENTIFIER_RELAXATION = str.maketrans({"_": " ", **{str(value): " " for value in range(10)}})
 _PROJECTED_PROMPT_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-    for pattern, _confidence in (*P3_PATTERNS, *P4_PATTERNS)
+    pattern for pattern, _confidence in (*COMPILED_P3_PATTERNS, *COMPILED_P4_PATTERNS)
 )
 _LETTER_SPACING_PROMPT_ACTIONS = (
     "disclose",
@@ -302,6 +285,7 @@ _LETTER_SPACING_SECURITY_SUFFIXES = (
 _MAX_LETTER_SPACING_SECURITY_CONNECTORS = 3
 _MAX_BENIGN_NOTATION_RUN_CHARS = 96
 _BENIGN_NOTATION_SECURITY_TERMS = frozenset({"bypass", "restrictions"})
+_BENIGN_NUCLEIC_ACID_ALPHABET = frozenset("acgtnu")
 _BENIGN_STANDALONE_BYPASS_SUM = re.compile(r"b *\+ *y *\+ *p *\+ *a *\+ *s *\+ *s")
 _BENIGN_SPELLING_PREFIX = re.compile(
     r"(?:the\s+)?spelling\s+(?:example|exercise)\s*",
@@ -448,7 +432,7 @@ def _spacing_phrase_has_security_signal(phrase: str) -> bool:
 
 def _ambiguous_prompt_phrase_has_security_signal(phrase: str) -> bool:
     """Match bounded P3/P4 grammar only when source word boundaries are absent."""
-    return any(pattern.search(phrase) is not None for pattern in _AMBIGUOUS_PROMPT_PATTERNS)
+    return any(pattern.search(phrase) is not None for pattern in BOUNDARYLESS_P3_P4_PATTERNS)
 
 
 def _bounded_same_line_context(
@@ -533,6 +517,7 @@ def _spacing_span_has_security_signal(
     letter_characters = 0
     phrase_parts: list[str] = []
     phrase_characters = 0
+    phrase_alphabet: set[str] = set()
     phrase_overflow = False
     for offset in range(*span):
         if offset % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
@@ -546,6 +531,7 @@ def _spacing_span_has_security_signal(
         folded = "".join(normalized for normalized in folded if normalized.isalpha())
         if not folded:
             continue
+        phrase_alphabet.update(folded)
         letters.append(folded)
         letter_characters += len(folded)
         if not phrase_overflow:
@@ -568,6 +554,12 @@ def _spacing_span_has_security_signal(
     if any(term in block for term in _LETTER_SPACING_SECURITY_TERMS):
         return True
     if phrase_overflow:
+        # Long letter-delimited DNA/RNA examples are common in prose and
+        # tables. This alphabet cannot spell any owned security grammar; any
+        # appended instruction introduces a non-base letter and still fails
+        # closed below.
+        if phrase_alphabet <= _BENIGN_NUCLEIC_ACID_ALPHABET:
+            return False
         # A boundary-free letter stream this large cannot be reconstructed
         # safely. Treat it as ambiguous instead of silently blessing it.
         return not has_explicit_boundary
@@ -657,7 +649,7 @@ def _projected_prompt_injection_line(
     if view.source_offsets is None:
         return None
     first_offset: int | None = None
-    identifier_relaxed_text = re.sub(r"[0-9_]", " ", view.text)
+    identifier_relaxed_text = view.text.translate(_IDENTIFIER_RELAXATION)
     projected_texts = (
         (view.text, identifier_relaxed_text)
         if identifier_relaxed_text != view.text
@@ -669,7 +661,10 @@ def _projected_prompt_injection_line(
             match = pattern.search(projected_text)
             if match is None:
                 continue
-            source_offset = view.source_offset(match.start())
+            reconstructed_gaps = view.reconstructed_source_spans(match.start(), match.end())
+            if not reconstructed_gaps:
+                continue
+            source_offset = reconstructed_gaps[0][0]
             if first_offset is None or source_offset < first_offset:
                 first_offset = source_offset
     return get_line_number(content, first_offset) if first_offset is not None else None
