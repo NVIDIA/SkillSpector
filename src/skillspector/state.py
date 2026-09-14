@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+import math
 import operator
+import os
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Annotated, NotRequired
@@ -36,9 +38,40 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
+from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
-MAX_WORKFLOW_SECONDS = 60.0
+logger = get_logger(__name__)
+
+DEFAULT_MAX_WORKFLOW_SECONDS = 600.0
+
+
+def _workflow_max_seconds_from_environment(value: str | None) -> float:
+    """Return a positive finite workflow deadline or the safe default."""
+    if value is None:
+        return DEFAULT_MAX_WORKFLOW_SECONDS
+    try:
+        seconds = float(value)
+    except ValueError:
+        logger.warning(
+            "SKILLSPECTOR_MAX_WORKFLOW_SECONDS=%r is not numeric, using default %.1fs",
+            value,
+            DEFAULT_MAX_WORKFLOW_SECONDS,
+        )
+        return DEFAULT_MAX_WORKFLOW_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0:
+        logger.warning(
+            "SKILLSPECTOR_MAX_WORKFLOW_SECONDS=%r must be finite and positive, using default %.1fs",
+            value,
+            DEFAULT_MAX_WORKFLOW_SECONDS,
+        )
+        return DEFAULT_MAX_WORKFLOW_SECONDS
+    return seconds
+
+
+MAX_WORKFLOW_SECONDS = _workflow_max_seconds_from_environment(
+    os.environ.get("SKILLSPECTOR_MAX_WORKFLOW_SECONDS")
+)
 MAX_WORKFLOW_BYTES = 64 * 1024 * 1024
 MAX_WORKFLOW_ARTIFACTS = 10_000
 MAX_WORKFLOW_LIMITATION_RECORDS = 256

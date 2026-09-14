@@ -1,3 +1,17 @@
+### 2.11.2 (Thursday, September 10, 2026)
+### Features/Bug Fixes
+* fix: prevent duplicate reference coverage from causing fatal scan-accounting errors (#507)
+* fix: avoid false shell-parser limits on ordinary documentation (#507)
+* fix: preserve partial coverage for runtime-selected printf and wrapper paths (#508)
+---
+### 2.11.1 (Monday, September 07, 2026)
+### Features/Bug Fixes
+* fix: parse space-separated allowed-tools strings (fixes #327) (#330)
+* fix(security): normalize concealed instruction text (#408)
+* fix(llm): bound total in-flight LLM requests, not one analyzer's fan-out (#401)
+* fix: preserve finding classification during deduplication (#462)
+* feat: make workflow deadline configurable (#468)
+---
 ### 2.11.0 (Friday, August 28, 2026)
 ### Features/Bug Fixes
 * feat: analyze bundled permission grants (#429)

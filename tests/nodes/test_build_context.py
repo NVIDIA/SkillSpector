@@ -38,11 +38,13 @@ from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import (
+    DEFAULT_MAX_WORKFLOW_SECONDS,
     MAX_WORKFLOW_ARTIFACTS,
     MAX_WORKFLOW_BYTES,
     MAX_WORKFLOW_SECONDS,
     SkillspectorState,
     WorkflowResourceBudget,
+    _workflow_max_seconds_from_environment,
 )
 
 _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
@@ -180,12 +182,29 @@ def test_build_context_starts_and_returns_default_graph_wide_budget(tmp_path: Pa
 
     budget = result["workflow_resource_budget"]
     assert isinstance(budget, WorkflowResourceBudget)
-    assert budget.max_seconds == MAX_WORKFLOW_SECONDS == 60.0
+    assert DEFAULT_MAX_WORKFLOW_SECONDS == 600.0
+    assert budget.max_seconds == MAX_WORKFLOW_SECONDS
     assert budget.max_bytes == MAX_WORKFLOW_BYTES == 64 * 1024 * 1024
     assert budget.max_artifacts == MAX_WORKFLOW_ARTIFACTS == 10_000
     assert budget.started_at is not None
     assert budget.scanned_bytes == len(payload)
     assert budget.scanned_artifacts == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("120", 120.0),
+        ("0.5", 0.5),
+        ("0", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("-1", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("nan", DEFAULT_MAX_WORKFLOW_SECONDS),
+        ("not-a-number", DEFAULT_MAX_WORKFLOW_SECONDS),
+    ],
+)
+def test_workflow_budget_seconds_environment_parsing(value: str | None, expected: float) -> None:
+    assert _workflow_max_seconds_from_environment(value) == expected
 
 
 def test_build_context_reuses_supplied_stricter_transitive_budget(tmp_path: Path) -> None:
@@ -1056,7 +1075,10 @@ def test_build_context_rejects_symlink_to_external_file(tmp_path: Path) -> None:
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
-    (skill_dir / "creds.md").symlink_to(secret)
+    try:
+        (skill_dir / "creds.md").symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
@@ -1074,7 +1096,10 @@ def test_build_context_rejects_symlinked_directory(tmp_path: Path) -> None:
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
-    (skill_dir / "linked").symlink_to(external, target_is_directory=True)
+    try:
+        (skill_dir / "linked").symlink_to(external, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
@@ -1109,7 +1134,10 @@ def test_build_context_rejects_in_tree_symlink(tmp_path: Path) -> None:
     skill_dir.mkdir()
     (skill_dir / "real.md").write_text("real content", encoding="utf-8")
     (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
-    (skill_dir / "alias.md").symlink_to(skill_dir / "real.md")
+    try:
+        (skill_dir / "alias.md").symlink_to(skill_dir / "real.md")
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
@@ -1127,6 +1155,12 @@ def test_build_context_rejects_file_swapped_to_symlink_before_read(
     secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
     target = tmp_path / "payload.md"
     target.write_text("safe", encoding="utf-8")
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+    probe.unlink()
 
     def replace_target(path: Path) -> BinaryIO:
         if path.name == target.name:
@@ -1154,7 +1188,10 @@ def test_build_context_rejects_symlinked_manifest(tmp_path: Path) -> None:
     )
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
-    (skill_dir / "SKILL.md").symlink_to(external)
+    try:
+        (skill_dir / "SKILL.md").symlink_to(external)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
