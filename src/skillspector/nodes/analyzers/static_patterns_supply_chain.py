@@ -124,6 +124,25 @@ SC2_PATTERNS = [
     (r"download\s+and\s+(?:run|execute)\s+(?:the\s+)?script", 0.7),
     (r"run\s+(?:this|the)\s+(?:following\s+)?(?:curl|wget)\s+command", 0.6),
 ]
+_INSTALLER_WARNING = re.compile(r"\b(?:warning|caution)\b", re.IGNORECASE)
+_INTERNAL_INSTALLER = re.compile(
+    r"\binternal\b[^\n]{0,80}\binstaller\b|\binstaller\b[^\n]{0,80}\binternal\b",
+    re.IGNORECASE,
+)
+_SOURCE_REVIEW_BEFORE_RUN = re.compile(
+    r"\b(?:review|inspect)\b[^\n]{0,80}\bsource\b[^\n]{0,80}"
+    r"\bbefore\b[^\n]{0,40}\b(?:run|execute|launch)(?:ning|d|s)?\b",
+    re.IGNORECASE,
+)
+_INSTALLER_WARNING_NEGATION = re.compile(
+    r"\b(?:not|no)\s+(?:an?\s+)?(?:warning|caution)\b|"
+    r"\b(?:never|do\s+not|don't)\s+(?:review|inspect)\b",
+    re.IGNORECASE,
+)
+_PIPE_TO_SHELL = re.compile(
+    r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba)?sh\b",
+    re.IGNORECASE,
+)
 SC3_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -1197,20 +1216,42 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             mt = match.group(0)
+            warned_internal_installer = _is_warned_internal_installer(content, match, file_type)
             if _is_safe_supply_chain_pattern(mt):
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:
                 adj = confidence
                 sev = Severity.HIGH
+            finding_tags = list(tag)
+            if warned_internal_installer:
+                finding_tags.extend(["contextual-triage", "explicit-risk-warning"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="SC2",
-                    message="External Script Fetching",
+                    message=(
+                        "Warned Pipe-to-Shell Installer"
+                        if warned_internal_installer
+                        else "External Script Fetching"
+                    ),
                     severity=sev,
                     location=loc(line_num),
                     confidence=adj,
-                    tags=tag,
+                    remediation=(
+                        "Keep the warning adjacent to this command. Prefer a checksum, signature, "
+                        "or inspect-before-execute flow instead of piping fetched content directly "
+                        "to a shell."
+                        if warned_internal_installer
+                        else None
+                    ),
+                    explanation=(
+                        "The matched documentation explicitly warns that an internal installer "
+                        "is fetched and piped directly to a shell. The warning provides context, "
+                        "but the command still executes remote code without an inspection step."
+                        if warned_internal_installer
+                        else None
+                    ),
+                    tags=finding_tags,
                     context=ctx(match.start()),
                     matched_text=mt[:200],
                     complete_match=mt,
@@ -1251,6 +1292,42 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     return findings
+
+
+def _is_warned_internal_installer(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+) -> bool:
+    """Return whether a pipe-to-shell example carries an explicit local warning."""
+    if file_type not in {"markdown", "text"}:
+        return False
+    pipe_match = _PIPE_TO_SHELL.search(match.group(0))
+    if pipe_match is None:
+        return False
+    pipe_start = match.start() + pipe_match.start()
+    pipe_end = match.start() + pipe_match.end()
+    line_start = content.rfind("\n", 0, pipe_start) + 1
+    line_end = content.find("\n", pipe_end)
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    if len(tuple(_PIPE_TO_SHELL.finditer(line))) != 1:
+        return False
+    local_pipe_start = pipe_start - line_start
+    local_pipe_end = pipe_end - line_start
+    code_start = line.rfind("`", 0, local_pipe_start)
+    descriptor_end = code_start if code_start >= 0 else local_pipe_start
+    descriptor_prefix = re.split(r"(?:[.!?;]\s+|\n)", line[:descriptor_end])[-1]
+    trailing_context = line[local_pipe_end:]
+    relevant_context = f"{descriptor_prefix} {trailing_context}"
+    if _INSTALLER_WARNING_NEGATION.search(relevant_context):
+        return False
+    return (
+        _INSTALLER_WARNING.search(descriptor_prefix) is not None
+        and _INTERNAL_INSTALLER.search(descriptor_prefix) is not None
+        and _SOURCE_REVIEW_BEFORE_RUN.search(trailing_context) is not None
+    )
 
 
 _TRUSTED_DOMAINS: tuple[str, ...] = (
