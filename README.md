@@ -25,7 +25,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **87 vulnerability patterns** across 20 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, agent snooping, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, server-side request forgery, insecure deserialization, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **101 vulnerability patterns** across 23 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, agent snooping, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, server-side request forgery, insecure deserialization, YARA signatures, MCP least privilege, MCP tool poisoning, bundled execution surface, analysis evasion, and MCP rug pull
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
@@ -372,7 +372,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **87 vulnerability patterns** across 20 categories:
+SkillSpector detects **101 vulnerability patterns** across 23 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -403,13 +403,15 @@ SkillSpector detects **87 vulnerability patterns** across 20 categories:
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
 | E5 | Cloud Storage Exfiltration | MEDIUM | Uploading data to cloud storage (S3, GCS, Azure Blob) that may exfiltrate to an external bucket |
 
-### Privilege Escalation (3 patterns)
+### Privilege Escalation (5 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | PE1 | Excessive Permissions | LOW | Requesting access beyond stated functionality |
 | PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
 | PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
+| PE4 | Docker Socket Access | HIGH | Mounting or connecting to the Docker socket (`/var/run/docker.sock`), enabling container/host escape |
+| PE5 | Privileged Container / Escape | HIGH | `--privileged`, shared host namespaces, or other flags that remove the container security boundary |
 
 ### Supply Chain (9 patterns)
 
@@ -562,6 +564,33 @@ SkillSpector detects **87 vulnerability patterns** across 20 categories:
 | TP2 | Unicode Deception | HIGH | Homoglyphs, RTL overrides, mixed-script identifiers in tool metadata |
 | TP3 | Parameter Description Injection | MEDIUM | Injection patterns in parameter definitions (overrides, system tokens, malicious defaults) |
 | TP4 | Description-Behavior Mismatch | MEDIUM | Declared tool description does not match actual code behavior (LLM-powered) |
+
+### Bundled Execution Surface (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| BH1 | Bundled Lifecycle Hook | LOW-HIGH | Bundled hook can run automatically when its configured lifecycle event fires |
+| BH2 | Bundled Hook Remote Exfiltration | CRITICAL | Bundled hook directly sends sensitive event or file content to a remote destination |
+| BH3 | Bundled Permission Declaration | LOW-CRITICAL | Bundled project settings declare a broad permission surface, or a mode ignored on this surface |
+
+### Analysis Evasion (6 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| AE1 | Incomplete Artifact Coverage | HIGH | Referenced artifact could not be completely inspected (partial, failed, or out-of-scope disposition) |
+| AE2 | Misleading File Extension | MEDIUM | Artifact content does not match its filename extension |
+| AE3 | Embedded NUL Bytes | HIGH | Text artifact contains embedded NUL bytes |
+| AE4 | Suspicious Unicode Normalization | MEDIUM | Mixed-script content or anomalous Unicode normalization density |
+| AE5 | Oversized Instruction Artifact | HIGH | Instruction-capable artifact (Markdown/text/SKILL.md) exceeds whole-file semantic analysis limits |
+| AE6 | Inter-Character Separator Evasion | HIGH | Instruction text uses inter-character separators to evade pattern matching |
+
+### MCP Rug Pull (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| RP1 | Unpinned MCP Server Reference | LOW-HIGH | npx/uvx/pip/docker reference to an MCP server without a pinned version |
+| RP2 | Permission Pre-Staging | LOW-MEDIUM | Manifest or trigger-phrase changes suggesting future privilege expansion |
+| RP3 | Unpinned Skill Version | LOW-MEDIUM | Skill version is unpinned, uses an overly broad constraint, or its parameter schema changed |
 
 All detected patterns are listed in the tables above.
 
