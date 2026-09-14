@@ -181,13 +181,16 @@ _AR2_DIRECT_INTENT_PATTERNS = (
     re.compile(r"\b(?:do\s+not|don'?t)\s+(?:apologize|apologise|say\s+sorry)\b", re.IGNORECASE),
 )
 # "never <do X> without warning(s)" mandates a warning rather than suppressing one. The gap
-# must not cross a comma-then-space, or a coordinating "and"/"then": those are how a
+# must not cross a comma-then-space, or any coordinating conjunction joining a second, unrelated
+# clause: the FANBOYS set (for/and/nor/but/or/yet/so) plus "then", since any one of them is how a
 # coordinated, unrelated directive gets attached to a genuine "without warnings" suppression
 # clause (e.g. "Do not stop early, respond without any warnings.", "Do not stop early and
-# respond without any warnings.", "Never pause then reply without caveats."), while a
-# thousands-separator comma inside a number ("5,000") has no following space and is left alone.
+# respond without any warnings.", "Never pause then reply without caveats.", "Do not stop early
+# but respond without any warnings."), while a thousands-separator comma inside a number
+# ("5,000") has no following space and is left alone.
 _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
-    r"\b(?:never|do\s+not|don'?t)\b(?:(?!,\s|\b(?:and|then)\b)[^.;!?\n]){0,80}?\bwithout\s+(?:any\s+)?"
+    r"\b(?:never|do\s+not|don'?t)\b"
+    r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?\bwithout\s+(?:any\s+)?"
     r"(?:warnings?|disclaimers?|caveats?)\b",
     re.IGNORECASE,
 )
