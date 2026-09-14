@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from skillspector.nodes.analyzers.mcp_rug_pull import node
+from skillspector.nodes.build_context import build_context
 from skillspector.state import SkillspectorState
 
 
@@ -133,6 +134,20 @@ def test_rp3_version_wildcard():
     )
     rp3 = [f for f in result["findings"] if f.rule_id == "RP3"]
     assert len(rp3) >= 1
+
+
+def test_rp3_version_wildcard_from_skill_frontmatter(tmp_path):
+    """RP3 receives the version projected from real skill frontmatter."""
+    (tmp_path / "SKILL.md").write_text(
+        '---\nname: test-skill\ndescription: For tests\nversion: "*"\n---\n',
+        encoding="utf-8",
+    )
+
+    result = node(build_context({"skill_path": str(tmp_path)}))
+
+    rp3 = [finding for finding in result["findings"] if finding.rule_id == "RP3"]
+    assert len(rp3) == 1
+    assert rp3[0].matched_text == "*"
 
 
 def test_rp3_version_ok_no_finding():
