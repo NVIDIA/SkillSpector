@@ -29,6 +29,7 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
@@ -156,6 +157,63 @@ _PIPE_TO_SHELL = re.compile(
     re.IGNORECASE,
 )
 _MAX_WARNED_INSTALLER_LINE_CHARS = 4_096
+def _literal_xor_decoder_keys(tree: ast.AST) -> dict[str, bytes]:
+    """Find narrowly recognizable byte-XOR decoder helpers."""
+    decoders: dict[str, bytes] = {}
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        key: bytes | None = None
+        uses_xor_bytes = False
+        for node in ast.walk(function):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, bytes)
+            ):
+                key = node.value.value
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitXor):
+                uses_xor_bytes = True
+        if key and uses_xor_bytes:
+            decoders[function.name] = key
+    return decoders
+
+
+def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
+    """Decode only literal byte arrays passed to a local XOR decoder helper."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    decoders = _literal_xor_decoder_keys(tree)
+    decoded: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in decoders
+            and len(node.args) == 1
+            and isinstance(node.args[0], (ast.List, ast.Tuple))
+        ):
+            continue
+        values = [item.value for item in node.args[0].elts if isinstance(item, ast.Constant)]
+        if len(values) != len(node.args[0].elts) or not all(
+            isinstance(value, int) and 0 <= value <= 255 for value in values
+        ):
+            continue
+        key = decoders[node.func.id]
+        try:
+            decoded_bytes = bytes(
+                value ^ key[index % len(key)] for index, value in enumerate(values)
+            )
+            command = decoded_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        decoded.append((node.lineno, command))
+    return decoded
 SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -1300,6 +1358,26 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=mt,
                 )
             )
+    if file_type == "python":
+        line_offsets = [0]
+        line_offsets.extend(index + 1 for index, char in enumerate(content) if char == "\n")
+        for line_num, command in _decoded_literal_xor_calls(content):
+            for pattern, confidence in SC2_PATTERNS:
+                if not re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
+                    continue
+                findings.append(
+                    AnalyzerFinding(
+                        rule_id="SC2",
+                        message="External Script Fetching",
+                        severity=Severity.HIGH,
+                        location=loc(line_num),
+                        confidence=confidence,
+                        tags=list(tag),
+                        context=ctx(line_offsets[line_num - 1]),
+                        matched_text=command[:200],
+                    )
+                )
+                break
     if file_type in ("python", "javascript", "shell", "other"):
         for pattern, confidence in SC3_PATTERNS:
             matches = (
