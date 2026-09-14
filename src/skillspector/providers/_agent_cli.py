@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -449,6 +450,104 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OpenCode CLI invocation  (verified against opencode 1.18.30)
+# ---------------------------------------------------------------------------
+
+
+def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
+    """Build the argv list for a non-interactive ``opencode run`` call.
+
+    Flags chosen (verified against ``opencode`` 1.18.30 ``run --help``):
+
+    ``run``
+        Non-interactive single-shot mode. With no positional message, the
+        prompt is piped to stdin by run_agent_cli — untrusted content never
+        reaches argv.
+
+    ``--pure``
+        Run without external plugins. This removes plugin-supplied tools,
+        but ``opencode run`` 1.18.30 exposes no sandbox/read-only/no-tools
+        flag for built-in agent tools.
+
+    ``--format json``
+        Emit raw JSON events to stdout for structured parsing.
+
+    ``--model <label>``
+        Model in ``provider/model`` form (validated). Omitted by default so
+        opencode uses the CLI default model (forwarded only when
+        SKILLSPECTOR_MODEL is set).
+
+    Least-privilege note: in addition to ``--pure``, the shared runner uses
+    a fresh temporary CWD, scrubs secret-bearing environment variables,
+    delivers untrusted content via stdin only, and never passes ``--auto``.
+    Built-in agent tool execution is not disabled by argv; use this provider
+    only where the local OpenCode runtime/agent defaults are acceptable for
+    analyzing untrusted skill content.
+
+    Deliberately NOT included:
+    - ``--auto`` — auto-approves permissions (dangerous); never use it.
+    - ``max_output_tokens`` — ``run`` has no token flag (accepted for
+      CliSpec uniformity and ignored, like codex/gemini).
+    """
+    # --model omitted by default -> opencode uses the CLI default model
+    # (forwarded only when SKILLSPECTOR_MODEL is set).
+    model_arg = ["--model", _validate_model_label(model)] if model else []
+    return [
+        binary,
+        "run",
+        "--pure",
+        "--format",
+        "json",
+        *model_arg,
+    ]
+
+
+def _parse_opencode_output(raw: str) -> str:
+    """Extract assistant text from ``opencode run --format json`` JSONL events.
+
+    Verified against opencode 1.18.30, whose events look like::
+
+        {"type": "step_start", ..., "part": {"type": "step-start", ...}}
+        {"type": "text", ..., "part": {"type": "text", "text": "hi", ...}}
+        {"type": "step_finish", ..., "part": {"type": "step-finish", ...}}
+
+    The assistant text arrives in ``part.text`` of ``text`` events; every
+    other event (step boundaries and the like) carries no reply text and is
+    skipped. Non-JSON lines (banner/TUI noise) are skipped, mirroring the
+    codex parser's tolerance. Multiple ``text`` events are concatenated in
+    order (streamed chunks).
+
+    Raises:
+        AgentCLIError: when stdout is empty or holds no ``text`` event.
+    """
+    chunks: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj: Any = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        part = obj.get("part")
+        if not isinstance(part, dict):
+            continue
+        if str(part.get("type", "")).lower() != "text":
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            chunks.append(text)
+    reply = "".join(chunks).strip()
+    if not reply:
+        raise AgentCLIError(
+            f"opencode returned no assistant text in JSON output; raw={raw[:400]!r}"
+        )
+    return reply
+
+
+# ---------------------------------------------------------------------------
 # Per-CLI authentication probes (cheap, local — run once per scan)
 # ---------------------------------------------------------------------------
 
@@ -492,6 +591,40 @@ def _gemini_auth_check(binary: str) -> tuple[bool, str | None]:
     we treat binary-on-PATH as available and let the first real call fail closed
     if auth is missing.
     """
+    return True, None
+
+
+def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
+    """Check opencode is authenticated via ``opencode auth list`` (no inference).
+
+    The caller must already have resolved ``binary``. The probe uses the same
+    scrubbed environment as inference, performs no inference, and completes
+    well under 15s. Fail-closed: probe error/timeout, non-zero exit, zero
+    parsed credentials everywhere, or unparseable output all return
+    ``(False, reason)``. ``True`` is returned only when at least one parsed
+    credential/environment-key count is positive.
+    """
+    try:
+        result = subprocess.run(
+            [binary, "auth", "list"],
+            capture_output=True,
+            shell=False,
+            timeout=15,
+            env=_scrub_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return False, f"opencode auth list check failed: {exc}"
+    if result.returncode != 0:
+        return False, "opencode is not authenticated (run `opencode auth login`)"
+    out = re.compile(r"\x1b\[[0-9;]*m").sub(
+        "", (result.stdout or b"").decode("utf-8", errors="replace")
+    )
+    creds_match = re.compile(r"(\d+)\s+credentials?").search(out)
+    env_match = re.compile(r"(\d+)\s+environment variables?").search(out)
+    num_creds = int(creds_match.group(1)) if creds_match else 0
+    num_env_keys = int(env_match.group(1)) if env_match else 0
+    if num_creds <= 0 and num_env_keys <= 0:
+        return False, "opencode is not authenticated (run `opencode auth login`)"
     return True, None
 
 
@@ -576,6 +709,9 @@ _REGISTRY: dict[str, CliSpec] = {
     "claude": CliSpec("claude", _build_claude_argv, _parse_claude_output, _claude_auth_check),
     "codex": CliSpec("codex", _build_codex_argv, _parse_codex_output, _codex_auth_check),
     "gemini": CliSpec("gemini", _build_gemini_argv, _parse_gemini_output, _gemini_auth_check),
+    "opencode": CliSpec(
+        "opencode", _build_opencode_argv, _parse_opencode_output, _opencode_auth_check
+    ),
     # Disabled (fails closed via _build_agy_argv). agy's backend is Gemini, so it
     # reuses _parse_gemini_output rather than duplicating it — though parse is
     # never reached while _build_agy_argv raises. See the antigravity note above.
