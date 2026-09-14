@@ -1111,11 +1111,11 @@ class TestTP4MarkdownFences:
         result = node(_make_state("tp4_markdown_fenced_code", use_llm=True))
 
         assert structured.calls == 1
-        assert "### SKILL.md#fence-1 (python)" in structured.prompts[0]
+        assert "### SKILL.md (python)" in structured.prompts[0]
         assert [finding.rule_id for finding in result["findings"]].count("TP4") == 1
         assert result["llm_call_log"][0]["ok"] is True
 
-    def test_fences_are_bounded_and_reject_false_positives(self):
+    def test_fences_reject_false_positives_and_keep_ranges(self):
         content = (
             "```\nprint('unlabeled')\n```\n"
             "```html\n<script>output</script>\n```\n"
@@ -1124,7 +1124,7 @@ class TestTP4MarkdownFences:
             "```python\nprint('unterminated')\n"
         )
 
-        fences = mcp_tool_poisoning._extract_tp4_markdown_fences(content)
+        fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
 
         assert fences == [("python", "print('accepted')\n", 11, 11)]
 
@@ -1134,22 +1134,8 @@ class TestTP4MarkdownFences:
             "```py\nprint('accepted')\n```\n"
             "```js\nconsole.log('accepted')\n```\n"
         )
-        fences = mcp_tool_poisoning._extract_tp4_markdown_fences(content)
+        fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
         assert [fence[0] for fence in fences] == ["shell", "python", "javascript"]
-
-    def test_markdown_boundary_is_32768_bytes(self):
-        opening = "```python\n"
-        closing = "\n```\n"
-        exact = opening + ("x" * (32768 - len(opening) - len(closing))) + closing
-        over = opening + ("x" * 32768) + closing
-
-        fences = mcp_tool_poisoning._extract_tp4_markdown_fences(exact)
-        over_fences = mcp_tool_poisoning._extract_tp4_markdown_fences(over)
-
-        assert len(fences) == 1
-        assert len(fences[0][1].encode("utf-8")) == (32768 - len(opening) - len(closing) + 1)
-        assert over_fences == []
-        assert mcp_tool_poisoning.TP4_MAX_MARKDOWN_BYTES == 32768
 
     def test_executable_candidates_precede_markdown_candidates(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1174,46 +1160,382 @@ class TestTP4MarkdownFences:
         result = node(state)
 
         assert "### tool.py (python)" in structured.prompts[0]
-        assert "### guide.md#fence-1 (python)" in structured.prompts[1]
+        assert "### guide.md (python)" in structured.prompts[1]
         assert all(
             event["path"] == "guide.md"
             for event in result["inspection_ledger"]
             if event["phase"] == "semantic" and event["path"].startswith("guide.md")
         )
 
-    def test_many_fences_in_one_file_use_one_bounded_candidate(
+    def test_markdown_artifact_cap_stops_before_prefix_and_fence_extraction(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
-        body = "\n".join("```python\nprint('example')\n```" for _ in range(70))
-        state = {
-            "manifest": {"name": "bounded", "description": "Documentation only."},
-            "file_cache": {"guide.md": body},
-            "component_metadata": [{"path": "guide.md", "type": "markdown"}],
-            "use_llm": True,
-            "model_config": {"default": "test-model"},
-        }
+        first = "```python\nprint('first')\n```\n"
+        whitespace = " " * 1024
+        over_cap = "```python\nprint('over cap')\n```\n"
+        later = "```python\nprint('later')\n```\n"
+        prefix_inputs: list[str] = []
+        iterator_inputs: list[str] = []
+        original_prefix = mcp_tool_poisoning._bounded_utf8_prefix
+        original_iterator = mcp_tool_poisoning._iter_tp4_markdown_fences
 
-        node(state)
+        def spy_prefix(content: str, max_bytes: int):
+            prefix_inputs.append(content)
+            return original_prefix(content, max_bytes)
+
+        def spy_iterator(content: str):
+            iterator_inputs.append(content)
+            return original_iterator(content)
+
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_FILES", 1)
+        monkeypatch.setattr(mcp_tool_poisoning, "_bounded_utf8_prefix", spy_prefix)
+        monkeypatch.setattr(mcp_tool_poisoning, "_iter_tp4_markdown_fences", spy_iterator)
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": {
+                    "first.md": first,
+                    "whitespace.md": whitespace,
+                    "over-cap.md": over_cap,
+                    "later.md": later,
+                },
+                "component_metadata": [
+                    {"path": "first.md", "type": "markdown"},
+                    {"path": "whitespace.md", "type": "markdown"},
+                    {"path": "over-cap.md", "type": "markdown"},
+                    {"path": "later.md", "type": "markdown"},
+                ],
+                "model_config": {"default": "test-model"},
+            }
+        )
 
         assert structured.calls == 1
-        assert "### guide.md#fence-70 (python)" in structured.prompts[0]
+        assert prefix_inputs == [first]
+        assert iterator_inputs == [first]
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert len(partial) == 1
+        assert partial[0]["path"] == "whitespace.md"
+        assert partial[0]["reason_code"] is LedgerReason.ARTIFACT_COUNT_LIMIT
+        assert partial[0]["limit_artifacts"] == 1
 
-    def test_markdown_overflow_is_recorded_as_partial(self):
-        content = ("padding\n" * 5000) + "```python\nprint('late')\n```\n"
+    def test_executable_artifact_cap_stops_before_content_reads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        class SpyText(str):
+            count_calls = 0
+            isspace_calls = 0
+
+            def count(self, *args: object) -> int:
+                SpyText.count_calls += 1
+                return super().count(*args)
+
+            def isspace(self) -> bool:
+                SpyText.isspace_calls += 1
+                return super().isspace()
+
+        first = "print('first')\n"
+        later = SpyText("x" * 200_000)
+        prefix_inputs: list[str] = []
+        original_prefix = mcp_tool_poisoning._bounded_utf8_prefix
+
+        def spy_prefix(content: str, max_bytes: int):
+            prefix_inputs.append(content)
+            return original_prefix(content, max_bytes)
+
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_FILES", 1)
+        monkeypatch.setattr(mcp_tool_poisoning, "_bounded_utf8_prefix", spy_prefix)
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": {"first.py": first, "later.py": later},
+                "component_metadata": [
+                    {"path": "first.py", "type": "python"},
+                    {"path": "later.py", "type": "python"},
+                ],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 1
+        assert prefix_inputs == [first]
+        assert SpyText.count_calls == SpyText.isspace_calls == 0
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert [event["path"] for event in partial] == ["later.py"]
+        assert partial[0]["reason_code"] is LedgerReason.ARTIFACT_COUNT_LIMIT
+
+    def test_blank_executable_prefix_keeps_no_call_status(self, monkeypatch):
+        structured = _mock_tp4_structured_llm(monkeypatch, [])
+        result = node(
+            {
+                "manifest": {"name": "clean", "description": "Only documentation."},
+                "file_cache": {"blank.py": "   \n"},
+                "component_metadata": [{"path": "blank.py", "type": "python"}],
+                "use_llm": True,
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 0
+        assert result["findings"] == []
+        assert result["analyzer_status_events"][0]["status"] == "completed"
+
+    def test_executable_cr_lines_keep_source_range(self, monkeypatch):
+        _mock_tp4_structured_llm(
+            monkeypatch,
+            [
+                {
+                    "is_mismatch": True,
+                    "confidence": 0.9,
+                    "mismatched_capabilities": ["network access"],
+                }
+            ],
+        )
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": {"tool.py": "a=1\rb=2\rc=3\r"},
+                "component_metadata": [{"path": "tool.py", "type": "python"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        finding = result.findings[0]
+        assert finding.evidence["code_path"] == "tool.py"
+        assert finding.evidence["code_start_line"] == 1
+        assert finding.evidence["code_end_line"] == 3
+
+    @pytest.mark.parametrize("source_order", ["executable-first", "markdown-first"])
+    def test_prompt_byte_stop_records_next_source(self, monkeypatch, source_order):
+        fence = "```python\nprint('first')\n```\n"
+        if source_order == "executable-first":
+            file_cache = {"tool.py": "print('first')\n", "next.md": fence}
+            metadata = [
+                {"path": "tool.py", "type": "python"},
+                {"path": "next.md", "type": "markdown"},
+            ]
+            expected_paths = ["tool.py", "next.md"]
+        else:
+            file_cache = {"first.md": fence, "next.md": fence}
+            metadata = [
+                {"path": "first.md", "type": "markdown"},
+                {"path": "next.md", "type": "markdown"},
+            ]
+            expected_paths = ["first.md", "next.md"]
+
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_TOTAL_INPUT_BYTES", 1)
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": file_cache,
+                "component_metadata": metadata,
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert [event["path"] for event in partial] == expected_paths
+        assert all(event["reason_code"] is LedgerReason.TOTAL_BYTES_LIMIT for event in partial)
+
+    @pytest.mark.parametrize("source_order", ["executable-first", "markdown-first"])
+    def test_runtime_stop_records_next_source(self, monkeypatch, source_order):
+        fence = "```python\nprint('first')\n```\n"
+        if source_order == "executable-first":
+            file_cache = {"tool.py": "print('first')\n", "next.md": fence}
+            metadata = [
+                {"path": "tool.py", "type": "python"},
+                {"path": "next.md", "type": "markdown"},
+            ]
+            expected_paths = ["tool.py", "next.md"]
+        else:
+            file_cache = {"first.md": fence, "next.md": fence}
+            metadata = [
+                {"path": "first.md", "type": "markdown"},
+                {"path": "next.md", "type": "markdown"},
+            ]
+            expected_paths = ["first.md", "next.md"]
+        remaining_calls = 0
+
+        def remaining(_state):
+            nonlocal remaining_calls
+            remaining_calls += 1
+            return None if remaining_calls == 1 else (60.0 if remaining_calls == 2 else 0.0)
+
+        monkeypatch.setattr(mcp_tool_poisoning, "transitive_remaining_seconds", remaining)
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": file_cache,
+                "component_metadata": metadata,
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert [event["path"] for event in partial] == expected_paths
+        assert all(event["reason_code"] is LedgerReason.RUNTIME_LIMIT for event in partial)
+
+    def test_markdown_whitespace_prefix_truncation_is_partial(self, monkeypatch):
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_FILE_CODE_BYTES", 32)
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": {"guide.md": (" " * 64) + "\n```python\nprint('late')\n```\n"},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert len(partial) == 1
+        assert partial[0]["path"] == "guide.md"
+        assert partial[0]["reason_code"] is LedgerReason.SIZE_LIMIT
+
+    def test_markdown_batch_cap_stops_before_next_source(self, monkeypatch: pytest.MonkeyPatch):
+        first = "```python\nprint('first')\n```\n"
+        prose = "```text\njust prose\n```\n"
+        later = "```python\nprint('later')\n```\n"
+        prefix_inputs: list[str] = []
+        iterator_inputs: list[str] = []
+        original_prefix = mcp_tool_poisoning._bounded_utf8_prefix
+        original_iterator = mcp_tool_poisoning._iter_tp4_markdown_fences
+
+        def spy_prefix(content: str, max_bytes: int):
+            prefix_inputs.append(content)
+            return original_prefix(content, max_bytes)
+
+        def spy_iterator(content: str):
+            iterator_inputs.append(content)
+            return original_iterator(content)
+
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", 1)
+        monkeypatch.setattr(mcp_tool_poisoning, "_bounded_utf8_prefix", spy_prefix)
+        monkeypatch.setattr(mcp_tool_poisoning, "_iter_tp4_markdown_fences", spy_iterator)
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": {"first.md": first, "prose.md": prose, "later.md": later},
+                "component_metadata": [
+                    {"path": "first.md", "type": "markdown"},
+                    {"path": "prose.md", "type": "markdown"},
+                    {"path": "later.md", "type": "markdown"},
+                ],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 1
+        assert prefix_inputs == [first]
+        assert iterator_inputs == [first]
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert len(partial) == 1
+        assert partial[0]["path"] == "prose.md"
+        assert partial[0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+
+    def test_markdown_deadline_stops_before_prefix_and_fence_extraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        first = "```python\nprint('first')\n```\n"
+        after_deadline = "```python\nprint('after deadline')\n```\n"
+        later = "```python\nprint('later')\n```\n"
+        prefix_inputs: list[str] = []
+        iterator_inputs: list[str] = []
+        original_prefix = mcp_tool_poisoning._bounded_utf8_prefix
+        original_iterator = mcp_tool_poisoning._iter_tp4_markdown_fences
+        remaining_calls = 0
+
+        def spy_remaining(_state):
+            nonlocal remaining_calls
+            remaining_calls += 1
+            if remaining_calls == 1:
+                return None
+            return 0.0 if remaining_calls >= 4 else 60.0
+
+        def spy_prefix(content: str, max_bytes: int):
+            prefix_inputs.append(content)
+            return original_prefix(content, max_bytes)
+
+        def spy_iterator(content: str):
+            iterator_inputs.append(content)
+            return original_iterator(content)
+
+        monkeypatch.setattr(mcp_tool_poisoning, "transitive_remaining_seconds", spy_remaining)
+        monkeypatch.setattr(mcp_tool_poisoning, "_bounded_utf8_prefix", spy_prefix)
+        monkeypatch.setattr(mcp_tool_poisoning, "_iter_tp4_markdown_fences", spy_iterator)
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documentation only."},
+                "file_cache": {
+                    "first.md": first,
+                    "after-deadline.md": after_deadline,
+                    "later.md": later,
+                },
+                "component_metadata": [
+                    {"path": "first.md", "type": "markdown"},
+                    {"path": "after-deadline.md", "type": "markdown"},
+                    {"path": "later.md", "type": "markdown"},
+                ],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 1
+        assert prefix_inputs == [first]
+        assert iterator_inputs == [first]
+        partial = [event for event in result.ledger if event["outcome"] is LedgerOutcome.PARTIAL]
+        assert len(partial) == 1
+        assert partial[0]["path"] == "after-deadline.md"
+        assert partial[0]["reason_code"] is LedgerReason.RUNTIME_LIMIT
+
+    def test_separated_markdown_fences_keep_independent_source_ranges(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        structured = _mock_tp4_structured_llm(
+            monkeypatch,
+            [
+                {"is_mismatch": False},
+                {
+                    "is_mismatch": True,
+                    "confidence": 0.9,
+                    "mismatched_capabilities": ["network access"],
+                },
+            ],
+        )
+        content = (
+            "Intro\n"
+            "```python\n"
+            "print('first')\n"
+            "```\n"
+            "Prose between fences.\n"
+            "~~~python\n"
+            "send_data()\n"
+            "~~~\n"
+        )
+
         result = mcp_tool_poisoning._check_tp4(
             {
                 "manifest": {"description": "Documentation only."},
                 "file_cache": {"guide.md": content},
                 "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
             }
         )
-        assert any(
-            event.get("path") == "guide.md"
-            and event.get("outcome") == LedgerOutcome.PARTIAL
-            and event.get("reason_code") == LedgerReason.SIZE_LIMIT
+
+        assert structured.calls == 2
+        finding = result.findings[0]
+        assert finding.evidence["code_path"] == "guide.md"
+        assert finding.evidence["code_start_line"] == 7
+        assert finding.evidence["code_end_line"] == 7
+        matching_events = [
+            event
             for event in result.ledger
-        )
+            if event["path"] == "guide.md" and event["start_line"] == 7 and event["end_line"] == 7
+        ]
+        assert matching_events
+        assert finding.finding_id in matching_events[0]["emitted_finding_ids"]
 
     def test_no_applicable_markdown_keeps_clean_status(self, monkeypatch: pytest.MonkeyPatch):
         structured = _mock_tp4_structured_llm(monkeypatch, [])
@@ -1230,6 +1552,29 @@ class TestTP4MarkdownFences:
         assert result["findings"] == []
         assert result["analyzer_status_events"][0]["status"] == "completed"
         assert result["analyzer_status_events"][0]["planned_work"]
+
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 1)
+        result = node(
+            {
+                "manifest": {"name": "clean", "description": "Only documentation."},
+                "file_cache": {"guide.md": "```text\njust prose\n```\n"},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "use_llm": True,
+                "model_config": {"default": "test-model"},
+            }
+        )
+        assert result["analyzer_status_events"][0]["status"] == "completed"
+
+        result = node(
+            {
+                "manifest": {"name": "clean", "description": "x" * 16_385},
+                "file_cache": {"guide.md": "```text\njust prose\n```\n"},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "use_llm": True,
+                "model_config": {"default": "test-model"},
+            }
+        )
+        assert result["analyzer_status_events"][0]["status"] == "completed"
 
 
 class TestTP4Fallbacks:
