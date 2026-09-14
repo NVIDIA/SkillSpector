@@ -106,6 +106,25 @@ def _finding_locations(finding: Finding) -> set[str]:
     return locations
 
 
+def test_same_line_p1_occurrences_survive_graph_boundaries(tmp_path: Path) -> None:
+    phrase = "ignore previous instructions"
+    content = f"{phrase}; {phrase}"
+    root = tmp_path / "same-line-p1"
+    _write_bundle(root, {"SKILL.md": content})
+
+    findings = _assert_rule(_scan(root), "P1", "SKILL.md")
+
+    assert len(findings) == 1
+    assert (findings[0].start_column, findings[0].end_column) == (0, len(phrase))
+    assert {
+        (occurrence["start_column"], occurrence["end_column"])
+        for occurrence in findings[0].occurrences
+    } == {
+        (content.index(phrase), content.index(phrase) + len(phrase)),
+        (content.rindex(phrase), content.rindex(phrase) + len(phrase)),
+    }
+
+
 async def _assert_rules_across_public_surfaces(
     root: Path,
     *,

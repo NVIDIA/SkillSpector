@@ -3,7 +3,11 @@
 
 """Tests for shared analyzer helpers."""
 
-from skillspector.nodes.analyzers.common import get_context, get_context_from_lines
+from skillspector.nodes.analyzers.common import (
+    SourceLocationIndex,
+    get_context,
+    get_context_from_lines,
+)
 
 
 def test_context_helpers_bound_long_lines_around_the_finding() -> None:
@@ -16,3 +20,23 @@ def test_context_helpers_bound_long_lines_around_the_finding() -> None:
     for context in (offset_context, line_context):
         assert len(context) <= 1_000
         assert "MATCH" in context
+
+
+def test_source_location_index_reuses_logical_line_offsets() -> None:
+    content = "alpha\r\nβeta\nlast"
+    locations = SourceLocationIndex(content, "SKILL.md")
+    line_starts = locations.line_starts
+
+    beta_start = content.index("β")
+    last_end = len(content)
+    first = locations.location(beta_start, beta_start + len("βeta"))
+    second = locations.location(content.index("last"), last_end)
+
+    assert locations.line_starts is line_starts
+    assert (first.start_line, first.start_column, first.end_line, first.end_column) == (2, 0, 2, 4)
+    assert (second.start_line, second.start_column, second.end_line, second.end_column) == (
+        3,
+        0,
+        3,
+        4,
+    )

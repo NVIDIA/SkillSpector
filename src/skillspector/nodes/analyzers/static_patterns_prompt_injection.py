@@ -28,7 +28,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
+from .common import LOGICAL_LINE_BREAK, SourceLocationIndex, get_context
 from .pattern_defaults import PatternCategory
 from .whitespace_padding import (
     VERTICAL_HIGH_SEVERITY_LINES,
@@ -259,6 +259,7 @@ def _tag_run_from(content: str, offset: int) -> str:
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for prompt injection patterns (P1–P4, P9)."""
     findings: list[AnalyzerFinding] = []
+    locations = SourceLocationIndex(content, file_path)
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -270,13 +271,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     for pattern, confidence in P1_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="P1",
                     message="Instruction Override",
                     severity=Severity.HIGH,
-                    location=loc(line_num),
+                    location=locations.location(match.start(), match.end()),
                     confidence=confidence,
                     tags=tag,
                     context=ctx(match.start()),
@@ -287,13 +287,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if file_type in ("markdown", "other"):
         for pattern, confidence in P2_PATTERNS:
             for match in _p2_pattern_matches(content, pattern):
-                line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(
                         rule_id="P2",
                         message="Hidden Instructions",
                         severity=Severity.HIGH,
-                        location=loc(line_num),
+                        location=locations.location(match.start(), match.end()),
                         confidence=confidence,
                         tags=tag,
                         context=ctx(match.start()),
@@ -303,13 +302,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
     for pattern, confidence in P3_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="P3",
                     message="Exfiltration Commands",
                     severity=Severity.HIGH,
-                    location=loc(line_num),
+                    location=locations.location(match.start(), match.end()),
                     confidence=confidence,
                     tags=tag,
                     context=ctx(match.start()),
@@ -319,13 +317,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in P4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="P4",
                     message="Behavior Manipulation",
                     severity=Severity.MEDIUM,
-                    location=loc(line_num),
+                    location=locations.location(match.start(), match.end()),
                     confidence=confidence,
                     tags=tag,
                     context=ctx(match.start()),
@@ -340,14 +337,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # that the markdown-only block above guards against false positives.
     tag_offset = _first_smuggled_tag_offset(content)
     if tag_offset is not None:
-        line_num = get_line_number(content, tag_offset)
         complete_match = _tag_run_from(content, tag_offset)
         findings.append(
             AnalyzerFinding(
                 rule_id="P2",
                 message="Hidden Instructions (Unicode Tag / ASCII smuggling)",
                 severity=Severity.HIGH,
-                location=loc(line_num),
+                location=locations.location(tag_offset, tag_offset + len(complete_match)),
                 confidence=0.9,
                 tags=tag,
                 context=ctx(tag_offset),

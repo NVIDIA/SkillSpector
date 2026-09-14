@@ -465,27 +465,52 @@ def _analyze_python(
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int, int, int | None, int | None]] = set()
+    contexts: dict[int, str] = {}
+
+    def context_for(lineno: int) -> str:
+        context = contexts.get(lineno)
+        if context is None:
+            context = get_context_from_lines(lines, lineno)
+            contexts[lineno] = context
+        return context
 
     def _emit(
         rule_id: str,
-        lineno: int,
-        end_lineno: int | None,
+        ast_node: ast.Call,
         msg: str,
     ) -> None:
-        key = (rule_id, lineno)
+        lineno = getattr(ast_node, "lineno", 1)
+        end_lineno = getattr(ast_node, "end_lineno", None)
+        start_byte_column = getattr(ast_node, "col_offset", 0)
+        end_byte_column = getattr(ast_node, "end_col_offset", None)
+        key = (rule_id, lineno, start_byte_column, end_lineno, end_byte_column)
         if key in seen:
             return
         seen.add(key)
-        complete_match = get_complete_source_segment(lines, lineno, end_lineno)
+        complete_match = python_ast.source_segment(ast_node)
+        if complete_match is None:
+            complete_match = get_complete_source_segment(lines, lineno, end_lineno)
+        start_column = python_ast.character_column(lineno, start_byte_column)
+        end_column = (
+            python_ast.character_column(end_lineno or lineno, end_byte_column)
+            if end_byte_column is not None
+            else None
+        )
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg,
             severity=_RULE_SEVERITIES[rule_id],
-            location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
+            location=Location(
+                file=file_path,
+                start_line=lineno,
+                end_line=end_lineno,
+                start_column=start_column,
+                end_column=end_column,
+            ),
             confidence=_RULE_CONFIDENCES[rule_id],
             tags=[_TAG],
-            context=get_context_from_lines(lines, lineno),
+            context=context_for(lineno),
             matched_text=complete_match[:200],
             complete_match=complete_match,
         )
@@ -540,9 +565,6 @@ def _analyze_python(
         if sink_name == "open" and not _is_open_for_write(ast_node):
             continue
 
-        lineno = getattr(ast_node, "lineno", 1)
-        end_lineno = getattr(ast_node, "end_lineno", None)
-
         for src_name, src_node in _find_nested_sources(
             ast_node,
             type_map,
@@ -556,8 +578,7 @@ def _analyze_python(
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
                 rule,
-                lineno,
-                end_lineno,
+                ast_node,
                 f"Direct flow: {src_name} ({src_cat}) \u2192 {sink_name} ({sink_cat})",
             )
 
@@ -571,8 +592,7 @@ def _analyze_python(
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
                 rule,
-                lineno,
-                end_lineno,
+                ast_node,
                 f"Tainted flow: '{tv.name}' from {tv.source_call} (line {tv.lineno}, "
                 f"{src_cat}) \u2192 {sink_name} ({sink_cat})",
             )

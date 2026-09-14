@@ -25,6 +25,8 @@ def _occurrences(finding: Finding) -> list[dict[str, object]]:
             "file": finding.file,
             "start_line": finding.start_line,
             "end_line": finding.end_line,
+            **({"start_column": finding.start_column} if finding.start_column is not None else {}),
+            **({"end_column": finding.end_column} if finding.end_column is not None else {}),
             "source_url": finding.source_url,
             "source_identity": finding.source_identity,
             "source_digest": finding.source_digest,
@@ -105,6 +107,10 @@ def _representative_key(finding: Finding) -> tuple[object, ...]:
         finding.start_line,
         finding.end_line is not None,
         finding.end_line or 0,
+        finding.start_column is None,
+        finding.start_column or 0,
+        finding.end_column is None,
+        finding.end_column or 0,
         finding.rule_id,
         finding.message,
         finding.category or "",
@@ -167,7 +173,7 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
     for (
         _source_scope,
         _rule_id,
-        fingerprint,
+        _fingerprint,
         _classification_metadata,
     ), group in groups.items():
         representative = min(group, key=_representative_key)
@@ -176,6 +182,8 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 str(occurrence.get("file", "")),
                 _line(occurrence.get("start_line"), 1),
                 occurrence.get("end_line"),
+                occurrence.get("start_column"),
+                occurrence.get("end_column"),
                 str(occurrence.get("source_identity") or finding.source_identity or ""),
                 str(occurrence.get("source_digest") or finding.source_digest or ""),
                 str(occurrence.get("source_url") or finding.source_url or ""),
@@ -189,6 +197,8 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 "file": file,
                 "start_line": start,
                 "end_line": end,
+                **({"start_column": start_column} if start_column is not None else {}),
+                **({"end_column": end_column} if end_column is not None else {}),
                 **({"source_identity": source_identity} if source_identity else {}),
                 **({"source_digest": source_digest} if source_digest else {}),
                 **({"source_url": source_url} if source_url else {}),
@@ -198,6 +208,8 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 file,
                 start,
                 end,
+                start_column,
+                end_column,
                 source_identity,
                 source_digest,
                 source_url,
@@ -205,20 +217,21 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
             ) in sorted(
                 occurrences,
                 key=lambda item: (
-                    item[3],
-                    item[4],
                     item[5],
                     item[6],
+                    item[7],
+                    item[8],
                     item[0],
                     item[1],
                     _line(item[2], item[1]),
+                    _line(item[3], -1),
+                    _line(item[4], -1),
                 ),
             )
         ]
         compacted.append(
             replace(
                 representative,
-                match_fingerprint=fingerprint,
                 occurrences=ordered_occurrences,
             )
         )

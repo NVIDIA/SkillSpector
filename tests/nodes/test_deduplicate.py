@@ -57,6 +57,30 @@ class TestSameFileDedup:
         result = deduplicate(findings)
         assert len(result) == 1
 
+    def test_same_line_match_keeps_distinct_column_occurrences(self) -> None:
+        first = _finding(file="a.py", start_line=5)
+        first.end_line = 5
+        first.start_column = 2
+        first.end_column = 12
+        second = replace(first, start_column=20, end_column=30)
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 1
+        assert {
+            (occurrence["start_column"], occurrence["end_column"])
+            for occurrence in result[0].occurrences
+        } == {(2, 12), (20, 30)}
+
+    def test_precise_location_is_preferred_over_line_only_duplicate(self) -> None:
+        line_only = _finding(file="a.py", start_line=5)
+        precise = replace(line_only, start_column=2, end_column=12)
+
+        result = deduplicate([line_only, precise])
+
+        assert len(result) == 1
+        assert (result[0].start_column, result[0].end_column) == (2, 12)
+
     def test_keeps_highest_confidence(self) -> None:
         """When duplicates exist, the highest confidence one is kept."""
         findings = [
@@ -68,8 +92,8 @@ class TestSameFileDedup:
         assert len(result) == 1
         assert result[0].confidence == 0.9
 
-    def test_keeps_most_severe_representative_and_all_occurrences(self) -> None:
-        """Severity outranks confidence when exact matches are compacted."""
+    def test_different_severity_classifications_are_not_compacted(self) -> None:
+        """Exact matches with different risk classifications remain separate."""
         critical = _finding(
             file="critical.py",
             start_line=7,
@@ -85,12 +109,8 @@ class TestSameFileDedup:
 
         result = deduplicate([high, critical])
 
-        assert len(result) == 1
-        assert result[0].severity == "CRITICAL"
-        assert result[0].confidence == 0.2
-        assert {
-            (occurrence["file"], occurrence["start_line"]) for occurrence in result[0].occurrences
-        } == {("critical.py", 7), ("high.py", 11)}
+        assert len(result) == 2
+        assert {finding.severity for finding in result} == {"CRITICAL", "HIGH"}
 
     def test_equal_rank_representative_is_semantically_deterministic(self) -> None:
         """Opaque finding IDs and input order do not select presentation fields."""

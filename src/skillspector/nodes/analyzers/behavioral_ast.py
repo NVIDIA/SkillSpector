@@ -338,6 +338,14 @@ def _analyze_python(
     aliases = python_ast.import_aliases
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
+    contexts: dict[int, str] = {}
+
+    def context_for(lineno: int) -> str:
+        context = contexts.get(lineno)
+        if context is None:
+            context = get_context_from_lines(lines, lineno)
+            contexts[lineno] = context
+        return context
 
     def _emit(
         rule_id: str,
@@ -346,22 +354,29 @@ def _analyze_python(
     ) -> None:
         lineno = getattr(ast_node, "lineno", 1)
         end_lineno = getattr(ast_node, "end_lineno", None)
-        complete_match = ast.get_source_segment(python_ast.content, ast_node)
+        complete_match = python_ast.source_segment(ast_node)
         if complete_match is None:
             complete_match = get_complete_source_segment(lines, lineno, end_lineno)
-        start_column = getattr(ast_node, "col_offset", 0)
-        end_column = getattr(ast_node, "end_col_offset", start_column)
-        complete_identity = f"{complete_match}\x1f{start_column}:{end_column}"
+        start_byte_column = getattr(ast_node, "col_offset", 0)
+        end_byte_column = getattr(ast_node, "end_col_offset", start_byte_column)
+        start_column = python_ast.character_column(lineno, start_byte_column)
+        end_column = python_ast.character_column(end_lineno or lineno, end_byte_column)
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg_override or _RULE_MESSAGES[rule_id],
             severity=_RULE_SEVERITIES[rule_id],
-            location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
+            location=Location(
+                file=file_path,
+                start_line=lineno,
+                end_line=end_lineno,
+                start_column=start_column,
+                end_column=end_column,
+            ),
             confidence=_RULE_CONFIDENCES[rule_id],
             tags=[_TAG],
-            context=get_context_from_lines(lines, lineno),
+            context=context_for(lineno),
             matched_text=complete_match[:200],
-            complete_match=complete_identity,
+            complete_match=complete_match,
         )
         if budget is None:
             findings.append(finding)

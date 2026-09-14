@@ -43,6 +43,47 @@ class TestExecDetection:
         assert len({finding.fingerprint() for finding in ast1}) == 2
         assert len(deduplicate(ast1)) == 2
 
+    def test_same_match_at_different_columns_groups_distinct_occurrences(self) -> None:
+        findings = _run('exec("same_payload")\nif True:\n    exec("same_payload")\n')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 1
+        assert {finding.start_column for finding in ast1} == {0, 4}
+
+        compacted = deduplicate(ast1)
+        assert len(compacted) == 1
+        assert {
+            (item["start_line"], item["start_column"]) for item in compacted[0].occurrences
+        } == {
+            (1, 0),
+            (3, 4),
+        }
+
+    def test_utf8_ast_columns_are_published_as_character_columns(self) -> None:
+        code = 'label = "🦄"; exec(\n    "payload"\n)\n'
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.matched_text == 'exec(\n    "payload"\n)'
+        assert ast1.start_line == 1
+        assert ast1.start_column == code.index("exec")
+        assert ast1.end_line == 3
+        assert ast1.end_column == 1
+
+    def test_many_same_line_calls_use_preindexed_source_slices(self, monkeypatch) -> None:
+        def fail_full_source_rescan(*_args, **_kwargs):
+            raise AssertionError("ast.get_source_segment must not run per finding")
+
+        monkeypatch.setattr(behavioral_ast.ast, "get_source_segment", fail_full_source_rescan)
+        call_count = 2_000
+        code = "; ".join('exec("payload")' for _ in range(call_count))
+
+        ast1 = [finding for finding in _run(code) if finding.rule_id == "AST1"]
+
+        assert len(ast1) == call_count
+        assert ast1[0].start_column == 0
+        assert ast1[-1].start_column == code.rindex("exec")
+
     def test_exec_produces_ast1(self):
         findings = _run('exec("print(1)")')
         ast1 = [f for f in findings if f.rule_id == "AST1"]

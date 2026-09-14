@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import ast
 import re
+from bisect import bisect_right
+from dataclasses import dataclass, field
 from typing import Any
 
-from skillspector.models import Finding
+from skillspector.models import Finding, Location
 from skillspector.python_ast import build_import_aliases
 
 # Keep the analyzer and runner fence walkers lexically aligned without sharing
@@ -83,6 +85,45 @@ def is_code_example(context: str, *, path: str = "") -> bool:
 def get_line_number(content: str, offset: int) -> int:
     """Return the 1-based line number for a character offset in *content*."""
     return sum(1 for _ in LOGICAL_LINE_BREAK.finditer(content, 0, offset)) + 1
+
+
+def logical_line_starts(content: str) -> tuple[int, ...]:
+    """Return character offsets for every logical line start in *content*."""
+    return (0, *(separator.end() for separator in LOGICAL_LINE_BREAK.finditer(content)))
+
+
+@dataclass(frozen=True)
+class SourceLocationIndex:
+    """Map character offsets to public locations using one shared line index."""
+
+    content: str
+    file_path: str
+    line_starts: tuple[int, ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "line_starts",
+            logical_line_starts(self.content),
+        )
+
+    def line_and_column(self, offset: int) -> tuple[int, int]:
+        """Return a one-based line and zero-based character column."""
+        bounded = min(max(offset, 0), len(self.content))
+        line_index = max(0, bisect_right(self.line_starts, bounded) - 1)
+        return line_index + 1, bounded - self.line_starts[line_index]
+
+    def location(self, start_offset: int, end_offset: int) -> Location:
+        """Build an exact location with zero-based, end-exclusive columns."""
+        start_line, start_column = self.line_and_column(start_offset)
+        end_line, end_column = self.line_and_column(end_offset)
+        return Location(
+            file=self.file_path,
+            start_line=start_line,
+            end_line=end_line,
+            start_column=start_column,
+            end_column=end_column,
+        )
 
 
 def get_context(content: str, match_start: int, context_lines: int = 3) -> str:

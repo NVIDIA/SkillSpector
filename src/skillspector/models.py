@@ -53,6 +53,10 @@ class Location:
     file: str
     start_line: int
     end_line: int | None = None
+    # Columns are zero-based; end_column is exclusive. They remain optional so
+    # producers that only know line-level locations keep their existing shape.
+    start_column: int | None = None
+    end_column: int | None = None
 
 
 _analyzer_finding_observer: ContextVar[Callable[[AnalyzerFinding], None] | None] = ContextVar(
@@ -127,6 +131,8 @@ class Finding:
     file: str = "SKILL.md"
     start_line: int = 1
     end_line: int | None = None
+    start_column: int | None = None
+    end_column: int | None = None
     category: str | None = None
     pattern: str | None = None
     finding: str | None = None  # short matched snippet
@@ -205,6 +211,8 @@ class Finding:
                 "file": self.file,
                 "start_line": self.start_line,
                 "end_line": self.end_line,
+                **({"start_column": self.start_column} if self.start_column is not None else {}),
+                **({"end_column": self.end_column} if self.end_column is not None else {}),
             }
         ]
         serialized: list[dict[str, object]] = []
@@ -234,6 +242,8 @@ class Finding:
                 "file": self.file,
                 "start_line": self.start_line,
                 "end_line": self.end_line,
+                **({"start_column": self.start_column} if self.start_column is not None else {}),
+                **({"end_column": self.end_column} if self.end_column is not None else {}),
             },
             "finding": self.finding,
             "explanation": self.explanation or self.message,
