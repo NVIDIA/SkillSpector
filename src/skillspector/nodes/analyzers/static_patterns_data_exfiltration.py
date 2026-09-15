@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -86,6 +87,20 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
+# Calls that hand an environment mapping to a child process. Materializing
+# ``os.environ`` for one of these is process launching, not harvesting: the child
+# receives the environment the skill already runs in, and no value leaves the host.
+_CHILD_PROCESS_ENV_CALLS = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+    }
+)
 E3_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -179,6 +194,131 @@ def _is_dynamic_copy_call(call: ast.Call, aliases: dict[str, str]) -> bool:
     )
 
 
+# In-place edits of a mapping that keep the values on the host.
+_ENVIRONMENT_MUTATION_METHODS = frozenset({"update", "pop", "popitem", "setdefault", "clear"})
+
+
+@dataclass
+class _EnvironmentBinding:
+    """One name bound to a candidate expression, tracked until the name is rebound."""
+
+    value_id: int
+    reached_child_process: bool = False
+    escaped: bool = False
+
+
+class _EnvironmentFlowVisitor(ast.NodeVisitor):
+    """Decide which environment mappings only ever reach a child-process ``env=``.
+
+    Names are followed in evaluation order (assignment values before their
+    targets) until they are rebound, so a later ``env = {}`` handed to a launcher
+    cannot vouch for an earlier ``env = os.environ.copy()``. A binding passes
+    through only if every use up to the rebinding is a child-process ``env=``
+    argument or an in-place edit of the mapping; any other use keeps the finding.
+    Function parameters rebind their name, but closures reading an outer name
+    still count against it, so a leak from a nested function is not hidden.
+    """
+
+    def __init__(self, tree: ast.AST, aliases: dict[str, str]) -> None:
+        self._env_arguments: set[int] = set()
+        self._mutated_names: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if resolve_call_name(node, aliases) in _CHILD_PROCESS_ENV_CALLS:
+                    self._env_arguments.update(
+                        id(keyword.value) for keyword in node.keywords if keyword.arg == "env"
+                    )
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _ENVIRONMENT_MUTATION_METHODS
+                    and isinstance(node.func.value, ast.Name)
+                ):
+                    self._mutated_names.add(id(node.func.value))
+            elif (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and isinstance(node.value, ast.Name)
+            ):
+                self._mutated_names.add(id(node.value))
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                self._mutated_names.add(id(node.target))
+        self._open: dict[str, _EnvironmentBinding] = {}
+        self._passed_through: set[int] = set()
+        self._escaped: set[int] = set()
+
+    def passthrough_ids(self) -> set[int]:
+        """Ids of expressions whose only destination is a child-process ``env=``."""
+        for name in list(self._open):
+            self._close(name)
+        return (self._passed_through - self._escaped) | self._env_arguments
+
+    def _close(self, name: str) -> None:
+        binding = self._open.pop(name, None)
+        if binding is None:
+            return
+        if binding.escaped:
+            self._escaped.add(binding.value_id)
+        elif binding.reached_child_process:
+            self._passed_through.add(binding.value_id)
+
+    def _bind(self, target: ast.expr, value_id: int) -> None:
+        if isinstance(target, ast.Name):
+            self._close(target.id)
+            self._open[target.id] = _EnvironmentBinding(value_id)
+        else:
+            self.visit(target)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._bind(target, id(node.value))
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is None:
+            return
+        self.visit(node.value)
+        self._bind(node.target, id(node.value))
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self._bind(node.target, id(node.value))
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.value)
+        self.visit(node.target)
+
+    def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
+        self.visit(node.iter)
+        self.visit(node.target)
+        for statement in node.body + node.orelse:
+            self.visit(statement)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+    def visit_comprehension(self, node: ast.comprehension) -> None:
+        self.visit(node.iter)
+        self.visit(node.target)
+        for condition in node.ifs:
+            self.visit(condition)
+
+    def visit_arg(self, node: ast.arg) -> None:
+        self._close(node.arg)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        node_id = id(node)
+        if not isinstance(node.ctx, ast.Load) and node_id not in self._mutated_names:
+            self._close(node.id)
+            return
+        binding = self._open.get(node.id)
+        if binding is None:
+            return
+        if node_id in self._env_arguments:
+            binding.reached_child_process = True
+        elif node_id not in self._mutated_names:
+            binding.escaped = True
+
+
 def _analyze_python_environment_reads(
     content: str,
     file_path: str,
@@ -204,6 +344,9 @@ def _analyze_python_environment_reads(
 
     aliases = python_ast.import_aliases
     lines = python_ast.lines
+    flow = _EnvironmentFlowVisitor(tree, aliases)
+    flow.visit(tree)
+    child_process_passthroughs = flow.passthrough_ids()
     findings: list[AnalyzerFinding] = []
     emitted: set[int] = set()
     tag = [PatternCategory.DATA_EXFILTRATION.value]
@@ -211,6 +354,8 @@ def _analyze_python_environment_reads(
     def emit(node: ast.AST, confidence: float) -> None:
         node_id = id(node)
         if node_id in emitted:
+            return
+        if node_id in child_process_passthroughs:
             return
         emitted.add(node_id)
         lineno = getattr(node, "lineno", 1)
