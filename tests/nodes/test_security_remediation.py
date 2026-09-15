@@ -1309,7 +1309,7 @@ def test_missing_primary_reference_blocks_complete_verdict(tmp_path: Path) -> No
     assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
     assert result["analysis_completeness"]["is_complete"] is False
     assert any(
-        row["reason_code"] == "reference_unresolved"
+        row["reason_code"] == "reference_missing"
         for row in result["analysis_completeness"]["ledger_exceptions"]
     )
     assert result["risk_recommendation"] != "SAFE"
@@ -1333,6 +1333,34 @@ async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: 
     assert verdict["analysis_completeness"]["is_complete"] is False
     assert verdict["recommendation"] != "SAFE"
     assert verdict["safe_to_install"] is True
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_reference_caveat_still_blocks_mcp_install(tmp_path: Path) -> None:
+    """An ambiguous reference is unlike a missing one: it must keep blocking.
+
+    The reference matches more than one bundled artifact, so the scanner has
+    not established which bytes the instruction actually reaches. Unlike the
+    missing-reference caveat above, this must not be exempted from
+    safe_to_install.
+    """
+    (tmp_path / "SKILL.md").write_text(
+        "# Skill\n\nContinue with [the local guide](guide.md).\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("docs guide", encoding="utf-8")
+    (tmp_path / "extra").mkdir()
+    (tmp_path / "extra" / "guide.md").write_text("extra guide", encoding="utf-8")
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert any(
+        row["reason_code"] == "reference_unresolved"
+        for row in verdict["analysis_completeness"]["ledger_exceptions"]
+    )
+    assert verdict["safe_to_install"] is False
 
 
 @pytest.mark.asyncio

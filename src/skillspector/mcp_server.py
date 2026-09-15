@@ -145,16 +145,20 @@ async def run_scan(
         analysis_completeness = result.get("analysis_completeness") or {}
         entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
         partially_inspected = int(analysis_completeness.get("partially_inspected_files", 0))
-        # An unresolved reference names a path the bundle does not carry, such
-        # as a file the skill writes at runtime. Every discovered file is still
+        # A missing reference names a path the bundle does not carry, such as a
+        # file the skill writes at runtime. Every discovered file is still
         # inspected, so on its own it hides no bytes and must not fail this
-        # gate; any other exceptional reason still does.
+        # gate. An *ambiguous* reference (REFERENCE_UNRESOLVED) is different:
+        # it matches more than one bundled artifact, so the scanner has not
+        # established which bytes the instruction actually reaches, and it
+        # must keep blocking safe_to_install like any other exceptional
+        # reason.
         ledger_exceptions = analysis_completeness.get("ledger_exceptions") or []
         reference_caveat_only = (
             bool(ledger_exceptions)
             and not analysis_completeness.get("limitations")
             and all(
-                exception.get("reason_code") == LedgerReason.REFERENCE_UNRESOLVED
+                exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
                 for exception in ledger_exceptions
             )
         )
