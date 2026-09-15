@@ -55,7 +55,7 @@ _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.
 def _write_real_oms_signature(root: Path, relative_path: str = "skill.oms.sig") -> Path:
     target = root / relative_path
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_OMS_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    target.write_bytes(_OMS_FIXTURE.read_bytes())
     return target
 
 
@@ -65,11 +65,14 @@ def _make_skill_spec_dir(root: Path, *, skill_md_name: str = "SKILL.md") -> None
         (root / "SKILL.md").write_text(
             "---\nname: test-skill\ndescription: For tests\ntriggers: [a, b]\npermissions: [read]\n---\n\n# Skill\n",
             encoding="utf-8",
+            newline="\n",
         )
     (root / "references").mkdir(exist_ok=True)
-    (root / "references" / "guide.md").write_text("# Reference guide\n", encoding="utf-8")
+    (root / "references" / "guide.md").write_text(
+        "# Reference guide\n", encoding="utf-8", newline="\n"
+    )
     (root / "scripts").mkdir(exist_ok=True)
-    (root / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8")
+    (root / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8", newline="\n")
     (root / "assets").mkdir(exist_ok=True)
     (root / "assets" / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\n")
     if skill_md_name == "skill.md":
@@ -329,8 +332,8 @@ def test_file_cache_stops_at_progressing_shared_deadline_with_affected_suffix(
     """A deadline reached between files marks the deterministic unread suffix partial."""
     import skillspector.nodes.build_context as build_context_module
 
-    (tmp_path / "first.txt").write_text("first\n", encoding="utf-8")
-    (tmp_path / "second.txt").write_text("second\n", encoding="utf-8")
+    (tmp_path / "first.txt").write_text("first\n", encoding="utf-8", newline="\n")
+    (tmp_path / "second.txt").write_text("second\n", encoding="utf-8", newline="\n")
     clock_values = iter((0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.6))
     monkeypatch.setattr(build_context_module, "monotonic", lambda: next(clock_values))
 
@@ -963,7 +966,7 @@ def test_build_context_reports_exclusion_boundary_without_descendants(tmp_path: 
 def test_build_context_inventories_hidden_file_for_local_analysis(tmp_path: Path) -> None:
     """Hidden regular files stay local and never enter the LLM-visible cache."""
     (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
-    (tmp_path / ".env").write_text("TOKEN=not-reported\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=not-reported\n", encoding="utf-8", newline="\n")
 
     result = build_context({"skill_path": str(tmp_path)})
     assert ".env" in result["components"]
