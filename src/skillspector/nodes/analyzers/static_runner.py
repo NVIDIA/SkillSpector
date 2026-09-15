@@ -113,7 +113,6 @@ _SOURCE_START_EVIDENCE = "_security_source_start"
 _SOURCE_END_EVIDENCE = "_security_source_end"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
 _CONTEXTUAL_TRIAGE_TAG = "contextual-triage"
-_BENIGN_CONTEXT_TAGS = frozenset({_CONTEXTUAL_TRIAGE_TAG, "likely-benign-context"})
 _ActiveSecurityView = tuple[SecurityTextView, str]
 _ACTIVE_SECURITY_VIEW: ContextVar[_ActiveSecurityView | None] = ContextVar(
     "static_runner_active_security_view", default=None
