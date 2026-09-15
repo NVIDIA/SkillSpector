@@ -520,6 +520,11 @@ def _extract_skill_name(skill_dir: Path, *, budget: _DetectionBudget) -> str:
         raise _read_error("multi_skill_manifest_content") from exc
 
     prefix = observed[:MAX_MULTI_SKILL_MANIFEST_FRONTMATTER_BYTES]
+    while prefix.startswith(b"\xef\xbb\xbf"):
+        # Byte-level counterpart to the BOM strip in build_context._parse_manifest:
+        # this sniff runs on raw bytes before decode, so a BOM-prefixed SKILL.md
+        # would otherwise fall through to `fallback` (the directory name) below.
+        prefix = prefix[3:]
     if not prefix.startswith(b"---"):
         return fallback
     content = prefix.decode("utf-8", errors="replace")

@@ -186,7 +186,10 @@ def _frontmatter_bounds(content: str, file_path: str) -> tuple[int, int] | None:
     """Return the YAML-frontmatter byte offsets for a SKILL.md file."""
     if file_path.rsplit("/", 1)[-1].lower() != "skill.md":
         return None
-    opening = re.match(r"\A---[ \t]*\r?\n", content)
+    # A leading BOM is matched here rather than stripped: the offsets this
+    # function returns index the caller's original `content` (line numbers and
+    # context are derived from it), so removing characters would shift them.
+    opening = re.match(r"\A\ufeff*---[ \t]*\r?\n", content)
     if opening is None:
         return None
     closing = re.search(r"^---[ \t]*$", content[opening.end() :], re.MULTILINE)
