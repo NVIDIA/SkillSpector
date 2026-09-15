@@ -22,6 +22,15 @@ def test_context_helpers_bound_long_lines_around_the_finding() -> None:
         assert "MATCH" in context
 
 
+def test_line_context_uses_the_finding_column_on_a_long_line() -> None:
+    lines = ["a" * 1_500 + "MATCH" + "b" * 1_500]
+
+    context = get_context_from_lines(lines, lineno=1, window=0, column=1_500)
+
+    assert len(context) <= 1_000
+    assert "MATCH" in context
+
+
 def test_source_location_index_reuses_logical_line_offsets() -> None:
     content = "alpha\r\nβeta\nlast"
     locations = SourceLocationIndex(content, "SKILL.md")

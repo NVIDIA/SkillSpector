@@ -84,6 +84,17 @@ class TestExecDetection:
         assert ast1[0].start_column == 0
         assert ast1[-1].start_column == code.rindex("exec")
 
+    def test_long_line_context_is_centered_on_the_ast_call(self) -> None:
+        prefix = "value = 0; " * 150
+        code = prefix + 'exec("LATE_AST_PAYLOAD")'
+
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.start_column == len(prefix)
+        assert ast1.context is not None
+        assert len(ast1.context) <= 1_000
+        assert 'exec("LATE_AST_PAYLOAD")' in ast1.context
+
     def test_exec_produces_ast1(self):
         findings = _run('exec("print(1)")')
         ast1 = [f for f in findings if f.rule_id == "AST1"]

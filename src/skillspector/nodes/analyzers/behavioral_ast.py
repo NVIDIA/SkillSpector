@@ -338,13 +338,14 @@ def _analyze_python(
     aliases = python_ast.import_aliases
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
-    contexts: dict[int, str] = {}
+    contexts: dict[tuple[int, int], str] = {}
 
-    def context_for(lineno: int) -> str:
-        context = contexts.get(lineno)
+    def context_for(lineno: int, column: int) -> str:
+        key = (lineno, column)
+        context = contexts.get(key)
         if context is None:
-            context = get_context_from_lines(lines, lineno)
-            contexts[lineno] = context
+            context = get_context_from_lines(lines, lineno, column=column)
+            contexts[key] = context
         return context
 
     def _emit(
@@ -374,7 +375,7 @@ def _analyze_python(
             ),
             confidence=_RULE_CONFIDENCES[rule_id],
             tags=[_TAG],
-            context=context_for(lineno),
+            context=context_for(lineno, start_column),
             matched_text=complete_match[:200],
             complete_match=complete_match,
         )

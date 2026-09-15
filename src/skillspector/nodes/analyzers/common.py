@@ -142,16 +142,46 @@ def get_context(content: str, match_start: int, context_lines: int = 3) -> str:
     return _bounded_context("\n".join(selected_lines), anchor)
 
 
-def get_context_from_lines(lines: list[str], lineno: int, window: int = 3) -> str:
-    """Extract surrounding lines given pre-split *lines* and a 1-based *lineno*."""
+def get_context_from_lines(
+    lines: list[str],
+    lineno: int,
+    window: int = 3,
+    *,
+    column: int = 0,
+) -> str:
+    """Extract bounded context around a 1-based line and character column."""
     start = max(0, lineno - 1 - window)
     end = min(len(lines), lineno + window)
     selected_lines = lines[start:end]
     if not selected_lines:
         return ""
     relative_line = min(max(0, lineno - 1 - start), len(selected_lines) - 1)
-    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line])
-    return _bounded_context("\n".join(selected_lines), anchor)
+    bounded_column = min(max(0, column), len(selected_lines[relative_line]))
+    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line]) + bounded_column
+    context_length = sum(len(line) for line in selected_lines) + len(selected_lines) - 1
+    if context_length <= MAX_FINDING_CONTEXT_CHARS:
+        return "\n".join(selected_lines)
+
+    half_window = MAX_FINDING_CONTEXT_CHARS // 2
+    slice_start = min(
+        max(0, anchor - half_window),
+        context_length - MAX_FINDING_CONTEXT_CHARS,
+    )
+    slice_end = slice_start + MAX_FINDING_CONTEXT_CHARS
+    pieces: list[str] = []
+    offset = 0
+    for index, line in enumerate(selected_lines):
+        line_end = offset + len(line)
+        overlap_start = max(slice_start, offset)
+        overlap_end = min(slice_end, line_end)
+        if overlap_start < overlap_end:
+            pieces.append(line[overlap_start - offset : overlap_end - offset])
+        if index + 1 < len(selected_lines) and slice_start <= line_end < slice_end:
+            pieces.append("\n")
+        offset = line_end + 1
+        if offset >= slice_end:
+            break
+    return "".join(pieces)
 
 
 def _bounded_context(context: str, anchor: int) -> str:

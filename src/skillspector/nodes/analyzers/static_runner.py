@@ -1247,7 +1247,7 @@ def _scan_declared_marker_views(
     check_runtime()
     projection_limited = False
     seen_views: set[tuple[str, int, int]] = set()
-    seen_findings: set[tuple[object, ...]] = set()
+    seen_finding_counts: dict[tuple[object, ...], int] = {}
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
         check_runtime()
@@ -1290,6 +1290,7 @@ def _scan_declared_marker_views(
                 if marker_key in seen_views:
                     continue
                 seen_views.add(marker_key)
+                projection_finding_counts: dict[tuple[object, ...], int] = {}
                 for view in _bounded_view_slices(marker_view):
                     check_runtime()
                     view_budget = _FindingBudget(
@@ -1315,9 +1316,11 @@ def _scan_declared_marker_views(
                     )
                     for finding in view_findings:
                         key = _projection_finding_key(finding)
-                        if key in seen_findings:
+                        projection_count = projection_finding_counts.get(key, 0) + 1
+                        projection_finding_counts[key] = projection_count
+                        if projection_count <= seen_finding_counts.get(key, 0):
                             continue
-                        seen_findings.add(key)
+                        seen_finding_counts[key] = projection_count
                         findings.append(finding)
                         if len(findings) > finding_budget.max_findings:
                             return (
