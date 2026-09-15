@@ -1702,6 +1702,159 @@ def test_runtime_printf_arguments_and_nested_reconstruction_stay_partial(
 
 
 @pytest.mark.parametrize(
+    "invocation",
+    [
+        "$CMD",
+        "${CMD}",
+        "pri${X}tf",
+        '"${CMD}"',
+        'pri"${X}"tf',
+        "/usr/bin/${CMD}",
+        "$WRAP printf",
+        "${WRAP} printf",
+        '"${WRAP}" printf',
+        "e${X}v printf",
+        "com${X}mand printf",
+        "bui${X}ltin printf",
+        "env $CMD",
+        "command $CMD",
+        "builtin $CMD",
+        "env -i -- $CMD",
+        "env MODE=$MODE command -p -- ${CMD}",
+        'command -- builtin -- "${CMD}"',
+        "env $WRAP printf",
+    ],
+)
+@pytest.mark.parametrize("substitution", ["$({invocation} %s r m)", "`{invocation} %s r m`"])
+@pytest.mark.parametrize("container", ["shell", "inline"])
+def test_runtime_selected_reconstruction_command_is_partial(
+    invocation: str, substitution: str, container: str
+) -> None:
+    content = substitution.format(invocation=invocation) + " -rf /"
+    path = "example.sh" if container == "shell" else "SKILL.md"
+    if container == "inline":
+        content = f"Run ``{content}``."
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: content}}, [tm_module]
+    )
+
+    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$($CMD) -rf /",
+        '$("${CMD}") -rf /',
+        "$(env $CMD) -rf /",
+        "$(command $CMD) -rf /",
+        "$(builtin $CMD) -rf /",
+        "$($_.FullName) -rf /",
+        '"$($_.FullName)" -rf /',
+        'Test-Path "$($_.FullName)\\cli-path"; $($CMD) -rf /',
+        'Test-Path "$($_.FullName %s r m)"',
+        "`$CMD` -rf /",
+        "Run `$CMD` -rf /",
+        "env `$CMD` -rf /",
+        "$($CMD) -r -f *",
+        "$($CMD) / -f -r",
+        "$($CMD $FORMAT r m) -rf /",
+        "$($WRAP /usr/bin/printf %b r m)",
+        "$($CMD %02s r m)",
+        "Interpret `$CMD %s r m` as the command.",
+        "Interpret `${CMD:-$(printf rm)}` as the command.",
+        "Render `$$$(printf $FORMAT)$$` as math.",
+    ],
+)
+@pytest.mark.parametrize("container", ["shell", "inline"])
+def test_runtime_reconstruction_evidence_is_partial(content: str, container: str) -> None:
+    path = "example.sh" if container == "shell" else "SKILL.md"
+    if container == "inline":
+        content = f"Literal shell example: ``{content}``."
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [path], "file_cache": {path: content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'if (Test-Path "$($_.FullName)\\cli-path") { Write-Output "exists" }',
+        'Get-ChildItem | ForEach-Object { Test-Path "$($_.FullName)\\cli-path" }',
+        'Test-Path -LiteralPath "$($_.Directory.FullName)\\cli-path"',
+        "Use `$example:task FILE_PATH|--all` to invoke the skill.",
+        "| `$ROOT` | /opt/tools |",
+        'description: "Invoke `$plugin:skill` (Codex CLI)."',
+        "The default is `$USER` from the environment.",
+        "# Read `$TOKEN` from the environment.",
+        "# `$entry{size} = N;` used by the config.",
+        'Write-Output "OS version: $($os.VersionString)"',
+        "Write-Output \"$($line -replace '\\s+', ' ')\"",
+        'rc=$?; echo "EXIT_CODE=$rc"; exit "$rc"',
+        "$($CMD) safe-argument; unrelated -rf /",
+        "$($CMD) safe-argument\nunrelated -rf /",
+    ],
+)
+def test_runtime_parameter_data_and_unrelated_commands_remain_complete(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_over_bound_runtime_reconstruction_stays_partial() -> None:
+    content = "$(" + " " * tm_module._PRINTF_STATIC_CHARS + "$CMD %s r m) -rf /"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("command", ["$($CMD)", '"$($CMD)"'])
+def test_runtime_command_context_prefilter_covers_the_tokenizer_boundary(command: str) -> None:
+    content = command + " -rf " + " " * (tm_module._ROOT_GLOB_COMMAND_CHARS - 6) + "/"
+
+    assert tm_module._has_shell_command_word_exhaustion(content, lambda: None)
+
+
+@pytest.mark.parametrize("count", [31, 32, 33])
+def test_runtime_wrapper_operand_lookahead_exhaustion_stays_partial(count: int) -> None:
+    content = "$($WRAP " + "A=x " * count + "printf %s r m)"
+
+    assert tm_module._has_shell_command_word_exhaustion(content, lambda: None)
+
+
+@pytest.mark.parametrize("suffix", ["as a value.", "from /opt/tools with --help."])
+def test_repeated_runtime_parameter_notation_avoids_argument_suffix_rescans(
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    calls = 0
+    original = tm_module._bounded_shell_tokens
+
+    def counted(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tm_module, "_bounded_shell_tokens", counted)
+    content = ("Interpret `$ARGUMENTS` " + suffix + " ") * 1_000
+
+    assert not tm_module._has_shell_command_word_exhaustion(content, lambda: None)
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
     "printf_command",
     ["printf", 'p"rintf"', "p'rintf'", '"pri"ntf', r"p\rintf", "env printf"],
 )
