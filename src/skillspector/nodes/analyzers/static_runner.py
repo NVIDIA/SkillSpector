@@ -454,6 +454,11 @@ def _uses_python_ast(module: object) -> bool:
     return getattr(module, "USES_PYTHON_AST", False) is True
 
 
+def _uses_runtime_check(module: object) -> bool:
+    """Return whether a pattern module accepts the runner-owned deadline hook."""
+    return getattr(module, "USES_RUNTIME_CHECK", False) is True
+
+
 class _StaticResourceLimitError(RuntimeError):
     """Internal control-flow signal for one attacker-controlled work ceiling."""
 
@@ -623,15 +628,16 @@ def _scan_path(
         finding_budget.begin_module()
         try:
             with observe_analyzer_findings(finding_budget.observe_creation):
+                analyze_kwargs: dict[str, object] = {
+                    "content": content,
+                    "file_path": path,
+                    "file_type": file_type,
+                }
                 if file_type == "python" and _uses_python_ast(module):
-                    raw = module.analyze(
-                        content=content,
-                        file_path=path,
-                        file_type=file_type,
-                        python_ast=python_ast,
-                    )
-                else:
-                    raw = module.analyze(content=content, file_path=path, file_type=file_type)
+                    analyze_kwargs["python_ast"] = python_ast
+                if _uses_runtime_check(module):
+                    analyze_kwargs["check_runtime"] = finding_budget.check_runtime
+                raw = module.analyze(**analyze_kwargs)
                 finding_budget.check_runtime()
                 for af in raw:
                     finding_budget.observe_emission()
