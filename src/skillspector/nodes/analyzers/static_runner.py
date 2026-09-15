@@ -442,7 +442,7 @@ def analyzer_finding_to_finding(
         category=category,
         pattern=pattern,
         finding=finding_snippet,
-        explanation=get_explanation(af.rule_id),
+        explanation=af.explanation or get_explanation(af.rule_id),
         code_snippet=af.context,
         intent=None,
         evidence=dict(af.evidence),
@@ -760,6 +760,7 @@ def _scan_view_windows(
         python_ast_cache_key,
     )
     for finding in findings:
+        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
             finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
@@ -1021,8 +1022,12 @@ def _restore_source_lines(
         return window_line + sum(1 for _ in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_offset))
 
     for finding in findings:
-        derived_start = _line_start_offset(view.text, finding.start_line)
-        raw_start = view.source_offset(derived_start)
+        source_start = finding.evidence.get(_SOURCE_START_EVIDENCE)
+        if isinstance(source_start, int):
+            raw_start = source_start
+        else:
+            derived_start = _line_start_offset(view.text, finding.start_line)
+            raw_start = view.source_offset(derived_start)
         finding.start_line = source_line(raw_start)
         if finding.end_line is not None:
             derived_end = _line_start_offset(view.text, finding.end_line)

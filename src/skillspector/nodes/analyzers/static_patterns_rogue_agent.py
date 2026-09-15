@@ -26,18 +26,20 @@ from __future__ import annotations
 
 import re
 import sys
+from bisect import bisect_right
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_rogue_agent"
+_SECURITY_VIEW_START_EVIDENCE = "_security_view_start"
 
 # RA1: Self-Modification — skill modifies its own code, config, or behavior
 RA1_PATTERNS = [
@@ -82,6 +84,69 @@ RA1_PATTERNS = [
         0.7,
     ),
 ]
+
+_VERIFY_SIGNATURE_FLAG = re.compile(
+    r"--verify-signature(?:=(?P<value>1|on|true|yes))?",
+    re.IGNORECASE,
+)
+_DISABLE_SIGNATURE_VERIFICATION = re.compile(
+    r"(?<!\S)--no-verify-signature(?=\s|$)"
+    r"|(?<!\S)--verify-signature(?:=|\s+)(?:0|false|no|off)(?=\s|$)",
+    re.IGNORECASE,
+)
+_SIGNED_CLI_RELEASE = re.compile(r"\bsigned\s+(?:cli\s+)?release\b", re.IGNORECASE)
+_SIGNED_CLI_RELEASE_NEGATION = re.compile(
+    r"\b(?:not|without)\s+(?:an?\s+)?signed\s+(?:cli\s+)?release\b|"
+    r"\bexcept\s+(?:for\s+)?(?:an?\s+)?signed\s+(?:cli\s+)?release\b|"
+    r"\b(?:never|do\s+not|don't)\b[^\n]{0,40}\bsigned\s+(?:cli\s+)?release\b",
+    re.IGNORECASE,
+)
+_SHELL_COMMAND_COMPOSITION = re.compile(r"(?:&&|\|\||[;&|#<>]|\$\(|<\(|>\()")
+_COMPANION_CLI_BEFORE_SELF_UPDATE = re.compile(
+    r"(?<![\w.-])(?P<cli>[a-z0-9][\w.-]{1,63})\s+$",
+    re.IGNORECASE,
+)
+_NON_COMPANION_UPDATE_SUBJECTS = frozenset(
+    {
+        "agent",
+        "assistant",
+        "bash",
+        "cli",
+        "cmd",
+        "command",
+        "env",
+        "exec",
+        "fish",
+        "itself",
+        "node",
+        "perl",
+        "powershell",
+        "pwsh",
+        "python",
+        "ruby",
+        "self",
+        "sh",
+        "skill",
+        "skillspector",
+        "sudo",
+        "tool",
+        "zsh",
+    }
+)
+_CLI_EXECUTABLE_EXTENSIONS = (
+    ".exe",
+    ".cmd",
+    ".bat",
+    ".com",
+    ".ps1",
+    ".sh",
+    ".py",
+    ".pyw",
+    ".js",
+    ".mjs",
+    ".cjs",
+)
+_CLI_ROLE_SUFFIXES = ("-cli", "_cli", ".cli", "cli", "-ctl", "_ctl", ".ctl", "ctl")
 
 # RA2: Session Persistence — unauthorized persistence across boundaries
 RA2_PATTERNS = [
@@ -144,6 +209,7 @@ RA2_PATTERNS = [
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for rogue agent patterns (RA1–RA2)."""
     findings: list[AnalyzerFinding] = []
+    line_starts, line_ends = _logical_line_metadata(content)
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -157,18 +223,46 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context = ctx(match.start())
-            if _is_negated_safety_constraint(content, match):
+            if _is_negated_safety_constraint(content, match, line_starts, line_ends):
                 continue
+            companion_update = _is_signed_companion_cli_update(
+                content,
+                match,
+                file_type,
+                line_starts,
+                line_ends,
+            )
+            finding_tags = list(tag)
+            if companion_update:
+                finding_tags.extend(["contextual-triage", "likely-benign-context"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="RA1",
-                    message="Self-Modification",
-                    severity=Severity.HIGH,
+                    message=(
+                        "Signed Companion CLI Update" if companion_update else "Self-Modification"
+                    ),
+                    severity=Severity.LOW if companion_update else Severity.HIGH,
                     location=loc(line_num),
-                    confidence=confidence,
-                    tags=tag,
+                    confidence=min(confidence, 0.15) if companion_update else confidence,
+                    remediation=(
+                        "No skill self-modification change is indicated by this match. Keep "
+                        "signature verification mandatory and identify the companion CLI "
+                        "explicitly."
+                        if companion_update
+                        else None
+                    ),
+                    explanation=(
+                        "The matched phrase is a signed self-update subcommand for a documented "
+                        "companion CLI; it does not direct the skill or agent to rewrite itself."
+                        if companion_update
+                        else None
+                    ),
+                    tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
+                    evidence=(
+                        {_SECURITY_VIEW_START_EVIDENCE: match.start()} if companion_update else {}
+                    ),
                 )
             )
     for pattern, confidence in RA2_PATTERNS:
@@ -189,12 +283,117 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
-def _is_negated_safety_constraint(content: str, match: re.Match[str]) -> bool:
+def _is_signed_companion_cli_update(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Identify a signed update subcommand whose subject is another CLI."""
+    if file_type not in {"markdown", "text"} or match.group(0).lower() != "self-update":
+        return False
+
+    line_start, line_end = _logical_line_bounds(
+        content,
+        match.start(),
+        line_starts,
+        line_ends,
+    )
+    line = content[line_start:line_end]
+    if line.count("`") != 2:
+        return False
+    local_start = match.start() - line_start
+    local_end = match.end() - line_start
+    code_start = line.rfind("`", 0, local_start)
+    code_end = line.find("`", local_end)
+    if code_start == -1 or code_end == -1:
+        return False
+    command = line[code_start + 1 : code_end]
+    if _SHELL_COMMAND_COMPOSITION.search(command):
+        return False
+    command_match_start = local_start - code_start - 1
+    command_match_end = local_end - code_start - 1
+    cli_match = _COMPANION_CLI_BEFORE_SELF_UPDATE.fullmatch(command[:command_match_start])
+    if cli_match is None:
+        return False
+    cli_subject = cli_match.group("cli").lower()
+    cli_stem = _normalized_cli_subject_stem(cli_subject)
+    if (
+        cli_subject in _NON_COMPANION_UPDATE_SUBJECTS
+        or cli_stem in _NON_COMPANION_UPDATE_SUBJECTS
+        or cli_stem.startswith("python")
+    ):
+        return False
+    if _DISABLE_SIGNATURE_VERIFICATION.search(command):
+        return False
+    flag = _VERIFY_SIGNATURE_FLAG.fullmatch(command[command_match_end:].strip())
+    if flag is None:
+        return False
+    flag_value = (flag.group("value") or "true").lower()
+    return (
+        flag_value in {"1", "on", "true", "yes"}
+        and _SIGNED_CLI_RELEASE.search(line) is not None
+        and _SIGNED_CLI_RELEASE_NEGATION.search(line) is None
+    )
+
+
+def _normalized_cli_subject_stem(subject: str) -> str:
+    """Normalize executable and CLI-role affixes before protected-subject checks."""
+    stem = subject.casefold()
+    changed = True
+    while changed:
+        changed = False
+        for extension in _CLI_EXECUTABLE_EXTENSIONS:
+            if stem.endswith(extension):
+                stem = stem[: -len(extension)]
+                changed = True
+                break
+        for suffix in _CLI_ROLE_SUFFIXES:
+            if len(stem) > len(suffix) and stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                changed = True
+                break
+    return re.sub(r"[-_.]", "", stem)
+
+
+def _logical_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Index the repository's complete set of logical line breaks once."""
+    starts = [0]
+    ends: list[int] = []
+    for separator in LOGICAL_LINE_BREAK.finditer(content):
+        ends.append(separator.start())
+        starts.append(separator.end())
+    ends.append(len(content))
+    return tuple(starts), tuple(ends)
+
+
+def _logical_line_bounds(
+    content: str,
+    start: int,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> tuple[int, int]:
+    """Return source-line bounds without joining evidence across separators."""
+    if line_starts is None or line_ends is None:
+        line_starts, line_ends = _logical_line_metadata(content)
+    line_index = bisect_right(line_starts, start) - 1
+    return line_starts[line_index], line_ends[line_index]
+
+
+def _is_negated_safety_constraint(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
     """Return True when an RA1 phrase is explicitly forbidden in policy prose."""
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(content)
+    line_start, line_end = _logical_line_bounds(
+        content,
+        match.start(),
+        line_starts,
+        line_ends,
+    )
     line = content[line_start:line_end]
     local_start = match.start() - line_start
     phrase = line[local_start : local_start + len(match.group(0))]

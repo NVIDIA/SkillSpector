@@ -172,12 +172,28 @@ _PE3_TOKEN_ACTION_CONTEXT = re.compile(
     r"harvest(?:s|ed|ing)?|scrap(?:e|es|ed|ing)|upload(?:s|ed|ing)?|"
     r"transmit(?:s|ted|ting)?|send(?:s|ing)?|sent|cop(?:y|ies|ied|ying)|"
     r"extract(?:s|ed|ing|ion)?|forward(?:s|ed|ing)?|leak(?:s|ed|ing)?|"
-    r"share(?:s|d|ing)?|expose(?:s|d|ing)?)\b"
+    r"share(?:s|d|ing)?|expose(?:s|d|ing)?|log(?:s|ged|ging)?|"
+    r"print(?:s|ed|ing)?|write(?:s|written|writing)?|publish(?:es|ed|ing)?|"
+    r"display(?:s|ed|ing)?|giv(?:e|es|ing|en)|reveal(?:s|ed|ing)?|"
+    r"email(?:s|ed|ing)?|include(?:s|d|ing)?)\b"
     r"|\bpost(?:s|ed|ing)?\b[^\n]{0,80}"
     r"\b(?:it|them|(?:the\s+)?(?:access|refresh|bearer|api)[ _-]?tokens?)\b"
     r"[^\n]{0,40}\bto\b"
     r"|\b(?:read(?:s|ing)?|open(?:s|ed|ing)?|load(?:s|ed|ing)?)\b[^\n]{0,80}"
     r"\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
+    re.IGNORECASE,
+)
+_PE3_BOUND_TOKEN_TRANSFER = re.compile(
+    r"\b(?:past(?:e|es|ed|ing)|submit(?:s|ted|ting)?|attach(?:es|ed|ing)?|"
+    r"relay(?:s|ed|ing)?|deliver(?:s|ed|ing)?|put(?:s|ting)?|"
+    r"pass(?:es|ed|ing)?|enter(?:s|ed|ing)?|insert(?:s|ed|ing)?|"
+    r"post(?:s|ed|ing)?)\b"
+    r"[\s`'\"-]{0,24}"
+    r"(?:it|them|(?:(?:the|this|that|these|those|returned|resulting|oauth|oidc|"
+    r"access|refresh|bearer|api)\s+){0,5}tokens?|"
+    r"(?:(?:this|that|the\s+(?:returned|resulting))\s+value))\b"
+    r"[^.!?;\r\n\v\f\x1c-\x1e\x85\u2028\u2029]{0,96}?"
+    r"\b(?:to|into|onto|through|via|in|on|with|as)\b(?=\s+\S)",
     re.IGNORECASE,
 )
 _PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
@@ -201,6 +217,41 @@ _PE3_ACCESS_TOKEN_NOUN_SUFFIX = re.compile(
     r"\s*(?:$|[|,.;:)]|(?:are|were|is|was|expire\w*|remain\w*|contain\w*|"
     r"include\w*|provide\w*|represent\w*|identify\w*|authenticate\w*|authorize\w*|"
     r"issued|returned|accepted|rejected|revoked|stored|used|tied|associated)\b)",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_PROTOCOL_CONTEXT = re.compile(
+    r"\b(?:oauth(?:\s*2(?:\.\d+)?)?|openid\s+connect|oidc|authorization\s+code|"
+    r"refresh[ _-]?tokens?|bearer[ _-]?tokens?)\b",
+    re.IGNORECASE,
+)
+_PE3_COMPANION_CLI_CONTEXT = re.compile(
+    r"\b(?:companion\s+cli|command[- ]line\s+(?:client|tool)|cli(?:'s)?|"
+    r"[a-z][\w.-]*(?:ctl|-cli)(?:'s)?)\b",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_RESULT_CONTEXT = re.compile(
+    r"\b(?P<verb>return(?:s|ed)?|issu(?:e|es|ed)|provid(?:e|es|ed)|yield(?:s|ed)?)"
+    r"\s+(?:an?|the)\s+(?:(?:oauth|oidc|bearer|short-lived|"
+    r"temporary|new|provider-specific)\s+){0,3}$",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_OWNER_BRIDGE = re.compile(
+    r"^(?:['’]s)?(?:\s+(?:sign[- ]?in|login|flow|authentication|authorization|"
+    r"token|code|exchange|command|client|process|request|operation|helper)){0,4}\s*$",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_CAUSATIVE_PREFIX = re.compile(
+    r"\b(?:have|has|had|make|makes|made|let|lets|cause|causes|caused|"
+    r"force|forces|forced|ask|asks|asked|tell|tells|told|instruct|instructs|"
+    r"instructed|get|gets|got|request|requests|require|requires|command|commands|"
+    r"direct|directs|order|orders|prompt|prompts|ensure|confirm|verify|check|"
+    r"configure|use|please|must|should|shall|need|needs|can|could|may|will|would)\b",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_BARE_RESULT_VERBS = frozenset({"return", "issue", "provide", "yield"})
+_PE3_OAUTH_RESULT_SUFFIX = re.compile(
+    r"\s*(?:and\s+(?:an?\s+|the\s+)?(?:short-lived\s+)?refresh[ _-]?token)?"
+    r"\s*[`'\".,;:)]*\s*$",
     re.IGNORECASE,
 )
 _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
@@ -252,6 +303,37 @@ def _source_line(
     """Return only the source line containing *match*."""
     line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
     return content[line_start:line_end]
+
+
+def _has_bound_token_transfer(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Return whether a transfer instruction is bound to this token.
+
+    The generic PE3 action veto intentionally fails closed on established
+    credential verbs. The additional natural-language transfer verbs here are
+    common in unrelated documentation, so require both a token/anaphoric
+    recipient and a destination rather than treating any nearby ``paste`` or
+    ``attach`` as credential access.
+    """
+    if line_starts is None or line_ends is None:
+        line_starts, line_ends = _source_line_metadata(content)
+    line_index = bisect_right(line_starts, match.start()) - 1
+    window_end = line_ends[min(line_index + 3, len(line_ends) - 1)]
+    window_start = line_starts[line_index]
+    window = content[window_start:window_end]
+    match_start = match.start() - window_start
+    match_end = match.end() - window_start
+    for transfer in _PE3_BOUND_TOKEN_TRANSFER.finditer(window):
+        # Direct instructions contain this exact token match. Anaphoric
+        # instructions ("Paste it ...") must follow it in the same bounded
+        # context window.
+        if transfer.start() <= match_start < transfer.end() or transfer.start() >= match_end:
+            return True
+    return False
 
 
 _PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
@@ -430,27 +512,36 @@ def _is_access_token_documentation_noun(
     "access tokens" from the OAuth compound noun "access token". A bare
     singular match is necessarily noun-shaped: the verb form requires a
     determiner (for example, "access the token"). Plural matches remain
-    ambiguous, so suppress them only when they are not governed by an
-    imperative/modal prefix, or when a line-leading match has noun syntax.
+    ambiguous, so classify them as documentation only when they are not
+    governed by an imperative/modal prefix, or when a line-leading match has
+    noun syntax.
 
     Any credential action or sensitive source in the bounded context vetoes
-    suppression. This keeps malicious instructions actionable even when they
-    are placed in documentation or next to otherwise benign OAuth prose.
+    that classification. This keeps malicious instructions actionable even
+    when they are placed in documentation or next to otherwise benign OAuth
+    prose.
     """
     if file_type not in {"markdown", "text"}:
-        return False
-    normalized_parts = file_path.replace("\\", "/").lower().split("/")
-    if not any(part in _PE3_TOKEN_DOCUMENTATION_DIRS for part in normalized_parts):
         return False
     matched_text = match.group(0).lower()
     if matched_text not in {"access token", "access tokens"}:
         return False
 
+    line = _source_line(content, match, line_starts, line_ends)
+    normalized_parts = file_path.replace("\\", "/").lower().split("/")
+    in_documentation_directory = any(
+        part in _PE3_TOKEN_DOCUMENTATION_DIRS for part in normalized_parts
+    )
+    if not in_documentation_directory:
+        return False
     context = get_context(content, match.start())
-    if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
+    if (
+        _PE3_TOKEN_ACTION_CONTEXT.search(context)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(context)
+        or _has_bound_token_transfer(content, match, line_starts, line_ends)
+    ):
         return False
 
-    line = _source_line(content, match, line_starts, line_ends)
     line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
     relative_start = match.start() - line_start
     relative_end = match.end() - line_start
@@ -469,6 +560,45 @@ def _is_access_token_documentation_noun(
     if not clause_prefix.strip():
         return _PE3_ACCESS_TOKEN_NOUN_SUFFIX.match(suffix) is not None
     return True
+
+
+def _is_companion_cli_oauth_result_noun(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Recognize one directly owned singular OAuth result in CLI documentation."""
+    if file_type not in {"markdown", "text"} or match.group(0).lower() != "access token":
+        return False
+    line = _source_line(content, match, line_starts, line_ends)
+    line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
+    prefix = line[: match.start() - line_start]
+    clause_prefix = prefix[max(prefix.rfind(mark) for mark in ".;:|") + 1 :]
+    cli_context = _PE3_COMPANION_CLI_CONTEXT.search(clause_prefix)
+    oauth_context = _PE3_OAUTH_PROTOCOL_CONTEXT.search(clause_prefix)
+    result_context = _PE3_OAUTH_RESULT_CONTEXT.search(clause_prefix)
+    if cli_context is None or oauth_context is None or result_context is None:
+        return False
+    owner_end = max(cli_context.end(), oauth_context.end())
+    owner_bridge = clause_prefix[owner_end : result_context.start()]
+    suffix = line[match.end() - line_start :]
+    cli_prefix = clause_prefix[: cli_context.start()]
+    if (
+        result_context.start() < owner_end
+        or _PE3_OAUTH_CAUSATIVE_PREFIX.search(cli_prefix) is not None
+        or result_context.group("verb").lower() in _PE3_OAUTH_BARE_RESULT_VERBS
+        or _PE3_OAUTH_OWNER_BRIDGE.fullmatch(owner_bridge) is None
+        or _PE3_OAUTH_RESULT_SUFFIX.fullmatch(suffix) is None
+    ):
+        return False
+    context = get_context(content, match.start())
+    return not (
+        _PE3_TOKEN_ACTION_CONTEXT.search(context)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(context)
+        or _has_bound_token_transfer(content, match, line_starts, line_ends)
+    )
 
 
 def _is_qualified_benign_access_requirement(
@@ -557,11 +687,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 continue
             line_num = bisect_right(line_starts, match.start())
             context = get_context(content, match.start())
+            token_documentation = _is_pe3_documentation_example(
+                content, match, file_type, file_path, line_starts, line_ends
+            )
+            companion_oauth_result = _is_companion_cli_oauth_result_noun(
+                content, match, file_type, line_starts, line_ends
+            )
             contextual = any(
                 (
-                    _is_pe3_documentation_example(
-                        content, match, file_type, file_path, line_starts, line_ends
-                    ),
+                    token_documentation,
+                    companion_oauth_result,
                     _is_qualified_benign_access_requirement(
                         content, match, file_type, line_starts, line_ends
                     ),
@@ -572,13 +707,37 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             finding_tags = list(tag)
             if contextual:
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
+            token_explanation = None
+            if companion_oauth_result:
+                if _PE3_OAUTH_PROTOCOL_CONTEXT.search(context):
+                    token_explanation = (
+                        "The matched phrase names an OAuth access-token value in documentation; "
+                        "no instruction to read, copy, or transmit stored credentials was matched."
+                    )
+                else:
+                    token_explanation = (
+                        "The matched phrase is an access-token label in documentation; no "
+                        "instruction to read, copy, or transmit stored credentials was matched."
+                    )
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
-                    message="Credential Access",
-                    severity=Severity.HIGH,
+                    message=(
+                        "OAuth Token Documentation"
+                        if companion_oauth_result
+                        else "Credential Access"
+                    ),
+                    severity=Severity.LOW if companion_oauth_result else Severity.HIGH,
                     location=loc(line_num),
-                    confidence=confidence,
+                    confidence=min(confidence, 0.15) if companion_oauth_result else confidence,
+                    remediation=(
+                        "No credential-access change is indicated by this match. Keep the OAuth "
+                        "flow and token scope explicit, and review separately if the skill reads "
+                        "or transmits stored tokens."
+                        if companion_oauth_result
+                        else None
+                    ),
+                    explanation=token_explanation,
                     tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],

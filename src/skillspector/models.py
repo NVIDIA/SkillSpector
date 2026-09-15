@@ -72,6 +72,7 @@ class AnalyzerFinding:
     context: str | None = None
     matched_text: str | None = None
     evidence: dict[str, object] = field(default_factory=dict)
+    explanation: str | None = None
 
     def __post_init__(self) -> None:
         """Notify an optional runner-owned resource guard after construction.
