@@ -8,12 +8,14 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
+from bisect import bisect_right
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from skillspector.artifacts import (
     ContentKind,
+    SecurityTextView,
     _concealed_instruction_run_spans,
     _contextual_default_ignorable_boundary_spans,
     _obfuscated_instruction_matches,
@@ -87,6 +89,7 @@ _LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
     }
 )
 _MAX_AMBIGUOUS_PROMPT_PHRASE = 512
+_MAX_IRREGULAR_SPACING_FRAGMENT_GAP = 2
 _IDENTIFIER_RELAXATION = str.maketrans({"_": " ", **{str(value): " " for value in range(10)}})
 _PROJECTED_PROMPT_PATTERNS = tuple(
     pattern for pattern, _confidence in (*COMPILED_P3_PATTERNS, *COMPILED_P4_PATTERNS)
@@ -667,7 +670,74 @@ def _projected_prompt_injection_line(
             source_offset = reconstructed_gaps[0][0]
             if first_offset is None or source_offset < first_offset:
                 first_offset = source_offset
+
+    irregular_projection = _irregular_spacing_prompt_projection(view)
+    if irregular_projection is not None:
+        irregular_text, join_points = irregular_projection
+        relaxed_irregular_text = irregular_text.translate(_IDENTIFIER_RELAXATION)
+        irregular_texts = (
+            (irregular_text, relaxed_irregular_text)
+            if relaxed_irregular_text != irregular_text
+            else (irregular_text,)
+        )
+        candidate_offsets = tuple(point[0] for point in join_points)
+        for projected_text in irregular_texts:
+            for pattern in _PROJECTED_PROMPT_PATTERNS:
+                budget.check_runtime()
+                for match in pattern.finditer(projected_text):
+                    budget.check_runtime()
+                    point_index = bisect_right(candidate_offsets, match.start())
+                    if (
+                        point_index >= len(join_points)
+                        or join_points[point_index][0] >= match.end()
+                    ):
+                        continue
+                    source_offset = join_points[point_index][1]
+                    if first_offset is None or source_offset < first_offset:
+                        first_offset = source_offset
     return get_line_number(content, first_offset) if first_offset is not None else None
+
+
+def _irregular_spacing_prompt_projection(
+    view: SecurityTextView,
+) -> tuple[str, tuple[tuple[int, int], ...]] | None:
+    """Join only short gaps that split adjacent reconstructed fragments.
+
+    The primary projection preserves a width change because fully letter-spaced
+    phrases use wider gaps as explicit word boundaries. An alternating one/two
+    character gap can therefore split a short action into two reconstructed
+    fragments. Joining only short gaps *between* those proven fragments creates
+    a fail-closed AE6 view without erasing the wider observed word boundaries.
+    """
+    if view.source_offsets is None or len(view.reconstructions) < 2:
+        return None
+
+    removable_gaps: list[tuple[int, int]] = []
+    for left, right in zip(view.reconstructions, view.reconstructions[1:], strict=False):
+        gap_start = left.derived_end
+        gap_end = right.derived_start
+        gap = view.text[gap_start:gap_end]
+        if (
+            0 < len(gap) <= _MAX_IRREGULAR_SPACING_FRAGMENT_GAP
+            and gap.isspace()
+            and not any(character in LINE_BREAK_CHARS for character in gap)
+        ):
+            removable_gaps.append((gap_start, gap_end))
+    if not removable_gaps:
+        return None
+
+    parts: list[str] = []
+    join_points: list[tuple[int, int]] = []
+    cursor = 0
+    projected_length = 0
+    for gap_start, gap_end in removable_gaps:
+        part = view.text[cursor:gap_start]
+        parts.append(part)
+        projected_length += len(part)
+        join_points.append((projected_length, view.source_offset(gap_start)))
+        cursor = gap_end
+    parts.append(view.text[cursor:])
+    return "".join(parts), tuple(join_points)
 
 
 def _text_signals(
