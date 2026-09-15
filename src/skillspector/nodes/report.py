@@ -453,19 +453,17 @@ def _compute_risk_score(
     to [0, 1]). Findings with confidence <= 0 are skipped entirely — they do not
     contribute to the score but remain in the reported findings list.
 
-    Within each rule_id bucket, findings are processed in severity-descending
-    order so that the highest-severity occurrence always receives the full weight.
+    Within each rule_id bucket, findings are processed by their unweighted score
+    contribution (severity points x confidence x executable multiplier). This gives
+    the strongest evidence the largest diminishing-return weight, makes the score
+    independent of analyzer output order, and ensures adding non-negative evidence
+    cannot lower the score by displacing a stronger occurrence.
 
     Base points per severity: CRITICAL=50, HIGH=25, MEDIUM=10, LOW=5.
     1.3x multiplier applied only to findings from executable script files;
     findings from documentation files (markdown, text, json, yaml, toml)
     are scored at base weight to avoid punishing security documentation.
     """
-    severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    sorted_findings = sorted(
-        findings,
-        key=lambda f: (f.rule_id or "UNKNOWN", severity_rank.get((f.severity or "LOW").upper(), 4)),
-    )
 
     def component_source_scope(component: Mapping[str, object]) -> str:
         for key in ("source_identity", "source_url", "source_digest"):
@@ -490,6 +488,24 @@ def _compute_risk_score(
             file_executable[(component_source_scope(cm), str(cm.get("path", "")))] = bool(
                 cm.get("executable", False)
             )
+
+    def finding_strength(finding: Finding) -> float:
+        confidence = max(0.0, min(1.0, finding.confidence))
+        severity = (finding.severity or "LOW").upper()
+        strength = _SEVERITY_POINTS.get(severity, 5) * confidence
+        if has_executable_scripts and file_executable.get(
+            (finding_source_scope(finding), finding.file), False
+        ):
+            strength *= 1.3
+        return strength
+
+    sorted_findings = sorted(
+        findings,
+        key=lambda f: (
+            f.rule_id or "UNKNOWN",
+            -finding_strength(f),
+        ),
+    )
 
     rule_occurrence_count: dict[str, int] = {}
     score = 0.0
