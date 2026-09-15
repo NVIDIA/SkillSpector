@@ -175,7 +175,9 @@ _PE3_TOKEN_ACTION_CONTEXT = re.compile(
     r"share(?:s|d|ing)?|expose(?:s|d|ing)?|log(?:s|ged|ging)?|"
     r"print(?:s|ed|ing)?|write(?:s|written|writing)?|publish(?:es|ed|ing)?|"
     r"display(?:s|ed|ing)?|giv(?:e|es|ing|en)|reveal(?:s|ed|ing)?|"
-    r"email(?:s|ed|ing)?|include(?:s|d|ing)?)\b"
+    r"email(?:s|ed|ing)?|include(?:s|d|ing)?|past(?:e|es|ed|ing)|"
+    r"submit(?:s|ted|ting)?|attach(?:es|ed|ing)?|relay(?:s|ed|ing)?|"
+    r"deliver(?:s|ed|ing)?)\b"
     r"|\bpost(?:s|ed|ing)?\b[^\n]{0,80}"
     r"\b(?:it|them|(?:the\s+)?(?:access|refresh|bearer|api)[ _-]?tokens?)\b"
     r"[^\n]{0,40}\bto\b"
@@ -217,7 +219,7 @@ _PE3_COMPANION_CLI_CONTEXT = re.compile(
     re.IGNORECASE,
 )
 _PE3_OAUTH_RESULT_CONTEXT = re.compile(
-    r"\b(?:return(?:s|ed)?|issu(?:e|es|ed)|provid(?:e|es|ed)|yield(?:s|ed)?)"
+    r"\b(?P<verb>return(?:s|ed)?|issu(?:e|es|ed)|provid(?:e|es|ed)|yield(?:s|ed)?)"
     r"\s+(?:an?|the)\s+(?:(?:oauth|oidc|bearer|short-lived|"
     r"temporary|new|provider-specific)\s+){0,3}$",
     re.IGNORECASE,
@@ -227,6 +229,14 @@ _PE3_OAUTH_OWNER_BRIDGE = re.compile(
     r"token|code|exchange|command|client|process|request|operation|helper)){0,4}\s*$",
     re.IGNORECASE,
 )
+_PE3_OAUTH_CAUSATIVE_PREFIX = re.compile(
+    r"\b(?:have|has|had|make|makes|made|let|lets|cause|causes|caused|"
+    r"force|forces|forced|ask|asks|asked|tell|tells|told|instruct|instructs|"
+    r"instructed|get|gets|got)\b[^.;:|]{0,96}$|"
+    r"^\s*(?:please\s+)?(?:ensure|confirm|verify|make\s+sure)\b",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_BARE_RESULT_VERBS = frozenset({"return", "issue", "provide", "yield"})
 _PE3_OAUTH_RESULT_SUFFIX = re.compile(
     r"\s*(?:and\s+(?:an?\s+|the\s+)?(?:short-lived\s+)?refresh[ _-]?token)?"
     r"\s*[`'\".,;:)]*\s*$",
@@ -527,8 +537,11 @@ def _is_companion_cli_oauth_result_noun(
     owner_end = max(cli_context.end(), oauth_context.end())
     owner_bridge = clause_prefix[owner_end : result_context.start()]
     suffix = line[match.end() - line_start :]
+    cli_prefix = clause_prefix[: cli_context.start()]
     if (
         result_context.start() < owner_end
+        or _PE3_OAUTH_CAUSATIVE_PREFIX.search(cli_prefix) is not None
+        or result_context.group("verb").lower() in _PE3_OAUTH_BARE_RESULT_VERBS
         or _PE3_OAUTH_OWNER_BRIDGE.fullmatch(owner_bridge) is None
         or _PE3_OAUTH_RESULT_SUFFIX.fullmatch(suffix) is None
     ):
