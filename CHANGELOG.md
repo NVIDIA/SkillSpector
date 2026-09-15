@@ -1,3 +1,17 @@
+### 2.11.3 (Tuesday, September 15, 2026)
+### Features/Bug Fixes
+* fix: avoid false analysis limits in documentation (#516)
+* fix: scan JSON quote candidates in linear time (#521)
+* feat: configure the static analysis time allowance (#522)
+* fix(cli): emit recursive JSON reports to stdout (#467)
+* fix(analyzer): project manifest version for RP3 (#474)
+* fix(supply-chain): prefer exact known-package matches in SC6 (#530)
+* Fix false local references from slash-separated prose (#451)
+* test(build-context): skip symlink cases where the platform refuses symlinks (#501)
+* docs(providers): align setup guidance (#434)
+* docs(readme): add HVTrust badge (#428)
+* docs(readme): clarify research background counts (#543)
+---
 ### 2.11.2 (Thursday, September 10, 2026)
 ### Features/Bug Fixes
 * fix: prevent duplicate reference coverage from causing fatal scan-accounting errors (#507)
