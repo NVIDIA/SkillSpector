@@ -372,7 +372,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.EXCESSIVE_AGENCY.value]
 
     for pattern, confidence in EA1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -387,7 +389,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in EA2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             findings.append(
@@ -403,7 +407,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in EA3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -418,7 +424,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in EA4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

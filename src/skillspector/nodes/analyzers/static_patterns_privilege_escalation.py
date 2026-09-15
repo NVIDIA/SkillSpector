@@ -515,7 +515,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.PRIVILEGE_ESCALATION.value]
 
     for pattern, confidence in PE1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
             findings.append(
@@ -531,7 +533,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
             finding_tags = list(tag)
@@ -550,7 +554,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             if _is_bare_credential_store_noun(
                 content, match, file_type, fence_ranges, line_starts, line_ends
             ):
@@ -588,7 +594,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # that match multiple patterns (e.g. DockerClient(base_url=".../docker.sock")).
     pe4_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
             finding_tags = list(tag)
@@ -611,7 +619,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # often matches multiple flags (e.g. --privileged + --cap-add=SYS_ADMIN).
     pe5_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE5_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             context = get_context(content, match.start())
             finding_tags = list(tag)

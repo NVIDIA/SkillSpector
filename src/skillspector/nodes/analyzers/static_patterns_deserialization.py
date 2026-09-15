@@ -128,7 +128,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.DESERIALIZATION.value]
     findings: list[AnalyzerFinding] = []
     for rule_id, message, severity, regex, confidence in _COMPILED[language]:
-        for match in regex.finditer(content):
+        for match in static_runner.iter_paragraph_matches(regex, content):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

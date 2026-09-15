@@ -1178,7 +1178,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     )
     if is_dep_file:
         for pattern, confidence in SC1_PATTERNS:
-            for match in re.finditer(pattern, content, re.MULTILINE):
+            for match in static_runner.iter_paragraph_matches(pattern, content, re.MULTILINE):
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(
@@ -1193,7 +1193,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
     for pattern, confidence in SC2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             mt = match.group(0)
             if _is_safe_supply_chain_pattern(mt):
@@ -1216,7 +1218,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     if file_type in ("python", "javascript", "shell", "other"):
         for pattern, confidence in SC3_PATTERNS:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            for match in static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            ):
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(
@@ -1232,7 +1236,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

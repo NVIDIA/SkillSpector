@@ -622,7 +622,9 @@ def analyze(
     tag = [PatternCategory.OUTPUT_HANDLING.value]
 
     for pattern, confidence in OH1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             if pattern == _EXEC_OUTPUT_PATTERN and _is_javascript_regexp_literal_exec(
                 content, match, file_path, file_type
             ):
@@ -654,7 +656,9 @@ def analyze(
     findings.extend(subprocess_findings)
 
     for pattern, confidence in OH2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -669,7 +673,9 @@ def analyze(
                 )
             )
     for pattern, confidence in OH3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
