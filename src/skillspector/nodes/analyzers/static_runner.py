@@ -1291,6 +1291,7 @@ def _scan_declared_marker_views(
                     continue
                 seen_views.add(marker_key)
                 projection_finding_counts: dict[tuple[object, ...], int] = {}
+                projection_seen_occurrences: set[_ViewFindingKey] = set()
                 for view in _bounded_view_slices(marker_view):
                     check_runtime()
                     view_budget = _FindingBudget(
@@ -1315,6 +1316,10 @@ def _scan_declared_marker_views(
                         source_line_starts=source_context.line_starts,
                     )
                     for finding in view_findings:
+                        occurrence_key = _view_finding_key(finding)
+                        if occurrence_key in projection_seen_occurrences:
+                            continue
+                        projection_seen_occurrences.add(occurrence_key)
                         key = _projection_finding_key(finding)
                         projection_count = projection_finding_counts.get(key, 0) + 1
                         projection_finding_counts[key] = projection_count
