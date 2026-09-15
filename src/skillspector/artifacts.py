@@ -54,6 +54,7 @@ class ArtifactRecord(TypedDict):
     misleading_extension: bool
     referenced: bool
     reason: NotRequired[str]
+    inherited_exclusion_reason: NotRequired[str]
 
 
 class BundleReference(TypedDict):

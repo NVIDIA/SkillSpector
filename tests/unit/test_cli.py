@@ -650,6 +650,39 @@ def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> Non
     )
 
 
+def test_cli_executable_selected_baseline_fails_closed(tmp_path: Path) -> None:
+    """A user-selected baseline remains auditable when its bytes are executable."""
+    skill = tmp_path / "skill"
+    baseline_file = skill / "config" / "skillspector-baseline.yaml"
+    baseline_file.parent.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Safe skill\n", encoding="utf-8")
+    baseline_file.write_text(
+        "#!/bin/sh\nversion: 2\nrules: []\nfingerprints: []\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--format",
+            "json",
+            "--baseline",
+            str(baseline_file),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.output)
+    issue = next(finding for finding in data["issues"] if finding["id"] == "SC9")
+    assert issue["location"]["file"] == "config/skillspector-baseline.yaml"
+    assert issue["evidence"]["excluded_from_analysis"] is True
+    assert data["risk_assessment"]["score"] >= 51
+    assert data["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+    assert data["analysis_completeness"]["is_complete"] is False
+
+
 def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     """Sibling files remain in scope even when their content resembles a baseline."""
     skill = tmp_path / "skill"

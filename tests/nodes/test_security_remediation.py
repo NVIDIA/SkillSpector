@@ -555,8 +555,7 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
     (tmp_path / ".git" / "config").write_text("[core]", encoding="utf-8")
     (tmp_path / ".git" / "hooks" / "pre-commit").write_text("echo check", encoding="utf-8")
     sample_hook = tmp_path / ".git" / "hooks" / "pre-commit.sample"
-    sample_hook.write_text("echo sample", encoding="utf-8")
-    sample_hook.chmod(0o755)
+    sample_hook.write_text("#!/bin/sh\necho sample\n", encoding="utf-8")
     (tmp_path / ".git" / "objects" / "aa" / "object").write_bytes(b"opaque")
 
     result = build_context({"skill_path": str(tmp_path)})
@@ -573,6 +572,53 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
         and event["reason_code"] == LedgerReason.VCS_METADATA
         for event in result["inspection_ledger"]
     )
+    sample_metadata = next(
+        item
+        for item in result["component_metadata"]
+        if item["path"] == ".git/hooks/pre-commit.sample"
+    )
+    assert sample_metadata["executable"] is True
+    assert sample_metadata["allowed_exclusion"] is True
+    assert sample_metadata["concealed_executable"] is False
+    assert not any(
+        event["path"] == ".git/hooks/pre-commit.sample"
+        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        for event in result["inspection_ledger"]
+    )
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "content"),
+    [
+        (".git/hooks/pre-commit.sample", b"MZ\x00\x00binary payload"),
+        (".git/hooks/templates/pre-commit.sample", b"#!/bin/sh\necho nested\n"),
+        (".git/hooks/pre-commit.sample.exe", b"MZ\x00\x00binary payload"),
+    ],
+)
+def test_git_hook_sample_policy_near_misses_fail_closed(
+    tmp_path: Path,
+    relative_path: str,
+    content: bytes,
+) -> None:
+    """Only inert direct text templates receive PR #412's allowed policy."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    payload = tmp_path / relative_path
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(content)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["executable"] is True
+    assert metadata.get("allowed_exclusion") is not True
+    assert metadata["concealed_executable"] is True
+    assert any(
+        event["path"] == relative_path
+        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        for event in result["inspection_ledger"]
+    )
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
 
 
 def test_primary_manifest_parsing_uses_bounded_cached_bytes(
