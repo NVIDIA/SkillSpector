@@ -343,14 +343,19 @@ def _is_signed_companion_cli_update(
 def _normalized_cli_subject_stem(subject: str) -> str:
     """Normalize executable and CLI-role affixes before protected-subject checks."""
     stem = subject.casefold()
-    for extension in _CLI_EXECUTABLE_EXTENSIONS:
-        if stem.endswith(extension):
-            stem = stem[: -len(extension)]
-            break
-    for suffix in _CLI_ROLE_SUFFIXES:
-        if len(stem) > len(suffix) and stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
-            break
+    changed = True
+    while changed:
+        changed = False
+        for extension in _CLI_EXECUTABLE_EXTENSIONS:
+            if stem.endswith(extension):
+                stem = stem[: -len(extension)]
+                changed = True
+                break
+        for suffix in _CLI_ROLE_SUFFIXES:
+            if len(stem) > len(suffix) and stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                changed = True
+                break
     return re.sub(r"[-_.]", "", stem)
 
 
