@@ -200,16 +200,21 @@ async def _assert_rules_across_public_surfaces(
     assert verdict["analysis_completeness"]["is_complete"] is True
 
 
-async def _assert_incomplete_across_public_surfaces(root: Path, python_result: dict) -> None:
+async def _assert_incomplete_across_public_surfaces(
+    root: Path,
+    python_result: dict,
+    *,
+    expected_recommendation: str = "CAUTION",
+) -> None:
     """Verify that a coverage limit cannot become a clean or install-safe verdict."""
     expected_score = python_result["risk_score"]
     assert python_result["analysis_completeness"]["is_complete"] is False
-    assert python_result["risk_recommendation"] == "CAUTION"
+    assert python_result["risk_recommendation"] == expected_recommendation
 
     for output_format in ("json", "markdown", "sarif", "terminal"):
         result = render_report({**python_result, "output_format": output_format})
         assert result["risk_score"] == expected_score
-        assert result["risk_recommendation"] == "CAUTION"
+        assert result["risk_recommendation"] == expected_recommendation
         if output_format == "json":
             parsed = json.loads(result["report_body"])
             assert parsed["analysis_completeness"]["is_complete"] is False
@@ -238,17 +243,18 @@ async def _assert_incomplete_across_public_surfaces(root: Path, python_result: d
             "--fail-on-incomplete",
         ],
     )
-    assert default_cli.exit_code == 0, default_cli.output
+    expected_default_exit = 1 if expected_recommendation == "DO_NOT_INSTALL" else 0
+    assert default_cli.exit_code == expected_default_exit, default_cli.output
     assert strict_cli.exit_code == 1, strict_cli.output
     for cli_result in (default_cli, strict_cli):
         parsed = json.loads(cli_result.output)
         assert parsed["risk_assessment"]["score"] == expected_score
-        assert parsed["risk_assessment"]["recommendation"] == "CAUTION"
+        assert parsed["risk_assessment"]["recommendation"] == expected_recommendation
         assert parsed["analysis_completeness"]["is_complete"] is False
 
     verdict = await run_scan(str(root), use_llm=False, output_format="json")
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["recommendation"] == expected_recommendation
     assert verdict["analysis_completeness"]["is_complete"] is False
     assert verdict["safe_to_install"] is False
 
@@ -983,7 +989,17 @@ async def test_bundle_resource_limits_fail_closed_across_public_surfaces(
         assert runtime_row["path"]
         assert runtime_row["observed_seconds"] > 0
         assert runtime_row["limit_seconds"] > 0
-    await _assert_incomplete_across_public_surfaces(tmp_path, result)
+    expected_recommendation = (
+        "DO_NOT_INSTALL"
+        if limit_case
+        in {"artifact_count", "directory_entries", "traversal_depth", "discovery_runtime"}
+        else "CAUTION"
+    )
+    await _assert_incomplete_across_public_surfaces(
+        tmp_path,
+        result,
+        expected_recommendation=expected_recommendation,
+    )
 
 
 @pytest.mark.asyncio
@@ -1160,7 +1176,7 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
     ae1_findings = _assert_rule(python_result, "AE1", "SKILL.md")
     expected_score = python_result["risk_score"]
     assert _rule_score(ae1_findings, "AE1") == 25
-    assert python_result["risk_recommendation"] == "CAUTION"
+    assert python_result["risk_recommendation"] == "DO_NOT_INSTALL"
     assert python_result["analysis_completeness"]["is_complete"] is False
     assert python_result["analysis_completeness"]["findings_before_filtering"] == len(
         python_result["effective_finding_ids"]
@@ -1192,12 +1208,12 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
             "--fail-on-incomplete",
         ],
     )
-    assert default_cli.exit_code == 0
+    assert default_cli.exit_code == 1
     assert strict_cli.exit_code == 1
     assert '"id": "AE1"' in strict_cli.output
 
     verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
     assert any(item["id"] == "AE1" for item in verdict["findings"])
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["recommendation"] == "DO_NOT_INSTALL"
     assert verdict["safe_to_install"] is False

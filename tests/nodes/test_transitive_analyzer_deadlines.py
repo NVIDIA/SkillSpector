@@ -44,7 +44,7 @@ def _expired_workflow_budget() -> WorkflowResourceBudget:
     return WorkflowResourceBudget(max_seconds=0.0)
 
 
-def test_direct_graph_deadline_exhaustion_is_partial_and_caution(tmp_path) -> None:
+def test_direct_graph_deadline_exhaustion_is_partial_and_blocks_install(tmp_path) -> None:
     (tmp_path / "SKILL.md").write_text("# bounded graph\n", encoding="utf-8")
 
     result = graph.invoke(
@@ -59,7 +59,7 @@ def test_direct_graph_deadline_exhaustion_is_partial_and_caution(tmp_path) -> No
     assert result["workflow_resource_budget"].max_seconds == 0.0
     assert result["analysis_completeness"]["status"] == "partial"
     assert result["analysis_completeness"]["is_complete"] is False
-    assert result["risk_recommendation"] == "CAUTION"
+    assert result["risk_recommendation"] == "DO_NOT_INSTALL"
     assert any(
         exception["reason_code"] == LedgerReason.RUNTIME_LIMIT
         for exception in result["analysis_completeness"]["ledger_exceptions"]
@@ -88,7 +88,7 @@ def test_cli_fail_on_incomplete_exits_for_workflow_deadline(
     )
 
     assert result.exit_code == 1
-    assert '"recommendation": "CAUTION"' in result.output
+    assert '"recommendation": "DO_NOT_INSTALL"' in result.output
     assert '"status": "partial"' in result.output
 
 
@@ -109,6 +109,7 @@ async def test_mcp_blocks_install_for_workflow_deadline(
     )
 
     assert verdict["safe_to_install"] is False
+    assert verdict["recommendation"] == "DO_NOT_INSTALL"
     assert verdict["analysis_completeness"]["status"] == "partial"
     assert verdict["analysis_completeness"]["is_complete"] is False
 
