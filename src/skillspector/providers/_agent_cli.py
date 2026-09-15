@@ -454,8 +454,101 @@ def _parse_gemini_output(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_OPENCODE_AGENT_NAME = "skillspector-deny-all"
+_OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
+_OPENCODE_CONFIG = json.dumps(
+    {
+        "$schema": "https://opencode.ai/config.json",
+        "agent": {
+            _OPENCODE_AGENT_NAME: {
+                "description": "SkillSpector text-only semantic analysis",
+                "mode": "primary",
+                "permission": "deny",
+            }
+        },
+        "autoshare": False,
+        "autoupdate": False,
+        "default_agent": _OPENCODE_AGENT_NAME,
+        "instructions": [],
+        "mcp": {},
+        "permission": "deny",
+        "plugin": [],
+        "share": "disabled",
+        "skills": {"paths": [], "urls": []},
+        "snapshot": False,
+    },
+    separators=(",", ":"),
+)
+
+
+def _prepare_opencode_env(base_env: dict[str, str], temp_root: str) -> dict[str, str]:
+    """Return an isolated, non-overridable deny-all OpenCode environment.
+
+    OpenCode merges several ambient configuration layers and lets agent-local
+    permissions override top-level permissions. The inline config therefore
+    defines the exact agent selected in argv *and* denies that agent every
+    current or future tool. ``OPENCODE_PERMISSION`` repeats the wildcard at
+    OpenCode's final permission-merge stage. Project/global extension loading,
+    auto-sharing, updates, external skills, and optional tool surfaces are
+    disabled independently as defense in depth.
+
+    The real OpenCode authentication store remains available so this CLI
+    provider can use the user's existing login. All mutable config, cache,
+    state, database, and temporary paths are redirected below the invocation's
+    already-isolated temporary root.
+    """
+    env = {key: value for key, value in base_env.items() if not key.upper().startswith("OPENCODE_")}
+    config_home = os.path.join(temp_root, "xdg-config")
+    config_dir = os.path.join(config_home, "opencode")
+    cache_home = os.path.join(temp_root, "xdg-cache")
+    state_home = os.path.join(temp_root, "xdg-state")
+    isolated_home = os.path.join(temp_root, "home")
+    child_tmp = os.path.join(temp_root, "tmp")
+    for directory in (config_dir, cache_home, state_home, isolated_home, child_tmp):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    env.update(
+        {
+            "OPENCODE_AUTO_SHARE": "0",
+            "OPENCODE_CLIENT": "skillspector",
+            "OPENCODE_CONFIG_CONTENT": _OPENCODE_CONFIG,
+            "OPENCODE_CONFIG_DIR": config_dir,
+            "OPENCODE_DB": os.path.join(temp_root, "opencode.db"),
+            "OPENCODE_DISABLE_AUTOCOMPACT": "1",
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
+            "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+            "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            "OPENCODE_DISABLE_PRUNE": "1",
+            "OPENCODE_DISABLE_TERMINAL_TITLE": "1",
+            "OPENCODE_ENABLE_EXA": "0",
+            "OPENCODE_ENABLE_PARALLEL": "0",
+            "OPENCODE_ENABLE_QUESTION_TOOL": "0",
+            "OPENCODE_EXPERIMENTAL": "0",
+            "OPENCODE_EXPERIMENTAL_CODE_MODE": "0",
+            "OPENCODE_EXPERIMENTAL_LSP_TOOL": "0",
+            "OPENCODE_EXPERIMENTAL_PLAN_MODE": "0",
+            "OPENCODE_PERMISSION": _OPENCODE_DENY_ALL,
+            "OPENCODE_PURE": "1",
+            # OpenCode 1.18.30 uses this internal override for the home paths
+            # searched for AGENTS.md, .opencode, .claude, and .agents content.
+            "OPENCODE_TEST_HOME": isolated_home,
+            "TEMP": child_tmp,
+            "TMP": child_tmp,
+            "TMPDIR": child_tmp,
+            "XDG_CACHE_HOME": cache_home,
+            "XDG_CONFIG_HOME": config_home,
+            "XDG_STATE_HOME": state_home,
+        }
+    )
+    return env
+
+
 def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
-    """Build the argv list for a non-interactive ``opencode run`` call.
+    """Build argv for a text-only, deny-all ``opencode run`` call.
 
     Flags chosen (verified against ``opencode`` 1.18.30 ``run --help``):
 
@@ -465,9 +558,13 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
         reaches argv.
 
     ``--pure``
-        Run without external plugins. This removes plugin-supplied tools,
-        but ``opencode run`` 1.18.30 exposes no sandbox/read-only/no-tools
-        flag for built-in agent tools.
+        Run without external plugins.
+
+    ``--agent skillspector-deny-all``
+        Select the fixed agent installed through ``OPENCODE_CONFIG_CONTENT``.
+        Its agent-local permission is ``deny``; the child environment also
+        supplies final-merge ``OPENCODE_PERMISSION={"*":"deny"}`` so built-in,
+        custom, MCP, and future tool names all remain unavailable.
 
     ``--format json``
         Emit raw JSON events to stdout for structured parsing.
@@ -477,12 +574,10 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
         opencode uses the CLI default model (forwarded only when
         SKILLSPECTOR_MODEL is set).
 
-    Least-privilege note: in addition to ``--pure``, the shared runner uses
-    a fresh temporary CWD, scrubs secret-bearing environment variables,
-    delivers untrusted content via stdin only, and never passes ``--auto``.
-    Built-in agent tool execution is not disabled by argv; use this provider
-    only where the local OpenCode runtime/agent defaults are acceptable for
-    analyzing untrusted skill content.
+    The shared runner also isolates every OpenCode config/state path, disables
+    ambient instructions, skills, plugins, auto-sharing, snapshots and updates,
+    scrubs secret-bearing environment variables, delivers untrusted content
+    via stdin only, and never passes ``--auto``.
 
     Deliberately NOT included:
     - ``--auto`` — auto-approves permissions (dangerous); never use it.
@@ -496,6 +591,8 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
         binary,
         "run",
         "--pure",
+        "--agent",
+        _OPENCODE_AGENT_NAME,
         "--format",
         "json",
         *model_arg,
@@ -604,16 +701,20 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
     ``(False, reason)``. ``True`` is returned only when at least one parsed
     credential/environment-key count is positive.
     """
+    tmp_root = tempfile.mkdtemp(prefix="skillspector_opencode_auth_")
     try:
-        result = subprocess.run(
-            [binary, "auth", "list"],
-            capture_output=True,
-            shell=False,
-            timeout=15,
-            env=_scrub_env(),
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        return False, f"opencode auth list check failed: {exc}"
+        try:
+            result = subprocess.run(
+                [binary, "auth", "list"],
+                capture_output=True,
+                shell=False,
+                timeout=15,
+                env=_prepare_opencode_env(_scrub_env(), tmp_root),
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            return False, f"opencode auth list check failed: {exc}"
+    finally:
+        _cleanup_temp_dir(tmp_root)
     if result.returncode != 0:
         return False, "opencode is not authenticated (run `opencode auth login`)"
     out = re.compile(r"\x1b\[[0-9;]*m").sub(
@@ -685,6 +786,8 @@ def _agy_auth_check(binary: str) -> tuple[bool, str | None]:
 #        _build_<name>_argv(binary, model, max_output_tokens) -> argv
 #        _parse_<name>_output(raw) -> str
 #        _<name>_auth_check(binary) -> (available, reason)
+#      If the CLI needs extra process isolation, also provide a fixed
+#      ``prepare_env(clean_env, temp_root)`` callback in its ``CliSpec``.
 #      Keep the security posture: no shell, NO tool execution, NO auto-approve,
 #      prompt via stdin (run_agent_cli handles stdin), fail-closed on any error.
 #   2. Add a CliSpec entry to _REGISTRY below.
@@ -703,6 +806,7 @@ class CliSpec:
     build_argv: Callable[[str, str, int], list[str]]
     parse_output: Callable[[str], str]
     auth_check: Callable[[str], tuple[bool, str | None]]
+    prepare_env: Callable[[dict[str, str], str], dict[str, str]] | None = None
 
 
 _REGISTRY: dict[str, CliSpec] = {
@@ -710,7 +814,11 @@ _REGISTRY: dict[str, CliSpec] = {
     "codex": CliSpec("codex", _build_codex_argv, _parse_codex_output, _codex_auth_check),
     "gemini": CliSpec("gemini", _build_gemini_argv, _parse_gemini_output, _gemini_auth_check),
     "opencode": CliSpec(
-        "opencode", _build_opencode_argv, _parse_opencode_output, _opencode_auth_check
+        "opencode",
+        _build_opencode_argv,
+        _parse_opencode_output,
+        _opencode_auth_check,
+        _prepare_opencode_env,
     ),
     # Disabled (fails closed via _build_agy_argv). agy's backend is Gemini, so it
     # reuses _parse_gemini_output rather than duplicating it — though parse is
@@ -931,9 +1039,6 @@ def run_agent_cli(
     # -- Build argv via the registry (no untrusted content here) ---------------
     argv = spec.build_argv(binary, model, max_output_tokens)
 
-    # -- Scrub environment ----------------------------------------------------
-    child_env = _scrub_env()
-
     # -- Run in a temporary directory (no CWD access) -------------------------
     # mkdtemp + explicit best-effort cleanup instead of TemporaryDirectory:
     # the context manager's rmtree-at-__exit__ raises on Windows while the
@@ -941,6 +1046,16 @@ def run_agent_cli(
     # already-successful call into a batch failure (#315).
     tmp_cwd = tempfile.mkdtemp(prefix="skillspector_cli_")
     try:
+        # -- Scrub and apply any CLI-specific isolation policy ----------------
+        child_env = _scrub_env()
+        if spec.prepare_env is not None:
+            try:
+                child_env = spec.prepare_env(child_env, tmp_cwd)
+            except OSError as exc:
+                raise AgentCLIError(
+                    f"{binary_name} environment isolation could not be established: {exc}"
+                ) from exc
+
         logger.debug(
             "Running %s argv=%r cwd=%s timeout=%ss",
             binary_name,
