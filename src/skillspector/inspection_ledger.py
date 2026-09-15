@@ -83,6 +83,7 @@ class LedgerReason(StrEnum):
     OPAQUE_CONTENT = "opaque_content"
     REFERENCED_UNINSPECTED = "referenced_uninspected"
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
+    REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
@@ -164,8 +165,13 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
         "Reference extraction reached an explicit resource bound before completion."
     ),
+    LedgerReason.REFERENCE_MISSING: (
+        "A local path-like reference does not match any bundled artifact,"
+        " such as a file the skill writes at runtime."
+    ),
     LedgerReason.REFERENCE_UNRESOLVED: (
-        "A local path-like reference could not be resolved unambiguously."
+        "A local path-like reference matched more than one bundled artifact"
+        " and could not be resolved to a single target."
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
