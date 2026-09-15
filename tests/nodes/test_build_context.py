@@ -1054,6 +1054,8 @@ def test_build_context_records_stat_errors_in_the_ledger(
 
 def test_build_context_records_non_regular_entries_in_the_ledger(tmp_path: Path) -> None:
     """A discovered FIFO is retained as failed ledger evidence, never silently skipped."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes are unavailable on this platform")
     fifo = tmp_path / "inspection.pipe"
     os.mkfifo(fifo)
 
