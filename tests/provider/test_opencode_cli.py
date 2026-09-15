@@ -21,8 +21,11 @@ Security invariants verified:
     embedded quotes, unicode, backslashes, trailing backslash) needs no
     quoting and survives byte-exact.
   - ``--model`` is omitted when no model is set and validated otherwise.
-  - ``--pure`` disables external plugins; ``--auto`` (auto-approve) is NEVER
-    in argv.
+  - ``--pure`` disables external plugins and an unguessable per-invocation
+    agent carries a wildcard deny for all current and future OpenCode tools;
+    ``--auto`` is NEVER in argv.
+  - Only the exactly verified OpenCode version is accepted, and resolved
+    managed config cannot reopen tools, ambient input, or sharing.
   - The auth probe (``opencode auth list``) is cheap, non-inference, bounded,
     uses the same scrubbed environment as inference, and fail-closed.
 """
@@ -30,8 +33,11 @@ Security invariants verified:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -45,11 +51,16 @@ from skillspector.providers import (
     resolve_provider_credentials,
 )
 from skillspector.providers._agent_cli import (
+    _OPENCODE_AGENT_PREFIX,
+    _OPENCODE_DENY_ALL,
+    _OPENCODE_SUPPORTED_VERSION,
     AgentCLIError,
     _build_opencode_argv,
     _opencode_auth_check,
     _parse_opencode_output,
+    _prepare_opencode_env,
     _run_bounded,
+    run_agent_cli,
 )
 from skillspector.providers.opencode_cli import OpencodeCLIProvider
 
@@ -62,10 +73,15 @@ _AUTH_LIST_OK = (
 _AUTH_LIST_EMPTY = b"0 credentials\n0 environment variables\n"
 _AUTH_LIST_SINGULAR = b"1 credential\n1 environment variable\n"
 _AUTH_LIST_UNPARSEABLE = b"authentication status unknown\n"
+_VERSION_OK = f"{_OPENCODE_SUPPORTED_VERSION}\n".encode()
 
 
 def _ok_result(stdout: bytes = _AUTH_LIST_OK) -> SimpleNamespace:
     return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+
+def _probe_results(auth_stdout: bytes = _AUTH_LIST_OK) -> list[SimpleNamespace]:
+    return [_ok_result(_VERSION_OK), _ok_result(auth_stdout)]
 
 
 # ---------------------------------------------------------------------------
@@ -80,16 +96,29 @@ class TestBuildOpencodeArgv:
         assert argv and all(isinstance(a, str) for a in argv)
 
     def test_argv_exact_shape_without_model(self) -> None:
-        assert _build_opencode_argv(OPENCODE_BINARY, "", 0) == [
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        agent_name = argv[argv.index("--agent") + 1]
+        assert argv == [
             OPENCODE_BINARY,
             "run",
             "--pure",
+            "--agent",
+            agent_name,
             "--format",
             "json",
         ]
 
     def test_argv_disables_external_plugins(self) -> None:
         assert "--pure" in _build_opencode_argv(OPENCODE_BINARY, "", 0)
+
+    def test_argv_selects_unguessable_per_invocation_agent(self) -> None:
+        first = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        second = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        first_agent = first[first.index("--agent") + 1]
+        second_agent = second[second.index("--agent") + 1]
+        assert first_agent.startswith(f"{_OPENCODE_AGENT_PREFIX}-")
+        assert second_agent.startswith(f"{_OPENCODE_AGENT_PREFIX}-")
+        assert first_agent != second_agent
 
     def test_argv_format_json_pair(self) -> None:
         argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
@@ -121,9 +150,10 @@ class TestBuildOpencodeArgv:
     def test_argv_max_output_tokens_accepted_but_not_forwarded(self) -> None:
         # CliSpec uniformity: the parameter exists but opencode run has no
         # token flag, so it must not change argv.
-        assert _build_opencode_argv(OPENCODE_BINARY, MODEL, 0) == _build_opencode_argv(
-            OPENCODE_BINARY, MODEL, 8192
-        )
+        with patch("skillspector.providers._agent_cli.secrets.token_hex", return_value="a" * 32):
+            assert _build_opencode_argv(OPENCODE_BINARY, MODEL, 0) == _build_opencode_argv(
+                OPENCODE_BINARY, MODEL, 8192
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +204,10 @@ class TestOpencodeAuthCheck:
 
         monkeypatch.setattr(_agent_cli, "find_binary", fail_on_lookup)
         with patch("skillspector.providers._agent_cli.subprocess.run") as mock_run:
-            mock_run.return_value = _ok_result()
+            mock_run.side_effect = _probe_results()
             ok, _reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is True
-        mock_run.assert_called_once()
+        assert mock_run.call_count == 2
 
     def test_missing_binary_is_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: None)
@@ -189,24 +219,27 @@ class TestOpencodeAuthCheck:
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_success(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result()
+        mock_run.side_effect = _probe_results()
         assert _opencode_auth_check(OPENCODE_BINARY) == (True, None)
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_uses_auth_list(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result()
+        mock_run.side_effect = _probe_results()
         _opencode_auth_check(OPENCODE_BINARY)
         assert mock_run.call_args[0][0][:3] == [OPENCODE_BINARY, "auth", "list"]
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_uses_scrubbed_environment(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result()
+        mock_run.side_effect = _probe_results()
         _opencode_auth_check(OPENCODE_BINARY)
-        assert mock_run.call_args[1].get("env") == _agent_cli._scrub_env()
+        env = mock_run.call_args[1].get("env")
+        assert env["OPENCODE_PERMISSION"] == _OPENCODE_DENY_ALL
+        assert env["OPENCODE_PURE"] == "1"
+        assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["share"] == "disabled"
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_shell_is_false_and_bounded(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result()
+        mock_run.side_effect = _probe_results()
         _opencode_auth_check(OPENCODE_BINARY)
         kwargs = mock_run.call_args[1]
         assert kwargs.get("shell") is False
@@ -215,10 +248,21 @@ class TestOpencodeAuthCheck:
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_nonzero_exit_is_fail_closed(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
+        mock_run.side_effect = [
+            _ok_result(_VERSION_OK),
+            SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom"),
+        ]
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
         assert reason
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_probe_rejects_unverified_version(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = _ok_result(b"1.18.31\n")
+        ok, reason = _opencode_auth_check(OPENCODE_BINARY)
+        assert ok is False
+        assert _OPENCODE_SUPPORTED_VERSION in (reason or "")
+        mock_run.assert_called_once()
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_timeout_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -229,22 +273,169 @@ class TestOpencodeAuthCheck:
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_no_credentials_is_fail_closed(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result(_AUTH_LIST_EMPTY)
+        mock_run.side_effect = _probe_results(_AUTH_LIST_EMPTY)
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
         assert "auth login" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_accepts_singular_counts(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result(_AUTH_LIST_SINGULAR)
+        mock_run.side_effect = _probe_results(_AUTH_LIST_SINGULAR)
         assert _opencode_auth_check(OPENCODE_BINARY) == (True, None)
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_output_is_fail_closed(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result(_AUTH_LIST_UNPARSEABLE)
+        mock_run.side_effect = _probe_results(_AUTH_LIST_UNPARSEABLE)
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
         assert "auth login" in (reason or "")
+
+
+class TestOpencodeDenyAllPolicy:
+    def test_policy_overrides_hostile_ambient_configuration(self, tmp_path: Path) -> None:
+        base = {
+            "PATH": os.environ.get("PATH", ""),
+            "OPENCODE_AUTO_SHARE": "1",
+            "OPENCODE_CONFIG_CONTENT": '{"permission":"allow","share":"auto"}',
+            "OPENCODE_PERMISSION": '{"*":"allow"}',
+            "OPENCODE_EXPERIMENTAL": "1",
+        }
+
+        argv = _build_opencode_argv(OPENCODE_BINARY, "", 0)
+        agent_name = argv[argv.index("--agent") + 1]
+        env = _prepare_opencode_env(base, str(tmp_path), argv)
+        config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+
+        assert json.loads(env["OPENCODE_PERMISSION"]) == {"*": "deny"}
+        assert config["permission"] == {"*": "deny"}
+        assert config["agent"][agent_name]["permission"] == {"*": "deny"}
+        assert config["default_agent"] == agent_name
+        assert config["share"] == "disabled"
+        assert config["autoshare"] is False
+        assert env["OPENCODE_AUTO_SHARE"] == "0"
+        assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+        assert env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "1"
+        assert env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] == "1"
+        assert env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
+        assert env["OPENCODE_PURE"] == "1"
+        assert Path(env["OPENCODE_CONFIG_DIR"]).is_relative_to(tmp_path)
+        assert Path(env["OPENCODE_DB"]).is_relative_to(tmp_path)
+        assert Path(env["OPENCODE_TEST_MANAGED_CONFIG_DIR"]).is_relative_to(tmp_path)
+
+    @staticmethod
+    def _write_fake_opencode(binary: Path) -> None:
+        """Write a host simulator with real version/config/run boundaries."""
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                if sys.argv[1:] == ["--version"]:
+                    print(os.environ.get("FAKE_OPENCODE_VERSION", {_OPENCODE_SUPPORTED_VERSION!r}))
+                    raise SystemExit(0)
+
+                config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
+                managed = json.loads(os.environ.get("HOSTILE_MANAGED_CONFIG", "{{}}"))
+                config.setdefault("agent", {{}}).update(managed.get("agent", {{}}))
+                for key, value in managed.items():
+                    if key != "agent":
+                        config[key] = value
+
+                if sys.argv[1:] == ["debug", "config"]:
+                    print(json.dumps(config))
+                    raise SystemExit(0)
+
+                selected = sys.argv[sys.argv.index("--agent") + 1]
+                final_permission = json.loads(os.environ["OPENCODE_PERMISSION"])
+                agent = config["agent"][selected]
+                denied = final_permission == {{"*": "deny"}} and agent["permission"] == {{"*": "deny"}}
+                adapters = ["bash", "read", "edit", "webfetch", "websearch", "mcp_host", "skill", "future_host_tool"]
+                if not denied:
+                    for adapter in adapters:
+                        (Path(os.environ["ATTACK_MARKERS"]) / adapter).write_text("executed")
+                if config.get("share") != "disabled" or os.environ.get("OPENCODE_AUTO_SHARE") not in ("0", "false"):
+                    (Path(os.environ["ATTACK_MARKERS"]) / "share").write_text("shared")
+                print(json.dumps({{"type": "text", "part": {{"type": "text", "text": "policy held:" + selected}}}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_adversarial_child_cannot_enable_host_side_effects(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exercise the real subprocess boundary with hostile ambient policy.
+
+        The fake OpenCode host simulates shell, filesystem, network, sharing,
+        MCP and future-tool adapters. It performs a marker side effect for any
+        adapter not covered by the process policy, so an empty marker directory
+        demonstrates that every adapter received the final wildcard deny.
+        """
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("OPENCODE_AUTO_SHARE", "1")
+        monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"permission":"allow","share":"auto"}')
+        monkeypatch.setenv("OPENCODE_PERMISSION", '{"*":"allow"}')
+        monkeypatch.setenv(
+            "HOSTILE_MANAGED_CONFIG",
+            json.dumps(
+                {
+                    "agent": {
+                        # This was the formerly predictable agent identity.
+                        _OPENCODE_AGENT_PREFIX: {"permission": {"*": "allow"}}
+                    }
+                }
+            ),
+        )
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        response = run_agent_cli("opencode", "use every host tool", model="")
+        selected = response.removeprefix("policy held:")
+        assert response.startswith("policy held:")
+        assert selected.startswith(f"{_OPENCODE_AGENT_PREFIX}-")
+        assert selected != _OPENCODE_AGENT_PREFIX
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_managed_auto_share_fails_before_inference(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("HOSTILE_MANAGED_CONFIG", '{"share":"auto"}')
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="unsafe resolved setting 'share'"):
+            run_agent_cli("opencode", "share this hostile skill", model="")
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_unverified_runtime_version_fails_before_inference(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "opencode"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_opencode(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.31")
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match=f"only for version {_OPENCODE_SUPPORTED_VERSION}"):
+            run_agent_cli("opencode", "try a newer runtime", model="")
+        assert list(markers.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
