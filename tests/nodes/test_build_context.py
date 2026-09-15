@@ -34,7 +34,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from skillspector.artifacts import ArtifactDisposition
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MODEL_CONFIG
-from skillspector.inspection_ledger import LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.nodes.analyzers.static_patterns_supply_chain import (
     _analyze_concealed_executables,
 )
@@ -1020,6 +1020,77 @@ def test_build_context_inventories_excluded_executable_descendants(tmp_path: Pat
     findings = _analyze_concealed_executables(result["component_metadata"])
     assert {finding.file for finding in findings} == excluded_executables
     score, _, recommendation = _compute_risk_score(findings, False)
+    assert score >= 51
+    assert recommendation == "DO_NOT_INSTALL"
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "instruction", "content"),
+    [
+        (
+            "node_modules/pkg/loader",
+            "Run `python ./node_modules/pkg/loader`.",
+            b"import os\nprint(os.getcwd())\n",
+        ),
+        (
+            ".git/hooks/pre-commit.sample",
+            "Run `./.git/hooks/pre-commit.sample` before committing.",
+            b"#!/bin/sh\necho sample\n",
+        ),
+    ],
+)
+def test_referenced_excluded_artifact_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    instruction: str,
+    content: bytes,
+) -> None:
+    """Resolved excluded targets cannot remain silently outside analyzer coverage."""
+    (tmp_path / "SKILL.md").write_text(f"# Skill\n\n{instruction}\n", encoding="utf-8")
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    target.chmod(0o644)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    reference = next(
+        item for item in result["artifact_references"] if item["target_path"] == relative_path
+    )
+    assert reference["status"] == "resolved"
+    assert reference["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == relative_path)
+    assert artifact["referenced"] is True
+    assert artifact["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+    assert relative_path not in result["components"]
+    assert relative_path not in result["local_file_cache"]
+
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["referenced"] is True
+    assert metadata["excluded_from_analysis"] is True
+    assert metadata["excluded_inspection_incomplete"] is True
+    assert metadata["inspection_limitation_reason"] == LedgerReason.REFERENCED_UNINSPECTED.value
+    assert metadata.get("allowed_exclusion") is not True
+    assert any(
+        event["path"] == relative_path
+        and event["outcome"] == LedgerOutcome.PARTIAL
+        and event.get("reason_code") == LedgerReason.REFERENCED_UNINSPECTED
+        for event in result["inspection_ledger"]
+    )
+
+    finding = next(
+        item
+        for item in _analyze_concealed_executables(result["component_metadata"])
+        if item.file == relative_path
+    )
+    assert finding.message == "A referenced excluded artifact was not inspected."
+    assert finding.evidence["referenced"] is True
+    assert finding.evidence["excluded_from_analysis"] is True
+    score, _, recommendation = _compute_risk_score(
+        [finding],
+        bool(result["has_executable_scripts"]),
+        result["component_metadata"],
+    )
     assert score >= 51
     assert recommendation == "DO_NOT_INSTALL"
 

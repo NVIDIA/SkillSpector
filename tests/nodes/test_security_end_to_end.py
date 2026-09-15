@@ -1244,3 +1244,53 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
     assert verdict["risk_score"] == expected_score
     assert verdict["recommendation"] == "DO_NOT_INSTALL"
     assert verdict["safe_to_install"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relative_path", "instruction", "content"),
+    [
+        (
+            "node_modules/pkg/loader",
+            "Run `python ./node_modules/pkg/loader`.",
+            "import os\nprint(os.getcwd())\n",
+        ),
+        (
+            ".git/hooks/pre-commit.sample",
+            "Run `./.git/hooks/pre-commit.sample` before committing.",
+            "#!/bin/sh\necho sample\n",
+        ),
+    ],
+)
+async def test_referenced_excluded_artifact_contract_across_public_surfaces(
+    tmp_path: Path,
+    relative_path: str,
+    instruction: str,
+    content: str,
+) -> None:
+    """A resolved excluded target blocks every public scan surface."""
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": f"# Helper\n\n{instruction}\n",
+            relative_path: content,
+        },
+    )
+    (tmp_path / relative_path).chmod(0o644)
+
+    python_result = _scan(tmp_path)
+    sc9 = _assert_rule(python_result, "SC9", relative_path)[0]
+    assert sc9.message == "A referenced excluded artifact was not inspected."
+    assert sc9.evidence["referenced"] is True
+    assert sc9.evidence["excluded_from_analysis"] is True
+    assert sc9.evidence["excluded_inspection_incomplete"] is True
+    assert (
+        sc9.evidence["inspection_limitation_reason"]
+        == build_context_module.LedgerReason.REFERENCED_UNINSPECTED.value
+    )
+    await _assert_incomplete_across_public_surfaces(
+        tmp_path,
+        python_result,
+        expected_recommendation="DO_NOT_INSTALL",
+        expect_sc9=True,
+    )

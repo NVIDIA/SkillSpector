@@ -2088,11 +2088,17 @@ def _analyze_concealed_executables(
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
         excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        referenced_uninspected = (
+            metadata.get("inspection_limitation_reason")
+            == LedgerReason.REFERENCED_UNINSPECTED.value
+        )
         findings.append(
             Finding(
                 rule_id="SC9",
                 message=(
-                    "An excluded artifact could not be completely inspected."
+                    "A referenced excluded artifact was not inspected."
+                    if referenced_uninspected
+                    else "An excluded artifact could not be completely inspected."
                     if inspection_incomplete
                     else "Executable content is excluded from analysis."
                     if excluded_from_analysis
@@ -2105,13 +2111,18 @@ def _analyze_concealed_executables(
                 start_line=1,
                 category="Supply Chain",
                 pattern=(
-                    "Excluded Artifact Inspection Incomplete"
+                    "Referenced Excluded Artifact Uninspected"
+                    if referenced_uninspected
+                    else "Excluded Artifact Inspection Incomplete"
                     if inspection_incomplete
                     else "Concealed Executable Artifact"
                 ),
                 finding=nested_path,
                 explanation=(
-                    "A resource, read, or archive-safety limit left excluded content "
+                    "SKILL.md references an artifact whose content remains outside "
+                    "deterministic analyzer coverage."
+                    if referenced_uninspected
+                    else "A resource, read, or archive-safety limit left excluded content "
                     "outside deterministic inspection coverage."
                     if inspection_incomplete
                     else "An executable artifact remains available under the skill install path "
@@ -2122,11 +2133,18 @@ def _analyze_concealed_executables(
                     "the skill at runtime."
                 ),
                 remediation=(
-                    "Review the artifact provenance and the reason executable content is "
+                    "Move directly referenced runtime artifacts into normal analyzer scope "
+                    "or remove the reference."
+                    if referenced_uninspected
+                    else "Review the artifact provenance and the reason executable content is "
                     "packaged in this location; keep executable files explicit and directly "
                     "reviewable."
                 ),
-                tags=["supply-chain", "concealed-executable", "local-only"],
+                tags=[
+                    "supply-chain",
+                    "referenced-artifact" if referenced_uninspected else "concealed-executable",
+                    "local-only",
+                ],
                 matched_text=path,
                 evidence={
                     "outer_path": outer_path,
@@ -2137,6 +2155,7 @@ def _analyze_concealed_executables(
                     "concealment": concealment,
                     "concealment_reasons": concealment_reasons,
                     "local_only": True,
+                    "referenced": metadata.get("referenced") is True,
                     "excluded_from_analysis": excluded_from_analysis,
                     "excluded_inspection_incomplete": inspection_incomplete,
                     "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),

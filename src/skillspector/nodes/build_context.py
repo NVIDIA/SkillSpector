@@ -1453,6 +1453,111 @@ def _inspect_excluded_artifacts(
     return inventory, metadata, events, archive_cache, input_bytes_read
 
 
+def _mark_referenced_excluded_artifacts(
+    referenced_paths: frozenset[str],
+    excluded_artifacts: Mapping[str, LedgerReason],
+    artifact_inventory: Mapping[str, ArtifactRecord],
+    component_metadata: list[dict[str, object]],
+) -> list[InspectionLedgerEvent]:
+    """Fail closed when a resolved reference targets content outside analysis.
+
+    Exclusion discovery intentionally reads only a bounded executable/archive
+    prefix from ordinary excluded files.  That is sufficient for unreferenced
+    dependency metadata, but not for a file that SKILL.md explicitly names: an
+    extensionless loader can contain executable source without a shebang, mode
+    bit, or magic prefix.  Keep the bytes out of provider-visible caches while
+    making the missing deterministic coverage blocking and reportable.
+    """
+    events: list[InspectionLedgerEvent] = []
+    metadata_by_path = {
+        str(item.get("path", "")): item for item in component_metadata if item.get("path")
+    }
+
+    for path in sorted(referenced_paths):
+        exclusion_reason = excluded_artifacts.get(path)
+        artifact = artifact_inventory.get(path)
+        # A selected suppression baseline has its own bounded parser and is an
+        # explicit scanner input, rather than an install-time artifact invoked
+        # by SKILL.md.  Preserve that existing policy boundary.
+        if (
+            exclusion_reason is None
+            or exclusion_reason is LedgerReason.BASELINE_FILE
+            or artifact is None
+            or artifact.get("disposition") is ArtifactDisposition.ANALYZED
+        ):
+            continue
+
+        metadata = metadata_by_path.get(path)
+        if metadata is not None:
+            metadata["referenced"] = True
+            already_blocks = metadata.get("allowed_exclusion") is not True and (
+                metadata.get("concealed_executable") is True
+                or metadata.get("excluded_inspection_incomplete") is True
+            )
+            if already_blocks:
+                continue
+        if metadata is None:
+            hidden = _is_hidden_component(path)
+            metadata = {
+                "path": path,
+                "type": _infer_file_type(path),
+                "lines": 0,
+                "executable": False,
+                "size_bytes": max(0, int(artifact.get("size_bytes", 0))),
+                "hidden": hidden,
+                "local_only": True,
+                "outer_path": path,
+                "nested_path": path,
+                "container_type": "filesystem",
+                "container_ancestry": ["filesystem"],
+                "container_depth": 0,
+                "outer_hidden": hidden,
+                "concealed_executable": False,
+                "excluded_from_analysis": True,
+                "concealment_reasons": [exclusion_reason.value],
+            }
+            component_metadata.append(metadata)
+            metadata_by_path[path] = metadata
+
+        raw_reasons = metadata.get("concealment_reasons", [])
+        reasons = [str(reason) for reason in raw_reasons] if isinstance(raw_reasons, list) else []
+        metadata.update(
+            {
+                "referenced": True,
+                "excluded_from_analysis": True,
+                "excluded_inspection_incomplete": True,
+                "inherited_exclusion_reason": exclusion_reason.value,
+                "inspection_limitation_reason": LedgerReason.REFERENCED_UNINSPECTED.value,
+                "concealment_reasons": list(
+                    dict.fromkeys(
+                        [
+                            *reasons,
+                            exclusion_reason.value,
+                            LedgerReason.REFERENCED_UNINSPECTED.value,
+                        ]
+                    )
+                ),
+            }
+        )
+        # Inactive hook templates are allowed only while they remain inert
+        # examples.  An explicit reference makes the template runtime-relevant.
+        metadata.pop("allowed_exclusion", None)
+        if metadata.get("executable") is True:
+            metadata["concealed_executable"] = True
+
+        events.append(
+            ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="reference_resolution",
+                path=path,
+                reason=LedgerReason.REFERENCED_UNINSPECTED,
+            )
+        )
+
+    return events
+
+
 def _read_file_cache(
     skill_dir: Path,
     components: list[str],
@@ -2645,6 +2750,14 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     for artifact in artifact_inventory:
         if artifact["path"] in referenced_paths:
             artifact["referenced"] = True
+    reference_events.extend(
+        _mark_referenced_excluded_artifacts(
+            referenced_paths,
+            excluded_artifacts,
+            inventory_by_path,
+            excluded_component_metadata,
+        )
+    )
 
     # Omitted paths remain represented in artifact_inventory, but are not fed
     # to analyzers without content. Genuine read failures remain analyzer work
