@@ -186,10 +186,12 @@ _PE3_TOKEN_ACTION_CONTEXT = re.compile(
 _PE3_BOUND_TOKEN_TRANSFER = re.compile(
     r"\b(?:past(?:e|es|ed|ing)|submit(?:s|ted|ting)?|attach(?:es|ed|ing)?|"
     r"relay(?:s|ed|ing)?|deliver(?:s|ed|ing)?|put(?:s|ting)?|"
-    r"pass(?:es|ed|ing)?|enter(?:s|ed|ing)?|insert(?:s|ed|ing)?)\b"
+    r"pass(?:es|ed|ing)?|enter(?:s|ed|ing)?|insert(?:s|ed|ing)?|"
+    r"post(?:s|ed|ing)?)\b"
     r"[\s`'\"-]{0,24}"
     r"(?:it|them|(?:(?:the|this|that|these|those|returned|resulting|oauth|oidc|"
-    r"access|refresh|bearer|api)\s+){0,5}tokens?)\b"
+    r"access|refresh|bearer|api)\s+){0,5}tokens?|"
+    r"(?:(?:this|that|the\s+(?:returned|resulting))\s+value))\b"
     r"[^.!?;\r\n\v\f\x1c-\x1e\x85\u2028\u2029]{0,96}?"
     r"\b(?:to|into|onto|through|via|in|on|with|as)\b(?=\s+\S)",
     re.IGNORECASE,
