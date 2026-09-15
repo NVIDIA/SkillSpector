@@ -54,27 +54,40 @@ _EXECUTABLE_SUFFIXES = frozenset(
         ".bash",
         ".bat",
         ".bin",
+        ".cjs",
         ".cmd",
         ".com",
+        ".cts",
         ".dll",
         ".dylib",
         ".exe",
         ".go",
         ".js",
+        ".jsx",
+        ".mjs",
         ".msi",
+        ".mts",
+        ".php",
+        ".php3",
+        ".php4",
+        ".php5",
+        ".phtml",
         ".pl",
         ".ps1",
         ".py",
         ".pyc",
         ".pyo",
+        ".rake",
         ".rb",
         ".rs",
         ".sh",
         ".so",
         ".ts",
+        ".tsx",
         ".zsh",
     }
 )
+_DECLARATION_SUFFIXES = (".d.cts", ".d.mts")
 _OOXML_MARKERS: tuple[tuple[str, str], ...] = (
     ("word/", "docx"),
     ("xl/", "xlsx"),
@@ -347,11 +360,17 @@ def _zip_member_is_link(info: zipfile.ZipInfo) -> bool:
 
 def is_executable_content(path: str, data: bytes, mode: int = 0) -> bool:
     """Classify filesystem and archive content with one static-only policy."""
+    name = Path(path).name.lower()
     suffix = Path(path).suffix.lower()
+    is_declaration_file = name.endswith(_DECLARATION_SUFFIXES)
     executable_magic = data.startswith(
         (b"#!", b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xcf\xfa\xed\xfe")
     )
-    return suffix in _EXECUTABLE_SUFFIXES or executable_magic or bool(mode & 0o111)
+    return (
+        (suffix in _EXECUTABLE_SUFFIXES and not is_declaration_file)
+        or executable_magic
+        or bool(mode & 0o111)
+    )
 
 
 def _member_executable(info: zipfile.ZipInfo, safe_name: str, data: bytes) -> bool:
