@@ -254,6 +254,99 @@ for key, val in os.environ.items():
 
         assert not any(finding.rule_id == "E2" for finding in findings)
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env | grep secret",
+            "env | grep -i -E 'token|key|secret' > /tmp/ctx.txt",
+            'env | grep -iE "aws_|secret"',
+            "env | grep --ignore-case token",
+            "env | egrep -e password -e token",
+            "env | grep AWS_SECRET_ACCESS_KEY",
+            "printenv | grep -i secret",
+            "env|grep KEY",
+            "env | grep SECRET > /tmp/out # -v",
+            "env | grep SECRET; echo -v",
+            "env | grep -i token  # redact with -v before sharing",
+            "env | grep --regexp=SECRET",
+            "env | grep -i -- SECRET",
+            "env | grep -E --color=never SECRET",
+            "env | grep -i TOKENS",
+            "env | grep KEY2",
+            "env | grep -i key1",
+            "env | grep -m 1 SECRET",
+            "env | grep -A 1 TOKEN",
+            "env | grep --max-count 1 SECRET",
+            "env | grep --max-count=1 SECRET",
+            "printenv | grep -m 1 -i secret",
+        ],
+    )
+    def test_e2_shell_env_grep_forms(self, command: str) -> None:
+        """Piping the environment through grep for secrets is detected whatever the flags."""
+        content = f"# Setup\n\n```bash\n{command}\n```\n"
+
+        findings = data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+        e2 = [finding for finding in findings if finding.rule_id == "E2"]
+
+        assert len(e2) == 1
+        assert e2[0].location.start_line == 4
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env | grep PATH",
+            "env | grep -i home",
+            "env | grep MONKEY_PATCH",
+            "env | grep -v SECRET",
+            "env | grep -iv SECRET",
+            "env | grep -i -v SECRET",
+            "env | grep --invert-match SECRET",
+            "env | grep --invert SECRET",
+            "env | grep --color=auto -v SECRET",
+            "env | grep -m 1 -v SECRET",
+            "env | grep -A 1 -v SECRET",
+            "env | grep --max-count 1 -v SECRET",
+            "env | grep --max-count=1 --invert-match KEY",
+            "env | grep -f keys.txt",
+            "env | grep XKB_DEFAULT_KEYMAP",
+            "env | grep -i keyboard",
+            "env | grep -i tokenizer",
+            "printenv | grep -v -E 'KEY|SECRET|TOKEN'",
+            "dotenv | grep KEY",
+            "env | grep -i PATH  # the token lives elsewhere",
+            "Run `env | grep PATH` to check the search path before setting your API key.",
+            "env | grep . | grep -v SECRET",
+            "env | grep TERM | grep -vi password",
+            "printenv | grep -i lang | grep -v KEY",
+            "env | grep PATH || echo no token found",
+            "| env | grep PATH | prints the token search path |",
+            "Use env | grep PATH. Then export your API key.",
+            "printenv HOME",
+        ],
+    )
+    def test_e2_shell_env_grep_ordinary_or_inverted_is_not_harvesting(self, command: str) -> None:
+        """Grepping the environment for ordinary names, or excluding secrets, is not harvesting."""
+        content = f"{command}\n"
+
+        findings = data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+
+        assert not any(finding.rule_id == "E2" for finding in findings)
+
+    @pytest.mark.parametrize("flags", [200, 2000])
+    def test_e2_shell_env_grep_long_flag_run_terminates_quickly(self, flags: int) -> None:
+        """A long run of grep flags cannot make the shell pattern backtrack.
+
+        Ten times the input for a bound that does not move, so a pattern that
+        degraded to exponential time on the flag run would fail the larger case.
+        """
+        content = "```bash\nenv | grep " + "--ab-cd " * flags + "x\n```\n"
+
+        started = time.monotonic()
+        data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"E2 shell pattern took {elapsed:.1f}s on {flags} flags"
+
 
 class TestPrivilegeEscalation:
     """privilege_escalation.analyze() — PE3."""

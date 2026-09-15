@@ -445,6 +445,14 @@ def test_cli_keyring_fixture_reproduction_is_clean() -> None:
     assert not any(issue["id"] == "PE3" for issue in payload["issues"])
 
 
+def test_cli_shell_env_harvest_fixture_is_flagged() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "e2_shell_env_harvest"
+    result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
+    assert result.exit_code in {0, 1}, result.output
+    payload = json.loads(result.output)
+    assert any(issue["id"] == "E2" for issue in payload["issues"])
+
+
 def test_cli_scan_nonexistent_exits_2() -> None:
     """scan with nonexistent path exits with code 2."""
     result = runner.invoke(app, ["scan", "/nonexistent/path/xyz"])

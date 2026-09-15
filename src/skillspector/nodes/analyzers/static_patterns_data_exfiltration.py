@@ -67,11 +67,43 @@ E2_PYTHON_FALLBACK_PATTERNS = [
     # Require braces so bare ``2 ** os.environ`` (exponentiation) is not flagged.
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
 ]
+# grep options that take a separate operand, so the operand is not mistaken for the search
+# pattern: `grep -m 1 SECRET` would otherwise stop at the 1. -e and --regexp are left out on
+# purpose, since their operand is the search pattern and has to stay visible. The short forms
+# are case sensitive because -A and -a mean different things, and the alternatives are atomic
+# so a run of them cannot be reparsed and blow up.
+_GREP_OPTION_WITH_OPERAND = (
+    r"(?:(?-i:-[a-zA-Z]*[ABCDdfm])"
+    r"|--(?:after-context|before-context|context|binary-files|devices|directories"
+    r"|file|max-count|label|exclude(?:-dir|-from)?|include(?:-dir)?|group-separator))"
+    r"(?:=\S*|[^\S\n]+\S+)"
+)
+
 E2_OTHER_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
-    (r"env\s*\|\s*grep\s+(?:-i\s+)?(?:key|secret|token|password)", 0.8),
+    # Shell: env/printenv piped to grep for secrets. The lookahead walks only the run of
+    # option words attached to grep and gives up on an inverting one, because excluding
+    # secrets from the output is the redaction idiom rather than harvesting. Scoping it to
+    # that run matters: searching the whole line for -v instead would let a trailing "# -v"
+    # comment or a later command suppress a real harvest. Both the walk and the flag run
+    # carry an option's operand along with it, so `grep -m 1 SECRET` reaches SECRET and
+    # `grep -m 1 -v SECRET` still reads as redaction. The flag run is possessive so a long
+    # run of flags cannot backtrack. Everything here is confined to the one command:
+    # horizontal whitespace only, and an unquoted argument ends at the pipe, so a redacting
+    # stage further down the pipeline stays visible to the lookahead that guards it.
+    # Keywords have to stand alone as a name, optionally plural or numbered, so KEY2 counts
+    # but MONKEY_PATCH and KEYBOARD do not.
+    (
+        r"\b(?:printenv|env)[^\S\n]*\|[^\S\n]*[ef]?grep"
+        rf"(?!(?:[^\S\n]+(?>{_GREP_OPTION_WITH_OPERAND}|-\S*))*"
+        r"[^\S\n]+-(?:\w*v\w*|-inv[\w-]*)(?![\w-]))"
+        rf"[^\S\n]+(?:(?>{_GREP_OPTION_WITH_OPERAND}|--?[\w-]+(?:=\S*)?)[^\S\n]+)*+"
+        r"(?:['\"`][^'\"`\n]{0,40}?|[^'\"`\s;>&#|]{0,40}?)"
+        r"(?<![a-z0-9])(?:key|secret|token|password)s?\d*(?![a-z])",
+        0.8,
+    ),
     (r"printenv\s+(?:\w*(?:KEY|SECRET|TOKEN|PASSWORD)\w*)", 0.7),
     (r"collect\s+(?:all\s+)?(?:environment\s+variables?|env\s+vars?)", 0.7),
     (r"(?:extract|harvest|gather)\s+(?:api\s+)?keys?\s+from\s+environment", 0.8),
