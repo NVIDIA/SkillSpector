@@ -358,7 +358,8 @@ def test_plain_slash_separated_prose_is_not_a_reference(tmp_path: Path) -> None:
         source_path="SKILL.md",
         source_text=(
             "Compare reads/writes, environment/profile settings, operation/node behavior, "
-            "and model/provider options. SkillSpector 2.10.0 supports node.js; see example.com."
+            "and model/provider options, including `request/response` terminology. "
+            "SkillSpector 2.10.0 supports node.js; see example.com."
         ),
         known_paths=["SKILL.md"],
     )
@@ -387,6 +388,41 @@ def test_plain_local_reference_requires_an_explicit_path_signal(
     assert len(records) == 1
     assert records[0]["status"] == "resolved"
     assert records[0]["target_path"] == target_path
+
+
+@pytest.mark.parametrize("path", ["./node_modules/pkg/loader", "node_modules/pkg/loader"])
+def test_inline_command_resolves_extensionless_nested_path(tmp_path: Path, path: str) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=f"Run `python {path}`.",
+        known_paths=["SKILL.md", "node_modules/pkg/loader"],
+    )
+
+    assert len(records) == 1
+    assert records[0]["status"] == "resolved"
+    assert records[0]["target_path"] == "node_modules/pkg/loader"
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        '`python -c "print(\\"request/response\\")"`',
+        "`python --config=request/response`",
+        "`node -e 'console.log(\"request/response\")'`",
+    ],
+)
+def test_inline_command_does_not_extract_paths_from_code_or_options(
+    tmp_path: Path, source_text: str
+) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source_text,
+        known_paths=["SKILL.md", "request/response"],
+    )
+
+    assert records == []
 
 
 def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -> None:

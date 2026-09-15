@@ -1033,6 +1033,11 @@ def test_build_context_inventories_excluded_executable_descendants(tmp_path: Pat
             b"import os\nprint(os.getcwd())\n",
         ),
         (
+            "node_modules/pkg/loader",
+            "Run `python node_modules/pkg/loader`.",
+            b"import os\nprint(os.getcwd())\n",
+        ),
+        (
             ".git/hooks/pre-commit.sample",
             "Run `./.git/hooks/pre-commit.sample` before committing.",
             b"#!/bin/sh\necho sample\n",

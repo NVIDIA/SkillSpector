@@ -1256,6 +1256,11 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
             "import os\nprint(os.getcwd())\n",
         ),
         (
+            "node_modules/pkg/loader",
+            "Run `python node_modules/pkg/loader`.",
+            "import os\nprint(os.getcwd())\n",
+        ),
+        (
             ".git/hooks/pre-commit.sample",
             "Run `./.git/hooks/pre-commit.sample` before committing.",
             "#!/bin/sh\necho sample\n",
