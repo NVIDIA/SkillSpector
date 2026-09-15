@@ -133,10 +133,14 @@ def _normalize_candidate(raw: str, source_path: str) -> str | None:
         return None
     # A purely numeric "extension" (e.g. "1.2", "v1.2", "1.2.0-beta.1") is a
     # version number, indistinguishable from a root-level file name without
-    # another path signal: real file extensions are never all digits.
-    basename = path_part.rsplit("/", 1)[-1]
-    if "." in basename and basename.rsplit(".", 1)[-1].isdigit():
-        return None
+    # another path signal: real file extensions are never all digits. This
+    # heuristic only applies to a bare token with no directory component —
+    # "/" is itself an explicit path signal (e.g. "docs/tool.1"), so a
+    # candidate carrying one is never treated as a version number.
+    if "/" not in path_part:
+        basename = path_part.rsplit("/", 1)[-1]
+        if "." in basename and basename.rsplit(".", 1)[-1].isdigit():
+            return None
     source_parent = PurePosixPath(source_path).parent.as_posix()
     joined = posixpath.normpath(posixpath.join(source_parent, path_part))
     if joined in {"", ".", ".."} or joined.startswith("../"):
