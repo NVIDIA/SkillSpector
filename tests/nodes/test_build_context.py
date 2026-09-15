@@ -1438,6 +1438,27 @@ def test_truncated_text_file_stays_in_llm_cache_with_audit_gap_marker(
     assert artifact["disposition"] == "partial"
 
 
+def test_source_local_only_truncated_text_stays_out_of_provider_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The truncated-file LLM view must not widen a local-only trust boundary."""
+    import skillspector.nodes.build_context as build_context_module
+
+    monkeypatch.setattr(build_context_module, "MAX_ANALYZABLE_FILE_BYTES", 64)
+    marker = "PRIVATE_TRUNCATED_CHILD_MARKER"
+    (tmp_path / "SKILL.md").write_text("# private child\n", encoding="utf-8")
+    (tmp_path / "server.py").write_text(marker + "\n" + "x" * 256, encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path), "source_local_only": True})
+
+    assert marker in result["local_file_cache"]["server.py"]
+    assert result["llm_file_cache"] == {}
+    assert result["llm_components"] == []
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "server.py")
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.SIZE_LIMIT.value
+
+
 def test_build_context_shares_artifact_budget_across_child_bundles(tmp_path: Path) -> None:
     """A second child sees the artifact allowance already consumed by its sibling."""
     from skillspector.cli import _TransitiveBudget, _TransitiveTraversalState
