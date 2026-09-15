@@ -197,8 +197,12 @@ _AR2_DIRECT_INTENT_PATTERNS = (
 # strict branch and stays an active suppression clause, same as the "and"/"then"/"but" cases.
 _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     r"\b(?:never|do\s+not|don'?t)\b"
+    # "fail to"/"hesitate to" flip the negation's polarity: "never fail to respond" means
+    # "always respond", so a following "without warnings" is a real suppression, not a
+    # mandate to warn, and must not be exempted the way a plain negated verb is.
+    r"(?!\s+(?:fail|hesitate)\s+to\b)"
     r"(?:"
-    r"\s+\w+\s+or\s+\w+\s+(?!without\b)\S+\b"
+    r"\s+\w+\s+or\s+\w+\s+(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
     r"|"
     r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
@@ -396,9 +400,20 @@ def _is_schema_field_clause(
     return bool(_BENIGN_AR_SCHEMA_FIELD_PATTERN.search(continuation))
 
 
-def _is_negated_warning_mandate_clause(match_clause: str) -> bool:
-    """Return True when the clause reads 'never/do not/don't ... without warning(s)'."""
-    return bool(_AR2_NEGATED_WARNING_MANDATE_PATTERN.search(match_clause))
+def _is_negated_warning_mandate_clause(
+    match_clause: str, clause_match_start: int, clause_match_end: int
+) -> bool:
+    """Return True when THIS finding's own span sits inside a 'never/do not/don't ...
+    without warning(s)' mandate, not merely somewhere in the same (comma/semicolon-only)
+    clause. _CLAUSE_BOUNDARY_PATTERN does not split on a coordinator like ", but", so an
+    unrelated earlier finding (e.g. "Do not include any disclaimers, but never run
+    scripts without warning the user.") shares its clause text with a real mandate later
+    in the sentence; only the finding the mandate actually covers should be exempted.
+    """
+    for mandate in _AR2_NEGATED_WARNING_MANDATE_PATTERN.finditer(match_clause):
+        if mandate.start() <= clause_match_start and mandate.end() >= clause_match_end:
+            return True
+    return False
 
 
 def _is_benign_ar_context(
@@ -445,7 +460,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 line_start = content.rfind("\n", 0, match.start()) + 1
                 line_match_start = match.start() - line_start
                 line_match_end = line_match_start + len(match.group(0))
-                match_clause, _, _ = _match_clause(match_line, line_match_start, line_match_end)
+                match_clause, clause_match_start, clause_match_end = _match_clause(
+                    match_line, line_match_start, line_match_end
+                )
                 is_directive = _is_directly_instructive(match_clause.lower(), match.group(0))
                 example_context = is_code_example(context) and _is_explicit_example_context(context)
                 benign_context = _is_benign_ar_context(
@@ -456,7 +473,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     previous_line=previous_line,
                 )
                 negated_mandate = rule_id == "AR2" and _is_negated_warning_mandate_clause(
-                    match_clause
+                    match_clause, clause_match_start, clause_match_end
                 )
                 finding_tags = list(tag)
                 if security_review_context or example_context or benign_context or negated_mandate:
