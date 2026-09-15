@@ -520,6 +520,65 @@ def test_cli_mcp_registry_exits_1_when_aggregate_risk_crosses_threshold(tmp_path
     assert json.loads(result.output)["risk_score"] == 95
 
 
+def test_cli_mcp_registry_fail_on_findings_exits_1_below_risk_threshold(
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "server": {
+                            "name": "mutable/example",
+                            "repository": {
+                                "url": "https://github.com/example/project",
+                                "source": "github",
+                            },
+                            "packages": [
+                                {
+                                    "registryType": "npm",
+                                    "identifier": "example",
+                                    "version": "latest",
+                                    "fileSha256": "a" * 64,
+                                    "transport": {"type": "stdio"},
+                                }
+                            ],
+                            "remotes": [
+                                {
+                                    "type": "streamable-http",
+                                    "url": "https://example.invalid/mcp",
+                                }
+                            ],
+                        },
+                        "_meta": {
+                            "io.modelcontextprotocol.registry/official": {"status": "active"}
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(payload),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--fail-on-findings",
+        ],
+    )
+
+    assert result.exit_code == 1
+    report = json.loads(result.output)
+    assert report["risk_score"] == 30
+    assert [finding["id"] for finding in report["findings"]] == ["MCP-PACKAGE-VERSION"]
+
+
 @pytest.mark.parametrize(
     "args", [[], ["--format", "terminal"], ["--format", "markdown"], ["--format", "sarif"]]
 )

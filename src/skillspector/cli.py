@@ -578,6 +578,8 @@ def scan(
                 console.print(f"Report saved to: {output}")
             else:
                 print(report)
+            if fail_on_findings and result["findings"]:
+                raise typer.Exit(code=1)
             if result["risk_score"] > RISK_THRESHOLD:
                 raise typer.Exit(code=1)
         except typer.Exit:
