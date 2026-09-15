@@ -175,14 +175,23 @@ _PE3_TOKEN_ACTION_CONTEXT = re.compile(
     r"share(?:s|d|ing)?|expose(?:s|d|ing)?|log(?:s|ged|ging)?|"
     r"print(?:s|ed|ing)?|write(?:s|written|writing)?|publish(?:es|ed|ing)?|"
     r"display(?:s|ed|ing)?|giv(?:e|es|ing|en)|reveal(?:s|ed|ing)?|"
-    r"email(?:s|ed|ing)?|include(?:s|d|ing)?|past(?:e|es|ed|ing)|"
-    r"submit(?:s|ted|ting)?|attach(?:es|ed|ing)?|relay(?:s|ed|ing)?|"
-    r"deliver(?:s|ed|ing)?)\b"
+    r"email(?:s|ed|ing)?|include(?:s|d|ing)?)\b"
     r"|\bpost(?:s|ed|ing)?\b[^\n]{0,80}"
     r"\b(?:it|them|(?:the\s+)?(?:access|refresh|bearer|api)[ _-]?tokens?)\b"
     r"[^\n]{0,40}\bto\b"
     r"|\b(?:read(?:s|ing)?|open(?:s|ed|ing)?|load(?:s|ed|ing)?)\b[^\n]{0,80}"
     r"\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
+    re.IGNORECASE,
+)
+_PE3_BOUND_TOKEN_TRANSFER = re.compile(
+    r"\b(?:past(?:e|es|ed|ing)|submit(?:s|ted|ting)?|attach(?:es|ed|ing)?|"
+    r"relay(?:s|ed|ing)?|deliver(?:s|ed|ing)?|put(?:s|ting)?|"
+    r"pass(?:es|ed|ing)?|enter(?:s|ed|ing)?|insert(?:s|ed|ing)?)\b"
+    r"[\s`'\"-]{0,24}"
+    r"(?:it|them|(?:(?:the|this|that|these|those|returned|resulting|oauth|oidc|"
+    r"access|refresh|bearer|api)\s+){0,5}tokens?)\b"
+    r"[^.!?;\r\n\v\f\x1c-\x1e\x85\u2028\u2029]{0,96}?"
+    r"\b(?:to|into|onto|through|via|in|on|with|as)\b(?=\s+\S)",
     re.IGNORECASE,
 )
 _PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
@@ -232,8 +241,9 @@ _PE3_OAUTH_OWNER_BRIDGE = re.compile(
 _PE3_OAUTH_CAUSATIVE_PREFIX = re.compile(
     r"\b(?:have|has|had|make|makes|made|let|lets|cause|causes|caused|"
     r"force|forces|forced|ask|asks|asked|tell|tells|told|instruct|instructs|"
-    r"instructed|get|gets|got)\b[^.;:|]{0,96}$|"
-    r"^\s*(?:please\s+)?(?:ensure|confirm|verify|make\s+sure)\b",
+    r"instructed|get|gets|got|request|requests|require|requires|command|commands|"
+    r"direct|directs|order|orders|prompt|prompts|ensure|confirm|verify|check|"
+    r"configure|use|please|must|should|shall|need|needs|can|could|may|will|would)\b",
     re.IGNORECASE,
 )
 _PE3_OAUTH_BARE_RESULT_VERBS = frozenset({"return", "issue", "provide", "yield"})
@@ -291,6 +301,37 @@ def _source_line(
     """Return only the source line containing *match*."""
     line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
     return content[line_start:line_end]
+
+
+def _has_bound_token_transfer(
+    content: str,
+    match: re.Match[str],
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+) -> bool:
+    """Return whether a transfer instruction is bound to this token.
+
+    The generic PE3 action veto intentionally fails closed on established
+    credential verbs. The additional natural-language transfer verbs here are
+    common in unrelated documentation, so require both a token/anaphoric
+    recipient and a destination rather than treating any nearby ``paste`` or
+    ``attach`` as credential access.
+    """
+    if line_starts is None or line_ends is None:
+        line_starts, line_ends = _source_line_metadata(content)
+    line_index = bisect_right(line_starts, match.start()) - 1
+    window_end = line_ends[min(line_index + 3, len(line_ends) - 1)]
+    window_start = line_starts[line_index]
+    window = content[window_start:window_end]
+    match_start = match.start() - window_start
+    match_end = match.end() - window_start
+    for transfer in _PE3_BOUND_TOKEN_TRANSFER.finditer(window):
+        # Direct instructions contain this exact token match. Anaphoric
+        # instructions ("Paste it ...") must follow it in the same bounded
+        # context window.
+        if transfer.start() <= match_start < transfer.end() or transfer.start() >= match_end:
+            return True
+    return False
 
 
 _PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
@@ -492,7 +533,11 @@ def _is_access_token_documentation_noun(
     if not in_documentation_directory:
         return False
     context = get_context(content, match.start())
-    if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
+    if (
+        _PE3_TOKEN_ACTION_CONTEXT.search(context)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(context)
+        or _has_bound_token_transfer(content, match, line_starts, line_ends)
+    ):
         return False
 
     line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
@@ -548,7 +593,9 @@ def _is_companion_cli_oauth_result_noun(
         return False
     context = get_context(content, match.start())
     return not (
-        _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context)
+        _PE3_TOKEN_ACTION_CONTEXT.search(context)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(context)
+        or _has_bound_token_transfer(content, match, line_starts, line_ends)
     )
 
 
