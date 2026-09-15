@@ -284,7 +284,7 @@ def test_scandir_checks_shared_deadline_for_each_directory_entry(
 
     assert paths == []
     assert excluded == {}
-    assert gaps == {".": (None, LedgerReason.RUNTIME_LIMIT)}
+    assert gaps == {"SKILL.md": (None, LedgerReason.RUNTIME_LIMIT)}
     assert len(events) == 1
     assert events[0]["outcome"] == "partial"
     assert events[0]["reason_code"] == LedgerReason.RUNTIME_LIMIT

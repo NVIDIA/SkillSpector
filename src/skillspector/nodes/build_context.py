@@ -326,7 +326,9 @@ def _walk_skill_files(
         return f"{relative_root.as_posix()}/" if relative_root.parts else "SKILL.md"
 
     def _gap_path(relative_root: Path) -> str:
-        return relative_root.as_posix() if relative_root.parts else "."
+        # Ledger paths are report-safe relative artifact paths; ``."`` is not
+        # valid and would make SC9 evidence disappear in the guarded analyzer.
+        return relative_root.as_posix() if relative_root.parts else "SKILL.md"
 
     def _record_excluded_gap(
         path: str,
