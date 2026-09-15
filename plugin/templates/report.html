@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NVIDIA Skill Inspector — Security Report</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<script src="/static/js/cytoscape.min.js"></script>
+<style>
+:root { --nvidia:#76B900; --bg:#0a0e14; --card:#111821; --border:#1f2a37; --text:#e6edf3; --muted:#8b949e; --critical:#ff3b30; --high:#ff9500; --medium:#ffcc02; --low:#34c759; --info:#5ac8fa; }
+* { scrollbar-width: thin; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">⬢</span> NVIDIA Skill Inspector <small>Security Plugin — 100% Offline • Deterministic</small></div>
+  <div class="meta">Scan <code>{{ scan_id }}</code> • {{ timestamp }}<br>Root <code title="{{ skills_root }}">{{ skills_root }}</code></div>
+</header>
+<nav class="tabs">
+  <button class="tab active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="findings">Findings ({{ summary.total_findings }})</button>
+  <button class="tab" data-tab="scorecards">Scorecards</button>
+  <button class="tab" data-tab="graph">Graph</button>
+  <button class="tab" data-tab="sbom">SBOM</button>
+  <button class="tab" data-tab="provenance">Provenance</button>
+</nav>
+<main>
+<section id="overview" class="panel active">
+  <div class="cards">
+    <div class="card"><h3>{{ summary.total_skills }}</h3><p>Skills Scanned</p><small>under {{ skills_root.split('/')[-1] if '/' in skills_root else skills_root }}</small></div>
+    <div class="card"><h3>{{ summary.total_findings }}</h3><p>Total Findings</p><small>deterministic static analysis</small></div>
+    <div class="card"><h3>{{ summary.avg_score }}</h3><p>Avg Security Score</p><small>0-100 higher is better</small></div>
+    <div class="card grade">
+      {% set avg = summary.avg_score %}
+      {% if avg >= 90 %}{% set g='A' %}{% elif avg >= 80 %}{% set g='B' %}{% elif avg >= 65 %}{% set g='C' %}{% elif avg >= 45 %}{% set g='D' %}{% else %}{% set g='F' %}{% endif %}
+      <h3 class="grade-{{ g|lower }}">{{ g }}</h3><p>Overall Grade</p><small>from avg_score</small></div>
+  </div>
+  <div class="severity-bar">
+    {% set sc = summary.severity_counts %}
+    <span class="sev critical">Critical {{ sc.critical or 0 }}</span>
+    <span class="sev high">High {{ sc.high or 0 }}</span>
+    <span class="sev medium">Medium {{ sc.medium or 0 }}</span>
+    <span class="sev low">Low {{ sc.low or 0 }}</span>
+    <span class="sev info">Info {{ sc.info or 0 }}</span>
+    <span class="sev" style="margin-left:auto; border-color:var(--nvidia); color:var(--nvidia)">Offline • No LLM • No Cloud</span>
+  </div>
+  {% if skills %}
+  <div class="skill-overview">
+    <h3>Per-Skill Summary</h3>
+    <table class="compact">
+      <thead><tr><th>Skill</th><th>Version</th><th>Score</th><th>Grade</th><th>Findings</th><th>Privacy</th><th>Capabilities</th></tr></thead>
+      <tbody>
+      {% for s in skills %}
+        <tr>
+          <td><strong>{{ s.name }}</strong><br><small class="muted">{{ s.author }}</small></td>
+          <td><code>{{ s.version }}</code></td>
+          <td><span class="badge {{ s.scorecard.severity_counts.critical and 'critical' or s.scorecard.severity_counts.high and 'high' or 'low' }}">{{ s.scorecard.score }}/100</span></td>
+          <td><span class="badge grade-{{ s.scorecard.grade|lower }}">{{ s.scorecard.grade }}</span></td>
+          <td>{{ s.findings|length }}</td>
+          <td><small>{{ s.privacy.categories|join(', ') or 'none' }}<br><span class="muted">risk {{ s.privacy.flows.risk }}</span></small></td>
+          <td><small>{% if s.capabilities.network %}🌐 network {% endif %}{% if s.capabilities.subprocess %}⚙ subprocess {% endif %}{% if s.capabilities.file_write %}💾 write {% elif s.capabilities.file_read %}📖 read {% endif %}</small></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  <div class="graph-metrics" style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px">
+    <div class="card" style="text-align:left">
+      <h4>Dependency Graph</h4>
+      <div class="kv"><span>Nodes</span><b>{{ metrics.num_nodes if metrics.num_nodes is not none else (graph.nodes|length if graph.nodes else 0) }}</b></div>
+      <div class="kv"><span>Edges</span><b>{{ metrics.num_edges if metrics.num_edges is not none else (graph.edges|length if graph.edges else 0) }}</b></div>
+      <div class="kv"><span>DAG</span><b>{{ 'Yes' if metrics.is_dag else 'No' if metrics.is_dag is not none else '—' }}</b></div>
+      <div class="kv"><span>Isolated</span><b>{{ metrics.isolated|join(', ') if metrics.isolated else 'none' }}</b></div>
+      {% if metrics.cycles and metrics.cycles|length %}<div class="kv" style="color:var(--high)"><span>Cycles</span><b>{{ metrics.cycles|length }} detected</b></div>{% endif %}
+    </div>
+    <div class="card" style="text-align:left">
+      <h4>Storage & Provenance</h4>
+      <div class="kv"><span>DB</span><code style="font-size:11px">~/.skill-inspector/skill_inspector.db</code></div>
+      <div class="kv"><span>Reports</span><code style="font-size:11px">~/.skill-inspector/reports/{{ scan_id }}.json</code></div>
+      <div class="kv"><span>SBOMs</span><code style="font-size:11px">~/.skill-inspector/sbom/</code></div>
+      <div class="kv"><span>Mode</span><b>Offline • Deterministic • Air-gapped</b></div>
+    </div>
+  </div>
+  {% if metrics.cycles and metrics.cycles|length %}
+  <div class="alert high" style="margin-top:12px">⚠ Dependency cycles detected: <code>{{ metrics.cycles }}</code> — review load order and trust.</div>
+  {% endif %}
+</section>
+
+<section id="findings" class="panel">
+  <div class="panel-head">
+    <h2>Findings — {{ summary.total_findings }} <small class="muted">sortable, filterable, deterministic</small></h2>
+    <div class="actions"><button onclick="exportFindingsCSV()">Export CSV</button> <button onclick="copyJSON()">Copy JSON</button></div>
+  </div>
+  <div class="filters">
+    <select id="filter-severity"><option value="">All Severities</option><option value="critical">critical</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option><option value="info">info</option></select>
+    <select id="filter-category"><option value="">All Categories</option><option value="secrets">secrets</option><option value="permission">permission</option><option value="privacy">privacy</option><option value="provenance">provenance</option><option value="diff">diff</option><option value="network">network</option><option value="subprocess">subprocess</option></select>
+    <input id="filter-skill" placeholder="Filter skill name…" style="min-width:140px">
+    <input id="filter-search" placeholder="Search rule, message, evidence…" style="flex:1">
+  </div>
+  <div class="tablewrap">
+  <table id="findings-table">
+    <thead><tr><th>Skill</th><th>Severity</th><th>Category</th><th>Rule</th><th>Message</th><th>File:Line</th><th>Evidence / Fix</th></tr></thead>
+    <tbody>
+      {% for skill in skills %}
+        {% for f in skill.findings %}
+        <tr data-sev="{{ f.severity|lower }}" data-cat="{{ f.category|lower }}" data-skill="{{ skill.name|lower }}">
+          <td><strong>{{ skill.name }}</strong></td>
+          <td><span class="badge {{ f.severity|lower }}">{{ f.severity }}</span></td>
+          <td><code>{{ f.category }}</code></td>
+          <td><code>{{ f.rule_id }}</code></td>
+          <td><div class="msg">{{ f.message }}</div>{% if f.fix %}<div class="fix"><b>Fix:</b> {{ f.fix }}</div>{% endif %}</td>
+          <td><code>{{ f.file }}{% if f.line %}:{{ f.line }}{% endif %}</code></td>
+          <td class="evidence"><div class="ev">{{ f.evidence|e }}</div></td>
+        </tr>
+        {% endfor %}
+      {% endfor %}
+      {% if summary.total_findings == 0 %}
+      <tr><td colspan="7" style="text-align:center; padding:24px; color:var(--muted)">No findings — skill appears clean under static analysis (re-run on version change).</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="scorecards" class="panel">
+  <h2>Skill Security Scorecards <small class="muted">0-100 • grade A-F • weighted by severity×category</small></h2>
+  {% if not skills %}<p class="muted">No skills found.</p>{% endif %}
+  <div class="scorecards">
+    {% for skill in skills %}
+    <div class="scorecard">
+      <div class="score-header">
+        <div>
+          <h3>{{ skill.name }} <small>v{{ skill.version }}</small> <small class="muted">• {{ skill.author }}</small></h3>
+          <div class="muted" style="font-size:12px">hash <code title="{{ skill.hash_sha256 }}">{{ skill.hash_sha256[:12] }}…</code> • {{ skill.origin }}</div>
+        </div>
+        <div class="score grade-{{ skill.scorecard.grade|lower }}">{{ skill.scorecard.score }}/100 <span>{{ skill.scorecard.grade }}</span></div>
+      </div>
+      <div class="progress" style="height:6px; background:var(--border); border-radius:999px; overflow:hidden; margin:8px 0"><div style="height:100%; width:{{ skill.scorecard.score }}%; background:var(--nvidia)"></div></div>
+      <p class="explanation">{{ skill.scorecard.explanation }}</p>
+      <div class="counts">
+        {% for k,v in skill.scorecard.severity_counts.items() %}{% if v>0 %}<span class="badge {{ k }}">{{ k }}: {{ v }}</span>{% endif %}{% endfor %}
+      </div>
+      {% if skill.scorecard.top_risks and skill.scorecard.top_risks|length %}
+      <details open><summary>Top Risks ({{ skill.scorecard.top_risks|length }})</summary>
+        <table class="compact" style="margin-top:8px"><thead><tr><th>Rule</th><th>Sev</th><th>Deduction</th><th>Message</th></tr></thead><tbody>
+        {% for r in skill.scorecard.top_risks %}
+          <tr><td><code>{{ r.rule_id }}</code></td><td><span class="badge {{ r.severity }}">{{ r.severity }}</span></td><td>-{{ r.deduction }}</td><td>{{ r.message }}</td></tr>
+        {% endfor %}
+        </tbody></table>
+      </details>
+      {% endif %}
+      <details><summary>Recommendations</summary><ul>{% for rec in skill.scorecard.recommendations %}<li>{{ rec }}</li>{% endfor %}</ul></details>
+      <details><summary>Privacy & Data Flows</summary>
+        <div class="kv"><span>Categories</span><b>{{ skill.privacy.categories|join(', ') or 'none' }}</b></div>
+        <div class="kv"><span>Flows</span><b>read {{ skill.privacy.flows.reads }} • write {{ skill.privacy.flows.writes }} • transmit {{ skill.privacy.flows.transmits }}</b> <span class="badge {{ 'high' if skill.privacy.flows.risk=='high' else 'medium' if skill.privacy.flows.risk=='medium' else 'low' }}">{{ skill.privacy.flows.risk }}</span></div>
+        <div class="kv"><span>Summary</span><small>{{ skill.privacy.summary }}</small></div>
+        {% if skill.privacy.details and skill.privacy.details|length %}<details><summary>Per-file signals ({{ skill.privacy.details|length }})</summary><ul>{% for d in skill.privacy.details[:10] %}<li><code>{{ d.file }}</code> → {{ d.category }} <small class="muted">{{ d.pattern }}</small></li>{% endfor %}{% if skill.privacy.details|length>10 %}<li><small class="muted">… {{ skill.privacy.details|length -10 }} more</small></li>{% endif %}</ul></details>{% endif %}
+      </details>
+      <details><summary>Capabilities Detected</summary><pre style="max-height:160px; overflow:auto">{{ skill.capabilities | tojson(indent=2) }}</pre></details>
+      <details><summary>Findings for this skill ({{ skill.findings|length }})</summary><ul>{% for f in skill.findings %}<li><code>{{ f.rule_id }}</code> <span class="badge {{ f.severity|lower }}">{{ f.severity }}</span> {{ f.message }} <small class="muted">— {{ f.file }}{% if f.line %}:{{ f.line }}{% endif %}</small></li>{% endfor %}</ul></details>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section id="graph" class="panel">
+  <h2>Skill Dependency Graph <small class="muted">networkx → Cytoscape (offline)</small></h2>
+  <div id="cy"></div>
+  <div class="legend"><span class="dot internal"></span> Local Skill <span class="dot external"></span> External Dependency <span class="dot" style="background:var(--info)"></span> Isolated</div>
+  <div id="graph-empty" style="display:none; padding:12px; color:var(--muted); text-align:center">No dependencies detected — skills are isolated.</div>
+  <div class="graph-table" style="margin-top:12px">
+    <h4>Edges</h4>
+    <table class="compact" id="graph-edges"><thead><tr><th>From</th><th>To</th><th>Type</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<section id="sbom" class="panel">
+  <h2>SBOM — CycloneDX 1.5 <small class="muted">offline, hashed, no external DB</small></h2>
+  <p>Aggregate: <code>{{ summary.sbom_aggregate }}</code> <button onclick="navigator.clipboard.writeText('{{ summary.sbom_aggregate }}')">copy</button></p>
+  <div class="sbom-grid">
+    {% for skill in skills %}
+    <div class="card" style="text-align:left">
+      <h4>{{ skill.name }} <small>v{{ skill.version }}</small></h4>
+      <div class="kv"><span>Components</span><b>{{ skill.sbom_components }}</b></div>
+      <div class="kv"><span>SBOM</span><code style="font-size:11px; word-break:break-all">{{ skill.sbom_path }}</code></div>
+      <div style="margin-top:8px; display:flex; gap:8px">
+        <a class="btn" href="/sbom/{{ skill.name }}" target="_blank">Download JSON</a>
+        <button onclick="loadSBOM('{{ skill.name }}')">Preview</button>
+      </div>
+      <pre id="sbom-{{ skill.name }}" style="display:none; max-height:220px; overflow:auto; margin-top:8px"></pre>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section id="provenance" class="panel">
+  <h2>Provenance & Reputation <small class="muted">hashes + version history (SQLite)</small></h2>
+  <table>
+    <thead><tr><th>Skill</th><th>Version</th><th>Author</th><th>Origin</th><th>SHA256</th><th>Capabilities</th></tr></thead>
+    <tbody>
+      {% for skill in skills %}
+      <tr>
+        <td><strong>{{ skill.name }}</strong></td>
+        <td><code>{{ skill.version }}</code></td>
+        <td>{{ skill.author }}</td>
+        <td><small title="{{ skill.origin }}">{{ skill.origin|truncate(24) }}</small></td>
+        <td><code title="{{ skill.hash_sha256 }}" style="cursor:copy" onclick="navigator.clipboard.writeText('{{ skill.hash_sha256 }}')">{{ skill.hash_sha256[:16] }}…</code></td>
+        <td><small>{{ skill.capabilities.network and '🌐' or '' }} {{ skill.capabilities.subprocess and '⚙' or '' }} {{ skill.privacy.categories|join(', ') or 'none' }}</small></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted" style="margin-top:8px">History stored in <code>~/.skill-inspector/skill_inspector.db</code> table <code>provenance</code> — author changes flagged as <code>PROV-001</code>.</p>
+</section>
+</main>
+<footer>Local report served on <code>http://127.0.0.1</code> only — no cloud, no telemetry, no LLM. Stored under <code>~/.skill-inspector/</code> (SQLite).</footer>
+<script id="graph-data" type="application/json">{{ graph_json | safe }}</script>
+<script id="skills-data" type="application/json">{{ skills_json | safe }}</script>
+<script src="/static/js/graph.js"></script>
+<script>
+// Tabs
+document.querySelectorAll('.tab').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(btn.dataset.tab).classList.add('active');
+    if(btn.dataset.tab==='graph' && window.renderGraph) window.renderGraph();
+  });
+});
+// Filters
+const sevSel=document.getElementById('filter-severity'), catSel=document.getElementById('filter-category'), skillSel=document.getElementById('filter-skill'), search=document.getElementById('filter-search');
+function filterRows(){
+  const sev=(sevSel?.value||'').toLowerCase(), cat=(catSel?.value||'').toLowerCase(), sk=(skillSel?.value||'').toLowerCase(), q=(search?.value||'').toLowerCase();
+  document.querySelectorAll('#findings-table tbody tr').forEach(tr=>{
+    const okSev=!sev || tr.dataset.sev===sev;
+    const okCat=!cat || tr.dataset.cat===cat;
+    const okSk=!sk || tr.dataset.skill.includes(sk);
+    const okQ=!q || tr.textContent.toLowerCase().includes(q);
+    tr.style.display=(okSev&&okCat&&okSk&&okQ?'':'none');
+  });
+}
+[sevSel,catSel,skillSel,search].forEach(el=>el&&el.addEventListener('input',filterRows));
+// SBOM preview
+async function loadSBOM(skill){
+  const pre=document.getElementById('sbom-'+skill);
+  if(!pre) return;
+  if(pre.style.display==='block'){ pre.style.display='none'; return; }
+  pre.textContent='Loading…'; pre.style.display='block';
+  try{
+    const r=await fetch('/sbom/'+encodeURIComponent(skill));
+    if(!r.ok) throw new Error(r.statusText);
+    const j=await r.json();
+    pre.textContent=JSON.stringify(j.components?.slice(0,20) || j, null, 2) + (j.components&&j.components.length>20 ? '\n… '+(j.components.length-20)+' more' : '');
+  }catch(e){ pre.textContent='Failed: '+e; }
+}
+function exportFindingsCSV(){
+  const rows=[['skill','severity','category','rule','message','file','evidence']];
+  document.querySelectorAll('#findings-table tbody tr').forEach(tr=>{
+    if(tr.style.display==='none') return;
+    const tds=[...tr.children].map(td=> '"'+td.textContent.replace(/"/g,'""')+'"');
+    if(tds.length) rows.push(tds);
+  });
+  const csv=rows.map(r=>r.join(',')).join('\n');
+  const blob=new Blob([csv],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='findings.csv'; a.click();
+}
+function copyJSON(){
+  const data=document.getElementById('skills-data')?.textContent;
+  if(data) navigator.clipboard.writeText(data);
+}
+// Populate graph edges table
+try{
+  const g=JSON.parse(document.getElementById('graph-data')?.textContent||'{"edges":[]}');
+  const tbody=document.querySelector('#graph-edges tbody');
+  if(tbody){
+    if(!g.edges || !g.edges.length){ document.getElementById('graph-empty').style.display='block'; }
+    else g.edges.forEach(e=>{ const tr=document.createElement('tr'); tr.innerHTML=`<td>${e.data.source}</td><td>${e.data.target}</td><td>${e.data.type}</td>`; tbody.appendChild(tr); });
+  }
+}catch(e){}
+</script>
+</body>
+</html>

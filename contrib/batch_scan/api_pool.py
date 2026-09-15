@@ -290,8 +290,7 @@ class ApiKeyPool:
                 key.rate_limited = True
                 self._rate_limits_hit += 1
                 logger.warning(
-                    "Pool: key …%s rate-limited for %.0fs "
-                    "(consecutive=%d)",
+                    "Pool: key …%s rate-limited for %.0fs (consecutive=%d)",
                     key.key[-8:],
                     backoff,
                     key.consecutive_429,
@@ -361,9 +360,7 @@ class ApiKeyPool:
             if k.rate_limited and now >= k.rate_limited_until:
                 k.rate_limited = False
                 k.consecutive_429 = 0
-                logger.info(
-                    "Pool: key …%s recovered (backoff expired)", k.key[-8:]
-                )
+                logger.info("Pool: key …%s recovered (backoff expired)", k.key[-8:])
 
     def _next_available_in(self, now: float) -> float | None:
         """Seconds until the earliest rate-limited key recovers, or ``None``."""
@@ -377,10 +374,7 @@ class ApiKeyPool:
         active = sum(k.active_requests for k in self._keys)
         total = sum(k.max_concurrent for k in self._keys)
         rate_limited = sum(1 for k in self._keys if k.rate_limited)
-        return (
-            f"{active}/{total} slots active, "
-            f"{rate_limited} key(s) rate-limited"
-        )
+        return f"{active}/{total} slots active, {rate_limited} key(s) rate-limited"
 
     @staticmethod
     def _remaining_timeout(deadline: float | None) -> float | None:
@@ -473,8 +467,7 @@ class PooledChatModel:
                 if self._is_rate_limit(exc) and attempt < self._max_retries:
                     self._pool.release(key, success=False)
                     logger.debug(
-                        "PooledChatModel: rate-limited, retrying "
-                        "(attempt %d/%d)",
+                        "PooledChatModel: rate-limited, retrying (attempt %d/%d)",
                         attempt + 1,
                         self._max_retries,
                     )
@@ -484,8 +477,7 @@ class PooledChatModel:
                 raise
 
         raise RuntimeError(
-            f"PooledChatModel: exhausted {self._max_retries} retries "
-            "due to rate-limit errors"
+            f"PooledChatModel: exhausted {self._max_retries} retries due to rate-limit errors"
         ) from last_exception
 
     async def _ainvoke_with_retry(
@@ -496,6 +488,7 @@ class PooledChatModel:
     ) -> object:
         """Async retry loop — non-blocking acquire first, block only if full."""
         import asyncio
+
         last_exception: Exception | None = None
 
         for attempt in range(self._max_retries + 1):
@@ -516,8 +509,7 @@ class PooledChatModel:
                 if self._is_rate_limit(exc) and attempt < self._max_retries:
                     self._pool.release(key, success=False)
                     logger.debug(
-                        "PooledChatModel: rate-limited, retrying "
-                        "(attempt %d/%d)",
+                        "PooledChatModel: rate-limited, retrying (attempt %d/%d)",
                         attempt + 1,
                         self._max_retries,
                     )
@@ -527,8 +519,7 @@ class PooledChatModel:
                 raise
 
         raise RuntimeError(
-            f"PooledChatModel: exhausted {self._max_retries} retries "
-            "due to rate-limit errors"
+            f"PooledChatModel: exhausted {self._max_retries} retries due to rate-limit errors"
         ) from last_exception
 
     def _build_llm(self, key: ApiKey):
@@ -538,6 +529,7 @@ class PooledChatModel:
 
         try:
             import httpx
+
             _timeout = httpx.Timeout(self._timeout, connect=8.0)
         except ImportError:
             _timeout = self._timeout
@@ -555,6 +547,7 @@ class PooledChatModel:
         """Detect rate-limit errors from common LLM provider SDKs."""
         try:
             import openai
+
             if isinstance(exc, openai.RateLimitError):
                 return True
         except ImportError:
@@ -610,27 +603,39 @@ def create_api_key_pool_from_env(
             key_str = parts[0].strip()
             base_url = parts[1].strip() if len(parts) > 1 else None
             model = parts[2].strip() if len(parts) > 2 else "gpt-5.4"
-            keys.append(ApiKey(
-                key=key_str, base_url=base_url, model=model,
-                max_concurrent=max_concurrent_per_key,
-            ))
+            keys.append(
+                ApiKey(
+                    key=key_str,
+                    base_url=base_url,
+                    model=model,
+                    max_concurrent=max_concurrent_per_key,
+                )
+            )
 
     if not keys:
         base = os.environ.get("OPENAI_API_KEY", "").strip()
         base_url = os.environ.get("OPENAI_BASE_URL", None)
         if base:
-            keys.append(ApiKey(
-                key=base, base_url=base_url, model="gpt-5.4",
-                max_concurrent=max_concurrent_per_key,
-            ))
+            keys.append(
+                ApiKey(
+                    key=base,
+                    base_url=base_url,
+                    model="gpt-5.4",
+                    max_concurrent=max_concurrent_per_key,
+                )
+            )
         for idx in range(2, 10):
             extra = os.environ.get(f"OPENAI_API_KEY_{idx}", "").strip()
             if not extra:
                 break
-            keys.append(ApiKey(
-                key=extra, base_url=base_url, model="gpt-5.4",
-                max_concurrent=max_concurrent_per_key,
-            ))
+            keys.append(
+                ApiKey(
+                    key=extra,
+                    base_url=base_url,
+                    model="gpt-5.4",
+                    max_concurrent=max_concurrent_per_key,
+                )
+            )
 
     if len(keys) <= 1:
         return None
@@ -638,6 +643,8 @@ def create_api_key_pool_from_env(
     total_cap = len(keys) * max_concurrent_per_key
     logger.info(
         "ApiKeyPool: %d keys × %d slots = %d total capacity",
-        len(keys), max_concurrent_per_key, total_cap,
+        len(keys),
+        max_concurrent_per_key,
+        total_cap,
     )
     return ApiKeyPool(keys)

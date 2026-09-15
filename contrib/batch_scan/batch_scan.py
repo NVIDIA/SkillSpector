@@ -61,6 +61,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from pathlib import Path
+
 from skillspector.constants import MODEL_CONFIG
 from skillspector.logging_config import set_level
 
@@ -157,14 +158,10 @@ def _scan_skill(
     # Gap-fill for non-English skills (post-graph, appends to issues)
     if lang != "en" and use_llm and not error_msg:
         fc = _read_skill_files(skill_dir)
-        gap_findings = run_gap_fill(
-            fc, lang, model=MODEL_CONFIG.get("default"), api_pool=api_pool
-        )
+        gap_findings = run_gap_fill(fc, lang, model=MODEL_CONFIG.get("default"), api_pool=api_pool)
         if gap_findings:
             existing = list(entry.get("issues", []))
-            new_issues = annotate_findings(
-                [f.to_dict() for f in gap_findings], lang
-            )
+            new_issues = annotate_findings([f.to_dict() for f in gap_findings], lang)
             entry["issues"] = existing + new_issues  # type: ignore[operator]
         # Patch enhancements so reports can show what was applied
         entry["enhancements"]["gap_fill_applied"] = True
@@ -302,13 +299,13 @@ def _main_impl() -> None:
     api_pool = create_api_key_pool_from_env()
     if api_pool:
         from .runner import set_api_pool
+
         set_api_pool(api_pool)
     use_llm = not args.no_llm
 
     # -- Header --------------------------------------------------------------
     pool_note = (
-        f", [green]{api_pool.keys_configured} keys "
-        f"({api_pool.total_capacity} slots)[/green]"
+        f", [green]{api_pool.keys_configured} keys ({api_pool.total_capacity} slots)[/green]"
         if api_pool
         else ""
     )
@@ -360,10 +357,7 @@ def _main_impl() -> None:
             except TimeoutError:
                 errors += 1
                 with _print_lock:
-                    _print(
-                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[red]TIMEOUT (90s)[/red]"
-                    )
+                    _print(f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → [red]TIMEOUT (90s)[/red]")
                 # Don't retry — the worker thread is still stuck and a
                 # retry would consume another slot.  HTTP-level timeouts
                 # (runner.py Patch 6) prevent most hangs from happening.
@@ -373,10 +367,7 @@ def _main_impl() -> None:
                 # Don't retry — log and continue.
                 errors += 1
                 with _print_lock:
-                    _print(
-                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[red]CRASH[/red]"
-                    )
+                    _print(f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → [red]CRASH[/red]")
                 continue
             lang = lang_map[skill_dirs[idx - 1]]
             results.append(entry)
@@ -397,8 +388,7 @@ def _main_impl() -> None:
                 if error_msg:
                     errors += 1
                     _print(
-                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → "
-                        f"[red]ERROR: {error_msg}[/red]"
+                        f"  [{idx}/{total}] [cyan]{rel_name}[/cyan] → [red]ERROR: {error_msg}[/red]"
                     )
                 else:
                     risk = entry.get("risk_assessment", {})
@@ -427,13 +417,10 @@ def _main_impl() -> None:
             f"{snap['total_requests_served']} requests served",
         ]
         if snap.get("peak_active_requests", 0) > 0:
-            _parts.append(
-                f"peak {snap['peak_active_requests']}/{snap['total_capacity']} slots"
-            )
+            _parts.append(f"peak {snap['peak_active_requests']}/{snap['total_capacity']} slots")
         if snap.get("rate_limits_hit", 0) > 0:
             _parts.append(
-                f"{snap['rate_limits_hit']} rate-limit(s), "
-                f"{snap['retry_successes']} retried"
+                f"{snap['rate_limits_hit']} rate-limit(s), {snap['retry_successes']} retried"
             )
         _parts.append(f"{snap['keys_configured']} keys")
         _print(f"\n[dim]API Pool: {', '.join(_parts)}[/dim]")

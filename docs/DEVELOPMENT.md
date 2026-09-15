@@ -202,11 +202,13 @@ The CLI passes `input_path` to the graph. The **resolve_input** node (using [inp
 ```python
 from skillspector import graph
 
-result = graph.invoke({
-    "input_path": "/path/to/skill",  # or use "skill_path" for a local dir
-    "output_format": "json",   # optional: terminal, json, markdown, sarif (default sarif)
-    "use_llm": True,           # optional: False to skip LLM in meta_analyzer
-})
+result = graph.invoke(
+    {
+        "input_path": "/path/to/skill",  # or use "skill_path" for a local dir
+        "output_format": "json",  # optional: terminal, json, markdown, sarif (default sarif)
+        "use_llm": True,  # optional: False to skip LLM in meta_analyzer
+    }
+)
 # Or: graph.stream(...)
 ```
 
