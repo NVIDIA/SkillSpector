@@ -139,6 +139,12 @@ class TestReflectiveGetattrExec:
         findings = _run("import builtins\ngetattr(builtins, 'exec')(payload)")
         assert any(f.rule_id == "AST9" for f in findings)
 
+    def test_getattr_joined_exec_name_produces_ast9(self):
+        findings = _run(
+            "import builtins\ngetattr(builtins, ''.join(['e', 'x', 'e', 'c']))(payload)"
+        )
+        assert any(f.rule_id == "AST9" for f in findings)
+
     def test_getattr_eval_double_quotes_produces_ast9(self):
         findings = _run('import builtins\ngetattr(builtins, "eval")("2+2")')
         assert any(f.rule_id == "AST9" for f in findings)
