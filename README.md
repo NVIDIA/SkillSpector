@@ -9,7 +9,7 @@
 
 ## Overview
 
-AI agent skills (used by Claude Code, Codex CLI, Gemini CLI, etc.) execute with implicit trust and minimal vetting. Research shows that **26.1% of skills contain vulnerabilities** and **5.2% show likely malicious intent**.
+AI agent skills (used by Claude Code, Codex CLI, Gemini CLI, etc.) execute with implicit trust and minimal vetting. In the 31,132-skill analyzed subset of the research dataset, **26.1% of skills contain vulnerabilities** and **5.2% show likely malicious intent**.
 
 SkillSpector helps you answer: **"Is this skill safe to install?"**
 
@@ -820,9 +820,9 @@ SkillSpector is defense-in-depth, not a sandbox. Know what it does and does not 
 
 Based on research from "Agent Skills in the Wild: An Empirical Study of Security Vulnerabilities at Scale" (Liu et al., 2026):
 
-- **Dataset**: 42,447 skills from major marketplaces
-- **Vulnerable**: 26.1% contain at least one vulnerability
-- **High-severity**: 5.2% show likely malicious intent
+- **Dataset**: 42,447 skills from major marketplaces; 31,132 were analyzed for the following rates
+- **Vulnerable**: 26.1% of the analyzed subset contain at least one vulnerability
+- **High-severity**: 5.2% of the analyzed subset show likely malicious intent
 - **Key finding**: Skills with executable scripts are 2.12x more likely to be vulnerable
 
 ## Python API Integration
