@@ -987,7 +987,13 @@ def test_build_context_reports_read_error_without_fake_empty_content(
     def deny_open(*args: object, **kwargs: object) -> int:
         raise PermissionError("sensitive operating-system detail")
 
+    # The secure open dispatches on the platform: POSIX goes through os.open,
+    # Windows through the handle-based helper. Deny both so the failure is
+    # injected wherever the test happens to run.
     monkeypatch.setattr("skillspector.input_handler.os.open", deny_open)
+    monkeypatch.setattr(
+        "skillspector.input_handler._open_regular_file_from_windows_handle", deny_open
+    )
     result = build_context({"skill_path": str(tmp_path)})
 
     assert "broken.py" in result["components"]

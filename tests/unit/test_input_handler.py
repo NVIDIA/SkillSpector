@@ -28,6 +28,7 @@ import pytest
 from skillspector.input_handler import (
     ALLOWED_GIT_HOSTS,
     InputHandler,
+    _FileOpenError,
     _open_regular_file_from_windows_handle,
     _open_regular_file_no_follow,
 )
@@ -225,8 +226,18 @@ def test_resolve_file_open_failure_does_not_create_temp_dir(tmp_path: Path) -> N
     source = tmp_path / "SKILL.md"
     source.write_text("# Skill", encoding="utf-8")
     handler = InputHandler()
+    denied = OSError("denied")
     try:
-        with patch("skillspector.input_handler.os.open", side_effect=OSError("denied")):
+        # The secure open dispatches on the platform: POSIX goes through os.open,
+        # Windows through the handle-based helper. Deny both so the failure is
+        # injected wherever the test happens to run.
+        with (
+            patch("skillspector.input_handler.os.open", side_effect=denied),
+            patch(
+                "skillspector.input_handler._open_regular_file_from_windows_handle",
+                side_effect=_FileOpenError(source, denied),
+            ),
+        ):
             with pytest.raises(ValueError, match="Could not safely open"):
                 handler.resolve(str(source))
         assert handler.temp_dir_for_cleanup() is None
