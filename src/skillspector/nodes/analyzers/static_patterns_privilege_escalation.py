@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import re
 import sys
 from bisect import bisect_right
@@ -503,6 +504,30 @@ def _is_qualified_benign_access_requirement(
     return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
 
 
+def _constructed_sensitive_paths(content: str) -> list[tuple[int, str, float]]:
+    """Return literal sensitive paths assembled with ``os.path.join`` in Python.
+
+    Keep this expression-level recognizer regex-based: Python AST parsing is shared
+    across the analyzer graph, so a second parse here would defeat that cache.
+    """
+    call_pattern = re.compile(r"os\.path\.join\((?P<args>[^()\n]+)\)")
+    string_pattern = re.compile(r"(['\"])(?P<value>[^'\"]*)\1")
+
+    resolved: list[tuple[int, str, float]] = []
+    for match in call_pattern.finditer(content):
+        args = match.group("args")
+        parts = [item.group("value") for item in string_pattern.finditer(args)]
+        residual = string_pattern.sub("", args).replace(",", "").strip()
+        if len(parts) < 2 or residual:
+            continue
+        value = posixpath.join(*parts)
+        for pattern, confidence in PE3_PATTERNS:
+            if re.search(pattern, value, re.IGNORECASE):
+                resolved.append((get_line_number(content, match.start()), value, confidence))
+                break
+    return resolved
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
@@ -582,6 +607,20 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
+                )
+            )
+    if file_type == "python":
+        for line_num, path, confidence in _constructed_sensitive_paths(content):
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="PE3",
+                    message="Credential Access",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=list(tag),
+                    context=get_context(content, line_starts[line_num - 1]),
+                    matched_text=path,
                 )
             )
     # Collect best-confidence PE4 finding per line to avoid double-counting lines
