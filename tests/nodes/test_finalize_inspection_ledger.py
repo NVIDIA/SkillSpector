@@ -754,6 +754,87 @@ def test_resolved_reference_ae1_disposition_matrix_is_llm_independent(
         assert result["effective_finding_ids"] == []
 
 
+@pytest.mark.parametrize(
+    ("disposition", "reason", "expected_ae7"),
+    [
+        ("analyzed", None, False),
+        ("partial", "size_limit", True),
+        ("partial", "total_bytes_limit", False),
+        ("failed", "read_error", False),
+    ],
+)
+def test_size_truncated_artifact_synthesizes_ae7(
+    disposition: str,
+    reason: str | None,
+    expected_ae7: bool,
+) -> None:
+    """A file past the per-file read cap must not yield a zero-finding report."""
+    item: dict[str, object] = {"path": "server.py", "disposition": disposition}
+    if reason is not None:
+        item["reason"] = reason
+    result = finalize_inspection_ledger(
+        {
+            "components": ["server.py"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "artifact_inventory": [item],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        }
+    )
+
+    ae7 = [finding for finding in result["findings"] if finding.rule_id == "AE7"]
+    assert bool(ae7) is expected_ae7
+    if expected_ae7:
+        assert ae7[0].severity == "HIGH"
+        assert ae7[0].file == "server.py"
+        assert ae7[0].category == "analysis-evasion"
+        assert result["analysis_completeness"]["is_complete"] is False
+
+
+def test_ae7_skips_paths_already_covered_by_ae1() -> None:
+    """A referenced size-truncated artifact gets AE1, not AE1 + AE7."""
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md", "assets/big.py"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "artifact_inventory": [
+                {
+                    "path": "assets/big.py",
+                    "disposition": "partial",
+                    "reason": "size_limit",
+                    "content_kind": "text",
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 3,
+                    "column": 1,
+                    "evidence": "See [server](assets/big.py).",
+                    "target_path": "assets/big.py",
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path="assets/big.py",
+                    reason=LedgerReason.SIZE_LIMIT,
+                )
+            ],
+            "analyzer_status_events": [],
+        }
+    )
+
+    rule_ids = [finding.rule_id for finding in result["findings"]]
+    assert rule_ids == ["AE1"]
+
+
 @pytest.mark.parametrize("status", ["missing", "ambiguous", "rejected"])
 def test_unresolved_reference_does_not_synthesize_ae1(status: str) -> None:
     result = finalize_inspection_ledger(
