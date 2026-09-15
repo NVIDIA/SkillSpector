@@ -28,6 +28,10 @@ Environment variables:
     ``SKILLSPECTOR_MODEL`` — overrides the default model (a Bedrock
     model ID, a cross-region inference-profile ID, or your own
     application-inference-profile ARN).
+
+Claude models that reject a forced ``toolChoice`` (HTTP 400) get a client
+restricted to ``toolChoice`` ``auto``; Bedrock has no JSON-schema output for
+them either.  See ``forced_tool_choice_supported``.
 """
 
 from __future__ import annotations
@@ -42,6 +46,10 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_sampling_parameters
+from skillspector.providers.structured_output import (
+    claude_model_from_bedrock_id,
+    rejects_forced_tool_call,
+)
 
 BEDROCK_DEFAULT_REGION = "us-west-2"
 # Cross-region inference profile ID for Claude Sonnet 4.6. Public,
@@ -130,6 +138,11 @@ class BedrockProvider:
         }
         if model.startswith("arn:"):
             kwargs["provider"] = "anthropic"
+        if not self.forced_tool_choice_supported(model):
+            # Forced toolChoice is a 400 on these models and Bedrock rejects the
+            # JSON-schema outputConfig for them too; bind tools with toolChoice auto
+            # and let bind_structured_output ask for the call in the prompt.
+            kwargs["supports_tool_choice_values"] = ("auto",)
         kwargs.update(resolve_sampling_parameters())
 
         return ChatBedrockConverse(**kwargs)
@@ -144,3 +157,18 @@ class BedrockProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > ``DEFAULT_MODEL``."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def forced_tool_choice_supported(self, model: str) -> bool:
+        """``False`` when *model* answers a forced ``toolChoice`` with HTTP 400.
+
+        A registry entry (``tool_choice: auto``) wins; otherwise the Claude
+        model name is read from the model ID, a geo/global inference-profile
+        ID, or a foundation-model / inference-profile ARN.  An
+        application-inference-profile ARN carries no model name, so declare
+        it in the registry.
+        """
+        declared = registry.lookup_setting(REGISTRY_PATH, model, "tool_choice")
+        if declared:
+            return declared != "auto"
+        family = claude_model_from_bedrock_id(model)
+        return not (family and rejects_forced_tool_call(family))
