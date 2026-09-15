@@ -213,6 +213,28 @@ def resolve_chat_model_credentials() -> tuple[str, str | None] | None:
     return _openai_fallback_provider().resolve_credentials()
 
 
+def provider_is_authoritative(provider: object) -> bool:
+    """Return whether *provider* can be trusted without OpenAI-style credentials.
+
+    True for an explicitly bound provider, for CLI providers, and for Bedrock —
+    which authenticates through the boto3 credential chain and so returns
+    ``None`` from ``resolve_credentials()`` by design.
+
+    Callers that ask "is an API key configured?" to decide whether to trust the
+    active provider should ask this instead. ``SKILLSPECTOR_PROVIDER=bedrock``
+    with working AWS credentials is a configured provider, but it has no API
+    key, and treating that as "no LLM available" silently disables the
+    analyzers that require one.
+    """
+    from .bedrock import BedrockProvider
+
+    return (
+        has_provider_binding()
+        or has_cli_capability(provider)
+        or isinstance(provider, BedrockProvider)
+    )
+
+
 def get_model_config_provider() -> ModelMetadataProvider:
     """Return the provider whose model defaults match graph chat-model routing.
 
@@ -221,13 +243,8 @@ def get_model_config_provider() -> ModelMetadataProvider:
     when their own credentials are absent and the OpenAI fallback is configured.
     """
     provider = _select_active_provider()
-    from .bedrock import BedrockProvider
 
-    if (
-        has_provider_binding()
-        or has_cli_capability(provider)
-        or isinstance(provider, BedrockProvider)
-    ):
+    if provider_is_authoritative(provider):
         return provider
     if provider.resolve_credentials() is not None:
         return provider
@@ -310,6 +327,7 @@ __all__ = [
     "get_metadata_provider",
     "has_cli_capability",
     "has_provider_binding",
+    "provider_is_authoritative",
     "reset_provider",
     "raise_no_llm_api_key_configured",
     "resolve_chat_model_credentials",
