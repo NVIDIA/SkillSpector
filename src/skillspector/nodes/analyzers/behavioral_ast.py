@@ -375,7 +375,7 @@ def _analyze_python(
             ),
             confidence=_RULE_CONFIDENCES[rule_id],
             tags=[_TAG],
-            context=context_for(lineno, start_column),
+            context=context_for(lineno, start_column if start_column is not None else 0),
             matched_text=complete_match[:200],
             complete_match=complete_match,
         )
