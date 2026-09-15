@@ -22,6 +22,7 @@ antivirus/Defender on test files containing real malware signatures.
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -30,6 +31,8 @@ import pytest
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers import static_yara
 from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+from skillspector.nodes.deduplicate import deduplicate
+from skillspector.nodes.report import _compute_risk_score
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +99,228 @@ def _has_rule(findings: list, rule_name: str) -> bool:
 
 
 class TestCorePipeline:
+    def test_long_match_preview_uses_complete_raw_match_identity(self, tmp_path):
+        rule = tmp_path / "long_tail.yar"
+        rule.write_text(
+            """rule long_tail {
+    meta:
+        description = "Long match"
+        category = "malware"
+        severity = "HIGH"
+        confidence = "0.9"
+    strings:
+        $a = /A{700}[XY]/
+    condition:
+        any of them
+}
+""",
+            encoding="utf-8",
+        )
+        shared = "A" * 700
+        first = _run(shared + "X", "first.txt", str(tmp_path))[0]
+        second = _run(shared + "Y", "second.txt", str(tmp_path))[0]
+        exact = _run(shared + "X", "exact.txt", str(tmp_path))[0]
+
+        assert first.matched_text == second.matched_text
+        assert len(first.matched_text or "") == 200
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+
+        compacted = deduplicate([first, exact])
+        assert len(compacted) == 1
+        assert {item["file"] for item in compacted[0].occurrences} == {
+            "first.txt",
+            "exact.txt",
+        }
+        assert shared + "X" not in json.dumps(first.to_dict(), sort_keys=True)
+
+    def test_distinct_rule_names_matching_same_bytes_keep_distinct_identities(
+        self, monkeypatch
+    ) -> None:
+        rules = static_yara.yara.compile(
+            source="""
+rule first_detector {
+    meta:
+        category = "malware"
+        severity = "CRITICAL"
+        confidence = "0.9"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+
+rule second_detector {
+    meta:
+        category = "malware"
+        severity = "CRITICAL"
+        confidence = "0.9"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+"""
+        )
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        findings = static_yara.node(
+            {
+                "components": ["skill.txt"],
+                "file_cache": {"skill.txt": "SHARED_MARKER"},
+            }
+        )["findings"]
+
+        assert len(findings) == 2
+        assert {finding.rule_id for finding in findings} == {"YR1"}
+        assert len({finding.match_fingerprint for finding in findings}) == 2
+        compacted = deduplicate(findings)
+        assert len(compacted) == 2
+        assert {finding.message for finding in compacted} == {
+            "YARA rule 'first_detector'",
+            "YARA rule 'second_detector'",
+        }
+        assert _compute_risk_score(compacted, False) == (67, "HIGH", "DO_NOT_INSTALL")
+
+    def test_same_rule_name_in_distinct_namespaces_keeps_distinct_identities(
+        self, monkeypatch
+    ) -> None:
+        source = """
+rule shared_detector {
+    meta:
+        category = "malware"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+"""
+        rules = static_yara.yara.compile(sources={"first_feed": source, "second_feed": source})
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        findings = static_yara.node(
+            {
+                "components": ["skill.txt"],
+                "file_cache": {"skill.txt": "SHARED_MARKER"},
+            }
+        )["findings"]
+
+        assert len(findings) == 2
+        assert len({finding.match_fingerprint for finding in findings}) == 2
+        assert len(deduplicate(findings)) == 2
+
+    def test_full_match_fingerprinting_is_byte_bounded(self, monkeypatch):
+        rules = static_yara.yara.compile(
+            source="rule long_tail { strings: $a = /A{700}X/ condition: $a }"
+        )
+        monkeypatch.setattr(
+            static_yara,
+            "MAX_YARA_MATCH_FINGERPRINT_BYTES_PER_FILE",
+            128,
+            raising=False,
+        )
+
+        matched = static_yara._match_file(
+            rules,
+            b"A" * 700 + b"X",
+            "large-match.txt",
+        )
+
+        assert len(matched.findings) == 1
+        assert matched.findings[0].match_fingerprint is not None
+        assert matched.reason == LedgerReason.SIZE_LIMIT
+        assert matched.metrics == {
+            "observed_bytes": 701,
+            "limit_bytes": 128,
+        }
+
+    def test_fingerprint_bound_marks_node_analysis_partial(self, monkeypatch):
+        rules = static_yara.yara.compile(
+            source="rule long_tail { strings: $a = /A{700}X/ condition: $a }"
+        )
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+        monkeypatch.setattr(
+            static_yara,
+            "MAX_YARA_MATCH_FINGERPRINT_BYTES_PER_FILE",
+            128,
+            raising=False,
+        )
+
+        result = static_yara.node(
+            {
+                "components": ["large-match.txt"],
+                "file_cache": {"large-match.txt": "A" * 700 + "X"},
+            }
+        )
+
+        assert len(result["findings"]) == 1
+        assert result["inspection_ledger"][0]["outcome"] == "partial"
+        assert result["inspection_ledger"][0]["reason_code"] == "size_limit"
+        assert result["inspection_ledger"][0]["emitted_finding_ids"] == [
+            result["findings"][0].finding_id
+        ]
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_fingerprint_budget_retains_current_match_with_deterministic_fallback(
+        self, monkeypatch
+    ) -> None:
+        """A fingerprint-limit signal cannot discard the matching YARA rule."""
+        rules = static_yara.yara.compile(
+            source='rule budgeted { strings: $a = "MARKER" condition: $a }'
+        )
+
+        def raise_fingerprint_limit(*_args, **_kwargs):
+            raise static_yara._YaraFingerprintLimitError(129, 128)
+
+        monkeypatch.setattr(static_yara, "_match_instances_fingerprint", raise_fingerprint_limit)
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        first = static_yara.node(
+            {"components": ["skill.txt"], "file_cache": {"skill.txt": "MARKER"}}
+        )
+        second = static_yara.node(
+            {"components": ["skill.txt"], "file_cache": {"skill.txt": "MARKER"}}
+        )
+
+        assert len(first["findings"]) == 1
+        assert first["findings"][0].match_fingerprint is not None
+        assert first["findings"][0].match_fingerprint == second["findings"][0].match_fingerprint
+        assert first["findings"][0].match_fingerprint.startswith("fallback-sha256:")
+        event = first["inspection_ledger"][0]
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "size_limit"
+        assert event["observed_bytes"] == 129
+        assert event["limit_bytes"] == 128
+        assert event["emitted_finding_ids"] == [first["findings"][0].finding_id]
+
+    def test_fallback_identity_keeps_same_rule_matches_in_different_files_distinct(
+        self, monkeypatch
+    ) -> None:
+        """Fallback fingerprints remain occurrence-safe across file boundaries."""
+        rules = static_yara.yara.compile(
+            source='rule budgeted { strings: $a = "MARKER" condition: $a }'
+        )
+
+        def raise_fingerprint_limit(*_args, **_kwargs):
+            raise static_yara._YaraFingerprintLimitError(129, 128)
+
+        monkeypatch.setattr(static_yara, "_match_instances_fingerprint", raise_fingerprint_limit)
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        result = static_yara.node(
+            {
+                "components": ["first.txt", "second.txt"],
+                "file_cache": {
+                    "first.txt": "MARKER first raw payload",
+                    "second.txt": "MARKER second raw payload",
+                },
+            }
+        )
+
+        assert len(result["findings"]) == 2
+        assert len({finding.match_fingerprint for finding in result["findings"]}) == 2
+        assert len(deduplicate(result["findings"])) == 2
+
     def test_single_match_produces_finding(self, tmp_path):
         _write_rule(
             tmp_path,

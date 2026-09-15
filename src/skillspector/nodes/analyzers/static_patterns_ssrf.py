@@ -127,6 +127,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         tags=tag,
                         context=get_context(content, match.start()),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
 
