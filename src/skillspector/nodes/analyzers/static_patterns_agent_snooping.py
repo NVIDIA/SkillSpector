@@ -198,16 +198,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 
 def _normalize_skill_identifier(value: object) -> str | None:
-    """Return the comparison form for a usable skill identifier."""
+    """Return a usable identifier without aliasing filesystem names."""
     if not isinstance(value, str):
         return None
-    normalized = value.strip().casefold().replace("_", "-")
+    normalized = value.strip()
     return normalized or None
 
 
 def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
-    """Derive fail-closed identities for the skill currently being inspected."""
-    identifiers: set[str] = set()
+    """Derive a trusted, internally consistent current-skill identity."""
 
     skill_path: object = state.get("skill_path")
     path_text: str | bytes | None = None
@@ -218,19 +217,24 @@ def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
             path_text = os.fspath(skill_path)
         except Exception:
             path_text = None
+    path_identifier: str | None = None
     if isinstance(path_text, str):
         normalized_path = path_text.replace("\\", "/").rstrip("/")
         path_identifier = _normalize_skill_identifier(normalized_path.rsplit("/", 1)[-1])
-        if path_identifier is not None:
-            identifiers.add(path_identifier)
 
     manifest = state.get("manifest")
+    manifest_identifier: str | None = None
     if isinstance(manifest, Mapping):
         manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
-        if manifest_identifier is not None:
-            identifiers.add(manifest_identifier)
 
-    return frozenset(identifiers)
+    # The path is the only host-derived identity available here.  A manifest
+    # name is contributor-controlled, so it may corroborate the path but must
+    # never introduce a second identity or override a disagreement.
+    if path_identifier is None:
+        return frozenset()
+    if manifest_identifier is not None and manifest_identifier != path_identifier:
+        return frozenset()
+    return frozenset({path_identifier})
 
 
 def _is_current_skill_path_reference(

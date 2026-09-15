@@ -825,8 +825,8 @@ class TestRunStaticPatternsAgentSnooping:
         assert readme_event["emitted_finding_ids"] == []
         assert not any(f.rule_id == "AS3" for f in result["findings"])
 
-    def test_as3_manifest_identity_marks_self_reference_when_path_is_unrelated(self):
-        """Manifest identity is authoritative when the checkout basename is unrelated."""
+    def test_as3_inconsistent_manifest_identity_fails_closed(self):
+        """A contributor-controlled manifest cannot override the scan-root identity."""
         state = {
             "skill_path": "/tmp/checkout-root",
             "manifest": {"name": "example-skill"},
@@ -836,7 +836,10 @@ class TestRunStaticPatternsAgentSnooping:
 
         result = agent_snooping_module.node(state)
 
-        assert not any(f.rule_id == "AS3" for f in result["findings"])
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [
+            "skills/example-skill/SKILL.md"
+        ]
 
     def test_as3_long_current_skill_path_is_not_snooping(self):
         """Self-reference comparison uses the full path before evidence truncation."""
@@ -884,22 +887,37 @@ class TestRunStaticPatternsAgentSnooping:
         assert readme_event["outcome"] == "completed"
         assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
 
-    def test_as3_current_identity_normalizes_case_hyphens_and_underscores(self):
-        """Manifest and path identifiers compare across supported spelling variants."""
+    @pytest.mark.parametrize("peer_name", ["example_skill", "Example-Skill"])
+    def test_as3_distinct_filesystem_identity_is_not_suppressed(self, peer_name: str):
+        """Separator and case variants remain distinct filesystem identities."""
         state = {
-            "skill_path": "/tmp/checkout-root",
-            "manifest": {"name": "Example_Skill"},
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
             "components": ["README.md"],
-            "file_cache": {"README.md": "Root skill: skills/eXaMpLe-SkIlL/SKILL.md"},
+            "file_cache": {"README.md": f"Peer skill: skills/{peer_name}/SKILL.md"},
         }
 
         result = agent_snooping_module.node(state)
 
-        readme_event = next(
-            event for event in result["inspection_ledger"] if event["path"] == "README.md"
-        )
-        assert readme_event["emitted_finding_ids"] == []
-        assert not any(f.rule_id == "AS3" for f in result["findings"])
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [
+            f"skills/{peer_name}/SKILL.md"
+        ]
+
+    def test_as3_manifest_only_identity_fails_closed(self):
+        """An uncorroborated contributor-controlled name cannot authorize suppression."""
+        state = {
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [
+            "skills/example-skill/SKILL.md"
+        ]
 
     def test_as3_fullwidth_peer_path_from_normalized_view_remains_suspicious(self):
         """A compatibility-normalized peer path remains an AS3 finding."""

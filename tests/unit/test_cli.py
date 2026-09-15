@@ -18,6 +18,7 @@
 import ast
 import json
 import re
+import shutil
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
@@ -445,8 +446,10 @@ def test_cli_keyring_fixture_reproduction_is_clean() -> None:
     assert not any(issue["id"] == "PE3" for issue in payload["issues"])
 
 
-def test_cli_as3_self_reference_fixture_preserves_only_peer_path() -> None:
-    fixture = Path(__file__).parents[1] / "fixtures" / "as3_self_reference"
+def test_cli_as3_self_reference_fixture_preserves_only_peer_path(tmp_path: Path) -> None:
+    fixture_source = Path(__file__).parents[1] / "fixtures" / "as3_self_reference"
+    fixture = tmp_path / "example-skill"
+    shutil.copytree(fixture_source, fixture)
     result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
 
     assert result.exit_code in {0, 1}, result.output
