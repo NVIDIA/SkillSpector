@@ -112,6 +112,51 @@ class TestComputeRiskScoreBasic:
         assert band == "HIGH"
         assert recommendation == "DO_NOT_INSTALL"
 
+    def test_excluded_executable_enforces_blocking_risk_floor(self) -> None:
+        finding = _finding(
+            "SC9",
+            "HIGH",
+            confidence=1.0,
+            file="node_modules/pkg/index.js",
+            evidence={"excluded_from_analysis": True},
+        )
+
+        score, band, recommendation = _compute_risk_score([finding], False)
+
+        assert score == 51
+        assert band == "HIGH"
+        assert recommendation == "DO_NOT_INSTALL"
+
+    def test_analyzed_sc9_artifact_keeps_existing_score(self) -> None:
+        finding = _finding(
+            "SC9",
+            "HIGH",
+            confidence=1.0,
+            file="archive.docx!/payload.sh",
+            evidence={"excluded_from_analysis": False},
+        )
+
+        score, _, _ = _compute_risk_score([finding], False)
+
+        assert score == 25
+
+    def test_incomplete_excluded_artifact_blocks_even_if_finding_output_is_limited(self) -> None:
+        score, band, recommendation = _compute_risk_score(
+            [],
+            False,
+            [
+                {
+                    "path": "node_modules/cache.zip",
+                    "excluded_from_analysis": True,
+                    "excluded_inspection_incomplete": True,
+                }
+            ],
+        )
+
+        assert score == 51
+        assert band == "HIGH"
+        assert recommendation == "DO_NOT_INSTALL"
+
     @pytest.mark.parametrize(
         ("finding", "expected_score"),
         [

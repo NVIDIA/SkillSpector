@@ -28,7 +28,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from io import StringIO
-from typing import Literal
+from typing import Literal, cast
 
 from rich.console import Console
 from rich.markup import escape
@@ -425,6 +425,8 @@ def _risk_score_floor(finding: Finding) -> int:
     configured_floor = _RISK_SCORE_FLOORS_BY_RULE_ID.get(finding.rule_id, 0)
     if configured_floor:
         return configured_floor
+    if finding.rule_id == "SC9" and finding.evidence.get("excluded_from_analysis") is True:
+        return 51
     if (finding.severity or "").upper() != "CRITICAL":
         return 0
     if finding.evidence.get("activation_state") != "conditional":
@@ -522,6 +524,16 @@ def _compute_risk_score(
         (_risk_score_floor(f) for f in sorted_findings if max(0.0, min(1.0, f.confidence)) > 0.0),
         default=0,
     )
+    if component_metadata and any(
+        component.get("excluded_from_analysis") is True
+        and component.get("allowed_exclusion") is not True
+        and (
+            component.get("executable") is True
+            or component.get("excluded_inspection_incomplete") is True
+        )
+        for component in component_metadata
+    ):
+        score_floor = max(score_floor, 51)
     final_score = min(100, max(score_floor, int(score)))
 
     severity_band = "LOW"
@@ -831,7 +843,9 @@ def _build_sarif(
             ],
         }
     )
-    rendered = sarif_log.model_dump(mode="json", by_alias=True, exclude_none=True)
+    rendered = cast(
+        dict[str, object], sarif_log.model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
     validate_sarif_report(rendered)
     return rendered
 
@@ -1030,7 +1044,7 @@ def _format_terminal(
         execution_successful,
     )
     console.print(f"[dim]Executable scripts: {'Yes' if has_executable_scripts else 'No'}[/dim]")
-    return console.export_text()
+    return cast(str, console.export_text())
 
 
 def _llm_runtime_status(
