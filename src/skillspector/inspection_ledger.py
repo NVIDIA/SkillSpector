@@ -113,7 +113,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM returned a malformed structured response after bounded retries."
     ),
-    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
+    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
+        "Transient LLM provider failure persisted after bounded retries."
+    ),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
     LedgerReason.FINDING_ACCOUNTING_ERROR: (
