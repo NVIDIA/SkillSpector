@@ -111,7 +111,7 @@ _VIEW_START_EVIDENCE = "_security_view_start"
 _SOURCE_START_EVIDENCE = "_security_source_start"
 _SOURCE_END_EVIDENCE = "_security_source_end"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
-_BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
+_CONTEXTUAL_TRIAGE_TAG = "contextual-triage"
 _ViewFindingKey = tuple[
     str,
     str,
@@ -540,7 +540,7 @@ def analyzer_finding_to_finding(
         category=category,
         pattern=pattern,
         finding=finding_snippet,
-        explanation=get_explanation(af.rule_id),
+        explanation=af.explanation or get_explanation(af.rule_id),
         code_snippet=af.context,
         intent=None,
         evidence=dict(af.evidence),
@@ -824,6 +824,12 @@ def _view_finding_key(finding: Finding) -> _ViewFindingKey:
 
 
 def _view_scope_key(finding: Finding) -> _ViewScopeKey:
+    # A mapped start column identifies the exact raw occurrence (and the end
+    # column scopes it further when available). Alternate security views may
+    # normalize characters inside that span and therefore produce a different
+    # content fingerprint; keep the fingerprint only as a fallback for legacy
+    # producers that lack precise columns.
+    occurrence_fingerprint = None if finding.start_column is not None else finding.fingerprint()
     return (
         finding.rule_id,
         finding.file,
@@ -831,8 +837,19 @@ def _view_scope_key(finding: Finding) -> _ViewScopeKey:
         finding.end_line,
         finding.start_column,
         finding.end_column,
-        finding.fingerprint(),
+        occurrence_fingerprint,
     )
+
+
+def _view_finding_strength(finding: Finding) -> tuple[int, float]:
+    """Rank classification without assuming public severity strings are valid."""
+    try:
+        severity = Severity(finding.severity)
+    except ValueError:
+        severity_rank = len(_ANALYZER_SEVERITY_ORDER)
+    else:
+        severity_rank = _ANALYZER_SEVERITY_ORDER[severity]
+    return severity_rank, -finding.confidence
 
 
 def _projection_finding_key(finding: Finding) -> tuple[object, ...]:
@@ -884,23 +901,30 @@ def _deduplicate_view_findings(findings: list[Finding]) -> list[Finding]:
     raw_keys = {
         _view_finding_key(finding) for finding in findings if "normalized-view" not in finding.tags
     }
-    raw_non_benign_scopes = {
-        _view_scope_key(finding)
-        for finding in findings
-        if "normalized-view" not in finding.tags and not _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
-    }
+    raw_non_contextual_strength: dict[_ViewScopeKey, tuple[int, float]] = {}
+    for finding in findings:
+        if "normalized-view" in finding.tags or _CONTEXTUAL_TRIAGE_TAG in finding.tags:
+            continue
+        scope = _view_scope_key(finding)
+        strength = _view_finding_strength(finding)
+        previous = raw_non_contextual_strength.get(scope)
+        if previous is None or strength < previous:
+            raw_non_contextual_strength[scope] = strength
     for finding in findings:
         key = _view_finding_key(finding)
         if "normalized-view" in finding.tags and key in raw_keys:
             continue
         if (
             "normalized-view" in finding.tags
-            and _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
-            and _view_scope_key(finding) in raw_non_benign_scopes
+            and _CONTEXTUAL_TRIAGE_TAG in finding.tags
+            and (raw_strength := raw_non_contextual_strength.get(_view_scope_key(finding)))
+            is not None
+            and raw_strength <= _view_finding_strength(finding)
         ):
-            # Normalization may make an ambiguous raw occurrence look benign.
-            # Prefer the raw non-benign signal, but never suppress a derived
-            # unsafe classification that exposes obfuscated content.
+            # Normalization may erase a raw separator and make the same exact
+            # occurrence appear contextually qualified. Prefer an equally or
+            # more severe raw classification; retain a stronger derived signal
+            # that actually exposes obfuscated content.
             continue
         if key in seen:
             continue
@@ -925,6 +949,7 @@ def _scan_view_windows(
         python_ast_cache_key,
     )
     for finding in findings:
+        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
         if not isinstance(local_start, int) and finding.start_column is not None:
             local_start = _line_start_offset(view.text, finding.start_line) + finding.start_column
