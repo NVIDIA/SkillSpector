@@ -63,40 +63,6 @@ _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
 _RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
 _SIMPLE_BRACED_PARAMETER_RE = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}")
 _PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
-_SHELL_ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-_SHELL_CONTROL_PREFIX_WORDS = frozenset(
-    {
-        "case",
-        "coproc",
-        "do",
-        "done",
-        "elif",
-        "else",
-        "esac",
-        "fi",
-        "for",
-        "function",
-        "if",
-        "in",
-        "select",
-        "then",
-        "time",
-        "until",
-        "while",
-    }
-)
-_SHELL_COMPOUND_HINT_RE = re.compile(
-    r"\b(?:case|coproc|do|elif|else|for|function|if|select|then|time|until|while)\b"
-    r"|(?:\A|[;|&\s])(?:[({!])(?=\s)"
-)
-_SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
-_RUNTIME_PARAMETER_WORD_RE = re.compile(
-    r"\$(?:"
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
-    r"|_[A-Za-z0-9_.]*"
-    r"|\{[A-Za-z_][A-Za-z0-9_]*\}"
-    r")"
-)
 _SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
     r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
     r"u(?:002[fF]|007[eE]|002[aA]|003[fF])|"
@@ -108,6 +74,9 @@ _POWERSHELL_REPLACE_EXPRESSION_RE = re.compile(
     r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s+-replace\b",
     re.IGNORECASE,
 )
+_SHELL_COMMAND_STRING_SHELLS = frozenset({"sh", "ash", "bash", "dash", "ksh", "yash", "zsh"})
+_SHELL_CLAUSE_PREFIX_WORDS = frozenset({"do", "else", "elif", "then", "time", "!"})
+_SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
 _RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
 _FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
@@ -781,7 +750,7 @@ def _consume_printf_invocation(
 ) -> tuple[bool, bool]:
     """Resolve an allowlisted invocation; return ``(recognized, exact)``."""
     pending: str | None = None
-    for _ in range(16 if runtime_command_context else 4):
+    for _ in range(4):
         word = pending if pending is not None else next_word()
         pending = None
         if word is None:
@@ -790,16 +759,7 @@ def _consume_printf_invocation(
             # A command substitution or complex expansion participates in the
             # invocation or wrapper word. Its basename is not deterministic.
             return True, False
-        if runtime_command_context and _SHELL_ASSIGNMENT_WORD_RE.match(word) is not None:
-            # POSIX assignment words may prefix a command without becoming its
-            # executable name. Keep looking for the runtime-selected command.
-            continue
         command = word.casefold().rsplit("/", 1)[-1]
-        if runtime_command_context and command in _SHELL_CONTROL_PREFIX_WORDS:
-            # Shell reserved words can introduce a later command position in
-            # compound commands. Continue conservatively rather than treating
-            # the control prefix itself as the executable name.
-            continue
         if _RUNTIME_SHELL_PARAMETER_SENTINEL in word and command in {
             "printf",
             "command",
@@ -832,23 +792,6 @@ def _consume_printf_invocation(
             return False, False
         if command == "printf":
             return True, True
-        if runtime_command_context and command == "exec":
-            while True:
-                word = next_word()
-                if word == "--":
-                    word = next_word()
-                    break
-                if word in {"-c", "-l"}:
-                    continue
-                if word == "-a":
-                    if next_word() is None:
-                        return True, False
-                    continue
-                break
-            if word is None or word.startswith("-"):
-                return True, False
-            pending = word
-            continue
         if command == "command":
             while True:
                 word = next_word()
@@ -902,335 +845,6 @@ def _consume_printf_invocation(
     return True, False
 
 
-def _top_level_shell_command_starts(
-    content: str,
-    check_runtime: Callable[[], None],
-) -> tuple[int, ...]:
-    """Return bounded command starts after proven top-level separators."""
-    starts = [0]
-    cursor = 0
-    quote: str | None = None
-    ansi_c_quote = False
-    word_started = False
-    parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
-    substitution_end_cache: dict[int, int | None] = {}
-    backtick_end_cache: dict[int, int | None] = {}
-    while cursor < len(content):
-        if cursor and cursor % 4096 == 0:
-            check_runtime()
-        character = content[cursor]
-        if quote is not None:
-            if character == quote:
-                quote = None
-                ansi_c_quote = False
-            elif character == "\\" and cursor + 1 < len(content) and (quote != "'" or ansi_c_quote):
-                cursor += 2
-                continue
-            elif quote == '"' and character == "$" and cursor + 1 < len(content):
-                if content[cursor + 1] == "(":
-                    end = _skip_command_substitution(
-                        content,
-                        cursor,
-                        len(content),
-                        check_runtime,
-                        substitution_end_cache,
-                        parameter_end_cache,
-                        backtick_end_cache,
-                    )
-                    if end is not None:
-                        cursor = end
-                        continue
-                elif content[cursor + 1] == "{":
-                    end = _skip_parameter_expansion(
-                        content,
-                        cursor,
-                        len(content),
-                        check_runtime,
-                        parameter_end_cache,
-                        substitution_end_cache,
-                        backtick_end_cache,
-                        True,
-                    )
-                    if end is not None:
-                        cursor = end
-                        continue
-            elif quote == '"' and character == "`":
-                end = _skip_backtick_substitution(
-                    content,
-                    cursor,
-                    len(content),
-                    check_runtime,
-                    backtick_end_cache,
-                    parameter_end_cache,
-                    substitution_end_cache,
-                )
-                if end is not None:
-                    cursor = end
-                    continue
-            cursor += 1
-            continue
-        if character == "$" and cursor + 1 < len(content) and content[cursor + 1] in "'\"":
-            quote = content[cursor + 1]
-            ansi_c_quote = quote == "'"
-            word_started = True
-            cursor += 2
-            continue
-        if character in "'\"":
-            quote = character
-            ansi_c_quote = False
-            word_started = True
-        elif character == "\\" and cursor + 1 < len(content):
-            cursor += 2
-            word_started = True
-            continue
-        elif character == "$" and cursor + 1 < len(content) and content[cursor + 1] == "(":
-            end = _skip_command_substitution(
-                content,
-                cursor,
-                len(content),
-                check_runtime,
-                substitution_end_cache,
-                parameter_end_cache,
-                backtick_end_cache,
-            )
-            if end is not None:
-                cursor = end
-                word_started = True
-                continue
-        elif character == "`":
-            end = _skip_backtick_substitution(
-                content,
-                cursor,
-                len(content),
-                check_runtime,
-                backtick_end_cache,
-                parameter_end_cache,
-                substitution_end_cache,
-            )
-            if end is not None:
-                cursor = end
-                word_started = True
-                continue
-        elif character == "#" and not word_started:
-            newline = content.find("\n", cursor + 1)
-            if newline < 0:
-                break
-            starts.append(newline + 1)
-            cursor = newline + 1
-            word_started = False
-            continue
-        elif character in ";|&\n":
-            if character in "|&" and cursor + 1 < len(content) and content[cursor + 1] == character:
-                cursor += 1
-            starts.append(cursor + 1)
-            word_started = False
-        elif character.isspace():
-            pass
-        else:
-            word_started = True
-        cursor += 1
-    return tuple(starts)
-
-
-def _is_powershell_replace_expression(
-    content: str,
-    start: int,
-    inner: str,
-    check_runtime: Callable[[], None],
-) -> bool:
-    """Recognize ``-replace`` only in a proven PowerShell output string."""
-    if _POWERSHELL_REPLACE_EXPRESSION_RE.search(inner) is None:
-        return False
-    line_start = content.rfind("\n", 0, start) + 1
-    prefix = content[line_start:start]
-    if (
-        re.fullmatch(
-            r"[ \t]*(?:Write-Output|Write-Host)[ \t]+\"",
-            prefix,
-            re.IGNORECASE,
-        )
-        is None
-    ):
-        return False
-    # A prefix match alone is insufficient: a later top-level statement could
-    # still select a runtime command. Quoted separators remain part of the
-    # PowerShell operands and are ignored by the bounded command-start walk.
-    return len(_top_level_shell_command_starts(inner, check_runtime)) == 1
-
-
-def _skip_runtime_command_prefix_syntax(
-    content: str,
-    start: int,
-    check_runtime: Callable[[], None],
-) -> tuple[int, bool]:
-    """Skip bounded command-position punctuation and redirection prefixes."""
-    cursor = start
-    for _ in range(16):
-        while cursor < len(content) and content[cursor].isspace():
-            if cursor and cursor % 4096 == 0:
-                check_runtime()
-            cursor += 1
-        if cursor >= len(content):
-            return cursor, False
-        if content[cursor] in "(){}!":
-            cursor += 1
-            continue
-        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(content, cursor)
-        if redirection is None:
-            return cursor, False
-        cursor = redirection.end()
-        target, cursor, limited = _next_shell_invocation_word(
-            content,
-            cursor,
-            check_runtime,
-        )
-        if target is None or limited:
-            return cursor, True
-    return cursor, True
-
-
-def _has_compound_runtime_candidate(
-    content: str,
-    check_runtime: Callable[[], None],
-) -> bool:
-    """Fail closed on a dynamic word inside unsupported compound grammar."""
-    if _SHELL_COMPOUND_HINT_RE.search(content) is None:
-        return False
-    cursor = 0
-    has_control_prefix = False
-    has_runtime_word = False
-    words = 0
-    while cursor < len(content):
-        while cursor < len(content) and (content[cursor].isspace() or content[cursor] in ";|&"):
-            if cursor and cursor % 4096 == 0:
-                check_runtime()
-            cursor += 1
-        if cursor >= len(content):
-            break
-        if content[cursor] in "(){}!":
-            has_control_prefix = True
-            cursor += 1
-            if has_runtime_word:
-                return True
-            continue
-        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(content, cursor)
-        if redirection is not None:
-            cursor = redirection.end()
-            _, next_cursor, limited = _next_shell_invocation_word(
-                content,
-                cursor,
-                check_runtime,
-            )
-            if limited or next_cursor <= cursor:
-                return True
-            cursor = next_cursor
-            continue
-        word, next_cursor, limited = _next_shell_invocation_word(
-            content,
-            cursor,
-            check_runtime,
-        )
-        if limited:
-            return True
-        if word is None:
-            cursor += 1
-            continue
-        words += 1
-        if words > 256:
-            return has_control_prefix or has_runtime_word
-        command = word.casefold().rsplit("/", 1)[-1]
-        has_control_prefix = has_control_prefix or command in _SHELL_CONTROL_PREFIX_WORDS
-        has_runtime_word = has_runtime_word or any(
-            marker in word
-            for marker in (_RUNTIME_SHELL_PARAMETER_SENTINEL, _DYNAMIC_SHELL_WORD_SENTINEL)
-        )
-        if has_control_prefix and has_runtime_word:
-            return True
-        cursor = max(next_cursor, cursor + 1)
-    return False
-
-
-def _runtime_parameter_command_word_ends(inner: str) -> Iterator[int]:
-    """Yield runtime parameters that can form a shell command word.
-
-    Single-quoted parameters and parameters embedded in quoted prose are data,
-    not executable names. A double-quoted word containing only the parameter is
-    still a valid command word and therefore remains eligible.
-    """
-    cursor = 0
-    delimiters = ";|&(){}<>! \t\r\n"
-    while cursor < len(inner):
-        character = inner[cursor]
-        if character == "\\" and cursor + 1 < len(inner):
-            cursor += 2
-            continue
-        if character in "'`":
-            quote = character
-            cursor += 1
-            while cursor < len(inner):
-                if inner[cursor] == "\\" and quote == "`" and cursor + 1 < len(inner):
-                    cursor += 2
-                    continue
-                if inner[cursor] == quote:
-                    cursor += 1
-                    break
-                cursor += 1
-            continue
-        if character == '"':
-            quote_start = cursor
-            cursor += 1
-            escaped = False
-            while cursor < len(inner):
-                if inner[cursor] == "\\" and cursor + 1 < len(inner):
-                    escaped = True
-                    cursor += 2
-                    continue
-                if inner[cursor] == '"':
-                    quoted = inner[quote_start + 1 : cursor]
-                    parameter = _RUNTIME_PARAMETER_WORD_RE.fullmatch(quoted)
-                    after = inner[cursor + 1] if cursor + 1 < len(inner) else " "
-                    before = inner[quote_start - 1] if quote_start else " "
-                    if (
-                        parameter is not None
-                        and not escaped
-                        and before in delimiters
-                        and after in delimiters
-                    ):
-                        yield cursor + 1
-                    cursor += 1
-                    break
-                cursor += 1
-            continue
-        if character == "#" and (cursor == 0 or inner[cursor - 1] in delimiters):
-            newline = inner.find("\n", cursor + 1)
-            if newline < 0:
-                return
-            cursor = newline + 1
-            continue
-        if character == "$":
-            parameter = _RUNTIME_PARAMETER_WORD_RE.match(inner, cursor)
-            if parameter is not None:
-                before = inner[cursor - 1] if cursor else " "
-                after = inner[parameter.end()] if parameter.end() < len(inner) else " "
-                if before in delimiters and after in delimiters:
-                    yield parameter.end()
-                cursor = parameter.end()
-                continue
-        cursor += 1
-
-
-def _has_unquoted_runtime_format_reconstruction(inner: str) -> bool:
-    """Recognize strong unresolved ``$command`` + printf-operand evidence."""
-    for parameter_end in _runtime_parameter_command_word_ends(inner):
-        tail = inner[parameter_end : parameter_end + _PRINTF_STATIC_CHARS]
-        if _PRINTF_FORMAT_CONVERSION_RE.search(tail) is None:
-            continue
-        operands = re.findall(r"(?<![A-Za-z0-9_])[rm](?![A-Za-z0-9_])", tail)
-        if "r" in operands and "m" in operands:
-            return True
-    return False
-
-
 def _printf_invocation_arguments(
     inner: str,
     *,
@@ -1239,44 +853,6 @@ def _printf_invocation_arguments(
 ) -> tuple[bool, list[str]]:
     """Parse direct or allowlisted wrapper invocations of shell ``printf``."""
     runtime_check = check_runtime or (lambda: None)
-
-    if runtime_command_context:
-        if _has_compound_runtime_candidate(inner, runtime_check):
-            return True, []
-        segment_starts = (
-            _top_level_shell_command_starts(inner, runtime_check)
-            if any(separator in inner for separator in ";|&\n")
-            else (0,)
-        )
-        for segment_start in segment_starts:
-            cursor = segment_start
-            limited = False
-
-            def next_segment_word() -> str | None:
-                nonlocal cursor, limited
-                cursor, prefix_limited = _skip_runtime_command_prefix_syntax(
-                    inner,
-                    cursor,
-                    runtime_check,
-                )
-                limited = limited or prefix_limited
-                if prefix_limited:
-                    return None
-                word, cursor, word_limited = _next_shell_invocation_word(
-                    inner,
-                    cursor,
-                    runtime_check,
-                )
-                limited = limited or word_limited
-                return word
-
-            recognized, _ = _consume_printf_invocation(
-                next_segment_word,
-                runtime_command_context=True,
-            )
-            if recognized or limited:
-                return True, []
-        return _has_unquoted_runtime_format_reconstruction(inner), []
 
     cursor = 0
     limited = False
@@ -1541,35 +1117,6 @@ def _next_shell_invocation_word(
     return "".join(output) if word_started else None, cursor, False
 
 
-def _has_printf_invocation_prefix(
-    content: str,
-    start: int,
-    check_runtime: Callable[[], None],
-    parameter_end_cache: dict[int, _ParameterExpansionEnd],
-    substitution_end_cache: dict[int, int | None],
-    backtick_end_cache: dict[int, int | None],
-) -> bool:
-    """Recognize over-bound direct ``printf`` without copying or suffix rescans."""
-    cursor = start + 2
-    limited = False
-
-    def next_word() -> str | None:
-        nonlocal cursor, limited
-        word, cursor, word_limited = _next_shell_invocation_word(
-            content,
-            cursor,
-            check_runtime,
-            parameter_end_cache,
-            substitution_end_cache,
-            backtick_end_cache,
-        )
-        limited = limited or word_limited
-        return word
-
-    recognized, _ = _consume_printf_invocation(next_word, runtime_command_context=True)
-    return recognized or limited
-
-
 def _static_printf_substitution(
     content: str,
     start: int,
@@ -1667,57 +1214,101 @@ def _has_constructed_recursive_force_option_source(content: str) -> bool:
     return False
 
 
+def _is_powershell_replace_value_context(
+    content: str,
+    start: int,
+    end: int,
+    inner: str,
+) -> bool:
+    """Recognize a bounded PowerShell ``-replace`` value statement."""
+    if (
+        _POWERSHELL_REPLACE_EXPRESSION_RE.search(inner) is None
+        or any(separator in inner for separator in ";|&\n")
+        or any(marker in inner for marker in ("$(", "`", "<(", ">("))
+    ):
+        return False
+
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end < 0:
+        line_end = len(content)
+    placeholder = "\ue003"
+    statement = (content[line_start:start] + placeholder + content[end:line_end]).strip()
+
+    if statement.startswith("|") and statement.endswith("|"):
+        cells = [cell.strip() for cell in statement[1:-1].split("|")]
+        value_cells = [cell for cell in cells if placeholder in cell]
+        if len(value_cells) != 1:
+            return False
+        statement = value_cells[0]
+    container = re.match(
+        r"(?:(?:>[ \t]*)+|(?:[-*+]|[0-9]+[.)]|#{1,6})[ \t]+)",
+        statement,
+    )
+    if container is not None:
+        statement = statement[container.end() :].strip()
+
+    # Raw Markdown inline code retains its delimiter; the normalized Markdown
+    # view blanks it. Support the explicit documentary prefix in both views
+    # without trusting a fenced-code language label as a security boundary.
+    prefix = re.match(
+        r"(?:The[ \t]+following[ \t]+is[ \t]+(?:a[ \t]+)?)?"
+        r"PowerShell(?:[ \t]+(?:example|snippet|command))?[ \t]*:[ \t]*",
+        statement,
+        re.IGNORECASE,
+    )
+    if prefix is not None:
+        statement = statement[prefix.end() :].strip()
+        if statement.endswith("."):
+            statement = statement[:-1].rstrip()
+    inline = re.fullmatch(r"(?P<ticks>`+)(?P<body>.*)(?P=ticks)", statement)
+    if inline is not None:
+        statement = inline.group("body").strip()
+
+    value = f'"{placeholder}"'
+    shapes = (
+        rf"Write-Output[ \t]+(?:{re.escape(value)}|\([ \t]*{re.escape(value)}[ \t]*\))",
+        rf"Write-Host(?:[ \t]+-NoNewline)?[ \t]+"
+        rf"(?:{re.escape(value)}|\([ \t]*{re.escape(value)}[ \t]*\))",
+        rf"{re.escape(value)}[ \t]*\|[ \t]*Write-Output",
+        rf"\$[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*{re.escape(value)}",
+    )
+    return any(re.fullmatch(shape, statement, re.IGNORECASE) is not None for shape in shapes)
+
+
 def _is_printf_substitution(
     content: str,
     start: int,
     end: int,
     *,
     backtick: bool = False,
-    check_command_context: bool = False,
+    check_command_context: bool = True,
     check_runtime: Callable[[], None] | None = None,
-    may_have_destructive_outer_operands: bool = True,
 ) -> bool:
     """Return whether a substitution invokes the bounded ``printf`` evaluator."""
     runtime_check = check_runtime or (lambda: None)
     inner_start = start + (1 if backtick else 2)
     inner_end = end - 1
     inner = content[inner_start:inner_end]
-    if _is_powershell_replace_expression(content, start, inner, runtime_check):
+    if not backtick and _is_powershell_replace_value_context(content, start, end, inner):
         return False
-    if backtick or not check_command_context:
-        recognized, _ = _printf_invocation_arguments(inner, check_runtime=runtime_check)
-        if recognized or not check_command_context:
-            return recognized
-    if "$" not in inner:
-        recognized, _ = _printf_invocation_arguments(inner, check_runtime=runtime_check)
+    recognized, _ = _printf_invocation_arguments(inner, check_runtime=runtime_check)
+    if recognized or not check_command_context:
         return recognized
-    possible_runtime, _ = _printf_invocation_arguments(
-        inner,
-        runtime_command_context=True,
-        check_runtime=runtime_check,
-    )
-    if possible_runtime and _has_unquoted_runtime_format_reconstruction(inner):
-        return True
+    if "$" not in inner:
+        return False
     command_start, body_start = start, end
     if start > 0 and content[start - 1] == '"' and end < len(content) and content[end] == '"':
         command_start -= 1
         body_start += 1
-    tail_end = min(len(content), body_start + _ROOT_GLOB_COMMAND_CHARS)
-    tail = content[body_start:tail_end]
-    tail_truncated = tail_end < len(content)
-    tail_is_complete_enough = not tail_truncated or not may_have_destructive_outer_operands
-    if (
-        tail_is_complete_enough
-        and "\\" not in tail
-        and ("-" not in tail or not any(marker in tail for marker in "/~*?"))
-    ):
+    tail = content[body_start : body_start + _ROOT_GLOB_COMMAND_CHARS]
+    if "\\" not in tail and ("-" not in tail or not any(marker in tail for marker in "/~*?")):
         # Without option and target characters the bounded tokenizer cannot
         # produce a destructive root command. Keep repeated parameter notation
         # cheap; escapes still require tokenization because they can encode both.
         return False
     if (
-        tail_is_complete_enough
-        and not any(marker in tail for marker in ("\\", "'", '"', "{", "}"))
+        not any(marker in tail for marker in ("\\", "'", '"', "{", "}"))
         and "printf" not in tail.casefold()
         and (
             _RECURSIVE_OPTION_SOURCE_RE.search(tail) is None
@@ -1728,6 +1319,11 @@ def _is_printf_substitution(
         # Quoting, escapes, braces, or printf can construct those spellings, so
         # keep those cases on the full tokenizer path.
         return False
+    possible_runtime, _ = _printf_invocation_arguments(
+        inner,
+        runtime_command_context=True,
+        check_runtime=runtime_check,
+    )
     if not possible_runtime:
         return False
     tokens, _, exhausted = _bounded_shell_tokens(
@@ -1769,9 +1365,7 @@ def _parse_shell_command_word(
     substitution_end_cache: dict[int, int | None] | None = None,
     backtick_end_cache: dict[int, int | None] | None = None,
     *,
-    check_command_context: bool = False,
     check_runtime: Callable[[], None] | None = None,
-    may_have_destructive_outer_operands: bool = True,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     output: list[str] = []
@@ -1826,11 +1420,7 @@ def _parse_shell_command_word(
                             content,
                             cursor,
                             substitution_end,
-                            check_command_context=check_command_context,
                             check_runtime=runtime_check,
-                            may_have_destructive_outer_operands=(
-                                may_have_destructive_outer_operands
-                            ),
                         )
                     else:
                         output.append(static_value)
@@ -1881,9 +1471,7 @@ def _parse_shell_command_word(
                         cursor,
                         substitution_end,
                         backtick=True,
-                        check_command_context=check_command_context,
                         check_runtime=runtime_check,
-                        may_have_destructive_outer_operands=may_have_destructive_outer_operands,
                     )
                 else:
                     output.append(static_value)
@@ -1930,9 +1518,7 @@ def _parse_shell_command_word(
                     content,
                     cursor,
                     substitution_end,
-                    check_command_context=check_command_context,
                     check_runtime=runtime_check,
-                    may_have_destructive_outer_operands=may_have_destructive_outer_operands,
                 )
             else:
                 output.append(static_value)
@@ -1982,9 +1568,7 @@ def _parse_shell_command_word(
                     cursor,
                     substitution_end,
                     backtick=True,
-                    check_command_context=check_command_context,
                     check_runtime=runtime_check,
-                    may_have_destructive_outer_operands=may_have_destructive_outer_operands,
                 )
             else:
                 output.append(static_value)
@@ -2083,6 +1667,7 @@ def _has_shell_command_word_exhaustion(
     *,
     structural_quote_closers: set[int] | None = None,
     structural_quote_openers: set[int] | None = None,
+    _command_string_depth: int = 0,
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound."""
     parsed_through = 0
@@ -2104,44 +1689,271 @@ def _has_shell_command_word_exhaustion(
             continue
         if _has_quoted_assignment_prefix(content, start):
             continue
-        if content.startswith("$(", start):
-            substitution_end = _bounded_static_substitution_end(content, start)
-            if substitution_end is None:
-                if _has_printf_invocation_prefix(
-                    content,
-                    start,
-                    check_runtime,
-                    parameter_end_cache,
-                    substitution_end_cache,
-                    backtick_end_cache,
-                ):
-                    return True
-                continue
-            if not _is_printf_substitution(
-                content,
-                start,
-                substitution_end,
-                check_command_context=True,
-                check_runtime=check_runtime,
-                may_have_destructive_outer_operands=may_have_destructive_outer_operands,
-            ):
-                continue
         parsed = _parse_shell_command_word(
             content,
             start,
             parameter_end_cache,
             substitution_end_cache,
             backtick_end_cache,
-            check_command_context=True,
             check_runtime=check_runtime,
-            may_have_destructive_outer_operands=may_have_destructive_outer_operands,
         )
         if parsed is None:
+            substitution_start = (
+                start + 1
+                if content[start : start + 1] in {"'", '"'} and content.startswith("$(", start + 1)
+                else start
+            )
+            if content.startswith("$(", substitution_start):
+                substitution_end = _skip_command_substitution(
+                    content,
+                    substitution_start,
+                    len(content),
+                    check_runtime,
+                    end_cache=substitution_end_cache,
+                    parameter_end_cache=parameter_end_cache,
+                    backtick_end_cache=backtick_end_cache,
+                )
+                if substitution_end is not None and _is_printf_substitution(
+                    content,
+                    substitution_start,
+                    substitution_end,
+                    check_runtime=check_runtime,
+                ):
+                    return True
+            # An unclosed expansion or quote can consume the rest of the
+            # artifact. Once that unresolved span exceeds the command-word
+            # budget, treating it as clean would turn malformed, deeply nested
+            # runtime selection into a fail-open result.
+            if len(content) - start > _SHELL_COMMAND_WORD_CHARS:
+                return True
             continue
-        parsed_through = max(parsed_through, parsed.end)
+        # Only executable nested substitutions retain independent command
+        # positions. A plain dynamic data argument still owns its inner bytes;
+        # revisiting those as commands would turn quoted printf data into code.
+        raw_word = content[start : parsed.end]
+        simple_backtick_parameter = (
+            re.fullmatch(
+                r"`\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})`",
+                raw_word,
+            )
+            is not None
+        )
+        if (
+            not parsed.dynamic
+            or not any(marker in raw_word for marker in ("$(", "`"))
+            or simple_backtick_parameter
+        ):
+            parsed_through = max(parsed_through, parsed.end)
         if parsed.limited:
             return True
+        if parsed.dynamic and may_have_destructive_outer_operands:
+            tokens, _, exhausted = _bounded_shell_tokens(
+                content,
+                start,
+                parsed.end,
+                check_runtime=check_runtime,
+            )
+            if (
+                exhausted
+                or _has_destructive_root_glob(tokens)
+                or _has_destructive_root_path(tokens)
+            ):
+                return True
+    for command_string in _shell_command_strings(content, check_runtime):
+        if command_string is None or _command_string_depth >= 8:
+            return True
+        if _has_shell_command_word_exhaustion(
+            command_string,
+            check_runtime,
+            _command_string_depth=_command_string_depth + 1,
+        ):
+            return True
     return False
+
+
+def _shell_command_strings(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> Iterator[str | None]:
+    """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
+    for clause_start in _shell_clause_starts(content, check_runtime):
+        check_runtime()
+        recognized, command_string = _command_string_from_clause(
+            content,
+            clause_start,
+            check_runtime,
+        )
+        if recognized:
+            yield command_string
+
+
+def _shell_clause_starts(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> Iterator[int]:
+    """Yield command-clause starts outside quotes and comments in one pass."""
+    yield 0
+    quote: str | None = None
+    word_started = False
+    cursor = 0
+    while cursor < len(content):
+        if cursor % 4096 == 0:
+            check_runtime()
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif quote == '"' and character == "\\" and cursor + 1 < len(content):
+                cursor += 2
+                continue
+        elif character in "'\"":
+            quote = character
+            word_started = True
+        elif character == "\\" and cursor + 1 < len(content):
+            cursor += 2
+            word_started = True
+            continue
+        elif character == "#" and not word_started:
+            newline = content.find("\n", cursor + 1)
+            if newline < 0:
+                return
+            cursor = newline + 1
+            word_started = False
+            yield cursor
+            continue
+        elif character in ";|&(){}\n":
+            word_started = False
+            yield cursor + 1
+        elif character.isspace():
+            word_started = False
+        else:
+            word_started = True
+        cursor += 1
+
+
+def _command_string_from_clause(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+) -> tuple[bool, str | None]:
+    """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
+    cursor = start
+    pending: str | None = None
+    wrapper_seen = False
+
+    def next_word() -> tuple[str | None, bool]:
+        nonlocal cursor
+        word, cursor, limited = _next_shell_invocation_word(content, cursor, check_runtime)
+        return word, limited
+
+    def resolved_command_string(word: str | None, limited: bool) -> str | None:
+        if (
+            limited
+            or word is None
+            or any(
+                marker in word
+                for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+            )
+        ):
+            return None
+        return word
+
+    for _ in range(32):
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(content, cursor)
+        if redirection is not None:
+            cursor = redirection.end()
+            target, limited = next_word()
+            if limited or target is None:
+                return wrapper_seen, None
+            continue
+
+        word, limited = (pending, False) if pending is not None else next_word()
+        pending = None
+        if limited:
+            return wrapper_seen, None
+        if word is None:
+            return False, None
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None:
+            continue
+        command = word.casefold().rsplit("/", 1)[-1]
+        if command in _SHELL_CLAUSE_PREFIX_WORDS:
+            continue
+        if command == "eval":
+            command_string, limited = next_word()
+            return True, resolved_command_string(command_string, limited)
+        if command in _SHELL_COMMAND_STRING_SHELLS:
+            for _ in range(16):
+                option, limited = next_word()
+                if limited or option is None:
+                    return True, None
+                if option.startswith("-") and not option.startswith("--"):
+                    if "c" in option[1:]:
+                        command_string, limited = next_word()
+                        return True, resolved_command_string(command_string, limited)
+                    continue
+                if option.startswith("+") or option.startswith("--"):
+                    continue
+                return False, None
+            return True, None
+
+        if command in {"env", "command", "nohup"}:
+            wrapper_seen = True
+            continue
+        if command in {"sudo", "nice", "xargs"}:
+            wrapper_seen = True
+            while True:
+                option, limited = next_word()
+                if limited or option is None:
+                    return True, None
+                if option == "--":
+                    pending, limited = next_word()
+                    if limited:
+                        return True, None
+                    break
+                if not option.startswith("-"):
+                    pending = option
+                    break
+                if option in {
+                    "-u",
+                    "-g",
+                    "-h",
+                    "-p",
+                    "-C",
+                    "-T",
+                    "-R",
+                    "-D",
+                    "-n",
+                    "-I",
+                    "-L",
+                    "-P",
+                    "-s",
+                }:
+                    _, limited = next_word()
+                    if limited:
+                        return True, None
+            continue
+        if command == "timeout":
+            wrapper_seen = True
+            while True:
+                option, limited = next_word()
+                if limited or option is None:
+                    return True, None
+                if option in {"-k", "--kill-after", "-s", "--signal"}:
+                    _, limited = next_word()
+                    if limited:
+                        return True, None
+                    continue
+                if option.startswith("-"):
+                    continue
+                break
+            pending, limited = next_word()
+            if limited:
+                return True, None
+            continue
+        return False, None
+    return wrapper_seen, None
 
 
 def _command_wrapper_quote(content: str, command_start: int) -> str | None:
@@ -3177,6 +2989,8 @@ def has_bounded_parse_exhaustion(
     complete_context: bool = True,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
+    if file_type == "powershell":
+        return False
     structural_quote_closers = None
     structural_quote_openers = None
     json_strings: list[tuple[int, int]] = []
