@@ -260,6 +260,23 @@ class TestExcessiveAgency:
             "selection_key": key,
         }
 
+    def test_ea5_frontmatter_identity_uses_the_complete_declaration(self) -> None:
+        shared = "gpt-" + "a" * 220
+        findings = [
+            next(
+                finding
+                for finding in ea_mod.analyze(
+                    f"---\nmodel: {shared}{tail}\n---\n", "SKILL.md", "markdown"
+                )
+                if finding.rule_id == "EA5"
+            )
+            for tail in ("first", "second")
+        ]
+
+        assert findings[0].matched_text == findings[1].matched_text
+        assert len(findings[0].matched_text or "") == 200
+        assert findings[0].match_fingerprint != findings[1].match_fingerprint
+
     def test_ea5_only_matches_top_level_skill_frontmatter(self) -> None:
         content = (
             "---\n"
@@ -297,6 +314,21 @@ class TestExcessiveAgency:
         assert len(ea5) == 1
         assert ea5[0].severity == Severity.HIGH
         assert ea5[0].evidence == {"selection_surface": "command"}
+
+    def test_ea5_command_identity_uses_the_complete_command(self) -> None:
+        shared = "gpt-" + "a" * 220
+        findings = [
+            next(
+                finding
+                for finding in ea_mod.analyze(f"cmd --model={shared}{tail}", "SKILL.md", "markdown")
+                if finding.rule_id == "EA5"
+            )
+            for tail in ("first", "second")
+        ]
+
+        assert findings[0].matched_text == findings[1].matched_text
+        assert len(findings[0].matched_text or "") == 200
+        assert findings[0].match_fingerprint != findings[1].match_fingerprint
 
     @pytest.mark.parametrize(
         "content",
