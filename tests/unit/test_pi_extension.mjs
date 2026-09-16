@@ -29,7 +29,7 @@ async function setup(t, exec) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "skillspector-pi-test-")));
   const workspace = join(root, "workspace");
   const install = join(root, "install");
-  const bin = join(install, ".venv/bin/skillspector");
+  const bin = join(install, process.platform === "win32" ? ".venv/Scripts/skillspector.exe" : ".venv/bin/skillspector");
   const source = process.env.SKILLSPECTOR_EXTENSION_SOURCE
     ?? new URL("../../extensions/skillspector.ts", import.meta.url);
   mkdirSync(workspace);
@@ -72,6 +72,22 @@ test("uses installed absolute executable and preserves scan arguments without ou
   assert.deepEqual(ctx.calls[0].args, ["scan", "./SKILL.md", "--format", "terminal", "--no-llm", "--verbose"]);
   assert.deepEqual(ctx.calls[0].options.env, { SKILLSPECTOR_PROVIDER: "anthropic", SKILLSPECTOR_MODEL: "synthetic-model" });
   assert.equal(ctx.calls[0].options.cwd, ctx.workspace);
+});
+
+test("finds the Windows virtualenv executable without a PATH fallback", async (t) => {
+  const ctx = await setup(t);
+  rmSync(ctx.bin);
+  const windowsBin = join(ctx.root, "install/.venv/Scripts/skillspector.exe");
+  mkdirSync(dirname(windowsBin), { recursive: true });
+  writeFileSync(windowsBin, "unused mocked executable");
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "win32" });
+  try {
+    await ctx.scan();
+    assert.equal(ctx.calls[0].command, windowsBin);
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
 });
 
 test("uses an absolute operator override and preserves URL targets", async (t) => {
@@ -180,22 +196,36 @@ test("rejects a report replaced by a symlink during the scan", async (t) => {
   assert.equal(existsSync(dirname(ctx.calls[0].output)), false);
 });
 
-test("preserves the requested report when completed scan findings produce exit 1", async (t) => {
-  const ctx = await setup(t, () => ({ code: 1, stderr: "risk threshold exceeded" }));
-  writeFileSync(join(ctx.workspace, "report.txt"), "old report");
-  await assert.rejects(ctx.scan({ output: "report.txt" }), /exit code 1/);
-  assert.equal(readFileSync(join(ctx.workspace, "report.txt"), "utf8"), "new report");
-  assert.equal(existsSync(dirname(ctx.calls[0].output)), false);
-  assert.deepEqual(readdirSync(ctx.workspace), ["report.txt"]);
+test("preserves generated reports when the scanner returns exit 1 or 2", async (t) => {
+  for (const code of [1, 2]) {
+    await t.test(`exit ${code}`, async (t) => {
+      const report = JSON.stringify({ execution_successful: code !== 2 });
+      const ctx = await setup(t, ({ output }) => {
+        writeFileSync(output, report);
+        return { code, stderr: "scan failed" };
+      });
+      writeFileSync(join(ctx.workspace, "existing.json"), "old report");
+      for (const output of ["existing.json", "new.json"]) {
+        await assert.rejects(ctx.scan({ format: "json", output }), new RegExp(`exit code ${code}`));
+        const destination = join(ctx.workspace, output);
+        assert.equal(readFileSync(destination, "utf8"), report);
+        if (process.platform !== "win32") assert.equal(statSync(destination).mode & 0o777, 0o600);
+        assert.equal(existsSync(dirname(ctx.calls.at(-1).output)), false);
+      }
+      assert.deepEqual(readdirSync(ctx.workspace), ["existing.json", "new.json"]);
+    });
+  }
 });
 
 test("cleans staged reports after operational failure, cancellation, and missing output", async (t) => {
-  for (const failure of ["status", "cancel", "missing"]) {
+  for (const failure of ["status", "empty", "symlink", "cancel", "missing", "killed"]) {
     await t.test(failure, async (t) => {
-      const ctx = await setup(t, ({ output }) => {
+      const ctx = await setup(t, ({ output, workspace }) => {
         if (failure === "cancel") throw new Error("cancelled");
-        if (failure === "missing") rmSync(output);
-        return { code: failure === "status" ? 2 : 0, stderr: "synthetic failure" };
+        if (["status", "missing", "symlink"].includes(failure)) rmSync(output);
+        if (failure === "empty") writeFileSync(output, "");
+        if (failure === "symlink") symlinkSync(join(workspace, "report.txt"), output);
+        return { code: failure === "missing" ? 0 : failure === "killed" ? 137 : 2, stderr: "synthetic failure" };
       });
       writeFileSync(join(ctx.workspace, "report.txt"), "preserve");
       await assert.rejects(ctx.scan({ output: "report.txt" }));

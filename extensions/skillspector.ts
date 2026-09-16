@@ -58,7 +58,8 @@ function packageRoot(): string {
 }
 
 function findSkillSpectorBin(): string {
-  const bin = process.env.SKILLSPECTOR_BIN ?? resolve(packageRoot(), ".venv/bin/skillspector");
+  const bundledBin = process.platform === "win32" ? ".venv/Scripts/skillspector.exe" : ".venv/bin/skillspector";
+  const bin = process.env.SKILLSPECTOR_BIN ?? resolve(packageRoot(), bundledBin);
   if (!isAbsolute(bin) || !existsSync(bin)) {
     throw new Error("Install SkillSpector in the extension's .venv or set SKILLSPECTOR_BIN to an absolute executable path.");
   }
@@ -132,8 +133,9 @@ export default function (pi: ExtensionAPI) {
       const bin = findSkillSpectorBin();
       const outputPath = reportOutputPath(ctx.cwd, params.output);
       const reportDir = outputPath ? mkdtempSync(join(tmpdir(), "skillspector-report-")) : undefined;
+      const reportPath = reportDir ? join(reportDir, "report") : undefined;
       try {
-        const args = buildScanArgs(params, ctx.cwd, reportDir ? join(reportDir, "report") : undefined);
+        const args = buildScanArgs(params, ctx.cwd, reportPath);
         const env: Record<string, string> = {};
 
         if (params.provider) env.SKILLSPECTOR_PROVIDER = params.provider;
@@ -151,12 +153,15 @@ export default function (pi: ExtensionAPI) {
         const stdout = truncateText(redactSecrets(result.stdout ?? ""));
         const stderr = truncateText(redactSecrets(result.stderr ?? ""), 6000);
 
-        // Exit 1 is a completed scan whose findings exceed the CLI's policy.
-        if ((result.code === 0 || result.code === 1) && outputPath && reportDir) {
+        // Exit 2 can follow a diagnostic report; failures before reporting produce no file.
+        const failureReport = result.code === 2 && reportPath
+          ? lstatSync(reportPath, { throwIfNoEntry: false }) : undefined;
+        const hasFailureReport = failureReport?.isFile() && failureReport.size > 0;
+        if ((result.code === 0 || result.code === 1 || hasFailureReport) && outputPath && reportPath) {
           if (reportOutputPath(ctx.cwd, params.output) !== outputPath) {
             throw new Error("Report output directory changed during the scan.");
           }
-          publishReport(join(reportDir, "report"), outputPath);
+          publishReport(reportPath, outputPath);
         }
         if (result.code !== 0) {
           throw new Error(`SkillSpector failed with exit code ${result.code}.\n${stderr.text}`);
