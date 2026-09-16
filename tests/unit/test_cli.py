@@ -23,6 +23,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from importlib import import_module
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -31,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from rich.console import Console
 from typer.testing import CliRunner
 
 from skillspector import __version__, cli, transitive
@@ -90,6 +92,119 @@ def test_cli_version() -> None:
     assert result.exit_code == 0
     assert "SkillSpector" in result.output
     assert "v" in result.output
+
+
+def test_discovered_files_tree_renders_untrusted_names_literally() -> None:
+    """File names cannot inject Rich markup or terminal control sequences."""
+    malicious_name = "\x1b]52;c;SGVsbG8=\x1b\\[conceal]hidden.py"
+    nested_path = str(Path("folder") / malicious_name)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree([nested_path]))
+
+    rendered = output.getvalue()
+    assert "\x1b]52" not in rendered
+    assert "\\x1b]52;c;SGVsbG8=\\x1b\\[conceal]hidden.py" in rendered
+    assert "📁 folder" in rendered
+    assert "📄 " in rendered
+
+
+def test_discovered_files_tree_bounds_untrusted_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "_PROGRESS_TREE_MAX_PATHS", 1)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree(["a.py", "b.py"]))
+
+    rendered = output.getvalue()
+    assert "a.py" in rendered
+    assert "b.py" not in rendered
+    assert "1 additional path omitted" in rendered
+
+
+def test_progress_counts_only_analyzers_wired_into_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "ANALYZER_NODE_IDS", ["wired", "unavailable"])
+    monkeypatch.setattr(cli, "graph", SimpleNamespace(nodes={"wired": object()}))
+
+    assert cli._wired_analyzer_node_ids() == frozenset({"wired"})
+
+
+def test_stream_progress_returns_complete_values_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_state = {
+        "report_body": "{}",
+        "analysis_completeness": {"is_complete": True},
+        "filtered_findings": [],
+        "inspection_ledger": [{"phase": "complete"}],
+        "provider_cache": {"preserved": True},
+    }
+
+    def fake_stream(
+        state: dict[str, object],
+        config: object,
+        stream_mode: list[str],
+    ) -> Iterator[tuple[str, dict[str, object]]]:
+        del state, config
+        assert stream_mode == ["updates", "values"]
+        yield "updates", {"build_context": {"components": []}}
+        yield "values", final_state
+
+    monkeypatch.setattr(
+        cli,
+        "graph",
+        SimpleNamespace(nodes={}, stream=fake_stream),
+    )
+
+    result = cli._run_graph_scan(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        stream_progress=True,
+    )
+
+    assert result == final_state
+
+
+@pytest.mark.parametrize(
+    ("terminal", "verbose", "expected"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_scan_streams_only_for_interactive_default(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: bool,
+    verbose: bool,
+    expected: bool,
+) -> None:
+    calls: list[bool] = []
+
+    def fake_run_graph_scan_for_source(**kwargs: object) -> dict[str, object]:
+        calls.append(bool(kwargs["stream_progress"]))
+        return {"risk_score": 0}
+
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", fake_run_graph_scan_for_source)
+    monkeypatch.setattr(cli.err_console, "_force_terminal", terminal)
+
+    cli._scan_skill(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        baseline=None,
+        yara_rules_dir=None,
+        verbose=verbose,
+        show_suppressed=False,
+        transitive_enabled=False,
+        transitive_depth=1,
+        transitive_allow_prefix=None,
+        transitive_deny_prefix=None,
+    )
+
+    assert calls == [expected]
 
 
 def test_cli_scan_help_lists_every_available_provider() -> None:
@@ -184,13 +299,15 @@ def test_cli_writes_report_then_exits_two_for_execution_failure(
     """An incomplete execution preserves the report but takes precedence over risk."""
     (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
     output = tmp_path / "report.json"
+    fake_result = {
+        "report_body": '{"execution_successful": false}',
+        "execution_successful": False,
+        "risk_score": 0,
+    }
+    monkeypatch.setattr("skillspector.cli.graph.invoke", lambda state, config: fake_result)
     monkeypatch.setattr(
-        "skillspector.cli.graph.invoke",
-        lambda state, config: {
-            "report_body": '{"execution_successful": false}',
-            "execution_successful": False,
-            "risk_score": 0,
-        },
+        "skillspector.cli.graph.stream",
+        lambda state, config, stream_mode: iter([{"meta_analyzer": fake_result}]),
     )
 
     result = runner.invoke(app, ["scan", str(tmp_path), "-f", "json", "-o", str(output)])
@@ -580,7 +697,7 @@ def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code == 0, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert [issue for issue in issues if issue["id"] == "P6"] == []
     pe3 = next(issue for issue in issues if issue["id"] == "PE3")
     assert {"contextual-triage", "likely-benign-context"} <= set(pe3["tags"])
@@ -604,7 +721,7 @@ def test_cli_scan_required_table_keeps_malicious_pe3(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code in {0, 1}, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert any(issue["id"] == "PE3" for issue in issues)
 
 
@@ -883,7 +1000,7 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
         ],
     )
     assert scan.exit_code == 0
-    data = json.loads(scan.output)
+    data = json.loads(scan.stdout)
     assert data["issues"] == []
     assert data["risk_assessment"]["score"] == 0
 
@@ -959,7 +1076,7 @@ def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["issues"] == []
     assert [finding["id"] for finding in data["suppressed"]] == ["PE5"]
     assert data["suppressed"][0]["location"]["file"] == "SKILL.md"
@@ -1042,7 +1159,7 @@ def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     )
 
     assert result.exit_code in {0, 1}, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     pe5_files = {
         finding["location"]["file"] for finding in data["issues"] if finding["id"] == "PE5"
     }
@@ -1099,7 +1216,7 @@ def test_recursive_single_skill_scan_still_accepts_baseline(tmp_path: Path) -> N
     )
 
     assert result.exit_code == 0, result.output
-    assert [issue for issue in json.loads(result.output)["issues"] if issue["id"] == "P1"] == []
+    assert [issue for issue in json.loads(result.stdout)["issues"] if issue["id"] == "P1"] == []
 
 
 def test_scan_multi_skill_markdown_output_to_file(
@@ -2087,31 +2204,39 @@ def test_cli_scan_json_preserves_single_skill_contract(
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: single-skill\n---\n# Single", encoding="utf-8")
 
+    fake_result = {
+        "report_body": json.dumps(
+            {
+                "skill": {
+                    "name": "single-skill",
+                    "source": str(skill_dir),
+                    "scanned_at": "2026-06-29T13:00:00+00:00",
+                },
+                "risk_assessment": {
+                    "score": 30,
+                    "severity": "LOW",
+                    "recommendation": "SAFE",
+                },
+                "components": [{"path": "root.py", "type": "python"}],
+                "issues": [{"id": "X-1", "severity": "low"}],
+                "suppressed_count": 0,
+                "suppressed": [],
+                "metadata": {"scan_scope": {"components_scanned": 1}},
+            }
+        )
+    }
+
     def fake_invoke(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
         assert state["input_path"] == str(skill_dir)
-        return {
-            "report_body": json.dumps(
-                {
-                    "skill": {
-                        "name": "single-skill",
-                        "source": str(skill_dir),
-                        "scanned_at": "2026-06-29T13:00:00+00:00",
-                    },
-                    "risk_assessment": {
-                        "score": 30,
-                        "severity": "LOW",
-                        "recommendation": "SAFE",
-                    },
-                    "components": [{"path": "root.py", "type": "python"}],
-                    "issues": [{"id": "X-1", "severity": "low"}],
-                    "suppressed_count": 0,
-                    "suppressed": [],
-                    "metadata": {"scan_scope": {"components_scanned": 1}},
-                }
-            )
-        }
+        return fake_result
 
-    monkeypatch.setattr("skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke))
+    def fake_stream(state: dict[str, Any], config: Any = None, stream_mode: str | None = None):
+        assert state["input_path"] == str(skill_dir)
+        yield {"meta_analyzer": fake_result}
+
+    monkeypatch.setattr(
+        "skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke, stream=fake_stream)
+    )
 
     out_file = tmp_path / "single.json"
     result = runner.invoke(
