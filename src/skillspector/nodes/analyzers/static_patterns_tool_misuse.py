@@ -2994,7 +2994,6 @@ def has_bounded_parse_exhaustion(
     structural_quote_closers = None
     structural_quote_openers = None
     json_strings: list[tuple[int, int]] = []
-    raw_content = content
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
@@ -3045,11 +3044,14 @@ def has_bounded_parse_exhaustion(
     # whole-content parser reaches its structural opener. Recover each proven
     # string independently, without bypassing that parser's forward watermark
     # and reparsing overlapping suffixes. These raw spans are disjoint and
-    # bounded by JSON validation; their projection retains both outer quotes
-    # and escaped bytes while preserving ordinary inline-code documentation.
+    # bounded by JSON validation. Reuse the whole-document projection so each
+    # string retains its original fenced/literal or inline-code ownership.
+    # Reinterpreting a string as standalone Markdown could mask shell backticks
+    # that were literal inside its surrounding code fence. The projection keeps
+    # source offsets, outer JSON quotes and escaped bytes unchanged.
     for start, end in json_strings:
         check_runtime()
-        projected = _markdown_shell_text(raw_content[start:end], check_runtime)
+        projected = content[start:end]
         if _has_shell_command_word_exhaustion(
             projected,
             check_runtime,
