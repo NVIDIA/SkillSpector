@@ -110,14 +110,18 @@ def _model_label(value: object, fallback: str = "unknown") -> str:
 def provider_name(provider: object) -> str:
     """Return a stable provider label without endpoint or credential data."""
     names = {
+        "AntigravityCLIProvider": "antigravity_cli",
         "AnthropicProvider": "anthropic",
         "AnthropicProxyProvider": "anthropic_proxy",
+        "AzureOpenAIProvider": "azure_openai",
         "BedrockProvider": "bedrock",
         "ClaudeCLIProvider": "claude_cli",
         "CodexCLIProvider": "codex_cli",
         "GeminiCLIProvider": "gemini_cli",
         "NvBuildProvider": "nv_build",
         "NvInferenceProvider": "nv_inference",
+        "OllamaProvider": "ollama",
+        "OpenAICompatibleProvider": "openai_compatible",
         "OpenAIProvider": "openai",
     }
     return names.get(type(provider).__name__, _label(type(provider).__name__.lower()))

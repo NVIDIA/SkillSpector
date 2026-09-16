@@ -26,6 +26,8 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 logger = logging.getLogger(__name__)
+MIN_SAMPLING_SEED = -(1 << 63)
+MAX_SAMPLING_SEED = (1 << 63) - 1
 
 
 def resolve_reasoning_effort() -> str | None:
@@ -34,25 +36,44 @@ def resolve_reasoning_effort() -> str | None:
     return reasoning_effort or None
 
 
+def resolve_temperature() -> float | None:
+    """Resolve the optional temperature using the provider validation contract."""
+    raw_temperature = os.environ.get("SKILLSPECTOR_TEMPERATURE", "").strip()
+    if not raw_temperature:
+        return None
+    try:
+        temperature = float(raw_temperature)
+    except ValueError as exc:
+        raise ValueError("SKILLSPECTOR_TEMPERATURE must be a number between 0 and 1") from exc
+    if not 0 <= temperature <= 1:
+        raise ValueError("SKILLSPECTOR_TEMPERATURE must be between 0 and 1")
+    return temperature
+
+
+def resolve_seed() -> int | None:
+    """Resolve the optional seed within the portable signed 64-bit contract."""
+    raw_seed = os.environ.get("SKILLSPECTOR_SEED", "").strip()
+    if not raw_seed:
+        return None
+    try:
+        seed = int(raw_seed)
+    except ValueError as exc:
+        raise ValueError("SKILLSPECTOR_SEED must be an integer") from exc
+    if not MIN_SAMPLING_SEED <= seed <= MAX_SAMPLING_SEED:
+        raise ValueError("SKILLSPECTOR_SEED must be a signed 64-bit integer")
+    return seed
+
+
 def resolve_sampling_parameters(*, include_seed: bool = False) -> dict[str, float | int]:
     """Resolve optional, validated sampling controls for hosted providers."""
     parameters: dict[str, float | int] = {}
-    raw_temperature = os.environ.get("SKILLSPECTOR_TEMPERATURE", "").strip()
-    if raw_temperature:
-        try:
-            temperature = float(raw_temperature)
-        except ValueError as exc:
-            raise ValueError("SKILLSPECTOR_TEMPERATURE must be a number between 0 and 1") from exc
-        if not 0 <= temperature <= 1:
-            raise ValueError("SKILLSPECTOR_TEMPERATURE must be between 0 and 1")
+    temperature = resolve_temperature()
+    if temperature is not None:
         parameters["temperature"] = temperature
 
-    raw_seed = os.environ.get("SKILLSPECTOR_SEED", "").strip()
-    if include_seed and raw_seed:
-        try:
-            parameters["seed"] = int(raw_seed)
-        except ValueError as exc:
-            raise ValueError("SKILLSPECTOR_SEED must be an integer") from exc
+    seed = resolve_seed() if include_seed else None
+    if seed is not None:
+        parameters["seed"] = seed
     return parameters
 
 

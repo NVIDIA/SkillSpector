@@ -1491,6 +1491,93 @@ def test_json_report_exposes_only_sanitized_provider_usage(
     ]
 
 
+def test_json_report_exposes_captured_llm_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [],
+        "inference_usage": [
+            {
+                "node": "semantic_developer_intent",
+                "request_kind": "structured_output",
+                "provider": "openai",
+                "model": "safe/model:1",
+                "model_source": "requested_model",
+                "usage_source": "provider_response",
+                "total_tokens": 1,
+            }
+        ],
+        "llm_provenance": {
+            "provider": {
+                "configured_adapter": "anthropic",
+                "resolved_adapter": "openai",
+                "service": "private-service-name",
+            },
+            "analyzers": [
+                {
+                    "analyzer_id": "semantic_developer_intent",
+                    "model": "safe/model:1",
+                    "analyzer_revision": {"value": "2.11.2", "prompt": "must not leak"},
+                }
+            ],
+            "sampling": {
+                "temperature": {
+                    "requested": 0.0,
+                    "source": "environment",
+                    "forwarded_to_client": 0.0,
+                    "adapter_support": True,
+                },
+                "seed": {
+                    "requested": 7,
+                    "source": "environment",
+                    "forwarded_to_client": 7,
+                    "adapter_support": True,
+                },
+            },
+            "endpoint": "https://private.example.test",
+        },
+    }
+
+    meta = _meta_from_json_report(state)
+    provenance = meta["llm_provenance"]
+
+    assert provenance["provider"] == {
+        "configured_adapter": "anthropic",
+        "resolved_adapter": "openai",
+        "effective_adapter": "openai",
+        "effective_adapters": ["openai"],
+        "service": "unknown",
+        "routing": {
+            "deployment_override": None,
+            "deployment_source": "not_applicable",
+            "api_version": None,
+            "api_version_source": "not_applicable",
+        },
+    }
+    intent = next(
+        item
+        for item in provenance["analyzers"]
+        if item["analyzer_id"] == "semantic_developer_intent"
+    )
+    assert intent["model"] == "safe/model:1"
+    assert intent["analyzer_revision"] == {
+        "value": "2.11.2",
+        "source": "skillspector_package",
+    }
+    assert provenance["sampling"]["temperature"]["forwarded_to_client"] == 0.0
+    assert provenance["sampling"]["seed"]["forwarded_to_client"] == 7
+    assert provenance["determinism"]["classification"] == "nondeterministic"
+    assert "private.example" not in json.dumps(meta)
+    assert "must not leak" not in json.dumps(meta)
+
+
 def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm False -> failures (if any) never mark the scan degraded."""
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))

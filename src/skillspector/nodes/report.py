@@ -38,6 +38,7 @@ from rich.table import Table
 from skillspector import __version__ as skillspector_version
 from skillspector.inference_usage import sanitize_inference_usage
 from skillspector.inspection_ledger import MAX_FINDING_OUTPUT_RECORDS, AnalysisCompleteness
+from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -1068,6 +1069,7 @@ def _build_metadata(
     use_llm: bool,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
     inference_usage: Sequence[Mapping[str, object]] | None = None,
+    llm_provenance: object = None,
     transitive_targets_scanned: int | None = None,
     transitive_bytes_scanned: int | None = None,
     transitive_truncation_reasons: Sequence[str] | None = None,
@@ -1106,6 +1108,7 @@ def _build_metadata(
     # some coverage was lost) into one boolean.
     meta_analysis_applied = use_llm and provider_available and meta_analyzer_succeeded
 
+    sanitized_inference_usage = sanitize_inference_usage(inference_usage)
     meta: dict[str, object] = {
         "has_executable_scripts": has_executable_scripts,
         "skillspector_version": skillspector_version,
@@ -1117,7 +1120,12 @@ def _build_metadata(
         # A list (including an empty list) makes observability explicit. Empty
         # means the provider/transport supplied no counters; it is never an
         # estimated zero-cost assertion.
-        "inference_usage": sanitize_inference_usage(inference_usage),
+        "inference_usage": sanitized_inference_usage,
+        "llm_provenance": sanitize_llm_provenance(
+            llm_provenance,
+            use_llm=use_llm,
+            inference_usage=sanitized_inference_usage,
+        ),
     }
     if not meta_analysis_applied:
         meta["filtering_mode"] = "heuristic"
@@ -1159,6 +1167,7 @@ def _format_json(
     use_llm: bool = True,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
     inference_usage: Sequence[Mapping[str, object]] | None = None,
+    llm_provenance: object = None,
     analysis_completeness: Mapping[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     execution_successful: bool = True,
@@ -1204,6 +1213,7 @@ def _format_json(
             use_llm,
             llm_call_log,
             inference_usage,
+            llm_provenance,
             transitive_targets_scanned,
             transitive_bytes_scanned,
             transitive_truncation_reasons,
@@ -1457,6 +1467,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     use_llm = state.get("use_llm", True)
     llm_call_log = state.get("llm_call_log") or []
     inference_usage = state.get("inference_usage") or []
+    llm_provenance = state.get("llm_provenance")
     transitive_targets_scanned = state.get("transitive_targets_scanned")
     transitive_bytes_scanned = state.get("transitive_bytes_scanned")
     transitive_truncation_reasons = [
@@ -1578,6 +1589,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             use_llm=use_llm,
             llm_call_log=llm_call_log,
             inference_usage=inference_usage,
+            llm_provenance=llm_provenance,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
             execution_successful=execution_successful,

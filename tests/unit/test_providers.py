@@ -591,12 +591,37 @@ class TestOpenAICompatibleConstructor:
         assert captured["temperature"] == 0.25
         assert captured["seed"] == 42
 
+    @pytest.mark.parametrize("seed", [-(1 << 63), (1 << 63) - 1])
+    def test_signed_64_bit_seed_boundaries_are_forwarded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seed: int,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_SEED", str(seed))
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["seed"] == seed
+
     @pytest.mark.parametrize(
         ("name", "value", "message"),
         [
             ("SKILLSPECTOR_TEMPERATURE", "warm", "must be a number"),
             ("SKILLSPECTOR_TEMPERATURE", "1.1", "must be between 0 and 1"),
             ("SKILLSPECTOR_SEED", "4.2", "must be an integer"),
+            ("SKILLSPECTOR_SEED", str(1 << 63), "must be a signed 64-bit integer"),
+            ("SKILLSPECTOR_SEED", str(-(1 << 63) - 1), "must be a signed 64-bit integer"),
         ],
     )
     def test_invalid_sampling_control_fails_before_model_construction(
