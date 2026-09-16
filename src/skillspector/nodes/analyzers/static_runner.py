@@ -17,6 +17,9 @@
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import re
 import time
 import unicodedata
@@ -42,7 +45,13 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Finding, observe_analyzer_findings
+from skillspector.models import (
+    AnalyzerFinding,
+    Finding,
+    Severity,
+    compute_match_fingerprint,
+    observe_analyzer_findings,
+)
 from skillspector.nodes.deduplicate import classification_metadata_key
 from skillspector.python_ast import (
     MAX_PYTHON_AST_SOURCE_CHARS,
@@ -61,10 +70,18 @@ from .common import (
     LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
+    logical_line_starts,
 )
 from .pattern_defaults import get_category, get_explanation, get_pattern_name, get_remediation
 
 logger = get_logger(__name__)
+
+_ANALYZER_SEVERITY_ORDER = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+}
 
 # Extension -> file type (match v1 InventoryBuilder.FILE_TYPES)
 FILE_TYPES: dict[str, str] = {
@@ -94,8 +111,17 @@ _VIEW_START_EVIDENCE = "_security_view_start"
 _SOURCE_START_EVIDENCE = "_security_source_start"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
 _BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
-_ViewFindingKey = tuple[str, str, int, str | None, tuple[object, ...]]
-_ViewScopeKey = tuple[str, str, int, str | None]
+_ViewFindingKey = tuple[
+    str,
+    str,
+    int,
+    int | None,
+    int | None,
+    int | None,
+    str | None,
+    tuple[object, ...],
+]
+_ViewScopeKey = tuple[str, str, int, int | None, int | None, int | None, str | None]
 assert _RAW_WINDOW_OWNED_CHARS > 0
 DECLARED_MARKER_LEFT_CONTEXT_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
 DECLARED_MARKER_RIGHT_CONTEXT_CHARS = MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS
@@ -115,10 +141,105 @@ _CONTINUITY_CONTEXT_CHARS = 2048
 _CONTINUITY_MAX_CHAIN_RUNS = 24
 MAX_FINDINGS_PER_ARTIFACT = 10_000
 MAX_FINDINGS_PER_ANALYZER = 10_000
-MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = 30.0
+DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = 300.0
+
+
+def _static_max_seconds_from_environment(value: str | None) -> float:
+    """Read the static artifact allowance using the workflow setting's convention."""
+    if value is None:
+        return DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0.0
+    if not math.isfinite(seconds) or seconds <= 0:
+        logger.warning(
+            "SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT=%r must be finite "
+            "and positive, using default %.1fs",
+            value,
+            DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT,
+        )
+        return DEFAULT_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+    return seconds
+
+
+MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = _static_max_seconds_from_environment(
+    os.environ.get("SKILLSPECTOR_MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT")
+)
 
 _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+
+
+def _analyzer_representative_key(finding: AnalyzerFinding) -> tuple[object, ...]:
+    """Rank exact analyzer duplicates by severity, confidence, and stable semantics."""
+    return (
+        _ANALYZER_SEVERITY_ORDER.get(finding.severity, 4),
+        -finding.confidence,
+        finding.location.file,
+        finding.location.start_line,
+        finding.location.end_line is not None,
+        finding.location.end_line or 0,
+        finding.location.start_column is not None,
+        finding.location.start_column or 0,
+        finding.location.end_column is not None,
+        finding.location.end_column or 0,
+        finding.rule_id,
+        finding.message,
+        finding.remediation or "",
+        tuple(finding.tags),
+        finding.context or "",
+        finding.matched_text or "",
+        json.dumps(
+            finding.evidence,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+
+def deduplicate_analyzer_findings(
+    findings: list[AnalyzerFinding],
+) -> list[AnalyzerFinding]:
+    """Compact only exact same-location matches before graph-state conversion."""
+    groups: dict[
+        tuple[str, int, int | None, int | None, int | None, str, str],
+        list[AnalyzerFinding],
+    ] = {}
+    identities: list[tuple[str, int, int | None, int | None, int | None, str, str] | None] = []
+    for finding in findings:
+        fingerprint = finding.match_fingerprint
+        if fingerprint is None and finding.matched_text:
+            fingerprint = compute_match_fingerprint(finding.rule_id, finding.matched_text)
+        identity = (
+            (
+                finding.location.file,
+                finding.location.start_line,
+                finding.location.end_line,
+                finding.location.start_column,
+                finding.location.end_column,
+                finding.rule_id,
+                fingerprint,
+            )
+            if fingerprint is not None
+            else None
+        )
+        identities.append(identity)
+        if identity is not None:
+            groups.setdefault(identity, []).append(finding)
+
+    compacted: list[AnalyzerFinding] = []
+    emitted: set[tuple[str, int, int | None, int | None, int | None, str, str]] = set()
+    for finding, identity in zip(findings, identities, strict=True):
+        if identity is None:
+            compacted.append(finding)
+        elif identity not in emitted:
+            compacted.append(min(groups[identity], key=_analyzer_representative_key))
+            emitted.add(identity)
+    return compacted
+
+
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
@@ -409,6 +530,8 @@ def analyzer_finding_to_finding(
         file=af.location.file,
         start_line=af.location.start_line,
         end_line=af.location.end_line,
+        start_column=af.location.start_column,
+        end_column=af.location.end_column,
         remediation=remediation,
         tags=list(af.tags),
         context=af.context,
@@ -420,6 +543,7 @@ def analyzer_finding_to_finding(
         code_snippet=af.context,
         intent=None,
         evidence=dict(af.evidence),
+        match_fingerprint=af.match_fingerprint,
     )
 
 
@@ -519,16 +643,49 @@ class _WindowSourceContext:
     fence_transitions: dict[int, tuple[str, int, str, int, int]]
 
 
+@dataclass
+class _OccurrenceColumnResolver:
+    """Fill missing static-match columns once at the runner boundary.
+
+    Most regex analyzers expose a bounded preview rather than raw offsets. The
+    resolver walks identical previews monotonically within their reported line,
+    preserving repeated same-line occurrences without retaining full payloads.
+    Producers that compact locally must publish exact columns themselves.
+    """
+
+    content: str
+    line_starts: tuple[int, ...]
+    next_offsets: dict[tuple[int, str, str], int] = field(default_factory=dict)
+
+    def assign(self, finding: AnalyzerFinding) -> None:
+        if finding.location.start_column is not None or not finding.matched_text:
+            return
+        line_index = finding.location.start_line - 1
+        if line_index < 0 or line_index >= len(self.line_starts):
+            return
+        line_start = self.line_starts[line_index]
+        line_end = (
+            self.line_starts[line_index + 1]
+            if line_index + 1 < len(self.line_starts)
+            else len(self.content)
+        )
+        key = (finding.location.start_line, finding.rule_id, finding.matched_text)
+        search_start = self.next_offsets.get(key, line_start)
+        search_limit = min(len(self.content), line_end + len(finding.matched_text))
+        match_start = self.content.find(finding.matched_text, search_start, search_limit)
+        if match_start < line_start or match_start >= line_end:
+            return
+        finding.location.start_column = match_start - line_start
+        self.next_offsets[key] = match_start + max(1, len(finding.matched_text))
+
+
 def _build_window_source_context(
     path: str,
     content: str,
     raw_starts: tuple[int, ...],
 ) -> _WindowSourceContext:
     """Build line and Markdown state once for every scanner window origin."""
-    line_starts = (
-        0,
-        *(separator.end() for separator in LOGICAL_LINE_BREAK.finditer(content)),
-    )
+    line_starts = logical_line_starts(content)
     fence_states, fence_transitions = (
         _markdown_fence_states(content, raw_starts)
         if _infer_file_type(path) in {"markdown", "text"}
@@ -592,8 +749,10 @@ def _scan_path(
         python_ast = get_python_ast(python_ast_cache_key, content, path)
         finding_budget.check_runtime()
 
+    line_starts = logical_line_starts(content)
     for module in pattern_modules:
         module_finding_start = len(findings)
+        occurrence_columns = _OccurrenceColumnResolver(content, line_starts)
         finding_budget.begin_module()
         try:
             with observe_analyzer_findings(finding_budget.observe_creation):
@@ -609,6 +768,7 @@ def _scan_path(
                 finding_budget.check_runtime()
                 for af in raw:
                     finding_budget.observe_emission()
+                    occurrence_columns.assign(af)
                     converted = _convert_analyzer_finding(
                         af,
                         path=path,
@@ -628,6 +788,7 @@ def _scan_path(
                     if finding_budget.emitted_findings >= finding_budget.max_findings:
                         break
                     finding_budget.emitted_findings += 1
+                    occurrence_columns.assign(af)
                     converted = _convert_analyzer_finding(
                         af,
                         path=path,
@@ -647,6 +808,9 @@ def _view_finding_key(finding: Finding) -> _ViewFindingKey:
         finding.rule_id,
         finding.file,
         finding.start_line,
+        finding.end_line,
+        finding.start_column,
+        finding.end_column,
         finding.fingerprint(),
         classification_metadata_key(finding, ignored_tags=_VIEW_ORIGIN_TAGS),
     )
@@ -657,7 +821,27 @@ def _view_scope_key(finding: Finding) -> _ViewScopeKey:
         finding.rule_id,
         finding.file,
         finding.start_line,
+        finding.end_line,
+        finding.start_column,
+        finding.end_column,
         finding.fingerprint(),
+    )
+
+
+def _projection_finding_key(finding: Finding) -> tuple[object, ...]:
+    """Identify one semantic signal across alternate marker projections.
+
+    Declared-marker reconstruction can expose the same canonical match through
+    multiple removal candidates. Those alternatives are not independent raw
+    occurrences, so their projected columns must not consume output budget.
+    """
+    return (
+        finding.rule_id,
+        finding.file,
+        finding.start_line,
+        finding.end_line,
+        finding.fingerprint(),
+        classification_metadata_key(finding, ignored_tags=_VIEW_ORIGIN_TAGS),
     )
 
 
@@ -735,6 +919,8 @@ def _scan_view_windows(
     )
     for finding in findings:
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
+        if not isinstance(local_start, int) and finding.start_column is not None:
+            local_start = _line_start_offset(view.text, finding.start_line) + finding.start_column
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
             finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
     if view.name != "raw":
@@ -949,6 +1135,10 @@ def _restore_continuity_lines(
         if finding.end_line is not None:
             end_index = min(max(finding.end_line - 1, 0), len(source_lines) - 1)
             finding.end_line = source_lines[end_index]
+        # Continuity projections retain exact raw lines but may remove columns'
+        # worth of separators. Do not publish a projected column as a raw one.
+        finding.start_column = None
+        finding.end_column = None
 
 
 def _continuity_finding_key(finding: Finding) -> tuple[object, ...]:
@@ -987,22 +1177,48 @@ def _restore_source_lines(
     window_start: int = 0,
     source_line_starts: tuple[int, ...] | None = None,
 ) -> None:
-    """Map normalized/window-relative locations to raw whole-file lines."""
+    """Map normalized/window-relative locations to raw whole-file coordinates."""
 
-    def source_line(raw_offset: int) -> int:
+    def source_position(raw_offset: int) -> tuple[int, int]:
         if source_line_starts is not None:
-            return bisect_right(source_line_starts, window_start + raw_offset)
-        return window_line + sum(1 for _ in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_offset))
+            absolute = window_start + raw_offset
+            line_index = max(0, bisect_right(source_line_starts, absolute) - 1)
+            return line_index + 1, absolute - source_line_starts[line_index]
+        line = window_line
+        line_start = 0
+        for separator in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_offset):
+            line += 1
+            line_start = separator.end()
+        return line, raw_offset - line_start
+
+    def derived_offset(line: int, column: int | None) -> int:
+        offset = _line_start_offset(view.text, line)
+        if column is not None:
+            offset += column
+        return min(max(offset, 0), len(view.text))
+
+    def source_end_offset(offset: int) -> int:
+        if offset <= 0:
+            return view.source_offset(0)
+        return view.source_offset(offset - 1) + 1
 
     for finding in findings:
-        derived_start = _line_start_offset(view.text, finding.start_line)
-        raw_start = view.source_offset(derived_start)
-        finding.start_line = source_line(raw_start)
+        source_start = finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+        has_exact_start = isinstance(source_start, int) or finding.start_column is not None
+        if isinstance(source_start, int):
+            raw_start = source_start
+        else:
+            raw_start = view.source_offset(derived_offset(finding.start_line, finding.start_column))
+        finding.start_line, raw_start_column = source_position(raw_start)
+        finding.start_column = raw_start_column if has_exact_start else None
         if finding.end_line is not None:
-            derived_end = _line_start_offset(view.text, finding.end_line)
-            raw_end = view.source_offset(derived_end)
-            finding.end_line = source_line(raw_end)
-        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+            has_exact_end = finding.end_column is not None
+            end_offset = derived_offset(finding.end_line, finding.end_column)
+            raw_end = (
+                source_end_offset(end_offset) if has_exact_end else view.source_offset(end_offset)
+            )
+            finding.end_line, raw_end_column = source_position(raw_end)
+            finding.end_column = raw_end_column if has_exact_end else None
 
 
 def _scan_declared_marker_views(
@@ -1031,7 +1247,7 @@ def _scan_declared_marker_views(
     check_runtime()
     projection_limited = False
     seen_views: set[tuple[str, int, int]] = set()
-    seen_findings: set[_ViewFindingKey] = set()
+    seen_finding_counts: dict[tuple[object, ...], int] = {}
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
         check_runtime()
@@ -1074,6 +1290,8 @@ def _scan_declared_marker_views(
                 if marker_key in seen_views:
                     continue
                 seen_views.add(marker_key)
+                projection_finding_counts: dict[tuple[object, ...], int] = {}
+                projection_seen_occurrences: set[_ViewFindingKey] = set()
                 for view in _bounded_view_slices(marker_view):
                     check_runtime()
                     view_budget = _FindingBudget(
@@ -1098,10 +1316,16 @@ def _scan_declared_marker_views(
                         source_line_starts=source_context.line_starts,
                     )
                     for finding in view_findings:
-                        key = _view_finding_key(finding)
-                        if key in seen_findings:
+                        occurrence_key = _view_finding_key(finding)
+                        if occurrence_key in projection_seen_occurrences:
                             continue
-                        seen_findings.add(key)
+                        projection_seen_occurrences.add(occurrence_key)
+                        key = _projection_finding_key(finding)
+                        projection_count = projection_finding_counts.get(key, 0) + 1
+                        projection_finding_counts[key] = projection_count
+                        if projection_count <= seen_finding_counts.get(key, 0):
+                            continue
+                        seen_finding_counts[key] = projection_count
                         findings.append(finding)
                         if len(findings) > finding_budget.max_findings:
                             return (
@@ -1302,6 +1526,10 @@ def _scan_all_views_detailed(
                                 exhaustion_hook(
                                     full_view.text,
                                     finding_budget.check_runtime,
+                                    file_type=_infer_file_type(path),
+                                    # A fragment cannot prove surrounding HTML,
+                                    # container, or inline delimiter ownership.
+                                    complete_context=whole_artifact_window,
                                 )
                             )
                 except _StaticResourceLimitError as exc:

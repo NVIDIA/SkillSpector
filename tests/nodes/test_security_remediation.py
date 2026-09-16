@@ -352,6 +352,43 @@ def test_full_body_reference_resolver_handles_markdown_and_unique_basename(
     assert all(record["status"] == "resolved" for record in records)
 
 
+def test_plain_slash_separated_prose_is_not_a_reference(tmp_path: Path) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=(
+            "Compare reads/writes, environment/profile settings, operation/node behavior, "
+            "and model/provider options. SkillSpector 2.10.0 supports node.js; see example.com."
+        ),
+        known_paths=["SKILL.md"],
+    )
+
+    assert records == []
+
+
+@pytest.mark.parametrize(
+    ("source_text", "target_path"),
+    [
+        ("Read references/guide.md before continuing.", "references/guide.md"),
+        ("Read ./guide before continuing.", "guide"),
+        ("Read ./references/guide before continuing.", "references/guide"),
+    ],
+)
+def test_plain_local_reference_requires_an_explicit_path_signal(
+    tmp_path: Path, source_text: str, target_path: str
+) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source_text,
+        known_paths=["SKILL.md", target_path],
+    )
+
+    assert len(records) == 1
+    assert records[0]["status"] == "resolved"
+    assert records[0]["target_path"] == target_path
+
+
 def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -> None:
     records = resolve_bundle_references(
         tmp_path,
