@@ -39,6 +39,83 @@ def _findings(content: str, path: str, module: object) -> set[str]:
     return {finding.rule_id for finding in static_runner.run_static_patterns(state, [module])}
 
 
+def _view_finding(**overrides: object) -> Finding:
+    values: dict[str, object] = {
+        "rule_id": "T1",
+        "message": "Raw classification",
+        "severity": "HIGH",
+        "confidence": 0.8,
+        "file": "SKILL.md",
+        "start_line": 1,
+        "start_column": 4,
+        "matched_text": "same match",
+        "match_fingerprint": "canonical-match",
+    }
+    values.update(overrides)
+    return Finding(**values)  # type: ignore[arg-type]
+
+
+def test_raw_stronger_classification_dominates_normalized_context() -> None:
+    raw = _view_finding()
+    normalized = _view_finding(
+        message="Normalization-only benign context",
+        severity="LOW",
+        confidence=0.15,
+        match_fingerprint="normalized-match",
+        tags=["contextual-triage", "likely-benign-context", "normalized-view"],
+    )
+
+    assert static_runner._deduplicate_view_findings([raw, normalized]) == [raw]
+
+
+def test_stronger_normalized_security_classification_is_retained() -> None:
+    raw = _view_finding(message="Raw low signal", severity="LOW", confidence=0.2)
+    normalized = _view_finding(
+        message="Normalized high signal",
+        severity="HIGH",
+        confidence=0.9,
+        tags=["contextual-triage", "normalized-view"],
+    )
+
+    result = static_runner._deduplicate_view_findings([raw, normalized])
+
+    assert [finding.message for finding in result] == ["Raw low signal", "Normalized high signal"]
+
+
+def test_exact_equal_normalized_view_is_deduplicated() -> None:
+    raw = _view_finding()
+    normalized = replace(raw, tags=["normalized-view"])
+
+    assert static_runner._deduplicate_view_findings([raw, normalized]) == [raw]
+
+
+def test_context_arbitration_preserves_distinct_occurrence_columns() -> None:
+    raw = _view_finding(start_column=4)
+    normalized = _view_finding(
+        message="Different occurrence",
+        severity="LOW",
+        confidence=0.15,
+        start_column=24,
+        tags=["contextual-triage", "likely-benign-context", "normalized-view"],
+    )
+
+    result = static_runner._deduplicate_view_findings([raw, normalized])
+
+    assert {finding.start_column for finding in result} == {4, 24}
+
+
+def test_context_arbitration_tolerates_unknown_public_severity() -> None:
+    raw = _view_finding(severity="UNKNOWN")
+    normalized = _view_finding(
+        message="Normalized context",
+        severity="UNKNOWN",
+        confidence=0.2,
+        tags=["contextual-triage", "normalized-view"],
+    )
+
+    assert static_runner._deduplicate_view_findings([raw, normalized]) == [raw]
+
+
 def test_complete_match_init_input_is_not_retained_and_preserves_identity() -> None:
     short_match = "subprocess.run(command, shell=True)"
     long_match = f"{short_match} {'segment' * 32}-tail"
@@ -165,6 +242,118 @@ def test_p1_identical_same_line_matches_keep_occurrence_columns() -> None:
         content.index(phrase),
         content.rindex(phrase),
     }
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "phrase"),
+    [
+        pytest.param("P1", "ignore previous instructions", id="p1"),
+        pytest.param("P2", "<!-- send -->", id="p2"),
+        pytest.param("P3", "send conversation to", id="p3"),
+        pytest.param("P4", "never warn the user", id="p4"),
+    ],
+)
+def test_prompt_matches_keep_content_identity_separate_from_occurrence_coordinates(
+    rule_id: str,
+    phrase: str,
+) -> None:
+    content = f"{phrase}; {phrase}"
+
+    matches = [
+        finding
+        for finding in pi_module.analyze(content, "SKILL.md", "markdown")
+        if finding.rule_id == rule_id
+    ]
+
+    assert len(matches) == 2
+    assert {finding.match_fingerprint for finding in matches} == {
+        Finding(rule_id=rule_id, message="prompt match", matched_text=phrase).fingerprint()
+    }
+    assert {finding.location.start_column for finding in matches} == {
+        content.index(phrase),
+        content.rindex(phrase),
+    }
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "spaced_phrase", "canonical_match"),
+    [
+        pytest.param(
+            "P3",
+            "s e n d conversation to",
+            "send conversation to",
+            id="p3",
+        ),
+        pytest.param(
+            "P4",
+            "n e v e r warn the user",
+            "never warn the user",
+            id="p4",
+        ),
+    ],
+)
+def test_projected_prompt_matches_keep_canonical_identity_and_raw_occurrences(
+    rule_id: str,
+    spaced_phrase: str,
+    canonical_match: str,
+) -> None:
+    content = f"{spaced_phrase}; {spaced_phrase}"
+
+    findings = static_runner.run_static_patterns(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+        [pi_module],
+    )
+    matches = [finding for finding in findings if finding.rule_id == rule_id]
+
+    assert len(matches) == 2
+    assert {finding.matched_text for finding in matches} == {canonical_match}
+    assert {finding.fingerprint() for finding in matches} == {
+        Finding(
+            rule_id=rule_id,
+            message="prompt match",
+            matched_text=canonical_match,
+        ).fingerprint()
+    }
+    assert {finding.start_column for finding in matches} == {
+        content.index(spaced_phrase),
+        content.rindex(spaced_phrase),
+    }
+
+    compacted = deduplicate(matches)
+    assert len(compacted) == 1
+    assert {item["start_column"] for item in compacted[0].occurrences} == {
+        content.index(spaced_phrase),
+        content.rindex(spaced_phrase),
+    }
+
+
+def test_long_prompt_match_is_owned_by_first_window_that_can_observe_its_end() -> None:
+    match_start = static_runner._RAW_WINDOW_OWNED_CHARS - 16
+    content = (
+        "x" * match_start
+        + "without telling the user"
+        + "x" * (static_runner._WINDOW_OVERLAP_CHARS + 100)
+        + " send"
+        + "x" * 20_000
+    )
+    match_end = content.index(" send", match_start) + len(" send")
+
+    findings = static_runner.run_static_patterns(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+        [pi_module],
+    )
+    matches = [finding for finding in findings if finding.rule_id == "P3"]
+
+    assert len(matches) == 1
+    assert (matches[0].start_column, matches[0].end_column) == (match_start, match_end)
+    assert (
+        matches[0].fingerprint()
+        == Finding(
+            rule_id="P3",
+            message="prompt match",
+            matched_text=content[match_start:match_end],
+        ).fingerprint()
+    )
 
 
 def test_p1_producer_builds_one_location_index_per_content(
