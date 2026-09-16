@@ -1387,7 +1387,8 @@ def _scan_declared_marker_views(
     owned_starts: tuple[int, ...],
     raw_starts: tuple[int, ...],
     source_context: _WindowSourceContext,
-) -> tuple[list[Finding], bool, _StaticResourceLimitError | None]:
+    complete_context: bool,
+) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
 
@@ -1403,6 +1404,7 @@ def _scan_declared_marker_views(
 
     check_runtime()
     projection_limited = False
+    bounded_parse_limited = False
     seen_views: set[tuple[str, int, int]] = set()
     seen_finding_counts: dict[tuple[object, ...], int] = {}
 
@@ -1489,6 +1491,7 @@ def _scan_declared_marker_views(
                             return (
                                 findings,
                                 projection_limited,
+                                bounded_parse_limited,
                                 _StaticResourceLimitError(
                                     LedgerReason.OUTPUT_LIMIT,
                                     {
@@ -1498,12 +1501,34 @@ def _scan_declared_marker_views(
                                 ),
                             )
                     if resource_limit is not None:
-                        return findings, projection_limited, resource_limit
+                        return (
+                            findings,
+                            projection_limited,
+                            bounded_parse_limited,
+                            resource_limit,
+                        )
+                # Preserve any concrete marker-view evidence before asking
+                # module-specific completeness hooks whether the reconstructed
+                # payload exceeded a bounded parser contract. If that hook
+                # reaches the shared deadline, ``check_runtime`` carries the
+                # findings accumulated above into the partial result.
+                for module in pattern_modules:
+                    exhaustion_hook = getattr(module, "has_bounded_parse_exhaustion", None)
+                    if callable(exhaustion_hook):
+                        check_runtime()
+                        bounded_parse_limited = bounded_parse_limited or bool(
+                            exhaustion_hook(
+                                marker_view.text,
+                                check_runtime,
+                                file_type=_infer_file_type(path),
+                                complete_context=complete_context,
+                            )
+                        )
 
         if owned_end == len(content):
             break
 
-    return findings, projection_limited, None
+    return findings, projection_limited, bounded_parse_limited, None
 
 
 def _scan_all_views_detailed(
@@ -1587,17 +1612,22 @@ def _scan_all_views_detailed(
                 tuple(sorted(set(marker_raw_starts).union(raw_starts))),
             )
             finding_budget.check_runtime()
-            marker_findings, marker_projection_limited, resource_limit = (
-                _scan_declared_marker_views(
-                    path,
-                    content,
-                    modules_for_windows,
-                    marker_budget,
-                    owned_starts=marker_owned_starts,
-                    raw_starts=marker_raw_starts,
-                    source_context=source_context,
-                )
+            (
+                marker_findings,
+                marker_projection_limited,
+                marker_bounded_parse_limited,
+                resource_limit,
+            ) = _scan_declared_marker_views(
+                path,
+                content,
+                modules_for_windows,
+                marker_budget,
+                owned_starts=marker_owned_starts,
+                raw_starts=marker_raw_starts,
+                source_context=source_context,
+                complete_context=whole_artifact_window,
             )
+            bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
             _extend_unique_findings(
                 findings,

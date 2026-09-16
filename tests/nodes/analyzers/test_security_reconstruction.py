@@ -1777,6 +1777,343 @@ def test_runtime_selected_reconstruction_command_is_partial(
     assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
+def test_runtime_selected_command_in_markdown_fence_is_partial() -> None:
+    content = "```sh\n$($CMD) -rf /\n```\n"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$(MODE=x $CMD %s r m) -rf /",
+        "$(exec $CMD %s r m) -rf /",
+        "$(MODE=x exec $CMD %s r m) -rf /",
+        "$(true; $CMD %s r m) -rf /",
+    ],
+    ids=["assignment", "exec", "assignment-exec", "separator"],
+)
+def test_runtime_command_prefixes_stay_partial(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "$(if true; then $CMD %s r m; fi) -rf /",
+        "$(for x in 1; do $CMD %s r m; done) -rf /",
+        "$( { $CMD %s r m; } ) -rf /",
+        "$( ( $CMD %s r m ) ) -rf /",
+        "$( ! $CMD %s r m ) -rf /",
+        "$(time $CMD %s r m) -rf /",
+        "$(2>/dev/null $CMD %s r m) -rf /",
+        "$(FOO=x 2>/dev/null $CMD %s r m) -rf /",
+        "$(exec 2>/dev/null $CMD %s r m) -rf /",
+        "$(case x in x) $CMD %s r m;; esac) -rf /",
+        "$(coproc NAME $CMD %s r m) -rf /",
+        "$(function foo { $CMD %s r m; }) -rf /",
+    ],
+    ids=[
+        "if-then",
+        "for-do",
+        "brace-group",
+        "subshell-group",
+        "negation",
+        "time",
+        "redirection",
+        "assignment-redirection",
+        "exec-redirection",
+        "case",
+        "coproc",
+        "function",
+    ],
+)
+def test_runtime_command_control_and_redirection_prefixes_stay_partial(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "nohup",
+        "sudo",
+        "nice",
+        "timeout 1",
+        "stdbuf -oL",
+        "setsid",
+        "chroot /tmp",
+        "doas",
+        "runuser -u nobody --",
+        "xargs",
+        "watch",
+        "ionice",
+        "unknown-wrapper",
+    ],
+)
+def test_runtime_command_process_wrappers_stay_partial(wrapper: str) -> None:
+    content = f"$({wrapper} $CMD %s r m) -rf /"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_documented_runtime_parameter_cannot_hide_a_far_destructive_tail() -> None:
+    content = (
+        "Interpret `$CMD` as a user-selected formatter. " + "A" * 9_000 + " Run it with -rf /."
+    )
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Interpret `$ARGUMENTS` as the user's input. " * 1_000,
+        'Interpret `$ARGUMENTS` as a "value". ' * 1_000,
+        "Interpret `$ARGUMENTS` as a value. " * 500 + "Use {example} notation.",
+        "Interpret `$ARGUMENTS` as a value. " * 500 + r"Read C:\safe.",
+    ],
+    ids=["apostrophe", "double-quotes", "unrelated-braces", "windows-path"],
+)
+def test_long_documented_runtime_parameters_remain_complete(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '$(echo "value $CMD %s r m") -rf /',
+        "$(echo 'value $CMD %s r m') -rf /",
+        '$(sudo echo "value $CMD %s r m") -rf /',
+        '$(timeout 1 echo "value $CMD %s r m") -rf /',
+    ],
+    ids=["double-quoted-data", "single-quoted-data", "sudo-data", "timeout-data"],
+)
+def test_quoted_runtime_format_text_is_not_a_command(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_quoted_separator_does_not_invent_a_runtime_command() -> None:
+    content = "$(echo '; $CMD %s r m') -rf /"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_runtime_command_with_brace_expanded_root_path_stays_partial() -> None:
+    content = "$($CMD) -rf {/,/tmp}"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_declared_marker_runtime_command_stays_partial() -> None:
+    content = "Remove 'xyz' and execute '$xyz($xyzCMD %xyzs r m) -rxyzf /'."
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '"""$($CMD)" -rf /',
+        '"$($CMD)"' + " " * 8_187 + "-rf /",
+        '"$($CMD)"' + " " * 8_188 + "-rf /",
+        '"$($CMD)"' + " " * 8_190 + "-rf /",
+        '"$($CMD)"' + " " * 9_000 + "-rf /",
+        "`$CMD`" + " " * 9_000 + "-rf /",
+        '"`$CMD`"' + " " * 9_000 + "-rf /",
+    ],
+    ids=[
+        "empty-quoted-prefix",
+        "lookahead-edge",
+        "lookahead-exceeded",
+        "first-missing-option",
+        "beyond-lookahead",
+        "backtick-beyond-lookahead",
+        "quoted-backtick-beyond-lookahead",
+    ],
+)
+def test_runtime_command_parse_uncertainty_stays_partial(content: str) -> None:
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize("file_path", ["SKILL.md", "example.ps1"])
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "$($text -replace '%TEMP%', $env:TEMP)",
+        "$($text -replace '%s', 'safe')",
+        "$($text -replace 'old', 'printf')",
+    ],
+    ids=["environment-placeholder", "printf-format-text", "printf-replacement-text"],
+)
+def test_powershell_replace_value_expression_remains_complete(
+    file_path: str,
+    expression: str,
+) -> None:
+    content = f'Write-Output "{expression}"'
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": [file_path], "file_cache": {file_path: content}}, [tm_module]
+    )
+
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+def test_powershell_replace_prefix_does_not_hide_a_runtime_command() -> None:
+    content = "$($text -replace '%s', 'safe'; $CMD %s r m) -rf /"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_shell_runtime_command_with_replace_argument_stays_partial() -> None:
+    content = "$($CMD -replace ignored) -rf /"
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["evil.sh"], "file_cache": {"evil.sh": content}}, [tm_module]
+    )
+
+    event = result["inspection_ledger"][0]
+    assert event["outcome"] is LedgerOutcome.PARTIAL
+    assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+def test_repeated_runtime_commands_do_not_rescan_overlapping_suffixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = tm_module._bounded_shell_tokens
+
+    def counted(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tm_module, "_bounded_shell_tokens", counted)
+    content = "$($CMD) -rf / " * 2_000
+
+    started_at = time.perf_counter()
+    findings = tm_module.analyze(content, "SKILL.md", "markdown")
+    elapsed = time.perf_counter() - started_at
+
+    assert findings == []
+    assert calls == 0
+    assert elapsed < _shell_stress_deadline()
+
+
+def test_runtime_command_tail_parser_receives_the_runtime_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BudgetExpiredError(Exception):
+        pass
+
+    entered_tail_parser = False
+    original = tm_module._bounded_shell_tokens
+
+    def check_runtime() -> None:
+        if entered_tail_parser:
+            raise BudgetExpiredError
+
+    def observed(*args: object, **kwargs: object) -> object:
+        nonlocal entered_tail_parser
+        assert kwargs["check_runtime"] is check_runtime
+        entered_tail_parser = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tm_module, "_bounded_shell_tokens", observed)
+
+    with pytest.raises(BudgetExpiredError):
+        tm_module._has_shell_command_word_exhaustion(
+            "$($CMD) -rf " + " " * tm_module._ROOT_GLOB_COMMAND_CHARS + "/",
+            check_runtime,
+        )
+
+    assert entered_tail_parser is True
+
+
+def test_literal_command_tail_parser_receives_the_runtime_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BudgetExpiredError(Exception):
+        pass
+
+    entered_tail_parser = False
+    original = tm_module._bounded_shell_tokens
+
+    def check_runtime() -> None:
+        if entered_tail_parser:
+            raise BudgetExpiredError
+
+    def observed(*args: object, **kwargs: object) -> object:
+        nonlocal entered_tail_parser
+        assert kwargs["check_runtime"] is check_runtime
+        entered_tail_parser = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tm_module, "_bounded_shell_tokens", observed)
+
+    with pytest.raises(BudgetExpiredError):
+        tm_module.has_bounded_parse_exhaustion("rm -rf /", check_runtime)
+
+    assert entered_tail_parser is True
+
+
 @pytest.mark.parametrize(
     "content",
     [
