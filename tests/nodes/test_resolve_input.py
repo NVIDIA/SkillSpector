@@ -15,8 +15,12 @@
 
 """Tests for resolve_input node."""
 
+import io
+import tempfile
+import zipfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from skillspector.input_handler import TransitiveIngestTruncatedError
@@ -188,3 +192,44 @@ def test_selected_source_identity_from_resolved_git_and_archive_inputs() -> None
         )
         == "repo"
     )
+
+
+@pytest.mark.parametrize("source", ["local-zip", "downloaded-zip"])
+def test_failed_materialization_removes_the_handler_temp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+) -> None:
+    """An input that fails to materialize leaves no temp directory or download behind."""
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("SKILL.md", "# Skill\n")
+        bundle.writestr("../outside.md", "escape\n")
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def mkdtemp(*args: str, **kwargs: str) -> str:
+        path = real_mkdtemp(*args, dir=tmp_path, **kwargs)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr("skillspector.input_handler.tempfile.mkdtemp", mkdtemp)
+    if source == "local-zip":
+        local_zip = tmp_path / "slip.zip"
+        local_zip.write_bytes(archive.getvalue())
+        input_path = str(local_zip)
+    else:
+        real_client = httpx.Client
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=archive.getvalue())
+        )
+        monkeypatch.setattr(
+            "skillspector.input_handler.httpx.Client",
+            lambda *args, **kwargs: real_client(*args, transport=transport, **kwargs),
+        )
+        monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
+        input_path = "https://raw.githubusercontent.com/org/repo/main/skill.zip"
+
+    with pytest.raises(ValueError, match="zip-slip"):
+        resolve_input({"input_path": input_path})
+
+    assert created
+    assert [path for path in created if path.exists()] == []

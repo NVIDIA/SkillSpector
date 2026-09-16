@@ -87,7 +87,10 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
                 exc.truncation.code,
             )
             raise
-        except (ValueError, FileNotFoundError):
+        except Exception:
+            # The graph fails before returning temp_dir_for_cleanup, so no caller
+            # can remove a partial download or extraction directory afterwards.
+            handler.cleanup()
             raise
 
     if skill_path and isinstance(skill_path, str) and skill_path.strip():
