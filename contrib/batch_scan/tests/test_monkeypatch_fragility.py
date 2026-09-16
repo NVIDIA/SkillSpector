@@ -46,37 +46,37 @@ _project_root = Path(__file__).resolve().parents[3]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
+from contrib.batch_scan.runner import (
+    _apply_patches,
+    _check_signature,
+    _original_asyncio_run,
+    _original_base_build_prompt,
+    _original_base_init,
+    _original_base_parse,
+    _original_meta_build_prompt,
+    _original_meta_parse,
+    _patched_base_init,
+    _restore_patches,
+    _verify_patch_targets,
+    deepseek_compat,
+)
 from skillspector.llm_analyzer_base import (
     Batch,
-    LLMAnalyzerBase,
     LLMAnalysisResult,
+    LLMAnalyzerBase,
     LLMFinding,
 )
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
-
-from contrib.batch_scan.runner import (
-    _check_signature,
-    _original_asyncio_run,
-    _original_base_init,
-    _original_base_parse,
-    _original_base_build_prompt,
-    _original_meta_parse,
-    _original_meta_build_prompt,
-    _patched_base_init,
-    _verify_patch_targets,
-    _apply_patches,
-    _restore_patches,
-    deepseek_compat,
-)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def _force_restore() -> None:
     """Safety-net: restore all patches regardless of depth counter."""
     import contrib.batch_scan.runner as _runner
+
     while _runner._patches_depth > 0:
         _runner._restore_patches()
 
@@ -198,6 +198,7 @@ class TestGuardPassesCurrentUpstream(unittest.TestCase):
     def test_guard_after_setup_and_manual_restore_still_passes(self) -> None:
         """Guard should pass after setup_deepseek_compat() + manual restore."""
         from contrib.batch_scan.runner import setup_deepseek_compat
+
         setup_deepseek_compat()
         _force_restore()
         try:
@@ -318,6 +319,7 @@ class TestGuardPatch2ParseResponse(unittest.TestCase):
         to simulate its absence.
         """
         import builtins
+
         _real_hasattr = builtins.hasattr
 
         def _fake_hasattr(obj, name):
@@ -381,6 +383,7 @@ class TestGuardPatch3MetaParse(unittest.TestCase):
 
     def test_guard_catches_missing_meta_analyzer_model_validate(self) -> None:
         import builtins
+
         _real_hasattr = builtins.hasattr
 
         def _fake_hasattr(obj, name):
@@ -400,9 +403,7 @@ class TestGuardPatch3MetaParse(unittest.TestCase):
         """If MetaAnalyzerResult no longer has 'findings' field."""
         saved = MetaAnalyzerResult.model_fields.copy()
         try:
-            MetaAnalyzerResult.model_fields = {
-                k: v for k, v in saved.items() if k != "findings"
-            }
+            MetaAnalyzerResult.model_fields = {k: v for k, v in saved.items() if k != "findings"}
             with self.assertRaises(RuntimeError) as ctx:
                 _verify_patch_targets()
             self.assertIn("findings", str(ctx.exception))
@@ -487,8 +488,7 @@ class TestGuardPatch7Asyncio(unittest.TestCase):
 
         # Verify the guard checks 'main' parameter on the original
         sig = inspect.signature(_original_asyncio_run)
-        self.assertIn("main", sig.parameters,
-                      "asyncio.run should have 'main' parameter")
+        self.assertIn("main", sig.parameters, "asyncio.run should have 'main' parameter")
 
     def test_guard_catches_missing_new_event_loop(self) -> None:
         """If asyncio.new_event_loop is removed, guard must raise."""
@@ -551,14 +551,18 @@ class TestOriginalCapturedAtImportTime(unittest.TestCase):
 
     def test_original_chatopenai_init_is_not_none(self) -> None:
         from contrib.batch_scan.runner import _original_chatopenai_init
+
         self.assertIsNotNone(
             _original_chatopenai_init,
             "_original_chatopenai_init must be captured at import time",
         )
 
     def test_original_asyncio_run_is_true_stdlib(self) -> None:
-        self.assertIs(_original_asyncio_run, asyncio.run,
-                      "_original_asyncio_run should be the stdlib function (unpatched)")
+        self.assertIs(
+            _original_asyncio_run,
+            asyncio.run,
+            "_original_asyncio_run should be the stdlib function (unpatched)",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
