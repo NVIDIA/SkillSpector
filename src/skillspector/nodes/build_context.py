@@ -41,7 +41,12 @@ from skillspector.artifacts import (
     classify_artifact,
     decode_text,
 )
-from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MAX_FILE_BYTES, build_model_config
+from skillspector.constants import (
+    MAX_ANALYZABLE_FILE_BYTES,
+    MAX_FILE_BYTES,
+    MAX_LLM_TRUNCATED_FILE_CHARS,
+    build_model_config,
+)
 from skillspector.input_handler import (
     _FileOpenError,
     _open_regular_file_no_follow,
@@ -664,6 +669,7 @@ def _build_component_metadata(
     started_at: float | None = None,
     deadline: float | None = None,
     runtime_limitations: list[tuple[str, float]] | None = None,
+    source_local_only: bool = False,
 ) -> tuple[list[dict[str, object]], bool]:
     """Build component_metadata list and has_executable_scripts from paths."""
     metadata: list[dict[str, object]] = []
@@ -712,9 +718,14 @@ def _build_component_metadata(
             "executable": executable,
             "size_bytes": size_bytes,
         }
-        if _is_hidden_component(path):
-            component["hidden"] = True
+        hidden_component = _is_hidden_component(path)
+        if hidden_component or source_local_only:
             component["local_only"] = True
+            if hidden_component:
+                component["hidden"] = True
+            if source_local_only:
+                component["hidden_ancestor"] = True
+                component["source_local_only"] = True
             if executable:
                 component.update(
                     {
@@ -754,6 +765,25 @@ def _is_hidden_path(path: str) -> bool:
     return any(part.startswith(".") for part in Path(path).parts)
 
 
+def _llm_view_of_truncated_file(content: str, *, total_size: int, read_bytes: int) -> str:
+    """Bound a truncated file's LLM view and mark the unreviewed region.
+
+    A truncated file must not vanish from the LLM stage: with exclusion, a
+    payload placed past the read cap is invisible to every analyzer while the
+    report still shows zero findings.  The view is capped so token cost stays
+    bounded, and the marker makes the audit gap explicit to the model.
+    """
+    marker = (
+        f"\n\n[SKILLSPECTOR: this file is {total_size} bytes; only the first "
+        f"{read_bytes} bytes were readable and the excerpt above is capped at "
+        f"{MAX_LLM_TRUNCATED_FILE_CHARS} characters. The remaining bytes were "
+        "not reviewed by any analyzer - treat the unseen region as an audit "
+        "gap.]\n"
+    )
+    budget = max(MAX_LLM_TRUNCATED_FILE_CHARS - len(marker), 0)
+    return content[:budget] + marker
+
+
 def _opaque_artifact_record(
     path: str,
     *,
@@ -783,6 +813,7 @@ def _read_file_cache(
     *,
     started_at: float | None = None,
     state: SkillspectorState | None = None,
+    provider_submission_allowed: bool = True,
 ) -> tuple[
     dict[str, str],
     dict[str, bytes],
@@ -1089,7 +1120,17 @@ def _read_file_cache(
                         )
                     )
             inventory.append(artifact)
-            if not truncated and not _is_hidden_path(path) and artifact["content_kind"] == "text":
+            if (
+                provider_submission_allowed
+                and not _is_hidden_path(path)
+                and artifact["content_kind"] == "text"
+            ):
+                if truncated:
+                    content = _llm_view_of_truncated_file(
+                        content,
+                        total_size=max(file_stat.st_size, len(observed)),
+                        read_bytes=len(raw),
+                    )
                 llm_file_cache[path] = _redact_for_external_model(path, content)
             if aggregate_truncated:
                 inventory.extend(
@@ -1455,6 +1496,9 @@ def _project_manifest(
             raise _ManifestSchemaError(type(description).__name__)
         _consume(description)
         manifest["description"] = description
+    version = data.get("version")
+    if version is not None:
+        manifest["version"] = _scalar_text(version)
 
     manifest["triggers"] = _string_list(data.get("triggers", []))
     manifest["permissions"] = _string_list(data.get("permissions", []))
@@ -1515,8 +1559,9 @@ def _parse_manifest(
 ) -> dict[str, object]:
     """Parse SKILL.md or skill.md YAML frontmatter into a manifest dict.
 
-    Returns dict with name, description, triggers (list), permissions (list),
-    allowed-tools (list), parameters (list). Returns {} if no file or parse fails.
+    Returns dict with name, description, version, triggers (list), permissions
+    (list), allowed-tools (list), parameters (list). Returns {} if no file or
+    parse fails.
     Parsing is restricted to a bounded byte prefix, including for direct helper
     callers that do not provide the bundle's already-bounded raw cache.
     """
@@ -1694,6 +1739,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     budgeted_state = dict(state)
     budgeted_state["workflow_resource_budget"] = workflow_budget
     state = cast(SkillspectorState, budgeted_state)
+    source_local_only = state.get("source_local_only") is True
 
     skill_dir = _resolve_skill_dir(state)
 
@@ -1720,6 +1766,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         cache_candidates,
         started_at=processing_started,
         state=state,
+        provider_submission_allowed=not source_local_only,
     )
 
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
@@ -2158,6 +2205,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         started_at=processing_started,
         deadline=processing_deadline,
         runtime_limitations=metadata_runtime_limitations,
+        source_local_only=source_local_only,
     )
     if metadata_runtime_limitations:
         path, elapsed = metadata_runtime_limitations[0]
@@ -2179,6 +2227,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             metadata.update(nested.outer_metadata[path])
             metadata["lines"] = 0
     component_metadata.extend(nested.metadata)
+    if source_local_only:
+        for metadata in component_metadata:
+            metadata["local_only"] = True
+            metadata["hidden_ancestor"] = True
+            metadata["source_local_only"] = True
     has_executable_scripts = has_executable_scripts or any(
         bool(metadata.get("executable")) for metadata in nested.metadata
     )
@@ -2190,6 +2243,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "local_file_cache": local_file_cache,
         "raw_file_cache": raw_file_cache,
         "llm_file_cache": llm_file_cache,
+        "source_local_only": source_local_only,
         "artifact_inventory": artifact_inventory,
         "artifact_references": references,
         "reference_resolution": reference_resolution,
