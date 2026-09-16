@@ -40,8 +40,8 @@ from skillspector.state import (
 )
 
 from .common import (
+    get_complete_source_segment,
     get_context_from_lines,
-    get_source_segment,
     resolve_call_name,
     resolve_dynamic_import_call,
 )
@@ -390,22 +390,46 @@ def _analyze_python(
     aliases = python_ast.import_aliases
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
+    contexts: dict[tuple[int, int], str] = {}
+
+    def context_for(lineno: int, column: int) -> str:
+        key = (lineno, column)
+        context = contexts.get(key)
+        if context is None:
+            context = get_context_from_lines(lines, lineno, column=column)
+            contexts[key] = context
+        return context
 
     def _emit(
         rule_id: str,
-        lineno: int,
-        end_lineno: int | None,
+        ast_node: ast.Call,
         msg_override: str | None = None,
     ) -> None:
+        lineno = getattr(ast_node, "lineno", 1)
+        end_lineno = getattr(ast_node, "end_lineno", None)
+        complete_match = python_ast.source_segment(ast_node)
+        if complete_match is None:
+            complete_match = get_complete_source_segment(lines, lineno, end_lineno)
+        start_byte_column = getattr(ast_node, "col_offset", 0)
+        end_byte_column = getattr(ast_node, "end_col_offset", start_byte_column)
+        start_column = python_ast.character_column(lineno, start_byte_column)
+        end_column = python_ast.character_column(end_lineno or lineno, end_byte_column)
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg_override or _RULE_MESSAGES[rule_id],
             severity=_RULE_SEVERITIES[rule_id],
-            location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
+            location=Location(
+                file=file_path,
+                start_line=lineno,
+                end_line=end_lineno,
+                start_column=start_column,
+                end_column=end_column,
+            ),
             confidence=_RULE_CONFIDENCES[rule_id],
             tags=[_TAG],
-            context=get_context_from_lines(lines, lineno),
-            matched_text=get_source_segment(lines, lineno, end_lineno),
+            context=context_for(lineno, start_column if start_column is not None else 0),
+            matched_text=complete_match[:200],
+            complete_match=complete_match,
         )
         if budget is None:
             findings.append(finding)
@@ -482,9 +506,6 @@ def _analyze_python(
         if call_name is None:
             continue
 
-        lineno = getattr(ast_node, "lineno", 1)
-        end_lineno = getattr(ast_node, "end_lineno", None)
-
         if call_name == "exec":
             if _is_chain_sink(ast_node, aliases) and ast_node.args:
                 source = _contains_dangerous_source(
@@ -493,8 +514,8 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", lineno, end_lineno, f"Dangerous chain: exec() wrapping {source}")
-            _emit("AST1", lineno, end_lineno)
+                    _emit("AST8", ast_node, f"Dangerous chain: exec() wrapping {source}")
+            _emit("AST1", ast_node)
 
         elif call_name == "eval":
             if _is_chain_sink(ast_node, aliases) and ast_node.args:
@@ -504,34 +525,34 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", lineno, end_lineno, f"Dangerous chain: eval() wrapping {source}")
-            _emit("AST2", lineno, end_lineno)
+                    _emit("AST8", ast_node, f"Dangerous chain: eval() wrapping {source}")
+            _emit("AST2", ast_node)
 
         elif call_name == "__import__":
-            _emit("AST3", lineno, end_lineno)
+            _emit("AST3", ast_node)
 
         elif call_name == "compile":
-            _emit("AST6", lineno, end_lineno)
+            _emit("AST6", ast_node)
 
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                _emit("AST4", lineno, end_lineno)
+                _emit("AST4", ast_node)
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
             if attr in _OS_EXEC_CALLS:
-                _emit("AST5", lineno, end_lineno)
+                _emit("AST5", ast_node)
 
         elif (deser_msg := _deserialization_message(call_name, ast_node)) is not None:
-            _emit("AST10", lineno, end_lineno, deser_msg)
+            _emit("AST10", ast_node, deser_msg)
 
         elif call_name == "getattr" and len(ast_node.args) >= 2:
             second_arg = ast_node.args[1]
             if not isinstance(second_arg, ast.Constant):
-                _emit("AST7", lineno, end_lineno)
+                _emit("AST7", ast_node)
             elif isinstance(second_arg.value, str) and second_arg.value in _DANGEROUS_GETATTR_NAMES:
-                _emit("AST9", lineno, end_lineno)
+                _emit("AST9", ast_node)
 
     return findings if budget is None else list(budget.current_findings)
 

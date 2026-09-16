@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from skillspector.nodes.analyzers import behavioral_ast
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.state import WorkflowResourceBudget
 
 
@@ -33,6 +34,67 @@ def _run(code: str, filename: str = "script.py") -> list:
 
 
 class TestExecDetection:
+    def test_same_line_exec_calls_keep_exact_node_identities(self) -> None:
+        """Separate AST calls on one line must not compact as one whole-line match."""
+        findings = _run('exec("first_payload_alpha"); exec("second_payload_beta")')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 2
+        assert len(deduplicate(ast1)) == 2
+
+    def test_same_match_at_different_columns_groups_distinct_occurrences(self) -> None:
+        findings = _run('exec("same_payload")\nif True:\n    exec("same_payload")\n')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 1
+        assert {finding.start_column for finding in ast1} == {0, 4}
+
+        compacted = deduplicate(ast1)
+        assert len(compacted) == 1
+        assert {
+            (item["start_line"], item["start_column"]) for item in compacted[0].occurrences
+        } == {
+            (1, 0),
+            (3, 4),
+        }
+
+    def test_utf8_ast_columns_are_published_as_character_columns(self) -> None:
+        code = 'label = "🦄"; exec(\n    "payload"\n)\n'
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.matched_text == 'exec(\n    "payload"\n)'
+        assert ast1.start_line == 1
+        assert ast1.start_column == code.index("exec")
+        assert ast1.end_line == 3
+        assert ast1.end_column == 1
+
+    def test_many_same_line_calls_use_preindexed_source_slices(self, monkeypatch) -> None:
+        def fail_full_source_rescan(*_args, **_kwargs):
+            raise AssertionError("ast.get_source_segment must not run per finding")
+
+        monkeypatch.setattr(behavioral_ast.ast, "get_source_segment", fail_full_source_rescan)
+        call_count = 2_000
+        code = "; ".join('exec("payload")' for _ in range(call_count))
+
+        ast1 = [finding for finding in _run(code) if finding.rule_id == "AST1"]
+
+        assert len(ast1) == call_count
+        assert ast1[0].start_column == 0
+        assert ast1[-1].start_column == code.rindex("exec")
+
+    def test_long_line_context_is_centered_on_the_ast_call(self) -> None:
+        prefix = "value = 0; " * 150
+        code = prefix + 'exec("LATE_AST_PAYLOAD")'
+
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.start_column == len(prefix)
+        assert ast1.context is not None
+        assert len(ast1.context) <= 1_000
+        assert 'exec("LATE_AST_PAYLOAD")' in ast1.context
+
     def test_exec_produces_ast1(self):
         findings = _run('exec("print(1)")')
         ast1 = [f for f in findings if f.rule_id == "AST1"]
@@ -68,6 +130,22 @@ class TestDunderImport:
 
 
 class TestSubprocess:
+    def test_long_ast_matches_use_complete_source_identity(self):
+        def code(tail: str) -> str:
+            shared_arguments = "\n".join(f'    "{"a" * 80}",' for _ in range(5))
+            return f'import subprocess\nsubprocess.run([\n{shared_arguments}\n    "{tail}",\n])\n'
+
+        first_code = code("UNIQUE_FIRST_TAIL")
+        second_code = code("UNIQUE_SECOND_TAIL")
+        first = next(f for f in _run(first_code, "first.py") if f.rule_id == "AST4")
+        second = next(f for f in _run(second_code, "second.py") if f.rule_id == "AST4")
+
+        assert first.matched_text == second.matched_text
+        assert len(first.matched_text or "") == 200
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        assert "UNIQUE_FIRST_TAIL" not in json.dumps(first.to_dict(), sort_keys=True)
+
     def test_subprocess_run_produces_ast4(self):
         code = 'import subprocess\nsubprocess.run(["ls", "-la"])'
         findings = _run(code)

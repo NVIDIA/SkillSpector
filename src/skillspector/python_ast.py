@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import ast
 import time
+from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import RLock
 from uuid import uuid4
 
@@ -54,11 +55,87 @@ class ParsedPythonFile:
     lines: list[str]
     content: str
     parse_error: str | None = None
+    # CPython AST columns are UTF-8 byte offsets. Retaining the encoded source
+    # and per-line byte starts makes every node slice O(match size), rather than
+    # repeatedly splitting and re-encoding the whole file for each finding.
+    source_bytes: bytes = field(init=False, repr=False)
+    line_byte_starts: tuple[int, ...] = field(init=False, repr=False)
+    line_character_starts: tuple[int, ...] = field(init=False, repr=False)
+    non_ascii_byte_ends: tuple[int, ...] = field(init=False, repr=False)
+    non_ascii_extra_bytes: tuple[int, ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        source_bytes = self.content.encode("utf-8")
+        line_byte_starts = [0]
+        line_character_starts = [0]
+        byte_offset = 0
+        character_offset = 0
+        for line in self.content.splitlines(keepends=True):
+            byte_offset += len(line.encode("utf-8"))
+            character_offset += len(line)
+            line_byte_starts.append(byte_offset)
+            line_character_starts.append(character_offset)
+        non_ascii_byte_ends: list[int] = []
+        non_ascii_extra_bytes = [0]
+        if not source_bytes.isascii():
+            byte_offset = 0
+            extra_bytes = 0
+            for character in self.content:
+                width = 1 if character.isascii() else len(character.encode("utf-8"))
+                byte_offset += width
+                if width > 1:
+                    extra_bytes += width - 1
+                    non_ascii_byte_ends.append(byte_offset)
+                    non_ascii_extra_bytes.append(extra_bytes)
+        object.__setattr__(self, "source_bytes", source_bytes)
+        object.__setattr__(self, "line_byte_starts", tuple(line_byte_starts))
+        object.__setattr__(self, "line_character_starts", tuple(line_character_starts))
+        object.__setattr__(self, "non_ascii_byte_ends", tuple(non_ascii_byte_ends))
+        object.__setattr__(self, "non_ascii_extra_bytes", tuple(non_ascii_extra_bytes))
 
     @property
     def is_parseable(self) -> bool:
         """Return whether this result contains a usable Python AST."""
         return self.tree is not None
+
+    def source_segment(self, node: ast.AST) -> str | None:
+        """Return a node's exact source using precomputed UTF-8 byte offsets."""
+        lineno = getattr(node, "lineno", None)
+        end_lineno = getattr(node, "end_lineno", None)
+        col_offset = getattr(node, "col_offset", None)
+        end_col_offset = getattr(node, "end_col_offset", None)
+        if not all(
+            isinstance(value, int) for value in (lineno, end_lineno, col_offset, end_col_offset)
+        ):
+            return None
+        assert isinstance(lineno, int)
+        assert isinstance(end_lineno, int)
+        assert isinstance(col_offset, int)
+        assert isinstance(end_col_offset, int)
+        start_index = lineno - 1
+        end_index = end_lineno - 1
+        if start_index < 0 or end_index < start_index or end_index >= len(self.line_byte_starts):
+            return None
+        start = self.line_byte_starts[start_index] + col_offset
+        end = self.line_byte_starts[end_index] + end_col_offset
+        if start < 0 or end < start or end > len(self.source_bytes):
+            return None
+        try:
+            return self.source_bytes[start:end].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def character_column(self, lineno: int, byte_column: int) -> int | None:
+        """Convert one CPython UTF-8 byte column to a public character column."""
+        line_index = lineno - 1
+        if line_index < 0 or line_index >= len(self.line_byte_starts):
+            return None
+        absolute_byte = self.line_byte_starts[line_index] + byte_column
+        if absolute_byte < 0 or absolute_byte > len(self.source_bytes):
+            return None
+        non_ascii_count = bisect_right(self.non_ascii_byte_ends, absolute_byte)
+        absolute_character = absolute_byte - self.non_ascii_extra_bytes[non_ascii_count]
+        return absolute_character - self.line_character_starts[line_index]
 
 
 PythonAstCache = dict[str, ParsedPythonFile]
