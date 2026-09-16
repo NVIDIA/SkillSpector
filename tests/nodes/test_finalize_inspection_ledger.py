@@ -91,6 +91,32 @@ def test_missing_terminal_row_becomes_fatal_unaccounted_work() -> None:
     assert result["execution_successful"] is False
 
 
+def test_missing_semantic_telemetry_is_canonical_incompleteness() -> None:
+    """A requested pass cannot bypass canonical completeness or CLI consumers."""
+    result = finalize_inspection_ledger(
+        {
+            "components": [],
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+            "llm_call_log": [],
+            "use_llm": True,
+            "llm_requested": True,
+        }
+    )
+
+    completeness = result["analysis_completeness"]
+    assert completeness["is_complete"] is False
+    assert completeness["status"] == "partial"
+    assert completeness["execution_successful"] is True
+    assert any(
+        event.get("phase") == "semantic_runtime"
+        and event.get("reason_code") == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+        and "per-source runtime telemetry" in str(event.get("message"))
+        for event in result["inspection_ledger"]
+    )
+
+
 def test_unknown_emitted_finding_id_is_fatal_accounting_error() -> None:
     work_id = inspection_work_id("behavioral_ast", "run.py", None, None)
     completeness, _ = finalize_ledger(
