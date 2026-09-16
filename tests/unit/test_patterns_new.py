@@ -2232,9 +2232,7 @@ class TestTriggerAnalysis:
         assert sc_mod._analyze_triggers({"name": "myskill"}, "myskill") == []
 
     def test_description_is_analyzed_when_triggers_are_absent(self) -> None:
-        findings = sc_mod._analyze_triggers(
-            {"description": "Use this for all messages and every request."}, "myskill"
-        )
+        findings = sc_mod._analyze_triggers({"description": "all messages"}, "myskill")
         assert any(finding.rule_id == "TR3" for finding in findings)
 
 
