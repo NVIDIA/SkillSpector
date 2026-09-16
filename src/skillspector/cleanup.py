@@ -17,7 +17,9 @@ def _retry_writable(function: Callable[[str], object], path: str, _error: BaseEx
     try:
         # chmod follows links, so never touch whatever a link points at.
         if not (os.path.islink(path) or os.path.isjunction(path)):
-            os.chmod(path, stat.S_IWRITE)
+            # Add the owner-write bit only; replacing the mode would strip read and
+            # search permission on POSIX and leave the entry harder to remove.
+            os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_IWRITE)
             function(path)
     except OSError:
         pass
