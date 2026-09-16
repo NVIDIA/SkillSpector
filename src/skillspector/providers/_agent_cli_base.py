@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared base for local agent-CLI providers (claude_cli, codex_cli, gemini_cli).
+"""Shared base for local agent-CLI providers (claude_cli, codex_cli,
+gemini_cli, opencode_cli).
 
 A concrete provider is just four class attributes (see how thin
 ``ClaudeCLIProvider`` / ``CodexCLIProvider`` / ``GeminiCLIProvider`` are). All

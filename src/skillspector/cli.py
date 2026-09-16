@@ -542,7 +542,7 @@ def scan(
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
                                openai_compatible | claude_cli | codex_cli |
-                               gemini_cli. Defaults to the NVIDIA path
+                               gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
@@ -564,8 +564,9 @@ def scan(
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
 
-        ollama uses the local Ollama service. claude_cli, codex_cli, and
-        gemini_cli use their CLI's existing local authentication session.
+        ollama uses the local Ollama service. claude_cli, codex_cli,
+        gemini_cli, and opencode_cli use their CLI's existing local
+        authentication session.
     """
     if mcp_registry:
         if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
