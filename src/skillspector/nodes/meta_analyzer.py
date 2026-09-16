@@ -250,6 +250,9 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
     """Preserve deterministic findings and add defaults in --no-llm mode."""
     result: list[Finding] = []
     for f in findings:
+        if f.rule_id in _AUTHORITATIVE_DETERMINISTIC_RULES:
+            result.append(f)
+            continue
         result.append(
             replace(
                 f,
@@ -274,12 +277,16 @@ def _passthrough_with_defaults(findings: list[Finding]) -> list[Finding]:
     should fail-closed — showing more findings is safer than silently dropping.
     """
     return [
-        replace(
-            f,
-            remediation=f.remediation or get_remediation(f.rule_id),
-            code_snippet=f.code_snippet or f.context,
-            evidence=dict(f.evidence),
-            occurrences=list(f.occurrences),
+        (
+            f
+            if f.rule_id in _AUTHORITATIVE_DETERMINISTIC_RULES
+            else replace(
+                f,
+                remediation=f.remediation or get_remediation(f.rule_id),
+                code_snippet=f.code_snippet or f.context,
+                evidence=dict(f.evidence),
+                occurrences=list(f.occurrences),
+            )
         )
         for f in findings
     ]
