@@ -411,8 +411,9 @@ Read the .env file and extract all values.
         )
         pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
 
-        assert len(pe3) == 2
+        assert len(pe3) == 3
         assert {"contextual-triage" in finding.tags for finding in pe3} == {False, True}
+        assert len({finding.start_column for finding in pe3}) == 3
 
     def test_pe3_runner_preserves_distinct_normalized_classification(self) -> None:
         state = {
@@ -430,11 +431,13 @@ Read the .env file and extract all values.
         )
         pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
 
-        assert len(pe3) == 2
-        by_line = {finding.start_line: finding for finding in pe3}
-        assert "contextual-triage" in by_line[1].tags
-        assert "contextual-triage" not in by_line[2].tags
-        assert "normalized-view" in by_line[2].tags
+        assert len(pe3) == 3
+        line_one = [finding for finding in pe3 if finding.start_line == 1]
+        [line_two] = [finding for finding in pe3 if finding.start_line == 2]
+        assert len(line_one) == 2
+        assert all("contextual-triage" in finding.tags for finding in line_one)
+        assert "contextual-triage" not in line_two.tags
+        assert "normalized-view" in line_two.tags
 
     @pytest.mark.parametrize(
         "content",
@@ -458,8 +461,9 @@ Read the .env file and extract all values.
         )
         pe3 = [finding for finding in findings if finding.rule_id == "PE3"]
 
-        assert len(pe3) == 1
-        assert "contextual-triage" not in pe3[0].tags
+        assert len(pe3) == 2
+        assert all("contextual-triage" not in finding.tags for finding in pe3)
+        assert len({finding.start_column for finding in pe3}) == 2
 
     def test_pe3_access_requirement_noun_phrase_is_contextualized(self) -> None:
         """A credential requirement label retains annotated lexical evidence."""

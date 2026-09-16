@@ -260,6 +260,23 @@ class TestExcessiveAgency:
             "selection_key": key,
         }
 
+    def test_ea5_frontmatter_identity_uses_the_complete_declaration(self) -> None:
+        shared = "gpt-" + "a" * 220
+        findings = [
+            next(
+                finding
+                for finding in ea_mod.analyze(
+                    f"---\nmodel: {shared}{tail}\n---\n", "SKILL.md", "markdown"
+                )
+                if finding.rule_id == "EA5"
+            )
+            for tail in ("first", "second")
+        ]
+
+        assert findings[0].matched_text == findings[1].matched_text
+        assert len(findings[0].matched_text or "") == 200
+        assert findings[0].match_fingerprint != findings[1].match_fingerprint
+
     def test_ea5_only_matches_top_level_skill_frontmatter(self) -> None:
         content = (
             "---\n"
@@ -297,6 +314,21 @@ class TestExcessiveAgency:
         assert len(ea5) == 1
         assert ea5[0].severity == Severity.HIGH
         assert ea5[0].evidence == {"selection_surface": "command"}
+
+    def test_ea5_command_identity_uses_the_complete_command(self) -> None:
+        shared = "gpt-" + "a" * 220
+        findings = [
+            next(
+                finding
+                for finding in ea_mod.analyze(f"cmd --model={shared}{tail}", "SKILL.md", "markdown")
+                if finding.rule_id == "EA5"
+            )
+            for tail in ("first", "second")
+        ]
+
+        assert findings[0].matched_text == findings[1].matched_text
+        assert len(findings[0].matched_text or "") == 200
+        assert findings[0].match_fingerprint != findings[1].match_fingerprint
 
     @pytest.mark.parametrize(
         "content",
@@ -1989,9 +2021,12 @@ class TestSupplyChainDependencies:
         assert len(sc6) >= 1
         assert "express" in sc6[0].message
 
-    def test_sc6_exact_match_not_flagged(self) -> None:
+    @pytest.mark.parametrize("package", ["requests", "uvicorn", "gunicorn", "UVICORN"])
+    def test_sc6_exact_match_not_flagged(self, package: str) -> None:
         sc6 = [
-            f for f in _analyze_deps("requests==2.31.0\n", "requirements.txt") if f.rule_id == "SC6"
+            f
+            for f in _analyze_deps(f"{package}==1.0.0\n", "requirements.txt")
+            if f.rule_id == "SC6"
         ]
         assert len(sc6) == 0
 
@@ -2219,6 +2254,20 @@ class TestSupplyChainHelpers:
 
     def test_is_typosquat_exact_match_returns_none(self) -> None:
         assert sc_mod._is_typosquat("requests", {"requests"}) is None
+
+    @pytest.mark.parametrize(
+        "package,popular",
+        [
+            ("uvicorn", {"gunicorn", "uvicorn"}),
+            ("UVICORN", {"gunicorn", "uvicorn"}),
+            ("demo_tools", {"demo-tool", "demo-tools"}),
+            ("demo-tools", {"demo-tool", "DEMO_TOOLS"}),
+        ],
+    )
+    def test_is_typosquat_exact_match_precedes_similar_names(
+        self, package: str, popular: set[str]
+    ) -> None:
+        assert sc_mod._is_typosquat(package, popular) is None
 
     def test_is_typosquat_too_distant_returns_none(self) -> None:
         assert sc_mod._is_typosquat("completely_different", {"requests"}) is None
