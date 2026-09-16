@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from skillspector.input_handler import (
@@ -32,6 +33,7 @@ from skillspector.input_handler import (
     _open_regular_file_from_windows_handle,
     _open_regular_file_no_follow,
 )
+from skillspector.state import WorkflowResourceBudget
 
 
 def _mock_windows_secure_open(
@@ -458,6 +460,51 @@ def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
     handler = InputHandler()
     assert handler._is_git_url("http://github.com/org/repo.git") is False
     assert handler._is_file_url("http://raw.githubusercontent.com/org/repo/SKILL.md") is False
+
+
+@pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "workflow-budget"])
+@pytest.mark.parametrize(
+    ("page_url", "raw_url"),
+    [
+        (
+            "https://github.com/org/repo/blob/main/skills/demo/SKILL.md",
+            "https://raw.githubusercontent.com/org/repo/main/skills/demo/SKILL.md",
+        ),
+        (
+            "https://gitlab.com/group/repo/-/blob/main/skills/demo/SKILL.md",
+            "https://gitlab.com/group/repo/-/raw/main/skills/demo/SKILL.md",
+        ),
+    ],
+    ids=["github", "gitlab"],
+)
+def test_file_page_url_downloads_the_raw_file(
+    monkeypatch: pytest.MonkeyPatch, page_url: str, raw_url: str, budgeted: bool
+) -> None:
+    """A forge's /blob/ file page resolves to the file itself, not its HTML viewer."""
+    skill = b"---\nname: demo\ndescription: demo\n---\n# Demo\n"
+    requested: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if str(request.url) == raw_url:
+            return httpx.Response(200, content=skill, headers={"content-type": "text/plain"})
+        return httpx.Response(200, content=b"<!DOCTYPE html><html></html>")
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "skillspector.input_handler.httpx.Client",
+        lambda *args, **kwargs: real_client(*args, transport=httpx.MockTransport(serve), **kwargs),
+    )
+    monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
+    handler = InputHandler(transitive_budget=WorkflowResourceBudget() if budgeted else None)
+    try:
+        resolved, source_type = handler.resolve(page_url)
+
+        assert source_type == "url"
+        assert requested == [raw_url]
+        assert (resolved / "SKILL.md").read_bytes() == skill
+    finally:
+        handler.cleanup()
 
 
 def test_validate_url_host_scp_extracts_github() -> None:
