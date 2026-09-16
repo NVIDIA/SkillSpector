@@ -669,6 +669,7 @@ def _build_component_metadata(
     started_at: float | None = None,
     deadline: float | None = None,
     runtime_limitations: list[tuple[str, float]] | None = None,
+    source_local_only: bool = False,
 ) -> tuple[list[dict[str, object]], bool]:
     """Build component_metadata list and has_executable_scripts from paths."""
     metadata: list[dict[str, object]] = []
@@ -717,9 +718,14 @@ def _build_component_metadata(
             "executable": executable,
             "size_bytes": size_bytes,
         }
-        if _is_hidden_component(path):
-            component["hidden"] = True
+        hidden_component = _is_hidden_component(path)
+        if hidden_component or source_local_only:
             component["local_only"] = True
+            if hidden_component:
+                component["hidden"] = True
+            if source_local_only:
+                component["hidden_ancestor"] = True
+                component["source_local_only"] = True
             if executable:
                 component.update(
                     {
@@ -807,6 +813,7 @@ def _read_file_cache(
     *,
     started_at: float | None = None,
     state: SkillspectorState | None = None,
+    provider_submission_allowed: bool = True,
 ) -> tuple[
     dict[str, str],
     dict[str, bytes],
@@ -1113,7 +1120,11 @@ def _read_file_cache(
                         )
                     )
             inventory.append(artifact)
-            if not _is_hidden_path(path) and artifact["content_kind"] == "text":
+            if (
+                provider_submission_allowed
+                and not _is_hidden_path(path)
+                and artifact["content_kind"] == "text"
+            ):
                 if truncated:
                     content = _llm_view_of_truncated_file(
                         content,
@@ -1728,6 +1739,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     budgeted_state = dict(state)
     budgeted_state["workflow_resource_budget"] = workflow_budget
     state = cast(SkillspectorState, budgeted_state)
+    source_local_only = state.get("source_local_only") is True
 
     skill_dir = _resolve_skill_dir(state)
 
@@ -1754,6 +1766,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         cache_candidates,
         started_at=processing_started,
         state=state,
+        provider_submission_allowed=not source_local_only,
     )
 
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
@@ -2192,6 +2205,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         started_at=processing_started,
         deadline=processing_deadline,
         runtime_limitations=metadata_runtime_limitations,
+        source_local_only=source_local_only,
     )
     if metadata_runtime_limitations:
         path, elapsed = metadata_runtime_limitations[0]
@@ -2213,6 +2227,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             metadata.update(nested.outer_metadata[path])
             metadata["lines"] = 0
     component_metadata.extend(nested.metadata)
+    if source_local_only:
+        for metadata in component_metadata:
+            metadata["local_only"] = True
+            metadata["hidden_ancestor"] = True
+            metadata["source_local_only"] = True
     has_executable_scripts = has_executable_scripts or any(
         bool(metadata.get("executable")) for metadata in nested.metadata
     )
@@ -2224,6 +2243,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "local_file_cache": local_file_cache,
         "raw_file_cache": raw_file_cache,
         "llm_file_cache": llm_file_cache,
+        "source_local_only": source_local_only,
         "artifact_inventory": artifact_inventory,
         "artifact_references": references,
         "reference_resolution": reference_resolution,
