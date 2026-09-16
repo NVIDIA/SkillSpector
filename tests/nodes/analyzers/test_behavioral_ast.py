@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from skillspector.nodes.analyzers import behavioral_ast

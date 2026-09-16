@@ -443,22 +443,18 @@ def _analyze_python(
             module = _reflective_module_dict_base(ast_node, aliases)
             if module is not None:
                 key = ast_node.slice
-                lineno = getattr(ast_node, "lineno", 1)
-                end_lineno = getattr(ast_node, "end_lineno", None)
                 if isinstance(key, ast.Constant):
                     if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
                         _emit(
                             "AST9",
-                            lineno,
-                            end_lineno,
+                            ast_node,
                             f"Reflective dangerous access via {module}.__dict__ subscript "
                             "with a literal sink name",
                         )
                 else:
                     _emit(
                         "AST7",
-                        lineno,
-                        end_lineno,
+                        ast_node,
                         f"Dynamic attribute access via {module}.__dict__ subscript",
                     )
             continue
@@ -478,22 +474,18 @@ def _analyze_python(
             module = _reflective_module_dict_container(ast_node.func.value, aliases)
             if module is not None:
                 key = ast_node.args[0]
-                lineno = getattr(ast_node, "lineno", 1)
-                end_lineno = getattr(ast_node, "end_lineno", None)
                 if isinstance(key, ast.Constant):
                     if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
                         _emit(
                             "AST9",
-                            lineno,
-                            end_lineno,
+                            ast_node,
                             f"Reflective dangerous access via {module}.__dict__.{method}() "
                             "with a literal sink name",
                         )
                 else:
                     _emit(
                         "AST7",
-                        lineno,
-                        end_lineno,
+                        ast_node,
                         f"Dynamic attribute access via {module}.__dict__.{method}()",
                     )
                 continue
