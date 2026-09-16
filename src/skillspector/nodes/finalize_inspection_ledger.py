@@ -18,6 +18,12 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.models import Finding
+from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.semantic_runtime import (
+    has_semantic_runtime_event,
+    semantic_runtime_intent,
+    semantic_runtime_ledger_event,
+)
 from skillspector.state import SkillspectorState
 
 
@@ -194,10 +200,24 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         *(state.get("effective_finding_ids") or []),
         *(finding.finding_id for finding in coverage_findings),
     ]
+    llm_requested, llm_enabled = semantic_runtime_intent(merged_state)
+    runtime_event = semantic_runtime_ledger_event(
+        requested=llm_requested,
+        enabled=llm_enabled,
+        result=merged_state,
+        discovered_modules=ANALYZER_MODULES,
+    )
+    runtime_events = (
+        [runtime_event]
+        if runtime_event is not None
+        and not has_semantic_runtime_event(state.get("inspection_ledger") or [], runtime_event)
+        else []
+    )
     merged_state["inspection_ledger"] = [
         *(state.get("inspection_ledger") or []),
         *reference_events,
         *output_events,
+        *runtime_events,
     ]
     reference_statuses = (
         [analyzer_status_for_events("reference_coverage", reference_events)]
@@ -219,6 +239,6 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         "execution_successful": completeness["execution_successful"],
         "findings": coverage_findings,
         "effective_finding_ids": effective_finding_ids,
-        "inspection_ledger": [*reference_events, *output_events],
+        "inspection_ledger": [*reference_events, *output_events, *runtime_events],
         "analyzer_status_events": reference_statuses,
     }
