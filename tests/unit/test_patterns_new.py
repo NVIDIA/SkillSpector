@@ -1473,6 +1473,14 @@ class TestToolMisuse:
         tm1 = [f for f in findings if f.rule_id == "TM1"]
         assert all(f.confidence >= 0.8 for f in tm1)
 
+    def test_tm1_ignores_reassigned_shell_variable(self) -> None:
+        findings = tm_mod.analyze(
+            "use_shell = True\nuse_shell = False\nsubprocess.run(cmd, shell=use_shell)",
+            "runner.py",
+            "python",
+        )
+        assert not any(finding.rule_id == "TM1" for finding in findings)
+
     def test_application_specific_no_verify_flag_is_not_tool_misuse(self) -> None:
         content = """\
 print("verification: skipped (--no-verify)")

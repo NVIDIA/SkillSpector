@@ -120,7 +120,7 @@ TM1_CODE_PATTERNS = [
     # avoids treating an arbitrary distant assignment as a data-flow fact.
     (
         r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
-        r"(?:[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+        r"(?:(?![^\n]*\b\1\s*=)[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
         r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b",
         0.8,
     ),
