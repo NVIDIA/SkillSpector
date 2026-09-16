@@ -1,18 +1,10 @@
 import { tool } from "@opencode-ai/plugin"
 import { execFile } from "node:child_process"
 import fs from "node:fs"
-import path from "node:path"
 import { promisify } from "node:util"
-import {
-  TIMEOUT_MS,
-  buildCliArgs,
-  formatExecError,
-  formatSuccess,
-  isUrlOrAbsolute,
-  resolveBinary,
-} from "./skillspector_scan_lib.ts"
+import { executeScan, type RunFile } from "./skillspector_scan_lib.ts"
 
-const runFile = promisify(execFile)
+const runFile = promisify(execFile) as unknown as RunFile
 
 export default tool({
   description: "Scan an AI agent skill for security risks with SkillSpector. Static analysis only by default; opt into LLM analysis explicitly.",
@@ -23,27 +15,10 @@ export default tool({
     output: tool.schema.string().optional().describe("Write the report to this file instead of returning it (resolved against the session directory if relative)"),
   },
   async execute(args, context) {
-    const baseDir = context.directory ?? context.worktree ?? process.cwd()
-    const target = isUrlOrAbsolute(args.target) ? args.target : path.resolve(baseDir, args.target)
-    const output = args.output
-      ? (isUrlOrAbsolute(args.output) ? args.output : path.resolve(baseDir, args.output))
-      : undefined
-    const bin = resolveBinary(context.worktree ?? baseDir, {
+    return executeScan(args, context, {
+      runFile,
       existsSync: fs.existsSync,
+      lstatSync: fs.lstatSync,
     })
-    const cliArgs = buildCliArgs({ target, format: args.format, noLlm: args.noLlm, output })
-
-    let result: { stdout: string; stderr: string }
-    try {
-      result = (await runFile(bin, cliArgs, {
-        timeout: TIMEOUT_MS,
-        maxBuffer: 32 * 1024 * 1024,
-        cwd: baseDir,
-      })) as { stdout: string; stderr: string }
-    } catch (err: unknown) {
-      return formatExecError(bin, err)
-    }
-
-    return formatSuccess(output, result.stdout, result.stderr)
   },
 })

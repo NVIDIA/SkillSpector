@@ -40,6 +40,11 @@ Equivalent CLI (static analysis only):
 skillspector scan ./my-skill --no-llm
 ```
 
+Before starting the CLI, the tool asks OpenCode for the capabilities used by
+that invocation: target reads (and remote fetches), report writes, external
+paths, and the CLI subprocess. A denied request stops the invocation before
+the subprocess starts.
+
 ## Tool parameters
 
 - `target`: path, URL, zip, Git repo, or `SKILL.md` to scan.
@@ -51,18 +56,28 @@ Unlike the [Pi extension](PI_EXTENSION.md), this tool has no `provider`, `model`
 
 ## LLM-backed analysis
 
-Static scan is default. To use semantic LLM analysis, configure provider credentials in your shell before launching OpenCode, then call the tool with `noLlm` false:
+Static scan is default. To use semantic LLM analysis, configure a supported
+provider before launching OpenCode, then call the tool with `noLlm` false. The
+tool makes a separate permission request naming the provider, model, and
+credential-free destination before analyzer-eligible skill content can leave
+the host:
 
 ```text
 Use skillspector_scan on ./my-skill with noLlm=false.
 ```
 
 ```bash
-export SKILLSPECTOR_PROVIDER=opencode_cli
-export SKILLSPECTOR_MODEL=opencode/nemotron-3-ultra-free
+export SKILLSPECTOR_PROVIDER=nv_build
+export NVIDIA_INFERENCE_KEY=nvapi-...
+# Optional; omit to use nv_build's bundled default model.
+# export SKILLSPECTOR_MODEL=z-ai/glm-5.2
 ```
 
-The extension never reads API keys itself and redacts secret-looking output.
+Other valid providers and their credential variables are listed in the main
+[LLM Analysis](../README.md#llm-analysis) table. The extension passes the
+environment to the existing SkillSpector CLI, but never puts credentials in a
+permission request. Model-visible output is bounded and redacts the supported
+provider credential values and names.
 
 ## Unit tests
 
