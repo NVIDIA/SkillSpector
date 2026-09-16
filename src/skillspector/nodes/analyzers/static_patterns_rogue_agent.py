@@ -33,7 +33,7 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
+from .common import LOGICAL_LINE_BREAK, get_context_from_lines
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -147,6 +147,10 @@ _CLI_EXECUTABLE_EXTENSIONS = (
     ".cjs",
 )
 _CLI_ROLE_SUFFIXES = ("-cli", "_cli", ".cli", "cli", "-ctl", "_ctl", ".ctl", "ctl")
+_PROTECTED_UPDATE_SUBJECT_PARTS = frozenset(
+    {"agent", "assistant", "self", "skill", "skillspector", "tool"}
+)
+_MAX_COMPANION_UPDATE_LINE_CHARS = 4_096
 
 # RA2: Session Persistence — unauthorized persistence across boundaries
 RA2_PATTERNS = [
@@ -210,18 +214,24 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     """Analyze content for rogue agent patterns (RA1–RA2)."""
     findings: list[AnalyzerFinding] = []
     line_starts, line_ends = _logical_line_metadata(content)
+    content_lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
     def ctx(start: int) -> str:
-        return get_context(content, start)
+        line_num = bisect_right(line_starts, start)
+        return get_context_from_lines(
+            content_lines,
+            line_num,
+            column=start - line_starts[line_num - 1],
+        )
 
     tag = [PatternCategory.ROGUE_AGENT.value]
 
     for pattern, confidence in RA1_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = bisect_right(line_starts, match.start())
             context = ctx(match.start())
             if _is_negated_safety_constraint(content, match, line_starts, line_ends):
                 continue
@@ -268,7 +278,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     for pattern, confidence in RA2_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = bisect_right(line_starts, match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="RA2",
@@ -302,15 +312,15 @@ def _is_signed_companion_cli_update(
         line_starts,
         line_ends,
     )
-    line = content[line_start:line_end]
-    if line.count("`") != 2:
+    if line_end - line_start > _MAX_COMPANION_UPDATE_LINE_CHARS:
         return False
+    line = content[line_start:line_end]
     local_start = match.start() - line_start
     local_end = match.end() - line_start
-    code_start = line.rfind("`", 0, local_start)
-    code_end = line.find("`", local_end)
-    if code_start == -1 or code_end == -1:
+    code_span = _enclosing_inline_code_span(line, local_start, local_end)
+    if code_span is None:
         return False
+    code_start, code_end = code_span
     command = line[code_start + 1 : code_end]
     if _SHELL_COMMAND_COMPOSITION.search(command):
         return False
@@ -320,12 +330,7 @@ def _is_signed_companion_cli_update(
     if cli_match is None:
         return False
     cli_subject = cli_match.group("cli").lower()
-    cli_stem = _normalized_cli_subject_stem(cli_subject)
-    if (
-        cli_subject in _NON_COMPANION_UPDATE_SUBJECTS
-        or cli_stem in _NON_COMPANION_UPDATE_SUBJECTS
-        or cli_stem.startswith("python")
-    ):
+    if _is_protected_update_subject(cli_subject):
         return False
     if _DISABLE_SIGNATURE_VERIFICATION.search(command):
         return False
@@ -333,15 +338,42 @@ def _is_signed_companion_cli_update(
     if flag is None:
         return False
     flag_value = (flag.group("value") or "true").lower()
+    clause_start = max(line.rfind(mark, 0, code_start) for mark in ".;!?") + 1
+    clause_ends = [position for mark in ".;!?" if (position := line.find(mark, code_end + 1)) >= 0]
+    clause_end = min(clause_ends, default=len(line))
+    evidence_clause = line[clause_start:clause_end]
+    next_code_start = line.find("`", code_end + 1)
+    negation_end = next_code_start if next_code_start >= 0 else len(line)
+    negation_scope = line[clause_start:negation_end]
     return (
         flag_value in {"1", "on", "true", "yes"}
-        and _SIGNED_CLI_RELEASE.search(line) is not None
-        and _SIGNED_CLI_RELEASE_NEGATION.search(line) is None
+        and _SIGNED_CLI_RELEASE.search(evidence_clause) is not None
+        and _SIGNED_CLI_RELEASE_NEGATION.search(negation_scope) is None
     )
 
 
-def _normalized_cli_subject_stem(subject: str) -> str:
-    """Normalize executable and CLI-role affixes before protected-subject checks."""
+def _enclosing_inline_code_span(
+    line: str,
+    match_start: int,
+    match_end: int,
+) -> tuple[int, int] | None:
+    """Return the simple Markdown code span containing one match.
+
+    Pairing delimiters from the start of the logical line permits independent
+    commands on the same line while malformed, unpaired, and multi-backtick
+    spans remain fail-closed.
+    """
+    delimiters = [item.start() for item in re.finditer(r"`", line)]
+    if len(delimiters) % 2:
+        return None
+    for code_start, code_end in zip(delimiters[::2], delimiters[1::2], strict=True):
+        if code_start < match_start and match_end <= code_end:
+            return code_start, code_end
+    return None
+
+
+def _strip_cli_subject_affixes(subject: str) -> str:
+    """Strip stacked executable and CLI-role suffixes without losing token boundaries."""
     stem = subject.casefold()
     changed = True
     while changed:
@@ -356,7 +388,26 @@ def _normalized_cli_subject_stem(subject: str) -> str:
                 stem = stem[: -len(suffix)]
                 changed = True
                 break
-    return re.sub(r"[-_.]", "", stem)
+    return stem
+
+
+def _is_protected_update_subject(subject: str) -> bool:
+    """Fail closed when a self-update subject may denote the skill or its agent.
+
+    Companion executable names are intentionally limited to ASCII. This avoids
+    treating a confusable spelling of a protected subject as an unrelated CLI.
+    Separator-delimited protected roles are rejected without substring-denying
+    unrelated vendor names such as ``agentsope-cli`` or ``toolboxctl``.
+    """
+    if not subject.isascii():
+        return True
+    stem = _strip_cli_subject_affixes(subject)
+    collapsed = re.sub(r"[-_.]", "", stem)
+    if collapsed in _NON_COMPANION_UPDATE_SUBJECTS or collapsed.startswith("python"):
+        return True
+    return any(
+        part in _PROTECTED_UPDATE_SUBJECT_PARTS for part in re.split(r"[-_.]+", stem) if part
+    )
 
 
 def _logical_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:

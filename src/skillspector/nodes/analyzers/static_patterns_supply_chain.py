@@ -36,6 +36,7 @@ import re
 import sys
 import time
 import tomllib
+from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,7 +63,12 @@ from skillspector.state import (
 )
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    LOGICAL_LINE_BREAK,
+    get_context_from_lines,
+    get_line_number,
+    logical_line_starts,
+)
 from .osv_client import (
     ECOSYSTEM_NPM,
     ECOSYSTEM_PYPI,
@@ -143,6 +149,7 @@ _PIPE_TO_SHELL = re.compile(
     r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba)?sh\b",
     re.IGNORECASE,
 )
+_MAX_WARNED_INSTALLER_LINE_CHARS = 4_096
 SC3_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -959,7 +966,9 @@ def _extract_packages_from_npm_lock(
     """Extract exact package versions from an npm lockfile."""
     if limit is not None and limit <= 0:
         return []
-    found = [(name, version, line) for name, version, line, _depth in _npm_lock_entries(content)]
+    found: list[tuple[str, str | None, int]] = [
+        (name, version, line) for name, version, line, _depth in _npm_lock_entries(content)
+    ]
     return found if limit is None else found[:limit]
 
 
@@ -1182,12 +1191,22 @@ def _version_lt(v1: str, v2: str) -> bool:
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for supply chain patterns (SC1–SC3, SC7)."""
     findings: list[AnalyzerFinding] = []
+    line_starts = logical_line_starts(content)
+    content_lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
     def ctx(start: int) -> str:
-        return str(get_context(content, start))
+        line_num = bisect_right(line_starts, start)
+        return get_context_from_lines(
+            content_lines,
+            line_num,
+            column=start - line_starts[line_num - 1],
+        )
+
+    def line_number(start: int) -> int:
+        return bisect_right(line_starts, start)
 
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
@@ -1198,7 +1217,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if is_dep_file:
         for pattern, confidence in SC1_PATTERNS:
             for match in re.finditer(pattern, content, re.MULTILINE):
-                line_num = get_line_number(content, match.start())
+                line_num = line_number(match.start())
                 findings.append(
                     AnalyzerFinding(
                         rule_id="SC1",
@@ -1214,9 +1233,14 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
     for pattern, confidence in SC2_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = line_number(match.start())
             mt = match.group(0)
-            warned_internal_installer = _is_warned_internal_installer(content, match, file_type)
+            warned_internal_installer = _is_warned_internal_installer(
+                content,
+                match,
+                file_type,
+                line_starts,
+            )
             if _is_safe_supply_chain_pattern(mt):
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
@@ -1260,7 +1284,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if file_type in ("python", "javascript", "shell", "other"):
         for pattern, confidence in SC3_PATTERNS:
             for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                line_num = get_line_number(content, match.start())
+                line_num = line_number(match.start())
                 findings.append(
                     AnalyzerFinding(
                         rule_id="SC3",
@@ -1277,7 +1301,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="SC7",
@@ -1298,6 +1322,7 @@ def _is_warned_internal_installer(
     content: str,
     match: re.Match[str],
     file_type: str,
+    line_starts: tuple[int, ...],
 ) -> bool:
     """Return whether a pipe-to-shell example carries an explicit local warning."""
     if file_type not in {"markdown", "text"}:
@@ -1307,10 +1332,14 @@ def _is_warned_internal_installer(
         return False
     pipe_start = match.start() + pipe_match.start()
     pipe_end = match.start() + pipe_match.end()
-    line_start = content.rfind("\n", 0, pipe_start) + 1
-    line_end = content.find("\n", pipe_end)
-    if line_end == -1:
-        line_end = len(content)
+    if LOGICAL_LINE_BREAK.search(content, pipe_start, pipe_end) is not None:
+        return False
+    line_index = max(0, bisect_right(line_starts, pipe_start) - 1)
+    line_start = line_starts[line_index]
+    separator = LOGICAL_LINE_BREAK.search(content, pipe_end)
+    line_end = separator.start() if separator is not None else len(content)
+    if line_end - line_start > _MAX_WARNED_INSTALLER_LINE_CHARS:
+        return False
     line = content[line_start:line_end]
     if len(tuple(_PIPE_TO_SHELL.finditer(line))) != 1:
         return False
