@@ -58,3 +58,7 @@ models:
   "gpt-6-astra":
     context_length: 1050000
     max_output_tokens: 128000
+
+  "gemini-3.5-flash":
+    context_length: 1048576
+    max_output_tokens: 65536

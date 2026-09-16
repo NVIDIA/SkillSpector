@@ -33,6 +33,7 @@ concurrency:
 env:
   UV_VERSION: "0.10.x"
   PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22.20.0"
   UV_CACHE_DIR: .uv-cache
   UV_LINK_MODE: copy
 
@@ -89,6 +90,18 @@ jobs:
       - run: make install-dev
       - run: uv run skillspector --version
       - run: uv run make test-ci
+
+  test-opencode:
+    name: OpenCode TypeScript Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Node.js
+        # Pinned to a full commit SHA (third-party action); comment tracks the tag.
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: node --test tests/opencode/skillspector_scan_lib.test.ts
 
   docker-smoke:
     needs: changes

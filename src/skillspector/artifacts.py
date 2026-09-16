@@ -54,6 +54,7 @@ class ArtifactRecord(TypedDict):
     misleading_extension: bool
     referenced: bool
     reason: NotRequired[str]
+    inherited_exclusion_reason: NotRequired[str]
 
 
 class BundleReference(TypedDict):
@@ -69,12 +70,23 @@ class BundleReference(TypedDict):
 
 
 @dataclass(frozen=True)
+class SecurityTextReconstruction:
+    """One projected run reconstructed from a bounded raw source span."""
+
+    derived_start: int
+    derived_end: int
+    source_start: int
+    source_end: int
+
+
+@dataclass(frozen=True)
 class SecurityTextView:
     """A bounded derived text view and mapping to raw character offsets."""
 
     name: str
     text: str
     source_offsets: array[int] | None = None
+    reconstructions: tuple[SecurityTextReconstruction, ...] = ()
 
     def source_offset(self, derived_offset: int) -> int:
         """Map a derived character offset to the corresponding source offset."""
@@ -84,6 +96,29 @@ class SecurityTextView:
             return 0
         index = min(max(derived_offset, 0), len(self.source_offsets) - 1)
         return self.source_offsets[index]
+
+    def reconstructed_source_spans(
+        self,
+        derived_start: int,
+        derived_end: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return exact removed source gaps reconstructed by a derived range."""
+        if derived_end <= derived_start or self.source_offsets is None:
+            return ()
+        gaps: list[tuple[int, int]] = []
+        for item in self.reconstructions:
+            overlap_start = max(derived_start, item.derived_start)
+            overlap_end = min(derived_end, item.derived_end)
+            for offset in range(max(overlap_start + 1, item.derived_start + 1), overlap_end):
+                previous_source = self.source_offsets[offset - 1]
+                source = self.source_offsets[offset]
+                if source > previous_source + 1:
+                    gaps.append((previous_source + 1, source))
+        return tuple(gaps)
+
+    def range_has_reconstruction(self, derived_start: int, derived_end: int) -> bool:
+        """Return whether a derived range joins characters across a removed gap."""
+        return bool(self.reconstructed_source_spans(derived_start, derived_end))
 
 
 @dataclass(frozen=True)
@@ -199,6 +234,10 @@ _LETTER_SPACING_CANDIDATE = re.compile(
 )
 _CONCEALED_INSTRUCTION_CANDIDATE = re.compile(
     r"(?:[^\W\d_](?:[^\w]|_)+){5}[^\W\d_]",
+    re.UNICODE,
+)
+_PROMPT_SPACING_CANDIDATE = re.compile(
+    r"(?<![^\W\d_])\S(?:[^\w\r\n]|_)+\S(?![^\W\d_])",
     re.UNICODE,
 )
 _MIN_LETTER_SPACING_RUN_LETTERS = 6
@@ -1698,6 +1737,187 @@ def compact_letter_view(text: str) -> SecurityTextView:
             output.write(normalized_char)
             offsets.append(source_offset)
     return SecurityTextView("compact", output.getvalue(), offsets)
+
+
+def prompt_injection_letter_spacing_view(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+    *,
+    preserve_identifier_boundaries: bool = True,
+) -> SecurityTextView:
+    """Collapse consistently separated tokens without inventing word boundaries.
+
+    The prompt-injection analyzer alone consumes this projection. Existing
+    word boundaries are retained verbatim, while consistent spaces, tabs, or
+    punctuation between single-character tokens are removed with exact raw-gap
+    provenance. A completely boundary-free run therefore remains one condensed
+    token and cannot acquire a guessed P3 or P4 segmentation. Identifier-adjacent
+    runs are preserved for semantic classification; artifact-integrity may opt
+    into their projection solely to produce an ambiguity finding.
+    """
+    if check_runtime is not None:
+        check_runtime()
+    if _PROMPT_SPACING_CANDIDATE.search(text) is None:
+        return SecurityTextView("prompt-letter-spacing", text)
+    processed_since_check = 0
+
+    def record_work(characters: int = 1) -> None:
+        nonlocal processed_since_check
+        if check_runtime is None:
+            return
+        processed_since_check += characters
+        if processed_since_check >= 4096:
+            check_runtime()
+            processed_since_check %= 4096
+
+    output = StringIO()
+    offsets = array("I")
+    reconstructions: list[SecurityTextReconstruction] = []
+    transformed = False
+
+    def append_source(start: int, end: int) -> None:
+        for source_offset in range(start, end):
+            record_work()
+            output.write(text[source_offset])
+            offsets.append(source_offset)
+
+    cursor = 0
+    index = 0
+    while index < len(text):
+        record_work()
+        # A line break is never a token: starting a run on it would treat the
+        # previous line's last character as the identifier-boundary neighbor.
+        if text[index] in _LOGICAL_LINE_BREAK_CHARACTERS or _is_letter_spacing_separator(
+            text[index]
+        ):
+            index += 1
+            continue
+
+        run_start = index
+        unit_offsets = array("I", (run_start,))
+        run_tail = text[run_start].casefold()[-8:]
+        url_mode = False
+        spacing_width: int | None = None
+        run_end = run_start + 1
+        while run_end < len(text):
+            gap_start = run_end
+            if text[gap_start].isspace() and text[gap_start] not in _LOGICAL_LINE_BREAK_CHARACTERS:
+                while (
+                    run_end < len(text)
+                    and text[run_end].isspace()
+                    and text[run_end] not in _LOGICAL_LINE_BREAK_CHARACTERS
+                ):
+                    record_work()
+                    run_end += 1
+                if run_end < len(text) and _is_letter_spacing_separator(text[run_end]):
+                    punctuation = text[run_end]
+                    punctuation_is_unit = (
+                        punctuation == ":"
+                        and run_tail in {"http", "https"}
+                        or punctuation == "/"
+                        and run_tail.endswith(("http:", "https:", "http:/", "https:/"))
+                        or punctuation == "."
+                        and url_mode
+                        or punctuation == "'"
+                        and run_tail.endswith("user")
+                    )
+                    if not punctuation_is_unit:
+                        run_end += 1
+                        record_work()
+                        while (
+                            run_end < len(text)
+                            and text[run_end].isspace()
+                            and text[run_end] not in _LOGICAL_LINE_BREAK_CHARACTERS
+                        ):
+                            record_work()
+                            run_end += 1
+            elif _is_letter_spacing_separator(text[gap_start]):
+                marker = text[gap_start]
+                while run_end < len(text) and (
+                    text[run_end] == marker
+                    or text[run_end].isspace()
+                    and text[run_end] not in _LOGICAL_LINE_BREAK_CHARACTERS
+                ):
+                    record_work()
+                    run_end += 1
+            if gap_start == run_end:
+                break
+            if run_end >= len(text):
+                run_end = gap_start
+                break
+
+            gap = text[gap_start:run_end]
+            gap_signature = _letter_spacing_gap_signature(gap)
+            whitespace_gap = all(character.isspace() for character in gap)
+            if gap_signature is None and not whitespace_gap:
+                run_end = gap_start
+                break
+
+            # A separator before a multi-letter word is an observed token
+            # boundary, not another inter-character gap. In particular, this
+            # keeps the first character of "conversation" out of "s e n d".
+            if text[run_end].isalpha() and run_end + 1 < len(text) and text[run_end + 1].isalpha():
+                run_end = gap_start
+                break
+
+            if whitespace_gap:
+                if spacing_width is not None and len(gap) != spacing_width:
+                    run_end = gap_start
+                    break
+                spacing_width = len(gap)
+
+            unit_offsets.append(run_end)
+            run_tail = (run_tail + text[run_end].casefold())[-8:]
+            url_mode = url_mode or "://" in run_tail
+            run_end += 1
+
+        if len(unit_offsets) == 1:
+            index += 1
+            continue
+
+        # Do not rewrite a letter-spaced fragment embedded in an identifier.
+        # Advance past rejected runs too, so attacker-controlled near misses
+        # cannot force quadratic rescanning from every interior character.
+        left_identifier = run_start > 0 and _is_word_character(text[run_start - 1])
+        right_identifier = run_end < len(text) and _is_word_character(text[run_end])
+        left_letter = run_start > 0 and text[run_start - 1].isalpha()
+        right_letter = run_end < len(text) and text[run_end].isalpha()
+        boundary_is_safe = (
+            not left_identifier and not right_identifier
+            if preserve_identifier_boundaries
+            else not left_letter and not right_letter
+        )
+        if boundary_is_safe:
+            append_source(cursor, run_start)
+            derived_start = len(offsets)
+            for source_offset in unit_offsets:
+                record_work()
+                output.write(text[source_offset])
+                offsets.append(source_offset)
+            reconstructions.append(
+                SecurityTextReconstruction(
+                    derived_start=derived_start,
+                    derived_end=len(offsets),
+                    source_start=run_start,
+                    source_end=run_end,
+                )
+            )
+            cursor = run_end
+            transformed = True
+        # Retrying at the second unit after a left-side rejection prevents one
+        # malformed prefix from hiding a valid suffix. Only the first attempt
+        # can have an adjacent left identifier, so the scan remains linear.
+        index = unit_offsets[1] if not boundary_is_safe and left_identifier else run_end
+
+    if not transformed:
+        return SecurityTextView("prompt-letter-spacing", text)
+    append_source(cursor, len(text))
+    return SecurityTextView(
+        "prompt-letter-spacing",
+        output.getvalue(),
+        offsets,
+        tuple(reconstructions),
+    )
 
 
 def _requires_normalized_security_view(text: str) -> bool:

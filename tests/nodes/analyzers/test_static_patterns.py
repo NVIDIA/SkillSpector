@@ -48,6 +48,7 @@ from skillspector.nodes.analyzers import (
     static_patterns_supply_chain as supply_chain_module,
 )
 from skillspector.nodes.analyzers import static_runner
+from skillspector.nodes.deduplicate import deduplicate
 
 
 class TestRunStaticPatternsPromptInjection:
@@ -121,6 +122,29 @@ class TestRunStaticPatternsPromptInjection:
         }
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
         assert any(f.rule_id == "P2" for f in findings)
+
+    def test_p2_unicode_tag_preview_uses_complete_run_identity(self):
+        def tags(value: str) -> str:
+            return "".join(chr(0xE0000 + ord(char)) for char in value)
+
+        shared = tags("a" * 40)
+
+        def finding(path: str, tail: str):
+            findings = static_runner.run_static_patterns(
+                {
+                    "components": [path],
+                    "file_cache": {path: shared + tags(tail)},
+                },
+                [prompt_injection_module],
+            )
+            return next(item for item in findings if item.rule_id == "P2")
+
+        first = finding("first.md", "first")
+        second = finding("second.md", "second")
+
+        assert first.matched_text == second.matched_text
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
 
     def test_p2_unicode_tag_smuggling_detected_in_python_script(self):
         """Tag smuggling is caught even in a .py file, where the bidi/zero-width
@@ -224,6 +248,36 @@ class TestRunStaticPatternsPromptInjection:
 
 class TestRunStaticPatternsP9WhitespacePadding:
     """run_static_patterns with prompt_injection: P9 whitespace padding."""
+
+    def test_block_summary_uses_complete_padding_run_identity(self):
+        pad_line = "\u3000" * 79
+
+        def finding(path: str, tail: str):
+            final_line = ("\u3000" * 78) + tail
+            block = "a\n" + "\n".join([pad_line] * 14 + [final_line]) + "\nb"
+            findings = static_runner.run_static_patterns(
+                {
+                    "components": [path],
+                    "file_cache": {path: block},
+                },
+                [prompt_injection_module],
+            )
+            return next(
+                item for item in findings if item.rule_id == "P9" and item.severity == "LOW"
+            )
+
+        first = finding("first.txt", "\u00a0")
+        second = finding("second.txt", "\u2000")
+        exact = finding("exact.txt", "\u00a0")
+
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        compacted = deduplicate([first, exact])
+        assert len(compacted) == 1
+        assert {item["file"] for item in compacted[0].occurrences} == {
+            "first.txt",
+            "exact.txt",
+        }
 
     def test_vertical_gap_then_instruction_high_severity(self):
         """80 blank lines followed by a malicious instruction yields P9 HIGH."""
@@ -384,6 +438,26 @@ class TestRunStaticPatternsDataExfiltration:
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         e2 = [f for f in findings if f.rule_id == "E2"]
         assert len(e2) >= 3
+
+    def test_e2_long_ast_matches_preserve_distinct_full_source_identity(self):
+        """Long AST matches with equal previews remain distinct after final compaction."""
+        shared_keyword_prefix = "a" * 240
+        content = (
+            f"dict(os.environ, {shared_keyword_prefix}first=1)\n"
+            f"dict(os.environ, {shared_keyword_prefix}second=1)\n"
+        )
+        state = {
+            "components": ["script.py"],
+            "file_cache": {"script.py": content},
+        }
+
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [finding for finding in findings if finding.rule_id == "E2"]
+
+        assert len(e2) == 2
+        assert e2[0].matched_text == e2[1].matched_text
+        assert len({finding.fingerprint() for finding in e2}) == 2
+        assert len(deduplicate(e2)) == 2
 
     def test_e2_exponentiation_not_flagged(self):
         """Bare ``2 ** os.environ`` (exponentiation) must not be flagged as E2."""
@@ -785,6 +859,239 @@ class TestRunStaticPatternsAgentSnooping:
         }
         findings = static_runner.run_static_patterns(state, [agent_snooping_module])
         assert any(f.rule_id == "AS3" for f in findings)
+
+    def test_as3_ownership_table_current_skill_is_not_snooping(self):
+        """An ownership table may name the skill currently being inspected."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_scan_root_identity_marks_self_reference_when_manifest_is_absent(self):
+        """The scan-root basename identifies the current skill without a manifest."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_inconsistent_manifest_identity_fails_closed(self):
+        """A contributor-controlled manifest cannot override the scan-root identity."""
+        state = {
+            "skill_path": "/tmp/checkout-root",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [
+            "skills/example-skill/SKILL.md"
+        ]
+
+    def test_as3_long_current_skill_path_is_not_snooping(self):
+        """Self-reference comparison uses the full path before evidence truncation."""
+        skill_name = f"example-{'a' * 190}"
+        path_reference = f"skills/{skill_name}/SKILL.md"
+        assert len(path_reference) > 200
+        state = {
+            "skill_path": f"/tmp/checkout-root/{skill_name}",
+            "manifest": {"name": skill_name},
+            "components": ["README.md"],
+            "file_cache": {"README.md": f"Root skill: {path_reference}"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_filtered_self_references_do_not_consume_output_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Filtered self paths neither consume output budget nor enter the ledger."""
+        monkeypatch.setattr(static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        peer_reference = "skills/other-skill/SKILL.md"
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": "\n".join(["skills/example-skill/SKILL.md"] * 3 + [peer_reference])
+            },
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [peer_reference]
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    @pytest.mark.parametrize("peer_name", ["example_skill", "Example-Skill"])
+    def test_as3_distinct_filesystem_identity_is_not_suppressed(self, peer_name: str):
+        """Separator and case variants remain distinct filesystem identities."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": f"Peer skill: skills/{peer_name}/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [
+            f"skills/{peer_name}/SKILL.md"
+        ]
+
+    def test_as3_manifest_only_identity_fails_closed(self):
+        """An uncorroborated contributor-controlled name cannot authorize suppression."""
+        state = {
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == [
+            "skills/example-skill/SKILL.md"
+        ]
+
+    def test_as3_fullwidth_peer_path_from_normalized_view_remains_suspicious(self):
+        """A compatibility-normalized peer path remains an AS3 finding."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Peer skill: skills/ｅxample-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        assert "normalized-view" in as3_findings[0].tags
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_hidden_separator_peer_path_from_compact_view_remains_suspicious(self):
+        """A peer path reconstructed across hidden text remains an AS3 finding."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Peer skill: skills/exam\u200bple-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        assert "normalized-view" in as3_findings[0].tags
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_literal_self_path_stays_suppressed_when_other_text_is_normalized(self):
+        """Unrelated normalization does not turn a literal self path into snooping."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "example-skill"},
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": (
+                    "Root skill: skills/example-skill/SKILL.md\nUnrelated compatibility text: ｘ"
+                )
+            },
+        }
+
+        result = agent_snooping_module.node(state)
+
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(finding.rule_id == "AS3" for finding in result["findings"])
+
+    def test_as3_raw_view_scope_does_not_extend_to_transformed_content(self):
+        """Raw-view authorization is bound to the runner-provided text object."""
+
+        class TransformedAnalyzer:
+            ANALYZER_ID = agent_snooping_module.ANALYZER_ID
+
+            @staticmethod
+            def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+                assert content == "placeholder"
+                transformed = "skills/example-skill/SKILL.md"
+                analyzer = agent_snooping_module._CurrentSkillScopedAnalyzer(
+                    frozenset({"example-skill"})
+                )
+                return analyzer.analyze(transformed, file_path, file_type)
+
+        result = static_runner.run_static_patterns_with_ledger(
+            {
+                "components": ["README.md"],
+                "file_cache": {"README.md": "placeholder"},
+            },
+            [TransformedAnalyzer()],
+        )
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        readme_event = result["inspection_ledger"][0]
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
+
+    def test_as3_missing_current_identity_fails_closed(self):
+        """Without a path or manifest identity, a skill path remains suspicious."""
+        state = {
+            "components": ["README.md"],
+            "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert len(as3_findings) == 1
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == [as3_findings[0].finding_id]
 
     def test_same_line_distinct_matches_preserved(self):
         """Distinct same-line config reads are preserved as separate findings."""
