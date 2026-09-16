@@ -91,6 +91,32 @@ def test_missing_terminal_row_becomes_fatal_unaccounted_work() -> None:
     assert result["execution_successful"] is False
 
 
+def test_missing_semantic_telemetry_is_canonical_incompleteness() -> None:
+    """A requested pass cannot bypass canonical completeness or CLI consumers."""
+    result = finalize_inspection_ledger(
+        {
+            "components": [],
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+            "llm_call_log": [],
+            "use_llm": True,
+            "llm_requested": True,
+        }
+    )
+
+    completeness = result["analysis_completeness"]
+    assert completeness["is_complete"] is False
+    assert completeness["status"] == "partial"
+    assert completeness["execution_successful"] is True
+    assert any(
+        event.get("phase") == "semantic_runtime"
+        and event.get("reason_code") == LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE
+        and "per-source runtime telemetry" in str(event.get("message"))
+        for event in result["inspection_ledger"]
+    )
+
+
 def test_unknown_emitted_finding_id_is_fatal_accounting_error() -> None:
     work_id = inspection_work_id("behavioral_ast", "run.py", None, None)
     completeness, _ = finalize_ledger(
@@ -610,6 +636,76 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["is_complete"] is False
 
 
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize(
+    "locations",
+    [
+        [("a.md", 4, 8), ("a.md", 4, 24)],
+        [("a.md", 4, 8), ("b.md", 4, 24)],
+        [("a.md", 4, 8), ("a.md", 7, 8)],
+        [("a.md", 4, 8), ("a.md", 4, 24), ("b.md", 4, 40), ("a.md", 7, 8)],
+    ],
+)
+def test_reference_findings_share_one_terminal_event_per_source_line(
+    locations: list[tuple[str, int, int]], failed: bool
+) -> None:
+    paths = sorted({path for path, _, _ in locations})
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md", *paths],
+            "findings": [],
+            "effective_finding_ids": [],
+            "artifact_inventory": [
+                {"path": path, "disposition": "analyzed", "content_kind": "text"} for path in paths
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": line,
+                    "column": column,
+                    "evidence": f"Read [{path}]({path}).",
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "analyzed",
+                }
+                for path, line, column in locations
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED if failed else LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.READ_ERROR if failed else LedgerReason.STATIC_PARSE_LIMIT,
+                )
+                for path in paths
+            ],
+            "analyzer_status_events": [],
+        }
+    )
+
+    findings = result["findings"]
+    expected_locations = {(line, path) for path, line, _ in locations}
+    assert len(findings) == len(expected_locations)
+    assert {
+        (finding.start_line, finding.matched_text) for finding in findings
+    } == expected_locations
+    events = result["inspection_ledger"]
+    assert len(events) == len({line for _, line, _ in locations})
+    for event in events:
+        assert set(event["emitted_finding_ids"]) == {
+            finding.finding_id for finding in findings if finding.start_line == event["start_line"]
+        }
+    completeness = result["analysis_completeness"]
+    assert completeness["status"] == ("failed" if failed else "partial")
+    assert result["execution_successful"] is (not failed)
+    assert len(result["effective_finding_ids"]) == len(expected_locations)
+    assert not any(
+        row["reason_code"] in {"unaccounted_work", "finding_accounting_error"}
+        for row in completeness["ledger_exceptions"]
+    )
+
+
 @pytest.mark.parametrize("use_llm", [False, True])
 @pytest.mark.parametrize(
     ("disposition", "outcome", "reason", "expected_ae1"),
@@ -682,6 +778,87 @@ def test_resolved_reference_ae1_disposition_matrix_is_llm_independent(
         assert len(result["effective_finding_ids"]) == 1
     else:
         assert result["effective_finding_ids"] == []
+
+
+@pytest.mark.parametrize(
+    ("disposition", "reason", "expected_ae7"),
+    [
+        ("analyzed", None, False),
+        ("partial", "size_limit", True),
+        ("partial", "total_bytes_limit", False),
+        ("failed", "read_error", False),
+    ],
+)
+def test_size_truncated_artifact_synthesizes_ae7(
+    disposition: str,
+    reason: str | None,
+    expected_ae7: bool,
+) -> None:
+    """A file past the per-file read cap must not yield a zero-finding report."""
+    item: dict[str, object] = {"path": "server.py", "disposition": disposition}
+    if reason is not None:
+        item["reason"] = reason
+    result = finalize_inspection_ledger(
+        {
+            "components": ["server.py"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "artifact_inventory": [item],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        }
+    )
+
+    ae7 = [finding for finding in result["findings"] if finding.rule_id == "AE7"]
+    assert bool(ae7) is expected_ae7
+    if expected_ae7:
+        assert ae7[0].severity == "HIGH"
+        assert ae7[0].file == "server.py"
+        assert ae7[0].category == "analysis-evasion"
+        assert result["analysis_completeness"]["is_complete"] is False
+
+
+def test_ae7_skips_paths_already_covered_by_ae1() -> None:
+    """A referenced size-truncated artifact gets AE1, not AE1 + AE7."""
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md", "assets/big.py"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "artifact_inventory": [
+                {
+                    "path": "assets/big.py",
+                    "disposition": "partial",
+                    "reason": "size_limit",
+                    "content_kind": "text",
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 3,
+                    "column": 1,
+                    "evidence": "See [server](assets/big.py).",
+                    "target_path": "assets/big.py",
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path="assets/big.py",
+                    reason=LedgerReason.SIZE_LIMIT,
+                )
+            ],
+            "analyzer_status_events": [],
+        }
+    )
+
+    rule_ids = [finding.rule_id for finding in result["findings"]]
+    assert rule_ids == ["AE1"]
 
 
 @pytest.mark.parametrize("status", ["missing", "ambiguous", "rejected"])

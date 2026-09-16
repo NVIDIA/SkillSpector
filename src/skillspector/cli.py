@@ -54,9 +54,15 @@ from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
+from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
-from skillspector.state import MAX_WORKFLOW_BYTES
+from skillspector.semantic_runtime import (
+    has_semantic_runtime_event,
+    semantic_runtime_intent,
+    semantic_runtime_ledger_event,
+)
+from skillspector.state import MAX_WORKFLOW_BYTES, MAX_WORKFLOW_SECONDS
 from skillspector.suppression import (
     Baseline,
     build_baseline_dict,
@@ -100,7 +106,7 @@ err_console = Console(stderr=True)
 
 _TRANSITIVE_MAX_TARGETS = 32
 _TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
-_TRANSITIVE_MAX_SECONDS = 60.0
+_TRANSITIVE_MAX_SECONDS = MAX_WORKFLOW_SECONDS
 _TRANSITIVE_MAX_ARTIFACTS = 10_000
 _TRANSITIVE_MAX_FINDINGS = 10_000
 _TRANSITIVE_MAX_COMPONENTS = 10_000
@@ -164,7 +170,7 @@ class _CachedTransitiveResult:
 
 @dataclass(slots=True)
 class _TransitiveTraversalState:
-    cache: dict[str, _CachedTransitiveResult] = field(default_factory=dict)
+    cache: dict[tuple[str, bool], _CachedTransitiveResult] = field(default_factory=dict)
     budget: _TransitiveBudget = field(default_factory=_TransitiveBudget)
     started_at: float | None = None
     scanned_targets: int = 0
@@ -288,12 +294,15 @@ def _scan_state(
     yara_rules_dir: str | None = None,
     baseline: Path | None = None,
     show_suppressed: bool = False,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
         "input_path": input_path,
         "output_format": format.value,
         "use_llm": not no_llm,
+        "llm_requested": not no_llm,
+        "source_local_only": source_local_only,
     }
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
@@ -494,6 +503,13 @@ def scan(
             help="Exit 1 when relevant analysis is partial or incomplete.",
         ),
     ] = False,
+    fail_on_findings: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-findings",
+            help="Exit 1 when the scan reports one or more active findings.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -571,6 +587,8 @@ def scan(
                 console.print(f"Report saved to: {output}")
             else:
                 print(report)
+            if fail_on_findings and result["findings"]:
+                raise typer.Exit(code=1)
             if result["risk_score"] > RISK_THRESHOLD:
                 raise typer.Exit(code=1)
         except typer.Exit:
@@ -628,10 +646,11 @@ def scan(
                 yara_dir=yara_dir,
                 verbose=verbose,
                 fail_on_incomplete=fail_on_incomplete,
+                fail_on_findings=fail_on_findings,
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
                 "detected. Scanning as single skill."
             )
@@ -644,7 +663,7 @@ def scan(
                 "with a bounded scan and reporting partial coverage."
             )
         if detection.is_multi_skill:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
@@ -701,6 +720,8 @@ def scan(
             else True
         )
         if fail_on_incomplete and not is_complete:
+            raise typer.Exit(code=1)
+        if fail_on_findings and effective_findings(result):
             raise typer.Exit(code=1)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
@@ -916,6 +937,27 @@ def _source_aware_status_events(
             entry["planned_work"] = scoped_work
         statuses.append(entry)
     return statuses
+
+
+def _source_aware_llm_call_log(
+    value: object,
+    *,
+    source_url: str,
+    source_identity: str,
+    source_digest: str,
+) -> list[dict[str, object]]:
+    """Bind child LLM telemetry to its immutable transitive source scope."""
+    records: list[dict[str, object]] = []
+    for record in _coerce_llm_call_log(value):
+        records.append(
+            {
+                **record,
+                "source_url": source_url,
+                "source_identity": source_identity,
+                "source_digest": source_digest,
+            }
+        )
+    return records
 
 
 def _coerce_file_cache(value: object) -> dict[str, str]:
@@ -1201,7 +1243,12 @@ def _cache_transitive_result(
         ],
         inspection_ledger=scoped_ledger,
         analyzer_status_events=scoped_statuses,
-        llm_call_log=_coerce_llm_call_log(child_result.get("llm_call_log")),
+        llm_call_log=_source_aware_llm_call_log(
+            child_result.get("llm_call_log"),
+            source_url=target,
+            source_identity=source_identity,
+            source_digest=source_digest,
+        ),
         inference_usage=_coerce_dict_list(child_result.get("inference_usage")),
         components=_source_aware_components(child_components, source_identity),
         component_metadata=child_metadata,
@@ -1234,6 +1281,7 @@ def _run_graph_scan(
     show_suppressed: bool = False,
     transitive_traversal: _TransitiveTraversalState | None = None,
     initial_inspection_ledger: list[dict[str, object]] | None = None,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1242,6 +1290,7 @@ def _run_graph_scan(
         yara_rules_dir=yara_dir,
         baseline=baseline,
         show_suppressed=show_suppressed,
+        source_local_only=source_local_only,
     )
     if transitive_traversal is not None:
         state["transitive_traversal_state"] = transitive_traversal
@@ -1249,6 +1298,63 @@ def _run_graph_scan(
         state["inspection_ledger"] = initial_inspection_ledger
     trace_config = _build_trace_config(input_path, format, no_llm)
     return cast(dict[str, object], graph.invoke(state, config=trace_config))
+
+
+def _run_graph_scan_for_source(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    yara_dir: str | None = None,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
+    transitive_traversal: _TransitiveTraversalState | None = None,
+    initial_inspection_ledger: list[dict[str, object]] | None = None,
+    source_local_only: bool = False,
+) -> dict[str, object]:
+    """Invoke a scan without widening the legacy call contract for public sources."""
+    if initial_inspection_ledger is not None:
+        if source_local_only:
+            return _run_graph_scan(
+                input_path=input_path,
+                format=format,
+                no_llm=no_llm,
+                yara_dir=yara_dir,
+                baseline=baseline,
+                show_suppressed=show_suppressed,
+                transitive_traversal=transitive_traversal,
+                initial_inspection_ledger=initial_inspection_ledger,
+                source_local_only=True,
+            )
+        return _run_graph_scan(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
+            yara_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            transitive_traversal=transitive_traversal,
+            initial_inspection_ledger=initial_inspection_ledger,
+        )
+    if source_local_only:
+        return _run_graph_scan(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
+            yara_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            transitive_traversal=transitive_traversal,
+            source_local_only=True,
+        )
+    return _run_graph_scan(
+        input_path=input_path,
+        format=format,
+        no_llm=no_llm,
+        yara_dir=yara_dir,
+        baseline=baseline,
+        show_suppressed=show_suppressed,
+        transitive_traversal=transitive_traversal,
+    )
 
 
 def _annotate_transitive_findings(
@@ -1423,10 +1529,11 @@ def _scan_transitive(
     baseline: Path | None,
     show_suppressed: bool,
     visited: set[str],
-    scan_cache: dict[str, _CachedTransitiveResult] | None = None,
+    scan_cache: dict[tuple[str, bool], _CachedTransitiveResult] | None = None,
     budget: _TransitiveBudget | None = None,
     yara_dir: str | None = None,
     traversal: _TransitiveTraversalState | None = None,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     if max_depth <= 0:
         report_result = cast(dict[str, object], report(initial_result))
@@ -1566,9 +1673,13 @@ def _scan_transitive(
                 break
             child_result: dict[str, object] | None = None
             try:
-                cached = traversal.cache.get(target)
+                # Privacy mode is part of the computation identity: sharing a
+                # cache entry across modes could either suppress a public LLM
+                # pass or leak provider-derived state into a local-only scan.
+                cache_key = (target, source_local_only)
+                cached = traversal.cache.get(cache_key)
                 if cached is None:
-                    child_result = _run_graph_scan(
+                    child_result = _run_graph_scan_for_source(
                         input_path=target,
                         format=format,
                         no_llm=no_llm,
@@ -1579,9 +1690,10 @@ def _scan_transitive(
                         baseline=None,
                         show_suppressed=False,
                         transitive_traversal=traversal,
+                        source_local_only=source_local_only,
                     )
                     cached = _cache_transitive_result(target, child_result, traversal)
-                    traversal.cache[target] = cached
+                    traversal.cache[cache_key] = cached
                     traversal.record_scan()
                     if child_result.get("execution_successful") is False:
                         traversal.note_child_scan_failure(target)
@@ -1801,6 +1913,8 @@ def _scan_transitive(
         "artifact_inventory": merged_artifact_inventory,
         "artifact_references": merged_artifact_references,
         "has_executable_scripts": has_executable_scripts,
+        "use_llm": initial_result.get("use_llm", not no_llm),
+        "llm_requested": initial_result.get("llm_requested", not no_llm),
         "llm_call_log": merged_llm_call_log,
         "inference_usage": merged_inference_usage,
         "effective_finding_ids": list(dict.fromkeys(merged_effective_finding_ids)),
@@ -1816,6 +1930,23 @@ def _scan_transitive(
         "transitive_truncated": bool(traversal.truncation_reasons),
         "transitive_truncation_reasons": traversal.truncation_reasons,
     }
+    llm_requested, llm_enabled = semantic_runtime_intent(merged_result)
+    runtime_event = semantic_runtime_ledger_event(
+        requested=llm_requested,
+        enabled=llm_enabled,
+        result=merged_result,
+        discovered_modules=ANALYZER_MODULES,
+    )
+    if runtime_event is not None and not has_semantic_runtime_event(
+        merged_inspection_ledger, runtime_event
+    ):
+        merged_inspection_ledger = _merge_bounded_ledger(
+            merged_inspection_ledger,
+            [dict(runtime_event)],
+            limit=traversal.budget.max_ledger_events,
+            traversal=traversal,
+        )
+        merged_result["inspection_ledger"] = merged_inspection_ledger
     if merged_inspection_ledger or merged_analyzer_status_events:
         completeness, effective_ids = finalize_ledger(merged_result)
         merged_result["analysis_completeness"] = completeness
@@ -1857,14 +1988,17 @@ def _scan_skill(
     transitive_depth: int,
     transitive_allow_prefix: tuple[str, ...] | list[str] | None,
     transitive_deny_prefix: tuple[str, ...] | list[str] | None,
-    transitive_cache: dict[str, _CachedTransitiveResult] | None = None,
+    transitive_cache: dict[tuple[str, bool], _CachedTransitiveResult] | None = None,
     transitive_traversal: _TransitiveTraversalState | None = None,
     pre_scan_ledger_events: list[dict[str, object]] | None = None,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
     if verbose:
-        console.print("[dim]Running scan...[/dim]")
+        (err_console if format == FormatChoice.json else console).print(
+            "[dim]Running scan...[/dim]"
+        )
     logger.debug(
         "Scan started: input_path=%s, format=%s, use_llm=%s, transitive=%s",
         input_path,
@@ -1875,7 +2009,7 @@ def _scan_skill(
     if transitive_enabled and transitive_traversal is None:
         transitive_traversal = _TransitiveTraversalState(cache=transitive_cache or {})
     if pre_scan_ledger_events:
-        result = _run_graph_scan(
+        result = _run_graph_scan_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1884,9 +2018,10 @@ def _scan_skill(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             initial_inspection_ledger=pre_scan_ledger_events,
+            source_local_only=source_local_only,
         )
     else:
-        result = _run_graph_scan(
+        result = _run_graph_scan_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1894,6 +2029,7 @@ def _scan_skill(
             baseline=baseline,
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
+            source_local_only=source_local_only,
         )
     if not transitive_enabled:
         return result
@@ -1919,6 +2055,7 @@ def _scan_skill(
         scan_cache=transitive_cache,
         yara_dir=yara_dir,
         traversal=transitive_traversal,
+        source_local_only=source_local_only,
     )
 
 
@@ -2075,15 +2212,19 @@ def _scan_multi_skill(
     yara_dir: str | None = None,
     verbose: bool = False,
     fail_on_incomplete: bool = False,
+    fail_on_findings: bool = False,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
-    console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
+    status_console = err_console if format == FormatChoice.json and output is None else console
+    status_console.print(
+        f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n"
+    )
 
-    shared_transitive_cache: dict[str, _CachedTransitiveResult] = {}
+    shared_transitive_cache: dict[tuple[str, bool], _CachedTransitiveResult] = {}
     shared_transitive_traversal = _TransitiveTraversalState(
         cache=shared_transitive_cache,
         budget=_TransitiveBudget(
@@ -2097,6 +2238,7 @@ def _scan_multi_skill(
     transitive_finding_count = 0
     transitive_sources: set[str] = set()
     analysis_incomplete = not detection.complete
+    has_findings = False
     aggregate_limitations = [
         f"recursive discovery {limitation.resource} limit reached"
         for limitation in detection.limitations[:256]
@@ -2130,7 +2272,7 @@ def _scan_multi_skill(
             analysis_incomplete = True
             aggregate_limitations.extend(shared_transitive_traversal.truncation_reasons)
             break
-        console.print(
+        status_console.print(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
         try:
@@ -2148,10 +2290,12 @@ def _scan_multi_skill(
                 transitive_deny_prefix=transitive_deny_prefix,
                 transitive_cache=shared_transitive_cache,
                 transitive_traversal=shared_transitive_traversal,
+                source_local_only=skill.local_only,
             )
             result_body = _result_body(result)
             result_characters = len(result_body)
             result_records = _multi_skill_public_record_count(result)
+            has_findings = has_findings or bool(effective_findings(result))
             if (
                 retained_public_records + result_records > _MULTI_SKILL_MAX_PUBLIC_RECORDS
                 or retained_report_characters + result_characters
@@ -2204,7 +2348,7 @@ def _scan_multi_skill(
             for source in _coerce_str_path_list(result.get("transitive_sources")):
                 transitive_sources.add(source)
             severity = result.get("risk_severity") or "LOW"
-            console.print(f"         Score: {score}/100 ({severity})\n")
+            status_console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
             error_message = str(e)[:1_024]
             err_console.print(f"         [red]Error:[/red] {error_message}\n")
@@ -2230,33 +2374,35 @@ def _scan_multi_skill(
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
 
-    console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
-    console.print(
+    status_console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
+    status_console.print(
         f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10} {'Execution':<10}"
     )
-    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
+    status_console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
 
     for skill, result in zip(processed_skills, results, strict=True):
         if "error" in result:
-            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}")
+            status_console.print(
+                f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}"
+            )
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
         finding_count = len(effective_findings(result))
         execution = "failed" if result.get("execution_successful") is False else "successful"
-        console.print(
+        status_console.print(
             f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
         )
     if omitted_skill_count:
-        console.print(
+        status_console.print(
             f"  {'<omitted>':<30} {'—':<8} {'—':<12} {omitted_skill_count:<10} {'partial':<10}"
         )
-        console.print(
+        status_console.print(
             "[yellow]Recursive scan incomplete:[/yellow] one or more skills were omitted "
             "after an aggregate safety limit."
         )
 
-    if output and format == FormatChoice.json:
+    if format == FormatChoice.json:
         combined: dict[str, object] = {
             "multi_skill": True,
             "skill_count": len(skills),
@@ -2346,8 +2492,11 @@ def _scan_multi_skill(
             }
             rendered = json.dumps(combined, indent=2)
         _ensure_recursive_output_bound(rendered)
-        Path(output).write_text(rendered, encoding="utf-8")
-        console.print(f"[green]Combined report saved to:[/green] {output}")
+        if output:
+            Path(output).write_text(rendered, encoding="utf-8")
+            console.print(f"[green]Combined report saved to:[/green] {output}")
+        else:
+            print(rendered)
     elif output and format == FormatChoice.sarif:
         merged_sarif = _multi_skill_sarif_report(
             processed_skills,
@@ -2395,6 +2544,8 @@ def _scan_multi_skill(
     if execution_failed:
         raise typer.Exit(code=2)
     if fail_on_incomplete and analysis_incomplete:
+        raise typer.Exit(code=1)
+    if fail_on_findings and has_findings:
         raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
