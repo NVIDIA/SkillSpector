@@ -1075,7 +1075,10 @@ def test_build_context_rejects_symlink_to_external_file(tmp_path: Path) -> None:
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
-    (skill_dir / "creds.md").symlink_to(secret)
+    try:
+        (skill_dir / "creds.md").symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
@@ -1093,7 +1096,10 @@ def test_build_context_rejects_symlinked_directory(tmp_path: Path) -> None:
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
-    (skill_dir / "linked").symlink_to(external, target_is_directory=True)
+    try:
+        (skill_dir / "linked").symlink_to(external, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
@@ -1128,7 +1134,10 @@ def test_build_context_rejects_in_tree_symlink(tmp_path: Path) -> None:
     skill_dir.mkdir()
     (skill_dir / "real.md").write_text("real content", encoding="utf-8")
     (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
-    (skill_dir / "alias.md").symlink_to(skill_dir / "real.md")
+    try:
+        (skill_dir / "alias.md").symlink_to(skill_dir / "real.md")
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
@@ -1146,6 +1155,12 @@ def test_build_context_rejects_file_swapped_to_symlink_before_read(
     secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
     target = tmp_path / "payload.md"
     target.write_text("safe", encoding="utf-8")
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+    probe.unlink()
 
     def replace_target(path: Path) -> BinaryIO:
         if path.name == target.name:
@@ -1173,7 +1188,10 @@ def test_build_context_rejects_symlinked_manifest(tmp_path: Path) -> None:
     )
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir()
-    (skill_dir / "SKILL.md").symlink_to(external)
+    try:
+        (skill_dir / "SKILL.md").symlink_to(external)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
 
     result = build_context({"skill_path": str(skill_dir)})
 
@@ -1369,6 +1387,33 @@ def test_build_context_reports_files_beyond_supported_envelope_as_partial(
         and event["reason_code"] == "size_limit"
         for event in result["inspection_ledger"]
     )
+
+
+def test_truncated_text_file_stays_in_llm_cache_with_audit_gap_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file past the read cap must still reach the LLM stage.
+
+    Excluding truncated files from ``llm_file_cache`` lets a payload hide
+    past the cap while the report shows zero findings.  The LLM view is a
+    bounded prefix plus an explicit audit-gap marker instead.
+    """
+    import skillspector.nodes.build_context as build_context_module
+
+    monkeypatch.setattr(build_context_module, "MAX_ANALYZABLE_FILE_BYTES", 64)
+    (tmp_path / "SKILL.md").write_text("# weather\n", encoding="utf-8")
+    (tmp_path / "server.py").write_text(
+        'PAYLOAD = "past-the-cut"\n' + "x" * 256 + "\n", encoding="utf-8"
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "server.py" in result["llm_file_cache"]
+    cached = result["llm_file_cache"]["server.py"]
+    assert "audit" in cached and "gap" in cached
+    assert "server.py" in result["llm_components"]
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "server.py")
+    assert artifact["disposition"] == "partial"
 
 
 def test_build_context_shares_artifact_budget_across_child_bundles(tmp_path: Path) -> None:
