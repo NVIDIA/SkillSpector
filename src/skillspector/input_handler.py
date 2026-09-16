@@ -743,7 +743,12 @@ class InputHandler:
         if git_target is not None:
             repository_url, branch, subdirectory = git_target
             clone_dir = self._clone_git(repository_url, branch=branch)
-            target = clone_dir.joinpath(*subdirectory.parts)
+            clone_root = clone_dir.resolve()
+            target = (clone_root / subdirectory).resolve()
+            try:
+                target.relative_to(clone_root)
+            except ValueError as exc:
+                raise ValueError("Git URL subdirectory must stay within the repository") from exc
             if not target.is_dir() or target.is_symlink():
                 raise ValueError("Git URL subdirectory does not exist or is not a directory")
             return target, "git"
@@ -1027,7 +1032,7 @@ class InputHandler:
         if len(parts) < 5 or parts[2] != "tree":
             return None
         owner, repository, _tree, branch, *subdirectory = parts
-        if any(part in {"", ".", ".."} for part in subdirectory):
+        if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in subdirectory):
             raise ValueError("Git URL subdirectory must stay within the repository")
         return (
             f"https://github.com/{owner}/{repository}.git",

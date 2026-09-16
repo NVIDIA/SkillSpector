@@ -470,6 +470,14 @@ def test_github_tree_url_resolves_a_checked_out_subdirectory(tmp_path: Path) -> 
     )
 
 
+@pytest.mark.parametrize("segment", ["%2Fetc", "%2E%2E%2Frepo", "%5Coutside"])
+def test_github_tree_url_rejects_encoded_path_escapes(segment: str) -> None:
+    with pytest.raises(ValueError, match="stay within the repository"):
+        InputHandler()._github_tree_target(
+            f"https://github.com/example/repo/tree/main/skills/{segment}"
+        )
+
+
 def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
     """Network inputs require HTTPS unless they use SSH's scp-style syntax."""
     handler = InputHandler()
