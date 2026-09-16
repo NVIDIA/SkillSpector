@@ -46,6 +46,7 @@ from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_event,
     ledger_event,
 )
@@ -175,6 +176,7 @@ def _enforce_rule_load_deadline() -> None:
 # Module-level cache keyed by a content hash of all rule directories.
 _compiled_rules: yara.Rules | None = None
 _rules_hash: str | None = None
+_rules_skipped_count: int = 0
 
 
 def _collect_rule_files(*dirs: Path) -> list[Path]:
@@ -394,8 +396,18 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     """Compile YARA rules from built-in and optional user-supplied directories.
 
     Results are cached at module level and reused if directory contents haven't changed.
+
+    Rule files that fail to decode (malformed base64) or fail to compile (YARA
+    syntax errors) are dropped from the active rule set. The count is recorded
+    in the module-level ``_rules_skipped_count`` (read via
+    :func:`rules_skipped_count`) rather than returned here, so this keeps its
+    original single-value signature and every existing
+    ``monkeypatch.setattr(static_yara, "_load_rules", ...)`` test double stays
+    valid; callers that care about the skip count must surface it themselves
+    or a scan can report ``completed``/SAFE while some of its own detections
+    never ran (#554).
     """
-    global _compiled_rules, _rules_hash  # noqa: PLW0603
+    global _compiled_rules, _rules_hash, _rules_skipped_count  # noqa: PLW0603
 
     dirs = [_BUILTIN_RULES_DIR]
     if extra_dir and extra_dir.is_dir():
@@ -406,6 +418,7 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     rule_files = _collect_rule_files(*dirs)
     if not rule_files:
         logger.info("%s: no YARA rule files found", ANALYZER_ID)
+        _rules_skipped_count = 0
         return None
 
     raw_cache = _read_rule_bytes_cache(rule_files)
@@ -416,6 +429,7 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     sources, materialize_skipped = _build_namespace_map(rule_files, raw_cache=raw_cache)
     compiled, compile_skipped = _compile_rules(sources)
     skipped = materialize_skipped + compile_skipped
+    _rules_skipped_count = skipped
 
     if compiled is None:
         logger.warning("%s: failed to compile any YARA rules", ANALYZER_ID)
@@ -426,6 +440,16 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     loaded = len(sources) - compile_skipped
     logger.info("%s: compiled %d YARA rule file(s) (%d skipped)", ANALYZER_ID, loaded, skipped)
     return compiled
+
+
+def rules_skipped_count() -> int:
+    """Return how many rule files the most recent :func:`_load_rules` call dropped.
+
+    Zero both when nothing was skipped and when a cache hit meant no reload
+    ran; a cache hit implies the same file set was already validated by the
+    load that populated the cache, so nothing new could have been skipped.
+    """
+    return _rules_skipped_count
 
 
 def _bounded_match_instances(
@@ -921,6 +945,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         return _rule_limit_response(exc.reason, dict(exc.metrics))
     finally:
         _RULE_LOAD_DEADLINE.reset(deadline_token)
+    rules_skipped = rules_skipped_count()
     remaining_after_load = transitive_remaining_seconds(state)
     if remaining_after_load is not None and remaining_after_load < 1.0:
         return _rule_limit_response(
@@ -1072,6 +1097,29 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
+    if rules_skipped:
+        # A rule that fails to compile or decode is dropped from the active
+        # set with no per-file signal: every scanned component can still
+        # report COMPLETED, because the rule that would have flagged it
+        # simply never ran. Surface that as its own ledger event, scoped to
+        # the rule directory rather than a skill file, so it isn't silently
+        # absorbed into a clean-looking events list (#554).
+        events.append(
+            ledger_event(
+                analyzer_id=ANALYZER_ID,
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="static",
+                # Not a scanned skill file: a synthetic scope for the rule
+                # set itself. Ledger paths must be relative POSIX paths, and
+                # the real rules directory (builtin or --yara-rules-dir) is
+                # absolute, so it cannot be used here.
+                path="yara_rules/",
+                reason=LedgerReason.READ_ERROR,
+                observed_artifacts=rules_skipped,
+                limit_artifacts=0,
+            )
+        )
     if not events:
         status = analyzer_status_event(
             analyzer_id=ANALYZER_ID,

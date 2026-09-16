@@ -953,6 +953,49 @@ class TestHelpers:
         assert "invalid" not in ns_map
         assert skipped == 1
 
+    def test_malformed_rule_is_reported_not_silently_dropped(self, tmp_path, monkeypatch):
+        """A custom rule that can't compile must not report a clean, SAFE scan (#554).
+
+        Reproduces the issue's own scenario: a valid rule plus a rule with a
+        YARA syntax error in the same --yara-rules-dir. The good rule must
+        still fire, but the analyzer status must not be "completed" -- that
+        claim would be false, since the broken rule never ran against
+        anything.
+        """
+        static_yara._compiled_rules = None
+        static_yara._rules_hash = None
+        static_yara._rules_skipped_count = 0
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", tmp_path / "empty_builtin")
+        (tmp_path / "empty_builtin").mkdir()
+
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "good.yar").write_text(
+            'rule good_rule { meta: category = "malware" '
+            'strings: $a = "ACME_CANARY" condition: $a }'
+        )
+        # Missing closing brace: a real YARA syntax error, not a decode failure.
+        (rules_dir / "bad.yar").write_text('rule bad_rule { strings: $a = "x" condition: $a')
+
+        result = static_yara.node(
+            {
+                "components": ["skill.md"],
+                "file_cache": {"skill.md": "contains ACME_CANARY"},
+                "yara_rules_dir": str(rules_dir),
+            }
+        )
+
+        assert any("good_rule" in f.message for f in result["findings"]), (
+            "the valid rule must still fire"
+        )
+        status = result["analyzer_status_events"][0]
+        assert status["status"] != "completed", "a dropped custom rule must not report a clean scan"
+        assert any(
+            event.get("reason_code") == LedgerReason.READ_ERROR
+            and event.get("observed_artifacts") == 1
+            for event in result["inspection_ledger"]
+        )
+
     @pytest.mark.parametrize("payload", ["not base64", "not base64 é"])
     def test_malformed_extra_encoded_rule_does_not_block_builtin_rules(self, tmp_path, payload):
         (tmp_path / "bad.yar.b64").write_text(payload)
