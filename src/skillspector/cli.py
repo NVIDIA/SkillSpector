@@ -54,8 +54,14 @@ from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
+from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
+from skillspector.semantic_runtime import (
+    has_semantic_runtime_event,
+    semantic_runtime_intent,
+    semantic_runtime_ledger_event,
+)
 from skillspector.state import MAX_WORKFLOW_BYTES, MAX_WORKFLOW_SECONDS
 from skillspector.suppression import (
     Baseline,
@@ -164,7 +170,7 @@ class _CachedTransitiveResult:
 
 @dataclass(slots=True)
 class _TransitiveTraversalState:
-    cache: dict[str, _CachedTransitiveResult] = field(default_factory=dict)
+    cache: dict[tuple[str, bool], _CachedTransitiveResult] = field(default_factory=dict)
     budget: _TransitiveBudget = field(default_factory=_TransitiveBudget)
     started_at: float | None = None
     scanned_targets: int = 0
@@ -288,12 +294,15 @@ def _scan_state(
     yara_rules_dir: str | None = None,
     baseline: Path | None = None,
     show_suppressed: bool = False,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
         "input_path": input_path,
         "output_format": format.value,
         "use_llm": not no_llm,
+        "llm_requested": not no_llm,
+        "source_local_only": source_local_only,
     }
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
@@ -930,6 +939,27 @@ def _source_aware_status_events(
     return statuses
 
 
+def _source_aware_llm_call_log(
+    value: object,
+    *,
+    source_url: str,
+    source_identity: str,
+    source_digest: str,
+) -> list[dict[str, object]]:
+    """Bind child LLM telemetry to its immutable transitive source scope."""
+    records: list[dict[str, object]] = []
+    for record in _coerce_llm_call_log(value):
+        records.append(
+            {
+                **record,
+                "source_url": source_url,
+                "source_identity": source_identity,
+                "source_digest": source_digest,
+            }
+        )
+    return records
+
+
 def _coerce_file_cache(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -1213,7 +1243,12 @@ def _cache_transitive_result(
         ],
         inspection_ledger=scoped_ledger,
         analyzer_status_events=scoped_statuses,
-        llm_call_log=_coerce_llm_call_log(child_result.get("llm_call_log")),
+        llm_call_log=_source_aware_llm_call_log(
+            child_result.get("llm_call_log"),
+            source_url=target,
+            source_identity=source_identity,
+            source_digest=source_digest,
+        ),
         inference_usage=_coerce_dict_list(child_result.get("inference_usage")),
         components=_source_aware_components(child_components, source_identity),
         component_metadata=child_metadata,
@@ -1246,6 +1281,7 @@ def _run_graph_scan(
     show_suppressed: bool = False,
     transitive_traversal: _TransitiveTraversalState | None = None,
     initial_inspection_ledger: list[dict[str, object]] | None = None,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1254,6 +1290,7 @@ def _run_graph_scan(
         yara_rules_dir=yara_dir,
         baseline=baseline,
         show_suppressed=show_suppressed,
+        source_local_only=source_local_only,
     )
     if transitive_traversal is not None:
         state["transitive_traversal_state"] = transitive_traversal
@@ -1261,6 +1298,63 @@ def _run_graph_scan(
         state["inspection_ledger"] = initial_inspection_ledger
     trace_config = _build_trace_config(input_path, format, no_llm)
     return cast(dict[str, object], graph.invoke(state, config=trace_config))
+
+
+def _run_graph_scan_for_source(
+    input_path: str,
+    format: FormatChoice,
+    no_llm: bool,
+    yara_dir: str | None = None,
+    baseline: Path | None = None,
+    show_suppressed: bool = False,
+    transitive_traversal: _TransitiveTraversalState | None = None,
+    initial_inspection_ledger: list[dict[str, object]] | None = None,
+    source_local_only: bool = False,
+) -> dict[str, object]:
+    """Invoke a scan without widening the legacy call contract for public sources."""
+    if initial_inspection_ledger is not None:
+        if source_local_only:
+            return _run_graph_scan(
+                input_path=input_path,
+                format=format,
+                no_llm=no_llm,
+                yara_dir=yara_dir,
+                baseline=baseline,
+                show_suppressed=show_suppressed,
+                transitive_traversal=transitive_traversal,
+                initial_inspection_ledger=initial_inspection_ledger,
+                source_local_only=True,
+            )
+        return _run_graph_scan(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
+            yara_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            transitive_traversal=transitive_traversal,
+            initial_inspection_ledger=initial_inspection_ledger,
+        )
+    if source_local_only:
+        return _run_graph_scan(
+            input_path=input_path,
+            format=format,
+            no_llm=no_llm,
+            yara_dir=yara_dir,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            transitive_traversal=transitive_traversal,
+            source_local_only=True,
+        )
+    return _run_graph_scan(
+        input_path=input_path,
+        format=format,
+        no_llm=no_llm,
+        yara_dir=yara_dir,
+        baseline=baseline,
+        show_suppressed=show_suppressed,
+        transitive_traversal=transitive_traversal,
+    )
 
 
 def _annotate_transitive_findings(
@@ -1435,10 +1529,11 @@ def _scan_transitive(
     baseline: Path | None,
     show_suppressed: bool,
     visited: set[str],
-    scan_cache: dict[str, _CachedTransitiveResult] | None = None,
+    scan_cache: dict[tuple[str, bool], _CachedTransitiveResult] | None = None,
     budget: _TransitiveBudget | None = None,
     yara_dir: str | None = None,
     traversal: _TransitiveTraversalState | None = None,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     if max_depth <= 0:
         report_result = cast(dict[str, object], report(initial_result))
@@ -1578,9 +1673,13 @@ def _scan_transitive(
                 break
             child_result: dict[str, object] | None = None
             try:
-                cached = traversal.cache.get(target)
+                # Privacy mode is part of the computation identity: sharing a
+                # cache entry across modes could either suppress a public LLM
+                # pass or leak provider-derived state into a local-only scan.
+                cache_key = (target, source_local_only)
+                cached = traversal.cache.get(cache_key)
                 if cached is None:
-                    child_result = _run_graph_scan(
+                    child_result = _run_graph_scan_for_source(
                         input_path=target,
                         format=format,
                         no_llm=no_llm,
@@ -1591,9 +1690,10 @@ def _scan_transitive(
                         baseline=None,
                         show_suppressed=False,
                         transitive_traversal=traversal,
+                        source_local_only=source_local_only,
                     )
                     cached = _cache_transitive_result(target, child_result, traversal)
-                    traversal.cache[target] = cached
+                    traversal.cache[cache_key] = cached
                     traversal.record_scan()
                     if child_result.get("execution_successful") is False:
                         traversal.note_child_scan_failure(target)
@@ -1813,6 +1913,8 @@ def _scan_transitive(
         "artifact_inventory": merged_artifact_inventory,
         "artifact_references": merged_artifact_references,
         "has_executable_scripts": has_executable_scripts,
+        "use_llm": initial_result.get("use_llm", not no_llm),
+        "llm_requested": initial_result.get("llm_requested", not no_llm),
         "llm_call_log": merged_llm_call_log,
         "inference_usage": merged_inference_usage,
         "effective_finding_ids": list(dict.fromkeys(merged_effective_finding_ids)),
@@ -1828,6 +1930,23 @@ def _scan_transitive(
         "transitive_truncated": bool(traversal.truncation_reasons),
         "transitive_truncation_reasons": traversal.truncation_reasons,
     }
+    llm_requested, llm_enabled = semantic_runtime_intent(merged_result)
+    runtime_event = semantic_runtime_ledger_event(
+        requested=llm_requested,
+        enabled=llm_enabled,
+        result=merged_result,
+        discovered_modules=ANALYZER_MODULES,
+    )
+    if runtime_event is not None and not has_semantic_runtime_event(
+        merged_inspection_ledger, runtime_event
+    ):
+        merged_inspection_ledger = _merge_bounded_ledger(
+            merged_inspection_ledger,
+            [dict(runtime_event)],
+            limit=traversal.budget.max_ledger_events,
+            traversal=traversal,
+        )
+        merged_result["inspection_ledger"] = merged_inspection_ledger
     if merged_inspection_ledger or merged_analyzer_status_events:
         completeness, effective_ids = finalize_ledger(merged_result)
         merged_result["analysis_completeness"] = completeness
@@ -1869,9 +1988,10 @@ def _scan_skill(
     transitive_depth: int,
     transitive_allow_prefix: tuple[str, ...] | list[str] | None,
     transitive_deny_prefix: tuple[str, ...] | list[str] | None,
-    transitive_cache: dict[str, _CachedTransitiveResult] | None = None,
+    transitive_cache: dict[tuple[str, bool], _CachedTransitiveResult] | None = None,
     transitive_traversal: _TransitiveTraversalState | None = None,
     pre_scan_ledger_events: list[dict[str, object]] | None = None,
+    source_local_only: bool = False,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
@@ -1889,7 +2009,7 @@ def _scan_skill(
     if transitive_enabled and transitive_traversal is None:
         transitive_traversal = _TransitiveTraversalState(cache=transitive_cache or {})
     if pre_scan_ledger_events:
-        result = _run_graph_scan(
+        result = _run_graph_scan_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1898,9 +2018,10 @@ def _scan_skill(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             initial_inspection_ledger=pre_scan_ledger_events,
+            source_local_only=source_local_only,
         )
     else:
-        result = _run_graph_scan(
+        result = _run_graph_scan_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1908,6 +2029,7 @@ def _scan_skill(
             baseline=baseline,
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
+            source_local_only=source_local_only,
         )
     if not transitive_enabled:
         return result
@@ -1933,6 +2055,7 @@ def _scan_skill(
         scan_cache=transitive_cache,
         yara_dir=yara_dir,
         traversal=transitive_traversal,
+        source_local_only=source_local_only,
     )
 
 
@@ -2101,7 +2224,7 @@ def _scan_multi_skill(
         f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n"
     )
 
-    shared_transitive_cache: dict[str, _CachedTransitiveResult] = {}
+    shared_transitive_cache: dict[tuple[str, bool], _CachedTransitiveResult] = {}
     shared_transitive_traversal = _TransitiveTraversalState(
         cache=shared_transitive_cache,
         budget=_TransitiveBudget(
@@ -2167,6 +2290,7 @@ def _scan_multi_skill(
                 transitive_deny_prefix=transitive_deny_prefix,
                 transitive_cache=shared_transitive_cache,
                 transitive_traversal=shared_transitive_traversal,
+                source_local_only=skill.local_only,
             )
             result_body = _result_body(result)
             result_characters = len(result_body)
