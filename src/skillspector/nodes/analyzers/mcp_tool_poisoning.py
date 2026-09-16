@@ -46,11 +46,12 @@ from skillspector.llm_analyzer_base import (
     estimate_tokens,
 )
 from skillspector.model_info import get_max_input_tokens
-from skillspector.models import Finding
+from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
 from skillspector.nodes.analyzers.whitespace_padding import (
     ZERO_WIDTH_CHARS,
     detect_whitespace_padding,
+    padding_run_match_fingerprint,
 )
 from skillspector.providers import get_active_provider
 from skillspector.state import (
@@ -232,8 +233,10 @@ _ZERO_WIDTH_RE = re.compile("[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]+\\S")
 # Base64 blobs (>=50 chars) — checked AFTER data URI to avoid double-counting
 _BASE64_RE = re.compile(r"[A-Za-z0-9+/]{50,}={0,2}")
 
-# Data URI prefix
-_DATA_URI_RE = re.compile(r"data:text/[^;]+;base64,")
+# Data URIs retain the complete supported base64 token for identity and range
+# accounting. The token ends at its first delimiter so adjacent standalone
+# base64 remains independently detectable.
+_DATA_URI_RE = re.compile(r"data:text/[^;\s\"'<>]+;base64,[A-Za-z0-9+/=_-]*")
 
 
 def _check_tp1(
@@ -255,6 +258,7 @@ def _check_tp1(
 
     # --- Data URIs (check first) ---
     for m in _DATA_URI_RE.finditer(text):
+        complete_match = m.group()
         data_uri_ranges.append((m.start(), m.end()))
         findings.append(
             Finding(
@@ -265,7 +269,8 @@ def _check_tp1(
                 file="SKILL.md",
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
-                matched_text=m.group(),
+                matched_text=complete_match[:4096],
+                match_fingerprint=compute_match_fingerprint("TP1", complete_match),
                 explanation=(
                     "Data URIs embedded in metadata fields can encode and deliver hidden payloads "
                     "to AI agents processing the manifest."
@@ -291,6 +296,7 @@ def _check_tp1(
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
                 matched_text=comment_text[:4096],
+                match_fingerprint=compute_match_fingerprint("TP1", comment_text),
                 explanation=(
                     "HTML comments in tool metadata are invisible to users but may be processed "
                     "by AI agents, enabling hidden instruction injection."
@@ -316,6 +322,7 @@ def _check_tp1(
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
                 matched_text=m.group()[:4096],
+                match_fingerprint=compute_match_fingerprint("TP1", m.group()),
                 explanation=(
                     "Markdown-style comments in metadata fields may hide instructions from users "
                     "while still being processed by AI systems."
@@ -326,6 +333,7 @@ def _check_tp1(
 
     # --- Zero-width chars ---
     for m in _ZERO_WIDTH_RE.finditer(text):
+        complete_match = m.group()
         findings.append(
             Finding(
                 rule_id="TP1",
@@ -338,7 +346,8 @@ def _check_tp1(
                 file="SKILL.md",
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
-                matched_text=m.group(),
+                matched_text=complete_match[:4096],
+                match_fingerprint=compute_match_fingerprint("TP1", complete_match),
                 explanation=(
                     "Zero-width Unicode characters are invisible to humans but detectable by AI. "
                     "When followed by visible text, they indicate hidden content injection."
@@ -354,8 +363,7 @@ def _check_tp1(
     for m in _BASE64_RE.finditer(text):
         # Check if this match overlaps with a data URI range
         overlaps = any(
-            m.start() >= uri_start and m.end() <= uri_end + 200
-            for uri_start, uri_end in data_uri_ranges
+            m.start() < uri_end and m.end() > uri_start for uri_start, uri_end in data_uri_ranges
         )
         if overlaps:
             continue
@@ -384,6 +392,7 @@ def _check_tp1(
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
                 matched_text=raw[:80] + ("..." if len(raw) > 80 else ""),
+                match_fingerprint=compute_match_fingerprint("TP1", raw),
                 explanation=(
                     "Long base64-encoded strings in metadata fields may encode hidden instructions "
                     "intended to be decoded and executed by AI agents."
@@ -446,6 +455,7 @@ def _check_p9_padding(
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
                 matched_text=run.summary,
+                match_fingerprint=padding_run_match_fingerprint(text, run),
                 explanation=(
                     "Large runs of whitespace padding in metadata fields can push injected "
                     "instructions out of a human reviewer's view while the AI agent still "
@@ -541,6 +551,7 @@ def _check_tp2(
                     category=_CATEGORY,
                     tags=list(_FRAMEWORK_TAGS),
                     matched_text=text[:4096],
+                    match_fingerprint=compute_match_fingerprint("TP2", text),
                     explanation=(
                         "Confusable Unicode characters (e.g., Cyrillic or Greek lookalikes of Latin letters) "
                         "can make a malicious tool name appear identical to a trusted one."
@@ -572,6 +583,7 @@ def _check_tp2(
                 category=_CATEGORY,
                 tags=list(_FRAMEWORK_TAGS),
                 matched_text=text[:100],
+                match_fingerprint=compute_match_fingerprint("TP2", text),
                 explanation=(
                     "RTL override characters (U+202E, U+202D, U+2066-U+2069) can reverse text "
                     "rendering to make malicious content appear benign."
@@ -602,6 +614,7 @@ def _check_tp2(
                     category=_CATEGORY,
                     tags=list(_FRAMEWORK_TAGS),
                     matched_text=text[:4096],
+                    match_fingerprint=compute_match_fingerprint("TP2", text),
                     explanation=(
                         "Invisible Unicode formatting characters (soft hyphen U+00AD, CGJ U+034F, "
                         "word joiner U+2060) inserted into identifiers create visually identical "
@@ -643,6 +656,7 @@ def _check_tp2(
                     category=_CATEGORY,
                     tags=list(_FRAMEWORK_TAGS),
                     matched_text=text[:4096],
+                    match_fingerprint=compute_match_fingerprint("TP2", text),
                     explanation=(
                         "Mixing characters from multiple Unicode scripts in a single identifier "
                         "is a common technique to create visually ambiguous tool names."
@@ -824,7 +838,8 @@ def _check_tp3(
             malicious_url = _TP3_MALICIOUS_URL_RE.search(default_str)
             shell_cmd = _TP3_SHELL_CMD_RE.search(default_str)
             if malicious_url or shell_cmd:
-                matched = (malicious_url or shell_cmd).group()  # type: ignore[union-attr]
+                complete_match = (malicious_url or shell_cmd).group()  # type: ignore[union-attr]
+                matched = complete_match[:4096]
                 findings.append(
                     Finding(
                         rule_id="TP3",
@@ -838,6 +853,7 @@ def _check_tp3(
                         category=_CATEGORY,
                         tags=list(_FRAMEWORK_TAGS),
                         matched_text=matched,
+                        match_fingerprint=compute_match_fingerprint("TP3", complete_match),
                         explanation=(
                             "Default parameter values containing URLs or shell commands may "
                             "trigger unintended network requests or command execution when used "

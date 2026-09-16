@@ -34,6 +34,11 @@ MAX_FILE_BYTES = 1_000_000
 # Static analysis supports complete per-artifact coverage through 16 MiB. Larger
 # files are read only to this bound and are reported as partial, never complete.
 MAX_ANALYZABLE_FILE_BYTES = 16 * 1024 * 1024
+# Truncated files must still reach the LLM stage: excluding them entirely lets
+# a payload hide past the read cap while the scan reports zero findings.  The
+# LLM view of a truncated file is bounded to this prefix so token cost stays
+# predictable, and an explicit marker records the unreviewed region.
+MAX_LLM_TRUNCATED_FILE_CHARS = 262_144
 
 # Default-model selection lives on each provider (see providers/<name>/provider.py
 # for ``DEFAULT_MODEL`` and ``SLOT_DEFAULTS``).  The active provider's

@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import ast
 import re
+from bisect import bisect_right
+from dataclasses import dataclass, field
 from typing import Any
 
-from skillspector.models import Finding
+from skillspector.models import Finding, Location
 from skillspector.python_ast import build_import_aliases
 
 # Keep the analyzer and runner fence walkers lexically aligned without sharing
@@ -30,6 +32,7 @@ MARKDOWN_FENCE_OPEN = re.compile(r"^[ ]{0,3}(`{3,}(?=[^`\r\n]*$)|~{3,})[^\r\n]*$
 MARKDOWN_FENCE_CLOSE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
 LOGICAL_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 LINE_BREAK_CHARS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+MAX_FINDING_CONTEXT_CHARS = 1_000
 
 
 def make_dummy_finding(analyzer_id: str) -> Finding:
@@ -84,20 +87,113 @@ def get_line_number(content: str, offset: int) -> int:
     return sum(1 for _ in LOGICAL_LINE_BREAK.finditer(content, 0, offset)) + 1
 
 
+def logical_line_starts(content: str) -> tuple[int, ...]:
+    """Return character offsets for every logical line start in *content*."""
+    return (0, *(separator.end() for separator in LOGICAL_LINE_BREAK.finditer(content)))
+
+
+@dataclass(frozen=True)
+class SourceLocationIndex:
+    """Map character offsets to public locations using one shared line index."""
+
+    content: str
+    file_path: str
+    line_starts: tuple[int, ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "line_starts",
+            logical_line_starts(self.content),
+        )
+
+    def line_and_column(self, offset: int) -> tuple[int, int]:
+        """Return a one-based line and zero-based character column."""
+        bounded = min(max(offset, 0), len(self.content))
+        line_index = max(0, bisect_right(self.line_starts, bounded) - 1)
+        return line_index + 1, bounded - self.line_starts[line_index]
+
+    def location(self, start_offset: int, end_offset: int) -> Location:
+        """Build an exact location with zero-based, end-exclusive columns."""
+        start_line, start_column = self.line_and_column(start_offset)
+        end_line, end_column = self.line_and_column(end_offset)
+        return Location(
+            file=self.file_path,
+            start_line=start_line,
+            end_line=end_line,
+            start_column=start_column,
+            end_column=end_column,
+        )
+
+
 def get_context(content: str, match_start: int, context_lines: int = 3) -> str:
     """Extract surrounding lines from *content* around the match at *match_start* (char offset)."""
     lines = content.splitlines()
     match_line = get_line_number(content, match_start) - 1
     start_line = max(0, match_line - context_lines)
     end_line = min(len(lines), match_line + context_lines + 1)
-    return "\n".join(lines[start_line:end_line])
+    selected_lines = lines[start_line:end_line]
+    if not selected_lines:
+        return ""
+    relative_line = min(match_line - start_line, len(selected_lines) - 1)
+    line_start = content.rfind("\n", 0, match_start) + 1
+    column = min(max(0, match_start - line_start), len(selected_lines[relative_line]))
+    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line]) + column
+    return _bounded_context("\n".join(selected_lines), anchor)
 
 
-def get_context_from_lines(lines: list[str], lineno: int, window: int = 3) -> str:
-    """Extract surrounding lines given pre-split *lines* and a 1-based *lineno*."""
+def get_context_from_lines(
+    lines: list[str],
+    lineno: int,
+    window: int = 3,
+    *,
+    column: int = 0,
+) -> str:
+    """Extract bounded context around a 1-based line and character column."""
     start = max(0, lineno - 1 - window)
     end = min(len(lines), lineno + window)
-    return "\n".join(lines[start:end])
+    selected_lines = lines[start:end]
+    if not selected_lines:
+        return ""
+    relative_line = min(max(0, lineno - 1 - start), len(selected_lines) - 1)
+    bounded_column = min(max(0, column), len(selected_lines[relative_line]))
+    anchor = sum(len(line) + 1 for line in selected_lines[:relative_line]) + bounded_column
+    context_length = sum(len(line) for line in selected_lines) + len(selected_lines) - 1
+    if context_length <= MAX_FINDING_CONTEXT_CHARS:
+        return "\n".join(selected_lines)
+
+    half_window = MAX_FINDING_CONTEXT_CHARS // 2
+    slice_start = min(
+        max(0, anchor - half_window),
+        context_length - MAX_FINDING_CONTEXT_CHARS,
+    )
+    slice_end = slice_start + MAX_FINDING_CONTEXT_CHARS
+    pieces: list[str] = []
+    offset = 0
+    for index, line in enumerate(selected_lines):
+        line_end = offset + len(line)
+        overlap_start = max(slice_start, offset)
+        overlap_end = min(slice_end, line_end)
+        if overlap_start < overlap_end:
+            pieces.append(line[overlap_start - offset : overlap_end - offset])
+        if index + 1 < len(selected_lines) and slice_start <= line_end < slice_end:
+            pieces.append("\n")
+        offset = line_end + 1
+        if offset >= slice_end:
+            break
+    return "".join(pieces)
+
+
+def _bounded_context(context: str, anchor: int) -> str:
+    """Return a bounded context window that retains the finding anchor."""
+    if len(context) <= MAX_FINDING_CONTEXT_CHARS:
+        return context
+    half_window = MAX_FINDING_CONTEXT_CHARS // 2
+    start = min(
+        max(0, anchor - half_window),
+        len(context) - MAX_FINDING_CONTEXT_CHARS,
+    )
+    return context[start : start + MAX_FINDING_CONTEXT_CHARS]
 
 
 def resolve_dotted_name(node: ast.expr) -> str | None:
@@ -295,8 +391,13 @@ def resolve_call_name_typed(
     return plain
 
 
-def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
-    """Extract the source text for a given line range, truncated to 200 chars."""
+def get_complete_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
+    """Extract the complete source text for a given line range."""
     start = max(0, lineno - 1)
     end = end_lineno or lineno
-    return "\n".join(lines[start:end])[:200]
+    return "\n".join(lines[start:end])
+
+
+def get_source_segment(lines: list[str], lineno: int, end_lineno: int | None) -> str:
+    """Extract a 200-character source preview for a given line range."""
+    return get_complete_source_segment(lines, lineno, end_lineno)[:200]
