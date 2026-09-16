@@ -28,6 +28,7 @@ import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -37,6 +38,7 @@ import typer
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.text import Text
 from rich.tree import Tree
 
 from skillspector import __version__, transitive
@@ -107,6 +109,8 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
+_PROGRESS_TREE_MAX_PATHS = 200
+_PROGRESS_TREE_MAX_NODES = 1_000
 _TRANSITIVE_MAX_TARGETS = 32
 _TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
 _TRANSITIVE_MAX_SECONDS = MAX_WORKFLOW_SECONDS
@@ -1276,6 +1280,72 @@ def _cache_transitive_result(
     )
 
 
+def _visible_terminal_text(value: str) -> str:
+    """Render untrusted path text without passing terminal control characters."""
+    visible: list[str] = []
+    for character in value:
+        if character.isprintable():
+            visible.append(character)
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0xFF:
+            visible.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            visible.append(f"\\u{codepoint:04x}")
+        else:
+            visible.append(f"\\U{codepoint:08x}")
+    return "".join(visible)
+
+
+def _discovered_files_tree(paths: list[str]) -> Tree:
+    """Build a literal, control-safe tree for paths from an untrusted bundle."""
+    tree = Tree(Text("Discovered Files to Scan", style="bold blue"))
+    nodes = {"": tree}
+    ordered_paths = sorted(dict.fromkeys(paths))
+    displayed_paths = 0
+    node_count = 1
+    for path in ordered_paths[:_PROGRESS_TREE_MAX_PATHS]:
+        parts = Path(path).parts
+        current = ""
+        path_complete = True
+        for index, part in enumerate(parts):
+            parent = current
+            current = f"{current}/{part}" if current else part
+            if current in nodes:
+                continue
+            if node_count >= _PROGRESS_TREE_MAX_NODES:
+                path_complete = False
+                break
+            is_file = index == len(parts) - 1
+            icon = "📄 " if is_file else "📁 "
+            style = "green" if is_file else "cyan"
+            label = Text(f"{icon}{_visible_terminal_text(part)}", style=style)
+            nodes[current] = nodes[parent].add(label)
+            node_count += 1
+        if not path_complete:
+            break
+        displayed_paths += 1
+
+    omitted_paths = len(ordered_paths) - displayed_paths
+    if omitted_paths:
+        noun = "path" if omitted_paths == 1 else "paths"
+        tree.add(
+            Text(
+                f"… {omitted_paths} additional {noun} omitted",
+                style="dim yellow",
+            )
+        )
+    return tree
+
+
+def _wired_analyzer_node_ids() -> frozenset[str]:
+    """Return only analyzers present in the compiled graph."""
+    graph_nodes = getattr(graph, "nodes", {})
+    if not isinstance(graph_nodes, dict):
+        return frozenset(ANALYZER_NODE_IDS)
+    return frozenset(node_id for node_id in ANALYZER_NODE_IDS if node_id in graph_nodes)
+
+
 def _run_graph_scan(
     input_path: str,
     format: FormatChoice,
@@ -1305,7 +1375,8 @@ def _run_graph_scan(
     if not stream_progress:
         return cast(dict[str, object], graph.invoke(state, config=trace_config))
 
-    total_analyzers = len(ANALYZER_NODE_IDS)
+    analyzer_node_ids = _wired_analyzer_node_ids()
+    total_analyzers = len(analyzer_node_ids)
     total_steps = 5 + total_analyzers
     result = dict(state)
 
@@ -1354,30 +1425,13 @@ def _run_graph_scan(
                     progress.update(
                         task_id,
                         description=(
-                            f"Analyzing {num_files} files "
-                            f"(0/{total_analyzers} rules applied)..."
+                            f"Analyzing {num_files} files (0/{total_analyzers} rules applied)..."
                         ),
                     )
 
-                    tree = Tree("[bold blue]Discovered Files to Scan[/bold blue]")
-                    nodes = {"": tree}
-                    for path in paths:
-                        parts = Path(path).parts
-                        current = ""
-                        for part in parts:
-                            parent = current
-                            current = f"{current}/{part}" if current else part
-                            if current not in nodes:
-                                is_file = current == path
-                                icon = "📄 " if is_file else "📁 "
-                                style = "green" if is_file else "cyan"
-                                nodes[current] = nodes[parent].add(
-                                    f"[{style}]{icon}{part}[/{style}]"
-                                )
-
-                    err_console.print(tree)
+                    err_console.print(_discovered_files_tree(paths))
                     err_console.print()
-                elif node_name in ANALYZER_NODE_IDS:
+                elif node_name in analyzer_node_ids:
                     analyzers_done += 1
                     progress.update(
                         task_id,
@@ -1409,9 +1463,12 @@ def _run_graph_scan_for_source(
     stream_progress: bool = False,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
+    run_graph_scan = (
+        partial(_run_graph_scan, stream_progress=True) if stream_progress else _run_graph_scan
+    )
     if initial_inspection_ledger is not None:
         if source_local_only:
-            return _run_graph_scan(
+            return run_graph_scan(
                 input_path=input_path,
                 format=format,
                 no_llm=no_llm,
@@ -1421,9 +1478,8 @@ def _run_graph_scan_for_source(
                 transitive_traversal=transitive_traversal,
                 initial_inspection_ledger=initial_inspection_ledger,
                 source_local_only=True,
-                stream_progress=stream_progress,
             )
-        return _run_graph_scan(
+        return run_graph_scan(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1432,10 +1488,9 @@ def _run_graph_scan_for_source(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             initial_inspection_ledger=initial_inspection_ledger,
-            stream_progress=stream_progress,
         )
     if source_local_only:
-        return _run_graph_scan(
+        return run_graph_scan(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1444,9 +1499,8 @@ def _run_graph_scan_for_source(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             source_local_only=True,
-            stream_progress=stream_progress,
         )
-    return _run_graph_scan(
+    return run_graph_scan(
         input_path=input_path,
         format=format,
         no_llm=no_llm,
@@ -1454,7 +1508,6 @@ def _run_graph_scan_for_source(
         baseline=baseline,
         show_suppressed=show_suppressed,
         transitive_traversal=transitive_traversal,
-        stream_progress=stream_progress,
     )
 
 
@@ -2109,6 +2162,7 @@ def _scan_skill(
     )
     if transitive_enabled and transitive_traversal is None:
         transitive_traversal = _TransitiveTraversalState(cache=transitive_cache or {})
+    stream_progress = not verbose and err_console.is_terminal
     if pre_scan_ledger_events:
         result = _run_graph_scan_for_source(
             input_path=input_path,
@@ -2120,7 +2174,7 @@ def _scan_skill(
             transitive_traversal=transitive_traversal,
             initial_inspection_ledger=pre_scan_ledger_events,
             source_local_only=source_local_only,
-            stream_progress=not verbose,
+            stream_progress=stream_progress,
         )
     else:
         result = _run_graph_scan_for_source(
@@ -2132,7 +2186,7 @@ def _scan_skill(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             source_local_only=source_local_only,
-            stream_progress=not verbose,
+            stream_progress=stream_progress,
         )
     if not transitive_enabled:
         return result

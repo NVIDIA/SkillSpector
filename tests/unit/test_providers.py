@@ -325,6 +325,8 @@ class TestOpenAIProvider:
         provider = OpenAIProvider()
         assert provider.get_context_length("gpt-5.4") == 1_000_000
         assert provider.get_max_output_tokens("gpt-5.4") == 128_000
+        assert provider.get_context_length("gemini-3.5-flash") == 1_048_576
+        assert provider.get_max_output_tokens("gemini-3.5-flash") == 65_536
 
 
 class TestAnthropicProvider:

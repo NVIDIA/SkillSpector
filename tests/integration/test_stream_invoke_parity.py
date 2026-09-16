@@ -13,16 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Parity test: non-verbose (stream) and verbose (invoke) paths must produce the same CLI-consumed keys.
+"""Parity test for the interactive stream and direct invoke graph paths.
 
 The CLI ``scan`` command has two code paths:
   - ``--verbose``: uses ``graph.invoke()`` → returns full final state.
-  - default (non-verbose): uses ``graph.stream()`` and manually accumulates a
-    subset of keys into a ``result`` dict.
+  - interactive default: uses ``graph.stream()`` for progress and returns the
+    final ``values`` state.
 
-If the streaming accumulation loop drifts (e.g. a new key is consumed downstream
-but never accumulated), the non-verbose path silently produces wrong output.
-This test guards against that.
+The stream path must preserve the complete state because the CLI and transitive
+scanner consume much more than the rendered report.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from skillspector.graph import graph
+from skillspector.cli import FormatChoice, _run_graph_scan
 
 # Keys the CLI reads from the result dict *after* the graph run.
 # Derived from cli.py: _write_result, _cleanup_result, exit-code check.
@@ -42,24 +41,13 @@ _CLI_CONSUMED_KEYS = frozenset(
         "sarif_report",
         "risk_score",
         "temp_dir_for_cleanup",
+        "execution_successful",
+        "analysis_completeness",
+        "findings",
+        "filtered_findings",
+        "effective_finding_ids",
     }
 )
-
-
-def _stream_result(state: dict) -> dict:
-    """Simulate the non-verbose streaming accumulation from cli.py."""
-    result: dict = dict(state)
-    for update in graph.stream(state, stream_mode="updates"):
-        for _node_name, node_output in update.items():
-            if "temp_dir_for_cleanup" in node_output:
-                result["temp_dir_for_cleanup"] = node_output["temp_dir_for_cleanup"]
-            if "report_body" in node_output:
-                result["report_body"] = node_output["report_body"]
-            if "sarif_report" in node_output:
-                result["sarif_report"] = node_output["sarif_report"]
-            if "risk_score" in node_output:
-                result["risk_score"] = node_output["risk_score"]
-    return result
 
 
 @pytest.mark.integration
@@ -68,33 +56,29 @@ def test_stream_and_invoke_produce_same_cli_keys(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: parity-test\n---\n# Safe skill\n", encoding="utf-8"
     )
-    state: dict = {
-        "skill_path": str(tmp_path),
-        "output_format": "json",
-        "use_llm": False,
-    }
+    invoke_result = _run_graph_scan(
+        input_path=str(tmp_path),
+        format=FormatChoice.json,
+        no_llm=True,
+    )
+    stream_result = _run_graph_scan(
+        input_path=str(tmp_path),
+        format=FormatChoice.json,
+        no_llm=True,
+        stream_progress=True,
+    )
 
-    invoke_result = graph.invoke(dict(state))
-    stream_result = _stream_result(dict(state))
+    assert set(stream_result) == set(invoke_result)
 
     # Every key the CLI consumes must be present in *both* results.
     for key in _CLI_CONSUMED_KEYS:
         assert key in invoke_result, f"invoke result missing CLI key: {key}"
         assert key in stream_result, f"stream result missing CLI key: {key}"
 
-    # The actual *values* of the CLI-consumed keys should match (structurally).
-    # For report_body we compare parsed JSON keys because timestamps differ
-    # between separate runs.
-    for key in _CLI_CONSUMED_KEYS:
-        inv = invoke_result.get(key)
-        stm = stream_result.get(key)
-        if key == "report_body":
-            # Both should parse to JSON with the same top-level keys
-            inv_parsed = json.loads(inv)
-            stm_parsed = json.loads(stm)
-            assert set(inv_parsed.keys()) == set(stm_parsed.keys()), (
-                f"report_body top-level keys differ: "
-                f"invoke={set(inv_parsed.keys())}, stream={set(stm_parsed.keys())}"
-            )
-        else:
-            assert inv == stm, f"value mismatch for CLI key {key!r}: invoke={inv!r}, stream={stm!r}"
+    # Reports carry per-run timestamps, so compare their public structure.
+    invoke_report = json.loads(invoke_result["report_body"])
+    stream_report = json.loads(stream_result["report_body"])
+    assert set(invoke_report) == set(stream_report)
+
+    for key in ("risk_score", "sarif_report", "temp_dir_for_cleanup", "execution_successful"):
+        assert invoke_result.get(key) == stream_result.get(key)

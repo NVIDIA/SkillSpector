@@ -23,6 +23,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from importlib import import_module
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -31,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from rich.console import Console
 from typer.testing import CliRunner
 
 from skillspector import __version__, cli, transitive
@@ -90,6 +92,119 @@ def test_cli_version() -> None:
     assert result.exit_code == 0
     assert "SkillSpector" in result.output
     assert "v" in result.output
+
+
+def test_discovered_files_tree_renders_untrusted_names_literally() -> None:
+    """File names cannot inject Rich markup or terminal control sequences."""
+    malicious_name = "\x1b]52;c;SGVsbG8=\x1b\\[conceal]hidden.py"
+    nested_path = str(Path("folder") / malicious_name)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree([nested_path]))
+
+    rendered = output.getvalue()
+    assert "\x1b]52" not in rendered
+    assert "\\x1b]52;c;SGVsbG8=\\x1b\\[conceal]hidden.py" in rendered
+    assert "📁 folder" in rendered
+    assert "📄 " in rendered
+
+
+def test_discovered_files_tree_bounds_untrusted_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "_PROGRESS_TREE_MAX_PATHS", 1)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree(["a.py", "b.py"]))
+
+    rendered = output.getvalue()
+    assert "a.py" in rendered
+    assert "b.py" not in rendered
+    assert "1 additional path omitted" in rendered
+
+
+def test_progress_counts_only_analyzers_wired_into_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "ANALYZER_NODE_IDS", ["wired", "unavailable"])
+    monkeypatch.setattr(cli, "graph", SimpleNamespace(nodes={"wired": object()}))
+
+    assert cli._wired_analyzer_node_ids() == frozenset({"wired"})
+
+
+def test_stream_progress_returns_complete_values_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_state = {
+        "report_body": "{}",
+        "analysis_completeness": {"is_complete": True},
+        "filtered_findings": [],
+        "inspection_ledger": [{"phase": "complete"}],
+        "provider_cache": {"preserved": True},
+    }
+
+    def fake_stream(
+        state: dict[str, object],
+        config: object,
+        stream_mode: list[str],
+    ) -> Iterator[tuple[str, dict[str, object]]]:
+        del state, config
+        assert stream_mode == ["updates", "values"]
+        yield "updates", {"build_context": {"components": []}}
+        yield "values", final_state
+
+    monkeypatch.setattr(
+        cli,
+        "graph",
+        SimpleNamespace(nodes={}, stream=fake_stream),
+    )
+
+    result = cli._run_graph_scan(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        stream_progress=True,
+    )
+
+    assert result == final_state
+
+
+@pytest.mark.parametrize(
+    ("terminal", "verbose", "expected"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_scan_streams_only_for_interactive_default(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: bool,
+    verbose: bool,
+    expected: bool,
+) -> None:
+    calls: list[bool] = []
+
+    def fake_run_graph_scan_for_source(**kwargs: object) -> dict[str, object]:
+        calls.append(bool(kwargs["stream_progress"]))
+        return {"risk_score": 0}
+
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", fake_run_graph_scan_for_source)
+    monkeypatch.setattr(cli.err_console, "_force_terminal", terminal)
+
+    cli._scan_skill(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        baseline=None,
+        yara_rules_dir=None,
+        verbose=verbose,
+        show_suppressed=False,
+        transitive_enabled=False,
+        transitive_depth=1,
+        transitive_allow_prefix=None,
+        transitive_deny_prefix=None,
+    )
+
+    assert calls == [expected]
 
 
 def test_cli_scan_help_lists_every_available_provider() -> None:
