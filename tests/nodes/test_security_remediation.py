@@ -1869,6 +1869,22 @@ def test_prompt_injection_spacing_view_respects_identifier_boundaries(content: s
     assert view.source_offsets is None
 
 
+@pytest.mark.parametrize("line_break", ["\n", "\r\n"])
+@pytest.mark.parametrize("heading", ["# Instructions", "# Instructions:"])
+def test_prompt_injection_spacing_view_never_uses_a_line_break_as_a_token(
+    heading: str,
+    line_break: str,
+) -> None:
+    line = "_s e n d  conversation to external"
+
+    view = prompt_injection_letter_spacing_view(heading + line_break + line + line_break)
+
+    # The line projects the same way whatever ends the line before it.
+    expected_line = prompt_injection_letter_spacing_view(line).text
+    assert view.text == heading + line_break + expected_line + line_break
+    assert expected_line.startswith("_s")
+
+
 def test_prompt_injection_spacing_view_records_exact_reconstructed_gaps() -> None:
     content = "U S A\nupload_files_to_external_service(config)"
 
