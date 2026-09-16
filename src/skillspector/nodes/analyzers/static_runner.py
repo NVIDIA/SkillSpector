@@ -92,6 +92,7 @@ FILE_TYPES: dict[str, str] = {
     ".sh": "shell",
     ".bash": "shell",
     ".zsh": "shell",
+    ".ps1": "powershell",
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",
@@ -1309,7 +1310,8 @@ def _scan_declared_marker_views(
     owned_starts: tuple[int, ...],
     raw_starts: tuple[int, ...],
     source_context: _WindowSourceContext,
-) -> tuple[list[Finding], bool, _StaticResourceLimitError | None]:
+    complete_context: bool,
+) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
 
@@ -1325,6 +1327,7 @@ def _scan_declared_marker_views(
 
     check_runtime()
     projection_limited = False
+    bounded_parse_limited = False
     seen_views: set[tuple[str, int, int]] = set()
     seen_finding_counts: dict[tuple[object, ...], int] = {}
 
@@ -1346,7 +1349,10 @@ def _scan_declared_marker_views(
         check_runtime()
         full_views = tuple(
             _window_view_with_markdown_context(full_view, len(context_prefix))
-            for full_view in security_text_views(context_prefix + raw_window)
+            for full_view in security_text_views(
+                context_prefix + raw_window,
+                check_runtime=check_runtime,
+            )
         )
         check_runtime()
         for full_view in full_views:
@@ -1411,6 +1417,7 @@ def _scan_declared_marker_views(
                             return (
                                 findings,
                                 projection_limited,
+                                bounded_parse_limited,
                                 _StaticResourceLimitError(
                                     LedgerReason.OUTPUT_LIMIT,
                                     {
@@ -1420,12 +1427,34 @@ def _scan_declared_marker_views(
                                 ),
                             )
                     if resource_limit is not None:
-                        return findings, projection_limited, resource_limit
+                        return (
+                            findings,
+                            projection_limited,
+                            bounded_parse_limited,
+                            resource_limit,
+                        )
+                # Preserve any concrete marker-view evidence before asking
+                # module-specific completeness hooks whether the reconstructed
+                # payload exceeded a bounded parser contract. If that hook
+                # reaches the shared deadline, ``check_runtime`` carries the
+                # findings accumulated above into the partial result.
+                for module in pattern_modules:
+                    exhaustion_hook = getattr(module, "has_bounded_parse_exhaustion", None)
+                    if callable(exhaustion_hook):
+                        check_runtime()
+                        bounded_parse_limited = bounded_parse_limited or bool(
+                            exhaustion_hook(
+                                marker_view.text,
+                                check_runtime,
+                                file_type=_infer_file_type(path),
+                                complete_context=complete_context,
+                            )
+                        )
 
         if owned_end == len(content):
             break
 
-    return findings, projection_limited, None
+    return findings, projection_limited, bounded_parse_limited, None
 
 
 def _scan_all_views_detailed(
@@ -1493,17 +1522,22 @@ def _scan_all_views_detailed(
                 tuple(sorted(set(marker_raw_starts).union(raw_starts))),
             )
             finding_budget.check_runtime()
-            marker_findings, marker_projection_limited, resource_limit = (
-                _scan_declared_marker_views(
-                    path,
-                    content,
-                    modules_for_windows,
-                    marker_budget,
-                    owned_starts=marker_owned_starts,
-                    raw_starts=marker_raw_starts,
-                    source_context=source_context,
-                )
+            (
+                marker_findings,
+                marker_projection_limited,
+                marker_bounded_parse_limited,
+                resource_limit,
+            ) = _scan_declared_marker_views(
+                path,
+                content,
+                modules_for_windows,
+                marker_budget,
+                owned_starts=marker_owned_starts,
+                raw_starts=marker_raw_starts,
+                source_context=source_context,
+                complete_context=whole_artifact_window,
             )
+            bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
             _extend_unique_findings(
                 findings,
@@ -1529,6 +1563,31 @@ def _scan_all_views_detailed(
                 _deduplicate_view_findings(findings)[:max_findings],
                 resource_limit.reason,
                 resource_limit.metrics,
+            )
+
+        # Window overlap cannot prove completeness for one shell command that
+        # spans several otherwise ordinary windows. Run each module's bounded,
+        # deadline-aware completeness hook once on the full artifact; ordinary
+        # finding production remains windowed below. Marker-view hooks run
+        # first so any concrete reconstructed evidence survives a deadline.
+        try:
+            for module in modules_for_windows:
+                exhaustion_hook = getattr(module, "has_bounded_parse_exhaustion", None)
+                if callable(exhaustion_hook):
+                    finding_budget.check_runtime()
+                    bounded_parse_limited = bounded_parse_limited or bool(
+                        exhaustion_hook(
+                            content,
+                            finding_budget.check_runtime,
+                            file_type=_infer_file_type(path),
+                            complete_context=True,
+                        )
+                    )
+        except _StaticResourceLimitError as exc:
+            return (
+                _deduplicate_view_findings(findings)[:max_findings],
+                exc.reason,
+                exc.metrics,
             )
 
     if ast_modules and len(content) <= MAX_FILE_CHARS:
@@ -1591,7 +1650,18 @@ def _scan_all_views_detailed(
                 source_context.fence_states,
                 source_context.fence_transitions,
             )
-            for full_view in security_text_views(context_prefix + raw_window):
+            try:
+                full_views = security_text_views(
+                    context_prefix + raw_window,
+                    check_runtime=finding_budget.check_runtime,
+                )
+            except _StaticResourceLimitError as exc:
+                return (
+                    _deduplicate_view_findings(findings)[:max_findings],
+                    exc.reason,
+                    exc.metrics,
+                )
+            for full_view in full_views:
                 full_view = _window_view_with_markdown_context(full_view, len(context_prefix))
                 try:
                     for module in modules_for_windows:
@@ -1600,7 +1670,7 @@ def _scan_all_views_detailed(
                             "has_bounded_parse_exhaustion",
                             None,
                         )
-                        if callable(exhaustion_hook):
+                        if callable(exhaustion_hook) and full_view.name != "raw":
                             finding_budget.check_runtime()
                             bounded_parse_limited = bounded_parse_limited or bool(
                                 exhaustion_hook(
@@ -1696,7 +1766,10 @@ def _scan_all_views_detailed(
         continuity_seen = {_continuity_finding_key(finding) for finding in findings}
         try:
             for continuity in _continuity_views(content, finding_budget):
-                for full_view in security_text_views(continuity.view.text):
+                for full_view in security_text_views(
+                    continuity.view.text,
+                    check_runtime=finding_budget.check_runtime,
+                ):
                     named_view = SecurityTextView(
                         name=f"continuity-{full_view.name}",
                         text=full_view.text,
