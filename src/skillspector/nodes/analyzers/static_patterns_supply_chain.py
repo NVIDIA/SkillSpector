@@ -1192,6 +1192,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         tags=tag,
                         context=ctx(match.start()),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
     for pattern, confidence in SC2_PATTERNS:
@@ -1214,6 +1215,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=mt[:200],
+                    complete_match=mt,
                 )
             )
     if file_type in ("python", "javascript", "shell", "other"):
@@ -1230,6 +1232,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         tags=tag,
                         context=ctx(match.start()),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
     # SC7: untrusted container image. Example filtering is delegated to the runner.
@@ -1246,6 +1249,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings
