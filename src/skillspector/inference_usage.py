@@ -119,6 +119,7 @@ def provider_name(provider: object) -> str:
         "NvBuildProvider": "nv_build",
         "NvInferenceProvider": "nv_inference",
         "OpenAIProvider": "openai",
+        "OpencodeCLIProvider": "opencode_cli",
     }
     return names.get(type(provider).__name__, _label(type(provider).__name__.lower()))
 

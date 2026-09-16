@@ -2157,10 +2157,9 @@ def _scan_shipped_bytecode(
 def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
     """Emit SC8 when a skill ships __pycache__ dirs or .pyc/.pyo files.
 
-    ``build_context`` excludes ``__pycache__`` from inventory and
-    ``static_runner`` treats ``.pyc`` as binary, so malicious bytecode can
-    otherwise score SAFE. Presence alone is a HIGH supply-chain signal;
-    full disassembly can come later.
+    ``build_context`` keeps bytecode out of content analysis and
+    ``static_runner`` treats ``.pyc`` as binary. Presence alone is a HIGH
+    supply-chain signal; full disassembly can come later.
     """
     return _scan_shipped_bytecode(skill_path).findings
 
@@ -2168,10 +2167,13 @@ def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
 def _analyze_concealed_executables(
     component_metadata: list[dict[str, object]],
 ) -> list[Finding]:
-    """Emit SC9 for executable content concealed in a local-only artifact."""
+    """Emit SC9 for concealed executables or incomplete excluded-artifact inspection."""
     findings: list[Finding] = []
     for metadata in component_metadata:
-        if not metadata.get("concealed_executable"):
+        if metadata.get("allowed_exclusion") is True:
+            continue
+        inspection_incomplete = metadata.get("excluded_inspection_incomplete") is True
+        if not metadata.get("concealed_executable") and not inspection_incomplete:
             continue
         path = str(metadata.get("path", ""))
         if not path:
@@ -2193,11 +2195,22 @@ def _analyze_concealed_executables(
             else:
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
+        excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        referenced_uninspected = (
+            metadata.get("inspection_limitation_reason")
+            == LedgerReason.REFERENCED_UNINSPECTED.value
+        )
         findings.append(
             Finding(
                 rule_id="SC9",
                 message=(
-                    "Executable content is concealed inside a document, hidden, "
+                    "A referenced excluded artifact was not inspected."
+                    if referenced_uninspected
+                    else "An excluded artifact could not be completely inspected."
+                    if inspection_incomplete
+                    else "Executable content is excluded from analysis."
+                    if excluded_from_analysis
+                    else "Executable content is concealed inside a document, hidden, "
                     "or disguised artifact."
                 ),
                 severity="HIGH",
@@ -2205,19 +2218,41 @@ def _analyze_concealed_executables(
                 file=path,
                 start_line=1,
                 category="Supply Chain",
-                pattern="Concealed Executable Artifact",
+                pattern=(
+                    "Referenced Excluded Artifact Uninspected"
+                    if referenced_uninspected
+                    else "Excluded Artifact Inspection Incomplete"
+                    if inspection_incomplete
+                    else "Concealed Executable Artifact"
+                ),
                 finding=nested_path,
                 explanation=(
-                    "An executable nested in a document or hidden/disguised artifact can "
+                    "SKILL.md references an artifact whose content remains outside "
+                    "deterministic analyzer coverage."
+                    if referenced_uninspected
+                    else "A resource, read, or archive-safety limit left excluded content "
+                    "outside deterministic inspection coverage."
+                    if inspection_incomplete
+                    else "An executable artifact remains available under the skill install path "
+                    "but its content is outside analyzer coverage."
+                    if excluded_from_analysis
+                    else "An executable nested in a document or hidden/disguised artifact can "
                     "evade ordinary extension-based review while still being available to "
                     "the skill at runtime."
                 ),
                 remediation=(
-                    "Review the artifact provenance and the reason executable content is "
+                    "Move directly referenced runtime artifacts into normal analyzer scope "
+                    "or remove the reference."
+                    if referenced_uninspected
+                    else "Review the artifact provenance and the reason executable content is "
                     "packaged in this location; keep executable files explicit and directly "
                     "reviewable."
                 ),
-                tags=["supply-chain", "concealed-executable", "local-only"],
+                tags=[
+                    "supply-chain",
+                    "referenced-artifact" if referenced_uninspected else "concealed-executable",
+                    "local-only",
+                ],
                 matched_text=path,
                 evidence={
                     "outer_path": outer_path,
@@ -2228,6 +2263,11 @@ def _analyze_concealed_executables(
                     "concealment": concealment,
                     "concealment_reasons": concealment_reasons,
                     "local_only": True,
+                    "referenced": metadata.get("referenced") is True,
+                    "excluded_from_analysis": excluded_from_analysis,
+                    "excluded_inspection_incomplete": inspection_incomplete,
+                    "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),
+                    "inspection_limitation_reason": metadata.get("inspection_limitation_reason"),
                 },
             )
         )
