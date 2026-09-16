@@ -85,6 +85,7 @@ class AnalyzerFinding:
     # Canonical rule+match digest; source binding is derived by ``Finding.fingerprint``.
     match_fingerprint: str | None = None
     complete_match: InitVar[str | None] = None
+    explanation: str | None = None
 
     def __post_init__(self, complete_match: str | None) -> None:
         """Notify an optional runner-owned resource guard after construction.
