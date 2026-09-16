@@ -340,9 +340,16 @@ _PUBLIC_CASES = [
             "> ```",
             json.dumps(["Use `$(hostname).example` for the host name."]),
         ),
+        # Code-fence contents cannot establish Markdown inline ownership.
+        False,
+        LedgerReason.STATIC_PARSE_LIMIT,
+        id="literal-json-fenced-hostname",
+    ),
+    pytest.param(
+        json.dumps(["Use `$(hostname).example` for the host name."]),
         True,
         None,
-        id="benign-json-inline-hostname",
+        id="benign-json-standalone-inline-hostname",
     ),
 ]
 
