@@ -211,6 +211,28 @@ def _is_private_ip(host: str) -> bool:
     return False
 
 
+def _raw_file_url(url: str) -> str:
+    """Point a GitHub or GitLab ``/blob/`` file page at the file's raw bytes.
+
+    Those pages are HTML viewers, so downloading one scans the forge's page
+    markup instead of the file. Every other URL is returned unchanged.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    segments = parsed.path.split("/")
+    # /<owner>/<repo>/blob/<ref>/<path> -> raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>
+    if host == "github.com" and len(segments) > 5 and segments[3] == "blob":
+        raw_path = "/".join(segments[:3] + segments[4:])
+        return parsed._replace(netloc="raw.githubusercontent.com", path=raw_path).geturl()
+    # /<namespace>/<project>/-/blob/<ref>/<path> -> /<namespace>/<project>/-/raw/<ref>/<path>
+    if host == "gitlab.com" and "-" in segments[3:]:
+        marker = segments.index("-", 3)
+        if marker + 3 < len(segments) and segments[marker + 1] == "blob":
+            segments[marker + 1] = "raw"
+            return parsed._replace(path="/".join(segments)).geturl()
+    return url
+
+
 def _root_owned_root_alias(path: Path) -> Path | None:
     """Return a root-owned symlink directly below ``/``, if *path* is one."""
     absolute_path = Path(os.path.abspath(path))
@@ -1138,6 +1160,7 @@ class InputHandler:
         partial file produced by a mid-stream breach is removed before
         the exception propagates.
         """
+        url = _raw_file_url(url)
         if self._transitive_budget is not None:
             return self._download_transitive_file(url)
         self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)
