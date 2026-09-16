@@ -1396,10 +1396,11 @@ def test_scan_multi_skill_json_stdout_survives_child_failure(
     assert "Error: boom" in captured.err
 
 
-def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_recursive_single_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, output_format: str
 ) -> None:
-    """Recursive fallback advisories stay off stdout when JSON is requested."""
+    """Recursive fallback advisories stay off stdout when JSON or SARIF is requested."""
     monkeypatch.setattr(
         cli,
         "detect_skills",
@@ -1420,7 +1421,7 @@ def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
 
     result = runner.invoke(
         app,
-        ["scan", str(tmp_path), "--recursive", "--format", "json", "--no-llm"],
+        ["scan", str(tmp_path), "--recursive", "--format", output_format, "--no-llm"],
     )
 
     assert result.exit_code == 0, result.output
@@ -1429,10 +1430,11 @@ def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
     assert "Scanning as single" in result.stderr
 
 
-def test_json_multi_skill_advisory_does_not_pollute_stdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_multi_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, output_format: str
 ) -> None:
-    """The non-recursive multi-skill advisory stays off JSON stdout."""
+    """The non-recursive multi-skill advisory stays off JSON and SARIF stdout."""
     skills = [
         SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
         for name in ("one", "two")
@@ -1457,7 +1459,7 @@ def test_json_multi_skill_advisory_does_not_pollute_stdout(
 
     result = runner.invoke(
         app,
-        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+        ["scan", str(tmp_path), "--format", output_format, "--no-llm"],
     )
 
     assert result.exit_code == 0, result.output
@@ -1697,6 +1699,30 @@ def test_recursive_sarif_is_valid_and_carries_aggregate_completeness(
     assert aggregate_run["properties"]["kind"] == "recursiveAggregate"
     completeness = aggregate_run["invocations"][0]["properties"]["analysisCompleteness"]
     assert completeness["is_complete"] is True
+
+
+def test_recursive_sarif_without_output_writes_only_the_log_to_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Recursive SARIF without --output prints the log; status text goes to stderr."""
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two")]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    monkeypatch.setattr(
+        cli.graph,
+        "invoke",
+        lambda *_args, **_kwargs: _bounded_recursive_result("one"),
+    )
+
+    _scan_multi_skill(detection, FormatChoice.sarif, None, no_llm=True, verbose=True)
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    validate_sarif_report(payload)
+    assert payload["runs"][-1]["properties"]["kind"] == "recursiveAggregate"
+    assert "Scanning" not in captured.out
+    assert "Scanning" in captured.err
+    assert "Running scan" in captured.err
+    assert "Multi-Skill Summary" in captured.err
 
 
 def test_recursive_sarif_bounds_the_final_serialized_document(
@@ -2813,6 +2839,32 @@ def test_transitive_resolver_failure_preserves_direct_report(tmp_path: Path, mon
     data = json.loads(result.output)
     assert len(data["issues"]) == 1
     assert data["issues"][0]["id"] == "D1"
+
+
+def test_transitive_failure_warning_stays_off_sarif_stdout(tmp_path: Path, monkeypatch) -> None:
+    """A failed transitive child does not print its warning into the SARIF log."""
+    target = "https://github.com/org/broken.git"
+
+    def fake_run_graph_scan(input_path: str, format, no_llm: bool, **_kwargs) -> dict[str, object]:
+        if input_path == str(tmp_path):
+            return _mock_graph_result(
+                findings=[_finding("D1", "direct finding")],
+                file_cache={"SKILL.md": f"deps {target}"},
+                output_format=format.value,
+            )
+        raise ValueError("resolver failure")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "sarif", "--transitive", "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Transitive scan failed" not in result.stdout
+    payload = json.loads(result.stdout)
+    validate_sarif_report(payload)
+    assert [item["ruleId"] for item in payload["runs"][0]["results"]] == ["D1"]
 
 
 def test_scan_transitive_does_not_rescan_root_source(monkeypatch) -> None:

@@ -133,6 +133,10 @@ class FormatChoice(StrEnum):
     sarif = "sarif"
 
 
+# Reports that tools parse from stdout, so status text must go to stderr.
+_MACHINE_READABLE_FORMATS = frozenset({FormatChoice.json, FormatChoice.sarif})
+
+
 class TransportChoice(StrEnum):
     """Transport choices for the MCP server."""
 
@@ -658,7 +662,7 @@ def scan(
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
-            (err_console if format == FormatChoice.json else console).print(
+            (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
                 "detected. Scanning as single skill."
             )
@@ -671,7 +675,7 @@ def scan(
                 "with a bounded scan and reporting partial coverage."
             )
         if detection.is_multi_skill:
-            (err_console if format == FormatChoice.json else console).print(
+            (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
@@ -2018,7 +2022,7 @@ def _scan_transitive(
             except Exception:
                 transitive_sources.add(target)
                 traversal.note_child_scan_failure(target)
-                if format == FormatChoice.json:
+                if format in _MACHINE_READABLE_FORMATS:
                     logger.warning("Transitive scan failed for %s", target)
                 else:
                     console.print(f"[yellow]Warning:[/yellow] Transitive scan failed for {target}")
@@ -2150,7 +2154,7 @@ def _scan_skill(
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
     if verbose:
-        (err_console if format == FormatChoice.json else console).print(
+        (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
             "[dim]Running scan...[/dim]"
         )
     logger.debug(
@@ -2376,7 +2380,9 @@ def _scan_multi_skill(
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
-    status_console = err_console if format == FormatChoice.json and output is None else console
+    status_console = (
+        err_console if format in _MACHINE_READABLE_FORMATS and output is None else console
+    )
     status_console.print(
         f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n"
     )
@@ -2654,7 +2660,7 @@ def _scan_multi_skill(
             console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
             print(rendered)
-    elif output and format == FormatChoice.sarif:
+    elif format == FormatChoice.sarif:
         merged_sarif = _multi_skill_sarif_report(
             processed_skills,
             results,
@@ -2669,8 +2675,11 @@ def _scan_multi_skill(
             merged_sarif = _multi_skill_sarif_report([], [], aggregate_completeness)
             rendered = json.dumps(merged_sarif, indent=2)
         _ensure_recursive_output_bound(rendered)
-        Path(output).write_text(rendered, encoding="utf-8")
-        console.print(f"[green]Combined report saved to:[/green] {output}")
+        if output:
+            Path(output).write_text(rendered, encoding="utf-8")
+            console.print(f"[green]Combined report saved to:[/green] {output}")
+        else:
+            print(rendered)
     elif output:
         sections: list[str] = []
         for skill, result in zip(processed_skills, results, strict=True):
