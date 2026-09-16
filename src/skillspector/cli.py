@@ -503,6 +503,13 @@ def scan(
             help="Exit 1 when relevant analysis is partial or incomplete.",
         ),
     ] = False,
+    fail_on_findings: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-findings",
+            help="Exit 1 when the scan reports one or more active findings.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -580,6 +587,8 @@ def scan(
                 console.print(f"Report saved to: {output}")
             else:
                 print(report)
+            if fail_on_findings and result["findings"]:
+                raise typer.Exit(code=1)
             if result["risk_score"] > RISK_THRESHOLD:
                 raise typer.Exit(code=1)
         except typer.Exit:
@@ -637,6 +646,7 @@ def scan(
                 yara_dir=yara_dir,
                 verbose=verbose,
                 fail_on_incomplete=fail_on_incomplete,
+                fail_on_findings=fail_on_findings,
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
@@ -710,6 +720,8 @@ def scan(
             else True
         )
         if fail_on_incomplete and not is_complete:
+            raise typer.Exit(code=1)
+        if fail_on_findings and effective_findings(result):
             raise typer.Exit(code=1)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
@@ -2200,6 +2212,7 @@ def _scan_multi_skill(
     yara_dir: str | None = None,
     verbose: bool = False,
     fail_on_incomplete: bool = False,
+    fail_on_findings: bool = False,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
@@ -2225,6 +2238,7 @@ def _scan_multi_skill(
     transitive_finding_count = 0
     transitive_sources: set[str] = set()
     analysis_incomplete = not detection.complete
+    has_findings = False
     aggregate_limitations = [
         f"recursive discovery {limitation.resource} limit reached"
         for limitation in detection.limitations[:256]
@@ -2281,6 +2295,7 @@ def _scan_multi_skill(
             result_body = _result_body(result)
             result_characters = len(result_body)
             result_records = _multi_skill_public_record_count(result)
+            has_findings = has_findings or bool(effective_findings(result))
             if (
                 retained_public_records + result_records > _MULTI_SKILL_MAX_PUBLIC_RECORDS
                 or retained_report_characters + result_characters
@@ -2529,6 +2544,8 @@ def _scan_multi_skill(
     if execution_failed:
         raise typer.Exit(code=2)
     if fail_on_incomplete and analysis_incomplete:
+        raise typer.Exit(code=1)
+    if fail_on_findings and has_findings:
         raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
