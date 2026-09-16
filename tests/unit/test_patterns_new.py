@@ -1448,6 +1448,14 @@ class TestToolMisuse:
         [
             pytest.param("subprocess.run(cmd, shell=True)", "runner.py", "python", id="shell_true"),
             pytest.param("Popen(cmd, shell=True)", "runner.py", "python", id="popen_shell_true"),
+            pytest.param(
+                "command = 'python a.py'\n"
+                "use_shell = True\n"
+                "subprocess.run(command, shell=use_shell)",
+                "runner.py",
+                "python",
+                id="static_true_shell_variable",
+            ),
             pytest.param("rm -rf /", "cleanup.sh", "shell", id="rm_rf_root"),
             pytest.param("chmod 777 /tmp/secrets", "setup.sh", "shell", id="chmod_777"),
             pytest.param("git push --force", "deploy.sh", "shell", id="git_force_push"),
