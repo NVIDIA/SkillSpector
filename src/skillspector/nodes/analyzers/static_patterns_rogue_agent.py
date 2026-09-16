@@ -169,6 +169,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in RA2_PATTERNS:
@@ -184,6 +185,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings
