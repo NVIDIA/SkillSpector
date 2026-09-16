@@ -17,6 +17,11 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
+
+import pytest
+
 from skillspector.models import Finding
 from skillspector.nodes.deduplicate import deduplicate
 
@@ -52,6 +57,30 @@ class TestSameFileDedup:
         result = deduplicate(findings)
         assert len(result) == 1
 
+    def test_same_line_match_keeps_distinct_column_occurrences(self) -> None:
+        first = _finding(file="a.py", start_line=5)
+        first.end_line = 5
+        first.start_column = 2
+        first.end_column = 12
+        second = replace(first, start_column=20, end_column=30)
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 1
+        assert {
+            (occurrence["start_column"], occurrence["end_column"])
+            for occurrence in result[0].occurrences
+        } == {(2, 12), (20, 30)}
+
+    def test_precise_location_is_preferred_over_line_only_duplicate(self) -> None:
+        line_only = _finding(file="a.py", start_line=5)
+        precise = replace(line_only, start_column=2, end_column=12)
+
+        result = deduplicate([line_only, precise])
+
+        assert len(result) == 1
+        assert (result[0].start_column, result[0].end_column) == (2, 12)
+
     def test_keeps_highest_confidence(self) -> None:
         """When duplicates exist, the highest confidence one is kept."""
         findings = [
@@ -62,6 +91,59 @@ class TestSameFileDedup:
         result = deduplicate(findings)
         assert len(result) == 1
         assert result[0].confidence == 0.9
+
+    def test_different_severity_classifications_are_not_compacted(self) -> None:
+        """Exact matches with different risk classifications remain separate."""
+        critical = _finding(
+            file="critical.py",
+            start_line=7,
+            severity="CRITICAL",
+            confidence=0.2,
+        )
+        high = _finding(
+            file="high.py",
+            start_line=11,
+            severity="HIGH",
+            confidence=0.95,
+        )
+
+        result = deduplicate([high, critical])
+
+        assert len(result) == 2
+        assert {finding.severity for finding in result} == {"CRITICAL", "HIGH"}
+
+    def test_equal_rank_representative_is_semantically_deterministic(self) -> None:
+        """Opaque finding IDs and input order do not select presentation fields."""
+
+        def candidates(*, reverse_ids: bool) -> tuple[Finding, Finding]:
+            first = _finding(file="same.py", start_line=5)
+            first.finding_id = "finding-z" if reverse_ids else "finding-a"
+            first.message = "Alpha presentation"
+            first.remediation = "Alpha remediation"
+            second = _finding(file="same.py", start_line=5)
+            second.finding_id = "finding-a" if reverse_ids else "finding-z"
+            second.message = "Beta presentation"
+            second.remediation = "Beta remediation"
+            return first, second
+
+        first_pair = candidates(reverse_ids=False)
+        second_pair = candidates(reverse_ids=True)
+        forward = deduplicate(list(first_pair))[0]
+        reverse = deduplicate(list(reversed(second_pair)))[0]
+
+        def semantic_fields(finding: Finding) -> tuple[object, ...]:
+            return (
+                finding.rule_id,
+                finding.file,
+                finding.start_line,
+                finding.severity,
+                finding.confidence,
+                finding.message,
+                finding.remediation,
+                finding.matched_text,
+            )
+
+        assert semantic_fields(forward) == semantic_fields(reverse)
 
     def test_different_rules_same_file_not_deduped(self) -> None:
         """Different rule_ids in same file are independent findings."""
@@ -80,6 +162,104 @@ class TestSameFileDedup:
         ]
         result = deduplicate(findings)
         assert len(result) == 2
+
+    @pytest.mark.parametrize(
+        ("field_name", "different_value"),
+        [
+            ("message", "Different message"),
+            ("severity", "MEDIUM"),
+            ("category", "Different category"),
+            ("pattern", "Different pattern"),
+            ("explanation", "Different explanation"),
+            ("remediation", "Different remediation"),
+            ("intent", "different intent"),
+            ("tags", ["contextual-triage", "likely-benign-context"]),
+            ("evidence", {"classification": "different"}),
+        ],
+    )
+    def test_different_report_metadata_is_not_deduplicated(
+        self,
+        field_name: str,
+        different_value: object,
+    ) -> None:
+        first = _finding(file="a.py")
+        second = deepcopy(first)
+        second.file = "b.py"
+        setattr(second, field_name, different_value)
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
+    @pytest.mark.parametrize("field_name", ["finding", "code_snippet", "context"])
+    def test_location_context_does_not_change_dedup_identity(self, field_name: str) -> None:
+        first = _finding(file="a.py")
+        second = deepcopy(first)
+        second.file = "b.py"
+        setattr(first, field_name, "context from a.py")
+        setattr(second, field_name, "context from b.py")
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 1
+        assert {item["file"] for item in result[0].occurrences} == {"a.py", "b.py"}
+
+    def test_evidence_mapping_order_does_not_change_dedup_identity(self) -> None:
+        first = _finding(file="a.py")
+        first.evidence = {"outer": {"a": 1, "b": [2, 3]}}
+        second = _finding(file="b.py")
+        second.evidence = {"outer": {"b": [2, 3], "a": 1}}
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 1
+
+    def test_tag_order_does_not_change_dedup_identity(self) -> None:
+        first = _finding(file="a.py")
+        first.tags = ["primary", "secondary"]
+        second = _finding(file="b.py")
+        second.tags = ["secondary", "primary"]
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 1
+        assert {item["file"] for item in result[0].occurrences} == {"a.py", "b.py"}
+
+    def test_non_json_evidence_fails_closed_without_raising(self) -> None:
+        first = _finding(file="a.py")
+        first.evidence = {"raw": b"same"}
+        second = _finding(file="b.py")
+        second.evidence = {"raw": b"same"}
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
+    def test_cyclic_evidence_fails_closed_without_raising(self) -> None:
+        first = _finding(file="a.py")
+        first.evidence["cycle"] = first.evidence
+        second = _finding(file="b.py")
+        second.evidence["cycle"] = second.evidence
+
+        result = deduplicate([first, second])
+
+        assert len(result) == 2
+
+    def test_same_line_benign_and_unsafe_matches_keep_local_classification(self) -> None:
+        safe = _finding(rule_id="PE3", file="build.sh", matched_text="/etc/passwd")
+        safe.tags = ["Privilege Escalation", "contextual-triage", "likely-benign-context"]
+        safe.code_snippet = "docker run -v /etc/passwd:/etc/passwd:ro image"
+        unsafe = _finding(rule_id="PE3", file="build.sh", matched_text="/etc/passwd")
+        unsafe.tags = ["Privilege Escalation"]
+        unsafe.code_snippet = "cat /etc/passwd"
+
+        for findings in ([safe, unsafe], [unsafe, safe]):
+            result = deduplicate(findings)
+            assert len(result) == 2
+            assert {(tuple(item.tags), item.code_snippet) for item in result} == {
+                (tuple(safe.tags), safe.code_snippet),
+                (tuple(unsafe.tags), unsafe.code_snippet),
+            }
 
 
 class TestCrossFileDedup:
@@ -228,6 +408,75 @@ class TestEdgeCases:
         result = deduplicate(findings)
         assert len(result) == 4
         assert [r.severity for r in result] == ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+
+    def test_tied_distinct_groups_have_input_independent_output_order(self) -> None:
+        first = _finding(file="same.py", start_line=5, matched_text="first match")
+        first.message = "Same presentation"
+        second = _finding(file="same.py", start_line=5, matched_text="second match")
+        second.message = "Same presentation"
+
+        forward = deduplicate([first, second])
+        reverse = deduplicate([second, first])
+
+        def output_identity(findings: list[Finding]) -> list[tuple[object, ...]]:
+            return [
+                (
+                    finding.rule_id,
+                    finding.file,
+                    finding.start_line,
+                    finding.message,
+                    finding.fingerprint(),
+                )
+                for finding in findings
+            ]
+
+        assert output_identity(forward) == output_identity(reverse)
+
+    def test_compaction_preserves_unbound_digest_across_source_rebinding(self) -> None:
+        base = _finding(file="same.py", start_line=5, matched_text="exact match")
+        base.match_fingerprint = base.fingerprint()
+        assert base.match_fingerprint is not None
+        first_source = replace(
+            base,
+            source_identity="external/first",
+            source_digest="sha256:" + "a" * 64,
+            transitive_depth=1,
+        )
+        first_duplicate = replace(first_source, file="other.py", start_line=9)
+
+        compacted = deduplicate([first_source, first_duplicate])[0]
+        rebound = replace(
+            compacted,
+            source_identity="external/second",
+            source_digest="sha256:" + "b" * 64,
+            occurrences=[],
+        )
+        fresh = replace(
+            base,
+            source_identity="external/second",
+            source_digest="sha256:" + "b" * 64,
+            transitive_depth=1,
+        )
+
+        assert compacted.match_fingerprint == base.match_fingerprint
+        assert rebound.fingerprint() == fresh.fingerprint()
+
+    def test_repeated_source_scoped_compaction_is_idempotent(self) -> None:
+        base = _finding(file="same.py", start_line=5, matched_text="exact match")
+        base.match_fingerprint = base.fingerprint()
+        source_finding = replace(
+            base,
+            source_identity="external/source",
+            source_digest="sha256:" + "a" * 64,
+            transitive_depth=1,
+        )
+        duplicate = replace(source_finding, file="other.py", start_line=9)
+
+        once = deduplicate([source_finding, duplicate])
+        twice = deduplicate(once)
+
+        assert once == twice
+        assert once[0].match_fingerprint == base.match_fingerprint
 
     def test_real_world_repetitive_skill(self) -> None:
         """Simulates a skill with subprocess in 5 files — should deduplicate to 1."""

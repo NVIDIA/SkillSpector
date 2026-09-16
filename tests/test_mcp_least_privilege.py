@@ -286,6 +286,18 @@ class TestLP3AllowedTools:
             f"allowed-tools should satisfy LP3, got: {[f.rule_id for f in findings]}"
         )
 
+    def test_allowed_tools_space_string_no_lp3(self):
+        """allowed-tools space-string form ('Bash Read') is also a declaration → no LP3."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = "Bash Read"
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp3_findings = [f for f in findings if f.rule_id == "LP3"]
+        assert lp3_findings == [], (
+            f"allowed-tools should satisfy LP3, got: {[f.rule_id for f in findings]}"
+        )
+
     def test_allowed_tools_underdeclared_fires_lp1(self):
         """allowed-tools: [Read] + Bash code → LP3 suppressed but LP1 fires HIGH for shell."""
         state = _make_state("mcp_underdeclared_skill")

@@ -37,6 +37,7 @@ from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 
 from skillspector.providers import registry
+from skillspector.providers.chat_models import resolve_sampling_parameters
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -71,14 +72,16 @@ class AzureOpenAIProvider:
         deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip() or model
         api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "").strip() or "2024-06-01"
 
-        return AzureChatOpenAI(
-            azure_endpoint=endpoint,
-            azure_deployment=deployment,
-            api_key=SecretStr(api_key),
-            api_version=api_version,
-            max_tokens=max_tokens,
-            timeout=timeout,
-        )
+        kwargs = {
+            "azure_endpoint": endpoint,
+            "azure_deployment": deployment,
+            "api_key": SecretStr(api_key),
+            "api_version": api_version,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+        }
+        kwargs.update(resolve_sampling_parameters(include_seed=True))
+        return AzureChatOpenAI(**kwargs)
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)

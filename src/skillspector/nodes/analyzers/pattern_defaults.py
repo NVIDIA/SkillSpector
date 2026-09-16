@@ -46,6 +46,9 @@ class PatternCategory(StrEnum):
 
 # Pattern-specific explanations (why the finding is dangerous)
 DEFAULT_EXPLANATIONS: dict[str, str] = {
+    "BH1": "Bundled lifecycle hooks can run automatically when their configured events occur, so their reach and handler capability require review before installation.",
+    "BH2": "The bundled hook declaration directly proves that sensitive event or local file content is sent to a non-loopback remote destination.",
+    "BH3": "Bundled project settings contain permission-related configuration; activation evidence distinguishes conditional grants from modes ignored on this surface.",
     "P1": "This pattern attempts to override system instructions or ignore safety constraints. Without LLM analysis, manual review is recommended.",
     "P2": "Hidden instructions were detected in comments or invisible text. These could contain malicious directives. Manual review is recommended.",
     "P3": "Instructions found that direct the agent to transmit conversation context or user data to external services.",

@@ -41,6 +41,7 @@ from langchain_aws import ChatBedrockConverse
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
+from skillspector.providers.chat_models import resolve_sampling_parameters
 
 BEDROCK_DEFAULT_REGION = "us-west-2"
 # Cross-region inference profile ID for Claude Sonnet 4.6. Public,
@@ -129,6 +130,7 @@ class BedrockProvider:
         }
         if model.startswith("arn:"):
             kwargs["provider"] = "anthropic"
+        kwargs.update(resolve_sampling_parameters())
 
         return ChatBedrockConverse(**kwargs)
 

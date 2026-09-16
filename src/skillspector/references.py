@@ -27,6 +27,14 @@ _MARKDOWN_DESTINATION = re.compile(r"\[[^\]\n]{1,200}\]\(([^)\n]{1,512})\)")
 _QUOTED_OR_CODE_PATH = re.compile(
     r"(?:`|'|\")((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:`|'|\")"
 )
+# An interpreter command is an explicit path signal, but only its immediate
+# script operand is eligible.  Searching the rest of the code span would turn
+# strings passed to ``-c``/``-e`` and option values into fabricated references.
+_INLINE_CODE_COMMAND_PATH = re.compile(
+    r"`(?:python(?:\d+(?:\.\d+)*)?|py|node|deno|bun|bash|sh|zsh|fish|ruby|perl|php|"
+    r"pwsh|powershell)\b[ \t]+"
+    r"((?:\./)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)(?![\w/.-])"
+)
 
 
 @dataclass(frozen=True)
@@ -44,7 +52,8 @@ class ReferenceResolutionResult:
 
 
 _PLAIN_RELATIVE_PATH = re.compile(
-    r"(?<![\w:/.-])((?:\./)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9]{1,12})?)(?![\w/.-])"
+    r"(?<![\w:/.-])((?:\./(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+|"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}))(?![\w/.-])"
 )
 
 
@@ -71,7 +80,12 @@ def _candidate_strings(
     """
     candidates: list[tuple[str, int, int, str]] = []
     seen: set[tuple[int, int, str]] = set()
-    patterns = (_MARKDOWN_DESTINATION, _QUOTED_OR_CODE_PATH, _PLAIN_RELATIVE_PATH)
+    patterns = (
+        _MARKDOWN_DESTINATION,
+        _QUOTED_OR_CODE_PATH,
+        _INLINE_CODE_COMMAND_PATH,
+        _PLAIN_RELATIVE_PATH,
+    )
     for line_number, line in enumerate(StringIO(text), 1):
         if clock() >= deadline:
             return candidates, ("runtime",)

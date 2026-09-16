@@ -32,7 +32,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import SecretStr
 
 from skillspector.providers import registry
-from skillspector.providers.chat_models import resolve_reasoning_effort
+from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
 
 # Default endpoint; overridden by ``ANTHROPIC_BASE_URL`` when set.
 ANTHROPIC_BASE_URL = "https://api.anthropic.com"
@@ -80,6 +80,7 @@ class AnthropicProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
+        kwargs.update(resolve_sampling_parameters())
         return ChatAnthropic(**kwargs)
 
     def get_context_length(self, model: str) -> int | None:

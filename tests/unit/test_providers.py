@@ -23,6 +23,7 @@ NVIDIA catalog API) is covered by the layered tests in
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 from langchain_anthropic import ChatAnthropic
@@ -117,6 +118,8 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
@@ -322,6 +325,8 @@ class TestOpenAIProvider:
         provider = OpenAIProvider()
         assert provider.get_context_length("gpt-5.4") == 1_000_000
         assert provider.get_max_output_tokens("gpt-5.4") == 128_000
+        assert provider.get_context_length("gemini-3.5-flash") == 1_048_576
+        assert provider.get_max_output_tokens("gemini-3.5-flash") == 65_536
 
 
 class TestAnthropicProvider:
@@ -399,6 +404,25 @@ class TestAnthropicProvider:
         AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
 
         assert "effort" not in captured
+
+    def test_temperature_is_forwarded_without_openai_seed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_anthropic(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(anthropic_provider_module, "ChatAnthropic", fake_chat_anthropic)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        AnthropicProvider().create_chat_model("claude-opus-4-6", max_tokens=123)
+
+        assert captured["temperature"] == 0.0
+        assert "seed" not in captured
 
     def test_create_chat_model_returns_none_without_key(self) -> None:
         # No ANTHROPIC_API_KEY → no client, signalling the caller to fall back.
@@ -549,6 +573,49 @@ class TestOpenAICompatibleConstructor:
         )
 
         assert captured["reasoning_effort"] == "provider-specific-value"
+
+    def test_sampling_controls_are_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", " 0.25 ")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["temperature"] == 0.25
+        assert captured["seed"] == 42
+
+    @pytest.mark.parametrize(
+        ("name", "value", "message"),
+        [
+            ("SKILLSPECTOR_TEMPERATURE", "warm", "must be a number"),
+            ("SKILLSPECTOR_TEMPERATURE", "1.1", "must be between 0 and 1"),
+            ("SKILLSPECTOR_SEED", "4.2", "must be an integer"),
+        ],
+    )
+    def test_invalid_sampling_control_fails_before_model_construction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+        message: str,
+    ) -> None:
+        monkeypatch.setenv(name, value)
+        with pytest.raises(ValueError, match=message):
+            create_openai_compatible_chat_model(
+                model="gpt-5.4",
+                credentials=("sk-x", "http://localhost:1234/v1"),
+                max_tokens=123,
+            )
 
 
 class TestProviderSelection:
@@ -764,6 +831,108 @@ class TestAntigravityCLIProvider:
         available, reason = AntigravityCLIProvider().is_available()
         assert available is False
         assert reason
+
+
+class TestAgentCLIProviderMetadata:
+    """Shared model-registry behavior for supported agent CLI providers."""
+
+    @pytest.mark.parametrize(
+        "provider_type", [ClaudeCLIProvider, CodexCLIProvider, GeminiCLIProvider]
+    )
+    @pytest.mark.parametrize(
+        "contents",
+        [
+            "models: [test-model]\n",
+            "models:\n  test-model: 42\n",
+            "models:\n  test-model:\n    context_length: lots\n    max_output_tokens: lots\n",
+            "models:\n  test-model:\n    context_length: -1\n    max_output_tokens: -1\n",
+            "models:\n  test-model:\n    context_length: 0\n    max_output_tokens: 0\n",
+            "models:\n  test-model:\n    context_length: .inf\n    max_output_tokens: .inf\n",
+        ],
+        ids=["models-list", "scalar-entry", "bad-string", "negative", "zero", "infinite"],
+    )
+    def test_malformed_registry_returns_none(
+        self,
+        provider_type: type[ClaudeCLIProvider | CodexCLIProvider | GeminiCLIProvider],
+        contents: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(contents, encoding="utf-8")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = provider_type()
+        assert provider.get_context_length("test-model") is None
+        assert provider.get_max_output_tokens("test-model") is None
+
+    @pytest.mark.parametrize("invalid_field", ["context_length", "max_output_tokens"])
+    def test_invalid_budget_preserves_other_field(
+        self, invalid_field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        valid_field = "max_output_tokens" if invalid_field == "context_length" else "context_length"
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            f'models:\n  test-model:\n    {invalid_field}: lots\n    {valid_field}: "32000"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = ClaudeCLIProvider()
+        assert getattr(provider, f"get_{invalid_field}")("test-model") is None
+        assert getattr(provider, f"get_{valid_field}")("test-model") == 32_000
+
+    @pytest.mark.parametrize(
+        "provider_type",
+        [ClaudeCLIProvider, CodexCLIProvider, GeminiCLIProvider],
+    )
+    def test_honors_model_registry_override(
+        self,
+        provider_type: type[ClaudeCLIProvider | CodexCLIProvider | GeminiCLIProvider],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            "models:\n  test-model:\n    context_length: 200000\n    max_output_tokens: 32000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = provider_type()
+        assert provider.get_context_length("test-model") == 200_000
+        assert provider.get_max_output_tokens("test-model") == 32_000
+
+    @pytest.mark.parametrize("registry_value", [None, "   "])
+    def test_returns_none_without_registry(
+        self,
+        registry_value: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if registry_value is None:
+            monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
+        else:
+            monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", registry_value)
+
+        provider = ClaudeCLIProvider()
+        assert provider.get_context_length("test-model") is None
+        assert provider.get_max_output_tokens("test-model") is None
+
+    def test_unknown_model_returns_none(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        registry_path = tmp_path / "model_registry.yaml"
+        registry_path.write_text(
+            "models:\n  known-model:\n    context_length: 200000\n    max_output_tokens: 32000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(registry_path))
+
+        provider = ClaudeCLIProvider()
+        assert provider.get_context_length("unknown-model") is None
+        assert provider.get_max_output_tokens("unknown-model") is None
 
 
 class TestClaudeCLIProvider:

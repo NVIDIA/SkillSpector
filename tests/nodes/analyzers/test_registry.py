@@ -41,6 +41,7 @@ EXPECTED_ANALYZER_NODE_IDS: list[str] = [
     "static_yara",
     "behavioral_ast",
     "behavioral_taint_tracking",
+    "bundled_execution_surface",
     "mcp_least_privilege",
     "mcp_tool_poisoning",
     "mcp_rug_pull",

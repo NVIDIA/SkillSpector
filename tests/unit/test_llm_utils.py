@@ -32,6 +32,7 @@ from langchain_core.outputs import ChatGeneration, LLMResult
 from pydantic import BaseModel
 
 from skillspector import llm_utils
+from skillspector.constants import build_model_config
 from skillspector.inference_usage import InferenceUsageCollector
 from skillspector.llm_utils import (
     AgentCLIChatModel,
@@ -529,6 +530,22 @@ class TestGetChatModelCLIAdapter:
                     "x"
                 )
 
+    def test_set_timeout_reaches_structured_wrapper(self) -> None:
+        """A retargeted deadline applies to structured wrappers made earlier."""
+
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = '{"verdict": "ok"}'
+        model = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024, timeout=30.0)
+        runnable = model.with_structured_output(_Schema)
+
+        model.set_timeout(4.5)
+        runnable.invoke("prompt")
+
+        assert provider.complete.call_args.kwargs["timeout"] == 4.5
+
     def test_structured_usage_marks_response_before_sync_parse_failure(self) -> None:
         class _Schema(BaseModel):
             verdict: str
@@ -657,6 +674,17 @@ class TestGetChatModel:
 
         llm = get_chat_model()
 
+        assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
+
+    def test_graph_model_config_matches_openai_fallback_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai-only")
+
+        model = build_model_config()["default"]
+        llm = get_chat_model(model=model)
+
+        assert model == OpenAIProvider.DEFAULT_MODEL
         assert _chat_model_name(llm) == OpenAIProvider.DEFAULT_MODEL
 
     def test_explicit_model_still_overrides_openai_fallback(

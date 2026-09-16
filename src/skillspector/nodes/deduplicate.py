@@ -5,12 +5,16 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from hashlib import sha256
 
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
 
 logger = get_logger(__name__)
+
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
 
 def _occurrences(finding: Finding) -> list[dict[str, object]]:
@@ -21,6 +25,8 @@ def _occurrences(finding: Finding) -> list[dict[str, object]]:
             "file": finding.file,
             "start_line": finding.start_line,
             "end_line": finding.end_line,
+            **({"start_column": finding.start_column} if finding.start_column is not None else {}),
+            **({"end_column": finding.end_column} if finding.end_column is not None else {}),
             "source_url": finding.source_url,
             "source_identity": finding.source_identity,
             "source_digest": finding.source_digest,
@@ -49,9 +55,103 @@ def _finding_source_scope(finding: Finding) -> str:
     return ""
 
 
+def _evidence_metadata_key(finding: Finding) -> tuple[str, object]:
+    """Return a bounded, fail-closed identity for classification evidence."""
+    try:
+        canonical = json.dumps(
+            finding.evidence,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    except (RecursionError, TypeError, ValueError):
+        # ``Finding.evidence`` intentionally accepts arbitrary plugin metadata.
+        # Ambiguous values must never crash a scan or merge distinct findings.
+        return ("opaque", id(finding))
+    return ("sha256", sha256(canonical).digest())
+
+
+def classification_metadata_key(
+    finding: Finding,
+    *,
+    ignored_tags: frozenset[str] = frozenset(),
+) -> tuple[object, ...]:
+    """Return the classification semantics compacted occurrences must share.
+
+    Occurrence expansion reuses one representative finding's report fields.
+    Keeping classification fields in the compaction identity prevents a
+    benign-context match and an unsafe match with the same rule fingerprint
+    from inheriting each other's classification or evidence. Confidence and
+    location-specific context are intentionally excluded because compaction
+    retains one highest-confidence representative for equivalent findings.
+    """
+    return (
+        finding.message,
+        finding.severity,
+        finding.category,
+        finding.pattern,
+        finding.explanation,
+        finding.remediation,
+        finding.intent,
+        tuple(sorted(tag for tag in finding.tags if tag not in ignored_tags)),
+        _evidence_metadata_key(finding),
+    )
+
+
+def _representative_key(finding: Finding) -> tuple[object, ...]:
+    """Return a stable semantic rank without using opaque run-unique IDs."""
+    return (
+        _SEVERITY_ORDER.get(finding.severity.upper(), 4),
+        -finding.confidence,
+        finding.file,
+        finding.start_line,
+        finding.end_line is not None,
+        finding.end_line or 0,
+        finding.start_column is None,
+        finding.start_column or 0,
+        finding.end_column is None,
+        finding.end_column or 0,
+        finding.rule_id,
+        finding.message,
+        finding.category or "",
+        finding.pattern or "",
+        finding.finding or "",
+        finding.explanation or "",
+        finding.remediation or "",
+        finding.code_snippet or "",
+        finding.intent or "",
+        tuple(finding.tags),
+        finding.context or "",
+        finding.matched_text or "",
+        finding.source_identity or "",
+        finding.source_digest or "",
+        finding.source_url or "",
+        finding.transitive_depth,
+    )
+
+
+def _output_key(finding: Finding) -> tuple[object, ...]:
+    """Return a total semantic order for bounded downstream consumers."""
+    return (
+        _SEVERITY_ORDER.get(finding.severity.upper(), 4),
+        finding.file,
+        finding.start_line,
+        finding.rule_id,
+        _representative_key(finding),
+        _finding_source_scope(finding),
+        finding.fingerprint() or "",
+        json.dumps(
+            finding.occurrences,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+
 def deduplicate(findings: list[Finding]) -> list[Finding]:
-    """Aggregate exact full-match duplicates while preserving every occurrence."""
-    groups: dict[tuple[str, str, str], list[Finding]] = {}
+    """Aggregate classification-equivalent exact matches while preserving occurrences."""
+    groups: dict[tuple[str, str, str, tuple[object, ...]], list[Finding]] = {}
     unique_without_match: list[Finding] = []
     for finding in findings:
         fingerprint = finding.fingerprint()
@@ -59,24 +159,31 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
             unique_without_match.append(finding)
             continue
         source_scope = _finding_source_scope(finding)
-        groups.setdefault((source_scope, finding.rule_id, fingerprint), []).append(finding)
+        groups.setdefault(
+            (
+                source_scope,
+                finding.rule_id,
+                fingerprint,
+                classification_metadata_key(finding),
+            ),
+            [],
+        ).append(finding)
 
     compacted: list[Finding] = []
-    for (_source_scope, _rule_id, fingerprint), group in groups.items():
-        representative = max(
-            group,
-            key=lambda item: (
-                item.confidence,
-                -item.start_line,
-                item.file,
-                item.finding_id,
-            ),
-        )
+    for (
+        _source_scope,
+        _rule_id,
+        _fingerprint,
+        _classification_metadata,
+    ), group in groups.items():
+        representative = min(group, key=_representative_key)
         occurrences = {
             (
                 str(occurrence.get("file", "")),
                 _line(occurrence.get("start_line"), 1),
                 occurrence.get("end_line"),
+                occurrence.get("start_column"),
+                occurrence.get("end_column"),
                 str(occurrence.get("source_identity") or finding.source_identity or ""),
                 str(occurrence.get("source_digest") or finding.source_digest or ""),
                 str(occurrence.get("source_url") or finding.source_url or ""),
@@ -90,6 +197,8 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 "file": file,
                 "start_line": start,
                 "end_line": end,
+                **({"start_column": start_column} if start_column is not None else {}),
+                **({"end_column": end_column} if end_column is not None else {}),
                 **({"source_identity": source_identity} if source_identity else {}),
                 **({"source_digest": source_digest} if source_digest else {}),
                 **({"source_url": source_url} if source_url else {}),
@@ -99,6 +208,8 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 file,
                 start,
                 end,
+                start_column,
+                end_column,
                 source_identity,
                 source_digest,
                 source_url,
@@ -106,34 +217,27 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
             ) in sorted(
                 occurrences,
                 key=lambda item: (
-                    item[3],
-                    item[4],
                     item[5],
                     item[6],
+                    item[7],
+                    item[8],
                     item[0],
                     item[1],
                     _line(item[2], item[1]),
+                    _line(item[3], -1),
+                    _line(item[4], -1),
                 ),
             )
         ]
         compacted.append(
             replace(
                 representative,
-                match_fingerprint=fingerprint,
                 occurrences=ordered_occurrences,
             )
         )
 
     compacted.extend(unique_without_match)
-    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    compacted.sort(
-        key=lambda finding: (
-            severity_order.get(finding.severity.upper(), 4),
-            finding.file,
-            finding.start_line,
-            finding.rule_id,
-        )
-    )
+    compacted.sort(key=_output_key)
     removed = len(findings) - len(compacted)
     if removed:
         logger.info(
