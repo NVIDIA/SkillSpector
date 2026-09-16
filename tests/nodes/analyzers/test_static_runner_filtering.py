@@ -39,6 +39,83 @@ def _findings(content: str, path: str, module: object) -> set[str]:
     return {finding.rule_id for finding in static_runner.run_static_patterns(state, [module])}
 
 
+def _view_finding(**overrides: object) -> Finding:
+    values: dict[str, object] = {
+        "rule_id": "T1",
+        "message": "Raw classification",
+        "severity": "HIGH",
+        "confidence": 0.8,
+        "file": "SKILL.md",
+        "start_line": 1,
+        "start_column": 4,
+        "matched_text": "same match",
+        "match_fingerprint": "canonical-match",
+    }
+    values.update(overrides)
+    return Finding(**values)  # type: ignore[arg-type]
+
+
+def test_raw_stronger_classification_dominates_normalized_context() -> None:
+    raw = _view_finding()
+    normalized = _view_finding(
+        message="Normalization-only benign context",
+        severity="LOW",
+        confidence=0.15,
+        match_fingerprint="normalized-match",
+        tags=["contextual-triage", "likely-benign-context", "normalized-view"],
+    )
+
+    assert static_runner._deduplicate_view_findings([raw, normalized]) == [raw]
+
+
+def test_stronger_normalized_security_classification_is_retained() -> None:
+    raw = _view_finding(message="Raw low signal", severity="LOW", confidence=0.2)
+    normalized = _view_finding(
+        message="Normalized high signal",
+        severity="HIGH",
+        confidence=0.9,
+        tags=["contextual-triage", "normalized-view"],
+    )
+
+    result = static_runner._deduplicate_view_findings([raw, normalized])
+
+    assert [finding.message for finding in result] == ["Raw low signal", "Normalized high signal"]
+
+
+def test_exact_equal_normalized_view_is_deduplicated() -> None:
+    raw = _view_finding()
+    normalized = replace(raw, tags=["normalized-view"])
+
+    assert static_runner._deduplicate_view_findings([raw, normalized]) == [raw]
+
+
+def test_context_arbitration_preserves_distinct_occurrence_columns() -> None:
+    raw = _view_finding(start_column=4)
+    normalized = _view_finding(
+        message="Different occurrence",
+        severity="LOW",
+        confidence=0.15,
+        start_column=24,
+        tags=["contextual-triage", "likely-benign-context", "normalized-view"],
+    )
+
+    result = static_runner._deduplicate_view_findings([raw, normalized])
+
+    assert {finding.start_column for finding in result} == {4, 24}
+
+
+def test_context_arbitration_tolerates_unknown_public_severity() -> None:
+    raw = _view_finding(severity="UNKNOWN")
+    normalized = _view_finding(
+        message="Normalized context",
+        severity="UNKNOWN",
+        confidence=0.2,
+        tags=["contextual-triage", "normalized-view"],
+    )
+
+    assert static_runner._deduplicate_view_findings([raw, normalized]) == [raw]
+
+
 def test_complete_match_init_input_is_not_retained_and_preserves_identity() -> None:
     short_match = "subprocess.run(command, shell=True)"
     long_match = f"{short_match} {'segment' * 32}-tail"
