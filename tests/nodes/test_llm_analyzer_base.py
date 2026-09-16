@@ -35,10 +35,18 @@ from anthropic import (
 from anthropic import (
     RateLimitError as AnthropicRateLimitError,
 )
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    ProxyConnectionError,
+    SSLError,
+)
+from botocore.exceptions import (
+    ConnectionError as BotocoreConnectionError,
+)
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_openai.chat_models._client_utils import _cached_async_httpx_client
 from openai import (
     APITimeoutError as OpenAIAPITimeoutError,
 )
@@ -359,6 +367,9 @@ class TestTransientProviderErrors:
             ),
             AnthropicRateLimitError("rate limited", response=_http_response(429), body=None),
             AnthropicAPITimeoutError(httpx.Request("POST", "https://provider.test/v1/chat")),
+            BotocoreConnectionError(error="connection reset"),
+            ProxyConnectionError(proxy_url="https://proxy.test"),
+            SSLError(endpoint_url="https://bedrock.test", error="TLS handshake failed"),
             _status_error(408),
             _status_error(429),
             _status_error(503),
@@ -806,6 +817,28 @@ class TestRunBatches:
             LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
         ]
 
+    @patch(MOCK_PATCH_TARGET)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_native_openai_http_425_is_retried_by_coordinator(
+        self, sleep: MagicMock, get_chat_model: MagicMock
+    ) -> None:
+        chat_model = ChatOpenAI(model=self.MODEL, api_key="sk-test")
+        get_chat_model.return_value = chat_model
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._invoke_batch = MagicMock(
+            side_effect=[
+                _status_error(425),
+                (Batch(file_path="a.py", content="code"), []),
+            ]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert len(outcome.successful) == 1
+        assert outcome.failures == []
+        assert analyzer._invoke_batch.call_count == 2
+        sleep.assert_called_once_with(0.5)
+
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
     def test_structured_validation_error_recovers_on_retry(self, sleep: MagicMock) -> None:
@@ -1162,6 +1195,47 @@ class TestDynamicTimeout:
 
         get_chat_model.assert_not_called()
 
+    def test_dynamic_deadline_retargets_one_transport_instead_of_building_more(self) -> None:
+        """A shrinking deadline must not open a connection pool per LLM call.
+
+        Evicted pools belong to event loops that earlier analyzer nodes already closed, so
+        finalizing them raises an unobservable ``RuntimeError: Event loop is closed``.
+        """
+        built: list[ChatOpenAI] = []
+
+        def _factory(*, model: str, timeout: float | None = None) -> ChatOpenAI:
+            chat_model = ChatOpenAI(model=model, api_key="sk-test", timeout=timeout)
+            built.append(chat_model)
+            return chat_model
+
+        calls = 200
+        countdown = iter(float(seconds) for seconds in range(calls + 1, 0, -1))
+        with patch(MOCK_PATCH_TARGET, side_effect=_factory):
+            analyzer = LLMAnalyzerBase(
+                base_prompt="test",
+                model="nvidia/openai/gpt-oss-120b",
+                timeout=lambda: next(countdown),
+            )
+
+            cache_misses_before = _cached_async_httpx_client.cache_info().misses
+            sync_client = analyzer._llm.root_client
+            async_client = analyzer._llm.root_async_client
+            applied: list[float | None] = []
+
+            for _ in range(calls):
+                llm, structured = analyzer._model_for_call()
+                assert llm is analyzer._llm
+                assert structured is analyzer._structured_llm
+                assert llm.root_client is sync_client
+                assert llm.root_async_client is async_client
+                applied.append(llm.root_async_client.timeout)
+
+        assert len(built) == 1
+        assert applied == [float(seconds) for seconds in range(calls, 0, -1)]
+        assert async_client.timeout == 1.0
+        assert sync_client.timeout == 1.0
+        assert _cached_async_httpx_client.cache_info().misses == cache_misses_before
+
     def test_run_batches_resolves_timeout_per_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Dynamic timeout providers are called again before every LLM call."""
         captured_timeouts: list[float | None] = []
@@ -1503,6 +1577,28 @@ class TestARunBatches:
         assert [failure.reason for failure in outcome.failures] == [
             LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
         ]
+
+    @patch(MOCK_PATCH_TARGET)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_native_openai_http_425_is_retried_by_coordinator(
+        self, sleep: AsyncMock, get_chat_model: MagicMock
+    ) -> None:
+        chat_model = ChatOpenAI(model=self.MODEL, api_key="sk-test")
+        get_chat_model.return_value = chat_model
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._ainvoke_batch = AsyncMock(
+            side_effect=[
+                _status_error(425),
+                (Batch(file_path="a.py", content="code"), []),
+            ]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert len(outcome.successful) == 1
+        assert outcome.failures == []
+        assert analyzer._ainvoke_batch.call_count == 2
+        sleep.assert_awaited_once_with(0.5)
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)

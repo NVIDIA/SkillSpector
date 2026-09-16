@@ -53,6 +53,7 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_utils import (
+    AgentCLIChatModel,
     StructuredOutputParseError,
     _AgentCLIMessage,
     _ainvoke_with_usage,
@@ -121,6 +122,7 @@ _RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
         "APIConnectionError",
         "APITimeoutError",
         "ConnectionClosedError",
+        "ConnectionError",
         "ConnectError",
         "ConnectTimeout",
         "ConnectTimeoutError",
@@ -128,16 +130,20 @@ _RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
         "InternalServerError",
         "ModelNotReadyException",
         "PoolTimeout",
+        "ProxyConnectionError",
         "RateLimitError",
         "ReadTimeout",
         "ReadTimeoutError",
         "RemoteProtocolError",
         "ServiceUnavailableError",
+        "SSLError",
         "ThrottlingException",
         "WriteTimeout",
     }
 )
 _RETRYABLE_PROVIDER_STATUS_CODES = frozenset({408, 409, 425, 429})
+_NATIVE_RETRYABLE_PROVIDER_ERROR_NAMES = frozenset({"APIConnectionError", "APITimeoutError"})
+_NATIVE_RETRYABLE_PROVIDER_STATUS_CODES = frozenset({408, 409, 429})
 _RETRYABLE_BEDROCK_ERROR_CODES = frozenset(
     {
         "ec2throttledexception",
@@ -247,6 +253,29 @@ def _is_retryable_provider_error(exc: BaseException) -> bool:
     return _transient_provider_cause(exc) is not None
 
 
+def _native_retries_cover_provider_error(exc: BaseException) -> bool:
+    """Return whether the configured OpenAI/Anthropic SDK retries this failure.
+
+    Their locked SDK versions cover connection failures, 408/409/429, and 5xx,
+    but not 425. Keeping this narrower than the coordinator policy prevents a
+    retryable status that the SDK does not own from being dropped after one call.
+    """
+    for candidate in _exception_chain(exc):
+        override = _provider_retry_override(candidate)
+        if override is not None:
+            return override
+        if isinstance(candidate, (ConnectionError, TimeoutError)):
+            return True
+        if type(candidate).__name__ in _NATIVE_RETRYABLE_PROVIDER_ERROR_NAMES:
+            return True
+        status_code = _provider_status_code(candidate)
+        if status_code in _NATIVE_RETRYABLE_PROVIDER_STATUS_CODES or (
+            status_code is not None and 500 <= status_code <= 599
+        ):
+            return True
+    return False
+
+
 def _is_provider_failure_for_ledger(exc: BaseException) -> bool:
     """Classify provider failures independently from their retry eligibility."""
     return _transient_provider_cause(exc) is not None or _is_retryable_provider_error(exc)
@@ -334,6 +363,33 @@ def _uses_native_connection_retries(
     if isinstance(chat_model, ChatAnthropic):
         chat_model.max_retries = max_retries
         return max_retries > 0
+    return False
+
+
+def _retarget_request_timeout(chat_model: object, timeout: float | None) -> bool:
+    """Point an existing chat model at *timeout* and report whether it took effect.
+
+    Returns ``False`` for transports that keep no mutable deadline, so the caller can
+    fall back to constructing a replacement model for that call.
+    """
+    if isinstance(chat_model, BaseChatOpenAI):
+        clients = (chat_model.root_client, chat_model.root_async_client)
+        if any(client is None for client in clients):
+            return False
+        for client in clients:
+            client.timeout = timeout
+        chat_model.request_timeout = timeout
+        return True
+    if isinstance(chat_model, ChatAnthropic):
+        # ``timeout <= 0`` is how ChatAnthropic spells "leave the SDK default alone"; an
+        # expired deadline never reaches here because ``_require_time_remaining`` raises first.
+        for client in (chat_model._client, chat_model._async_client):
+            client.timeout = timeout
+        chat_model.default_request_timeout = timeout
+        return True
+    if isinstance(chat_model, AgentCLIChatModel):
+        chat_model.set_timeout(timeout)
+        return True
     return False
 
 
@@ -892,6 +948,10 @@ class LLMAnalyzerBase:
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
+        if _retarget_request_timeout(self._llm, remaining):
+            # Native retries were already disabled for the dynamic-deadline case in
+            # ``__init__``, and the structured runnable wraps this same model instance.
+            return self._llm, self._structured_llm
         llm = get_chat_model(model=self.model, timeout=remaining)
         _uses_native_connection_retries(llm, max_retries=0)
         structured = (
@@ -1047,7 +1107,10 @@ class LLMAnalyzerBase:
                 retryable = _is_retryable_provider_error(exc)
                 if (
                     not retryable
-                    or self._uses_native_connection_retries
+                    or (
+                        self._uses_native_connection_retries
+                        and _native_retries_cover_provider_error(exc)
+                    )
                     or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
@@ -1123,7 +1186,10 @@ class LLMAnalyzerBase:
                 retryable = _is_retryable_provider_error(exc)
                 if (
                     not retryable
-                    or self._uses_native_connection_retries
+                    or (
+                        self._uses_native_connection_retries
+                        and _native_retries_cover_provider_error(exc)
+                    )
                     or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):

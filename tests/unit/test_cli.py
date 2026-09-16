@@ -23,6 +23,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from importlib import import_module
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -31,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import typer
 import yaml
+from rich.console import Console
 from typer.testing import CliRunner
 
 from skillspector import __version__, cli, transitive
@@ -90,6 +92,119 @@ def test_cli_version() -> None:
     assert result.exit_code == 0
     assert "SkillSpector" in result.output
     assert "v" in result.output
+
+
+def test_discovered_files_tree_renders_untrusted_names_literally() -> None:
+    """File names cannot inject Rich markup or terminal control sequences."""
+    malicious_name = "\x1b]52;c;SGVsbG8=\x1b\\[conceal]hidden.py"
+    nested_path = str(Path("folder") / malicious_name)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree([nested_path]))
+
+    rendered = output.getvalue()
+    assert "\x1b]52" not in rendered
+    assert "\\x1b]52;c;SGVsbG8=\\x1b\\[conceal]hidden.py" in rendered
+    assert "📁 folder" in rendered
+    assert "📄 " in rendered
+
+
+def test_discovered_files_tree_bounds_untrusted_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "_PROGRESS_TREE_MAX_PATHS", 1)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree(["a.py", "b.py"]))
+
+    rendered = output.getvalue()
+    assert "a.py" in rendered
+    assert "b.py" not in rendered
+    assert "1 additional path omitted" in rendered
+
+
+def test_progress_counts_only_analyzers_wired_into_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "ANALYZER_NODE_IDS", ["wired", "unavailable"])
+    monkeypatch.setattr(cli, "graph", SimpleNamespace(nodes={"wired": object()}))
+
+    assert cli._wired_analyzer_node_ids() == frozenset({"wired"})
+
+
+def test_stream_progress_returns_complete_values_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_state = {
+        "report_body": "{}",
+        "analysis_completeness": {"is_complete": True},
+        "filtered_findings": [],
+        "inspection_ledger": [{"phase": "complete"}],
+        "provider_cache": {"preserved": True},
+    }
+
+    def fake_stream(
+        state: dict[str, object],
+        config: object,
+        stream_mode: list[str],
+    ) -> Iterator[tuple[str, dict[str, object]]]:
+        del state, config
+        assert stream_mode == ["updates", "values"]
+        yield "updates", {"build_context": {"components": []}}
+        yield "values", final_state
+
+    monkeypatch.setattr(
+        cli,
+        "graph",
+        SimpleNamespace(nodes={}, stream=fake_stream),
+    )
+
+    result = cli._run_graph_scan(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        stream_progress=True,
+    )
+
+    assert result == final_state
+
+
+@pytest.mark.parametrize(
+    ("terminal", "verbose", "expected"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_scan_streams_only_for_interactive_default(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: bool,
+    verbose: bool,
+    expected: bool,
+) -> None:
+    calls: list[bool] = []
+
+    def fake_run_graph_scan_for_source(**kwargs: object) -> dict[str, object]:
+        calls.append(bool(kwargs["stream_progress"]))
+        return {"risk_score": 0}
+
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", fake_run_graph_scan_for_source)
+    monkeypatch.setattr(cli.err_console, "_force_terminal", terminal)
+
+    cli._scan_skill(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        baseline=None,
+        yara_rules_dir=None,
+        verbose=verbose,
+        show_suppressed=False,
+        transitive_enabled=False,
+        transitive_depth=1,
+        transitive_allow_prefix=None,
+        transitive_deny_prefix=None,
+    )
+
+    assert calls == [expected]
 
 
 def test_cli_scan_help_lists_every_available_provider() -> None:
@@ -184,13 +299,15 @@ def test_cli_writes_report_then_exits_two_for_execution_failure(
     """An incomplete execution preserves the report but takes precedence over risk."""
     (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
     output = tmp_path / "report.json"
+    fake_result = {
+        "report_body": '{"execution_successful": false}',
+        "execution_successful": False,
+        "risk_score": 0,
+    }
+    monkeypatch.setattr("skillspector.cli.graph.invoke", lambda state, config: fake_result)
     monkeypatch.setattr(
-        "skillspector.cli.graph.invoke",
-        lambda state, config: {
-            "report_body": '{"execution_successful": false}',
-            "execution_successful": False,
-            "risk_score": 0,
-        },
+        "skillspector.cli.graph.stream",
+        lambda state, config, stream_mode: iter([{"meta_analyzer": fake_result}]),
     )
 
     result = runner.invoke(app, ["scan", str(tmp_path), "-f", "json", "-o", str(output)])
@@ -580,7 +697,7 @@ def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code == 0, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert [issue for issue in issues if issue["id"] == "P6"] == []
     pe3 = next(issue for issue in issues if issue["id"] == "PE3")
     assert {"contextual-triage", "likely-benign-context"} <= set(pe3["tags"])
@@ -604,7 +721,7 @@ def test_cli_scan_required_table_keeps_malicious_pe3(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code in {0, 1}, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert any(issue["id"] == "PE3" for issue in issues)
 
 
@@ -851,7 +968,7 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
         ],
     )
     assert scan.exit_code == 0
-    data = json.loads(scan.output)
+    data = json.loads(scan.stdout)
     assert data["issues"] == []
     assert data["risk_assessment"]["score"] == 0
 
@@ -927,7 +1044,7 @@ def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["issues"] == []
     assert [finding["id"] for finding in data["suppressed"]] == ["PE5"]
     assert data["suppressed"][0]["location"]["file"] == "SKILL.md"
@@ -939,6 +1056,39 @@ def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> Non
         and exclusion["reason_code"] == "baseline_file"
         for exclusion in data["analysis_completeness"]["scope_exclusions"]
     )
+
+
+def test_cli_executable_selected_baseline_fails_closed(tmp_path: Path) -> None:
+    """A user-selected baseline remains auditable when its bytes are executable."""
+    skill = tmp_path / "skill"
+    baseline_file = skill / "config" / "skillspector-baseline.yaml"
+    baseline_file.parent.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Safe skill\n", encoding="utf-8")
+    baseline_file.write_text(
+        "#!/bin/sh\nversion: 2\nrules: []\nfingerprints: []\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--format",
+            "json",
+            "--baseline",
+            str(baseline_file),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.output)
+    issue = next(finding for finding in data["issues"] if finding["id"] == "SC9")
+    assert issue["location"]["file"] == "config/skillspector-baseline.yaml"
+    assert issue["evidence"]["excluded_from_analysis"] is True
+    assert data["risk_assessment"]["score"] >= 51
+    assert data["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+    assert data["analysis_completeness"]["is_complete"] is False
 
 
 def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
@@ -977,7 +1127,7 @@ def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     )
 
     assert result.exit_code in {0, 1}, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     pe5_files = {
         finding["location"]["file"] for finding in data["issues"] if finding["id"] == "PE5"
     }
@@ -1034,7 +1184,7 @@ def test_recursive_single_skill_scan_still_accepts_baseline(tmp_path: Path) -> N
     )
 
     assert result.exit_code == 0, result.output
-    assert [issue for issue in json.loads(result.output)["issues"] if issue["id"] == "P1"] == []
+    assert [issue for issue in json.loads(result.stdout)["issues"] if issue["id"] == "P1"] == []
 
 
 def test_scan_multi_skill_markdown_output_to_file(
@@ -1214,10 +1364,11 @@ def test_scan_multi_skill_json_stdout_survives_child_failure(
     assert "Error: boom" in captured.err
 
 
-def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_recursive_single_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, output_format: str
 ) -> None:
-    """Recursive fallback advisories stay off stdout when JSON is requested."""
+    """Recursive fallback advisories stay off stdout when JSON or SARIF is requested."""
     monkeypatch.setattr(
         cli,
         "detect_skills",
@@ -1238,7 +1389,7 @@ def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
 
     result = runner.invoke(
         app,
-        ["scan", str(tmp_path), "--recursive", "--format", "json", "--no-llm"],
+        ["scan", str(tmp_path), "--recursive", "--format", output_format, "--no-llm"],
     )
 
     assert result.exit_code == 0, result.output
@@ -1247,10 +1398,11 @@ def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
     assert "Scanning as single" in result.stderr
 
 
-def test_json_multi_skill_advisory_does_not_pollute_stdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_multi_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, output_format: str
 ) -> None:
-    """The non-recursive multi-skill advisory stays off JSON stdout."""
+    """The non-recursive multi-skill advisory stays off JSON and SARIF stdout."""
     skills = [
         SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
         for name in ("one", "two")
@@ -1275,7 +1427,7 @@ def test_json_multi_skill_advisory_does_not_pollute_stdout(
 
     result = runner.invoke(
         app,
-        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+        ["scan", str(tmp_path), "--format", output_format, "--no-llm"],
     )
 
     assert result.exit_code == 0, result.output
@@ -1515,6 +1667,30 @@ def test_recursive_sarif_is_valid_and_carries_aggregate_completeness(
     assert aggregate_run["properties"]["kind"] == "recursiveAggregate"
     completeness = aggregate_run["invocations"][0]["properties"]["analysisCompleteness"]
     assert completeness["is_complete"] is True
+
+
+def test_recursive_sarif_without_output_writes_only_the_log_to_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Recursive SARIF without --output prints the log; status text goes to stderr."""
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two")]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    monkeypatch.setattr(
+        cli.graph,
+        "invoke",
+        lambda *_args, **_kwargs: _bounded_recursive_result("one"),
+    )
+
+    _scan_multi_skill(detection, FormatChoice.sarif, None, no_llm=True, verbose=True)
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    validate_sarif_report(payload)
+    assert payload["runs"][-1]["properties"]["kind"] == "recursiveAggregate"
+    assert "Scanning" not in captured.out
+    assert "Scanning" in captured.err
+    assert "Running scan" in captured.err
+    assert "Multi-Skill Summary" in captured.err
 
 
 def test_recursive_sarif_bounds_the_final_serialized_document(
@@ -2022,31 +2198,39 @@ def test_cli_scan_json_preserves_single_skill_contract(
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: single-skill\n---\n# Single", encoding="utf-8")
 
+    fake_result = {
+        "report_body": json.dumps(
+            {
+                "skill": {
+                    "name": "single-skill",
+                    "source": str(skill_dir),
+                    "scanned_at": "2026-06-29T13:00:00+00:00",
+                },
+                "risk_assessment": {
+                    "score": 30,
+                    "severity": "LOW",
+                    "recommendation": "SAFE",
+                },
+                "components": [{"path": "root.py", "type": "python"}],
+                "issues": [{"id": "X-1", "severity": "low"}],
+                "suppressed_count": 0,
+                "suppressed": [],
+                "metadata": {"scan_scope": {"components_scanned": 1}},
+            }
+        )
+    }
+
     def fake_invoke(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
         assert state["input_path"] == str(skill_dir)
-        return {
-            "report_body": json.dumps(
-                {
-                    "skill": {
-                        "name": "single-skill",
-                        "source": str(skill_dir),
-                        "scanned_at": "2026-06-29T13:00:00+00:00",
-                    },
-                    "risk_assessment": {
-                        "score": 30,
-                        "severity": "LOW",
-                        "recommendation": "SAFE",
-                    },
-                    "components": [{"path": "root.py", "type": "python"}],
-                    "issues": [{"id": "X-1", "severity": "low"}],
-                    "suppressed_count": 0,
-                    "suppressed": [],
-                    "metadata": {"scan_scope": {"components_scanned": 1}},
-                }
-            )
-        }
+        return fake_result
 
-    monkeypatch.setattr("skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke))
+    def fake_stream(state: dict[str, Any], config: Any = None, stream_mode: str | None = None):
+        assert state["input_path"] == str(skill_dir)
+        yield {"meta_analyzer": fake_result}
+
+    monkeypatch.setattr(
+        "skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke, stream=fake_stream)
+    )
 
     out_file = tmp_path / "single.json"
     result = runner.invoke(
@@ -2623,6 +2807,32 @@ def test_transitive_resolver_failure_preserves_direct_report(tmp_path: Path, mon
     data = json.loads(result.output)
     assert len(data["issues"]) == 1
     assert data["issues"][0]["id"] == "D1"
+
+
+def test_transitive_failure_warning_stays_off_sarif_stdout(tmp_path: Path, monkeypatch) -> None:
+    """A failed transitive child does not print its warning into the SARIF log."""
+    target = "https://github.com/org/broken.git"
+
+    def fake_run_graph_scan(input_path: str, format, no_llm: bool, **_kwargs) -> dict[str, object]:
+        if input_path == str(tmp_path):
+            return _mock_graph_result(
+                findings=[_finding("D1", "direct finding")],
+                file_cache={"SKILL.md": f"deps {target}"},
+                output_format=format.value,
+            )
+        raise ValueError("resolver failure")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "sarif", "--transitive", "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Transitive scan failed" not in result.stdout
+    payload = json.loads(result.stdout)
+    validate_sarif_report(payload)
+    assert [item["ruleId"] for item in payload["runs"][0]["results"]] == ["D1"]
 
 
 def test_scan_transitive_does_not_rescan_root_source(monkeypatch) -> None:

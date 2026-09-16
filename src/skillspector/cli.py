@@ -24,9 +24,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -35,6 +37,9 @@ from typing import Annotated, cast
 import typer
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.text import Text
+from rich.tree import Tree
 
 from skillspector import __version__, transitive
 from skillspector.cleanup import cleanup_result
@@ -54,7 +59,7 @@ from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
-from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
 from skillspector.semantic_runtime import (
@@ -104,6 +109,8 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
+_PROGRESS_TREE_MAX_PATHS = 200
+_PROGRESS_TREE_MAX_NODES = 1_000
 _TRANSITIVE_MAX_TARGETS = 32
 _TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
 _TRANSITIVE_MAX_SECONDS = MAX_WORKFLOW_SECONDS
@@ -124,6 +131,10 @@ class FormatChoice(StrEnum):
     json = "json"
     markdown = "markdown"
     sarif = "sarif"
+
+
+# Reports that tools parse from stdout, so status text must go to stderr.
+_MACHINE_READABLE_FORMATS = frozenset({FormatChoice.json, FormatChoice.sarif})
 
 
 class TransportChoice(StrEnum):
@@ -542,7 +553,7 @@ def scan(
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
                                openai_compatible | claude_cli | codex_cli |
-                               gemini_cli. Defaults to the NVIDIA path
+                               gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
@@ -564,8 +575,9 @@ def scan(
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
 
-        ollama uses the local Ollama service. claude_cli, codex_cli, and
-        gemini_cli use their CLI's existing local authentication session.
+        ollama uses the local Ollama service. claude_cli, codex_cli,
+        gemini_cli, and opencode_cli use their CLI's existing local
+        authentication session.
     """
     if mcp_registry:
         if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
@@ -650,7 +662,7 @@ def scan(
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
-            (err_console if format == FormatChoice.json else console).print(
+            (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
                 "detected. Scanning as single skill."
             )
@@ -663,7 +675,7 @@ def scan(
                 "with a bounded scan and reporting partial coverage."
             )
         if detection.is_multi_skill:
-            (err_console if format == FormatChoice.json else console).print(
+            (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
@@ -1272,6 +1284,72 @@ def _cache_transitive_result(
     )
 
 
+def _visible_terminal_text(value: str) -> str:
+    """Render untrusted path text without passing terminal control characters."""
+    visible: list[str] = []
+    for character in value:
+        if character.isprintable():
+            visible.append(character)
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0xFF:
+            visible.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            visible.append(f"\\u{codepoint:04x}")
+        else:
+            visible.append(f"\\U{codepoint:08x}")
+    return "".join(visible)
+
+
+def _discovered_files_tree(paths: list[str]) -> Tree:
+    """Build a literal, control-safe tree for paths from an untrusted bundle."""
+    tree = Tree(Text("Discovered Files to Scan", style="bold blue"))
+    nodes = {"": tree}
+    ordered_paths = sorted(dict.fromkeys(paths))
+    displayed_paths = 0
+    node_count = 1
+    for path in ordered_paths[:_PROGRESS_TREE_MAX_PATHS]:
+        parts = Path(path).parts
+        current = ""
+        path_complete = True
+        for index, part in enumerate(parts):
+            parent = current
+            current = f"{current}/{part}" if current else part
+            if current in nodes:
+                continue
+            if node_count >= _PROGRESS_TREE_MAX_NODES:
+                path_complete = False
+                break
+            is_file = index == len(parts) - 1
+            icon = "📄 " if is_file else "📁 "
+            style = "green" if is_file else "cyan"
+            label = Text(f"{icon}{_visible_terminal_text(part)}", style=style)
+            nodes[current] = nodes[parent].add(label)
+            node_count += 1
+        if not path_complete:
+            break
+        displayed_paths += 1
+
+    omitted_paths = len(ordered_paths) - displayed_paths
+    if omitted_paths:
+        noun = "path" if omitted_paths == 1 else "paths"
+        tree.add(
+            Text(
+                f"… {omitted_paths} additional {noun} omitted",
+                style="dim yellow",
+            )
+        )
+    return tree
+
+
+def _wired_analyzer_node_ids() -> frozenset[str]:
+    """Return only analyzers present in the compiled graph."""
+    graph_nodes = getattr(graph, "nodes", {})
+    if not isinstance(graph_nodes, dict):
+        return frozenset(ANALYZER_NODE_IDS)
+    return frozenset(node_id for node_id in ANALYZER_NODE_IDS if node_id in graph_nodes)
+
+
 def _run_graph_scan(
     input_path: str,
     format: FormatChoice,
@@ -1282,6 +1360,7 @@ def _run_graph_scan(
     transitive_traversal: _TransitiveTraversalState | None = None,
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
+    stream_progress: bool = False,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1297,7 +1376,82 @@ def _run_graph_scan(
     if initial_inspection_ledger:
         state["inspection_ledger"] = initial_inspection_ledger
     trace_config = _build_trace_config(input_path, format, no_llm)
-    return cast(dict[str, object], graph.invoke(state, config=trace_config))
+    if not stream_progress:
+        return cast(dict[str, object], graph.invoke(state, config=trace_config))
+
+    analyzer_node_ids = _wired_analyzer_node_ids()
+    total_analyzers = len(analyzer_node_ids)
+    total_steps = 5 + total_analyzers
+    result = dict(state)
+
+    with (
+        warnings.catch_warnings(),
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=err_console,
+            transient=True,
+        ) as progress,
+    ):
+        warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+        task_id = progress.add_task("Resolving input...", total=total_steps)
+        num_files = 0
+        analyzers_done = 0
+
+        stream = graph.stream(
+            state,
+            config=trace_config,
+            stream_mode=["updates", "values"],
+        )
+        for stream_mode, chunk in stream:
+            if stream_mode == "values":
+                if isinstance(chunk, dict):
+                    result = dict(chunk)
+                continue
+            if stream_mode != "updates" or not isinstance(chunk, dict):
+                continue
+
+            for node_name, node_output in chunk.items():
+                progress.advance(task_id)
+                if not isinstance(node_output, dict):
+                    continue
+
+                if node_name == "resolve_input":
+                    progress.update(task_id, description="Building context...")
+                elif node_name == "build_context":
+                    raw_components = node_output.get("components")
+                    components = raw_components if isinstance(raw_components, list) else []
+                    paths = sorted(str(path) for path in components)
+                    num_files = len(paths)
+                    progress.update(
+                        task_id,
+                        description=(
+                            f"Analyzing {num_files} files (0/{total_analyzers} rules applied)..."
+                        ),
+                    )
+
+                    err_console.print(_discovered_files_tree(paths))
+                    err_console.print()
+                elif node_name in analyzer_node_ids:
+                    analyzers_done += 1
+                    progress.update(
+                        task_id,
+                        description=(
+                            f"Analyzing {num_files} files "
+                            f"({analyzers_done}/{total_analyzers} rules applied)..."
+                        ),
+                    )
+                    err_console.print(f"[dim]✔ Rule completed: {node_name}[/dim]")
+                elif node_name == "meta_analyzer":
+                    progress.update(task_id, description="Generating report...")
+                    err_console.print(
+                        "[dim]✔ Rule completed: meta_analyzer (filtering findings)[/dim]"
+                    )
+
+    return result
 
 
 def _run_graph_scan_for_source(
@@ -1310,11 +1464,15 @@ def _run_graph_scan_for_source(
     transitive_traversal: _TransitiveTraversalState | None = None,
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
+    stream_progress: bool = False,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
+    run_graph_scan = (
+        partial(_run_graph_scan, stream_progress=True) if stream_progress else _run_graph_scan
+    )
     if initial_inspection_ledger is not None:
         if source_local_only:
-            return _run_graph_scan(
+            return run_graph_scan(
                 input_path=input_path,
                 format=format,
                 no_llm=no_llm,
@@ -1325,7 +1483,7 @@ def _run_graph_scan_for_source(
                 initial_inspection_ledger=initial_inspection_ledger,
                 source_local_only=True,
             )
-        return _run_graph_scan(
+        return run_graph_scan(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1336,7 +1494,7 @@ def _run_graph_scan_for_source(
             initial_inspection_ledger=initial_inspection_ledger,
         )
     if source_local_only:
-        return _run_graph_scan(
+        return run_graph_scan(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -1346,7 +1504,7 @@ def _run_graph_scan_for_source(
             transitive_traversal=transitive_traversal,
             source_local_only=True,
         )
-    return _run_graph_scan(
+    return run_graph_scan(
         input_path=input_path,
         format=format,
         no_llm=no_llm,
@@ -1864,7 +2022,7 @@ def _scan_transitive(
             except Exception:
                 transitive_sources.add(target)
                 traversal.note_child_scan_failure(target)
-                if format == FormatChoice.json:
+                if format in _MACHINE_READABLE_FORMATS:
                     logger.warning("Transitive scan failed for %s", target)
                 else:
                     console.print(f"[yellow]Warning:[/yellow] Transitive scan failed for {target}")
@@ -1996,7 +2154,7 @@ def _scan_skill(
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
     if verbose:
-        (err_console if format == FormatChoice.json else console).print(
+        (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
             "[dim]Running scan...[/dim]"
         )
     logger.debug(
@@ -2008,6 +2166,7 @@ def _scan_skill(
     )
     if transitive_enabled and transitive_traversal is None:
         transitive_traversal = _TransitiveTraversalState(cache=transitive_cache or {})
+    stream_progress = not verbose and err_console.is_terminal
     if pre_scan_ledger_events:
         result = _run_graph_scan_for_source(
             input_path=input_path,
@@ -2019,6 +2178,7 @@ def _scan_skill(
             transitive_traversal=transitive_traversal,
             initial_inspection_ledger=pre_scan_ledger_events,
             source_local_only=source_local_only,
+            stream_progress=stream_progress,
         )
     else:
         result = _run_graph_scan_for_source(
@@ -2030,6 +2190,7 @@ def _scan_skill(
             show_suppressed=show_suppressed,
             transitive_traversal=transitive_traversal,
             source_local_only=source_local_only,
+            stream_progress=stream_progress,
         )
     if not transitive_enabled:
         return result
@@ -2219,7 +2380,9 @@ def _scan_multi_skill(
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
-    status_console = err_console if format == FormatChoice.json and output is None else console
+    status_console = (
+        err_console if format in _MACHINE_READABLE_FORMATS and output is None else console
+    )
     status_console.print(
         f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n"
     )
@@ -2497,7 +2660,7 @@ def _scan_multi_skill(
             console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
             print(rendered)
-    elif output and format == FormatChoice.sarif:
+    elif format == FormatChoice.sarif:
         merged_sarif = _multi_skill_sarif_report(
             processed_skills,
             results,
@@ -2512,8 +2675,11 @@ def _scan_multi_skill(
             merged_sarif = _multi_skill_sarif_report([], [], aggregate_completeness)
             rendered = json.dumps(merged_sarif, indent=2)
         _ensure_recursive_output_bound(rendered)
-        Path(output).write_text(rendered, encoding="utf-8")
-        console.print(f"[green]Combined report saved to:[/green] {output}")
+        if output:
+            Path(output).write_text(rendered, encoding="utf-8")
+            console.print(f"[green]Combined report saved to:[/green] {output}")
+        else:
+            print(rendered)
     elif output:
         sections: list[str] = []
         for skill, result in zip(processed_skills, results, strict=True):

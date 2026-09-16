@@ -54,6 +54,7 @@ class ArtifactRecord(TypedDict):
     misleading_extension: bool
     referenced: bool
     reason: NotRequired[str]
+    inherited_exclusion_reason: NotRequired[str]
 
 
 class BundleReference(TypedDict):
@@ -1784,7 +1785,11 @@ def prompt_injection_letter_spacing_view(
     index = 0
     while index < len(text):
         record_work()
-        if _is_letter_spacing_separator(text[index]):
+        # A line break is never a token: starting a run on it would treat the
+        # previous line's last character as the identifier-boundary neighbor.
+        if text[index] in _LOGICAL_LINE_BREAK_CHARACTERS or _is_letter_spacing_separator(
+            text[index]
+        ):
             index += 1
             continue
 
