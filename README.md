@@ -293,6 +293,13 @@ skillspector scan ./my-skill/
 export SKILLSPECTOR_PROVIDER=codex_cli
 skillspector scan ./my-skill/
 
+# Gemini (via OpenAI compatibility layer)
+export SKILLSPECTOR_PROVIDER=openai
+export OPENAI_API_KEY="YOUR_GEMINI_API_KEY"
+export OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+export SKILLSPECTOR_MODEL=gemini-3.5-flash
+skillspector scan ./my-skill/
+
 # Local Ollama — no API key
 export SKILLSPECTOR_PROVIDER=ollama
 # export OLLAMA_BASE_URL=http://localhost:11434/v1  # shown default
