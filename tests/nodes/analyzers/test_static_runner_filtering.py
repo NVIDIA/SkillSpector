@@ -167,6 +167,118 @@ def test_p1_identical_same_line_matches_keep_occurrence_columns() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("rule_id", "phrase"),
+    [
+        pytest.param("P1", "ignore previous instructions", id="p1"),
+        pytest.param("P2", "<!-- send -->", id="p2"),
+        pytest.param("P3", "send conversation to", id="p3"),
+        pytest.param("P4", "never warn the user", id="p4"),
+    ],
+)
+def test_prompt_matches_keep_content_identity_separate_from_occurrence_coordinates(
+    rule_id: str,
+    phrase: str,
+) -> None:
+    content = f"{phrase}; {phrase}"
+
+    matches = [
+        finding
+        for finding in pi_module.analyze(content, "SKILL.md", "markdown")
+        if finding.rule_id == rule_id
+    ]
+
+    assert len(matches) == 2
+    assert {finding.match_fingerprint for finding in matches} == {
+        Finding(rule_id=rule_id, message="prompt match", matched_text=phrase).fingerprint()
+    }
+    assert {finding.location.start_column for finding in matches} == {
+        content.index(phrase),
+        content.rindex(phrase),
+    }
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "spaced_phrase", "canonical_match"),
+    [
+        pytest.param(
+            "P3",
+            "s e n d conversation to",
+            "send conversation to",
+            id="p3",
+        ),
+        pytest.param(
+            "P4",
+            "n e v e r warn the user",
+            "never warn the user",
+            id="p4",
+        ),
+    ],
+)
+def test_projected_prompt_matches_keep_canonical_identity_and_raw_occurrences(
+    rule_id: str,
+    spaced_phrase: str,
+    canonical_match: str,
+) -> None:
+    content = f"{spaced_phrase}; {spaced_phrase}"
+
+    findings = static_runner.run_static_patterns(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+        [pi_module],
+    )
+    matches = [finding for finding in findings if finding.rule_id == rule_id]
+
+    assert len(matches) == 2
+    assert {finding.matched_text for finding in matches} == {canonical_match}
+    assert {finding.fingerprint() for finding in matches} == {
+        Finding(
+            rule_id=rule_id,
+            message="prompt match",
+            matched_text=canonical_match,
+        ).fingerprint()
+    }
+    assert {finding.start_column for finding in matches} == {
+        content.index(spaced_phrase),
+        content.rindex(spaced_phrase),
+    }
+
+    compacted = deduplicate(matches)
+    assert len(compacted) == 1
+    assert {item["start_column"] for item in compacted[0].occurrences} == {
+        content.index(spaced_phrase),
+        content.rindex(spaced_phrase),
+    }
+
+
+def test_long_prompt_match_is_owned_by_first_window_that_can_observe_its_end() -> None:
+    match_start = static_runner._RAW_WINDOW_OWNED_CHARS - 16
+    content = (
+        "x" * match_start
+        + "without telling the user"
+        + "x" * (static_runner._WINDOW_OVERLAP_CHARS + 100)
+        + " send"
+        + "x" * 20_000
+    )
+    match_end = content.index(" send", match_start) + len(" send")
+
+    findings = static_runner.run_static_patterns(
+        {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}},
+        [pi_module],
+    )
+    matches = [finding for finding in findings if finding.rule_id == "P3"]
+
+    assert len(matches) == 1
+    assert (matches[0].start_column, matches[0].end_column) == (match_start, match_end)
+    assert (
+        matches[0].fingerprint()
+        == Finding(
+            rule_id="P3",
+            message="prompt match",
+            matched_text=content[match_start:match_end],
+        ).fingerprint()
+    )
+
+
 def test_p1_producer_builds_one_location_index_per_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

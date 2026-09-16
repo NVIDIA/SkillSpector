@@ -109,6 +109,7 @@ _WINDOW_OVERLAP_CHARS = 8192
 _RAW_WINDOW_OWNED_CHARS = SECURITY_VIEW_WINDOW_CHARS - 2 * _WINDOW_OVERLAP_CHARS
 _VIEW_START_EVIDENCE = "_security_view_start"
 _SOURCE_START_EVIDENCE = "_security_source_start"
+_SOURCE_END_EVIDENCE = "_security_source_end"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
 _BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
 _ViewFindingKey = tuple[
@@ -552,6 +553,11 @@ def _uses_python_ast(module: object) -> bool:
     return getattr(module, "USES_PYTHON_AST", False) is True
 
 
+def _uses_runtime_check(module: object) -> bool:
+    """Return whether a pattern module accepts the runner-owned deadline hook."""
+    return getattr(module, "USES_RUNTIME_CHECK", False) is True
+
+
 class _StaticResourceLimitError(RuntimeError):
     """Internal control-flow signal for one attacker-controlled work ceiling."""
 
@@ -756,15 +762,16 @@ def _scan_path(
         finding_budget.begin_module()
         try:
             with observe_analyzer_findings(finding_budget.observe_creation):
+                analyze_kwargs: dict[str, object] = {
+                    "content": content,
+                    "file_path": path,
+                    "file_type": file_type,
+                }
                 if file_type == "python" and _uses_python_ast(module):
-                    raw = module.analyze(
-                        content=content,
-                        file_path=path,
-                        file_type=file_type,
-                        python_ast=python_ast,
-                    )
-                else:
-                    raw = module.analyze(content=content, file_path=path, file_type=file_type)
+                    analyze_kwargs["python_ast"] = python_ast
+                if _uses_runtime_check(module):
+                    analyze_kwargs["check_runtime"] = finding_budget.check_runtime
+                raw = module.analyze(**analyze_kwargs)
                 finding_budget.check_runtime()
                 for af in raw:
                     finding_budget.observe_emission()
@@ -923,6 +930,10 @@ def _scan_view_windows(
             local_start = _line_start_offset(view.text, finding.start_line) + finding.start_column
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
             finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
+        if finding.end_line is not None and finding.end_column is not None:
+            local_end = _line_start_offset(view.text, finding.end_line) + finding.end_column
+            if 0 < local_end <= len(view.text):
+                finding.evidence[_SOURCE_END_EVIDENCE] = view.source_offset(local_end - 1) + 1
     if view.name != "raw":
         for finding in findings:
             if "normalized-view" not in finding.tags:
@@ -1204,6 +1215,7 @@ def _restore_source_lines(
 
     for finding in findings:
         source_start = finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+        source_end = finding.evidence.pop(_SOURCE_END_EVIDENCE, None)
         has_exact_start = isinstance(source_start, int) or finding.start_column is not None
         if isinstance(source_start, int):
             raw_start = source_start
@@ -1215,7 +1227,13 @@ def _restore_source_lines(
             has_exact_end = finding.end_column is not None
             end_offset = derived_offset(finding.end_line, finding.end_column)
             raw_end = (
-                source_end_offset(end_offset) if has_exact_end else view.source_offset(end_offset)
+                source_end
+                if isinstance(source_end, int)
+                else (
+                    source_end_offset(end_offset)
+                    if has_exact_end
+                    else view.source_offset(end_offset)
+                )
             )
             finding.end_line, raw_end_column = source_position(raw_end)
             finding.end_column = raw_end_column if has_exact_end else None
@@ -1563,10 +1581,22 @@ def _scan_all_views_detailed(
                     owned_findings: list[Finding] = []
                     for finding in view_findings:
                         source_start = finding.evidence.get(_SOURCE_START_EVIDENCE)
-                        if isinstance(source_start, int) and not (
-                            owned_source_start <= source_start < owned_source_end
-                        ):
-                            continue
+                        if isinstance(source_start, int):
+                            starts_in_owned_range = (
+                                owned_source_start <= source_start < owned_source_end
+                            )
+                            source_end = finding.evidence.get(_SOURCE_END_EVIDENCE)
+                            # A match starting in the left overlap normally belongs
+                            # to the preceding window. If its exact end lies past
+                            # that window's right edge, however, this is the first
+                            # window capable of observing the complete occurrence.
+                            first_discoverable_in_this_window = (
+                                source_start < owned_source_start
+                                and isinstance(source_end, int)
+                                and source_end > owned_source_start + _WINDOW_OVERLAP_CHARS
+                            )
+                            if not starts_in_owned_range and not first_discoverable_in_this_window:
+                                continue
                         owned_findings.append(finding)
                     view_findings = owned_findings
                     _restore_source_lines(
