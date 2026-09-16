@@ -81,5 +81,17 @@ def lookup_max_output_tokens(default_yaml_path: str, model: str) -> int | None:
     return None
 
 
+def lookup_setting(default_yaml_path: str, model: str, key: str) -> str | None:
+    """Return the registry's string-valued *key* for *model*, if declared."""
+    entry = _load(_resolve_path(default_yaml_path)).get(model)
+    value = entry.get(key) if entry else None
+    return str(value) if value else None
+
+
+def lookup_structured_output_method(default_yaml_path: str, model: str) -> str | None:
+    """Return the registry's ``structured_output`` method for *model*, if declared."""
+    return lookup_setting(default_yaml_path, model, "structured_output")
+
+
 # Back-compat alias for tests that previously called ``_load_registry``.
 _load_registry = _load

@@ -37,13 +37,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import threading
 import weakref
 from collections.abc import Coroutine
 from typing import Any, NoReturn
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableLambda
 
 from skillspector.inference_usage import InferenceUsageCollector, provider_name
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
@@ -355,10 +356,80 @@ class AgentCLIChatModel:
     async def ainvoke(self, prompt: str) -> _AgentCLIMessage:
         return await asyncio.to_thread(self.invoke, prompt)
 
-    def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
+    def with_structured_output(
+        self, schema: type, method: str | None = None
+    ) -> _StructuredAgentCLIModel:
+        del method  # parity with LangChain chat models; the CLI transport always asks for JSON
         return _StructuredAgentCLIModel(
             self._provider, self._model, self._max_output_tokens, schema, self._timeout
         )
+
+
+STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
+
+
+def structured_output_kwargs(model: str, provider: object | None = None) -> dict[str, str]:
+    """Keyword arguments for ``with_structured_output`` when binding a schema for *model*.
+
+    ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`` wins, then the active provider's
+    ``structured_output_method(model)`` hint, else LangChain's default (no kwargs).
+
+    Raises:
+        ValueError: when the environment override is not a known method.
+    """
+    override = os.environ.get("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
+    if override:
+        if override not in STRUCTURED_OUTPUT_METHODS:
+            raise ValueError(
+                "SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD must be one of "
+                f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {override!r}"
+            )
+        return {"method": override}
+    if provider is None:
+        provider = get_active_provider()
+    hint = getattr(provider, "structured_output_method", None)
+    method = hint(model) if callable(hint) else None
+    return {"method": method} if method else {}
+
+
+def bind_structured_output(
+    llm: object, schema: type, model: str, provider: object | None = None
+) -> object:
+    """``llm.with_structured_output(schema)`` with the method *model* needs.
+
+    A chat model restricted to ``toolChoice`` ``auto`` (Bedrock models that
+    reject a forced tool call) is bound with LangChain's default tool method,
+    the prompt asks for the tool call explicitly, and a prose answer raises
+    :class:`StructuredOutputParseError`, which the analyzers retry like any
+    other malformed structured response.
+    """
+    kwargs = structured_output_kwargs(model, provider)
+    structured = llm.with_structured_output(schema, **kwargs)  # type: ignore[attr-defined]
+    if kwargs or getattr(llm, "supports_tool_choice_values", None) != ("auto",):
+        return structured
+    return _require_tool_call(structured, schema)
+
+
+_TOOL_CALL_INSTRUCTION = (
+    "Report your result by calling the {tool} tool exactly once. Do not answer in prose."
+)
+
+
+def _require_tool_call(structured: Runnable, schema: type) -> Runnable:
+    """Ask for the tool call in the prompt and fail closed when it does not happen."""
+    tool = schema.__name__ if isinstance(schema, type) else "response"
+
+    def _ask(prompt: str) -> str:
+        return f"{prompt}\n\n{_TOOL_CALL_INSTRUCTION.format(tool=tool)}"
+
+    def _check(result: object) -> object:
+        if result is None:
+            raise StructuredOutputParseError(
+                f"model answered in prose instead of calling the {tool} tool"
+            )
+        return result
+
+    return RunnableLambda(_ask) | structured | RunnableLambda(_check)
 
 
 def get_chat_model(
