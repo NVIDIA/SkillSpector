@@ -530,6 +530,22 @@ class TestGetChatModelCLIAdapter:
                     "x"
                 )
 
+    def test_set_timeout_reaches_structured_wrapper(self) -> None:
+        """A retargeted deadline applies to structured wrappers made earlier."""
+
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = '{"verdict": "ok"}'
+        model = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024, timeout=30.0)
+        runnable = model.with_structured_output(_Schema)
+
+        model.set_timeout(4.5)
+        runnable.invoke("prompt")
+
+        assert provider.complete.call_args.kwargs["timeout"] == 4.5
+
     def test_structured_usage_marks_response_before_sync_parse_failure(self) -> None:
         class _Schema(BaseModel):
             verdict: str
