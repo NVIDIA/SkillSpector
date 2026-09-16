@@ -18,13 +18,15 @@
 import ast
 import json
 import re
+import shutil
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import typer
@@ -46,7 +48,9 @@ from skillspector.multi_skill import (
     MultiSkillDetectionResult,
     SkillDirectory,
 )
+from skillspector.nodes.finalize_inspection_ledger import finalize_inspection_ledger
 from skillspector.sarif_models import validate_sarif_report
+from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressedFinding, SuppressionRule
 
 runner = CliRunner()
@@ -108,6 +112,14 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         "gemini_cli",
     ):
         assert provider in result.output
+
+
+@pytest.mark.parametrize(("no_llm", "expected"), [(False, True), (True, False)])
+def test_scan_state_records_explicit_llm_request_intent(no_llm: bool, expected: bool) -> None:
+    """Report finalization can distinguish real CLI intent from legacy direct calls."""
+    state = cli._scan_state("skill", FormatChoice.json, no_llm)
+
+    assert state["llm_requested"] is expected
 
 
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
@@ -218,6 +230,57 @@ def test_cli_fail_on_incomplete_exits_one_after_writing_report(
 
     assert result.exit_code == 1
     assert output.exists()
+
+
+def test_cli_fail_on_incomplete_rejects_missing_semantic_telemetry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The CLI consumes the canonical semantic-runtime completeness projection."""
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "semantic-incomplete.json"
+
+    def invoke_without_semantic_telemetry(
+        state: dict[str, object], config: object
+    ) -> dict[str, object]:
+        del config
+        graph_state = {
+            **state,
+            "components": [],
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+            "llm_call_log": [],
+            "component_metadata": [],
+            "manifest": {},
+        }
+        typed_state = cast(SkillspectorState, graph_state)
+        finalized = finalize_inspection_ledger(typed_state)
+        rendered = cli_module.report(cast(SkillspectorState, {**graph_state, **finalized}))
+        return {**graph_state, **finalized, **rendered}
+
+    monkeypatch.setattr("skillspector.cli.graph.invoke", invoke_without_semantic_telemetry)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--fail-on-incomplete",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["analysis_completeness"]["is_complete"] is False
+    assert payload["analysis_completeness"]["status"] == "partial"
+    assert any(
+        "per-source runtime telemetry" in exception["message"]
+        for exception in payload["analysis_completeness"]["ledger_exceptions"]
+    )
 
 
 def test_cli_fail_on_findings_exits_one_below_risk_threshold(
@@ -367,6 +430,132 @@ def test_recursive_scan_malformed_risk_score_falls_back_to_zero(tmp_path: Path) 
     assert payload["max_risk_score"] == 0
 
 
+def test_recursive_scan_dispatches_dot_prefixed_child_skill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive dispatch scans bounded dot-prefixed children and excludes links and skips."""
+    for name in ("skill-a", "skill-b", ".review-helper"):
+        child = tmp_path / name
+        child.mkdir()
+        (child / "SKILL.md").write_text(f"---\nname: {name.lstrip('.')}\n---\n", encoding="utf-8")
+    skipped = tmp_path / ".git"
+    skipped.mkdir()
+    (skipped / "SKILL.md").write_text("---\nname: skipped\n---\n", encoding="utf-8")
+    linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+    linked_target.mkdir()
+    (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+    try:
+        (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    scanned_sources: list[tuple[str, bool]] = []
+
+    def fake_scan_skill(
+        *, input_path: str, source_local_only: bool = False, **_kwargs: object
+    ) -> dict[str, object]:
+        scanned_sources.append((input_path, source_local_only))
+        return {
+            "filtered_findings": [],
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "report_body": "{}",
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": True},
+        }
+
+    monkeypatch.setattr(cli_module, "_scan_skill", fake_scan_skill)
+    result = runner.invoke(app, ["scan", str(tmp_path), "--recursive", "--no-llm"])
+
+    assert result.exit_code == 0
+    assert scanned_sources == [
+        (str(tmp_path / ".review-helper"), True),
+        (str(tmp_path / "skill-a"), False),
+        (str(tmp_path / "skill-b"), False),
+    ]
+
+
+def test_recursive_dot_child_static_finding_never_reaches_a_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hidden-child source and finding context remain local through a real graph scan."""
+    private_marker = "PRIVATE_DOT_CHILD_FINDING_MARKER"
+    public_marker = "PUBLIC_PROVIDER_CONTROL_MARKER"
+    hidden_skill = tmp_path / ".review-helper"
+    hidden_skill.mkdir()
+    (hidden_skill / "SKILL.md").write_text(
+        "---\nname: review-helper\ndescription: local review helper\n---\n",
+        encoding="utf-8",
+    )
+    (hidden_skill / "run.py").write_text(
+        f'import os\nos.system("echo {private_marker}")\n', encoding="utf-8"
+    )
+    public_skill = tmp_path / "public-helper"
+    public_skill.mkdir()
+    (public_skill / "SKILL.md").write_text(
+        f"---\nname: public-helper\ndescription: public provider control\n---\n# {public_marker}\n",
+        encoding="utf-8",
+    )
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True,
+        skills=[
+            SkillDirectory(
+                path=hidden_skill,
+                name="review-helper",
+                relative_path=".review-helper",
+                local_only=True,
+            ),
+            SkillDirectory(
+                path=public_skill,
+                name="public-helper",
+                relative_path="public-helper",
+            ),
+        ],
+    )
+    transports: list[MagicMock] = []
+
+    def structured_output(schema: type) -> MagicMock:
+        response = schema(findings=[])
+        transport = MagicMock(
+            invoke=MagicMock(return_value=response),
+            ainvoke=AsyncMock(return_value=response),
+        )
+        transports.append(transport)
+        return transport
+
+    model = MagicMock()
+    model.with_structured_output.side_effect = structured_output
+    get_chat_model = MagicMock(return_value=model)
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+    monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(cli_module, "graph", import_module("skillspector.graph").create_graph())
+    monkeypatch.setattr(cli_module, "RISK_THRESHOLD", 100)
+    output = tmp_path / "recursive.json"
+
+    _scan_multi_skill(
+        detection,
+        FormatChoice.json,
+        output,
+        no_llm=False,
+    )
+
+    assert get_chat_model.call_count >= 3
+    provider_payloads = repr(
+        [
+            (call.args, call.kwargs)
+            for transport in transports
+            for call in [*transport.invoke.call_args_list, *transport.ainvoke.call_args_list]
+        ]
+    )
+    assert public_marker in provider_payloads
+    assert private_marker not in provider_payloads
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    child = payload["skills"][0]
+    assert private_marker in json.dumps(child["issues"])
+    assert child["metadata"].get("llm_calls_attempted", 0) == 0
+
+
 def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     """Benign context stays distinguishable without deleting deterministic CLI evidence."""
     (tmp_path / "references").mkdir()
@@ -470,6 +659,22 @@ def test_cli_keyring_fixture_reproduction_is_clean() -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert not any(issue["id"] == "PE3" for issue in payload["issues"])
+
+
+def test_cli_as3_self_reference_fixture_preserves_only_peer_path(tmp_path: Path) -> None:
+    fixture_source = Path(__file__).parents[1] / "fixtures" / "as3_self_reference"
+    fixture = tmp_path / "example-skill"
+    shutil.copytree(fixture_source, fixture)
+    result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
+
+    assert result.exit_code in {0, 1}, result.output
+    payload = json.loads(result.output)
+    assert payload["execution_successful"] is True
+    assert [
+        (issue["location"]["file"], issue["finding"])
+        for issue in payload["issues"]
+        if issue["id"] == "AS3"
+    ] == [("README.md", "skills/peer-skill/SKILL.md")]
 
 
 def test_cli_scan_nonexistent_exits_2() -> None:
@@ -2586,6 +2791,179 @@ def test_scan_transitive_preserves_cached_child_llm_telemetry(monkeypatch) -> No
     assert body["metadata"]["llm_calls_attempted"] == 1
     assert body["metadata"]["llm_calls_succeeded"] == 0
     assert body["metadata"]["llm_degraded"] is True
+
+
+def test_scan_transitive_scopes_complete_root_and_child_semantic_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete child pass cannot collide with the root's analyzer IDs."""
+    target = "https://github.com/org/transitive.git"
+    analyzer_ids = (
+        "semantic_developer_intent",
+        "semantic_quality_policy",
+        "semantic_security_discovery",
+    )
+
+    def complete_semantic_result(*, file_cache: dict[str, str]) -> dict[str, object]:
+        result = _mock_graph_result(file_cache=file_cache)
+        result.update(
+            {
+                "use_llm": True,
+                "llm_requested": True,
+                "analyzer_status_events": [
+                    {"analyzer_id": analyzer_id, "status": "completed"}
+                    for analyzer_id in analyzer_ids
+                ],
+                "llm_call_log": [
+                    {"node": analyzer_id, "ok": True, "error": None} for analyzer_id in analyzer_ids
+                ],
+            }
+        )
+        return result
+
+    initial_result = complete_semantic_result(file_cache={"SKILL.md": target})
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format: FormatChoice,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline: Path | None = None,
+        show_suppressed: bool = False,
+        transitive_traversal: object | None = None,
+    ) -> dict[str, object]:
+        del format, no_llm, yara_dir, baseline, show_suppressed, transitive_traversal
+        assert input_path == target.removesuffix(".git")
+        return complete_semantic_result(file_cache={})
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=FormatChoice.json,
+        no_llm=False,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    assert merged["analysis_completeness"]["is_complete"] is True
+    assert json.loads(merged["report_body"])["metadata"].get("llm_degraded") is not True
+
+
+def test_transitive_descendants_cannot_clear_local_only_source_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local-only ancestry propagates monotonically through transitive child scans."""
+    target = "https://github.com/org/private-dependency"
+    initial_result = _mock_graph_result(file_cache={})
+    initial_result["local_file_cache"] = {"SKILL.md": target}
+    initial_result["source_local_only"] = True
+    calls: list[str] = []
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format: FormatChoice,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline: Path | None = None,
+        show_suppressed: bool = False,
+        transitive_traversal: object | None = None,
+        source_local_only: bool = False,
+    ) -> dict[str, object]:
+        del format, no_llm, yara_dir, baseline, show_suppressed, transitive_traversal
+        assert input_path == target
+        assert source_local_only is True
+        calls.append(input_path)
+        result = _mock_graph_result(file_cache={})
+        result["local_file_cache"] = {}
+        result["source_local_only"] = True
+        return result
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+
+    cli._scan_transitive(
+        initial_result=initial_result,
+        format=FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        source_local_only=True,
+    )
+    assert calls == [target]
+
+
+@pytest.mark.parametrize("privacy_order", [(True, False), (False, True)])
+def test_transitive_cache_is_partitioned_by_privacy_mode(
+    monkeypatch: pytest.MonkeyPatch, privacy_order: tuple[bool, bool]
+) -> None:
+    """A shared target is scanned independently for hidden and public roots."""
+    target = "https://github.com/org/shared-dependency"
+    calls: list[bool] = []
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format: FormatChoice,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline: Path | None = None,
+        show_suppressed: bool = False,
+        transitive_traversal: object | None = None,
+        source_local_only: bool = False,
+    ) -> dict[str, object]:
+        del format, no_llm, yara_dir, baseline, show_suppressed, transitive_traversal
+        assert input_path == target
+        calls.append(source_local_only)
+        result = _mock_graph_result(file_cache={})
+        result["local_file_cache"] = {}
+        result["source_local_only"] = source_local_only
+        result["llm_call_log"] = (
+            []
+            if source_local_only
+            else [{"node": "public-provider-control", "ok": True, "error": None}]
+        )
+        return result
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    traversal = cli._TransitiveTraversalState()
+
+    for source_local_only in privacy_order:
+        initial_result = _mock_graph_result(file_cache={})
+        initial_result["local_file_cache"] = {"SKILL.md": target}
+        cli._scan_transitive(
+            initial_result=initial_result,
+            format=FormatChoice.json,
+            no_llm=False,
+            max_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            baseline=None,
+            show_suppressed=False,
+            visited=set(),
+            traversal=traversal,
+            source_local_only=source_local_only,
+        )
+
+    assert calls == list(privacy_order)
+    assert set(traversal.cache) == {(target, False), (target, True)}
+    assert traversal.cache[(target, True)].llm_call_log == []
+    public_cached = traversal.cache[(target, False)]
+    assert public_cached.llm_call_log == [
+        {
+            "node": "public-provider-control",
+            "ok": True,
+            "error": None,
+            "source_url": target,
+            "source_identity": public_cached.source_identity,
+            "source_digest": public_cached.source_digest,
+        }
+    ]
 
 
 def test_scan_transitive_zero_depth_preserves_root_cleanup(tmp_path: Path, monkeypatch) -> None:
