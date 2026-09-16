@@ -313,7 +313,9 @@ async def test_late_provider_binding_cannot_claim_a_complete_semantic_scan(
         lambda: (False, "not configured"),
         raising=False,
     )
-    late_bound_graph = graph_module.create_graph()
+    from skillspector import create_graph
+
+    late_bound_graph = create_graph()
 
     def transport_failure(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated late-bound provider failure")
