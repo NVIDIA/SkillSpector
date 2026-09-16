@@ -4,12 +4,14 @@
 """Tests for the MCP Registry owner and posture checks."""
 
 import json
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from skillspector import mcp_registry
 from skillspector.mcp_registry import (
     OFFICIAL_META_KEY,
     REGISTRY_URL,
@@ -419,3 +421,96 @@ def test_scan_registry_aggregates_risk_score() -> None:
     report = scan_registry(str(FIXTURES / "mcp_registry.json"))
     assert report["risk_score"] == 45
     assert report["max_risk_score"] == 25
+
+
+def test_local_registry_bounds_read_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.touch()
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", 32, raising=False)
+    read_sizes: list[int] = []
+
+    class Source(BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return super().read(size)
+
+    def unexpected_parse(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("oversized JSON must be rejected before parsing")
+
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: Source(b" " * 64))
+    monkeypatch.setattr(mcp_registry.json, "loads", unexpected_parse)
+    with pytest.raises(ValueError, match="MCP Registry source failed.*exceeds 32 bytes"):
+        scan_registry(str(capture))
+    assert read_sizes == [33]
+
+
+def test_local_registry_accepts_exact_byte_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    raw = json.dumps(one_server({"name": "example/ü"}), ensure_ascii=False).encode("utf-8")
+    capture.write_bytes(raw)
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", len(raw), raising=False)
+    assert scan_registry(str(capture))["server_count"] == 1
+
+
+def test_local_registry_bounds_depth_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_text('{"servers": [], "extra": [[[]]]}', encoding="utf-8")
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_DEPTH", 3, raising=False)
+
+    def unexpected_parse(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("deep JSON must be rejected before parsing")
+
+    monkeypatch.setattr(mcp_registry.json, "loads", unexpected_parse)
+    with pytest.raises(ValueError, match="MCP Registry source failed.*nesting exceeds 3 levels"):
+        scan_registry(str(capture))
+
+
+def test_local_registry_depth_ignores_escaped_string_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    server = {"name": "example/safe", "description": '[[[{{{\\"\\\\'}
+    capture.write_text(json.dumps(one_server(server)), encoding="utf-8")
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_DEPTH", 4, raising=False)
+    assert scan_registry(str(capture))["snapshots"][0]["description"] == server["description"]
+
+
+@pytest.mark.parametrize("field", ["servers", "packages", "remotes"])
+def test_registry_bounds_record_expansion_before_normalization(
+    field: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = one_server({"name": "example/safe"})
+    if field == "servers":
+        data["servers"] *= 4
+    else:
+        data["servers"][0]["server"][field] = [{}, {}, {}]
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_RECORDS", 3, raising=False)
+
+    def unexpected_normalize(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("record budget must be checked before constructing snapshots")
+
+    monkeypatch.setattr(mcp_registry, "normalize_server", unexpected_normalize)
+    with pytest.raises(ValueError, match="exceeds 3 records"):
+        normalize_payload(data, source="fixture")
+
+
+def test_registry_record_budget_is_aggregate_and_accepts_exact_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "registry.json"
+    data = one_server(pinned_server())
+    data["servers"].append({"server": pinned_server(name="example/second")})
+    capture.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_RECORDS", 6, raising=False)
+    report = scan_registry(str(capture))
+    assert report["server_count"] == 2
+    assert len(report["snapshots"]) == len(report["servers"]) == 2
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_RECORDS", 5)
+    with pytest.raises(ValueError, match="exceeds 5 records"):
+        scan_registry(str(capture))

@@ -17,12 +17,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 
+from skillspector import suppression as suppression_module
 from skillspector.models import Finding
 from skillspector.suppression import (
     SHIPPED_BASELINE_FILENAME,
@@ -517,6 +519,167 @@ def test_baseline_from_dict_requires_scanner_version_for_fingerprints() -> None:
 def test_load_baseline_missing_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_baseline(tmp_path / "nope.yaml")
+
+
+def test_load_baseline_byte_limit_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_BYTES", 32, raising=False)
+    out = tmp_path / "baseline.yaml"
+    out.write_bytes(b"version: 2\n".ljust(32, b" "))
+    assert load_baseline(out).is_empty()
+    out.write_bytes(out.read_bytes() + b" ")
+
+    def unexpected_parse(*args: object, **kwargs: object) -> None:
+        pytest.fail("oversized baseline reached YAML parsing")
+
+    monkeypatch.setattr(yaml, "load", unexpected_parse)
+    with pytest.raises(ValueError, match="byte limit"):
+        load_baseline(out)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "boundary", "message"),
+    [
+        ("MAX_BASELINE_NODES", 3, "node limit"),
+        ("MAX_BASELINE_DEPTH", 2, "depth limit"),
+        ("MAX_BASELINE_SCALAR_CHARS", 7, "scalar character limit"),
+    ],
+)
+def test_load_baseline_yaml_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    boundary: int,
+    message: str,
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text("version: 2\n", encoding="utf-8")
+    monkeypatch.setattr(suppression_module, limit_name, boundary, raising=False)
+    assert load_baseline(out).is_empty()
+    monkeypatch.setattr(suppression_module, limit_name, boundary - 1, raising=False)
+    with pytest.raises(ValueError, match=message):
+        load_baseline(out)
+
+
+def test_load_baseline_counts_alias_expansion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text(
+        "version: 2\nrules:\n  - &rule {id: SQP-1, reason: accepted}\n  - *rule\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_NODES", 15, raising=False)
+    assert len(load_baseline(out).rules) == 2
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_NODES", 14, raising=False)
+    with pytest.raises(ValueError, match="expanded YAML node limit"):
+        load_baseline(out)
+
+
+def test_load_baseline_bounds_merge_expansion_before_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text(
+        "version: 2\n"
+        "a: &a {id: SQP-1, reason: accepted}\n"
+        "b: &b {<<: [*a, *a]}\n"
+        "c: &c {<<: [*b, *b]}\n"
+        "rules: [{<<: [*c, *c]}]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_NODES", 100, raising=False)
+
+    def unexpected_construction(*args: object, **kwargs: object) -> None:
+        pytest.fail("expanded baseline reached object construction")
+
+    monkeypatch.setattr(yaml.SafeLoader, "construct_document", unexpected_construction)
+    with pytest.raises(ValueError, match="expanded YAML node limit"):
+        load_baseline(out)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("note: &cycle [*cycle]\n", "cyclic YAML aliases"),
+        (
+            "a: &a [value]\nb: &b [*a]\nc: [*b]\n",
+            "expanded YAML depth limit",
+        ),
+    ],
+)
+def test_load_baseline_rejects_cyclic_or_deep_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str, message: str
+) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_DEPTH", 4, raising=False)
+    out = tmp_path / "baseline.yaml"
+    out.write_text("version: 2\n" + payload, encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_baseline(out)
+
+
+def test_load_baseline_bounds_repeated_scalar_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_BYTES", 96, raising=False)
+    out = tmp_path / "baseline.yaml"
+    content = f"version: 2\na: &text {'x' * 40}\nb: *text\nc: *text\n"
+    assert len(content.encode()) <= 96
+    out.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match="expanded YAML character limit"):
+        load_baseline(out)
+
+
+def test_load_baseline_preserves_bounded_yaml_merges(tmp_path: Path) -> None:
+    out = tmp_path / "baseline.yaml"
+    out.write_text(
+        "version: 2\n"
+        "defaults: &defaults {id: SQP-1, reason: accepted}\n"
+        "rules:\n  - <<: *defaults\n    path: SKILL.md\n"
+        "  - <<: [*defaults, {id: SSD-2, reason: second}]\n",
+        encoding="utf-8",
+    )
+    baseline = load_baseline(out)
+    assert baseline.rules == [
+        SuppressionRule(rule_id="SQP-1", reason="accepted", path="SKILL.md"),
+        SuppressionRule(rule_id="SQP-1", reason="accepted"),
+    ]
+
+
+def test_baseline_combined_record_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(suppression_module, "MAX_BASELINE_RECORDS", 2, raising=False)
+    data = {
+        "version": 2,
+        "scanner_version": SCANNER_VERSION,
+        "rules": [{"id": "SQP-1", "reason": "accepted"}],
+        "fingerprints": [{"hash": "sha256:" + "a" * 64, "reason": "accepted"}],
+    }
+    baseline = baseline_from_dict(data)
+    assert len(baseline.rules) + len(baseline.fingerprints) == 2
+    data["rules"].append({"id": "SSD-2", "reason": "accepted"})
+    with pytest.raises(ValueError, match="record limit"):
+        baseline_from_dict(data)
+    out = tmp_path / "baseline.yaml"
+    out.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="record limit"):
+        load_baseline(out)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_load_baseline_rejects_fifo_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "baseline.yaml"
+    os.mkfifo(out)
+
+    def unexpected_legacy_read(*args: object, **kwargs: object) -> None:
+        pytest.fail("non-regular baseline reached an unbounded read")
+
+    # Keep this regression safe on revisions that still use the blocking reader.
+    monkeypatch.setattr(Path, "read_text", unexpected_legacy_read)
+    with pytest.raises(ValueError, match="regular file"):
+        load_baseline(out)
 
 
 def test_build_dump_load_round_trip(tmp_path: Path) -> None:
