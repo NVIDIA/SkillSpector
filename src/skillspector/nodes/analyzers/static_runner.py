@@ -58,7 +58,10 @@ from skillspector.nodes.deduplicate import classification_metadata_key
 from skillspector.python_ast import (
     MAX_PYTHON_AST_SOURCE_CHARS,
     ParsedPythonFile,
+    PythonSourceClassification,
     get_python_ast,
+    may_be_python_source,
+    resolve_python_source_classification,
 )
 from skillspector.security_reconstruction import (
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
@@ -90,6 +93,7 @@ FILE_TYPES: dict[str, str] = {
     ".md": "markdown",
     ".markdown": "markdown",
     ".py": "python",
+    ".pyw": "python",
     ".sh": "shell",
     ".bash": "shell",
     ".zsh": "shell",
@@ -487,7 +491,7 @@ _LICENSE_CANONICAL_RANGES: tuple[tuple[tuple[str, ...], int], ...] = (
 
 
 def _infer_file_type(path: str) -> str:
-    """Infer file type from path (extension)."""
+    """Infer the declared file type from the path extension."""
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
@@ -640,6 +644,15 @@ def _uses_python_ast(module: object) -> bool:
     return getattr(module, "USES_PYTHON_AST", False) is True
 
 
+def _uses_python_source_type(module: object) -> bool:
+    """Return whether a module needs the artifact's Python execution type."""
+    return (
+        _uses_python_ast(module)
+        or _explicit_module_hook(module, "POSTPROCESS_USES_PYTHON_AST") is True
+        or getattr(module, "USES_PYTHON_SOURCE_TYPE", False) is True
+    )
+
+
 def _requires_python_ast(pattern_modules: list) -> bool:
     """Return whether an analyzer or its postprocessor consumes the shared AST."""
     return any(_uses_python_ast(module) for module in pattern_modules) or bool(
@@ -648,16 +661,25 @@ def _requires_python_ast(pattern_modules: list) -> bool:
     )
 
 
+def _requires_python_source_type(pattern_modules: list) -> bool:
+    """Return whether any analyzer behavior depends on Python execution identity."""
+    return any(_uses_python_source_type(module) for module in pattern_modules)
+
+
 def _python_ast_for_path(
     path: str,
     content: str,
     pattern_modules: list,
     python_ast_cache_key: str | None,
+    *,
+    python_source: bool | None = None,
 ) -> ParsedPythonFile | None:
     """Return the shared parse needed by analyzer or postprocessor hooks."""
     if len(content) > MAX_FILE_CHARS or not _requires_python_ast(pattern_modules):
         return None
-    if _infer_file_type(path) != "python":
+    if python_source is None:
+        python_source = may_be_python_source(path, content)
+    if not python_source:
         return None
     return get_python_ast(python_ast_cache_key, content, path)
 
@@ -857,23 +879,28 @@ def _scan_path(
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None = None,
     python_ast: ParsedPythonFile | None = None,
+    python_source: bool | None = None,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
     file_type = _infer_file_type(path)
+    if python_source is None:
+        python_source = may_be_python_source(path, content)
     content_lines = content.splitlines()
     normalized_license_lines = (
         tuple(_normalize_license_line(line) for line in content_lines)
         if _is_license_basename(path, file_type)
         else None
     )
-    if file_type == "python" and any(_uses_python_ast(module) for module in pattern_modules):
+    if python_source and any(_uses_python_ast(module) for module in pattern_modules):
         finding_budget.check_runtime()
         python_ast = python_ast or get_python_ast(python_ast_cache_key, content, path)
         finding_budget.check_runtime()
 
     line_starts = logical_line_starts(content)
     for module in pattern_modules:
+        module_uses_python = _uses_python_source_type(module)
+        module_file_type = "python" if python_source and module_uses_python else file_type
         module_finding_start = len(findings)
         occurrence_columns = _OccurrenceColumnResolver(content, line_starts)
         finding_budget.begin_module()
@@ -882,9 +909,9 @@ def _scan_path(
                 analyze_kwargs: dict[str, object] = {
                     "content": content,
                     "file_path": path,
-                    "file_type": file_type,
+                    "file_type": module_file_type,
                 }
-                if file_type == "python" and _uses_python_ast(module):
+                if module_file_type == "python" and _uses_python_ast(module):
                     analyze_kwargs["python_ast"] = python_ast
                 if _uses_runtime_check(module):
                     analyze_kwargs["check_runtime"] = finding_budget.check_runtime
@@ -896,7 +923,7 @@ def _scan_path(
                     converted = _convert_analyzer_finding(
                         af,
                         path=path,
-                        file_type=file_type,
+                        file_type=module_file_type,
                         content=content,
                         content_lines=content_lines,
                         normalized_license_lines=normalized_license_lines,
@@ -916,7 +943,7 @@ def _scan_path(
                     converted = _convert_analyzer_finding(
                         af,
                         path=path,
-                        file_type=file_type,
+                        file_type=module_file_type,
                         content=content,
                         content_lines=content_lines,
                         normalized_license_lines=normalized_license_lines,
@@ -1068,6 +1095,7 @@ def _scan_view_windows(
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None,
     *,
+    python_source: bool,
     source_text: str,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Scan one already-bounded view."""
@@ -1079,6 +1107,7 @@ def _scan_view_windows(
             pattern_modules,
             finding_budget,
             python_ast_cache_key,
+            python_source=python_source,
         )
     finally:
         _ACTIVE_SECURITY_VIEW.reset(view_token)
@@ -1764,6 +1793,7 @@ def _scan_declared_marker_views(
     owned_starts: tuple[int, ...],
     raw_starts: tuple[int, ...],
     source_context: _WindowSourceContext,
+    python_source: bool,
 ) -> tuple[list[Finding], bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -1846,6 +1876,7 @@ def _scan_declared_marker_views(
                         pattern_modules,
                         view_budget,
                         None,
+                        python_source=python_source,
                         source_text=raw_window,
                     )
                     _restore_source_lines(
@@ -1899,22 +1930,23 @@ def _scan_all_views_detailed(
     timeout_seconds: float | None = None,
     started_at: float | None = None,
     python_ast: ParsedPythonFile | None = None,
+    python_source: bool | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
     started_at = time.monotonic() if started_at is None else started_at
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
-    python_ast_eligible = _infer_file_type(path) == "python" and len(content) <= MAX_FILE_CHARS
-    if python_ast is None:
-        python_ast = _python_ast_for_path(
-            path,
-            content,
-            pattern_modules,
-            python_ast_cache_key,
+    if python_source is None:
+        python_source = (
+            may_be_python_source(path, content)
+            if _requires_python_source_type(pattern_modules)
+            else False
         )
+    python_ast_eligible = python_source and len(content) <= MAX_FILE_CHARS
+    if python_ast_eligible and _requires_python_ast(pattern_modules) and python_ast is None:
+        python_ast = get_python_ast(python_ast_cache_key, content, path)
     python_syntax_error = bool(
-        _infer_file_type(path) == "python"
-        and len(content) <= MAX_FILE_CHARS
+        python_ast_eligible
         and _requires_python_ast(pattern_modules)
         and python_ast is not None
         and python_ast.tree is None
@@ -2051,6 +2083,7 @@ def _scan_all_views_detailed(
                     owned_starts=marker_owned_starts,
                     raw_starts=marker_raw_starts,
                     source_context=source_context,
+                    python_source=python_source,
                 )
             )
         except _StaticResourceLimitError as exc:
@@ -2085,6 +2118,7 @@ def _scan_all_views_detailed(
                 finding_budget,
                 python_ast_cache_key,
                 python_ast,
+                python_source=python_source,
             )
         except _StaticResourceLimitError as exc:
             return reconciled_prefix(), exc.reason, exc.metrics
@@ -2202,6 +2236,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            python_source=python_source,
                             source_text=raw_window,
                         )
                     except _StaticResourceLimitError as exc:
@@ -2304,6 +2339,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            python_source=python_source,
                             source_text=continuity.view.text,
                         )
                         _restore_source_lines(
@@ -2383,6 +2419,7 @@ def _scan_all_views(
     timeout_seconds: float | None = None,
     started_at: float | None = None,
     python_ast: ParsedPythonFile | None = None,
+    python_source: bool | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -2393,6 +2430,7 @@ def _scan_all_views(
         timeout_seconds=timeout_seconds,
         started_at=started_at,
         python_ast=python_ast,
+        python_source=python_source,
     )
     return findings
 
@@ -2474,6 +2512,17 @@ def run_static_patterns(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
+    source_classifications = cast(
+        Mapping[str, PythonSourceClassification | str] | None,
+        state.get("python_source_classifications")
+        if "python_source_classifications" in state
+        else None,
+    )
+    source_classification_limitations = cast(
+        Mapping[str, str], state.get("python_source_classification_limitations") or {}
+    )
+    needs_python_source = _requires_python_source_type(pattern_modules)
     python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
     container_paths = {
         str(metadata.get("path", ""))
@@ -2500,6 +2549,8 @@ def run_static_patterns(
         if content is None:
             logger.debug("Skipping %s: no content in file_cache", path)
             continue
+        if needs_python_source and path in source_classification_limitations:
+            continue
         if path in binary_paths or (not binary_paths and _is_binary_file(path, content)):
             continue
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
@@ -2509,11 +2560,24 @@ def run_static_patterns(
         shared_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
         if shared_remaining is not None and shared_remaining <= 0:
             break
+        python_source = False
+        if needs_python_source:
+            source_classification = resolve_python_source_classification(
+                path,
+                content,
+                source_classifications=source_classifications,
+                raw_file_cache=raw_file_cache,
+            )
+            python_source = source_classification is not PythonSourceClassification.NON_PYTHON
+            current_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
+            if current_remaining is not None and current_remaining <= 0:
+                break
         python_ast = _python_ast_for_path(
             path,
             content,
             pattern_modules,
             python_ast_cache_key,
+            python_source=python_source,
         )
         path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
         path_findings, resource_limit, _ = _scan_all_views_detailed(
@@ -2525,6 +2589,7 @@ def run_static_patterns(
             timeout_seconds=shared_remaining,
             started_at=path_started_at,
             python_ast=python_ast,
+            python_source=python_source,
         )
         runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
         if shared_remaining is not None:
@@ -2564,6 +2629,20 @@ def run_static_patterns_with_ledger(
     file_cache = cast(
         dict[str, str], state.get("local_file_cache") or state.get("file_cache") or {}
     )
+    raw_file_cache = cast(Mapping[str, bytes] | None, state.get("raw_file_cache"))
+    source_classifications = cast(
+        Mapping[str, PythonSourceClassification | str] | None,
+        state.get("python_source_classifications")
+        if "python_source_classifications" in state
+        else None,
+    )
+    source_classification_limitations = cast(
+        Mapping[str, str], state.get("python_source_classification_limitations") or {}
+    )
+    source_decode_failures = cast(
+        Mapping[str, str], state.get("python_source_decode_failures") or {}
+    )
+    needs_python_source = _requires_python_source_type(pattern_modules)
     python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
     container_paths = {
         str(metadata.get("path", ""))
@@ -2590,7 +2669,23 @@ def run_static_patterns_with_ledger(
             )
         else:
             artifact = inventory.get(path, {})
-        if path not in container_paths and artifact.get("content_kind") == ContentKind.OPAQUE:
+        if path not in container_paths and path in source_classification_limitations:
+            event = ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                phase="static",
+                analyzer_id=analyzer_id,
+                path=path,
+                reason=LedgerReason.RUNTIME_LIMIT,
+            )
+        elif path not in container_paths and path in source_decode_failures:
+            event = ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                phase="static",
+                analyzer_id=analyzer_id,
+                path=path,
+                reason=LedgerReason.PYTHON_SOURCE_DECODE_ERROR,
+            )
+        elif path not in container_paths and artifact.get("content_kind") == ContentKind.OPAQUE:
             event = ledger_event(
                 outcome=(
                     LedgerOutcome.FAILED
@@ -2641,6 +2736,7 @@ def run_static_patterns_with_ledger(
                 path_findings: list[Finding]
                 resource_limit: LedgerReason | None
                 resource_metrics: dict[str, int | float]
+                source_classification: PythonSourceClassification | None = None
                 if shared_remaining is not None and shared_remaining <= 0:
                     path_findings = []
                     resource_limit = LedgerReason.RUNTIME_LIMIT
@@ -2650,11 +2746,36 @@ def run_static_patterns_with_ledger(
                     }
                 else:
                     try:
+                        python_source = False
+                        if needs_python_source:
+                            source_classification = resolve_python_source_classification(
+                                path,
+                                content,
+                                source_classifications=source_classifications,
+                                raw_file_cache=raw_file_cache,
+                            )
+                            python_source = (
+                                source_classification is not PythonSourceClassification.NON_PYTHON
+                            )
+                            current_remaining = transitive_remaining_seconds(
+                                cast(SkillspectorState, state)
+                            )
+                            if current_remaining is not None and current_remaining <= 0:
+                                raise _StaticResourceLimitError(
+                                    LedgerReason.RUNTIME_LIMIT,
+                                    {
+                                        "observed_seconds": max(
+                                            0.0, time.monotonic() - path_started_at
+                                        ),
+                                        "limit_seconds": max(0.0, shared_remaining or 0.0),
+                                    },
+                                )
                         python_ast = _python_ast_for_path(
                             path,
                             content,
                             pattern_modules,
                             python_ast_cache_key,
+                            python_source=python_source,
                         )
                         path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
                         path_findings, resource_limit, resource_metrics = _scan_all_views_detailed(
@@ -2666,6 +2787,7 @@ def run_static_patterns_with_ledger(
                             timeout_seconds=shared_remaining,
                             started_at=path_started_at,
                             python_ast=python_ast,
+                            python_source=python_source,
                         )
                         has_postprocessor = bool(
                             pattern_modules
@@ -2762,12 +2884,22 @@ def run_static_patterns_with_ledger(
                     path_findings = path_findings[:remaining]
                     resource_limit = LedgerReason.OUTPUT_LIMIT
                 findings.extend(path_findings)
-                partial = resource_limit is not None or (
-                    _infer_file_type(path) == "python"
+                oversized_python = (
+                    source_classification is not None
+                    and source_classification is not PythonSourceClassification.NON_PYTHON
                     and len(content) > MAX_FILE_CHARS
                     and _requires_python_ast(pattern_modules)
                 )
-                partial_reason = resource_limit or LedgerReason.SIZE_LIMIT
+                ambiguous_python = (
+                    source_classification is PythonSourceClassification.AMBIGUOUS
+                    and needs_python_source
+                )
+                partial = resource_limit is not None or oversized_python or ambiguous_python
+                partial_reason = (
+                    resource_limit
+                    or (LedgerReason.SIZE_LIMIT if oversized_python else None)
+                    or LedgerReason.PYTHON_SOURCE_AMBIGUOUS
+                )
                 event = ledger_event(
                     outcome=LedgerOutcome.PARTIAL if partial else LedgerOutcome.COMPLETED,
                     phase="static",

@@ -81,6 +81,7 @@ ALLOWED_DOWNLOAD_HOSTS = frozenset(
 _DIRECT_FILE_URL_SUFFIXES = (
     ".md",
     ".py",
+    ".pyw",
     ".sh",
 )
 
