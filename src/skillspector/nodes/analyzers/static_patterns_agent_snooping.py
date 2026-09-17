@@ -209,7 +209,7 @@ def _normalize_skill_identifier(value: object) -> str | None:
 
 
 def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
-    """Derive a trusted, internally consistent current-skill identity."""
+    """Derive current-skill identities from scan-root basename and/or manifest name."""
 
     skill_path: object = state.get("skill_path")
     path_text: str | bytes | None = None
@@ -230,14 +230,17 @@ def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
     if isinstance(manifest, Mapping):
         manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
 
-    # The path is the only host-derived identity available here.  A manifest
-    # name is contributor-controlled, so it may corroborate the path but must
-    # never introduce a second identity or override a disagreement.
-    if path_identifier is None:
-        return frozenset()
-    if manifest_identifier is not None and manifest_identifier != path_identifier:
-        return frozenset()
-    return frozenset({path_identifier})
+    # Accept both host-derived scan-root basename and declared manifest name as
+    # independent current-skill identities. Temp clones extract to directories
+    # like ``.../repo`` while SKILL.md keeps the real skill name; treating only
+    # the path as authoritative false-positives those self-references as AS3.
+    # Peer-skill paths still fire because they match neither identity.
+    identifiers: set[str] = set()
+    if path_identifier is not None:
+        identifiers.add(path_identifier)
+    if manifest_identifier is not None:
+        identifiers.add(manifest_identifier)
+    return frozenset(identifiers)
 
 
 def _is_current_skill_path_reference(
