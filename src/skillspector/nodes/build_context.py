@@ -3215,31 +3215,37 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 classified_artifact = inventory_by_path.get(path)
                 if classified_artifact is not None:
                     promote_artifact_to_decoded_text(classified_artifact)
+                    disposition = classified_artifact.get("disposition")
+                    reason = classified_artifact.get("reason")
+                    bounded_provider_view = (
+                        disposition == ArtifactDisposition.PARTIAL
+                        and reason
+                        in {
+                            LedgerReason.SIZE_LIMIT.value,
+                            LedgerReason.TOTAL_BYTES_LIMIT.value,
+                        }
+                    )
                     if not source_local_only and (
                         path in llm_file_cache
                         or (
                             path not in nested.file_cache
                             and path not in recognized_containers
                             and not _is_hidden_path(path)
-                            and classified_artifact.get("disposition")
-                            == ArtifactDisposition.ANALYZED
+                            and (
+                                disposition == ArtifactDisposition.ANALYZED or bounded_provider_view
+                            )
                         )
                     ):
                         provider_content = decoded_python
-                        if classified_artifact.get("disposition") == ArtifactDisposition.PARTIAL:
-                            reason = classified_artifact.get("reason")
-                            if reason in {
-                                LedgerReason.SIZE_LIMIT.value,
-                                LedgerReason.TOTAL_BYTES_LIMIT.value,
-                            }:
-                                provider_content = _llm_view_of_truncated_file(
-                                    decoded_python,
-                                    total_size=max(
-                                        len(raw_content),
-                                        int(classified_artifact.get("size_bytes", 0)),
-                                    ),
-                                    read_bytes=len(raw_content),
-                                )
+                        if bounded_provider_view:
+                            provider_content = _llm_view_of_truncated_file(
+                                decoded_python,
+                                total_size=max(
+                                    len(raw_content),
+                                    int(classified_artifact.get("size_bytes", 0)),
+                                ),
+                                read_bytes=len(raw_content),
+                            )
                         llm_file_cache[path] = _redact_for_external_model(
                             path,
                             provider_content,

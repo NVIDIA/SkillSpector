@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -283,6 +285,54 @@ def test_truncated_pep263_python_preserves_exact_provider_text_and_audit_gap(
     assert "café" in provider_text
     assert "audit" in provider_text
     assert "gap" in provider_text
+
+
+def test_truncated_binary_like_pep263_python_enters_exact_provider_cache(
+    tmp_path, monkeypatch
+) -> None:
+    """A strict Python decode can promote a binary heuristic without losing LLM coverage."""
+    filename = "script.py"
+    raw = b"# coding: latin-1\nvalue='" + b"\xff" * 200 + b"'\n" + b"x" * 200
+    (tmp_path / filename).write_bytes(raw)
+    monkeypatch.setattr(build_context_module, "MAX_ANALYZABLE_FILE_BYTES", 128)
+
+    state = build_context({"skill_path": str(tmp_path)})
+    artifact = next(item for item in state["artifact_inventory"] if item["path"] == filename)
+
+    assert artifact["content_kind"] is ContentKind.TEXT
+    assert artifact["disposition"] is ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.SIZE_LIMIT.value
+    provider_text = state["llm_file_cache"][filename]
+    assert "ÿ" in provider_text
+    assert "audit" in provider_text
+    assert "gap" in provider_text
+
+
+def test_promoted_binary_like_python_respects_provider_boundaries(tmp_path, monkeypatch) -> None:
+    """Exact decoding must not publish local-only, hidden, or nested source."""
+    raw = b"# coding: latin-1\nvalue='" + b"\xff" * 200 + b"'\n" + b"x" * 200
+    monkeypatch.setattr(build_context_module, "MAX_ANALYZABLE_FILE_BYTES", 128)
+
+    local_only = tmp_path / "local-only"
+    local_only.mkdir()
+    (local_only / "script.py").write_bytes(raw)
+    local_state = build_context({"skill_path": str(local_only), "source_local_only": True})
+    assert local_state["llm_file_cache"] == {}
+
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    (hidden / ".script.py").write_bytes(raw)
+    hidden_state = build_context({"skill_path": str(hidden)})
+    assert ".script.py" not in hidden_state["llm_file_cache"]
+
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr("script.py", raw)
+    (nested / "bundle.zip").write_bytes(archive_bytes.getvalue())
+    nested_state = build_context({"skill_path": str(nested)})
+    assert "bundle.zip!/script.py" not in nested_state["llm_file_cache"]
 
 
 @pytest.mark.parametrize(
