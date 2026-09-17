@@ -67,11 +67,123 @@ E2_PYTHON_FALLBACK_PATTERNS = [
     # Require braces so bare ``2 ** os.environ`` (exponentiation) is not flagged.
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
 ]
+# The prefix the argument scan may cross before the name it looks for, and that name. Both are
+# reused by the guards below, which have to decide whether an option's operand is itself the
+# search pattern. A quoted argument is scanned up to the next quote character. An unquoted one
+# ends at whitespace, a quote, a # or a shell operator, so a bare pipe stops it and a redacting
+# stage further down the pipeline stays a command of its own, while a redirect keeps the name of
+# the file out of it, as in `grep PATH<secret.txt`, but an escaped pipe is grep's own alternation and is
+# crossed: it is the `aws_\|secret` in `grep -E aws_\|secret`. An escaped space or tab is
+# crossed too, since it keeps the word going, as in `grep PATH\ SECRET`. The three unquoted
+# alternatives cannot match the same character, so a long argument has nothing to reparse.
+_GREP_ARGUMENT_PREFIX = (
+    r"(?:['\"`][^'\"`\n]{0,40}?"
+    r"|(?:\\[|\t ]|[^'\"`\s;<>&#|\\]|\\(?![|\t ])){0,40}?)"
+)
+# A secret name, optionally plural or numbered and optionally joined to a qualifier that names
+# the kind of secret, as in APIKEY or secretkey. The name cannot follow a letter, a digit, a $
+# or a ${, so MONKEY_PATCH and `grep "^$key="` are not secret lookups.
+_SECRET_NAME = (
+    r"(?:api|access|auth|client|private|secret)?(?:key|secret|token|password)s?\d*(?![a-z])"
+)
+_NAME_START = r"(?<![a-z0-9$])(?<!\$\{)"
+# An inverting option, in either the short bundle or the long spelling. In a short bundle the
+# v has to come before any e, since everything after -e is the search pattern: -ePRIVATE_KEY
+# searches for PRIVATE_KEY. The bundle is case sensitive, since -E is not -e and -V is not -v,
+# so `grep -Ev 'KEY|SECRET'` inverts. The letters before the v cannot themselves be a v, so
+# there is one way to split the word and a long run of v characters cannot backtrack.
+_GREP_INVERTING_OPTION = r"-(?:(?-i:[^\Wev]*v)\w*+|-inv[\w-]*+)(?![\w-])"
+# One piece of a shell word: a quoted string, an escaped character, or a character the shell
+# does not end the word at. A quoted | or > stays inside the word, as in --label='<stdin>', while
+# an unquoted one ends it, which keeps the option walks inside one command so a line of
+# repeated pipelines is not rescanned from every env on it. The alternatives start with
+# different characters, so a word has one way to split.
+_SHELL_WORD_PART = r"(?:'[^'\n]*'|\"[^\"\n]*\"|\\.|[^\s;&|<>'\"\\])"
+# grep options that take a separate operand, so the operand is not mistaken for the search
+# pattern: `grep -m 1 SECRET` would otherwise stop at the 1. -e and --regexp are left out on
+# purpose, since their operand is the search pattern and is handled separately below. The short
+# forms are case sensitive because -A and -a mean different things, and the alternatives are
+# atomic so a run of them cannot be reparsed and blow up.
+# `--` ends grep's options, so no later word is one. Both inversion walks stop at it, which is
+# also why `grep -- SECRET -v` is not seen as redaction: that gap predates this pattern.
+_GREP_END_OF_OPTIONS = r"--(?![^\s;&|<>])"
+_GREP_OPTION_WITH_OPERAND = (
+    r"(?:(?-i:-[a-zA-Z]*[ABCDdfm])"
+    r"|--(?:after-context|before-context|context|binary-files|devices|directories"
+    r"|file|max-count|label|exclude(?:-dir|-from)?|include(?:-dir)?|group-separator))"
+    rf"(?:={_SHELL_WORD_PART}*+|[^\S\n]++{_SHELL_WORD_PART}++)"
+)
+# -e and --regexp carry the search pattern, attached or separate. The flag run stops in front
+# of one that names a secret, so the scan lands on the name: `grep --regexp=SECRET > out` would
+# otherwise have the run consume the option whole and start scanning at the redirect. Operands
+# naming something else are consumed, so the second pattern in `grep -e PATH -e SECRET` is
+# still reached.
+# A quoted operand is one word even when it holds a space, as in -e 'PATH HOME', and so is an
+# unquoted one whose space is escaped, as in -e PATH\ HOME.
+# The -e of a short bundle, and only a real one: a letter that takes an operand would have
+# swallowed the rest of the word, so `-drecurse` is -d with the operand recurse, not an -e.
+# Each letter before the e is checked one at a time, so the word has one way to split.
+_GREP_SHORT_PATTERN_FLAG = r"(?-i:-(?:[a-zA-Z](?<![ABCDdfme]))*e)"
+_GREP_ATTACHED_PATTERN_OPTION = rf"(?:--regexp=|{_GREP_SHORT_PATTERN_FLAG})"
+_GREP_ATTACHED_SECRET = (
+    rf"(?!{_GREP_ATTACHED_PATTERN_OPTION}"
+    rf"(?:{_GREP_ARGUMENT_PREFIX}{_NAME_START})?{_SECRET_NAME})"
+)
+_GREP_PATTERN_OPERAND = rf"{_SHELL_WORD_PART}++"
+_GREP_ORDINARY_PATTERN_OPERAND = (
+    rf"(?:{_GREP_SHORT_PATTERN_FLAG}[^\S\n]++|--regexp(?:=|[^\S\n]++))"
+    rf"(?!{_GREP_ARGUMENT_PREFIX}{_NAME_START}{_SECRET_NAME})"
+    rf"{_GREP_PATTERN_OPERAND}"
+)
+# The leading walk skips every separate pattern operand, whatever it names, so the -v in
+# `grep -e PATH -v -e SECRET` is still found and an operand spelled -v is not taken for one.
+# An attached one is part of its option word, quotes included, as in --regexp='PATH|HOME'.
+_GREP_ANY_PATTERN_OPERAND = (
+    rf"(?:{_GREP_SHORT_PATTERN_FLAG}[^\S\n]++|--regexp[^\S\n]++){_GREP_PATTERN_OPERAND}"
+)
+
 E2_OTHER_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
-    (r"env\s*\|\s*grep\s+(?:-i\s+)?(?:key|secret|token|password)", 0.8),
+    # Shell: env/printenv piped to grep for secrets. Inversion is checked on both sides of the
+    # search pattern, because grep accepts -v after it as readily as before, and excluding
+    # secrets from the output is the redaction idiom rather than harvesting. Neither check
+    # reads the whole line: each walks the words of this command only, the leading one from
+    # grep to the search pattern and the trailing one from the search pattern on, and a word
+    # ends at a pipe, a redirect or a separator, quoted strings and escaped characters
+    # included, so the pipe in `grep -E 'SECRET|TOKEN' -v` does not end the walk early.
+    # A word that cannot be an option is not read as one: an -e or --regexp operand is stepped
+    # over, as in `grep -e SECRET -e -v`, and a bare -- ends the walk, since it ends grep's
+    # options, as in `grep -E -- -v\|SECRET` where the -v is grep's pattern. That scoping is what keeps a
+    # trailing "# -v" comment or a later command from suppressing a real harvest, and it leaves
+    # a redacting stage further down the pipeline visible to the grep that owns it. Both the
+    # walk and the flag run carry an option's operand along with it, so `grep -m 1 SECRET`
+    # reaches SECRET and `grep -m 1 -v SECRET` still reads as redaction, and the run stops in
+    # front of an -e or --regexp operand that names a secret so an attached or later search
+    # pattern is not skipped over. The flag run and the whitespace around its words are
+    # possessive, so a long run of flags or spaces is not rescanned for every way to split it.
+    # The pipe may be followed by a line break, and either side of it by an escaped one, as
+    # bash allows. A name cannot follow a letter or digit but may be plural, numbered or joined
+    # to a qualifier, so KEY2 and APIKEY count but MONKEY_PATCH and KEYBOARD do not; an attached
+    # operand is the other place a name may follow a letter, since the letter is grep's flag.
+    (
+        r"\b(?:printenv|env)(?:[^\S\n]|\\\n)*+\|(?:\s|\\\n)*+[ef]?grep"
+        rf"(?!(?:[^\S\n]++(?>{_GREP_OPTION_WITH_OPERAND}|{_GREP_ANY_PATTERN_OPERAND}"
+        rf"|(?!{_GREP_END_OF_OPTIONS})-{_SHELL_WORD_PART}*+))*"
+        rf"[^\S\n]++{_GREP_INVERTING_OPTION})"
+        rf"[^\S\n]++(?:{_GREP_ATTACHED_SECRET}"
+        rf"(?>{_GREP_ORDINARY_PATTERN_OPERAND}|{_GREP_OPTION_WITH_OPERAND}"
+        rf"|--?[\w-]+(?:={_SHELL_WORD_PART}*+)?)[^\S\n]++)*+"
+        rf"(?!{_GREP_PATTERN_OPERAND}"
+        rf"(?:[^\S\n]++(?>{_GREP_ANY_PATTERN_OPERAND}"
+        rf"|(?!{_GREP_END_OF_OPTIONS})(?!\#){_SHELL_WORD_PART}++))*?"
+        rf"[^\S\n]++{_GREP_INVERTING_OPTION})"
+        rf"(?:{_GREP_ATTACHED_PATTERN_OPTION}"
+        rf"|{_GREP_ATTACHED_PATTERN_OPTION}?{_GREP_ARGUMENT_PREFIX}{_NAME_START})"
+        rf"{_SECRET_NAME}",
+        0.8,
+    ),
     (r"printenv\s+(?:\w*(?:KEY|SECRET|TOKEN|PASSWORD)\w*)", 0.7),
     (r"collect\s+(?:all\s+)?(?:environment\s+variables?|env\s+vars?)", 0.7),
     (r"(?:extract|harvest|gather)\s+(?:api\s+)?keys?\s+from\s+environment", 0.8),

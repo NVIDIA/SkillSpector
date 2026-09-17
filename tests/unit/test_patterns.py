@@ -254,6 +254,180 @@ for key, val in os.environ.items():
 
         assert not any(finding.rule_id == "E2" for finding in findings)
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env | grep secret",
+            "env | grep -i -E 'token|key|secret' > /tmp/ctx.txt",
+            'env | grep -iE "aws_|secret"',
+            "env | grep --ignore-case token",
+            "env | egrep -e password -e token",
+            "env | grep AWS_SECRET_ACCESS_KEY",
+            "printenv | grep -i secret",
+            "env|grep KEY",
+            "env | grep SECRET > /tmp/out # -v",
+            "env | grep SECRET; echo -v",
+            "env | grep -i token  # redact with -v before sharing",
+            "env | grep --regexp=SECRET",
+            "env | grep -i -- SECRET",
+            "env | grep -E --color=never SECRET",
+            "env | grep -i TOKENS",
+            "env | grep KEY2",
+            "env | grep -i key1",
+            "env | grep -m 1 SECRET",
+            "env | grep -A 1 TOKEN",
+            "env | grep --max-count 1 SECRET",
+            "env | grep --max-count=1 SECRET",
+            "printenv | grep -m 1 -i secret",
+            "env | grep --regexp=SECRET > /tmp/ctx.txt",
+            "env | grep -eSECRET > /tmp/out",
+            "env | grep -e PATH -e SECRET",
+            "env | grep --regexp=PATH --regexp=SECRET",
+            "env | grep -e MONKEY_PATCH -e SECRET",
+            "env | grep -i -e HOME -e TOKEN | tee /tmp/x",
+            r"env | grep -iE aws_\|secret",
+            r"env | grep -E aws_\|secret > /tmp/out",
+            "env | grep -ePRIVATE_KEY",
+            "env | grep --regexp='SECRET'",
+            "env | grep -e 'PATH HOME' -e SECRET",
+            r"env | grep -e PATH\ HOME -e SECRET",
+            r"env | grep PATH\ SECRET",
+            "env | grep -i apikey",
+            "env | grep -i secretkey",
+            "env |\n  grep -i secret",
+            "env \\\n  | grep -i token",
+            "env | grep -H --label '<env>' -i token",
+            "env | grep '{TOKEN}'",
+            "env | grep -e SECRET -e -v",
+            r"env | grep -E -- -v\|SECRET",
+        ],
+    )
+    def test_e2_shell_env_grep_forms(self, command: str) -> None:
+        """Piping the environment through grep for secrets is detected whatever the flags."""
+        content = f"# Setup\n\n```bash\n{command}\n```\n"
+
+        findings = data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+        e2 = [finding for finding in findings if finding.rule_id == "E2"]
+
+        assert len(e2) == 1
+        assert e2[0].location.start_line == 4
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env | grep PATH",
+            "env | grep -i home",
+            "env | grep MONKEY_PATCH",
+            "env | grep -v SECRET",
+            "env | grep -iv SECRET",
+            "env | grep -i -v SECRET",
+            "env | grep --invert-match SECRET",
+            "env | grep --invert SECRET",
+            "env | grep --color=auto -v SECRET",
+            "env | grep -m 1 -v SECRET",
+            "env | grep -A 1 -v SECRET",
+            "env | grep --max-count 1 -v SECRET",
+            "env | grep --max-count=1 --invert-match KEY",
+            "env | grep -f keys.txt",
+            "env | grep XKB_DEFAULT_KEYMAP",
+            "env | grep -i keyboard",
+            "env | grep -i tokenizer",
+            "printenv | grep -v -E 'KEY|SECRET|TOKEN'",
+            "dotenv | grep KEY",
+            "env | grep -i PATH  # the token lives elsewhere",
+            "Run `env | grep PATH` to check the search path before setting your API key.",
+            "env | grep . | grep -v SECRET",
+            "env | grep TERM | grep -vi password",
+            "printenv | grep -i lang | grep -v KEY",
+            "env | grep PATH || echo no token found",
+            "| env | grep PATH | prints the token search path |",
+            "Use env | grep PATH. Then export your API key.",
+            "printenv HOME",
+            "env | grep SECRET -v",
+            "env | grep -e SECRET -v",
+            "env | grep 'SECRET' -v",
+            "env | grep --regexp=SECRET -v",
+            "env | grep SECRET --invert-match",
+            "env | grep -e PATH -e HOME",
+            "env | grep -e MONKEY_PATCH -e KEYBOARD",
+            r"env | grep TERM|grep -v SECRET",
+            r"env | grep -iE aws_\|home",
+            "env | grep -E 'SECRET|TOKEN' -v",
+            r"env | grep -E SECRET\|TOKEN -v",
+            r"env | grep -e PATH\ HOME -v",
+            "env | grep -Ev 'KEY|SECRET|TOKEN'",
+            "env | egrep KEY -Ev",
+            "env | grep -e PATH -v -e SECRET",
+            'env | grep "^$key="',
+            "env | grep --regexp='PATH|HOME' -v -e SECRET",
+            "env | grep -e SECRET -v",
+            "env | grep -v -- SECRET",
+            "env | grep -i secret -drecurse -v",
+            "env | grep PATH<secret.txt",
+            "env | grep SECRET -fexclude -v",
+        ],
+    )
+    def test_e2_shell_env_grep_ordinary_or_inverted_is_not_harvesting(self, command: str) -> None:
+        """Grepping the environment for ordinary names, or excluding secrets, is not harvesting."""
+        content = f"{command}\n"
+
+        findings = data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+
+        assert not any(finding.rule_id == "E2" for finding in findings)
+
+    @pytest.mark.parametrize("flags", [200, 2000])
+    @pytest.mark.parametrize("flag", ["--ab-cd ", "--regexp=ab ", "-e ab ", "-e a\\ b ", "-m 1 "])
+    def test_e2_shell_env_grep_long_flag_run_terminates_quickly(
+        self, flag: str, flags: int
+    ) -> None:
+        """A long run of grep flags cannot make the shell pattern backtrack.
+
+        Ten times the input for a bound that does not move, so a pattern that
+        degraded to exponential time on the flag run would fail the larger case.
+        Options carrying an operand are covered too, since each one is scanned
+        for a secret name before the run consumes it.
+        """
+        content = "```bash\nenv | grep " + flag * flags + "x\n```\n"
+
+        started = time.monotonic()
+        data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"E2 shell pattern took {elapsed:.1f}s on {flags} {flag!r}"
+
+    @pytest.mark.parametrize("size", [10_000, 100_000])
+    @pytest.mark.parametrize(
+        "shape", ["spaces", "pipelines", "trailing-words", "trailing-operands"]
+    )
+    def test_e2_shell_env_grep_long_line_terminates_quickly(self, shape: str, size: int) -> None:
+        """A long line is not rescanned quadratically, whichever run it repeats."""
+        if shape == "spaces":
+            line = "env | grep" + " " * size + "x"
+        elif shape == "pipelines":
+            line = "env|grep " + "-a|env|grep " * (size // 12)
+        elif shape == "trailing-words":
+            line = "env | grep SECRET " + "word " * (size // 5)
+        else:
+            line = "env | grep SECRET " + "-e x " * (size // 5)
+        content = "```bash\n" + line + "\n```\n"
+
+        started = time.monotonic()
+        data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"E2 shell pattern took {elapsed:.1f}s on {size} characters"
+
+    @pytest.mark.parametrize("length", [20_000, 100_000])
+    def test_e2_shell_env_grep_long_option_word_terminates_quickly(self, length: int) -> None:
+        """A long option word made of v characters cannot make the inversion check backtrack."""
+        content = "```bash\nenv | grep -" + "v" * length + "- x\n```\n"
+
+        started = time.monotonic()
+        data_exfiltration_module.analyze(content, "SKILL.md", "markdown")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"E2 shell pattern took {elapsed:.1f}s on a {length}-character word"
+
 
 class TestPrivilegeEscalation:
     """privilege_escalation.analyze() — PE3."""
