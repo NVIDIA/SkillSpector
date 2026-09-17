@@ -1336,18 +1336,22 @@ def _uv_arguments_execute_appended_script(arguments: tuple[_EnvArgument, ...]) -
     ``uv run -s``, ``uv run --script``, and ``uv run --gui-script`` mark the
     following positional command as Python.  In a shebang the kernel appends
     the inspected artifact after these arguments, so an exact trailing
-    selector executes that artifact as Python.  Other ``uv run`` forms remain
-    unresolved: the appended path can itself become a command, or an explicit
-    command/script can receive it and load it from argv.
+    selector executes that artifact as Python.  Other ``uv`` argv shapes stay
+    unresolved because global options can precede ``run``, the appended path
+    can itself become a command, or an explicit command/script can receive it
+    and load it from argv.  Only exact terminal version queries are certified
+    as non-executing.
     """
     if any(argument.dynamic_offsets for argument in arguments):
         return None
-    if not arguments or arguments[0].text != "run":
+    if not arguments:
         return False
 
     selectors = {"-s", "--script", "--gui-script"}
-    if len(arguments) == 2 and arguments[1].text in selectors:
+    if len(arguments) == 2 and arguments[0].text == "run" and arguments[1].text in selectors:
         return True
+    if len(arguments) == 1 and arguments[0].text in {"-V", "--version"}:
+        return False
     return None
 
 

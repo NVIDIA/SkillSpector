@@ -206,6 +206,11 @@ def test_uv_run_script_shebang_executes_appended_python_source(selector: str) ->
         pytest.param("run echo", id="explicit-command"),
         pytest.param("run echo --script", id="selector-after-command"),
         pytest.param("run --frozen --script", id="run-option-before-selector"),
+        pytest.param("--offline run --script", id="global-flag-before-run"),
+        pytest.param("--quiet run --script", id="global-quiet-before-run"),
+        pytest.param("--no-cache run --script", id="global-cache-before-run"),
+        pytest.param("--color never run --script", id="global-operand-before-run"),
+        pytest.param("--directory /tmp run --script", id="global-directory-before-run"),
         pytest.param("run --script /tmp/other.py", id="explicit-script-operand"),
         pytest.param("run --script=/tmp/other.py", id="attached-long-script"),
         pytest.param("run --gui-script=/tmp/other.py", id="attached-gui-script"),
@@ -266,6 +271,37 @@ def test_real_macos_uv_filesystem_alias_is_classified_ambiguous(tmp_path: Path) 
     source = tmp_path / "runner"
     marker = "UV_ALIAS_EXECUTED"
     content = f'#!/usr/bin/env -S UV run --script\nprint("{marker}")\n'
+    source.write_text(content, encoding="utf-8")
+    source.chmod(0o755)
+
+    executed = subprocess.run(
+        [str(source)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert executed.returncode == 0, executed.stderr
+    assert marker in executed.stdout
+    assert classify_python_source("runner", content) is PythonSourceClassification.AMBIGUOUS
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "--offline run --script",
+        "--quiet run --script",
+        "--no-cache run --script",
+        "--color never run --script",
+        "--directory /tmp run --script",
+    ],
+)
+def test_real_uv_global_options_can_launch_python(tmp_path: Path, arguments: str) -> None:
+    source = tmp_path / "runner"
+    marker = "UV_GLOBAL_OPTION_EXECUTED"
+    content = f'#!/usr/bin/env -S uv {arguments}\nprint("{marker}")\n'
     source.write_text(content, encoding="utf-8")
     source.chmod(0o755)
 
