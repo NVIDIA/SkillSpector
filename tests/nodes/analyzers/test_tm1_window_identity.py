@@ -146,8 +146,7 @@ def test_same_line_bound_duplicates_match_direct_output_budget(monkeypatch, cap:
     monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", cap)
     direct = _run('subprocess.run("x", shell=True); subprocess.run("x", shell=True)\n')
     bound = _run(
-        'enabled = True\nsubprocess.run("x", shell=enabled); '
-        'subprocess.run("x", shell=enabled)\n'
+        'enabled = True\nsubprocess.run("x", shell=enabled); subprocess.run("x", shell=enabled)\n'
     )
     direct_findings = [finding for finding in direct["findings"] if finding.rule_id == "TM1"]
     bound_findings = [finding for finding in bound["findings"] if finding.rule_id == "TM1"]
@@ -161,9 +160,7 @@ def test_same_line_bound_duplicates_match_direct_output_budget(monkeypatch, cap:
 @pytest.mark.parametrize("bound_name", ["a", "true_value"])
 def test_bound_fingerprint_matches_direct_literal(bound_name: str) -> None:
     direct = _tm1("subprocess.run(command, shell=True, capture_output=True)\n")
-    bound = _tm1(
-        f"{bound_name} = True\nsubprocess.run(command, shell={bound_name}, text=True)\n"
-    )
+    bound = _tm1(f"{bound_name} = True\nsubprocess.run(command, shell={bound_name}, text=True)\n")
 
     assert len(direct) == len(bound) == 1
     assert bound[0].fingerprint() == direct[0].fingerprint()
