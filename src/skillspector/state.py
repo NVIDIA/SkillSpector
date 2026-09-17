@@ -236,6 +236,8 @@ class SkillspectorState(TypedDict, total=False):
     # Input: resolve_input node consumes input_path or skill_path, sets skill_path
     input_path: str | None
     skill_path: str | None
+    # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
+    primary_file_path: str | None
     # Set by resolve_input when a temp dir was created (git/url/zip/file); caller should clean up
     temp_dir_for_cleanup: str | None
     zip_bytes: bytes | None

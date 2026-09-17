@@ -82,6 +82,7 @@ class LedgerReason(StrEnum):
     ARCHIVE_TIME_LIMIT = "archive_time_limit"
     VCS_METADATA = "vcs_metadata"
     OPAQUE_CONTENT = "opaque_content"
+    UNSUPPORTED_PRIMARY_CONTENT = "unsupported_primary_content"
     REFERENCED_UNINSPECTED = "referenced_uninspected"
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
     REFERENCE_UNRESOLVED = "reference_unresolved"
@@ -165,6 +166,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "VCS object and history metadata is outside the bounded artifact inspection profile."
     ),
     LedgerReason.OPAQUE_CONTENT: "Artifact contents could not be fully interpreted.",
+    LedgerReason.UNSUPPORTED_PRIMARY_CONTENT: (
+        "The requested file or primary instructions could not be interpreted. "
+        "Provide UTF-8 text, a supported ZIP, or an extracted directory instead."
+    ),
     LedgerReason.REFERENCED_UNINSPECTED: ("A referenced artifact was not completely inspected."),
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
         "Reference extraction reached an explicit resource bound before completion."

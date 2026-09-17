@@ -60,6 +60,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             resolved, source_type = handler.resolve(input_path.strip())
             update: dict[str, object] = {
                 "skill_path": str(resolved),
+                "primary_file_path": handler.primary_file_path,
                 "workflow_resource_budget": workflow_budget,
             }
             temp_dir = handler.temp_dir_for_cleanup()
@@ -87,6 +88,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             resolved = validate_local_input_path(Path(skill_path))
             return {
                 "skill_path": str(resolved),
+                "primary_file_path": None,
                 "temp_dir_for_cleanup": None,
                 "workflow_resource_budget": workflow_budget,
             }
@@ -94,12 +96,14 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             logger.warning("Could not resolve skill_path: %s", e)
             return {
                 "skill_path": None,
+                "primary_file_path": None,
                 "temp_dir_for_cleanup": None,
                 "workflow_resource_budget": workflow_budget,
             }
 
     return {
         "skill_path": None,
+        "primary_file_path": None,
         "temp_dir_for_cleanup": None,
         "workflow_resource_budget": workflow_budget,
     }
