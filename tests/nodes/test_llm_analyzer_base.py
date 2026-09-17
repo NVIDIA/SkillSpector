@@ -30,6 +30,7 @@ from google.auth.exceptions import RefreshError
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
+from langchain_openai.chat_models._client_utils import _cached_async_httpx_client
 from pydantic import ValidationError
 
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
@@ -957,6 +958,83 @@ class TestDynamicTimeout:
             )
 
         get_chat_model.assert_not_called()
+
+    def test_dynamic_deadline_retargets_one_transport_instead_of_building_more(self) -> None:
+        """A shrinking deadline must not open a connection pool per LLM call.
+
+        Evicted pools belong to event loops that earlier analyzer nodes already closed, so
+        finalizing them raises an unobservable ``RuntimeError: Event loop is closed``.
+        """
+        built: list[ChatOpenAI] = []
+
+        def _factory(*, model: str, timeout: float | None = None) -> ChatOpenAI:
+            chat_model = ChatOpenAI(model=model, api_key="sk-test", timeout=timeout)
+            built.append(chat_model)
+            return chat_model
+
+        calls = 200
+        countdown = iter(float(seconds) for seconds in range(calls + 2, 0, -1))
+        with patch(MOCK_PATCH_TARGET, side_effect=_factory):
+            analyzer = LLMAnalyzerBase(
+                base_prompt="test",
+                model="nvidia/openai/gpt-oss-120b",
+                timeout=lambda: next(countdown),
+            )
+
+            cache_misses_before = _cached_async_httpx_client.cache_info().misses
+            sync_client = analyzer._llm.root_client
+            async_client = analyzer._llm.root_async_client
+            applied: list[float | None] = []
+
+            for _ in range(calls):
+                llm, structured = analyzer._model_for_call()
+                assert llm is analyzer._llm
+                assert structured is analyzer._structured_llm
+                assert llm.root_client is sync_client
+                assert llm.root_async_client is async_client
+                applied.append(llm.root_async_client.timeout)
+
+        assert len(built) == 1
+        assert applied == [float(seconds) for seconds in range(calls, 0, -1)]
+        assert async_client.timeout == 1.0
+        assert sync_client.timeout == 1.0
+        assert _cached_async_httpx_client.cache_info().misses == cache_misses_before
+
+    def test_gemini_reuses_client_until_adc_token_changes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skillspector.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        tokens = iter(["first", "second", "second"])
+        monkeypatch.setattr(
+            provider,
+            "resolve_credentials",
+            lambda *, timeout: (next(tokens), "https://example.invalid"),
+        )
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_active_provider", lambda: provider)
+        built: list[ChatOpenAI] = []
+
+        def _factory(*, model: str, timeout: float | None = None) -> ChatOpenAI:
+            chat_model = ChatOpenAI(
+                model=model,
+                api_key="first" if not built else "second",
+                timeout=timeout,
+            )
+            built.append(chat_model)
+            return chat_model
+
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", _factory)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model="gemini-test", timeout=lambda: 10.0)
+
+        first, _ = analyzer._model_for_call()
+        second, _ = analyzer._model_for_call()
+        third, _ = analyzer._model_for_call()
+
+        assert first is built[0]
+        assert second is built[1]
+        assert third is second
+        assert len(built) == 2
 
     def test_run_batches_resolves_timeout_per_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Dynamic timeout providers are called again before every LLM call."""

@@ -52,6 +52,7 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_utils import (
+    AgentCLIChatModel,
     StructuredOutputParseError,
     _AgentCLIMessage,
     _ainvoke_with_usage,
@@ -62,6 +63,8 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
+from skillspector.providers import get_active_provider
+from skillspector.providers.gemini import GeminiProvider
 
 logger = get_logger(__name__)
 
@@ -132,6 +135,33 @@ def _uses_native_connection_retries(
     if isinstance(chat_model, ChatAnthropic):
         chat_model.max_retries = max_retries
         return max_retries > 0
+    return False
+
+
+def _retarget_request_timeout(chat_model: object, timeout: float | None) -> bool:
+    """Point an existing chat model at *timeout* and report whether it took effect.
+
+    Returns ``False`` for transports that keep no mutable deadline, so the caller can
+    fall back to constructing a replacement model for that call.
+    """
+    if isinstance(chat_model, ChatOpenAI):
+        clients = (chat_model.root_client, chat_model.root_async_client)
+        if any(client is None for client in clients):
+            return False
+        for client in clients:
+            client.timeout = timeout
+        chat_model.request_timeout = timeout
+        return True
+    if isinstance(chat_model, ChatAnthropic):
+        # ``timeout <= 0`` is how ChatAnthropic spells "leave the SDK default alone"; an
+        # expired deadline never reaches here because ``_require_time_remaining`` raises first.
+        for client in (chat_model._client, chat_model._async_client):
+            client.timeout = timeout
+        chat_model.default_request_timeout = timeout
+        return True
+    if isinstance(chat_model, AgentCLIChatModel):
+        chat_model.set_timeout(timeout)
+        return True
     return False
 
 
@@ -697,6 +727,19 @@ class LLMAnalyzerBase:
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
+        provider = get_active_provider()
+        token_changed = False
+        if isinstance(provider, GeminiProvider) and isinstance(self._llm, ChatOpenAI):
+            credentials = provider.resolve_credentials(timeout=remaining)
+            if credentials is None:
+                raise ValueError("Gemini credentials unavailable.")
+            token = self._llm.openai_api_key
+            token_changed = token is None or token.get_secret_value() != credentials[0]
+            remaining = self._require_time_remaining()
+        if not token_changed and _retarget_request_timeout(self._llm, remaining):
+            # Native retries were already disabled for the dynamic-deadline case in
+            # ``__init__``, and the structured runnable wraps this same model instance.
+            return self._llm, self._structured_llm
         try:
             llm = get_chat_model(model=self.model, timeout=remaining)
         except ValueError:
@@ -709,6 +752,8 @@ class LLMAnalyzerBase:
         structured = (
             llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
+        if token_changed:
+            self._llm, self._structured_llm = llm, structured
         return llm, structured
 
     @property
