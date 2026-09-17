@@ -199,6 +199,13 @@ def test_uv_run_script_shebang_executes_appended_python_source(selector: str) ->
     assert classify_python_source("runner", content) is PythonSourceClassification.PYTHON
 
 
+@pytest.mark.parametrize("selector", ["-s", "--script", "--gui-script"])
+def test_uv_script_source_with_option_like_invocation_is_ambiguous(selector: str) -> None:
+    content = f"#!/usr/bin/env -S uv run {selector}\npass\n"
+
+    assert classify_python_source("-runner", content) is PythonSourceClassification.AMBIGUOUS
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -322,6 +329,55 @@ def test_real_uv_global_options_can_launch_python(tmp_path: Path, arguments: str
     assert executed.returncode == 0, executed.stderr
     assert marker in executed.stdout
     assert classify_python_source("runner", content) is PythonSourceClassification.AMBIGUOUS
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or shutil.which("uv") is None,
+    reason="POSIX shebang execution with uv is unavailable",
+)
+@pytest.mark.parametrize("selector", ["-s", "--script", "--gui-script"])
+def test_real_uv_option_like_source_spelling_has_multiple_branches(
+    tmp_path: Path, selector: str
+) -> None:
+    source = tmp_path / "-runner"
+    marker = "UV_OPTION_LIKE_SOURCE_EXECUTED"
+    source.write_text(
+        f'#!/usr/bin/env -S uv run {selector}\nprint("{marker}")\n',
+        encoding="utf-8",
+    )
+    source.chmod(0o755)
+    execve_probe = (
+        "import os, sys; os.chdir(sys.argv[1]); os.execve(sys.argv[2], [sys.argv[2]], os.environ)"
+    )
+
+    option_like = subprocess.run(
+        [sys.executable, "-c", execve_probe, str(tmp_path), source.name],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    relative = subprocess.run(
+        [sys.executable, "-c", execve_probe, str(tmp_path), f"./{source.name}"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    absolute = subprocess.run(
+        [sys.executable, "-c", execve_probe, str(tmp_path), str(source)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert option_like.returncode != 0
+    assert marker not in option_like.stdout
+    assert relative.returncode == 0, relative.stderr
+    assert marker in relative.stdout
+    assert absolute.returncode == 0, absolute.stderr
+    assert marker in absolute.stdout
 
 
 @pytest.mark.parametrize(

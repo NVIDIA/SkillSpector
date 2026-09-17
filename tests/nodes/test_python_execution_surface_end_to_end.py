@@ -178,6 +178,33 @@ def test_uv_global_option_script_launcher_is_analyzed_fail_closed(tmp_path: Path
     )
 
 
+def test_uv_option_like_source_path_is_analyzed_fail_closed(tmp_path: Path) -> None:
+    filename = "-runner"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Option-like uv helper",
+            filename: (
+                "#!/usr/bin/env -S uv run --script\n"
+                "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run(command, shell=enabled)\n"
+            ),
+        },
+    )
+    (tmp_path / filename).chmod(0o755)
+
+    result = _scan(tmp_path)
+    exceptions = result["analysis_completeness"]["ledger_exceptions"]
+
+    assert filename in _tm1_paths(result)
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert any(
+        row["path"] == filename and row["reason_code"] == "python_source_ambiguous"
+        for row in exceptions
+    )
+
+
 def test_ambiguous_python_surface_is_analyzed_fail_closed(tmp_path: Path) -> None:
     filename = "runner"
     _write_bundle(

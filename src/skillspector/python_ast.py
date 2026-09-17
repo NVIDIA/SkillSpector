@@ -1330,17 +1330,20 @@ def _python_arguments_execute_appended_script(
     return merge_version_branches(True)
 
 
-def _uv_arguments_execute_appended_script(arguments: tuple[_EnvArgument, ...]) -> bool | None:
+def _uv_arguments_execute_appended_script(
+    arguments: tuple[_EnvArgument, ...], source_path: str
+) -> bool | None:
     """Classify bounded ``uv run`` forms that can consume the source path.
 
     ``uv run -s``, ``uv run --script``, and ``uv run --gui-script`` mark the
     following positional command as Python.  In a shebang the kernel appends
     the inspected artifact after these arguments, so an exact trailing
-    selector executes that artifact as Python.  Other ``uv`` argv shapes stay
-    unresolved because global options can precede ``run``, the appended path
-    can itself become a command, or an explicit command/script can receive it
-    and load it from argv.  Only exact terminal version queries are certified
-    as non-executing.
+    selector executes that artifact as Python unless one valid relative
+    invocation spelling can be parsed as another option.  Other ``uv`` argv
+    shapes stay unresolved because global options can precede ``run``, the
+    appended path can itself become a command, or an explicit command/script
+    can receive it and load it from argv.  Only exact terminal version queries
+    are certified as non-executing.
     """
     if any(argument.dynamic_offsets for argument in arguments):
         return None
@@ -1349,7 +1352,7 @@ def _uv_arguments_execute_appended_script(arguments: tuple[_EnvArgument, ...]) -
 
     selectors = {"-s", "--script", "--gui-script"}
     if len(arguments) == 2 and arguments[0].text == "run" and arguments[1].text in selectors:
-        return True
+        return None if _implicit_python_source_path_can_be_an_option(source_path) else True
     if len(arguments) == 1 and arguments[0].text in {"-V", "--version"}:
         return False
     return None
@@ -1376,7 +1379,7 @@ def _record_source_execution(
         execution.utility,
         allow_filesystem_aliases=allow_filesystem_aliases,
     ):
-        executes_script = _uv_arguments_execute_appended_script(execution.arguments)
+        executes_script = _uv_arguments_execute_appended_script(execution.arguments, source_path)
     else:
         execution_kinds.add(False)
         return False
