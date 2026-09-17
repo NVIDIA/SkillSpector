@@ -3215,11 +3215,15 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 classified_artifact = inventory_by_path.get(path)
                 if classified_artifact is not None:
                     promote_artifact_to_decoded_text(classified_artifact)
-                    if path in llm_file_cache or (
-                        path not in nested.file_cache
-                        and path not in recognized_containers
-                        and not _is_hidden_path(path)
+                    if (
+                        not source_local_only
                         and classified_artifact.get("disposition") == ArtifactDisposition.ANALYZED
+                        and (
+                            path in llm_file_cache
+                            or path not in nested.file_cache
+                            and path not in recognized_containers
+                            and not _is_hidden_path(path)
+                        )
                     ):
                         llm_file_cache[path] = _redact_for_external_model(path, decoded_python)
         completed_source_classifications.add(path)
