@@ -423,8 +423,7 @@ def test_root_level_numeric_suffix_known_path_resolves(tmp_path: Path) -> None:
     )
 
     assert any(
-        record["status"] == "resolved" and record["target_path"] == "tool.1"
-        for record in records
+        record["status"] == "resolved" and record["target_path"] == "tool.1" for record in records
     )
     assert any(
         record["status"] == "rejected" and record["target_path"] is None
