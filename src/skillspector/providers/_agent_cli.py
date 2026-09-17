@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hardened subprocess helper for agent CLI providers (claude, codex, gemini).
+"""Hardened subprocess helper for agent CLI providers (claude, codex, gemini,
+opencode, and copilot).
 
 This is the single security chokepoint for all agent-CLI calls. Per-CLI
 knowledge (argv, output parsing, auth check) lives in a small ``CliSpec``
@@ -875,6 +876,158 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.85)
+# ---------------------------------------------------------------------------
+
+
+def _parse_copilot_version(raw: bytes) -> str | None:
+    """Parse an exact stable semantic version from ``copilot --version``."""
+    lines = raw.decode("utf-8", errors="replace").strip().splitlines() or [""]
+    match = re.fullmatch(
+        r"(?:github\s+copilot\s+cli\s+)?v?(\d+\.\d+\.\d+)\.?",
+        lines[0].strip(),
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match is not None else None
+
+
+def _prepare_copilot_env(
+    base_env: dict[str, str], temp_root: str, argv: list[str]
+) -> dict[str, str]:
+    """Return the child environment for a copilot invocation.
+
+    ``temp_root``/``argv`` are unused (CliSpec signature uniformity).
+    Starts from the already-scrubbed base and applies an explicit allowlist
+    to ``COPILOT_*``: every such variable is dropped EXCEPT the three
+    documented token variables (``COPILOT_GITHUB_TOKEN``, ``GH_TOKEN``,
+    ``GITHUB_TOKEN`` — re-read from the operator environment because the
+    shared scrub strips ``GITHUB_TOKEN``), which are the CLI's supported
+    headless auth path and therefore work at inference time. In particular
+    ``COPILOT_ALLOW_ALL`` never reaches the child, so ambient shell config
+    cannot re-enable tools; ``COPILOT_PROVIDER_*`` cannot redirect inference
+    to an arbitrary endpoint; and ``COPILOT_CUSTOM_INSTRUCTIONS_DIRS``
+    cannot inject instructions. ``COPILOT_AUTO_UPDATE`` is forced off so the
+    version gate cannot be invalidated mid-scan. ``COPILOT_HOME`` is
+    deliberately left alone: pinning it would hide the login session this
+    provider relies on when no token is set.
+    """
+    env = {key: value for key, value in base_env.items() if not key.upper().startswith("COPILOT_")}
+    for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            env[name] = value
+    env["COPILOT_AUTO_UPDATE"] = "false"
+    return env
+
+
+def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
+    """Build the argv list for a non-interactive ``copilot`` call.
+
+    Flags chosen (verified against Copilot CLI 1.0.85 ``--help``):
+
+    (no ``-p``)
+        With no prompt flag, the prompt is piped to stdin by run_agent_cli —
+        untrusted content never reaches argv (verified by nonce round-trip).
+
+    ``-s``
+        Suppress stats and decoration, emitting only the agent's response.
+
+    ``--no-ask-user``
+        Disable the ask_user tool so the agent cannot pause for input.
+
+    ``--available-tools skillspector-no-tools``
+        Allowlist holding a fixed implausible name, so the model is offered
+        no usable tools (verified: a file-creation request was refused with
+        no side effects). A fictitious name fails closed if a future CLI
+        ever rejects unknown tool names.
+
+    ``--deny-tool shell,write``
+        Belt-and-braces deny of the shell and file-writing tool kinds in the
+        documented ``Kind(argument)`` form; deny rules take precedence over
+        allow rules. (No wildcard deny exists; single-tool deny alone does
+        not stop reads through other tools, hence the allowlist above.)
+
+    ``--model <label>``
+        Model in plain form (validated). Omitted by default so copilot uses
+        the CLI default model (forwarded only when SKILLSPECTOR_MODEL is set).
+
+    Deliberately NOT included:
+    - ``--allow-all*`` / ``--yolo`` — auto-approve permissions (dangerous); never use them.
+    - ``max_output_tokens`` — copilot has no token flag (accepted for
+      CliSpec uniformity and ignored, like codex/gemini).
+    """
+    # --model omitted by default -> copilot uses the CLI default model
+    # (forwarded only when SKILLSPECTOR_MODEL is set).
+    model_arg = ["--model", _validate_model_label(model)] if model else []
+    return [
+        binary,
+        "-s",
+        "--no-ask-user",
+        "--available-tools",
+        "skillspector-no-tools",
+        "--deny-tool",
+        "shell,write",
+        *model_arg,
+    ]
+
+
+def _parse_copilot_output(raw: str) -> str:
+    """Extract the assistant reply from ``copilot -s`` plain-text output.
+
+    Verified against Copilot CLI 1.0.85: ``-s`` emits only the response text.
+    The whole stripped output is the reply; empty output raises fail-closed
+    (an empty response must never be mistaken for a clean analysis).
+    """
+    reply = raw.strip()
+    if not reply:
+        raise AgentCLIError(f"copilot returned no assistant text in output; raw={raw[:400]!r}")
+    return reply
+
+
+def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
+    """Check copilot is usable via ``copilot --version`` (no inference).
+
+    The caller must already have resolved ``binary``. The probe uses the
+    shared scrubbed environment (token re-injection is inference-only and
+    version output does not depend on it), performs no inference, and
+    completes well under 15s. Fail-closed: probe error/timeout, non-zero
+    exit, or a version other than the verified 1.0.85 all return
+    ``(False, reason)``.
+
+    There is no status subcommand, so a passing probe means the binary runs
+    the verified version — not proof of login. Authentication works two
+    ways: the persistent login session (``copilot login``), validated by the
+    first inference call failing closed with the CLI's real error; or one of
+    ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``, which
+    ``_prepare_copilot_env`` deliberately preserves through the scrub while
+    dropping every other ``COPILOT_*`` variable.
+    """
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            shell=False,
+            timeout=15,
+            env=_scrub_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return False, f"copilot --version check failed: {exc}"
+    if result.returncode != 0:
+        return False, (
+            "copilot --version probe failed "
+            f"(exit {result.returncode}); check the binary, then `copilot login`"
+        )
+    version = _parse_copilot_version(result.stdout or b"")
+    if version != "1.0.85":
+        version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+        return False, (
+            "copilot_cli requires exactly GitHub Copilot CLI 1.0.85 "
+            f"for its verified tool-deny policy; found {version_text[:80]!r}"
+        )
+    return True, None
+
+
+# ---------------------------------------------------------------------------
 # Antigravity CLI  (registered but DISABLED — verified incompatible)
 #
 # The Antigravity CLI (binary: ``agy``) was tested end-to-end against the real
@@ -967,6 +1120,13 @@ _REGISTRY: dict[str, CliSpec] = {
         _opencode_auth_check,
         _prepare_opencode_env,
         _preflight_opencode_policy,
+    ),
+    "copilot": CliSpec(
+        "copilot",
+        _build_copilot_argv,
+        _parse_copilot_output,
+        _copilot_auth_check,
+        _prepare_copilot_env,
     ),
     # Disabled (fails closed via _build_agy_argv). agy's backend is Gemini, so it
     # reuses _parse_gemini_output rather than duplicating it — though parse is
