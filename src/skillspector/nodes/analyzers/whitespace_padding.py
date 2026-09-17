@@ -27,6 +27,7 @@ definition without risking circular imports.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -174,6 +175,21 @@ class PaddingRun:
     def __post_init__(self) -> None:
         if self.end_offset < 0:
             self.end_offset = self.start_offset
+
+
+def padding_run_match_fingerprint(content: str, run: PaddingRun) -> str:
+    """Hash one complete padding signal without retaining its raw payload."""
+    if 0 <= run.start_offset < run.end_offset <= len(content):
+        payload = content[run.start_offset : run.end_offset]
+    else:
+        # Ratio findings govern the entire file and intentionally have no span.
+        payload = content
+    digest = hashlib.sha256()
+    digest.update(b"skillspector-padding-run-v1\x00P9\x00")
+    digest.update(run.kind.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(payload.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _split_lines(content: str) -> tuple[list[str], list[int]]:
