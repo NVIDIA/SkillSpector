@@ -15,7 +15,7 @@ import ast
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 
-from .common import get_context_from_lines, get_source_segment
+from .common import get_complete_source_segment, get_context_from_lines
 from .pattern_defaults import PatternCategory
 
 ANALYZER_ID = "static_patterns_tool_misuse"
@@ -214,6 +214,56 @@ class _DirectBindingCollector:
                 pending.extend(current.patterns)
                 continue
             pending.extend(ast.iter_child_nodes(current))
+
+
+def _direct_bound_names(node: ast.AST) -> set[str]:
+    """Return names bound by *node* without entering deferred nested scopes."""
+    candidates: set[str] = set()
+    for current in ast.walk(node):
+        if isinstance(current, ast.Name) and isinstance(current.ctx, (ast.Store, ast.Del)):
+            candidates.add(current.id)
+        elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            candidates.add(current.name)
+        elif isinstance(current, ast.Import):
+            candidates.update(
+                imported.asname or imported.name.partition(".")[0] for imported in current.names
+            )
+        elif isinstance(current, ast.ImportFrom):
+            candidates.update(
+                imported.asname or imported.name
+                for imported in current.names
+                if imported.name != "*"
+            )
+        elif isinstance(current, ast.ExceptHandler) and isinstance(current.name, str):
+            candidates.add(current.name)
+        elif isinstance(current, (ast.MatchAs, ast.MatchStar)) and isinstance(
+            current.name,
+            str,
+        ):
+            candidates.add(current.name)
+        elif isinstance(current, ast.MatchMapping) and isinstance(current.rest, str):
+            candidates.add(current.rest)
+    collector = _DirectBindingCollector(candidates)
+    collector.visit(node)
+    return collector.bound
+
+
+def _function_parameter_names(statement: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Return names that may already hold unsafe values on body entry."""
+    arguments = statement.args
+    names = {
+        argument.arg
+        for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    }
+    if arguments.vararg is not None:
+        names.add(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.add(arguments.kwarg.arg)
+    declarations = _DirectBindingCollector(set())
+    for child in statement.body:
+        declarations.visit(child)
+    names.update(declarations.nonlocal_names)
+    return names
 
 
 def _function_bound_direct_names(
@@ -432,6 +482,23 @@ def _call_arguments_are_passive(call: ast.Call) -> bool:
     )
 
 
+def _is_finalizer_safe_value(expression: ast.expr, safe_names: set[str]) -> bool:
+    """Return whether releasing the resulting value cannot run user code."""
+    if not _is_passive_argument(expression):
+        return False
+    return all(
+        not isinstance(node, ast.Name) or node.id in safe_names for node in ast.walk(expression)
+    )
+
+
+def _call_arguments_are_protocol_safe(call: ast.Call, safe_names: set[str]) -> bool:
+    """Return whether subprocess argument consumption cannot dispatch user code."""
+    return all(_is_finalizer_safe_value(argument, safe_names) for argument in call.args) and all(
+        keyword.arg is not None and _is_finalizer_safe_value(keyword.value, safe_names)
+        for keyword in call.keywords
+    )
+
+
 def _annotation_is_passive(annotation: ast.expr) -> bool:
     """Accept only annotation spellings whose evaluation cannot rebind a name."""
     return all(
@@ -461,6 +528,37 @@ def _function_header_is_passive(
     if statement.returns is not None:
         annotations.append(statement.returns)
     return all(_annotation_is_passive(annotation) for annotation in annotations)
+
+
+def _is_immediate_function(statement: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return whether a direct call begins executing this function body."""
+    if isinstance(statement, ast.AsyncFunctionDef):
+        return False
+    pending: list[ast.AST] = list(statement.body)
+    while pending:
+        current = pending.pop()
+        if isinstance(current, (ast.Yield, ast.YieldFrom)):
+            return False
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        pending.extend(ast.iter_child_nodes(current))
+    return True
+
+
+def _passive_direct_call(statement: ast.stmt) -> ast.Call | None:
+    """Return a directly evaluated simple-name call with passive arguments."""
+    value: ast.expr | None = None
+    if isinstance(statement, (ast.Expr, ast.Assign)):
+        value = statement.value
+    elif isinstance(statement, ast.AnnAssign):
+        value = statement.value
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and _call_arguments_are_passive(value)
+    ):
+        return value
+    return None
 
 
 def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None:
@@ -496,9 +594,10 @@ def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None
 
 
 class _Analyzer:
-    def __init__(self, file_path: str, lines: list[str]) -> None:
+    def __init__(self, file_path: str, python_ast: ParsedPythonFile) -> None:
         self.file_path = file_path
-        self.lines = lines
+        self.python_ast = python_ast
+        self.lines = python_ast.lines
         self.findings: list[AnalyzerFinding] = []
 
     def _inspect_call(self, call: ast.Call, facts: dict[str, bool]) -> None:
@@ -511,16 +610,34 @@ class _Analyzer:
             return
         line = getattr(call, "lineno", 1)
         end_line = getattr(call, "end_lineno", None)
+        start_byte_column = getattr(call, "col_offset", 0)
+        end_byte_column = getattr(call, "end_col_offset", start_byte_column)
+        start_column = self.python_ast.character_column(line, start_byte_column)
+        end_column = self.python_ast.character_column(end_line or line, end_byte_column)
+        complete_match = self.python_ast.source_segment(call)
+        if complete_match is None:
+            complete_match = get_complete_source_segment(self.lines, line, end_line)
         self.findings.append(
             AnalyzerFinding(
                 rule_id="TM1",
                 message="Tool Parameter Abuse",
                 severity=Severity.HIGH,
-                location=Location(file=self.file_path, start_line=line, end_line=end_line),
+                location=Location(
+                    file=self.file_path,
+                    start_line=line,
+                    end_line=end_line,
+                    start_column=start_column,
+                    end_column=end_column,
+                ),
                 confidence=0.8,
                 tags=[PatternCategory.TOOL_MISUSE.value],
-                context=get_context_from_lines(self.lines, line),
-                matched_text=get_source_segment(self.lines, line, end_line),
+                context=get_context_from_lines(
+                    self.lines,
+                    line,
+                    column=start_column if start_column is not None else 0,
+                ),
+                matched_text=complete_match[:200],
+                complete_match=complete_match,
                 evidence={BOUND_SHELL_EVIDENCE: True},
             )
         )
@@ -531,26 +648,59 @@ class _Analyzer:
         value: ast.expr,
         facts: dict[str, bool],
         trusted_names: set[str],
+        bound_names: set[str],
+        finalizer_safe_names: set[str],
     ) -> None:
+        simple_targets = all(isinstance(target, ast.Name) for target in targets)
+        releases_unsafe_value = simple_targets and any(
+            target.id in bound_names
+            and target.id not in finalizer_safe_names
+            and not (isinstance(value, ast.Name) and value.id == target.id)
+            for target in targets
+            if isinstance(target, ast.Name)
+        )
+        result_is_finalizer_safe = _is_finalizer_safe_value(value, finalizer_safe_names)
+        call_has_protocol_effects = False
         if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
             resolved = None
             safe_value = _call_arguments_are_passive(value)
             if safe_value:
                 self._inspect_call(value, facts)
+                call_has_protocol_effects = not _call_arguments_are_protocol_safe(
+                    value,
+                    finalizer_safe_names,
+                )
         else:
             resolved = _truth_value(value, facts)
             safe_value = resolved is not None or _is_passive_argument(value)
 
-        if not safe_value or any(not isinstance(target, ast.Name) for target in targets):
+        if not safe_value or not simple_targets:
             facts.clear()
+            finalizer_safe_names.clear()
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bound_names.add(target.id)
             trusted_names.difference_update(_changed_direct_names([value, *targets], trusted_names))
             return
+        if releases_unsafe_value:
+            facts.clear()
+            finalizer_safe_names.clear()
+            trusted_names.clear()
+        if call_has_protocol_effects:
+            facts.clear()
+            finalizer_safe_names.clear()
+            trusted_names.clear()
         for target in targets:
             assert isinstance(target, ast.Name)
-            if resolved is None:
+            bound_names.add(target.id)
+            if releases_unsafe_value or call_has_protocol_effects or resolved is None:
                 facts.pop(target.id, None)
             else:
                 facts[target.id] = resolved
+            if releases_unsafe_value or call_has_protocol_effects or not result_is_finalizer_safe:
+                finalizer_safe_names.discard(target.id)
+            else:
+                finalizer_safe_names.add(target.id)
             preserves_binding = (
                 isinstance(value, ast.Name) and value.id == target.id and value.id in trusted_names
             )
@@ -562,29 +712,52 @@ class _Analyzer:
         statements: list[ast.stmt],
         *,
         trusted_names: set[str] | None = None,
+        initial_bound_names: set[str] | None = None,
     ) -> None:
         trusted_names = set(_DIRECT_CALL_NAMES if trusted_names is None else trusted_names)
         facts: dict[str, bool] = {}
-        last_invalidation_by_name: dict[str, int] = {}
+        bound_names = set(initial_bound_names or ())
+        finalizer_safe_names: set[str] = set()
 
-        def last_invalidation(name: str) -> int:
-            cached = last_invalidation_by_name.get(name)
-            if cached is not None:
-                return cached
-            last = -1
-            for candidate_index, candidate in enumerate(statements):
-                probe = {name}
-                _advance_trusted_names(candidate, probe)
-                if name not in probe:
-                    last = candidate_index
-            last_invalidation_by_name[name] = last
-            return last
+        last_invalidation_by_name: dict[str, int] = {}
+        receiver_trust = set(trusted_names)
+        for candidate_index, candidate in enumerate(statements):
+            before = set(receiver_trust)
+            _advance_trusted_names(candidate, receiver_trust)
+            for name in before.difference(receiver_trust):
+                last_invalidation_by_name[name] = candidate_index
+
+        trusted_at_call_by_definition: dict[int, set[str]] = {}
+        receiver_trust = set(trusted_names)
+        active_functions: dict[str, int] = {}
+        for candidate_index, candidate in enumerate(statements):
+            call = _passive_direct_call(candidate)
+            if call is not None:
+                assert isinstance(call.func, ast.Name)
+                owner = active_functions.get(call.func.id)
+                if owner is not None:
+                    trusted_at_call_by_definition.setdefault(owner, set()).update(receiver_trust)
+
+            changed_names = _direct_bound_names(candidate)
+            for name in changed_names:
+                active_functions.pop(name, None)
+            if (
+                isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and _function_header_is_passive(candidate)
+                and _is_immediate_function(candidate)
+            ):
+                active_functions[candidate.name] = candidate_index
+            _advance_trusted_names(candidate, receiver_trust)
 
         for index, statement in enumerate(statements):
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 passive_header = _function_header_is_passive(statement)
+                trusted_at_call = trusted_at_call_by_definition.get(index, set())
+                nested_trusted_names = set(trusted_names).union(trusted_at_call)
                 nested_trusted_names = {
-                    name for name in trusted_names if last_invalidation(name) <= index
+                    name
+                    for name in nested_trusted_names
+                    if last_invalidation_by_name.get(name, -1) <= index or name in trusted_at_call
                 }
                 nested_trusted_names.difference_update(
                     _function_bound_direct_names(statement, nested_trusted_names)
@@ -592,15 +765,27 @@ class _Analyzer:
                 nested_trusted_names.discard(statement.name)
                 if not passive_header:
                     nested_trusted_names.clear()
-                self._scan_block(statement.body, trusted_names=nested_trusted_names)
-                if passive_header:
+                self._scan_block(
+                    statement.body,
+                    trusted_names=nested_trusted_names,
+                    initial_bound_names=_function_parameter_names(statement),
+                )
+                releases_unsafe_value = (
+                    statement.name in bound_names and statement.name not in finalizer_safe_names
+                )
+                if passive_header and not releases_unsafe_value:
                     facts.pop(statement.name, None)
                 else:
                     facts.clear()
+                    finalizer_safe_names.clear()
                     trusted_names.clear()
+                bound_names.add(statement.name)
+                finalizer_safe_names.discard(statement.name)
                 trusted_names.discard(statement.name)
             elif isinstance(statement, (ast.Import, ast.ImportFrom)):
                 facts.clear()
+                finalizer_safe_names.clear()
+                bound_names.update(_direct_bound_names(statement))
                 _update_trusted_names_from_import(statement, trusted_names)
             elif isinstance(statement, ast.Assign):
                 self._scan_assignment(
@@ -608,6 +793,8 @@ class _Analyzer:
                     statement.value,
                     facts,
                     trusted_names,
+                    bound_names,
+                    finalizer_safe_names,
                 )
             elif isinstance(statement, ast.AnnAssign):
                 value = statement.value
@@ -618,9 +805,14 @@ class _Analyzer:
                 ):
                     self._inspect_call(value, facts)
                 facts.clear()
+                finalizer_safe_names.clear()
+                if value is not None:
+                    bound_names.update(_direct_bound_names(statement))
                 trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
             elif isinstance(statement, (ast.AugAssign, ast.Delete)):
                 facts.clear()
+                finalizer_safe_names.clear()
+                bound_names.update(_direct_bound_names(statement))
                 trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
             elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
                 call = statement.value
@@ -628,8 +820,13 @@ class _Analyzer:
                     call
                 ):
                     self._inspect_call(call, facts)
+                    if not _call_arguments_are_protocol_safe(call, finalizer_safe_names):
+                        facts.clear()
+                        finalizer_safe_names.clear()
+                        trusted_names.clear()
                 else:
                     facts.clear()
+                    finalizer_safe_names.clear()
                     trusted_names.difference_update(_changed_direct_names([call], trusted_names))
             elif isinstance(statement, ast.Pass) or (
                 isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
@@ -637,12 +834,16 @@ class _Analyzer:
                 continue
             elif isinstance(statement, ast.ClassDef):
                 facts.clear()
+                finalizer_safe_names.clear()
+                bound_names.update(_direct_bound_names(statement))
                 trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
                 trusted_names.difference_update(
                     _class_body_changed_direct_names(statement, trusted_names)
                 )
             else:
                 facts.clear()
+                finalizer_safe_names.clear()
+                bound_names.update(_direct_bound_names(statement))
                 trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
 
     def run(self, tree: ast.Module) -> list[AnalyzerFinding]:
@@ -663,4 +864,4 @@ def analyze(
     parsed = python_ast or parse_python_source(content, file_path)
     if parsed.tree is None:
         return []
-    return _Analyzer(file_path, parsed.lines).run(parsed.tree)
+    return _Analyzer(file_path, parsed).run(parsed.tree)
