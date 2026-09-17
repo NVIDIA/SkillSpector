@@ -21,7 +21,7 @@ from skillspector.artifacts import (
     normalized_security_view,
     security_text_views,
 )
-from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.models import AnalyzerFinding, Location, Severity, compute_match_fingerprint
 from skillspector.python_ast import ParsedPythonFile, parse_python_source
 
 from .common import LINE_BREAK_CHARS, get_complete_source_segment, get_context_from_lines
@@ -821,19 +821,7 @@ class _Analyzer:
             evidence[BOUND_DIRECT_MATCH_END_EVIDENCE] = shell_start + len("True")
         if popen_start is not None:
             evidence[BOUND_POPEN_START_EVIDENCE] = popen_start
-        canonical_fingerprint = (
-            canonical[0]
-            if canonical is not None
-            else sha256(
-                (
-                    "TM1\x1f"
-                    + " ".join(
-                        normalized_security_prefix(source, _MAX_FINGERPRINT_CHARS).strip().split()
-                    )
-                ).encode()
-            ).hexdigest()
-        )
-        finding_key = (line, canonical_fingerprint)
+        finding_key = (line, compute_match_fingerprint("TM1", source))
         if finding_key in self._finding_keys:
             return
         self._finding_keys.add(finding_key)

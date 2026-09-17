@@ -2878,7 +2878,11 @@ def analyze(
                 confidence,
                 file_type,
             )
-        candidate_key = (line_num, " ".join(matched.strip().split()))
+        candidate_identity = matched_text if is_direct_shell_true else matched
+        candidate_key = (
+            line_num,
+            sha256(" ".join(candidate_identity.strip().split()).encode()).hexdigest(),
+        )
         existing = tm1_findings_by_key.get(candidate_key)
         if existing is not None:
             if adj > existing.confidence:
@@ -3018,6 +3022,26 @@ def analyze(
 def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Finding]:
     """Select one owner per direct call without discarding private coordinates."""
     from . import static_python_shell_truthiness
+
+    full_match_identities = {
+        finding.finding_id: finding.match_fingerprint
+        for finding in findings
+        if finding.match_fingerprint is not None
+    }
+    canonical_bound_calls: dict[tuple[str, int, str], set[int]] = {}
+    for finding in findings:
+        canonical = finding.evidence.get(
+            static_python_shell_truthiness.BOUND_CANONICAL_FINGERPRINT_EVIDENCE
+        )
+        call_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
+        if isinstance(canonical, str) and type(call_start) is int:
+            canonical_bound_calls.setdefault(
+                (finding.file, finding.start_line, canonical),
+                set(),
+            ).add(call_start)
+    colliding_bound_identities = {
+        key for key, call_starts in canonical_bound_calls.items() if len(call_starts) > 1
+    }
 
     lexical_records: list[tuple[Finding, int]] = []
     parents: dict[int, int] = {}
@@ -3184,6 +3208,19 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
             return reach_end > shell_value_start
         return reach_end >= direct_match_end
 
+    lexical_canonical_calls: dict[tuple[str, int, str], set[int]] = {}
+    for call_start, group in lexical_groups.items():
+        canonical = select_fingerprint_source(group, call_start)
+        lexical_canonical_fingerprint = lexical_fingerprint(canonical)
+        if isinstance(lexical_canonical_fingerprint, str):
+            lexical_canonical_calls.setdefault(
+                (canonical.file, canonical.start_line, lexical_canonical_fingerprint),
+                set(),
+            ).add(call_start)
+    colliding_lexical_identities = {
+        key for key, call_starts in lexical_canonical_calls.items() if len(call_starts) > 1
+    }
+
     lexical_owners: dict[int, Finding] = {}
     lexical_member_starts: dict[str, int] = {}
     for call_start, group in lexical_groups.items():
@@ -3226,7 +3263,18 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
             owner.evidence[static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE] = call_start
             if "normalized-view" in canonical.tags and "normalized-view" not in owner.tags:
                 owner.tags.append("normalized-view")
-        owner.match_fingerprint = lexical_fingerprint(canonical)
+        lexical_canonical_fingerprint = lexical_fingerprint(canonical)
+        canonical_key = (
+            canonical.file,
+            canonical.start_line,
+            lexical_canonical_fingerprint,
+        )
+        complete_identity = full_match_identities.get(canonical.finding_id)
+        owner.match_fingerprint = (
+            complete_identity
+            if canonical_key in colliding_lexical_identities and isinstance(complete_identity, str)
+            else lexical_canonical_fingerprint
+        )
         lexical_owners[call_start] = owner
         lexical_member_starts.update((candidate.finding_id, call_start) for candidate in group)
 
@@ -3240,9 +3288,25 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
         )
         lexical_identity = finding.evidence.get(LEXICAL_BOUND_IDENTITY_EVIDENCE)
         previously_reachable = finding.evidence.get(LEXICAL_BOUND_REACHABLE_EVIDENCE) is True
-        fingerprint = (
-            lexical_identity if isinstance(lexical_identity, str) else canonical_fingerprint
+        complete_identity = full_match_identities.get(finding.finding_id)
+        canonical_collision = (
+            isinstance(canonical_fingerprint, str)
+            and (
+                finding.file,
+                finding.start_line,
+                canonical_fingerprint,
+            )
+            in colliding_bound_identities
         )
+        fingerprint = (
+            lexical_identity
+            if isinstance(lexical_identity, str)
+            else complete_identity
+            if canonical_collision and isinstance(complete_identity, str)
+            else canonical_fingerprint
+        )
+        if canonical_collision and isinstance(fingerprint, str):
+            finding.evidence[LEXICAL_BOUND_IDENTITY_EVIDENCE] = fingerprint
         if isinstance(fingerprint, str):
             finding.match_fingerprint = fingerprint
         ast_call_start = finding.evidence.get(
@@ -4193,6 +4257,20 @@ def postprocess_path_findings(
             next((finding.file for finding in reconciled), "<unknown>"),
             direct_starts,
         )
+        canonical_direct_calls: dict[tuple[str, int, str], set[int]] = {}
+        for finding in reconciled:
+            direct_call_start = _lexical_call_start(finding)
+            metadata = (
+                direct_metadata.get(direct_call_start) if type(direct_call_start) is int else None
+            )
+            if metadata is not None:
+                canonical_direct_calls.setdefault(
+                    (finding.file, finding.start_line, metadata.match_fingerprint),
+                    set(),
+                ).add(metadata.call_start)
+        colliding_direct_identities = {
+            key for key, call_starts in canonical_direct_calls.items() if len(call_starts) > 1
+        }
         for finding in reconciled:
             direct_call_start = _lexical_call_start(finding)
             metadata = (
@@ -4201,7 +4279,12 @@ def postprocess_path_findings(
             lexical_anchor = finding.evidence.get(static_runner._ABSOLUTE_ANCHOR_EVIDENCE)
             if metadata is None or lexical_anchor != metadata.shell_anchor:
                 continue
-            finding.match_fingerprint = metadata.match_fingerprint
+            if (
+                finding.file,
+                finding.start_line,
+                metadata.match_fingerprint,
+            ) not in colliding_direct_identities:
+                finding.match_fingerprint = metadata.match_fingerprint
             finding.evidence.update(
                 {
                     static_python_shell_truthiness.BOUND_SHELL_EVIDENCE: True,

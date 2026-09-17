@@ -128,6 +128,16 @@ def test_distinct_bound_calls_on_one_line_are_not_deduplicated() -> None:
     }
 
 
+def test_long_direct_calls_with_shared_preview_keep_distinct_identity() -> None:
+    payload = "x" * 240
+    first_call = f'subprocess.run("{payload}A", shell=True)'
+    second_call = f'subprocess.run("{payload}B", shell=True)'
+    findings = _tm1(f"first = {first_call}; second = {second_call}\n")
+
+    assert len(findings) == 2
+    assert findings[0].fingerprint() != findings[1].fingerprint()
+
+
 def test_output_cap_keeps_first_mixed_owner_in_source_order(monkeypatch) -> None:
     monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
     result = _run(
