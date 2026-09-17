@@ -157,6 +157,9 @@ _PIPE_TO_SHELL = re.compile(
     re.IGNORECASE,
 )
 _MAX_WARNED_INSTALLER_LINE_CHARS = 4_096
+_MAX_LITERAL_XOR_KEY_BYTES = 256
+_MAX_LITERAL_XOR_VALUES = 4_096
+
 def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     """Decode literal byte arrays passed to a recognizable local XOR helper.
 
@@ -180,22 +183,34 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
             or ".decode(" not in body
         ):
             continue
-        key = codecs.decode(key_match.group("key"), "unicode_escape").encode("latin1")
+        try:
+            key = codecs.decode(key_match.group("key"), "unicode_escape").encode("latin1")
+        except (UnicodeError, ValueError):
+            continue
+        if not key or len(key) > _MAX_LITERAL_XOR_KEY_BYTES:
+            continue
         call_pattern = re.compile(
             rf"\b{re.escape(function.group('name'))}\(\s*\[(?P<values>[\d,\s]+)\]\s*\)"
         )
         for call in call_pattern.finditer(content):
-            values = [
-                int(value) for value in call.group("values").split(",") if value.strip()
-            ]
-            if not values or any(value > 255 for value in values):
+            try:
+                values = [
+                    int(value) for value in call.group("values").split(",") if value.strip()
+                ]
+            except ValueError:
+                continue
+            if (
+                not values
+                or len(values) > _MAX_LITERAL_XOR_VALUES
+                or any(value < 0 or value > 255 for value in values)
+            ):
                 continue
             try:
                 decoded_bytes = bytes(
                     value ^ key[index % len(key)] for index, value in enumerate(values)
                 )
                 command = decoded_bytes.decode("utf-8")
-            except UnicodeDecodeError:
+            except (UnicodeDecodeError, ValueError):
                 continue
             decoded.append((get_line_number(content, call.start()), command))
     return decoded

