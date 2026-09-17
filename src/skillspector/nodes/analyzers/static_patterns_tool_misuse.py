@@ -2253,53 +2253,78 @@ def _tm1_candidates(
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             yield match.start(), pattern_index, match, confidence
 
-    direct_iterators = (
-        direct_matches(pattern_index, pattern, confidence)
-        for pattern_index, (pattern, confidence) in enumerate(DIRECT_SHELL_TRUE_PATTERNS)
-    )
-    qualified_popen_starts: set[int] = set()
-    for _, pattern_index, match, confidence in heapq.merge(
-        *direct_iterators,
-        key=lambda candidate: (candidate[0], candidate[1]),
-    ):
-        alternate_start: int | None = None
-        alternate_matched_text: str | None = None
-        if pattern_index == 0:
-            method = re.match(r"subprocess\.(?P<method>\w+)", match.group(0), re.IGNORECASE)
-            if method is not None and method.group("method").casefold() == "popen":
-                alternate_start = match.start() + method.start("method")
-                alternate_matched_text = content[alternate_start : match.end()]
-                qualified_popen_starts.add(alternate_start)
-        elif match.start() in qualified_popen_starts:
-            # Emit one candidate for a qualified ``subprocess.Popen`` call,
-            # but retain the bare-method coordinate as an ownership fallback
-            # when the qualifier belongs to an adjacent scan window.
-            qualified_popen_starts.remove(match.start())
-            continue
-        elif (qualifier_start := _subprocess_qualifier_start(content, match.start())) is not None:
-            alternate_start = qualifier_start
-            alternate_matched_text = content[qualifier_start : match.end()]
-        relative_anchor = _outer_shell_true_anchor(match.group(0))
-        if relative_anchor is None:
-            for shell_value in _DIRECT_SHELL_TRUE_VALUE.finditer(match.group(0)):
-                relative_anchor = shell_value.start()
-        anchor = match.start() + relative_anchor if relative_anchor is not None else None
-        yield (
-            match.start(),
-            match.end(),
-            match.group(0),
-            confidence,
-            True,
-            anchor,
-            alternate_start,
-            alternate_matched_text,
+    def direct_candidates() -> Iterator[
+        tuple[int, int, str, float, bool, int | None, int | None, str | None]
+    ]:
+        direct_iterators = (
+            direct_matches(pattern_index, pattern, confidence)
+            for pattern_index, (pattern, confidence) in enumerate(DIRECT_SHELL_TRUE_PATTERNS)
         )
+        qualified_popen_starts: set[int] = set()
+        for _, pattern_index, match, confidence in heapq.merge(
+            *direct_iterators,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        ):
+            alternate_start: int | None = None
+            alternate_matched_text: str | None = None
+            if pattern_index == 0:
+                method = re.match(r"subprocess\.(?P<method>\w+)", match.group(0), re.IGNORECASE)
+                if method is not None and method.group("method").casefold() == "popen":
+                    alternate_start = match.start() + method.start("method")
+                    alternate_matched_text = content[alternate_start : match.end()]
+                    qualified_popen_starts.add(alternate_start)
+            elif match.start() in qualified_popen_starts:
+                # Emit one candidate for a qualified ``subprocess.Popen`` call,
+                # but retain the bare-method coordinate as an ownership fallback
+                # when the qualifier belongs to an adjacent scan window.
+                qualified_popen_starts.remove(match.start())
+                continue
+            elif (
+                qualifier_start := _subprocess_qualifier_start(content, match.start())
+            ) is not None:
+                alternate_start = qualifier_start
+                alternate_matched_text = content[qualifier_start : match.end()]
+            relative_anchor = _outer_shell_true_anchor(match.group(0))
+            if relative_anchor is None:
+                for shell_value in _DIRECT_SHELL_TRUE_VALUE.finditer(match.group(0)):
+                    relative_anchor = shell_value.start()
+            anchor = match.start() + relative_anchor if relative_anchor is not None else None
+            yield (
+                match.start(),
+                match.end(),
+                match.group(0),
+                confidence,
+                True,
+                anchor,
+                alternate_start,
+                alternate_matched_text,
+            )
 
     if direct_shell_only:
+        yield from direct_candidates()
         return
 
-    for pattern, confidence in TM1_PATTERNS[len(DIRECT_SHELL_TRUE_PATTERNS) :]:
+    def ordinary_matches(
+        pattern_index: int,
+        pattern: str,
+        confidence: float,
+    ) -> Iterator[tuple[int, int, re.Match[str], float]]:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            yield match.start(), pattern_index, match, confidence
+
+    def ordinary_candidates() -> Iterator[
+        tuple[int, int, str, float, bool, int | None, int | None, str | None]
+    ]:
+        ordinary_iterators = (
+            ordinary_matches(pattern_index, pattern, confidence)
+            for pattern_index, (pattern, confidence) in enumerate(
+                TM1_PATTERNS[len(DIRECT_SHELL_TRUE_PATTERNS) :]
+            )
+        )
+        for _, _, match, confidence in heapq.merge(
+            *ordinary_iterators,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        ):
             yield (
                 match.start(),
                 match.end(),
@@ -2311,29 +2336,39 @@ def _tm1_candidates(
                 None,
             )
 
-    seen_commands: set[tuple[int, int]] = set()
-    covered_until = 0
-    for command_start, body_start in _destructive_command_words(content):
-        if command_start < covered_until:
-            continue
-        command_key = (command_start, body_start)
-        if command_key in seen_commands:
-            continue
-        seen_commands.add(command_key)
-        # Documentation is excluded regardless of the shell parse result.  Apply
-        # that existing semantic gate first so large manuals do not pay for a
-        # character-by-character shell parse for every explanatory ``rm`` noun.
-        if _is_root_glob_documentation(content, command_start, body_start):
-            continue
-        tokens, command_end, _ = _bounded_shell_tokens(
-            content,
-            command_start,
-            body_start,
-        )
-        covered_until = max(covered_until, command_end)
-        command = content[command_start:command_end]
-        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
-            yield command_start, command_end, command, 0.9, False, None, None, None
+    def destructive_candidates() -> Iterator[
+        tuple[int, int, str, float, bool, int | None, int | None, str | None]
+    ]:
+        seen_commands: set[tuple[int, int]] = set()
+        covered_until = 0
+        for command_start, body_start in _destructive_command_words(content):
+            if command_start < covered_until:
+                continue
+            command_key = (command_start, body_start)
+            if command_key in seen_commands:
+                continue
+            seen_commands.add(command_key)
+            # Documentation is excluded regardless of the shell parse result. Apply
+            # that existing semantic gate first so large manuals do not pay for a
+            # character-by-character shell parse for every explanatory ``rm`` noun.
+            if _is_root_glob_documentation(content, command_start, body_start):
+                continue
+            tokens, command_end, _ = _bounded_shell_tokens(
+                content,
+                command_start,
+                body_start,
+            )
+            covered_until = max(covered_until, command_end)
+            command = content[command_start:command_end]
+            if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+                yield command_start, command_end, command, 0.9, False, None, None, None
+
+    yield from heapq.merge(
+        direct_candidates(),
+        ordinary_candidates(),
+        destructive_candidates(),
+        key=lambda candidate: candidate[0],
+    )
 
 
 def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
@@ -2879,6 +2914,7 @@ def analyze(
                 file_type,
             )
         candidate_identity = matched_text if is_direct_shell_true else matched
+        complete_identity_match = matched_text
         candidate_key = (
             line_num,
             sha256(" ".join(candidate_identity.strip().split()).encode()).hexdigest(),
@@ -2912,6 +2948,7 @@ def analyze(
                     else matched_text
                 )
             )
+            complete_identity_match = normalized_security_view(canonical_match).text
             reach_end = content.find(")", match_start)
             reach_terminated = reach_end != -1
             if not reach_terminated:
@@ -2949,7 +2986,7 @@ def analyze(
             tags=tag,
             context=context_text,
             matched_text=matched,
-            complete_match=matched_text,
+            complete_match=complete_identity_match,
             evidence=evidence,
         )
         tm1_findings_by_key[candidate_key] = finding
@@ -3208,19 +3245,6 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
             return reach_end > shell_value_start
         return reach_end >= direct_match_end
 
-    lexical_canonical_calls: dict[tuple[str, int, str], set[int]] = {}
-    for call_start, group in lexical_groups.items():
-        canonical = select_fingerprint_source(group, call_start)
-        lexical_canonical_fingerprint = lexical_fingerprint(canonical)
-        if isinstance(lexical_canonical_fingerprint, str):
-            lexical_canonical_calls.setdefault(
-                (canonical.file, canonical.start_line, lexical_canonical_fingerprint),
-                set(),
-            ).add(call_start)
-    colliding_lexical_identities = {
-        key for key, call_starts in lexical_canonical_calls.items() if len(call_starts) > 1
-    }
-
     lexical_owners: dict[int, Finding] = {}
     lexical_member_starts: dict[str, int] = {}
     for call_start, group in lexical_groups.items():
@@ -3264,15 +3288,10 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
             if "normalized-view" in canonical.tags and "normalized-view" not in owner.tags:
                 owner.tags.append("normalized-view")
         lexical_canonical_fingerprint = lexical_fingerprint(canonical)
-        canonical_key = (
-            canonical.file,
-            canonical.start_line,
-            lexical_canonical_fingerprint,
-        )
         complete_identity = full_match_identities.get(canonical.finding_id)
         owner.match_fingerprint = (
             complete_identity
-            if canonical_key in colliding_lexical_identities and isinstance(complete_identity, str)
+            if isinstance(complete_identity, str)
             else lexical_canonical_fingerprint
         )
         lexical_owners[call_start] = owner
@@ -3630,7 +3649,7 @@ def _window_popen_qualifiers(
                         qualifier_start,
                         qualifier_end,
                         qualifier_text,
-                        normalized_security_prefix(match.group(0), 200),
+                        match.group(0),
                         requires_derived_match,
                         owned_start <= qualifier_start < owned_end,
                     )
@@ -3698,7 +3717,7 @@ def _cross_window_subprocess_qualifiers(
                         projection.source_offset(projected_start),
                         projection.source_offset(projected_end) + 1,
                         view.text[match.start() : derived_popen_start],
-                        normalized_security_prefix(match.group(0), 200),
+                        match.group(0),
                         True,
                     )
     return qualifiers
@@ -3778,14 +3797,15 @@ def reconcile_retained_findings(
         if qualifier is None:
             continue
         qualifier_start, _, _, canonical_match, normalized_view = qualifier
-        canonical_match = normalized_security_prefix(canonical_match, 200)
-        finding.evidence[LEXICAL_NORMALIZED_MATCH_EVIDENCE] = canonical_match
+        canonical_projection = normalized_security_view(canonical_match).text
+        canonical_preview = canonical_projection[:200]
+        finding.evidence[LEXICAL_NORMALIZED_MATCH_EVIDENCE] = canonical_preview
         if update_public_match:
-            finding.matched_text = canonical_match
-            finding.finding = canonical_match
+            finding.matched_text = canonical_preview
+            finding.finding = canonical_preview
         finding.evidence[static_runner._ABSOLUTE_ALTERNATE_START_EVIDENCE] = qualifier_start
         finding.match_fingerprint = sha256(
-            f"{finding.rule_id}\x1f{' '.join(canonical_match.strip().split())}".encode()
+            f"{finding.rule_id}\x1f{' '.join(canonical_projection.strip().split())}".encode()
         ).hexdigest()
         if normalized_view and "normalized-view" not in finding.tags:
             finding.tags.append("normalized-view")
