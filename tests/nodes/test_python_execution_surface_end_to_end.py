@@ -71,6 +71,59 @@ def test_python_execution_surfaces_reach_static_and_behavioral_analyzers(
     assert result["analysis_completeness"]["is_complete"] is True
 
 
+@pytest.mark.parametrize("selector", ["-s", "--script", "--gui-script"])
+def test_uv_script_launcher_reaches_static_analyzers(tmp_path: Path, selector: str) -> None:
+    filename = "runner"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# uv Python helper",
+            filename: (
+                f"#!/usr/bin/env -S uv run {selector}\n"
+                "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run(command, shell=enabled)\n"
+            ),
+        },
+    )
+    (tmp_path / filename).chmod(0o755)
+
+    result = _scan(tmp_path)
+    metadata = next(row for row in result["component_metadata"] if row["path"] == filename)
+
+    assert filename in _tm1_paths(result)
+    assert metadata["type"] == "python"
+    assert metadata["executable"] is True
+    assert result["analysis_completeness"]["is_complete"] is True
+
+
+def test_uv_run_without_script_selector_is_analyzed_fail_closed(tmp_path: Path) -> None:
+    filename = "runner"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Ambiguous uv helper",
+            filename: (
+                "#!/usr/bin/env -S uv run\n"
+                "import subprocess\n"
+                "enabled = True\n"
+                "subprocess.run(command, shell=enabled)\n"
+            ),
+        },
+    )
+    (tmp_path / filename).chmod(0o755)
+
+    result = _scan(tmp_path)
+    exceptions = result["analysis_completeness"]["ledger_exceptions"]
+
+    assert filename in _tm1_paths(result)
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert any(
+        row["path"] == filename and row["reason_code"] == "python_source_ambiguous"
+        for row in exceptions
+    )
+
+
 def test_ambiguous_python_surface_is_analyzed_fail_closed(tmp_path: Path) -> None:
     filename = "runner"
     _write_bundle(

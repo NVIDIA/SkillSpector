@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -181,6 +182,71 @@ def test_is_python_source_accepts_supported_execution_surfaces(
     path: str, content: str | bytes
 ) -> None:
     assert is_python_source(path, content)
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        pytest.param("-s", id="short-script"),
+        pytest.param("--script", id="long-script"),
+        pytest.param("--gui-script", id="gui-script"),
+    ],
+)
+def test_uv_run_script_shebang_executes_appended_python_source(selector: str) -> None:
+    content = f"#!/usr/bin/env -S uv run {selector}\npass\n"
+
+    assert classify_python_source("runner", content) is PythonSourceClassification.PYTHON
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param("run", id="implicit-command"),
+        pytest.param("run echo", id="explicit-command"),
+        pytest.param("run echo --script", id="selector-after-command"),
+        pytest.param("run --frozen --script", id="run-option-before-selector"),
+        pytest.param("run --script /tmp/other.py", id="explicit-script-operand"),
+        pytest.param("run --script=/tmp/other.py", id="attached-long-script"),
+        pytest.param("run --gui-script=/tmp/other.py", id="attached-gui-script"),
+        pytest.param("run -s/tmp/other.py", id="attached-short-script"),
+    ],
+)
+def test_uv_run_uncertain_source_selection_is_ambiguous(arguments: str) -> None:
+    content = f"#!/usr/bin/env -S uv {arguments}\npass\n"
+
+    assert classify_python_source("runner", content) is PythonSourceClassification.AMBIGUOUS
+
+
+@pytest.mark.parametrize("utility", ["node", "bash", "uv --version"])
+def test_non_python_env_utilities_remain_non_python(utility: str) -> None:
+    content = f"#!/usr/bin/env -S {utility}\npass\n"
+
+    assert classify_python_source("runner", content) is PythonSourceClassification.NON_PYTHON
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize("selector", ["-s", "--script", "--gui-script"])
+def test_real_uv_script_launcher_executes_extensionless_python(
+    tmp_path: Path, selector: str
+) -> None:
+    source = tmp_path / "runner"
+    marker = "UV_SCRIPT_EXECUTED"
+    source.write_text(
+        f'#!/usr/bin/env -S uv run {selector}\nprint("{marker}")\n',
+        encoding="utf-8",
+    )
+    source.chmod(0o755)
+
+    executed = subprocess.run(
+        [str(source)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert executed.returncode == 0, executed.stderr
+    assert marker in executed.stdout
 
 
 @pytest.mark.parametrize(

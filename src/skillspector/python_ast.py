@@ -238,6 +238,11 @@ def _is_python_interpreter_filesystem_alias(command: str) -> bool:
     return _PYTHON_INTERPRETER_BASENAME.fullmatch(normalized) is not None
 
 
+def _is_uv_launcher(command: str) -> bool:
+    """Return whether a command names Astral's Python-capable ``uv`` launcher."""
+    return command.rsplit("/", 1)[-1] == "uv"
+
+
 def _is_trusted_env_filesystem_alias(command: str) -> bool:
     """Return whether filesystem/path aliases may resolve trusted ``env``."""
     if command.startswith("/"):
@@ -1322,6 +1327,27 @@ def _python_arguments_execute_appended_script(
     return merge_version_branches(True)
 
 
+def _uv_arguments_execute_appended_script(arguments: tuple[_EnvArgument, ...]) -> bool | None:
+    """Classify bounded ``uv run`` forms that can consume the source path.
+
+    ``uv run -s``, ``uv run --script``, and ``uv run --gui-script`` mark the
+    following positional command as Python.  In a shebang the kernel appends
+    the inspected artifact after these arguments, so an exact trailing
+    selector executes that artifact as Python.  Other ``uv run`` forms remain
+    unresolved: the appended path can itself become a command, or an explicit
+    command/script can receive it and load it from argv.
+    """
+    if any(argument.dynamic_offsets for argument in arguments):
+        return None
+    if not arguments or arguments[0].text != "run":
+        return False
+
+    selectors = {"-s", "--script", "--gui-script"}
+    if len(arguments) == 2 and arguments[1].text in selectors:
+        return True
+    return None
+
+
 def _record_source_execution(
     execution: _EnvExecution,
     execution_kinds: set[bool],
@@ -1330,16 +1356,20 @@ def _record_source_execution(
     allow_filesystem_aliases: bool = False,
 ) -> bool:
     """Record a viable source interpreter and return unresolved Python argv."""
-    if not _is_python_interpreter(execution.utility) and not (
+    is_python_interpreter = _is_python_interpreter(execution.utility) or (
         allow_filesystem_aliases and _is_python_interpreter_filesystem_alias(execution.utility)
-    ):
+    )
+    if is_python_interpreter:
+        executes_script = _python_arguments_execute_appended_script(
+            execution.arguments,
+            source_path,
+            environment_inspect=execution.python_inspect,
+        )
+    elif _is_uv_launcher(execution.utility):
+        executes_script = _uv_arguments_execute_appended_script(execution.arguments)
+    else:
         execution_kinds.add(False)
         return False
-    executes_script = _python_arguments_execute_appended_script(
-        execution.arguments,
-        source_path,
-        environment_inspect=execution.python_inspect,
-    )
     if executes_script is True:
         execution_kinds.add(True)
     elif executes_script is False:
