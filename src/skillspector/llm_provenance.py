@@ -246,6 +246,7 @@ def _sanitize_control(
     *,
     use_llm: bool,
     effective_adapters: Sequence[str],
+    observed_values: Sequence[object],
 ) -> dict[str, object]:
     raw = value if isinstance(value, Mapping) else {}
     source = raw.get("source")
@@ -294,30 +295,58 @@ def _sanitize_control(
     if source != "environment":
         requested = None
 
-    # A configured client value is only reportable after provider-response
-    # telemetry proves that an analyzer call reached an effective adapter.
-    forwarded = requested if effective_adapters and adapter_support else None
-    if name == "temperature":
-        forwarded = (
-            float(forwarded)
-            if isinstance(forwarded, (int, float))
-            and not isinstance(forwarded, bool)
-            and math.isfinite(forwarded)
-            and 0 <= forwarded <= 1
-            else None
-        )
-    elif name == "seed":
-        forwarded = (
-            forwarded
-            if isinstance(forwarded, int)
-            and not isinstance(forwarded, bool)
-            and _MIN_SAFE_SEED <= forwarded <= _MAX_SAFE_SEED
-            else None
-        )
-    else:
-        forwarded = _safe_setting(forwarded, fallback="") or None
-    if not use_llm or not adapter_support or source != "environment" or forwarded != requested:
-        forwarded = None
+    # Provider-response observations carry the controls recorded from the
+    # actual client constructor. They supersede the earlier configuration
+    # capture, which is necessarily provisional until a client is built.
+    observed: list[float | int | str | None] = []
+    invalid_observation = False
+    for candidate in observed_values:
+        if candidate is None:
+            observed.append(None)
+        elif name == "temperature":
+            if (
+                isinstance(candidate, (int, float))
+                and not isinstance(candidate, bool)
+                and math.isfinite(candidate)
+                and 0 <= candidate <= 1
+            ):
+                observed.append(float(candidate))
+            else:
+                invalid_observation = True
+        elif name == "seed":
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and _MIN_SAFE_SEED <= candidate <= _MAX_SAFE_SEED
+            ):
+                observed.append(candidate)
+            else:
+                invalid_observation = True
+        else:
+            setting = _safe_setting(candidate, fallback="")
+            if setting:
+                observed.append(setting)
+            else:
+                invalid_observation = True
+
+    forwarded: float | int | str | None = None
+    if use_llm and adapter_support and observed_values:
+        distinct = []
+        for candidate in observed:
+            if candidate not in distinct:
+                distinct.append(candidate)
+        if invalid_observation or len(observed) != len(observed_values) or len(distinct) != 1:
+            requested = None
+            source = "unknown"
+        else:
+            actual = distinct[0]
+            if actual is None:
+                requested = None
+                source = "unset" if name == "seed" else "provider_default"
+            else:
+                requested = actual
+                source = "environment"
+                forwarded = actual
 
     return {
         "requested": requested,
@@ -372,17 +401,52 @@ def _sanitize_provider_routing(value: object, *, resolved_adapter: str) -> dict[
     }
 
 
-def _effective_adapters(inference_usage: object) -> list[str]:
-    """Return providers proven by sanitized provider-response telemetry."""
+def _provider_response_records(inference_usage: object) -> list[Mapping[object, object]]:
+    """Return internal provider-response evidence, including counter-less calls."""
     records = inference_usage if isinstance(inference_usage, Sequence) else []
+    return [
+        record
+        for record in records
+        if isinstance(record, Mapping) and record.get("usage_source") == "provider_response"
+    ]
+
+
+def _effective_adapters(records: Sequence[Mapping[object, object]]) -> list[str]:
+    """Return providers proven by provider-response telemetry."""
     adapters = {
         adapter
         for record in records
-        if isinstance(record, Mapping)
-        and record.get("usage_source") == "provider_response"
-        and (adapter := _safe_optional_label(record.get("provider"))) is not None
+        if (adapter := _safe_optional_label(record.get("provider"))) is not None
     }
     return sorted(adapters)
+
+
+def _observed_controls(
+    records: Sequence[Mapping[object, object]],
+) -> dict[str, list[object]]:
+    """Collect fixed-field constructor controls from successful calls."""
+    observed = {name: [] for name in ("temperature", "seed", "reasoning_effort")}
+    for record in records:
+        controls = record.get("forwarded_controls")
+        if not isinstance(controls, Mapping):
+            continue
+        for name in observed:
+            if name in controls:
+                observed[name].append(controls.get(name))
+    return observed
+
+
+def _expected_observed_controls(effective_adapters: Sequence[str]) -> set[str]:
+    """Return controls whose constructor state is observable for all adapters."""
+    expected: set[str] = set()
+    for name, supported in (
+        ("temperature", _TEMPERATURE_ADAPTERS),
+        ("seed", _SEED_ADAPTERS),
+        ("reasoning_effort", _REASONING_EFFORT_ADAPTERS),
+    ):
+        if effective_adapters and all(adapter in supported for adapter in effective_adapters):
+            expected.add(name)
+    return expected
 
 
 def sanitize_llm_provenance(
@@ -397,7 +461,9 @@ def sanitize_llm_provenance(
     provider = raw_provider if isinstance(raw_provider, Mapping) else {}
     configured_adapter = _safe_label(provider.get("configured_adapter"))
     resolved_adapter = _safe_label(provider.get("resolved_adapter"))
-    effective_adapters = _effective_adapters(inference_usage) if use_llm else []
+    response_records = _provider_response_records(inference_usage) if use_llm else []
+    effective_adapters = _effective_adapters(response_records)
+    observed_controls = _observed_controls(response_records)
     effective_adapter = (
         "not_applicable"
         if not use_llm
@@ -443,9 +509,19 @@ def sanitize_llm_provenance(
             sampling.get(name),
             use_llm=use_llm,
             effective_adapters=effective_adapters,
+            observed_values=observed_controls[name],
         )
         for name in ("temperature", "seed", "reasoning_effort")
     }
+    expected_observations = _expected_observed_controls(effective_adapters)
+    controls_observed = all(
+        all(
+            isinstance(record.get("forwarded_controls"), Mapping)
+            and name in record.get("forwarded_controls", {})
+            for record in response_records
+        )
+        for name in expected_observations
+    )
     requested_controls = [
         control for control in sanitized_sampling.values() if control["source"] == "environment"
     ]
@@ -458,7 +534,7 @@ def sanitize_llm_provenance(
         control_status = "invalid_configuration"
     elif any(control["source"] == "unknown" for control in sanitized_sampling.values()):
         control_status = "configuration_unknown"
-    elif not effective_adapters:
+    elif not effective_adapters or not controls_observed:
         control_status = "controls_not_observed"
     elif not requested_controls:
         control_status = "provider_defaults"

@@ -69,7 +69,10 @@ def test_collector_marks_response_received_without_usage_counters() -> None:
     collector.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]], llm_output={}))
 
     assert collector.response_received is True
-    assert collector.snapshot() == []
+    observation = collector.snapshot()
+    assert observation[0]["provider"] == "codex_cli"
+    assert observation[0]["usage_source"] == "provider_response"
+    assert sanitize_inference_usage(observation) == []
 
 
 def test_raw_anthropic_usage_adds_external_cache_counters_to_prompt_total() -> None:

@@ -18,17 +18,21 @@
 import ast
 import json
 import re
+import shutil
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from importlib import import_module
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import typer
 import yaml
+from rich.console import Console
 from typer.testing import CliRunner
 
 from skillspector import __version__, cli, transitive
@@ -46,7 +50,9 @@ from skillspector.multi_skill import (
     MultiSkillDetectionResult,
     SkillDirectory,
 )
+from skillspector.nodes.finalize_inspection_ledger import finalize_inspection_ledger
 from skillspector.sarif_models import validate_sarif_report
+from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressedFinding, SuppressionRule
 
 runner = CliRunner()
@@ -88,6 +94,119 @@ def test_cli_version() -> None:
     assert "v" in result.output
 
 
+def test_discovered_files_tree_renders_untrusted_names_literally() -> None:
+    """File names cannot inject Rich markup or terminal control sequences."""
+    malicious_name = "\x1b]52;c;SGVsbG8=\x1b\\[conceal]hidden.py"
+    nested_path = str(Path("folder") / malicious_name)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree([nested_path]))
+
+    rendered = output.getvalue()
+    assert "\x1b]52" not in rendered
+    assert "\\x1b]52;c;SGVsbG8=\\x1b\\[conceal]hidden.py" in rendered
+    assert "📁 folder" in rendered
+    assert "📄 " in rendered
+
+
+def test_discovered_files_tree_bounds_untrusted_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "_PROGRESS_TREE_MAX_PATHS", 1)
+    output = StringIO()
+    render_console = Console(file=output, force_terminal=True, color_system=None)
+
+    render_console.print(cli._discovered_files_tree(["a.py", "b.py"]))
+
+    rendered = output.getvalue()
+    assert "a.py" in rendered
+    assert "b.py" not in rendered
+    assert "1 additional path omitted" in rendered
+
+
+def test_progress_counts_only_analyzers_wired_into_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "ANALYZER_NODE_IDS", ["wired", "unavailable"])
+    monkeypatch.setattr(cli, "graph", SimpleNamespace(nodes={"wired": object()}))
+
+    assert cli._wired_analyzer_node_ids() == frozenset({"wired"})
+
+
+def test_stream_progress_returns_complete_values_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_state = {
+        "report_body": "{}",
+        "analysis_completeness": {"is_complete": True},
+        "filtered_findings": [],
+        "inspection_ledger": [{"phase": "complete"}],
+        "provider_cache": {"preserved": True},
+    }
+
+    def fake_stream(
+        state: dict[str, object],
+        config: object,
+        stream_mode: list[str],
+    ) -> Iterator[tuple[str, dict[str, object]]]:
+        del state, config
+        assert stream_mode == ["updates", "values"]
+        yield "updates", {"build_context": {"components": []}}
+        yield "values", final_state
+
+    monkeypatch.setattr(
+        cli,
+        "graph",
+        SimpleNamespace(nodes={}, stream=fake_stream),
+    )
+
+    result = cli._run_graph_scan(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        stream_progress=True,
+    )
+
+    assert result == final_state
+
+
+@pytest.mark.parametrize(
+    ("terminal", "verbose", "expected"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_scan_streams_only_for_interactive_default(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: bool,
+    verbose: bool,
+    expected: bool,
+) -> None:
+    calls: list[bool] = []
+
+    def fake_run_graph_scan_for_source(**kwargs: object) -> dict[str, object]:
+        calls.append(bool(kwargs["stream_progress"]))
+        return {"risk_score": 0}
+
+    monkeypatch.setattr(cli, "_run_graph_scan_for_source", fake_run_graph_scan_for_source)
+    monkeypatch.setattr(cli.err_console, "_force_terminal", terminal)
+
+    cli._scan_skill(
+        input_path="SKILL.md",
+        format=FormatChoice.json,
+        no_llm=True,
+        baseline=None,
+        yara_rules_dir=None,
+        verbose=verbose,
+        show_suppressed=False,
+        transitive_enabled=False,
+        transitive_depth=1,
+        transitive_allow_prefix=None,
+        transitive_deny_prefix=None,
+    )
+
+    assert calls == [expected]
+
+
 def test_cli_scan_help_lists_every_available_provider() -> None:
     """Built-in help names every provider accepted by the selector."""
     result = runner.invoke(app, ["scan", "--help"])
@@ -108,6 +227,14 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         "gemini_cli",
     ):
         assert provider in result.output
+
+
+@pytest.mark.parametrize(("no_llm", "expected"), [(False, True), (True, False)])
+def test_scan_state_records_explicit_llm_request_intent(no_llm: bool, expected: bool) -> None:
+    """Report finalization can distinguish real CLI intent from legacy direct calls."""
+    state = cli._scan_state("skill", FormatChoice.json, no_llm)
+
+    assert state["llm_requested"] is expected
 
 
 def test_cli_scan_local_directory(tmp_path: Path) -> None:
@@ -172,13 +299,15 @@ def test_cli_writes_report_then_exits_two_for_execution_failure(
     """An incomplete execution preserves the report but takes precedence over risk."""
     (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
     output = tmp_path / "report.json"
+    fake_result = {
+        "report_body": '{"execution_successful": false}',
+        "execution_successful": False,
+        "risk_score": 0,
+    }
+    monkeypatch.setattr("skillspector.cli.graph.invoke", lambda state, config: fake_result)
     monkeypatch.setattr(
-        "skillspector.cli.graph.invoke",
-        lambda state, config: {
-            "report_body": '{"execution_successful": false}',
-            "execution_successful": False,
-            "risk_score": 0,
-        },
+        "skillspector.cli.graph.stream",
+        lambda state, config, stream_mode: iter([{"meta_analyzer": fake_result}]),
     )
 
     result = runner.invoke(app, ["scan", str(tmp_path), "-f", "json", "-o", str(output)])
@@ -218,6 +347,57 @@ def test_cli_fail_on_incomplete_exits_one_after_writing_report(
 
     assert result.exit_code == 1
     assert output.exists()
+
+
+def test_cli_fail_on_incomplete_rejects_missing_semantic_telemetry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The CLI consumes the canonical semantic-runtime completeness projection."""
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "semantic-incomplete.json"
+
+    def invoke_without_semantic_telemetry(
+        state: dict[str, object], config: object
+    ) -> dict[str, object]:
+        del config
+        graph_state = {
+            **state,
+            "components": [],
+            "findings": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+            "llm_call_log": [],
+            "component_metadata": [],
+            "manifest": {},
+        }
+        typed_state = cast(SkillspectorState, graph_state)
+        finalized = finalize_inspection_ledger(typed_state)
+        rendered = cli_module.report(cast(SkillspectorState, {**graph_state, **finalized}))
+        return {**graph_state, **finalized, **rendered}
+
+    monkeypatch.setattr("skillspector.cli.graph.invoke", invoke_without_semantic_telemetry)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--fail-on-incomplete",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["analysis_completeness"]["is_complete"] is False
+    assert payload["analysis_completeness"]["status"] == "partial"
+    assert any(
+        "per-source runtime telemetry" in exception["message"]
+        for exception in payload["analysis_completeness"]["ledger_exceptions"]
+    )
 
 
 def test_cli_fail_on_findings_exits_one_below_risk_threshold(
@@ -367,6 +547,132 @@ def test_recursive_scan_malformed_risk_score_falls_back_to_zero(tmp_path: Path) 
     assert payload["max_risk_score"] == 0
 
 
+def test_recursive_scan_dispatches_dot_prefixed_child_skill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive dispatch scans bounded dot-prefixed children and excludes links and skips."""
+    for name in ("skill-a", "skill-b", ".review-helper"):
+        child = tmp_path / name
+        child.mkdir()
+        (child / "SKILL.md").write_text(f"---\nname: {name.lstrip('.')}\n---\n", encoding="utf-8")
+    skipped = tmp_path / ".git"
+    skipped.mkdir()
+    (skipped / "SKILL.md").write_text("---\nname: skipped\n---\n", encoding="utf-8")
+    linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+    linked_target.mkdir()
+    (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+    try:
+        (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    scanned_sources: list[tuple[str, bool]] = []
+
+    def fake_scan_skill(
+        *, input_path: str, source_local_only: bool = False, **_kwargs: object
+    ) -> dict[str, object]:
+        scanned_sources.append((input_path, source_local_only))
+        return {
+            "filtered_findings": [],
+            "risk_score": 0,
+            "risk_severity": "LOW",
+            "report_body": "{}",
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": True},
+        }
+
+    monkeypatch.setattr(cli_module, "_scan_skill", fake_scan_skill)
+    result = runner.invoke(app, ["scan", str(tmp_path), "--recursive", "--no-llm"])
+
+    assert result.exit_code == 0
+    assert scanned_sources == [
+        (str(tmp_path / ".review-helper"), True),
+        (str(tmp_path / "skill-a"), False),
+        (str(tmp_path / "skill-b"), False),
+    ]
+
+
+def test_recursive_dot_child_static_finding_never_reaches_a_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hidden-child source and finding context remain local through a real graph scan."""
+    private_marker = "PRIVATE_DOT_CHILD_FINDING_MARKER"
+    public_marker = "PUBLIC_PROVIDER_CONTROL_MARKER"
+    hidden_skill = tmp_path / ".review-helper"
+    hidden_skill.mkdir()
+    (hidden_skill / "SKILL.md").write_text(
+        "---\nname: review-helper\ndescription: local review helper\n---\n",
+        encoding="utf-8",
+    )
+    (hidden_skill / "run.py").write_text(
+        f'import os\nos.system("echo {private_marker}")\n', encoding="utf-8"
+    )
+    public_skill = tmp_path / "public-helper"
+    public_skill.mkdir()
+    (public_skill / "SKILL.md").write_text(
+        f"---\nname: public-helper\ndescription: public provider control\n---\n# {public_marker}\n",
+        encoding="utf-8",
+    )
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True,
+        skills=[
+            SkillDirectory(
+                path=hidden_skill,
+                name="review-helper",
+                relative_path=".review-helper",
+                local_only=True,
+            ),
+            SkillDirectory(
+                path=public_skill,
+                name="public-helper",
+                relative_path="public-helper",
+            ),
+        ],
+    )
+    transports: list[MagicMock] = []
+
+    def structured_output(schema: type) -> MagicMock:
+        response = schema(findings=[])
+        transport = MagicMock(
+            invoke=MagicMock(return_value=response),
+            ainvoke=AsyncMock(return_value=response),
+        )
+        transports.append(transport)
+        return transport
+
+    model = MagicMock()
+    model.with_structured_output.side_effect = structured_output
+    get_chat_model = MagicMock(return_value=model)
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+    monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr(cli_module, "graph", import_module("skillspector.graph").create_graph())
+    monkeypatch.setattr(cli_module, "RISK_THRESHOLD", 100)
+    output = tmp_path / "recursive.json"
+
+    _scan_multi_skill(
+        detection,
+        FormatChoice.json,
+        output,
+        no_llm=False,
+    )
+
+    assert get_chat_model.call_count >= 3
+    provider_payloads = repr(
+        [
+            (call.args, call.kwargs)
+            for transport in transports
+            for call in [*transport.invoke.call_args_list, *transport.ainvoke.call_args_list]
+        ]
+    )
+    assert public_marker in provider_payloads
+    assert private_marker not in provider_payloads
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    child = payload["skills"][0]
+    assert private_marker in json.dumps(child["issues"])
+    assert child["metadata"].get("llm_calls_attempted", 0) == 0
+
+
 def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     """Benign context stays distinguishable without deleting deterministic CLI evidence."""
     (tmp_path / "references").mkdir()
@@ -391,7 +697,7 @@ def test_cli_scan_slack_p6_pe3_regression(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code == 0, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert [issue for issue in issues if issue["id"] == "P6"] == []
     pe3 = next(issue for issue in issues if issue["id"] == "PE3")
     assert {"contextual-triage", "likely-benign-context"} <= set(pe3["tags"])
@@ -415,7 +721,7 @@ def test_cli_scan_required_table_keeps_malicious_pe3(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
 
     assert result.exit_code in {0, 1}, result.output
-    issues = json.loads(result.output)["issues"]
+    issues = json.loads(result.stdout)["issues"]
     assert any(issue["id"] == "PE3" for issue in issues)
 
 
@@ -470,6 +776,22 @@ def test_cli_keyring_fixture_reproduction_is_clean() -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert not any(issue["id"] == "PE3" for issue in payload["issues"])
+
+
+def test_cli_as3_self_reference_fixture_preserves_only_peer_path(tmp_path: Path) -> None:
+    fixture_source = Path(__file__).parents[1] / "fixtures" / "as3_self_reference"
+    fixture = tmp_path / "example-skill"
+    shutil.copytree(fixture_source, fixture)
+    result = runner.invoke(app, ["scan", str(fixture), "--format", "json", "--no-llm"])
+
+    assert result.exit_code in {0, 1}, result.output
+    payload = json.loads(result.output)
+    assert payload["execution_successful"] is True
+    assert [
+        (issue["location"]["file"], issue["finding"])
+        for issue in payload["issues"]
+        if issue["id"] == "AS3"
+    ] == [("README.md", "skills/peer-skill/SKILL.md")]
 
 
 def test_cli_scan_nonexistent_exits_2() -> None:
@@ -646,7 +968,7 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
         ],
     )
     assert scan.exit_code == 0
-    data = json.loads(scan.output)
+    data = json.loads(scan.stdout)
     assert data["issues"] == []
     assert data["risk_assessment"]["score"] == 0
 
@@ -722,7 +1044,7 @@ def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["issues"] == []
     assert [finding["id"] for finding in data["suppressed"]] == ["PE5"]
     assert data["suppressed"][0]["location"]["file"] == "SKILL.md"
@@ -734,6 +1056,39 @@ def test_cli_scan_excludes_selected_baseline_inside_skill(tmp_path: Path) -> Non
         and exclusion["reason_code"] == "baseline_file"
         for exclusion in data["analysis_completeness"]["scope_exclusions"]
     )
+
+
+def test_cli_executable_selected_baseline_fails_closed(tmp_path: Path) -> None:
+    """A user-selected baseline remains auditable when its bytes are executable."""
+    skill = tmp_path / "skill"
+    baseline_file = skill / "config" / "skillspector-baseline.yaml"
+    baseline_file.parent.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Safe skill\n", encoding="utf-8")
+    baseline_file.write_text(
+        "#!/bin/sh\nversion: 2\nrules: []\nfingerprints: []\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--format",
+            "json",
+            "--baseline",
+            str(baseline_file),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.output)
+    issue = next(finding for finding in data["issues"] if finding["id"] == "SC9")
+    assert issue["location"]["file"] == "config/skillspector-baseline.yaml"
+    assert issue["evidence"]["excluded_from_analysis"] is True
+    assert data["risk_assessment"]["score"] >= 51
+    assert data["risk_assessment"]["recommendation"] == "DO_NOT_INSTALL"
+    assert data["analysis_completeness"]["is_complete"] is False
 
 
 def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
@@ -772,7 +1127,7 @@ def test_cli_scan_excludes_only_the_selected_baseline(tmp_path: Path) -> None:
     )
 
     assert result.exit_code in {0, 1}, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     pe5_files = {
         finding["location"]["file"] for finding in data["issues"] if finding["id"] == "PE5"
     }
@@ -829,7 +1184,7 @@ def test_recursive_single_skill_scan_still_accepts_baseline(tmp_path: Path) -> N
     )
 
     assert result.exit_code == 0, result.output
-    assert [issue for issue in json.loads(result.output)["issues"] if issue["id"] == "P1"] == []
+    assert [issue for issue in json.loads(result.stdout)["issues"] if issue["id"] == "P1"] == []
 
 
 def test_scan_multi_skill_markdown_output_to_file(
@@ -1009,10 +1364,11 @@ def test_scan_multi_skill_json_stdout_survives_child_failure(
     assert "Error: boom" in captured.err
 
 
-def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_recursive_single_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, output_format: str
 ) -> None:
-    """Recursive fallback advisories stay off stdout when JSON is requested."""
+    """Recursive fallback advisories stay off stdout when JSON or SARIF is requested."""
     monkeypatch.setattr(
         cli,
         "detect_skills",
@@ -1033,7 +1389,7 @@ def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
 
     result = runner.invoke(
         app,
-        ["scan", str(tmp_path), "--recursive", "--format", "json", "--no-llm"],
+        ["scan", str(tmp_path), "--recursive", "--format", output_format, "--no-llm"],
     )
 
     assert result.exit_code == 0, result.output
@@ -1042,10 +1398,11 @@ def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
     assert "Scanning as single" in result.stderr
 
 
-def test_json_multi_skill_advisory_does_not_pollute_stdout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_multi_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, output_format: str
 ) -> None:
-    """The non-recursive multi-skill advisory stays off JSON stdout."""
+    """The non-recursive multi-skill advisory stays off JSON and SARIF stdout."""
     skills = [
         SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
         for name in ("one", "two")
@@ -1070,7 +1427,7 @@ def test_json_multi_skill_advisory_does_not_pollute_stdout(
 
     result = runner.invoke(
         app,
-        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+        ["scan", str(tmp_path), "--format", output_format, "--no-llm"],
     )
 
     assert result.exit_code == 0, result.output
@@ -1310,6 +1667,30 @@ def test_recursive_sarif_is_valid_and_carries_aggregate_completeness(
     assert aggregate_run["properties"]["kind"] == "recursiveAggregate"
     completeness = aggregate_run["invocations"][0]["properties"]["analysisCompleteness"]
     assert completeness["is_complete"] is True
+
+
+def test_recursive_sarif_without_output_writes_only_the_log_to_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Recursive SARIF without --output prints the log; status text goes to stderr."""
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two")]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    monkeypatch.setattr(
+        cli.graph,
+        "invoke",
+        lambda *_args, **_kwargs: _bounded_recursive_result("one"),
+    )
+
+    _scan_multi_skill(detection, FormatChoice.sarif, None, no_llm=True, verbose=True)
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    validate_sarif_report(payload)
+    assert payload["runs"][-1]["properties"]["kind"] == "recursiveAggregate"
+    assert "Scanning" not in captured.out
+    assert "Scanning" in captured.err
+    assert "Running scan" in captured.err
+    assert "Multi-Skill Summary" in captured.err
 
 
 def test_recursive_sarif_bounds_the_final_serialized_document(
@@ -1817,31 +2198,39 @@ def test_cli_scan_json_preserves_single_skill_contract(
     skill_dir.mkdir()
     (skill_dir / "SKILL.md").write_text("---\nname: single-skill\n---\n# Single", encoding="utf-8")
 
+    fake_result = {
+        "report_body": json.dumps(
+            {
+                "skill": {
+                    "name": "single-skill",
+                    "source": str(skill_dir),
+                    "scanned_at": "2026-06-29T13:00:00+00:00",
+                },
+                "risk_assessment": {
+                    "score": 30,
+                    "severity": "LOW",
+                    "recommendation": "SAFE",
+                },
+                "components": [{"path": "root.py", "type": "python"}],
+                "issues": [{"id": "X-1", "severity": "low"}],
+                "suppressed_count": 0,
+                "suppressed": [],
+                "metadata": {"scan_scope": {"components_scanned": 1}},
+            }
+        )
+    }
+
     def fake_invoke(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
         assert state["input_path"] == str(skill_dir)
-        return {
-            "report_body": json.dumps(
-                {
-                    "skill": {
-                        "name": "single-skill",
-                        "source": str(skill_dir),
-                        "scanned_at": "2026-06-29T13:00:00+00:00",
-                    },
-                    "risk_assessment": {
-                        "score": 30,
-                        "severity": "LOW",
-                        "recommendation": "SAFE",
-                    },
-                    "components": [{"path": "root.py", "type": "python"}],
-                    "issues": [{"id": "X-1", "severity": "low"}],
-                    "suppressed_count": 0,
-                    "suppressed": [],
-                    "metadata": {"scan_scope": {"components_scanned": 1}},
-                }
-            )
-        }
+        return fake_result
 
-    monkeypatch.setattr("skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke))
+    def fake_stream(state: dict[str, Any], config: Any = None, stream_mode: str | None = None):
+        assert state["input_path"] == str(skill_dir)
+        yield {"meta_analyzer": fake_result}
+
+    monkeypatch.setattr(
+        "skillspector.cli.graph", SimpleNamespace(invoke=fake_invoke, stream=fake_stream)
+    )
 
     out_file = tmp_path / "single.json"
     result = runner.invoke(
@@ -2420,6 +2809,32 @@ def test_transitive_resolver_failure_preserves_direct_report(tmp_path: Path, mon
     assert data["issues"][0]["id"] == "D1"
 
 
+def test_transitive_failure_warning_stays_off_sarif_stdout(tmp_path: Path, monkeypatch) -> None:
+    """A failed transitive child does not print its warning into the SARIF log."""
+    target = "https://github.com/org/broken.git"
+
+    def fake_run_graph_scan(input_path: str, format, no_llm: bool, **_kwargs) -> dict[str, object]:
+        if input_path == str(tmp_path):
+            return _mock_graph_result(
+                findings=[_finding("D1", "direct finding")],
+                file_cache={"SKILL.md": f"deps {target}"},
+                output_format=format.value,
+            )
+        raise ValueError("resolver failure")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "sarif", "--transitive", "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Transitive scan failed" not in result.stdout
+    payload = json.loads(result.stdout)
+    validate_sarif_report(payload)
+    assert [item["ruleId"] for item in payload["runs"][0]["results"]] == ["D1"]
+
+
 def test_scan_transitive_does_not_rescan_root_source(monkeypatch) -> None:
     """A root external source is seeded in visited so self-references are not rescanned."""
     root_source = "https://github.com/org/root.git"
@@ -2586,6 +3001,179 @@ def test_scan_transitive_preserves_cached_child_llm_telemetry(monkeypatch) -> No
     assert body["metadata"]["llm_calls_attempted"] == 1
     assert body["metadata"]["llm_calls_succeeded"] == 0
     assert body["metadata"]["llm_degraded"] is True
+
+
+def test_scan_transitive_scopes_complete_root_and_child_semantic_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A complete child pass cannot collide with the root's analyzer IDs."""
+    target = "https://github.com/org/transitive.git"
+    analyzer_ids = (
+        "semantic_developer_intent",
+        "semantic_quality_policy",
+        "semantic_security_discovery",
+    )
+
+    def complete_semantic_result(*, file_cache: dict[str, str]) -> dict[str, object]:
+        result = _mock_graph_result(file_cache=file_cache)
+        result.update(
+            {
+                "use_llm": True,
+                "llm_requested": True,
+                "analyzer_status_events": [
+                    {"analyzer_id": analyzer_id, "status": "completed"}
+                    for analyzer_id in analyzer_ids
+                ],
+                "llm_call_log": [
+                    {"node": analyzer_id, "ok": True, "error": None} for analyzer_id in analyzer_ids
+                ],
+            }
+        )
+        return result
+
+    initial_result = complete_semantic_result(file_cache={"SKILL.md": target})
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format: FormatChoice,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline: Path | None = None,
+        show_suppressed: bool = False,
+        transitive_traversal: object | None = None,
+    ) -> dict[str, object]:
+        del format, no_llm, yara_dir, baseline, show_suppressed, transitive_traversal
+        assert input_path == target.removesuffix(".git")
+        return complete_semantic_result(file_cache={})
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=FormatChoice.json,
+        no_llm=False,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    assert merged["analysis_completeness"]["is_complete"] is True
+    assert json.loads(merged["report_body"])["metadata"].get("llm_degraded") is not True
+
+
+def test_transitive_descendants_cannot_clear_local_only_source_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local-only ancestry propagates monotonically through transitive child scans."""
+    target = "https://github.com/org/private-dependency"
+    initial_result = _mock_graph_result(file_cache={})
+    initial_result["local_file_cache"] = {"SKILL.md": target}
+    initial_result["source_local_only"] = True
+    calls: list[str] = []
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format: FormatChoice,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline: Path | None = None,
+        show_suppressed: bool = False,
+        transitive_traversal: object | None = None,
+        source_local_only: bool = False,
+    ) -> dict[str, object]:
+        del format, no_llm, yara_dir, baseline, show_suppressed, transitive_traversal
+        assert input_path == target
+        assert source_local_only is True
+        calls.append(input_path)
+        result = _mock_graph_result(file_cache={})
+        result["local_file_cache"] = {}
+        result["source_local_only"] = True
+        return result
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+
+    cli._scan_transitive(
+        initial_result=initial_result,
+        format=FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        source_local_only=True,
+    )
+    assert calls == [target]
+
+
+@pytest.mark.parametrize("privacy_order", [(True, False), (False, True)])
+def test_transitive_cache_is_partitioned_by_privacy_mode(
+    monkeypatch: pytest.MonkeyPatch, privacy_order: tuple[bool, bool]
+) -> None:
+    """A shared target is scanned independently for hidden and public roots."""
+    target = "https://github.com/org/shared-dependency"
+    calls: list[bool] = []
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format: FormatChoice,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline: Path | None = None,
+        show_suppressed: bool = False,
+        transitive_traversal: object | None = None,
+        source_local_only: bool = False,
+    ) -> dict[str, object]:
+        del format, no_llm, yara_dir, baseline, show_suppressed, transitive_traversal
+        assert input_path == target
+        calls.append(source_local_only)
+        result = _mock_graph_result(file_cache={})
+        result["local_file_cache"] = {}
+        result["source_local_only"] = source_local_only
+        result["llm_call_log"] = (
+            []
+            if source_local_only
+            else [{"node": "public-provider-control", "ok": True, "error": None}]
+        )
+        return result
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    traversal = cli._TransitiveTraversalState()
+
+    for source_local_only in privacy_order:
+        initial_result = _mock_graph_result(file_cache={})
+        initial_result["local_file_cache"] = {"SKILL.md": target}
+        cli._scan_transitive(
+            initial_result=initial_result,
+            format=FormatChoice.json,
+            no_llm=False,
+            max_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            baseline=None,
+            show_suppressed=False,
+            visited=set(),
+            traversal=traversal,
+            source_local_only=source_local_only,
+        )
+
+    assert calls == list(privacy_order)
+    assert set(traversal.cache) == {(target, False), (target, True)}
+    assert traversal.cache[(target, True)].llm_call_log == []
+    public_cached = traversal.cache[(target, False)]
+    assert public_cached.llm_call_log == [
+        {
+            "node": "public-provider-control",
+            "ok": True,
+            "error": None,
+            "source_url": target,
+            "source_identity": public_cached.source_identity,
+            "source_digest": public_cached.source_digest,
+        }
+    ]
 
 
 def test_scan_transitive_zero_depth_preserves_root_cleanup(tmp_path: Path, monkeypatch) -> None:

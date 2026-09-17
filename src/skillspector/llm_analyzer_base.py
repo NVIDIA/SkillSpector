@@ -41,7 +41,7 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from skillspector.inference_usage import InferenceUsageRecord
+from skillspector.inference_usage import InferenceUsageRecord, chat_model_controls
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
@@ -52,10 +52,12 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_utils import (
+    AgentCLIChatModel,
     StructuredOutputParseError,
     _AgentCLIMessage,
     _ainvoke_with_usage,
     _invoke_with_usage,
+    chat_model_provider_name,
     get_chat_model,
     new_inference_usage_collector,
 )
@@ -132,6 +134,33 @@ def _uses_native_connection_retries(
     if isinstance(chat_model, ChatAnthropic):
         chat_model.max_retries = max_retries
         return max_retries > 0
+    return False
+
+
+def _retarget_request_timeout(chat_model: object, timeout: float | None) -> bool:
+    """Point an existing chat model at *timeout* and report whether it took effect.
+
+    Returns ``False`` for transports that keep no mutable deadline, so the caller can
+    fall back to constructing a replacement model for that call.
+    """
+    if isinstance(chat_model, ChatOpenAI):
+        clients = (chat_model.root_client, chat_model.root_async_client)
+        if any(client is None for client in clients):
+            return False
+        for client in clients:
+            client.timeout = timeout
+        chat_model.request_timeout = timeout
+        return True
+    if isinstance(chat_model, ChatAnthropic):
+        # ``timeout <= 0`` is how ChatAnthropic spells "leave the SDK default alone"; an
+        # expired deadline never reaches here because ``_require_time_remaining`` raises first.
+        for client in (chat_model._client, chat_model._async_client):
+            client.timeout = timeout
+        chat_model.default_request_timeout = timeout
+        return True
+    if isinstance(chat_model, AgentCLIChatModel):
+        chat_model.set_timeout(timeout)
+        return True
     return False
 
 
@@ -690,8 +719,16 @@ class LLMAnalyzerBase:
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
+        if _retarget_request_timeout(self._llm, remaining):
+            # Native retries were already disabled for the dynamic-deadline case in
+            # ``__init__``, and the structured runnable wraps this same model instance.
+            return self._llm, self._structured_llm
         llm = get_chat_model(model=self.model, timeout=remaining)
         _uses_native_connection_retries(llm, max_retries=0)
+        effective_provider = chat_model_provider_name(llm)
+        if effective_provider is not None:
+            self._usage_collector.set_provider(effective_provider)
+        self._usage_collector.set_forwarded_controls(chat_model_controls(llm))
         structured = (
             llm.with_structured_output(self.response_schema) if self.response_schema else None
         )

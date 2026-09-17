@@ -15,6 +15,8 @@ from skillspector.llm_provenance import (
     capture_llm_provenance,
     sanitize_llm_provenance,
 )
+from skillspector.llm_utils import new_inference_usage_collector
+from skillspector.providers.chat_models import create_openai_compatible_chat_model
 
 
 class OpenAIProvider:
@@ -33,8 +35,17 @@ def _models(value: str = "safe/model:1") -> dict[str, str]:
     return dict.fromkeys(LLM_ANALYZER_SLOTS, value)
 
 
-def _usage(provider: str) -> list[dict[str, object]]:
-    return [{"provider": provider, "usage_source": "provider_response"}]
+def _usage(
+    provider: str,
+    controls: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    record: dict[str, object] = {
+        "provider": provider,
+        "usage_source": "provider_response",
+    }
+    if controls is not None:
+        record["forwarded_controls"] = controls
+    return [record]
 
 
 def test_capture_records_resolved_adapters_models_and_forwarded_controls(
@@ -51,7 +62,14 @@ def test_capture_records_resolved_adapters_models_and_forwarded_controls(
     monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "low")
 
     captured = capture_llm_provenance(_models())
-    result = sanitize_llm_provenance(captured, use_llm=True, inference_usage=_usage("openai"))
+    result = sanitize_llm_provenance(
+        captured,
+        use_llm=True,
+        inference_usage=_usage(
+            "openai",
+            {"temperature": 0.0, "seed": 0, "reasoning_effort": "low"},
+        ),
+    )
 
     assert result["provider"] == {
         "configured_adapter": "anthropic",
@@ -97,7 +115,10 @@ def test_seed_is_requested_but_not_claimed_forwarded_for_anthropic(
     result = sanitize_llm_provenance(
         capture_llm_provenance(_models()),
         use_llm=True,
-        inference_usage=_usage("anthropic"),
+        inference_usage=_usage(
+            "anthropic",
+            {"temperature": 0.1, "reasoning_effort": None},
+        ),
     )
 
     assert result["sampling"]["temperature"]["forwarded_to_client"] == 0.1
@@ -132,6 +153,59 @@ def test_capture_is_stable_if_environment_changes_before_report(
 
     assert result["sampling"]["temperature"]["requested"] == 0.2
     assert result["sampling"]["seed"]["requested"] == 11
+
+
+def test_constructor_observation_supersedes_stale_configuration_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forwarded controls come from the client constructor, not preflight state."""
+    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: OpenAIProvider())
+    monkeypatch.setattr(
+        "skillspector.llm_provenance.get_model_config_provider", lambda: OpenAIProvider()
+    )
+    monkeypatch.setattr("skillspector.llm_utils.get_active_provider", lambda: OpenAIProvider())
+    monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
+    monkeypatch.setenv("SKILLSPECTOR_SEED", "11")
+    captured = capture_llm_provenance(_models())
+
+    monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.9")
+    monkeypatch.setenv("SKILLSPECTOR_SEED", "99")
+    monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "high")
+
+    class _FakeChatModel:
+        pass
+
+    fake_model = _FakeChatModel()
+    monkeypatch.setattr(
+        "skillspector.providers.chat_models.ChatOpenAI",
+        lambda **_kwargs: fake_model,
+    )
+    chat_model = create_openai_compatible_chat_model(
+        model="safe/model:1",
+        credentials=("test-key", None),
+        max_tokens=128,
+    )
+    assert chat_model is fake_model
+    collector = new_inference_usage_collector(
+        node="semantic_developer_intent",
+        request_kind="structured_output",
+        model="safe/model:1",
+        chat_model=chat_model,
+    )
+    collector.mark_response_received()
+
+    result = sanitize_llm_provenance(
+        captured,
+        use_llm=True,
+        inference_usage=collector.snapshot(),
+    )
+
+    assert result["sampling"]["temperature"]["requested"] == 0.9
+    assert result["sampling"]["temperature"]["forwarded_to_client"] == 0.9
+    assert result["sampling"]["seed"]["requested"] == 99
+    assert result["sampling"]["seed"]["forwarded_to_client"] == 99
+    assert result["sampling"]["reasoning_effort"]["requested"] == "high"
+    assert result["sampling"]["reasoning_effort"]["forwarded_to_client"] == "high"
 
 
 def test_configured_controls_are_not_claimed_forwarded_without_response_evidence(
@@ -321,7 +395,10 @@ def test_provider_specific_reasoning_effort_is_recorded_exactly(
     result = sanitize_llm_provenance(
         capture_llm_provenance(_models()),
         use_llm=True,
-        inference_usage=_usage("openai"),
+        inference_usage=_usage(
+            "openai",
+            {"temperature": None, "seed": None, "reasoning_effort": "provider specific value"},
+        ),
     )
 
     assert result["sampling"]["reasoning_effort"]["requested"] == "provider specific value"
@@ -360,7 +437,10 @@ def test_effective_provider_comes_from_response_not_preflight_candidate(
     result = sanitize_llm_provenance(
         capture_llm_provenance(_models()),
         use_llm=True,
-        inference_usage=_usage("openai"),
+        inference_usage=_usage(
+            "openai",
+            {"temperature": None, "seed": 17, "reasoning_effort": None},
+        ),
     )
 
     assert result["provider"]["resolved_adapter"] == "bedrock"

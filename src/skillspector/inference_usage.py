@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import threading
+import weakref
 from collections.abc import Mapping, Sequence
 from typing import NotRequired, TypedDict
 
@@ -28,6 +29,17 @@ _COUNTER_KEYS = (
     "total_tokens",
 )
 _MAX_TOKEN_COUNT = (1 << 63) - 1
+_MIN_SAMPLING_SEED = -(1 << 63)
+_MAX_SAMPLING_SEED = (1 << 63) - 1
+_FORWARDED_CONTROL_NAMES = ("temperature", "seed", "reasoning_effort")
+_SAFE_SETTING_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:/+\-]{0,255}")
+_SECRET_PREFIXES = ("sk-", "nvapi-", "ghp_", "glpat-", "bearer-")
+
+_CHAT_MODEL_CONTROLS: dict[
+    int,
+    tuple[weakref.ReferenceType[object], dict[str, float | int | str | None]],
+] = {}
+_CHAT_MODEL_CONTROLS_LOCK = threading.Lock()
 
 
 class InferenceUsageRecord(TypedDict):
@@ -45,6 +57,76 @@ class InferenceUsageRecord(TypedDict):
     cache_write_tokens: NotRequired[int]
     reasoning_tokens: NotRequired[int]
     total_tokens: NotRequired[int]
+    # Internal-only construction evidence. ``sanitize_inference_usage`` never
+    # includes this field in the public token-usage projection; the provenance
+    # sanitizer consumes it separately after a provider response is observed.
+    forwarded_controls: NotRequired[dict[str, float | int | str | None]]
+
+
+def _forwarded_controls(value: Mapping[str, object] | None) -> dict[str, float | int | str | None]:
+    """Return the fixed, non-secret sampling-control construction record."""
+    source = value or {}
+    controls: dict[str, float | int | str | None] = {}
+    for name in _FORWARDED_CONTROL_NAMES:
+        if name not in source:
+            continue
+        raw = source.get(name)
+        if raw is None:
+            controls[name] = None
+        elif name == "temperature":
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 <= float(raw) <= 1:
+                controls[name] = float(raw)
+        elif name == "seed":
+            if (
+                isinstance(raw, int)
+                and not isinstance(raw, bool)
+                and _MIN_SAMPLING_SEED <= raw <= _MAX_SAMPLING_SEED
+            ):
+                controls[name] = raw
+        elif isinstance(raw, str):
+            setting = raw.strip()
+            lowered = setting.lower()
+            if (
+                _SAFE_SETTING_RE.fullmatch(setting)
+                and "://" not in setting
+                and "@" not in setting
+                and not lowered.startswith(_SECRET_PREFIXES)
+            ):
+                controls[name] = setting
+    return controls
+
+
+def register_chat_model_controls(
+    chat_model: object,
+    controls: Mapping[str, object],
+) -> None:
+    """Associate a constructed chat model with the controls passed to its client."""
+    model_id = id(chat_model)
+    sanitized = _forwarded_controls(controls)
+
+    def _discard(model_ref: weakref.ReferenceType[object]) -> None:
+        with _CHAT_MODEL_CONTROLS_LOCK:
+            current = _CHAT_MODEL_CONTROLS.get(model_id)
+            if current is not None and current[0] is model_ref:
+                _CHAT_MODEL_CONTROLS.pop(model_id, None)
+
+    try:
+        model_ref = weakref.ref(chat_model, _discard)
+    except TypeError:
+        return
+    with _CHAT_MODEL_CONTROLS_LOCK:
+        _CHAT_MODEL_CONTROLS[model_id] = (model_ref, sanitized)
+
+
+def chat_model_controls(chat_model: object | None) -> dict[str, float | int | str | None]:
+    """Return detached construction evidence for *chat_model*, when recorded."""
+    if chat_model is None:
+        return {}
+    with _CHAT_MODEL_CONTROLS_LOCK:
+        current = _CHAT_MODEL_CONTROLS.get(id(chat_model))
+        if current is None or current[0]() is not chat_model:
+            return {}
+        return current[1].copy()
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -123,6 +205,7 @@ def provider_name(provider: object) -> str:
         "OllamaProvider": "ollama",
         "OpenAICompatibleProvider": "openai_compatible",
         "OpenAIProvider": "openai",
+        "OpencodeCLIProvider": "opencode_cli",
     }
     return names.get(type(provider).__name__, _label(type(provider).__name__.lower()))
 
@@ -300,11 +383,13 @@ class InferenceUsageCollector(BaseCallbackHandler):
         request_kind: str,
         provider: str,
         requested_model: str,
+        forwarded_controls: Mapping[str, object] | None = None,
     ) -> None:
         self._node = node
         self._request_kind = request_kind
         self._provider = provider
         self._requested_model = requested_model
+        self._forwarded_controls = _forwarded_controls(forwarded_controls)
         self._records: list[InferenceUsageRecord] = []
         self._response_received = False
         self._lock = threading.Lock()
@@ -331,12 +416,29 @@ class InferenceUsageCollector(BaseCallbackHandler):
         with self._lock:
             self._response_received = True
             if record is not None:
+                if self._forwarded_controls:
+                    record["forwarded_controls"] = self._forwarded_controls.copy()
                 self._records.append(record)
+            else:
+                self._records.append(self._response_observation())
+
+    def _response_observation(self) -> InferenceUsageRecord:
+        """Build counter-less, internal-only evidence of a completed response."""
+        return {
+            "node": _label(self._node),
+            "request_kind": _label(self._request_kind),
+            "provider": _label(self._provider),
+            "model": _model_label(self._requested_model),
+            "model_source": "requested_model",
+            "usage_source": "provider_response",
+            "forwarded_controls": self._forwarded_controls.copy(),
+        }
 
     def mark_response_received(self) -> None:
         """Record a completed response from a non-LangChain transport."""
         with self._lock:
             self._response_received = True
+            self._records.append(self._response_observation())
 
     def set_provider(self, provider: str) -> None:
         """Set the effective provider before the first response is observed."""
@@ -346,6 +448,12 @@ class InferenceUsageCollector(BaseCallbackHandler):
                 raise RuntimeError("cannot change inference provider after a response")
             self._provider = label
 
+    def set_forwarded_controls(self, controls: Mapping[str, object] | None) -> None:
+        """Update construction evidence before the next provider response."""
+        sanitized = _forwarded_controls(controls)
+        with self._lock:
+            self._forwarded_controls = sanitized
+
     @property
     def response_received(self) -> bool:
         """Whether the provider returned, even when it reported no token usage."""
@@ -353,9 +461,16 @@ class InferenceUsageCollector(BaseCallbackHandler):
             return self._response_received
 
     def snapshot(self) -> list[InferenceUsageRecord]:
-        """Return detached copies safe for graph-state serialization."""
+        """Return usage plus counter-less response evidence for provenance."""
         with self._lock:
-            return [record.copy() for record in self._records]
+            snapshot: list[InferenceUsageRecord] = []
+            for record in self._records:
+                detached = record.copy()
+                controls = record.get("forwarded_controls")
+                if isinstance(controls, dict):
+                    detached["forwarded_controls"] = controls.copy()
+                snapshot.append(detached)
+            return snapshot
 
 
 def sanitize_inference_usage(

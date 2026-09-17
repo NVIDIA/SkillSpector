@@ -25,6 +25,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
+from skillspector.inference_usage import register_chat_model_controls
+
 logger = logging.getLogger(__name__)
 MIN_SAMPLING_SEED = -(1 << 63)
 MAX_SAMPLING_SEED = (1 << 63) - 1
@@ -125,5 +127,15 @@ def create_openai_compatible_chat_model(
     reasoning_effort = resolve_reasoning_effort()
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
-    kwargs.update(resolve_sampling_parameters(include_seed=True))
-    return ChatOpenAI(**kwargs)
+    sampling_parameters = resolve_sampling_parameters(include_seed=True)
+    kwargs.update(sampling_parameters)
+    chat_model = ChatOpenAI(**kwargs)
+    register_chat_model_controls(
+        chat_model,
+        {
+            "temperature": sampling_parameters.get("temperature"),
+            "seed": sampling_parameters.get("seed"),
+            "reasoning_effort": reasoning_effort,
+        },
+    )
+    return chat_model

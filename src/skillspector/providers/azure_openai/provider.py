@@ -36,6 +36,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 
+from skillspector.inference_usage import register_chat_model_controls
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_sampling_parameters
 
@@ -80,8 +81,17 @@ class AzureOpenAIProvider:
             "max_tokens": max_tokens,
             "timeout": timeout,
         }
-        kwargs.update(resolve_sampling_parameters(include_seed=True))
-        return AzureChatOpenAI(**kwargs)
+        sampling_parameters = resolve_sampling_parameters(include_seed=True)
+        kwargs.update(sampling_parameters)
+        chat_model = AzureChatOpenAI(**kwargs)
+        register_chat_model_controls(
+            chat_model,
+            {
+                "temperature": sampling_parameters.get("temperature"),
+                "seed": sampling_parameters.get("seed"),
+            },
+        )
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)
