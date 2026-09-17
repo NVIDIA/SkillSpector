@@ -414,6 +414,25 @@ def test_quoted_version_number_is_not_a_reference(tmp_path: Path) -> None:
     assert all(record["target_path"] is None for record in records)
 
 
+def test_root_level_numeric_suffix_known_path_resolves(tmp_path: Path) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text='See "tool.1" for the manual page and "1.2" for the metadata version.',
+        known_paths=["SKILL.md", "tool.1"],
+    )
+
+    assert any(
+        record["status"] == "resolved" and record["target_path"] == "tool.1"
+        for record in records
+    )
+    assert any(
+        record["status"] == "rejected" and record["target_path"] is None
+        for record in records
+        if record["evidence"] and "1.2" in record["evidence"]
+    )
+
+
 def test_numeric_suffix_path_with_directory_signal_still_resolves(tmp_path: Path) -> None:
     records = resolve_bundle_references(
         tmp_path,

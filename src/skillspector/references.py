@@ -131,21 +131,25 @@ def _normalize_candidate(raw: str, source_path: str) -> str | None:
         return None
     if len(path_part) >= 2 and path_part[1] == ":":
         return None
-    # A purely numeric "extension" (e.g. "1.2", "v1.2", "1.2.0-beta.1") is a
-    # version number, indistinguishable from a root-level file name without
-    # another path signal: real file extensions are never all digits. This
-    # heuristic only applies to a bare token with no directory component —
-    # "/" is itself an explicit path signal (e.g. "docs/tool.1"), so a
-    # candidate carrying one is never treated as a version number.
-    if "/" not in path_part:
-        basename = path_part.rsplit("/", 1)[-1]
-        if "." in basename and basename.rsplit(".", 1)[-1].isdigit():
-            return None
     source_parent = PurePosixPath(source_path).parent.as_posix()
     joined = posixpath.normpath(posixpath.join(source_parent, path_part))
     if joined in {"", ".", ".."} or joined.startswith("../"):
         return None
     return joined.removeprefix("./")
+
+
+def _looks_like_bare_version_token(basename: str) -> bool:
+    """Return True when a basename resembles a version number, not a filename.
+
+    A purely numeric "extension" (e.g. "1.2", "v1.2", "1.2.0-beta.1") is
+    indistinguishable from a root-level file name without another path
+    signal: real file extensions are never all digits. This is only
+    consulted once exact and basename resolution against known_paths have
+    both failed, so a bundled file with a numeric extension (e.g. a
+    root-level "tool.1") still resolves normally rather than being rejected
+    outright.
+    """
+    return "." in basename and basename.rsplit(".", 1)[-1].isdigit()
 
 
 def resolve_bundle_references_with_metadata(
@@ -225,6 +229,10 @@ def resolve_bundle_references_with_metadata(
                 elif len(matches) > 1:
                     status = "ambiguous"
                     disposition = ArtifactDisposition.PARTIAL
+                elif _looks_like_bare_version_token(PurePosixPath(target).name):
+                    status = "rejected"
+                    disposition = ArtifactDisposition.OUT_OF_SCOPE
+                    target = None
                 else:
                     status = "missing"
                     disposition = ArtifactDisposition.PARTIAL
