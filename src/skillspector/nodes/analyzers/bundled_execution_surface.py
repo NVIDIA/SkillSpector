@@ -1649,6 +1649,7 @@ def _analyze_document(
     scan = _scan_declarations(path, document, previous_settings_hook_ids)
     declarations = [] if hooks_disabled else scan.hooks
     proofs = [proof for declaration in declarations if (proof := _bh2_proof(declaration))]
+    payload_unmodeled = _payload_analysis_level(declarations) == "unmodeled"
     permission_declarations = scan.permissions
     findings: list[Finding] = []
     if declarations:
@@ -1657,7 +1658,7 @@ def _analyze_document(
         findings.append(_bh2_finding(path, proofs))
     if permission_declarations:
         findings.append(_bh3_finding(path, permission_declarations))
-    if scan.partial:
+    if scan.partial or payload_unmodeled:
         return findings, ledger_event(
             outcome=LedgerOutcome.PARTIAL,
             phase="static",
