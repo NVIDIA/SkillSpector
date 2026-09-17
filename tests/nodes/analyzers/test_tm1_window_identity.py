@@ -257,6 +257,18 @@ def test_lexical_long_identity_is_cap_stable_without_retained_sibling(
     assert capped[0].fingerprint() == complete[0].fingerprint()
 
 
+def test_lexical_long_calls_on_different_lines_keep_distinct_identity() -> None:
+    payload = "x" * 240
+    first = f'subprocess.Popen("{payload}A", shell=True)'
+    second = f'subprocess.Popen("{payload}B", shell=True)'
+
+    findings = _tm1(f"{first}\n{second}\n", "guide.md")
+
+    assert len(findings) == 2
+    assert findings[0].fingerprint() != findings[1].fingerprint()
+    assert len(deduplicate(findings)) == 2
+
+
 @pytest.mark.parametrize("cap", [1, 2])
 def test_same_line_bound_duplicates_match_direct_output_budget(monkeypatch, cap: int) -> None:
     monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", cap)
