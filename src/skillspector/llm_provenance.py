@@ -5,13 +5,14 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 from collections.abc import Mapping, Sequence
-from importlib.metadata import version
+from importlib.metadata import distribution, version
 
-from skillspector.inference_usage import provider_name
+from skillspector.inference_usage import looks_like_credential, provider_name
 from skillspector.providers import get_active_provider, get_model_config_provider
 from skillspector.providers.chat_models import (
     MAX_SAMPLING_SEED,
@@ -37,17 +38,21 @@ _TEMPERATURE_ADAPTERS = frozenset(
         "azure_openai",
         "bedrock",
         "nv_build",
+        "nv_inference",
         "ollama",
         "openai",
         "openai_compatible",
     }
 )
-_SEED_ADAPTERS = frozenset({"azure_openai", "nv_build", "ollama", "openai", "openai_compatible"})
+_SEED_ADAPTERS = frozenset(
+    {"azure_openai", "nv_build", "nv_inference", "ollama", "openai", "openai_compatible"}
+)
 _REASONING_EFFORT_ADAPTERS = frozenset(
     {
         "anthropic",
         "anthropic_proxy",
         "nv_build",
+        "nv_inference",
         "ollama",
         "openai",
         "openai_compatible",
@@ -55,7 +60,6 @@ _REASONING_EFFORT_ADAPTERS = frozenset(
 )
 _SAFE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,255}")
 _SAFE_SETTING = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:/+\-]{0,255}")
-_SECRET_PREFIXES = ("sk-", "nvapi-", "ghp_", "glpat-", "bearer-")
 _MAX_SAFE_SEED = MAX_SAMPLING_SEED
 _MIN_SAFE_SEED = MIN_SAMPLING_SEED
 _CONTROL_SOURCES = frozenset(
@@ -64,17 +68,18 @@ _CONTROL_SOURCES = frozenset(
 _DEPLOYMENT_SOURCES = frozenset({"environment", "resolved_model", "not_applicable", "unknown"})
 _API_VERSION_SOURCES = frozenset({"environment", "provider_default", "not_applicable", "unknown"})
 _AZURE_OPENAI_DEFAULT_API_VERSION = "2024-06-01"
+_SOURCE_REVISION = re.compile(r"[0-9a-fA-F]{7,64}")
+_SOURCE_REVISION_SOURCES = frozenset({"build_environment", "package_vcs_metadata", "unknown"})
 
 
 def _safe_label(value: object, fallback: str = "unknown") -> str:
     candidate = value if isinstance(value, str) else ""
     candidate = candidate.strip()
-    lowered = candidate.lower()
     if (
         _SAFE_LABEL.fullmatch(candidate)
         and "://" not in candidate
         and "@" not in candidate
-        and not lowered.startswith(_SECRET_PREFIXES)
+        and not looks_like_credential(candidate)
     ):
         return candidate
     return fallback
@@ -84,12 +89,11 @@ def _safe_setting(value: object, fallback: str = "unknown") -> str:
     """Return a bounded printable setting while allowing provider-specific spaces."""
     candidate = value if isinstance(value, str) else ""
     candidate = candidate.strip()
-    lowered = candidate.lower()
     if (
         _SAFE_SETTING.fullmatch(candidate)
         and "://" not in candidate
         and "@" not in candidate
-        and not lowered.startswith(_SECRET_PREFIXES)
+        and not looks_like_credential(candidate)
     ):
         return candidate
     return fallback
@@ -99,6 +103,25 @@ def _safe_optional_label(value: object) -> str | None:
     """Return a safe label or ``None`` without inventing a placeholder."""
     label = _safe_label(value, fallback="")
     return label or None
+
+
+def _capture_source_revision() -> tuple[str, str]:
+    """Return an injected/packaged VCS identity without invoking Git."""
+    injected = os.environ.get("SKILLSPECTOR_BUILD_REVISION", "").strip()
+    if _SOURCE_REVISION.fullmatch(injected):
+        return injected.lower(), "build_environment"
+
+    try:
+        direct_url = distribution("skillspector").read_text("direct_url.json")
+        metadata = json.loads(direct_url) if direct_url else {}
+    except (json.JSONDecodeError, OSError, TypeError):
+        metadata = {}
+    vcs_info = metadata.get("vcs_info") if isinstance(metadata, Mapping) else None
+    vcs_info = vcs_info if isinstance(vcs_info, Mapping) else {}
+    packaged = vcs_info.get("commit_id")
+    if isinstance(packaged, str) and _SOURCE_REVISION.fullmatch(packaged.strip()):
+        return packaged.strip().lower(), "package_vcs_metadata"
+    return "unknown", "unknown"
 
 
 def _capture_provider_routing(resolved_adapter: str) -> dict[str, object]:
@@ -189,6 +212,7 @@ def capture_llm_provenance(model_config: Mapping[str, object]) -> dict[str, obje
     # Runtime response telemetry supplies the actual effective provider later.
     resolved_adapter = provider_name(get_model_config_provider())
     package_version = version("skillspector")
+    source_revision, source_revision_source = _capture_source_revision()
 
     temperature, temperature_source = _requested_temperature(
         os.environ.get("SKILLSPECTOR_TEMPERATURE", "").strip()
@@ -206,6 +230,10 @@ def capture_llm_provenance(model_config: Mapping[str, object]) -> dict[str, obje
             "analyzer_revision": {
                 "value": package_version,
                 "source": "skillspector_package",
+                "source_revision": {
+                    "value": source_revision,
+                    "source": source_revision_source,
+                },
             },
         }
         for slot in LLM_ANALYZER_SLOTS
@@ -240,13 +268,51 @@ def capture_llm_provenance(model_config: Mapping[str, object]) -> dict[str, obje
     }
 
 
+def _sanitize_observed_control_values(
+    name: str,
+    values: Sequence[object],
+) -> tuple[list[float | int | str | None], bool]:
+    observed: list[float | int | str | None] = []
+    invalid = False
+    for candidate in values:
+        if candidate is None:
+            observed.append(None)
+        elif name == "temperature":
+            if (
+                isinstance(candidate, (int, float))
+                and not isinstance(candidate, bool)
+                and math.isfinite(candidate)
+                and 0 <= candidate <= 1
+            ):
+                observed.append(float(candidate))
+            else:
+                invalid = True
+        elif name == "seed":
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and _MIN_SAFE_SEED <= candidate <= _MAX_SAFE_SEED
+            ):
+                observed.append(candidate)
+            else:
+                invalid = True
+        else:
+            setting = _safe_setting(candidate, fallback="")
+            if setting:
+                observed.append(setting)
+            else:
+                invalid = True
+    return observed, invalid
+
+
 def _sanitize_control(
     name: str,
     value: object,
     *,
     use_llm: bool,
     effective_adapters: Sequence[str],
-    observed_values: Sequence[object],
+    observed_requested_values: Sequence[object],
+    observed_forwarded_values: Sequence[object],
 ) -> dict[str, object]:
     raw = value if isinstance(value, Mapping) else {}
     source = raw.get("source")
@@ -295,47 +361,23 @@ def _sanitize_control(
     if source != "environment":
         requested = None
 
-    # Provider-response observations carry the controls recorded from the
-    # actual client constructor. They supersede the earlier configuration
-    # capture, which is necessarily provisional until a client is built.
-    observed: list[float | int | str | None] = []
-    invalid_observation = False
-    for candidate in observed_values:
-        if candidate is None:
-            observed.append(None)
-        elif name == "temperature":
-            if (
-                isinstance(candidate, (int, float))
-                and not isinstance(candidate, bool)
-                and math.isfinite(candidate)
-                and 0 <= candidate <= 1
-            ):
-                observed.append(float(candidate))
-            else:
-                invalid_observation = True
-        elif name == "seed":
-            if (
-                isinstance(candidate, int)
-                and not isinstance(candidate, bool)
-                and _MIN_SAFE_SEED <= candidate <= _MAX_SAFE_SEED
-            ):
-                observed.append(candidate)
-            else:
-                invalid_observation = True
-        else:
-            setting = _safe_setting(candidate, fallback="")
-            if setting:
-                observed.append(setting)
-            else:
-                invalid_observation = True
-
+    # The constructor-time request supersedes the provisional preflight
+    # capture. Forwarding is derived separately from the normalized provider
+    # payload because a model adapter may accept and then omit a control.
     forwarded: float | int | str | None = None
-    if use_llm and adapter_support and observed_values:
+    if use_llm and adapter_support and observed_requested_values:
+        observed, invalid_observation = _sanitize_observed_control_values(
+            name, observed_requested_values
+        )
         distinct = []
         for candidate in observed:
             if candidate not in distinct:
                 distinct.append(candidate)
-        if invalid_observation or len(observed) != len(observed_values) or len(distinct) != 1:
+        if (
+            invalid_observation
+            or len(observed) != len(observed_requested_values)
+            or len(distinct) != 1
+        ):
             requested = None
             source = "unknown"
         else:
@@ -346,7 +388,22 @@ def _sanitize_control(
             else:
                 requested = actual
                 source = "environment"
-                forwarded = actual
+
+    if use_llm and adapter_support and observed_forwarded_values:
+        observed, invalid_observation = _sanitize_observed_control_values(
+            name, observed_forwarded_values
+        )
+        distinct = []
+        for candidate in observed:
+            if candidate not in distinct:
+                distinct.append(candidate)
+        if (
+            not invalid_observation
+            and len(observed) == len(observed_forwarded_values)
+            and len(distinct) == 1
+            and distinct[0] is not None
+        ):
+            forwarded = distinct[0]
 
     return {
         "requested": requested,
@@ -423,11 +480,12 @@ def _effective_adapters(records: Sequence[Mapping[object, object]]) -> list[str]
 
 def _observed_controls(
     records: Sequence[Mapping[object, object]],
+    field: str,
 ) -> dict[str, list[object]]:
     """Collect fixed-field constructor controls from successful calls."""
     observed = {name: [] for name in ("temperature", "seed", "reasoning_effort")}
     for record in records:
-        controls = record.get("forwarded_controls")
+        controls = record.get(field)
         if not isinstance(controls, Mapping):
             continue
         for name in observed:
@@ -463,7 +521,8 @@ def sanitize_llm_provenance(
     resolved_adapter = _safe_label(provider.get("resolved_adapter"))
     response_records = _provider_response_records(inference_usage) if use_llm else []
     effective_adapters = _effective_adapters(response_records)
-    observed_controls = _observed_controls(response_records)
+    observed_requested_controls = _observed_controls(response_records, "requested_controls")
+    observed_forwarded_controls = _observed_controls(response_records, "forwarded_controls")
     effective_adapter = (
         "not_applicable"
         if not use_llm
@@ -489,6 +548,23 @@ def sanitize_llm_provenance(
         item = item if isinstance(item, Mapping) else {}
         revision = item.get("analyzer_revision")
         revision = revision if isinstance(revision, Mapping) else {}
+        raw_source_revision = revision.get("source_revision")
+        raw_source_revision = (
+            raw_source_revision if isinstance(raw_source_revision, Mapping) else {}
+        )
+        source_revision = raw_source_revision.get("value")
+        source_revision = (
+            source_revision.lower()
+            if isinstance(source_revision, str) and _SOURCE_REVISION.fullmatch(source_revision)
+            else "unknown"
+        )
+        source_revision_source = raw_source_revision.get("source")
+        if (
+            not isinstance(source_revision_source, str)
+            or source_revision_source not in _SOURCE_REVISION_SOURCES
+            or source_revision == "unknown"
+        ):
+            source_revision_source = "unknown"
         analyzers.append(
             {
                 "analyzer_id": slot,
@@ -497,6 +573,10 @@ def sanitize_llm_provenance(
                 "analyzer_revision": {
                     "value": _safe_label(revision.get("value")),
                     "source": "skillspector_package",
+                    "source_revision": {
+                        "value": source_revision,
+                        "source": source_revision_source,
+                    },
                 },
             }
         )
@@ -509,14 +589,17 @@ def sanitize_llm_provenance(
             sampling.get(name),
             use_llm=use_llm,
             effective_adapters=effective_adapters,
-            observed_values=observed_controls[name],
+            observed_requested_values=observed_requested_controls[name],
+            observed_forwarded_values=observed_forwarded_controls[name],
         )
         for name in ("temperature", "seed", "reasoning_effort")
     }
     expected_observations = _expected_observed_controls(effective_adapters)
     controls_observed = all(
         all(
-            isinstance(record.get("forwarded_controls"), Mapping)
+            isinstance(record.get("requested_controls"), Mapping)
+            and name in record.get("requested_controls", {})
+            and isinstance(record.get("forwarded_controls"), Mapping)
             and name in record.get("forwarded_controls", {})
             for record in response_records
         )
@@ -564,7 +647,7 @@ def sanitize_llm_provenance(
             "reason": (
                 "Optional controls do not guarantee identical provider output."
                 if use_llm
-                else "LLM analysis was disabled for this scan."
+                else "LLM analysis was not executed for this scan."
             ),
         },
     }

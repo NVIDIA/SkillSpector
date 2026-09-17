@@ -41,7 +41,11 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from skillspector.inference_usage import InferenceUsageRecord, chat_model_controls
+from skillspector.inference_usage import (
+    InferenceUsageRecord,
+    chat_model_controls,
+    chat_model_requested_controls,
+)
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
@@ -728,7 +732,10 @@ class LLMAnalyzerBase:
         effective_provider = chat_model_provider_name(llm)
         if effective_provider is not None:
             self._usage_collector.set_provider(effective_provider)
-        self._usage_collector.set_forwarded_controls(chat_model_controls(llm))
+        self._usage_collector.set_controls(
+            chat_model_requested_controls(llm),
+            chat_model_controls(llm),
+        )
         structured = (
             llm.with_structured_output(self.response_schema) if self.response_schema else None
         )

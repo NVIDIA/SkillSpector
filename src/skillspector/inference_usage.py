@@ -33,13 +33,49 @@ _MIN_SAMPLING_SEED = -(1 << 63)
 _MAX_SAMPLING_SEED = (1 << 63) - 1
 _FORWARDED_CONTROL_NAMES = ("temperature", "seed", "reasoning_effort")
 _SAFE_SETTING_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:/+\-]{0,255}")
-_SECRET_PREFIXES = ("sk-", "nvapi-", "ghp_", "glpat-", "bearer-")
+_CREDENTIAL_PREFIXES = (
+    "sk-",
+    "nvapi-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "bearer-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "hf_",
+    "aiza",
+    "akia",
+    "asia",
+    "aws-secret-",
+)
+_UNPREFIXED_CREDENTIAL = re.compile(r"(?:[0-9a-fA-F]{32,64}|[A-Za-z0-9_+/=-]{40,88})\Z")
 
 _CHAT_MODEL_CONTROLS: dict[
     int,
-    tuple[weakref.ReferenceType[object], dict[str, float | int | str | None]],
+    tuple[
+        weakref.ReferenceType[object],
+        dict[str, float | int | str | None],
+        dict[str, float | int | str | None],
+    ],
 ] = {}
 _CHAT_MODEL_CONTROLS_LOCK = threading.Lock()
+
+
+def looks_like_credential(value: object) -> bool:
+    """Return whether a printable label resembles a common secret value."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    lowered = candidate.lower()
+    return lowered.startswith(_CREDENTIAL_PREFIXES) or bool(
+        _UNPREFIXED_CREDENTIAL.fullmatch(candidate)
+    )
 
 
 class InferenceUsageRecord(TypedDict):
@@ -60,6 +96,7 @@ class InferenceUsageRecord(TypedDict):
     # Internal-only construction evidence. ``sanitize_inference_usage`` never
     # includes this field in the public token-usage projection; the provenance
     # sanitizer consumes it separately after a provider response is observed.
+    requested_controls: NotRequired[dict[str, float | int | str | None]]
     forwarded_controls: NotRequired[dict[str, float | int | str | None]]
 
 
@@ -85,12 +122,11 @@ def _forwarded_controls(value: Mapping[str, object] | None) -> dict[str, float |
                 controls[name] = raw
         elif isinstance(raw, str):
             setting = raw.strip()
-            lowered = setting.lower()
             if (
                 _SAFE_SETTING_RE.fullmatch(setting)
                 and "://" not in setting
                 and "@" not in setting
-                and not lowered.startswith(_SECRET_PREFIXES)
+                and not looks_like_credential(setting)
             ):
                 controls[name] = setting
     return controls
@@ -98,11 +134,14 @@ def _forwarded_controls(value: Mapping[str, object] | None) -> dict[str, float |
 
 def register_chat_model_controls(
     chat_model: object,
-    controls: Mapping[str, object],
+    forwarded_controls: Mapping[str, object],
+    *,
+    requested_controls: Mapping[str, object] | None = None,
 ) -> None:
-    """Associate a constructed chat model with the controls passed to its client."""
+    """Associate a model with requested and normalized request controls."""
     model_id = id(chat_model)
-    sanitized = _forwarded_controls(controls)
+    sanitized_requested = _forwarded_controls(requested_controls)
+    sanitized_forwarded = _forwarded_controls(forwarded_controls)
 
     def _discard(model_ref: weakref.ReferenceType[object]) -> None:
         with _CHAT_MODEL_CONTROLS_LOCK:
@@ -115,7 +154,11 @@ def register_chat_model_controls(
     except TypeError:
         return
     with _CHAT_MODEL_CONTROLS_LOCK:
-        _CHAT_MODEL_CONTROLS[model_id] = (model_ref, sanitized)
+        _CHAT_MODEL_CONTROLS[model_id] = (
+            model_ref,
+            sanitized_requested,
+            sanitized_forwarded,
+        )
 
 
 def chat_model_controls(chat_model: object | None) -> dict[str, float | int | str | None]:
@@ -126,7 +169,58 @@ def chat_model_controls(chat_model: object | None) -> dict[str, float | int | st
         current = _CHAT_MODEL_CONTROLS.get(id(chat_model))
         if current is None or current[0]() is not chat_model:
             return {}
+        return current[2].copy()
+
+
+def chat_model_requested_controls(
+    chat_model: object | None,
+) -> dict[str, float | int | str | None]:
+    """Return the controls resolved when *chat_model* was constructed."""
+    if chat_model is None:
+        return {}
+    with _CHAT_MODEL_CONTROLS_LOCK:
+        current = _CHAT_MODEL_CONTROLS.get(id(chat_model))
+        if current is None or current[0]() is not chat_model:
+            return {}
         return current[1].copy()
+
+
+def retained_chat_model_controls(
+    chat_model: object,
+    names: Sequence[str],
+) -> dict[str, float | int | str | None]:
+    """Return controls retained by the normalized provider request payload.
+
+    LangChain may accept a constructor option and then remove it for a
+    provider/model combination. Provenance must describe the request that the
+    adapter will send, not the raw constructor arguments supplied before that
+    normalization.
+    """
+    selected = [name for name in names if name in _FORWARDED_CONTROL_NAMES]
+    controls: dict[str, object] = dict.fromkeys(selected)
+    payload: Mapping[str, object] | None = None
+    payload_builder = getattr(chat_model, "_get_request_payload", None)
+    if callable(payload_builder):
+        try:
+            candidate = payload_builder("SkillSpector provenance probe")
+        except (TypeError, ValueError):
+            candidate = None
+        if isinstance(candidate, Mapping):
+            payload = candidate
+
+    if payload is not None:
+        output_config = payload.get("output_config")
+        output_config = output_config if isinstance(output_config, Mapping) else {}
+        for name in selected:
+            if name == "reasoning_effort":
+                controls[name] = payload.get(name, output_config.get("effort"))
+            else:
+                controls[name] = payload.get(name)
+    else:
+        for name in selected:
+            attribute = "effort" if name == "reasoning_effort" else name
+            controls[name] = getattr(chat_model, name, getattr(chat_model, attribute, None))
+    return _forwarded_controls(controls)
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -180,7 +274,12 @@ def _strict_label(value: object) -> str | None:
 def _strict_model_label(value: object) -> str | None:
     """Return a model label only when it cannot encode a URL or userinfo."""
     candidate = _strict_label(value)
-    if candidate is None or "://" in candidate or "@" in candidate:
+    if (
+        candidate is None
+        or "://" in candidate
+        or "@" in candidate
+        or looks_like_credential(candidate)
+    ):
         return None
     return candidate
 
@@ -383,12 +482,14 @@ class InferenceUsageCollector(BaseCallbackHandler):
         request_kind: str,
         provider: str,
         requested_model: str,
+        requested_controls: Mapping[str, object] | None = None,
         forwarded_controls: Mapping[str, object] | None = None,
     ) -> None:
         self._node = node
         self._request_kind = request_kind
         self._provider = provider
         self._requested_model = requested_model
+        self._requested_controls = _forwarded_controls(requested_controls)
         self._forwarded_controls = _forwarded_controls(forwarded_controls)
         self._records: list[InferenceUsageRecord] = []
         self._response_received = False
@@ -416,6 +517,8 @@ class InferenceUsageCollector(BaseCallbackHandler):
         with self._lock:
             self._response_received = True
             if record is not None:
+                if self._requested_controls:
+                    record["requested_controls"] = self._requested_controls.copy()
                 if self._forwarded_controls:
                     record["forwarded_controls"] = self._forwarded_controls.copy()
                 self._records.append(record)
@@ -431,6 +534,7 @@ class InferenceUsageCollector(BaseCallbackHandler):
             "model": _model_label(self._requested_model),
             "model_source": "requested_model",
             "usage_source": "provider_response",
+            "requested_controls": self._requested_controls.copy(),
             "forwarded_controls": self._forwarded_controls.copy(),
         }
 
@@ -448,11 +552,15 @@ class InferenceUsageCollector(BaseCallbackHandler):
                 raise RuntimeError("cannot change inference provider after a response")
             self._provider = label
 
-    def set_forwarded_controls(self, controls: Mapping[str, object] | None) -> None:
-        """Update construction evidence before the next provider response."""
-        sanitized = _forwarded_controls(controls)
+    def set_controls(
+        self,
+        requested: Mapping[str, object] | None,
+        forwarded: Mapping[str, object] | None,
+    ) -> None:
+        """Update constructor/request evidence before the next response."""
         with self._lock:
-            self._forwarded_controls = sanitized
+            self._requested_controls = _forwarded_controls(requested)
+            self._forwarded_controls = _forwarded_controls(forwarded)
 
     @property
     def response_received(self) -> bool:
@@ -469,6 +577,9 @@ class InferenceUsageCollector(BaseCallbackHandler):
                 controls = record.get("forwarded_controls")
                 if isinstance(controls, dict):
                     detached["forwarded_controls"] = controls.copy()
+                requested = record.get("requested_controls")
+                if isinstance(requested, dict):
+                    detached["requested_controls"] = requested.copy()
                 snapshot.append(detached)
             return snapshot
 

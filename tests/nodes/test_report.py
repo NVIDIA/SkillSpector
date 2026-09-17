@@ -1568,6 +1568,11 @@ def test_json_report_exposes_captured_llm_provenance(
                 "model_source": "requested_model",
                 "usage_source": "provider_response",
                 "total_tokens": 1,
+                "requested_controls": {
+                    "temperature": 0.0,
+                    "seed": 7,
+                    "reasoning_effort": None,
+                },
                 "forwarded_controls": {
                     "temperature": 0.0,
                     "seed": 7,
@@ -1631,6 +1636,7 @@ def test_json_report_exposes_captured_llm_provenance(
     assert intent["analyzer_revision"] == {
         "value": "2.11.2",
         "source": "skillspector_package",
+        "source_revision": {"value": "unknown", "source": "unknown"},
     }
     assert provenance["sampling"]["temperature"]["forwarded_to_client"] == 0.0
     assert provenance["sampling"]["seed"]["forwarded_to_client"] == 7
@@ -2306,13 +2312,35 @@ def test_preflight_unavailable_log_does_not_claim_runtime_calls_failed(
         "output_format": "json",
         "use_llm": False,
         "llm_requested": True,
+        # Stale/caller-supplied response evidence cannot turn a preflight-
+        # disabled scan into one that claims LLM execution.
+        "inference_usage": [
+            {
+                "node": "semantic_developer_intent",
+                "request_kind": "structured_output",
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "model_source": "requested_model",
+                "usage_source": "provider_response",
+                "total_tokens": 1,
+                "forwarded_controls": {"seed": 7},
+            }
+        ],
     }
 
     with caplog.at_level(logging.WARNING, logger="skillspector.nodes.report"):
-        report(state)
+        result = report(state)
 
     assert "unavailable during preflight" in caplog.text
     assert "0/0" not in caplog.text
+    provenance = json.loads(result["report_body"])["metadata"]["llm_provenance"]
+    assert provenance["provider"]["effective_adapter"] == "not_applicable"
+    assert provenance["determinism"] == {
+        "classification": "not_applicable",
+        "control_status": "not_applied",
+        "provider_guarantee": False,
+        "reason": "LLM analysis was not executed for this scan.",
+    }
 
 
 def test_non_degraded_clean_scan_stays_safe() -> None:

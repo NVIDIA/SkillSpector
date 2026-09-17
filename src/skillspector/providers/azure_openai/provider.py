@@ -36,7 +36,10 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
 
-from skillspector.inference_usage import register_chat_model_controls
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_sampling_parameters
 
@@ -86,7 +89,8 @@ class AzureOpenAIProvider:
         chat_model = AzureChatOpenAI(**kwargs)
         register_chat_model_controls(
             chat_model,
-            {
+            retained_chat_model_controls(chat_model, ("temperature", "seed")),
+            requested_controls={
                 "temperature": sampling_parameters.get("temperature"),
                 "seed": sampling_parameters.get("seed"),
             },

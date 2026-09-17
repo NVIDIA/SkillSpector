@@ -40,7 +40,10 @@ from botocore.config import Config as BotocoreConfig
 from langchain_aws import ChatBedrockConverse
 from langchain_core.language_models.chat_models import BaseChatModel
 
-from skillspector.inference_usage import register_chat_model_controls
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_sampling_parameters
 
@@ -137,7 +140,8 @@ class BedrockProvider:
         chat_model = ChatBedrockConverse(**kwargs)
         register_chat_model_controls(
             chat_model,
-            {"temperature": sampling_parameters.get("temperature")},
+            retained_chat_model_controls(chat_model, ("temperature",)),
+            requested_controls={"temperature": sampling_parameters.get("temperature")},
         )
         return chat_model
 

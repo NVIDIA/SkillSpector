@@ -31,7 +31,10 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import SecretStr
 
-from skillspector.inference_usage import register_chat_model_controls
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
 
@@ -86,7 +89,11 @@ class AnthropicProvider:
         chat_model = ChatAnthropic(**kwargs)
         register_chat_model_controls(
             chat_model,
-            {
+            retained_chat_model_controls(
+                chat_model,
+                ("temperature", "reasoning_effort"),
+            ),
+            requested_controls={
                 "temperature": sampling_parameters.get("temperature"),
                 "reasoning_effort": effort,
             },

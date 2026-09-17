@@ -13,6 +13,9 @@ from langchain_core.outputs import ChatGeneration, LLMResult
 from skillspector.inference_usage import (
     InferenceUsageCollector,
     _usage_record,
+    chat_model_controls,
+    chat_model_requested_controls,
+    register_chat_model_controls,
     sanitize_inference_usage,
 )
 
@@ -73,6 +76,29 @@ def test_collector_marks_response_received_without_usage_counters() -> None:
     assert observation[0]["provider"] == "codex_cli"
     assert observation[0]["usage_source"] == "provider_response"
     assert sanitize_inference_usage(observation) == []
+
+
+def test_constructor_control_registry_drops_credential_shaped_effort() -> None:
+    class _ChatModel:
+        pass
+
+    model = _ChatModel()
+    register_chat_model_controls(
+        model,
+        {
+            "temperature": 0.2,
+            "seed": 7,
+            "reasoning_effort": "github_pat_fake-value",
+        },
+        requested_controls={
+            "temperature": 0.2,
+            "seed": 7,
+            "reasoning_effort": "github_pat_fake-value",
+        },
+    )
+
+    assert chat_model_controls(model) == {"temperature": 0.2, "seed": 7}
+    assert chat_model_requested_controls(model) == {"temperature": 0.2, "seed": 7}
 
 
 def test_raw_anthropic_usage_adds_external_cache_counters_to_prompt_total() -> None:
@@ -367,6 +393,8 @@ def test_report_sanitizer_rejects_url_and_userinfo_model_labels() -> None:
             [
                 {**common, "model": "https://key@private-host/v1"},
                 {**common, "model": "key@private-host"},
+                {**common, "model": "github_pat_fake-value"},
+                {**common, "model": "0123456789abcdef" * 2},
             ]
         )
         == []

@@ -31,6 +31,10 @@ class AzureOpenAIProvider:
     pass
 
 
+class NvInferenceProvider:
+    pass
+
+
 def _models(value: str = "safe/model:1") -> dict[str, str]:
     return dict.fromkeys(LLM_ANALYZER_SLOTS, value)
 
@@ -44,6 +48,7 @@ def _usage(
         "usage_source": "provider_response",
     }
     if controls is not None:
+        record["requested_controls"] = controls
         record["forwarded_controls"] = controls
     return [record]
 
@@ -97,6 +102,63 @@ def test_capture_records_resolved_adapters_models_and_forwarded_controls(
         "control_status": "best_effort_controls_forwarded",
         "provider_guarantee": False,
         "reason": "Optional controls do not guarantee identical provider output.",
+    }
+
+
+def test_editable_source_build_reports_unknown_source_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _EditableDistribution:
+        @staticmethod
+        def read_text(name: str) -> str | None:
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": "file:///workspace/SkillSpector",
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    monkeypatch.delenv("SKILLSPECTOR_BUILD_REVISION", raising=False)
+    monkeypatch.setattr(
+        "skillspector.llm_provenance.distribution", lambda _name: _EditableDistribution()
+    )
+    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: OpenAIProvider())
+    monkeypatch.setattr(
+        "skillspector.llm_provenance.get_model_config_provider", lambda: OpenAIProvider()
+    )
+
+    result = sanitize_llm_provenance(
+        capture_llm_provenance(_models()),
+        use_llm=False,
+    )
+
+    assert result["analyzers"][0]["analyzer_revision"]["source_revision"] == {
+        "value": "unknown",
+        "source": "unknown",
+    }
+
+
+def test_injected_build_revision_is_reported_separately_from_package_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+    monkeypatch.setenv("SKILLSPECTOR_BUILD_REVISION", revision)
+    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: OpenAIProvider())
+    monkeypatch.setattr(
+        "skillspector.llm_provenance.get_model_config_provider", lambda: OpenAIProvider()
+    )
+
+    result = sanitize_llm_provenance(
+        capture_llm_provenance(_models()),
+        use_llm=False,
+    )
+    analyzer_revision = result["analyzers"][0]["analyzer_revision"]
+
+    assert analyzer_revision["source"] == "skillspector_package"
+    assert analyzer_revision["source_revision"] == {
+        "value": revision.lower(),
+        "source": "build_environment",
     }
 
 
@@ -166,30 +228,21 @@ def test_constructor_observation_supersedes_stale_configuration_capture(
     monkeypatch.setattr("skillspector.llm_utils.get_active_provider", lambda: OpenAIProvider())
     monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
     monkeypatch.setenv("SKILLSPECTOR_SEED", "11")
-    captured = capture_llm_provenance(_models())
+    captured = capture_llm_provenance(_models("gpt-4o"))
 
     monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.9")
     monkeypatch.setenv("SKILLSPECTOR_SEED", "99")
     monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "high")
 
-    class _FakeChatModel:
-        pass
-
-    fake_model = _FakeChatModel()
-    monkeypatch.setattr(
-        "skillspector.providers.chat_models.ChatOpenAI",
-        lambda **_kwargs: fake_model,
-    )
     chat_model = create_openai_compatible_chat_model(
-        model="safe/model:1",
+        model="gpt-4o",
         credentials=("test-key", None),
         max_tokens=128,
     )
-    assert chat_model is fake_model
     collector = new_inference_usage_collector(
         node="semantic_developer_intent",
         request_kind="structured_output",
-        model="safe/model:1",
+        model="gpt-4o",
         chat_model=chat_model,
     )
     collector.mark_response_received()
@@ -206,6 +259,49 @@ def test_constructor_observation_supersedes_stale_configuration_capture(
     assert result["sampling"]["seed"]["forwarded_to_client"] == 99
     assert result["sampling"]["reasoning_effort"]["requested"] == "high"
     assert result["sampling"]["reasoning_effort"]["forwarded_to_client"] == "high"
+
+
+def test_gpt_5_4_reports_only_controls_retained_by_request_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: OpenAIProvider())
+    monkeypatch.setattr(
+        "skillspector.llm_provenance.get_model_config_provider", lambda: OpenAIProvider()
+    )
+    monkeypatch.setattr("skillspector.llm_utils.get_active_provider", lambda: OpenAIProvider())
+    monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
+    monkeypatch.setenv("SKILLSPECTOR_SEED", "11")
+    captured = capture_llm_provenance(_models("gpt-5.4"))
+
+    chat_model = create_openai_compatible_chat_model(
+        model="gpt-5.4",
+        credentials=("test-key", None),
+        max_tokens=128,
+    )
+    collector = new_inference_usage_collector(
+        node="semantic_developer_intent",
+        request_kind="structured_output",
+        model="gpt-5.4",
+        chat_model=chat_model,
+    )
+    collector.mark_response_received()
+
+    result = sanitize_llm_provenance(
+        captured,
+        use_llm=True,
+        inference_usage=collector.snapshot(),
+    )
+
+    assert result["sampling"]["temperature"] == {
+        "requested": 0.2,
+        "source": "environment",
+        "forwarded_to_client": None,
+        "adapter_support": True,
+        "provider_support": "unknown",
+    }
+    assert result["sampling"]["seed"]["requested"] == 11
+    assert result["sampling"]["seed"]["forwarded_to_client"] == 11
+    assert result["determinism"]["control_status"] == "controls_partially_forwarded"
 
 
 def test_configured_controls_are_not_claimed_forwarded_without_response_evidence(
@@ -322,6 +418,68 @@ def test_public_projection_drops_unknown_fields_and_redacts_unsafe_labels() -> N
     assert "private.example" not in serialized
     assert "do-not-emit" not in serialized
     assert "private prompt" not in serialized
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "AWS-secret-fake-value",
+        "github_pat_fake-value",
+        "xoxb-fake-value",
+        "hf_fake-value",
+        "AIza-fake-value",
+        "0123456789abcdef" * 2,
+        "AbCdEfGhIjKlMnOpQrSt" * 2,
+    ],
+)
+def test_capture_and_projection_do_not_emit_credential_shaped_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    credential: str,
+) -> None:
+    provider = AzureOpenAIProvider()
+    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: provider)
+    monkeypatch.setattr("skillspector.llm_provenance.get_model_config_provider", lambda: provider)
+    monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", credential)
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", credential)
+
+    result = sanitize_llm_provenance(
+        capture_llm_provenance(_models(credential)),
+        use_llm=False,
+    )
+    serialized = json.dumps(result)
+
+    assert credential not in serialized
+    assert {item["model"] for item in result["analyzers"]} == {"redacted"}
+    assert result["provider"]["routing"]["deployment_override"] is None
+    assert result["sampling"]["reasoning_effort"]["requested"] is None
+
+
+def test_malformed_source_revision_is_not_emitted() -> None:
+    secret = "github_pat_fake-value"
+    result = sanitize_llm_provenance(
+        {
+            "analyzers": [
+                {
+                    "analyzer_id": LLM_ANALYZER_SLOTS[0],
+                    "model": "safe/model:1",
+                    "analyzer_revision": {
+                        "value": "2.11.2",
+                        "source_revision": {
+                            "value": secret,
+                            "source": "build_environment",
+                        },
+                    },
+                }
+            ]
+        },
+        use_llm=False,
+    )
+
+    assert secret not in json.dumps(result)
+    assert result["analyzers"][0]["analyzer_revision"]["source_revision"] == {
+        "value": "unknown",
+        "source": "unknown",
+    }
 
 
 def test_multiple_response_providers_are_reported_as_mixed() -> None:
@@ -448,6 +606,31 @@ def test_effective_provider_comes_from_response_not_preflight_candidate(
     assert result["provider"]["effective_adapters"] == ["openai"]
     assert result["sampling"]["seed"]["adapter_support"] is True
     assert result["sampling"]["seed"]["forwarded_to_client"] == 17
+
+
+def test_nv_inference_preserves_all_observed_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = NvInferenceProvider()
+    monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: provider)
+    monkeypatch.setattr("skillspector.llm_provenance.get_model_config_provider", lambda: provider)
+    monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.25")
+    monkeypatch.setenv("SKILLSPECTOR_SEED", "23")
+    monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "high")
+
+    result = sanitize_llm_provenance(
+        capture_llm_provenance(_models()),
+        use_llm=True,
+        inference_usage=_usage(
+            "nv_inference",
+            {"temperature": 0.25, "seed": 23, "reasoning_effort": "high"},
+        ),
+    )
+
+    assert result["provider"]["effective_adapter"] == "nv_inference"
+    assert result["sampling"]["temperature"]["forwarded_to_client"] == 0.25
+    assert result["sampling"]["seed"]["forwarded_to_client"] == 23
+    assert result["sampling"]["reasoning_effort"]["forwarded_to_client"] == "high"
 
 
 def test_azure_routing_records_deployment_and_api_version(

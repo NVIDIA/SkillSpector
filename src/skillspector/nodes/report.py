@@ -1150,6 +1150,7 @@ def _build_metadata(
     # some coverage was lost) into one boolean.
     execution_enabled = use_llm if llm_execution_enabled is None else llm_execution_enabled
     unavailable_before_execution = bool(use_llm and not execution_enabled)
+    llm_executed = bool(use_llm and execution_enabled)
     meta_analysis_applied = (
         use_llm and execution_enabled and provider_available and meta_analyzer_succeeded
     )
@@ -1169,7 +1170,7 @@ def _build_metadata(
         "inference_usage": sanitized_inference_usage,
         "llm_provenance": sanitize_llm_provenance(
             llm_provenance,
-            use_llm=use_llm,
+            use_llm=llm_executed,
             # Counter-less responses and constructor controls are internal
             # provenance evidence. The public inference_usage projection above
             # intentionally omits both, so provenance must inspect the raw
