@@ -80,8 +80,10 @@ MP1_PATTERNS = [
 ]
 
 # MP2: Context Window Stuffing — filling context to displace content
-MP2_PATTERNS = [
+MP2_CONTENT_PATTERNS = [
     (r"(.{2,20}?)\1{20,}", 0.8),
+]
+MP2_PROSE_PATTERNS = [
     (
         r"(?:repeat|duplicate|echo)\s+(?:this|the\s+following)\s+(?:\d{3,}|many|hundreds?|thousands?)\s+times?",
         0.85,
@@ -107,6 +109,7 @@ MP2_PATTERNS = [
         0.8,
     ),
 ]
+MP2_PATTERNS = MP2_CONTENT_PATTERNS + MP2_PROSE_PATTERNS
 
 # MP3: Memory Manipulation — direct modification of agent memory/state
 MP3_PATTERNS = [
@@ -310,7 +313,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in MP2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in MP2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
             if _is_layout_only_span(span):
                 continue

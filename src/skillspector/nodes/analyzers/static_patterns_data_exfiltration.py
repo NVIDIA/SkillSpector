@@ -42,7 +42,7 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_data_exfiltration"
 USES_PYTHON_AST = True
 
-E1_PATTERNS = [
+E1_CODE_PATTERNS = [
     (r"requests\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
     (r"requests\s*\.\s*(?:post|put)\s*\([^)]*json\s*=", 0.7),
     (r"httpx\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
@@ -51,11 +51,14 @@ E1_PATTERNS = [
     (r"curl\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\s+", 0.6),
     (r"wget\s+[^|]*--post-(?:data|file)", 0.6),
     (r"https?://(?:api\.|data\.|collect\.|telemetry\.|analytics\.)[\w.-]+/", 0.5),
+]
+E1_PROSE_PATTERNS = [
     (
         r"(?:send|transmit|post|upload)\s+(?:user\s+)?(?:data|information|context|files?)\s+to\s+(?:https?://|external)",
         0.7,
     ),
 ]
+E1_PATTERNS = E1_CODE_PATTERNS + E1_PROSE_PATTERNS
 E2_PYTHON_FALLBACK_PATTERNS = [
     # Python: for k, v in os.environ.items() — whitespace-tolerant
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
@@ -67,15 +70,18 @@ E2_PYTHON_FALLBACK_PATTERNS = [
     # Require braces so bare ``2 ** os.environ`` (exponentiation) is not flagged.
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
 ]
-E2_OTHER_PATTERNS = [
+E2_OTHER_CODE_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
     (r"env\s*\|\s*grep\s+(?:-i\s+)?(?:key|secret|token|password)", 0.8),
     (r"printenv\s+(?:\w*(?:KEY|SECRET|TOKEN|PASSWORD)\w*)", 0.7),
+]
+E2_PROSE_PATTERNS = [
     (r"collect\s+(?:all\s+)?(?:environment\s+variables?|env\s+vars?)", 0.7),
     (r"(?:extract|harvest|gather)\s+(?:api\s+)?keys?\s+from\s+environment", 0.8),
 ]
+E2_OTHER_PATTERNS = E2_OTHER_CODE_PATTERNS + E2_PROSE_PATTERNS
 E2_PATTERNS = E2_PYTHON_FALLBACK_PATTERNS + E2_OTHER_PATTERNS
 
 _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
@@ -86,22 +92,25 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
-E3_PATTERNS = [
+E3_CODE_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
     (r"Path\s*\.\s*home\s*\(\s*\)\s*\.\s*(?:glob|rglob)\s*\(", 0.7),
+    (r"os\s*\.\s*listdir\s*\([^)]*(?:\.ssh|\.aws|\.config|\.gnupg)", 0.8),
+    (r"scandir\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
+    (r"find\s+[~\$/]\S*\s+.*?-name\s+['\"]?\*(?:\.env|\.pem|\.key|credential)", 0.8),
+    (r"ls\s+-[la]*R?\s+(?:~/|/home/|/Users/)", 0.6),
+]
+E3_PROSE_PATTERNS = [
     (
         r"(?:find|search|scan|enumerate)\s+(?:for\s+)?(?:all\s+)?(?:\.env|credential|secret|key)\s+files?",
         0.8,
     ),
     (r"(?:list|get)\s+(?:all\s+)?files?\s+(?:in|from)\s+(?:home|~|/Users|/home)", 0.6),
-    (r"os\s*\.\s*listdir\s*\([^)]*(?:\.ssh|\.aws|\.config|\.gnupg)", 0.8),
-    (r"scandir\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
-    (r"find\s+[~\$/]\S*\s+.*?-name\s+['\"]?\*(?:\.env|\.pem|\.key|credential)", 0.8),
-    (r"ls\s+-[la]*R?\s+(?:~/|/home/|/Users/)", 0.6),
     (r"(?:recursively|recursive)\s+(?:scan|search|find|list)\s+(?:all\s+)?files?", 0.5),
     (r"walk\s+(?:through\s+)?(?:the\s+)?(?:entire\s+)?(?:file\s*system|directory|home)", 0.6),
 ]
+E3_PATTERNS = E3_CODE_PATTERNS + E3_PROSE_PATTERNS
 E4_PATTERNS = [
     (
         r"(?:send|transmit|upload|log|record)\s+(?:the\s+)?(?:full\s+)?(?:conversation|chat|dialog|session)\s+(?:history|context|log)?",
@@ -290,7 +299,12 @@ def analyze(
     tag = [PatternCategory.DATA_EXFILTRATION.value]
 
     for pattern, confidence in E1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in E1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             adj = (
                 min(1.0, confidence + 0.1)
@@ -320,7 +334,12 @@ def analyze(
             e2_patterns = E2_OTHER_PATTERNS
 
     for pattern, confidence in e2_patterns:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in E2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -336,7 +355,12 @@ def analyze(
                 )
             )
     for pattern, confidence in E3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in E3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
