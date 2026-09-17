@@ -194,9 +194,7 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
         )
         for call in call_pattern.finditer(content):
             try:
-                values = [
-                    int(value) for value in call.group("values").split(",") if value.strip()
-                ]
+                values = [int(value) for value in call.group("values").split(",") if value.strip()]
             except ValueError:
                 continue
             if (
