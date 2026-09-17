@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -316,31 +317,11 @@ def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
     result: list[Finding] = []
     for f in findings:
         result.append(
-            Finding(
-                rule_id=f.rule_id,
-                message=f.message,
-                finding_id=f.finding_id,
-                severity=f.severity,
-                confidence=f.confidence,
-                file=f.file,
-                start_line=f.start_line,
-                end_line=f.end_line,
+            replace(
+                f,
                 remediation=f.remediation or get_remediation(f.rule_id),
-                tags=f.tags,
-                context=f.context,
-                matched_text=f.matched_text,
-                transitive_depth=f.transitive_depth,
-                source_url=f.source_url,
-                source_identity=f.source_identity,
-                source_digest=f.source_digest,
-                category=getattr(f, "category", None),
-                pattern=getattr(f, "pattern", None),
-                finding=getattr(f, "finding", None),
-                explanation=getattr(f, "explanation", None),
-                code_snippet=getattr(f, "code_snippet", None) or f.context,
+                code_snippet=f.code_snippet or f.context,
                 evidence=dict(f.evidence),
-                intent=f.intent,
-                match_fingerprint=f.match_fingerprint,
                 occurrences=list(f.occurrences),
             )
         )
@@ -359,31 +340,11 @@ def _passthrough_with_defaults(findings: list[Finding]) -> list[Finding]:
     should fail-closed — showing more findings is safer than silently dropping.
     """
     return [
-        Finding(
-            rule_id=f.rule_id,
-            message=f.message,
-            finding_id=f.finding_id,
-            severity=f.severity,
-            confidence=f.confidence,
-            file=f.file,
-            start_line=f.start_line,
-            end_line=f.end_line,
+        replace(
+            f,
             remediation=f.remediation or get_remediation(f.rule_id),
-            tags=f.tags,
-            context=f.context,
-            matched_text=f.matched_text,
-            transitive_depth=f.transitive_depth,
-            source_url=f.source_url,
-            source_identity=f.source_identity,
-            source_digest=f.source_digest,
-            category=getattr(f, "category", None),
-            pattern=getattr(f, "pattern", None),
-            finding=getattr(f, "finding", None),
-            explanation=getattr(f, "explanation", None),
-            code_snippet=getattr(f, "code_snippet", None) or f.context,
+            code_snippet=f.code_snippet or f.context,
             evidence=dict(f.evidence),
-            intent=f.intent,
-            match_fingerprint=f.match_fingerprint,
             occurrences=list(f.occurrences),
         )
         for f in findings
@@ -527,61 +488,25 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                 if "llm-unconfirmed" not in unconfirmed_tags:
                     unconfirmed_tags.append("llm-unconfirmed")
                 result.append(
-                    Finding(
-                        rule_id=f.rule_id,
-                        message=f.message,
-                        finding_id=f.finding_id,
-                        severity=f.severity,
-                        confidence=f.confidence,
-                        file=f.file,
-                        start_line=f.start_line,
-                        end_line=f.end_line,
+                    replace(
+                        f,
                         remediation=f.remediation or get_remediation(f.rule_id),
                         tags=unconfirmed_tags,
-                        context=f.context,
-                        matched_text=f.matched_text,
-                        transitive_depth=f.transitive_depth,
-                        source_url=f.source_url,
-                        source_identity=f.source_identity,
-                        source_digest=f.source_digest,
-                        category=getattr(f, "category", None),
-                        pattern=getattr(f, "pattern", None),
-                        finding=getattr(f, "finding", None),
-                        explanation=getattr(f, "explanation", None),
-                        code_snippet=getattr(f, "code_snippet", None) or f.context,
+                        code_snippet=f.code_snippet or f.context,
                         evidence=dict(f.evidence),
-                        intent=f.intent,
-                        match_fingerprint=f.match_fingerprint,
                         occurrences=list(f.occurrences),
                     )
                 )
                 continue
             result.append(
-                Finding(
-                    rule_id=f.rule_id,
+                replace(
+                    f,
                     message=expl,
-                    finding_id=f.finding_id,
-                    severity=f.severity,
                     confidence=max(f.confidence, conf),
-                    file=f.file,
-                    start_line=f.start_line,
-                    end_line=f.end_line,
                     remediation=rem,
-                    tags=f.tags,
-                    context=f.context,
-                    matched_text=f.matched_text,
-                    transitive_depth=f.transitive_depth,
-                    source_url=f.source_url,
-                    source_identity=f.source_identity,
-                    source_digest=f.source_digest,
-                    category=getattr(f, "category", None),
-                    pattern=getattr(f, "pattern", None),
-                    finding=getattr(f, "finding", None),
                     explanation=expl,
-                    code_snippet=getattr(f, "code_snippet", None) or f.context,
+                    code_snippet=f.code_snippet or f.context,
                     evidence=dict(f.evidence),
-                    intent=f.intent,
-                    match_fingerprint=f.match_fingerprint,
                     occurrences=list(f.occurrences),
                 )
             )

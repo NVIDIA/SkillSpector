@@ -17,6 +17,7 @@ from array import array
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 from io import StringIO
 from typing import NotRequired
 
@@ -54,6 +55,7 @@ class ArtifactRecord(TypedDict):
     misleading_extension: bool
     referenced: bool
     reason: NotRequired[str]
+    inherited_exclusion_reason: NotRequired[str]
 
 
 class BundleReference(TypedDict):
@@ -69,12 +71,23 @@ class BundleReference(TypedDict):
 
 
 @dataclass(frozen=True)
+class SecurityTextReconstruction:
+    """One projected run reconstructed from a bounded raw source span."""
+
+    derived_start: int
+    derived_end: int
+    source_start: int
+    source_end: int
+
+
+@dataclass(frozen=True)
 class SecurityTextView:
     """A bounded derived text view and mapping to raw character offsets."""
 
     name: str
     text: str
     source_offsets: array[int] | None = None
+    reconstructions: tuple[SecurityTextReconstruction, ...] = ()
 
     def source_offset(self, derived_offset: int) -> int:
         """Map a derived character offset to the corresponding source offset."""
@@ -84,6 +97,29 @@ class SecurityTextView:
             return 0
         index = min(max(derived_offset, 0), len(self.source_offsets) - 1)
         return self.source_offsets[index]
+
+    def reconstructed_source_spans(
+        self,
+        derived_start: int,
+        derived_end: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return exact removed source gaps reconstructed by a derived range."""
+        if derived_end <= derived_start or self.source_offsets is None:
+            return ()
+        gaps: list[tuple[int, int]] = []
+        for item in self.reconstructions:
+            overlap_start = max(derived_start, item.derived_start)
+            overlap_end = min(derived_end, item.derived_end)
+            for offset in range(max(overlap_start + 1, item.derived_start + 1), overlap_end):
+                previous_source = self.source_offsets[offset - 1]
+                source = self.source_offsets[offset]
+                if source > previous_source + 1:
+                    gaps.append((previous_source + 1, source))
+        return tuple(gaps)
+
+    def range_has_reconstruction(self, derived_start: int, derived_end: int) -> bool:
+        """Return whether a derived range joins characters across a removed gap."""
+        return bool(self.reconstructed_source_spans(derived_start, derived_end))
 
 
 @dataclass(frozen=True)
@@ -192,6 +228,13 @@ _TEXT_EXTENSIONS = frozenset(
 )
 
 _ALLOWED_FORMAT_CHARS = frozenset({"\n", "\r", "\t"})
+# A scan runs every analyzer over the same file content, and each one asks the
+# same questions about that text again. These predicates are pure functions of
+# the text, so the answers are memoized rather than recomputed: measured on one
+# real skill, `_has_letter_spacing_run` ran 780 times over 23 distinct texts.
+# The bound keeps a long-lived process from retaining file content indefinitely.
+_TEXT_PREDICATE_CACHE_SIZE = 64
+
 _IGNORED_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _LETTER_SPACING_CANDIDATE = re.compile(
     r"(?:[^\W\d_](?:[^\w\r\n]|_)+){5}[^\W\d_]",
@@ -199,6 +242,10 @@ _LETTER_SPACING_CANDIDATE = re.compile(
 )
 _CONCEALED_INSTRUCTION_CANDIDATE = re.compile(
     r"(?:[^\W\d_](?:[^\w]|_)+){5}[^\W\d_]",
+    re.UNICODE,
+)
+_PROMPT_SPACING_CANDIDATE = re.compile(
+    r"(?<![^\W\d_])\S(?:[^\w\r\n]|_)+\S(?![^\W\d_])",
     re.UNICODE,
 )
 _MIN_LETTER_SPACING_RUN_LETTERS = 6
@@ -352,12 +399,27 @@ def _contains_default_ignorable(text: str) -> bool:
     return _DEFAULT_IGNORABLE_PATTERN.search(text) is not None
 
 
-def _is_unconditionally_ignored(ch: str) -> bool:
+def _compute_unconditionally_ignored(ch: str) -> bool:
     return (
         bool(_IGNORED_ASCII_CONTROL.fullmatch(ch))
         or unicodedata.category(ch) in {"Cf", "Cc"}
         and ch not in _ALLOWED_FORMAT_CHARS
     )
+
+
+# Skill content is overwhelmingly ASCII, and the classification of an ASCII
+# character never changes, so resolve that range once at import instead of
+# paying a regex match plus a unicodedata lookup for every character scanned.
+# The table is derived from the predicate itself, so it cannot drift from it.
+_ASCII_UNCONDITIONALLY_IGNORED = frozenset(
+    ch for ch in map(chr, range(128)) if _compute_unconditionally_ignored(ch)
+)
+
+
+def _is_unconditionally_ignored(ch: str) -> bool:
+    if ch.isascii():
+        return ch in _ASCII_UNCONDITIONALLY_IGNORED
+    return _compute_unconditionally_ignored(ch)
 
 
 def _is_word_character(ch: str) -> bool:
@@ -1420,9 +1482,21 @@ def _obfuscated_instruction_gap_offsets(text: str) -> Iterator[int]:
             yield from range(start, end)
 
 
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
 def _has_letter_spacing_run(text: str) -> bool:
     """Use a C-level ASCII prefilter before the exact Unicode-aware scan."""
     return next(_letter_spacing_run_spans(text), None) is not None
+
+
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
+def _has_obfuscated_instruction(text: str) -> bool:
+    """Return whether any obfuscated instruction is present.
+
+    Existence is all ``security_text_views`` needs, and unlike the generator it
+    is a plain bool, so it can be memoized without materializing the matches or
+    handing the same iterator to two consumers.
+    """
+    return next(_obfuscated_instruction_matches(text), None) is not None
 
 
 def _letter_spacing_gap_offsets(text: str) -> Iterator[int]:
@@ -1433,13 +1507,34 @@ def _letter_spacing_gap_offsets(text: str) -> Iterator[int]:
                 yield offset
 
 
-def _is_token_gap_character(ch: str) -> bool:
+def _compute_token_gap_character(ch: str) -> bool:
     return (
         _is_unconditionally_ignored(ch)
         or is_default_ignorable(ch)
         or _is_non_ascii_separator(ch)
         or ch == "\ufffd"
     )
+
+
+_ASCII_TOKEN_GAP_CHARS = frozenset(
+    ch for ch in map(chr, range(128)) if _compute_token_gap_character(ch)
+)
+
+# Any character that cannot be a token gap need not be examined at all. Every
+# ASCII character outside this class is settled by the table above, so a text
+# built only from them has no gap spans and the per-character walk below is
+# pure overhead.
+_TOKEN_GAP_CANDIDATE = re.compile(
+    "[^"
+    + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
+    + "]"
+)
+
+
+def _is_token_gap_character(ch: str) -> bool:
+    if ch.isascii():
+        return ch in _ASCII_TOKEN_GAP_CHARS
+    return _compute_token_gap_character(ch)
 
 
 def _token_bridging_gap_spans(
@@ -1449,6 +1544,8 @@ def _token_bridging_gap_spans(
     check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield contextual noise runs in one pass without crossing ASCII spaces."""
+    if _TOKEN_GAP_CANDIDATE.search(text) is None:
+        return
     offset = 0
     while offset < len(text):
         if check_runtime is not None and offset % 4096 == 0:
@@ -1700,6 +1797,188 @@ def compact_letter_view(text: str) -> SecurityTextView:
     return SecurityTextView("compact", output.getvalue(), offsets)
 
 
+def prompt_injection_letter_spacing_view(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+    *,
+    preserve_identifier_boundaries: bool = True,
+) -> SecurityTextView:
+    """Collapse consistently separated tokens without inventing word boundaries.
+
+    The prompt-injection analyzer alone consumes this projection. Existing
+    word boundaries are retained verbatim, while consistent spaces, tabs, or
+    punctuation between single-character tokens are removed with exact raw-gap
+    provenance. A completely boundary-free run therefore remains one condensed
+    token and cannot acquire a guessed P3 or P4 segmentation. Identifier-adjacent
+    runs are preserved for semantic classification; artifact-integrity may opt
+    into their projection solely to produce an ambiguity finding.
+    """
+    if check_runtime is not None:
+        check_runtime()
+    if _PROMPT_SPACING_CANDIDATE.search(text) is None:
+        return SecurityTextView("prompt-letter-spacing", text)
+    processed_since_check = 0
+
+    def record_work(characters: int = 1) -> None:
+        nonlocal processed_since_check
+        if check_runtime is None:
+            return
+        processed_since_check += characters
+        if processed_since_check >= 4096:
+            check_runtime()
+            processed_since_check %= 4096
+
+    output = StringIO()
+    offsets = array("I")
+    reconstructions: list[SecurityTextReconstruction] = []
+    transformed = False
+
+    def append_source(start: int, end: int) -> None:
+        for source_offset in range(start, end):
+            record_work()
+            output.write(text[source_offset])
+            offsets.append(source_offset)
+
+    cursor = 0
+    index = 0
+    while index < len(text):
+        record_work()
+        # A line break is never a token: starting a run on it would treat the
+        # previous line's last character as the identifier-boundary neighbor.
+        if text[index] in _LOGICAL_LINE_BREAK_CHARACTERS or _is_letter_spacing_separator(
+            text[index]
+        ):
+            index += 1
+            continue
+
+        run_start = index
+        unit_offsets = array("I", (run_start,))
+        run_tail = text[run_start].casefold()[-8:]
+        url_mode = False
+        spacing_width: int | None = None
+        run_end = run_start + 1
+        while run_end < len(text):
+            gap_start = run_end
+            if text[gap_start].isspace() and text[gap_start] not in _LOGICAL_LINE_BREAK_CHARACTERS:
+                while (
+                    run_end < len(text)
+                    and text[run_end].isspace()
+                    and text[run_end] not in _LOGICAL_LINE_BREAK_CHARACTERS
+                ):
+                    record_work()
+                    run_end += 1
+                if run_end < len(text) and _is_letter_spacing_separator(text[run_end]):
+                    punctuation = text[run_end]
+                    punctuation_is_unit = (
+                        punctuation == ":"
+                        and run_tail in {"http", "https"}
+                        or punctuation == "/"
+                        and run_tail.endswith(("http:", "https:", "http:/", "https:/"))
+                        or punctuation == "."
+                        and url_mode
+                        or punctuation == "'"
+                        and run_tail.endswith("user")
+                    )
+                    if not punctuation_is_unit:
+                        run_end += 1
+                        record_work()
+                        while (
+                            run_end < len(text)
+                            and text[run_end].isspace()
+                            and text[run_end] not in _LOGICAL_LINE_BREAK_CHARACTERS
+                        ):
+                            record_work()
+                            run_end += 1
+            elif _is_letter_spacing_separator(text[gap_start]):
+                marker = text[gap_start]
+                while run_end < len(text) and (
+                    text[run_end] == marker
+                    or text[run_end].isspace()
+                    and text[run_end] not in _LOGICAL_LINE_BREAK_CHARACTERS
+                ):
+                    record_work()
+                    run_end += 1
+            if gap_start == run_end:
+                break
+            if run_end >= len(text):
+                run_end = gap_start
+                break
+
+            gap = text[gap_start:run_end]
+            gap_signature = _letter_spacing_gap_signature(gap)
+            whitespace_gap = all(character.isspace() for character in gap)
+            if gap_signature is None and not whitespace_gap:
+                run_end = gap_start
+                break
+
+            # A separator before a multi-letter word is an observed token
+            # boundary, not another inter-character gap. In particular, this
+            # keeps the first character of "conversation" out of "s e n d".
+            if text[run_end].isalpha() and run_end + 1 < len(text) and text[run_end + 1].isalpha():
+                run_end = gap_start
+                break
+
+            if whitespace_gap:
+                if spacing_width is not None and len(gap) != spacing_width:
+                    run_end = gap_start
+                    break
+                spacing_width = len(gap)
+
+            unit_offsets.append(run_end)
+            run_tail = (run_tail + text[run_end].casefold())[-8:]
+            url_mode = url_mode or "://" in run_tail
+            run_end += 1
+
+        if len(unit_offsets) == 1:
+            index += 1
+            continue
+
+        # Do not rewrite a letter-spaced fragment embedded in an identifier.
+        # Advance past rejected runs too, so attacker-controlled near misses
+        # cannot force quadratic rescanning from every interior character.
+        left_identifier = run_start > 0 and _is_word_character(text[run_start - 1])
+        right_identifier = run_end < len(text) and _is_word_character(text[run_end])
+        left_letter = run_start > 0 and text[run_start - 1].isalpha()
+        right_letter = run_end < len(text) and text[run_end].isalpha()
+        boundary_is_safe = (
+            not left_identifier and not right_identifier
+            if preserve_identifier_boundaries
+            else not left_letter and not right_letter
+        )
+        if boundary_is_safe:
+            append_source(cursor, run_start)
+            derived_start = len(offsets)
+            for source_offset in unit_offsets:
+                record_work()
+                output.write(text[source_offset])
+                offsets.append(source_offset)
+            reconstructions.append(
+                SecurityTextReconstruction(
+                    derived_start=derived_start,
+                    derived_end=len(offsets),
+                    source_start=run_start,
+                    source_end=run_end,
+                )
+            )
+            cursor = run_end
+            transformed = True
+        # Retrying at the second unit after a left-side rejection prevents one
+        # malformed prefix from hiding a valid suffix. Only the first attempt
+        # can have an adjacent left identifier, so the scan remains linear.
+        index = unit_offsets[1] if not boundary_is_safe and left_identifier else run_end
+
+    if not transformed:
+        return SecurityTextView("prompt-letter-spacing", text)
+    append_source(cursor, len(text))
+    return SecurityTextView(
+        "prompt-letter-spacing",
+        output.getvalue(),
+        offsets,
+        tuple(reconstructions),
+    )
+
+
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
 def _requires_normalized_security_view(text: str) -> bool:
     """Return whether normalization can produce a distinct security view."""
     if _IGNORED_ASCII_CONTROL.search(text) is not None:
@@ -1722,7 +2001,7 @@ def security_text_views(text: str) -> tuple[SecurityTextView, ...]:
     """Return distinct raw, normalized, and compact views deterministically."""
     raw = SecurityTextView("raw", text)
     has_letter_spacing = _has_letter_spacing_run(text)
-    has_obfuscated_instruction = next(_obfuscated_instruction_matches(text), None) is not None
+    has_obfuscated_instruction = _has_obfuscated_instruction(text)
     if (
         text.isascii()
         and _IGNORED_ASCII_CONTROL.search(text) is None
