@@ -335,6 +335,15 @@ def test_long_same_line_calls_keep_exact_coordinates_and_distinct_identity() -> 
     assert len(deduplicate(findings)) == 2
 
 
-@pytest.mark.parametrize("path", ["run.pyw", "run", "run.sh"])
+@pytest.mark.parametrize("path", ["run", "run.sh"])
 def test_non_py_surfaces_do_not_enable_ast_companion(path: str) -> None:
     assert not _tm1("enabled = True\nsubprocess.run(command, shell=enabled)\n", path)
+
+
+def test_python_window_surface_enables_ast_companion() -> None:
+    findings = _tm1(
+        "import subprocess\nenabled = True\nsubprocess.run(command, shell=enabled)\n",
+        "run.pyw",
+    )
+
+    assert len(findings) == 1

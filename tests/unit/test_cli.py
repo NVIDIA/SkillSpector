@@ -3162,6 +3162,49 @@ def test_scan_transitive_depth_one_merges_provenance(tmp_path: Path, monkeypatch
     assert transitive_issue["source_url"] == "https://github.com/org/transitive"
 
 
+def test_scan_transitive_routes_python_window_script_with_provenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A referenced ``.pyw`` reaches the child scan and keeps its source identity."""
+    target = "https://raw.githubusercontent.com/NVIDIA/SkillSpector/main/tool.pyw"
+    calls: list[str] = []
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline=None,
+        show_suppressed: bool = False,
+        transitive_traversal=None,
+    ) -> dict[str, object]:
+        calls.append(input_path)
+        if input_path == str(tmp_path):
+            return _mock_graph_result(
+                file_cache={"SKILL.md": target},
+                output_format=format.value,
+            )
+        assert input_path == target
+        return _mock_graph_result(
+            findings=[_finding("TM1", "Tool Parameter Abuse", file="tool.pyw", depth=1)],
+            output_format=format.value,
+        )
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--transitive", "--no-llm"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [str(tmp_path), target]
+    issue = json.loads(result.output)["issues"][0]
+    assert issue["id"] == "TM1"
+    assert issue["location"]["file"] == "tool.pyw"
+    assert issue["transitive_depth"] == 1
+    assert issue["source_url"] == target
+
+
 def test_scan_transitive_ignores_non_scannable_urls(tmp_path: Path, monkeypatch) -> None:
     """Non-scannable documentation or badge URLs are not followed transitively."""
     calls: list[str] = []

@@ -3884,6 +3884,8 @@ def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
 class _DirectShellReplayLexical:
     """Lexical-only facade used for direct-equivalent bounded windows."""
 
+    USES_PYTHON_SOURCE_TYPE = True
+
     @staticmethod
     def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
         return analyze(
@@ -4126,6 +4128,7 @@ def _bound_direct_replays(
                         [_DirectShellReplayLexical],
                         replay_budget,
                         None,
+                        python_source=True,
                         source_text=raw_window,
                     )
                     owned_findings: list[Finding] = []
@@ -4197,6 +4200,7 @@ def _bound_direct_replays(
                         [_DirectShellReplayLexical],
                         replay_budget,
                         None,
+                        python_source=True,
                         source_text=projection.text,
                     )
                     static_runner._restore_source_lines(
