@@ -127,6 +127,7 @@ _RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
         "ConnectTimeout",
         "ConnectTimeoutError",
         "EndpointConnectionError",
+        "HTTPClientError",
         "InternalServerError",
         "ModelNotReadyException",
         "PoolTimeout",
@@ -135,6 +136,7 @@ _RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
         "ReadTimeout",
         "ReadTimeoutError",
         "RemoteProtocolError",
+        "ResponseStreamingError",
         "ServiceUnavailableError",
         "SSLError",
         "ThrottlingException",
@@ -151,6 +153,8 @@ _RETRYABLE_BEDROCK_ERROR_CODES = frozenset(
         "modelnotreadyexception",
         "priorrequestnotcomplete",
         "requestlimitexceeded",
+        "requesttimeout",
+        "requesttimeoutexception",
         "servicetemporarilyunavailable",
         "serviceunavailableexception",
         "slowdown",
@@ -276,9 +280,9 @@ def _native_retries_cover_provider_error(exc: BaseException) -> bool:
     return False
 
 
-def _is_provider_failure_for_ledger(exc: BaseException) -> bool:
-    """Classify provider failures independently from their retry eligibility."""
-    return _transient_provider_cause(exc) is not None or _is_retryable_provider_error(exc)
+def _provider_retries_exhausted(exc: BaseException) -> bool:
+    """Return whether a failed provider call was eligible for bounded retries."""
+    return _is_retryable_provider_error(exc)
 
 
 def _provider_failure_class(exc: BaseException) -> str:
@@ -315,25 +319,32 @@ def _provider_retry_after_seconds(exc: BaseException) -> float | None:
     for candidate in _exception_chain(exc):
         for source in _provider_headers(candidate):
             headers = {str(key).lower(): value for key, value in source.items()}
-            raw_delay = headers.get("retry-after") or headers.get("x-amz-retry-after")
-            divisor = 1.0
-            if raw_delay is None:
-                raw_delay = headers.get("retry-after-ms")
-                divisor = 1000.0
-            try:
-                delay = float(str(raw_delay)) / divisor
-            except (TypeError, ValueError):
-                if raw_delay is None or divisor != 1.0:
+            raw_milliseconds = headers.get("retry-after-ms")
+            if raw_milliseconds is not None:
+                try:
+                    delay = float(str(raw_milliseconds)) / 1000.0
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if delay >= 0:
+                        return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
+
+            for header in ("retry-after", "x-amz-retry-after"):
+                raw_delay = headers.get(header)
+                if raw_delay is None:
                     continue
                 try:
-                    retry_at = parsedate_to_datetime(str(raw_delay))
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if retry_at.tzinfo is None:
-                    continue
-                delay = max(0.0, retry_at.timestamp() - time.time())
-            if delay >= 0:
-                return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
+                    delay = float(str(raw_delay))
+                except (TypeError, ValueError):
+                    try:
+                        retry_at = parsedate_to_datetime(str(raw_delay))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if retry_at.tzinfo is None:
+                        continue
+                    delay = max(0.0, retry_at.timestamp() - time.time())
+                if delay >= 0:
+                    return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
     return None
 
 
@@ -1272,7 +1283,7 @@ class LLMAnalyzerBase:
                         error_class=_provider_failure_class(exc),
                         reason=(
                             LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _is_provider_failure_for_ledger(exc)
+                            if _provider_retries_exhausted(exc)
                             else LedgerReason.LLM_BATCH_FAILED
                         ),
                     )
@@ -1390,7 +1401,7 @@ class LLMAnalyzerBase:
                         error_class=_provider_failure_class(result),
                         reason=(
                             LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _is_provider_failure_for_ledger(result)
+                            if _provider_retries_exhausted(result)
                             else LedgerReason.LLM_BATCH_FAILED
                         ),
                     )

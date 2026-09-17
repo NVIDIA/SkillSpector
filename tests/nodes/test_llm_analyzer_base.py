@@ -37,7 +37,9 @@ from anthropic import (
 )
 from botocore.exceptions import (
     ClientError,
+    HTTPClientError,
     ProxyConnectionError,
+    ResponseStreamingError,
     SSLError,
 )
 from botocore.exceptions import (
@@ -321,12 +323,18 @@ def _status_error(
     status_code: int,
     *,
     retry_after: str | None = None,
+    retry_after_ms: str | None = None,
+    aws_retry_after: str | None = None,
     should_retry: str | None = None,
 ) -> Exception:
     """Build a provider-neutral status exception with an httpx response."""
     headers = {}
     if retry_after is not None:
         headers["retry-after"] = retry_after
+    if retry_after_ms is not None:
+        headers["retry-after-ms"] = retry_after_ms
+    if aws_retry_after is not None:
+        headers["x-amz-retry-after"] = aws_retry_after
     if should_retry is not None:
         headers["x-should-retry"] = should_retry
     response = _http_response(status_code, headers=headers)
@@ -369,11 +377,15 @@ class TestTransientProviderErrors:
             AnthropicAPITimeoutError(httpx.Request("POST", "https://provider.test/v1/chat")),
             BotocoreConnectionError(error="connection reset"),
             ProxyConnectionError(proxy_url="https://proxy.test"),
+            HTTPClientError(error="connection reset"),
+            ResponseStreamingError(error="stream interrupted"),
             SSLError(endpoint_url="https://bedrock.test", error="TLS handshake failed"),
             _status_error(408),
             _status_error(429),
             _status_error(503),
             _bedrock_error("ThrottlingException"),
+            _bedrock_error("RequestTimeout"),
+            _bedrock_error("RequestTimeoutException"),
             _bedrock_error("ServiceUnavailableException"),
         ],
     )
@@ -413,6 +425,26 @@ class TestTransientProviderErrors:
 
     def test_uses_provider_retry_after_for_http_responses(self) -> None:
         assert _provider_retry_delay(_status_error(429, retry_after="12.5"), 0) == 12.5
+
+    def test_prefers_retry_after_milliseconds_over_seconds(self) -> None:
+        error = _status_error(429, retry_after="10", retry_after_ms="60000")
+
+        assert _provider_retry_delay(error, 0) == 60.0
+
+    def test_malformed_retry_after_milliseconds_falls_back_to_seconds(self) -> None:
+        error = _status_error(429, retry_after="12.5", retry_after_ms="invalid")
+
+        assert _provider_retry_delay(error, 0) == 12.5
+
+    def test_malformed_standard_hints_fall_back_to_aws_header(self) -> None:
+        error = _status_error(
+            429,
+            retry_after="invalid",
+            retry_after_ms="invalid",
+            aws_retry_after="7",
+        )
+
+        assert _provider_retry_delay(error, 0) == 7.0
 
     def test_uses_http_date_retry_after(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("skillspector.llm_analyzer_base.time.time", lambda: 0.0)
@@ -972,6 +1004,32 @@ class TestRunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_botocore_standard_transients_use_full_coordinator_budget(
+        self, sleep: MagicMock
+    ) -> None:
+        errors = [
+            HTTPClientError(error="connection reset"),
+            ResponseStreamingError(error="stream interrupted"),
+            _bedrock_error("RequestTimeout"),
+            _bedrock_error("RequestTimeoutException"),
+        ]
+
+        for error in errors:
+            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+            analyzer._structured_llm.invoke = MagicMock(side_effect=error)
+
+            outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+            assert outcome.successful == []
+            assert [failure.reason for failure in outcome.failures] == [
+                LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+            ]
+            assert analyzer._structured_llm.invoke.call_count == API_CONNECTION_MAX_RETRIES + 1
+            assert sleep.call_args_list == [((0.5,), {}), ((1.0,), {}), ((2.0,), {})]
+            sleep.reset_mock()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
     def test_internal_server_error_recovers_with_bounded_backoff(self, sleep: MagicMock) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.invoke = MagicMock(
@@ -1009,7 +1067,7 @@ class TestRunBatches:
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
-    def test_provider_no_retry_override_retains_service_failure_classification(
+    def test_provider_no_retry_override_uses_generic_failure_ledger_reason(
         self, sleep: MagicMock
     ) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
@@ -1025,8 +1083,11 @@ class TestRunBatches:
         analyzer._structured_llm.invoke.assert_called_once()
         sleep.assert_not_called()
         assert [(failure.error_class, failure.reason) for failure in outcome.failures] == [
-            ("InternalServerError", LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED)
+            ("InternalServerError", LedgerReason.LLM_BATCH_FAILED)
         ]
+        events, status = ledger_events_for_batches("semantic_test", outcome)
+        assert events[0]["reason_code"] is LedgerReason.LLM_BATCH_FAILED
+        assert status["status"] == "failed"
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
@@ -1541,6 +1602,58 @@ class TestARunBatches:
         assert outcome.failures == []
         assert analyzer._structured_llm.ainvoke.call_count == 2
         sleep.assert_awaited_once_with(0.5)
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_botocore_standard_transients_use_full_coordinator_budget(
+        self, sleep: AsyncMock
+    ) -> None:
+        errors = [
+            HTTPClientError(error="connection reset"),
+            ResponseStreamingError(error="stream interrupted"),
+            _bedrock_error("RequestTimeout"),
+            _bedrock_error("RequestTimeoutException"),
+        ]
+
+        for error in errors:
+            analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+            analyzer._structured_llm.ainvoke = AsyncMock(side_effect=error)
+
+            outcome = await analyzer.arun_batches_detailed(
+                [Batch(file_path="a.py", content="code")]
+            )
+
+            assert outcome.successful == []
+            assert [failure.reason for failure in outcome.failures] == [
+                LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+            ]
+            assert analyzer._structured_llm.ainvoke.call_count == API_CONNECTION_MAX_RETRIES + 1
+            assert sleep.await_args_list == [((0.5,), {}), ((1.0,), {}), ((2.0,), {})]
+            sleep.reset_mock()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_provider_no_retry_override_uses_generic_failure_ledger_reason(
+        self, sleep: AsyncMock
+    ) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        error = OpenAIInternalServerError(
+            "provider detail",
+            response=_http_response(503, headers={"x-should-retry": "false"}),
+            body=None,
+        )
+        analyzer._structured_llm.ainvoke = AsyncMock(side_effect=error)
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        analyzer._structured_llm.ainvoke.assert_awaited_once()
+        sleep.assert_not_awaited()
+        assert [(failure.error_class, failure.reason) for failure in outcome.failures] == [
+            ("InternalServerError", LedgerReason.LLM_BATCH_FAILED)
+        ]
+        events, status = ledger_events_for_batches("semantic_test", outcome)
+        assert events[0]["reason_code"] is LedgerReason.LLM_BATCH_FAILED
+        assert status["status"] == "failed"
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
