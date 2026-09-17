@@ -268,6 +268,23 @@ def test_pep263_python_source_is_strictly_decoded_and_analyzed(tmp_path) -> None
     )
 
 
+def test_truncated_pep263_python_preserves_exact_provider_text_and_audit_gap(
+    tmp_path, monkeypatch
+) -> None:
+    """A bounded provider view keeps the exact Python decode and truncation marker."""
+    filename = "script.py"
+    raw = ("# coding: latin-1\n# café\nvalue = 'bounded'\n" + "x" * 256 + "\n").encode("latin-1")
+    (tmp_path / filename).write_bytes(raw)
+    monkeypatch.setattr(build_context_module, "MAX_ANALYZABLE_FILE_BYTES", 64)
+
+    state = build_context({"skill_path": str(tmp_path)})
+    provider_text = state["llm_file_cache"][filename]
+
+    assert "café" in provider_text
+    assert "audit" in provider_text
+    assert "gap" in provider_text
+
+
 @pytest.mark.parametrize(
     ("filename", "raw", "decoded_marker"),
     [
