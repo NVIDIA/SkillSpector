@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from itertools import chain
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, TypedDict
 
 import httpx
@@ -366,7 +368,13 @@ def _dict_payload(payload: object, *, source: str) -> dict[str, Any]:
 
 
 def _load_local_registry(path: Path) -> dict[str, Any]:
-    with path.open("rb") as source_file:
+    with open(
+        path,
+        "rb",
+        opener=lambda path, flags: os.open(path, flags | getattr(os, "O_NONBLOCK", 0)),
+    ) as source_file:
+        if not S_ISREG(os.fstat(source_file.fileno()).st_mode):
+            raise ValueError(f"Registry input must be a regular file: {path}")
         raw = source_file.read(MAX_REGISTRY_BYTES + 1)
     if len(raw) > MAX_REGISTRY_BYTES:
         raise ValueError(f"input exceeds {MAX_REGISTRY_BYTES} bytes")

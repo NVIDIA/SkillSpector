@@ -4,7 +4,10 @@
 """Tests for the MCP Registry owner and posture checks."""
 
 import json
-from io import BytesIO
+import os
+import subprocess
+import sys
+from io import BufferedReader
 from pathlib import Path
 from typing import Any
 
@@ -427,11 +430,11 @@ def test_local_registry_bounds_read_before_parsing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     capture = tmp_path / "registry.json"
-    capture.touch()
+    capture.write_bytes(b" " * 64)
     monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", 32, raising=False)
     read_sizes: list[int] = []
 
-    class Source(BytesIO):
+    class Source(BufferedReader):
         def read(self, size: int = -1) -> bytes:
             read_sizes.append(size)
             return super().read(size)
@@ -439,11 +442,62 @@ def test_local_registry_bounds_read_before_parsing(
     def unexpected_parse(*args: Any, **kwargs: Any) -> None:
         pytest.fail("oversized JSON must be rejected before parsing")
 
-    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: Source(b" " * 64))
+    monkeypatch.setattr(
+        mcp_registry,
+        "open",
+        lambda *args, **kwargs: Source(open(*args, **kwargs, buffering=0)),
+        raising=False,
+    )
     monkeypatch.setattr(mcp_registry.json, "loads", unexpected_parse)
     with pytest.raises(ValueError, match="MCP Registry source failed.*exceeds 32 bytes"):
         scan_registry(str(capture))
     assert read_sizes == [33]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_local_registry_rejects_fifo_swap_without_blocking(tmp_path: Path) -> None:
+    capture = tmp_path / "registry.json"
+    capture.write_text('{"servers": []}', encoding="utf-8")
+    # Keep a regressed blocking open contained in a child with a hard timeout.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+from skillspector.mcp_registry import scan_registry
+
+capture = Path(sys.argv[1])
+original_is_file = Path.is_file
+
+def swap_after_check(path):
+    is_file = original_is_file(path)
+    if path == capture and is_file:
+        path.unlink()
+        os.mkfifo(path)
+    return is_file
+
+with patch.object(Path, "is_file", swap_after_check):
+    try:
+        scan_registry(str(capture))
+    except ValueError as exc:
+        assert "MCP Registry source failed" in str(exc), str(exc)
+        assert "regular file" in str(exc), str(exc)
+    else:
+        raise AssertionError("swapped FIFO must be rejected")
+""",
+            str(capture),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_local_registry_accepts_exact_byte_limit(

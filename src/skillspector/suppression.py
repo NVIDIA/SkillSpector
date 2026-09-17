@@ -371,8 +371,12 @@ def baseline_from_dict(data: dict[str, Any]) -> Baseline:
         raise ValueError(f"baseline must be a mapping (got {type(data).__name__})")
 
     version = data.get("version")
-    raw_rules = data.get("rules") or []
-    raw_fingerprints = data.get("fingerprints") or []
+    raw_rules = data.get("rules")
+    raw_fingerprints = data.get("fingerprints")
+    if raw_rules is None:
+        raw_rules = []
+    if raw_fingerprints is None:
+        raw_fingerprints = []
     if not isinstance(raw_rules, list) or not isinstance(raw_fingerprints, list):
         raise ValueError("baseline rules and fingerprints must be lists")
     if len(raw_rules) + len(raw_fingerprints) > MAX_BASELINE_RECORDS:

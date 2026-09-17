@@ -441,6 +441,21 @@ def test_baseline_from_dict_rejects_non_mapping() -> None:
         baseline_from_dict(["not", "a", "mapping"])  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("field", ["rules", "fingerprints"])
+@pytest.mark.parametrize("value", [{}, "", 0, False])
+def test_baseline_from_dict_rejects_falsy_non_list_collections(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match="rules and fingerprints must be lists"):
+        baseline_from_dict({"version": 2, field: value})
+
+
+@pytest.mark.parametrize(
+    "collections",
+    [{}, {"rules": None}, {"fingerprints": None}, {"rules": []}, {"fingerprints": []}],
+)
+def test_baseline_from_dict_accepts_empty_collections(collections: dict[str, object]) -> None:
+    assert baseline_from_dict({"version": 2, **collections}).is_empty()
+
+
 def test_baseline_from_dict_rejects_legacy_v1_fingerprints() -> None:
     with pytest.raises(ValueError, match="Version 1 fingerprints cannot be trusted"):
         baseline_from_dict(
