@@ -56,22 +56,37 @@ _EXECUTABLE_SUFFIXES = frozenset(
         ".bin",
         ".cmd",
         ".com",
+        ".cjs",
+        ".class",
+        ".cts",
         ".dll",
         ".dylib",
         ".exe",
         ".go",
         ".js",
+        ".jsx",
+        ".mjs",
         ".msi",
+        ".mts",
+        ".php",
+        ".php3",
+        ".php4",
+        ".php5",
         ".pl",
+        ".phtml",
         ".ps1",
         ".py",
         ".pyc",
         ".pyo",
         ".rb",
+        ".rake",
         ".rs",
         ".sh",
         ".so",
+        ".svg",
         ".ts",
+        ".tsx",
+        ".wasm",
         ".zsh",
     }
 )
@@ -194,9 +209,10 @@ def _zip64_record_offset(data: bytes, *, locator_offset: int) -> int | None:
     """Resolve a ZIP64 EOCD record, including archives with a prepended stub."""
     if locator_offset < 0 or data[locator_offset : locator_offset + 4] != _ZIP64_LOCATOR_SIGNATURE:
         return None
-    locator_disk, reported_offset, total_disks = struct.unpack_from(
-        "<IQI", data, locator_offset + 4
-    )
+    raw_locator = struct.unpack_from("<IQI", data, locator_offset + 4)
+    locator_disk = int(raw_locator[0])
+    reported_offset = int(raw_locator[1])
+    total_disks = int(raw_locator[2])
     if locator_disk != 0 or total_disks != 1:
         return None
     candidates = [reported_offset]
@@ -208,7 +224,7 @@ def _zip64_record_offset(data: bytes, *, locator_offset: int) -> int | None:
             continue
         if data[offset : offset + 4] != _ZIP64_EOCD_SIGNATURE:
             continue
-        record_size = struct.unpack_from("<Q", data, offset + 4)[0]
+        record_size = int(struct.unpack_from("<Q", data, offset + 4)[0])
         if record_size >= 44 and offset + 12 + record_size <= locator_offset:
             return offset
     return None
@@ -294,8 +310,12 @@ def _count_central_directory_entries(
     return count if offset == directory.end else None
 
 
-def _is_zip_signature(data: bytes) -> bool:
+def is_zip_content(data: bytes) -> bool:
+    """Return whether bytes begin with a supported ZIP-family signature."""
     return data.startswith(_ZIP_SIGNATURES)
+
+
+_is_zip_signature = is_zip_content
 
 
 def _is_hidden_path(path: str) -> bool:
@@ -311,7 +331,8 @@ def _container_type(names: list[str]) -> str:
     return "zip"
 
 
-def _expected_container_type(path: str) -> str | None:
+def expected_container_type(path: str) -> str | None:
+    """Return the ZIP-family container type implied by a filename, if any."""
     suffix = Path(path).suffix.lower()
     return next(
         (
@@ -321,6 +342,9 @@ def _expected_container_type(path: str) -> str | None:
         ),
         None,
     )
+
+
+_expected_container_type = expected_container_type
 
 
 def _safe_member_name(name: str) -> str | None:
@@ -345,12 +369,29 @@ def _zip_member_is_link(info: zipfile.ZipInfo) -> bool:
     return bool(mode and stat.S_ISLNK(mode))
 
 
+_BINARY_EXECUTABLE_MAGICS = (
+    b"MZ",
+    b"\x7fELF",
+    b"\x00asm",
+    b"\xfe\xed\xfa",
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
+)
+
+
+def has_binary_executable_magic(data: bytes) -> bool:
+    """Return whether canonical bytes begin with supported executable magic."""
+    return data.startswith(_BINARY_EXECUTABLE_MAGICS)
+
+
 def is_executable_content(path: str, data: bytes, mode: int = 0) -> bool:
     """Classify filesystem and archive content with one static-only policy."""
     suffix = Path(path).suffix.lower()
-    executable_magic = data.startswith(
-        (b"#!", b"MZ", b"\x7fELF", b"\xfe\xed\xfa", b"\xcf\xfa\xed\xfe")
-    )
+    executable_magic = data.startswith(b"#!") or has_binary_executable_magic(data)
     return suffix in _EXECUTABLE_SUFFIXES or executable_magic or bool(mode & 0o111)
 
 
@@ -429,11 +470,14 @@ def _mark_inventory_exception(
     if disposition is None:
         return
     result.inventory_overrides[path] = (disposition, reason.value)
-    for artifact in reversed(result.artifact_inventory):
-        if artifact["path"] == path:
-            artifact["disposition"] = disposition
-            artifact["reason"] = reason.value
-            return
+
+
+def _apply_inventory_overrides(result: NestedInspectionResult) -> None:
+    """Reconcile all exception dispositions in one linear inventory pass."""
+    for artifact in result.artifact_inventory:
+        override = result.inventory_overrides.get(artifact["path"])
+        if override is not None:
+            artifact["disposition"], artifact["reason"] = override
 
 
 def _exception(
@@ -513,19 +557,18 @@ def _add_unreadable_component(
             if reason in _PARTIAL_INVENTORY_REASONS
             else ArtifactDisposition.FAILED
         )
-        result.artifact_inventory.append(
-            {
-                "path": virtual_path,
-                "content_kind": ContentKind.OPAQUE,
-                "disposition": disposition,
-                "size_bytes": max(size_bytes, 0),
-                "decodable": False,
-                "contains_nul": False,
-                "misleading_extension": False,
-                "referenced": False,
-                "reason": reason.value,
-            }
-        )
+        artifact: ArtifactRecord = {
+            "path": virtual_path,
+            "content_kind": ContentKind.OPAQUE,
+            "disposition": disposition,
+            "size_bytes": max(size_bytes, 0),
+            "decodable": False,
+            "contains_nul": False,
+            "misleading_extension": False,
+            "referenced": False,
+            "reason": reason.value,
+        }
+        result.artifact_inventory.append(artifact)
         result.metadata.append(
             {
                 "path": virtual_path,
@@ -948,7 +991,8 @@ def _inspect_zip_bytes(
             result.components.append(virtual_path)
             result.file_cache[virtual_path] = member_data.decode("utf-8", errors="replace")
             result.raw_file_cache[virtual_path] = member_data
-            result.artifact_inventory.append(classify_artifact(virtual_path, member_data))
+            artifact = classify_artifact(virtual_path, member_data)
+            result.artifact_inventory.append(artifact)
             result.metadata.append(
                 {
                     "path": virtual_path,
@@ -1064,7 +1108,7 @@ def inspect_nested_artifacts(
         hidden = _is_hidden_path(path)
 
         supplied = raw_file_cache is not None and path in raw_file_cache
-        if supplied:
+        if raw_file_cache is not None and path in raw_file_cache:
             data = raw_file_cache[path]
             size = len(data)
         else:
@@ -1156,4 +1200,5 @@ def inspect_nested_artifacts(
 
     result.components = list(dict.fromkeys(result.components))
     result.uncompressed_bytes = budget.uncompressed_bytes
+    _apply_inventory_overrides(result)
     return result

@@ -33,12 +33,13 @@ Selection happens via the ``SKILLSPECTOR_PROVIDER`` env var:
     claude_cli        → ClaudeCLIProvider            (local ``claude`` binary, no API key)
     codex_cli         → CodexCLIProvider             (local ``codex`` binary, no API key)
     gemini_cli        → GeminiCLIProvider            (local ``gemini`` binary, no API key)
+    opencode_cli      → OpencodeCLIProvider          (local ``opencode`` binary, no API key)
     antigravity_cli   → AntigravityCLIProvider       (local ``agy`` binary; registered
                                                       but disabled; use gemini_cli)
 
 When unset, the selector defaults to ``nv_build``.
 
-CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) implement the
+CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``, ``opencode_cli``) implement the
 optional :class:`~skillspector.providers.base.AgentCLICapable` interface — they
 expose ``is_available()`` and ``complete()`` so that
 :func:`skillspector.llm_utils.get_chat_model` uses the local CLI subprocess
@@ -151,6 +152,10 @@ def _select_active_provider() -> LLMProvider:
         from .gemini_cli import GeminiCLIProvider
 
         return GeminiCLIProvider()
+    if name == "opencode_cli":
+        from .opencode_cli import OpencodeCLIProvider
+
+        return OpencodeCLIProvider()
     if name == "antigravity_cli":
         from .antigravity_cli import AntigravityCLIProvider
 
@@ -169,7 +174,7 @@ def _select_active_provider() -> LLMProvider:
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
         "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
         "ollama, azure_openai, openai_compatible, "
-        "claude_cli, codex_cli, gemini_cli, antigravity_cli (or unset)."
+        "claude_cli, codex_cli, gemini_cli, opencode_cli, antigravity_cli (or unset)."
     )
 
 
@@ -250,8 +255,9 @@ def create_chat_model_with_provider(
 ) -> tuple[BaseChatModel, LLMProvider]:
     """Create a chat model and return the provider that actually built it.
 
-    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) do not have
-    a native LangChain chat model — callers that need CLI transport should use
+    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    ``opencode_cli``) do not have a native LangChain chat model — callers
+    that need CLI transport should use
     :func:`skillspector.llm_utils.get_chat_model` instead (which returns an
     :class:`~skillspector.llm_utils.AgentCLIChatModel` adapter).
 
