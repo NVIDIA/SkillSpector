@@ -1615,6 +1615,40 @@ def test_recursive_oversized_failed_child_preserves_fatal_aggregate(
     assert "x" * 1_001 not in output.read_text(encoding="utf-8")
 
 
+def test_recursive_postscan_failure_counts_child_once_and_cleans_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failure after scanning replaces, rather than duplicates, child accounting."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    output = tmp_path / "combined.json"
+    child = _bounded_recursive_result("one", finding_count=0)
+    child["report_body"] = ""
+    child["sarif_report"] = {"not_json_serializable": object()}
+    cleaned: list[dict[str, object]] = []
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
+    monkeypatch.setattr(cli, "cleanup_result", lambda result: cleaned.append(result))
+
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+        )
+
+    assert exit_info.value.exit_code == 2
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    completeness = payload["analysis_completeness"]
+    assert payload["skill_count"] == 1
+    assert payload["skills_scanned"] == 1
+    assert payload["skills_output_omitted"] == 0
+    assert completeness["fully_inspected_files"] == 0
+    assert completeness["entirely_uninspected_files"] == 1
+    assert completeness["total_files"] == 1
+    assert sum(result is child for result in cleaned) == 1
+
+
 def test_recursive_over_record_budget_child_preserves_risk_and_exit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3018,6 +3052,46 @@ def test_child_failure_target_text_cannot_exhaust_traversal_by_substring() -> No
     assert traversal.can_scan_more() is True
 
 
+def test_transitive_failed_attempt_consumes_shared_target_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed target attempt still consumes one shared execution slot."""
+    traversal = cli._TransitiveTraversalState(
+        budget=cli._TransitiveBudget(max_targets=1),
+    )
+    attempted_targets: list[str] = []
+
+    def fail_child(*args: object, **kwargs: object) -> dict[str, object]:
+        input_path = kwargs.get("input_path") if kwargs else args[0]
+        attempted_targets.append(str(input_path))
+        raise RuntimeError("TOKEN=private-child-failure")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fail_child)
+    targets = ["https://github.com/org/failed-one", "https://github.com/org/failed-two"]
+    for target in targets:
+        root = {
+            **_mock_graph_result(file_cache={"SKILL.md": target}),
+            "local_file_cache": {"SKILL.md": target},
+        }
+        cli._scan_transitive(
+            initial_result=root,
+            format=cli.FormatChoice.json,
+            no_llm=True,
+            max_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            baseline=None,
+            show_suppressed=False,
+            visited=set(),
+            traversal=traversal,
+        )
+
+    assert attempted_targets == [targets[0]]
+    assert traversal.scanned_targets == 1
+    assert traversal.budget_exhausted is True
+    assert traversal.truncation_reasons[-1] == "target budget 1 reached"
+
+
 @pytest.mark.parametrize(
     ("budget_kwargs", "expected_reason"),
     [
@@ -4305,7 +4379,7 @@ def test_scan_transitive_child_failure_stays_visible_and_fail_closed(monkeypatch
     body = json.loads(merged["report_body"])
     assert merged["temp_dir_for_cleanup"] == "root-temp"
     assert merged["transitive_sources"] == [failed_target]
-    assert merged["transitive_targets_scanned"] == 0
+    assert merged["transitive_targets_scanned"] == 1
     assert merged["transitive_truncated"] is True
     assert merged["transitive_truncation_reasons"] == [
         f"transitive child scan failed for {failed_target}"
@@ -4560,6 +4634,72 @@ def test_transitive_child_exact_failure_survives_pre_cache_ledger_cap(
     assert "analyzer_runtime_error" in reasons
     assert "transitive_child_scan_failed" not in reasons
     assert "unaccounted_work" not in reasons
+
+
+def test_transitive_ledger_cap_preserves_distinct_root_and_child_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ledger cap retains both fatal scopes before completed work."""
+    target = "https://github.com/org/root-and-child-failures"
+    root_events = [
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            analyzer_id="root-analyzer",
+        )
+        for path in ("one.py", "two.py")
+    ]
+    root_events.append(
+        ledger_event(
+            outcome=LedgerOutcome.FAILED,
+            phase="static",
+            path="root-failed.py",
+            analyzer_id="root-analyzer",
+            reason=LedgerReason.READ_ERROR,
+        )
+    )
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}),
+        "components": ["one.py", "two.py", "root-failed.py", "SKILL.md"],
+        "local_file_cache": {"SKILL.md": target},
+        "inspection_ledger": root_events,
+        "analyzer_status_events": [analyzer_status_for_events("root-analyzer", root_events)],
+        "execution_successful": False,
+    }
+    child_event = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        phase="static",
+        path="child-failed.py",
+        analyzer_id="child-analyzer",
+        reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+    )
+    child_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"child-failed.py": "pass\n"}),
+        "components": ["child-failed.py"],
+        "local_file_cache": {"child-failed.py": "pass\n"},
+        "inspection_ledger": [child_event],
+        "analyzer_status_events": [analyzer_status_for_events("child-analyzer", [child_event])],
+        "execution_successful": False,
+    }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", lambda *args, **kwargs: child_result)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=3),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    reasons = {item["reason_code"] for item in body["analysis_completeness"]["ledger_exceptions"]}
+    assert reasons == {"read_error", "analyzer_runtime_error", "output_limit"}
 
 
 @pytest.mark.parametrize("ledger_cap", [1, 2])
