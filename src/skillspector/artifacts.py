@@ -282,9 +282,13 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
 )
 _DEFAULT_IGNORABLE_RUN_PATTERN = re.compile(_DEFAULT_IGNORABLE_PATTERN.pattern + "+")
 _REPEATED_CHARACTER_RUN_PATTERN = re.compile(r"(.)\1+")
-_ASCII_CONFUSABLE_PATTERN = re.compile(
-    "[" + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON) + "]"
-)
+# Membership in a 1,515-code-point class, asked as "does this text contain any".
+# As a regex character class that costs a bounded scan per character against 528
+# disjoint ranges; as a set it is one C-level pass building the text's distinct
+# characters. On 180 KB of ASCII prose the set form is ~230x faster, and the
+# class contains no ASCII code point at all, so ordinary text answers with a
+# single disjointness check.
+_ASCII_CONFUSABLE_CHARS = frozenset(chr(codepoint) for codepoint in ASCII_CONFUSABLE_SKELETON)
 _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "ignore",
     "override",
@@ -464,7 +468,36 @@ def _letter_spacing_gap_signature(gap: str) -> tuple[str, str] | None:
     return ("marked", marker[0])
 
 
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
+def _letter_spacing_run_spans_cached(
+    text: str, require_consistent_separator_class: bool
+) -> tuple[tuple[int, int], ...]:
+    """Materialize the spans once per text so repeat callers reuse them."""
+    return tuple(
+        _letter_spacing_run_spans_uncached(
+            text, require_consistent_separator_class=require_consistent_separator_class
+        )
+    )
+
+
 def _letter_spacing_run_spans(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+    *,
+    require_consistent_separator_class: bool = True,
+) -> Iterator[tuple[int, int]]:
+    """Yield maximal runs of six or more separator-delimited single letters."""
+    if check_runtime is None:
+        yield from _letter_spacing_run_spans_cached(text, require_consistent_separator_class)
+        return
+    yield from _letter_spacing_run_spans_uncached(
+        text,
+        check_runtime,
+        require_consistent_separator_class=require_consistent_separator_class,
+    )
+
+
+def _letter_spacing_run_spans_uncached(
     text: str,
     check_runtime: Callable[[], None] | None = None,
     *,
@@ -1524,6 +1557,13 @@ _ASCII_TOKEN_GAP_CHARS = frozenset(
 # ASCII character outside this class is settled by the table above, so a text
 # built only from them has no gap spans and the per-character walk below is
 # pure overhead.
+# Every token-gap character lies outside printable ASCII and the three ASCII
+# whitespace characters, so the next candidate position can be found in C rather
+# than by stepping through the text one character at a time in Python. The class
+# is a deliberate superset -- an accented letter matches it but is not a gap
+# character -- so each hit is still confirmed by the exact predicate below.
+_TOKEN_GAP_SEEK = re.compile(r"[^\t\n\r\x20-\x7e]")
+
 _TOKEN_GAP_CANDIDATE = re.compile(
     "[^"
     + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
@@ -1550,6 +1590,10 @@ def _token_bridging_gap_spans(
     while offset < len(text):
         if check_runtime is not None and offset % 4096 == 0:
             check_runtime()
+        seek = _TOKEN_GAP_SEEK.search(text, offset)
+        if seek is None:
+            return
+        offset = seek.start()
         if not _is_token_gap_character(text[offset]):
             offset += 1
             continue
@@ -1703,8 +1747,14 @@ def _next_offset(offsets: Iterator[int]) -> int | None:
     return next(offsets, None)
 
 
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
 def normalized_security_view(text: str) -> SecurityTextView:
-    """Build an NFKC/UTS #39 ASCII-skeleton view with compact offsets."""
+    """Build an NFKC/UTS #39 ASCII-skeleton view with compact offsets.
+
+    Memoized: every analyzer reaches this with the same file content. The view
+    is a frozen dataclass and its ``source_offsets`` array is only ever read --
+    sliced, or copied into a fresh array -- so callers can share one instance.
+    """
     output = StringIO()
     offsets = array("I")
     contextual_spans = iter(_normalization_ignored_spans(text))
@@ -1987,7 +2037,7 @@ def _requires_normalized_security_view(text: str) -> bool:
         return True
     if not unicodedata.is_normalized("NFKC", text):
         return True
-    if _ASCII_CONFUSABLE_PATTERN.search(text) is not None:
+    if not _ASCII_CONFUSABLE_CHARS.isdisjoint(text):
         return True
     if text.isprintable():
         return False
