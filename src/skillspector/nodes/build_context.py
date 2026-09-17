@@ -3216,10 +3216,10 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 if classified_artifact is not None:
                     promote_artifact_to_decoded_text(classified_artifact)
                     disposition = classified_artifact.get("disposition")
-                    reason = classified_artifact.get("reason")
+                    artifact_reason = classified_artifact.get("reason")
                     bounded_provider_view = (
                         disposition == ArtifactDisposition.PARTIAL
-                        and reason
+                        and artifact_reason
                         in {
                             LedgerReason.SIZE_LIMIT.value,
                             LedgerReason.TOTAL_BYTES_LIMIT.value,
