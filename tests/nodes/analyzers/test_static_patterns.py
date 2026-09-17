@@ -931,9 +931,7 @@ class TestRunStaticPatternsAgentSnooping:
         result = agent_snooping_module.node(state)
 
         as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
-        assert [finding.matched_text for finding in as3_findings] == [
-            "skills/other-skill/SKILL.md"
-        ]
+        assert [finding.matched_text for finding in as3_findings] == ["skills/other-skill/SKILL.md"]
 
     def test_as3_long_current_skill_path_is_not_snooping(self):
         """Self-reference comparison uses the full path before evidence truncation."""
