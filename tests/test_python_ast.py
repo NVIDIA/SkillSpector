@@ -230,7 +230,10 @@ def test_non_python_env_utilities_remain_non_python(utility: str) -> None:
     assert classify_python_source("runner", content) is PythonSourceClassification.NON_PYTHON
 
 
-@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.skipif(
+    os.name != "posix" or shutil.which("uv") is None,
+    reason="POSIX shebang execution with uv is unavailable",
+)
 @pytest.mark.parametrize("selector", ["-s", "--script", "--gui-script"])
 def test_real_uv_script_launcher_executes_extensionless_python(
     tmp_path: Path, selector: str
@@ -287,7 +290,10 @@ def test_real_macos_uv_filesystem_alias_is_classified_ambiguous(tmp_path: Path) 
     assert classify_python_source("runner", content) is PythonSourceClassification.AMBIGUOUS
 
 
-@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.skipif(
+    os.name != "posix" or shutil.which("uv") is None,
+    reason="POSIX shebang execution with uv is unavailable",
+)
 @pytest.mark.parametrize(
     "arguments",
     [
