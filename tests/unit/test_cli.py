@@ -937,6 +937,38 @@ def test_cli_scan_missing_baseline_exits_2(tmp_path: Path) -> None:
     assert "baseline" in result.output.lower()
 
 
+@pytest.mark.parametrize("mode", ["registry", "explicit_baseline", "shipped_baseline"])
+def test_cli_oversized_input_exits_2_without_replacing_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    from skillspector import mcp_registry, suppression
+
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# A simple skill\n", encoding="utf-8")
+    output = tmp_path / "report.json"
+    output.write_text("previous report", encoding="utf-8")
+    if mode == "registry":
+        source = tmp_path / "registry.json"
+        source.write_text('{"servers": []}', encoding="utf-8")
+        monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_BYTES", 8, raising=False)
+        args = ["scan", str(source), "--mcp-registry"]
+    else:
+        source = skill / ".skillspector-baseline.yaml"
+        source.write_text("version: 2\nrules: []\n", encoding="utf-8")
+        monkeypatch.setattr(suppression, "MAX_BASELINE_BYTES", 8, raising=False)
+        args = ["scan", str(skill), "--no-llm"]
+        args += (
+            ["--baseline", str(source)]
+            if mode == "explicit_baseline"
+            else ["--use-shipped-baseline"]
+        )
+    result = runner.invoke(app, [*args, "--format", "json", "--output", str(output)])
+    assert result.exit_code == 2
+    assert "exceeds" in result.output
+    assert output.read_text(encoding="utf-8") == "previous report"
+
+
 def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     """`baseline` writes a file; scanning with it suppresses those findings."""
     skill = tmp_path / "skill"
