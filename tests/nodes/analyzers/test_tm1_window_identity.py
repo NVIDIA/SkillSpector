@@ -138,6 +138,33 @@ def test_long_direct_calls_with_shared_preview_keep_distinct_identity() -> None:
     assert findings[0].fingerprint() != findings[1].fingerprint()
 
 
+def test_long_shared_preview_identity_is_cap_stable_and_matches_bound_call(monkeypatch) -> None:
+    payload = "x" * 240
+    direct_source = (
+        f'subprocess.run("{payload}A", shell=True); subprocess.run("{payload}B", shell=True)\n'
+    )
+    bound_source = (
+        "enabled = True\n"
+        f'subprocess.run("{payload}A", shell=enabled); '
+        f'subprocess.run("{payload}B", shell=enabled)\n'
+    )
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    direct_capped = _tm1(direct_source)
+    bound_capped = _tm1(bound_source)
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
+    direct_complete = _tm1(direct_source)
+    bound_complete = _tm1(bound_source)
+
+    assert len(direct_capped) == len(bound_capped) == 1
+    assert len(direct_complete) == len(bound_complete) == 2
+    assert direct_capped[0].fingerprint() == direct_complete[0].fingerprint()
+    assert bound_capped[0].fingerprint() == bound_complete[0].fingerprint()
+    assert [finding.fingerprint() for finding in direct_complete] == [
+        finding.fingerprint() for finding in bound_complete
+    ]
+
+
 def test_output_cap_keeps_first_mixed_owner_in_source_order(monkeypatch) -> None:
     monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
     result = _run(
@@ -149,6 +176,21 @@ def test_output_cap_keeps_first_mixed_owner_in_source_order(monkeypatch) -> None
 
     assert [finding.start_line for finding in findings] == [1]
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+
+
+def test_output_cap_orders_bound_and_ordinary_tm1_by_source(monkeypatch) -> None:
+    content = '# --skip-validation\nenabled = True\nsubprocess.run("later", shell=enabled)\n'
+
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 2)
+    complete = _tm1(content)
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    capped_result = _run(content)
+    capped = [finding for finding in capped_result["findings"] if finding.rule_id == "TM1"]
+
+    assert [finding.start_line for finding in complete] == [1, 3]
+    assert [finding.start_line for finding in capped] == [1]
+    assert capped_result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert capped_result["inspection_ledger"][0]["reason_code"] is LedgerReason.OUTPUT_LIMIT
 
 
 @pytest.mark.parametrize("cap", [1, 2])
