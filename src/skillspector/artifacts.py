@@ -391,12 +391,27 @@ def _contains_default_ignorable(text: str) -> bool:
     return _DEFAULT_IGNORABLE_PATTERN.search(text) is not None
 
 
-def _is_unconditionally_ignored(ch: str) -> bool:
+def _compute_unconditionally_ignored(ch: str) -> bool:
     return (
         bool(_IGNORED_ASCII_CONTROL.fullmatch(ch))
         or unicodedata.category(ch) in {"Cf", "Cc"}
         and ch not in _ALLOWED_FORMAT_CHARS
     )
+
+
+# Skill content is overwhelmingly ASCII, and the classification of an ASCII
+# character never changes, so resolve that range once at import instead of
+# paying a regex match plus a unicodedata lookup for every character scanned.
+# The table is derived from the predicate itself, so it cannot drift from it.
+_ASCII_UNCONDITIONALLY_IGNORED = frozenset(
+    ch for ch in map(chr, range(128)) if _compute_unconditionally_ignored(ch)
+)
+
+
+def _is_unconditionally_ignored(ch: str) -> bool:
+    if ch.isascii():
+        return ch in _ASCII_UNCONDITIONALLY_IGNORED
+    return _compute_unconditionally_ignored(ch)
 
 
 def _is_word_character(ch: str) -> bool:
@@ -1472,13 +1487,34 @@ def _letter_spacing_gap_offsets(text: str) -> Iterator[int]:
                 yield offset
 
 
-def _is_token_gap_character(ch: str) -> bool:
+def _compute_token_gap_character(ch: str) -> bool:
     return (
         _is_unconditionally_ignored(ch)
         or is_default_ignorable(ch)
         or _is_non_ascii_separator(ch)
         or ch == "\ufffd"
     )
+
+
+_ASCII_TOKEN_GAP_CHARS = frozenset(
+    ch for ch in map(chr, range(128)) if _compute_token_gap_character(ch)
+)
+
+# Any character that cannot be a token gap need not be examined at all. Every
+# ASCII character outside this class is settled by the table above, so a text
+# built only from them has no gap spans and the per-character walk below is
+# pure overhead.
+_TOKEN_GAP_CANDIDATE = re.compile(
+    "[^"
+    + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
+    + "]"
+)
+
+
+def _is_token_gap_character(ch: str) -> bool:
+    if ch.isascii():
+        return ch in _ASCII_TOKEN_GAP_CHARS
+    return _compute_token_gap_character(ch)
 
 
 def _token_bridging_gap_spans(
@@ -1488,6 +1524,8 @@ def _token_bridging_gap_spans(
     check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield contextual noise runs in one pass without crossing ASCII spaces."""
+    if _TOKEN_GAP_CANDIDATE.search(text) is None:
+        return
     offset = 0
     while offset < len(text):
         if check_runtime is not None and offset % 4096 == 0:
