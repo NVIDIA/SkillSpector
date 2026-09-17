@@ -23,14 +23,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from skillspector.input_handler import (
     ALLOWED_GIT_HOSTS,
     InputHandler,
+    _FileOpenError,
     _open_regular_file_from_windows_handle,
     _open_regular_file_no_follow,
 )
+from skillspector.state import WorkflowResourceBudget
 
 
 def _mock_windows_secure_open(
@@ -40,8 +43,13 @@ def _mock_windows_secure_open(
     handle: int = 1,
     attributes: int = 0,
     final_path: str | None = None,
+    long_names: dict[str, str] | None = None,
 ) -> None:
-    """Install a handle-level Windows open simulation on any platform."""
+    """Install a handle-level Windows open simulation on any platform.
+
+    ``long_names`` stands in for ``GetLongPathNameW``: it maps a path spelled
+    with an 8.3 short component to the long spelling the filesystem aliases.
+    """
 
     def get_file_information(_handle: int, information: object) -> bool:
         information._obj.dwFileAttributes = attributes  # type: ignore[attr-defined]
@@ -52,10 +60,16 @@ def _mock_windows_secure_open(
         buffer.value = opened_path  # type: ignore[attr-defined]
         return len(opened_path)
 
+    def get_long_path_name(path: str, buffer: object, _size: int) -> int:
+        expanded = (long_names or {}).get(path, path)
+        buffer.value = expanded  # type: ignore[attr-defined]
+        return len(expanded)
+
     kernel32 = SimpleNamespace(
         CreateFileW=lambda *_args: handle,
         GetFileInformationByHandle=get_file_information,
         GetFinalPathNameByHandleW=get_final_path,
+        GetLongPathNameW=get_long_path_name,
         CloseHandle=lambda _handle: True,
     )
     msvcrt = SimpleNamespace(open_osfhandle=lambda _handle, _flags: os.open(source, os.O_RDONLY))
@@ -225,8 +239,18 @@ def test_resolve_file_open_failure_does_not_create_temp_dir(tmp_path: Path) -> N
     source = tmp_path / "SKILL.md"
     source.write_text("# Skill", encoding="utf-8")
     handler = InputHandler()
+    denied = OSError("denied")
     try:
-        with patch("skillspector.input_handler.os.open", side_effect=OSError("denied")):
+        # The secure open dispatches on the platform: POSIX goes through os.open,
+        # Windows through the handle-based helper. Deny both so the failure is
+        # injected wherever the test happens to run.
+        with (
+            patch("skillspector.input_handler.os.open", side_effect=denied),
+            patch(
+                "skillspector.input_handler._open_regular_file_from_windows_handle",
+                side_effect=_FileOpenError(source, denied),
+            ),
+        ):
             with pytest.raises(ValueError, match="Could not safely open"):
                 handler.resolve(str(source))
         assert handler.temp_dir_for_cleanup() is None
@@ -305,6 +329,37 @@ def test_windows_no_follow_open_rejects_reparse_point(
 
     with pytest.raises(ValueError, match="Could not safely open"):
         _open_regular_file_from_windows_handle(source)
+
+
+def test_windows_no_follow_open_accepts_a_short_dos_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path spelled with an 8.3 short component opens the entry it aliases."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    short = tmp_path / "SHORTN~1.MD"
+    _mock_windows_secure_open(
+        monkeypatch,
+        source,
+        final_path=str(source),
+        long_names={str(short): str(source)},
+    )
+
+    with _open_regular_file_from_windows_handle(short) as opened:
+        assert opened.read() == b"# Skill"
+
+
+def test_windows_no_follow_open_rejects_an_unresolvable_short_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short name that no longer expands leaves the comparison fail-closed."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    short = tmp_path / "SHORTN~1.MD"
+    _mock_windows_secure_open(monkeypatch, source, final_path=str(source))
+
+    with pytest.raises(ValueError, match="Could not safely open"):
+        _open_regular_file_from_windows_handle(short)
 
 
 def test_windows_no_follow_open_rejects_canonical_path_mismatch(
@@ -419,6 +474,51 @@ def test_resolve_routes_github_python_window_asset_as_direct_file(tmp_path: Path
 
     assert (resolved, source_type) == (tmp_path, "url")
     download.assert_called_once_with(url)
+
+
+@pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "workflow-budget"])
+@pytest.mark.parametrize(
+    ("page_url", "raw_url"),
+    [
+        (
+            "https://github.com/org/repo/blob/main/skills/demo/SKILL.md",
+            "https://raw.githubusercontent.com/org/repo/main/skills/demo/SKILL.md",
+        ),
+        (
+            "https://gitlab.com/group/repo/-/blob/main/skills/demo/SKILL.md",
+            "https://gitlab.com/group/repo/-/raw/main/skills/demo/SKILL.md",
+        ),
+    ],
+    ids=["github", "gitlab"],
+)
+def test_file_page_url_downloads_the_raw_file(
+    monkeypatch: pytest.MonkeyPatch, page_url: str, raw_url: str, budgeted: bool
+) -> None:
+    """A forge's /blob/ file page resolves to the file itself, not its HTML viewer."""
+    skill = b"---\nname: demo\ndescription: demo\n---\n# Demo\n"
+    requested: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if str(request.url) == raw_url:
+            return httpx.Response(200, content=skill, headers={"content-type": "text/plain"})
+        return httpx.Response(200, content=b"<!DOCTYPE html><html></html>")
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "skillspector.input_handler.httpx.Client",
+        lambda *args, **kwargs: real_client(*args, transport=httpx.MockTransport(serve), **kwargs),
+    )
+    monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
+    handler = InputHandler(transitive_budget=WorkflowResourceBudget() if budgeted else None)
+    try:
+        resolved, source_type = handler.resolve(page_url)
+
+        assert source_type == "url"
+        assert requested == [raw_url]
+        assert (resolved / "SKILL.md").read_bytes() == skill
+    finally:
+        handler.cleanup()
 
 
 def test_validate_url_host_scp_extracts_github() -> None:

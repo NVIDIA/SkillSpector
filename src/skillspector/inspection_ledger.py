@@ -57,6 +57,7 @@ class LedgerReason(StrEnum):
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     UNACCOUNTED_WORK = "unaccounted_work"
+    SEMANTIC_RUNTIME_INCOMPLETE = "semantic_runtime_incomplete"
     FINDING_ACCOUNTING_ERROR = "finding_accounting_error"
     DISABLED_BY_CONFIGURATION = "disabled_by_configuration"
     MISSING_CREDENTIALS = "missing_credentials"
@@ -90,6 +91,7 @@ class LedgerReason(StrEnum):
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
+    EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
@@ -119,6 +121,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
+    LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE: (
+        "Requested semantic analysis did not produce complete per-source runtime telemetry."
+    ),
     LedgerReason.FINDING_ACCOUNTING_ERROR: (
         "Finding identity could not be reconciled with completed work."
     ),
@@ -180,6 +185,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.TRAVERSAL_DEPTH_LIMIT: ("Bundle discovery reached its directory-depth limit."),
     LedgerReason.TOTAL_BYTES_LIMIT: "Bundle caching reached its aggregate byte limit.",
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
+    LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
+        "Executable content was inventoried but excluded from content analysis."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
     LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
         "A transitive child scan failed before complete inspection."
@@ -258,6 +266,9 @@ class AnalyzerStatusEvent(TypedDict):
     planned_work: list[PlannedWorkTarget]
     reason_code: NotRequired[LedgerReason]
     message: NotRequired[str]
+    source_url: NotRequired[str]
+    source_identity: NotRequired[str]
+    source_digest: NotRequired[str]
 
 
 class InspectionLedgerException(TypedDict):

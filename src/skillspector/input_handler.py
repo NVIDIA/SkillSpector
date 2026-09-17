@@ -212,6 +212,28 @@ def _is_private_ip(host: str) -> bool:
     return False
 
 
+def _raw_file_url(url: str) -> str:
+    """Point a GitHub or GitLab ``/blob/`` file page at the file's raw bytes.
+
+    Those pages are HTML viewers, so downloading one scans the forge's page
+    markup instead of the file. Every other URL is returned unchanged.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    segments = parsed.path.split("/")
+    # /<owner>/<repo>/blob/<ref>/<path> -> raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>
+    if host == "github.com" and len(segments) > 5 and segments[3] == "blob":
+        raw_path = "/".join(segments[:3] + segments[4:])
+        return parsed._replace(netloc="raw.githubusercontent.com", path=raw_path).geturl()
+    # /<namespace>/<project>/-/blob/<ref>/<path> -> /<namespace>/<project>/-/raw/<ref>/<path>
+    if host == "gitlab.com" and "-" in segments[3:]:
+        marker = segments.index("-", 3)
+        if marker + 3 < len(segments) and segments[marker + 1] == "blob":
+            segments[marker + 1] = "raw"
+            return parsed._replace(path="/".join(segments)).geturl()
+    return url
+
+
 def _root_owned_root_alias(path: Path) -> Path | None:
     """Return a root-owned symlink directly below ``/``, if *path* is one."""
     absolute_path = Path(os.path.abspath(path))
@@ -444,6 +466,41 @@ def _windows_last_error() -> OSError:
     return cast(OSError, ctypes.WinError(ctypes.get_last_error()))  # type: ignore[attr-defined]
 
 
+def _windows_long_path_name(path: str) -> str:
+    """Expand any 8.3 short components of a Windows path to their long form.
+
+    ``GetFinalPathNameByHandleW`` always answers with long components, while the
+    requested path may carry short ones: Windows keeps an 8.3 alias for a
+    directory whose name holds a space, so a profile directory such as
+    ``C:\\Users\\Hoang Pham`` reaches the scanner as ``C:\\Users\\HOANGP~1`` by way
+    of ``%TEMP%``. Comparing the two spellings without expanding them first
+    rejects every file below such a path.
+
+    The short name is an alias the filesystem keeps for one directory entry, so
+    expanding it names that same entry and does not resolve symlinks or
+    junctions; the reparse-point checks around the caller keep their meaning. A
+    path that no longer resolves comes back unchanged, which leaves that caller
+    fail-closed.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    get_long_path_name = kernel32.GetLongPathNameW
+    get_long_path_name.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_long_path_name.restype = wintypes.DWORD
+
+    buffer_size = 260
+    while True:
+        buffer = ctypes.create_unicode_buffer(buffer_size)
+        result = cast(int, get_long_path_name(path, buffer, buffer_size))
+        if result == 0:
+            return path
+        if result < buffer_size:
+            return buffer.value
+        buffer_size = result + 1
+
+
 def _windows_normalized_path(path: str) -> str:
     """Normalize a Windows DOS path for an exact opened-handle comparison."""
     long_path_prefix = "\\\\?\\"
@@ -452,7 +509,8 @@ def _windows_normalized_path(path: str) -> str:
         path = "\\\\" + path[len(long_unc_prefix) :]
     elif path.startswith(long_path_prefix):
         path = path[len(long_path_prefix) :]
-    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    absolute = os.path.normpath(os.path.abspath(path))
+    return os.path.normcase(_windows_long_path_name(absolute))
 
 
 def _close_fd_safely(fd: int) -> None:
@@ -1088,6 +1146,7 @@ class InputHandler:
         partial file produced by a mid-stream breach is removed before
         the exception propagates.
         """
+        url = _raw_file_url(url)
         if self._transitive_budget is not None:
             return self._download_transitive_file(url)
         self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)

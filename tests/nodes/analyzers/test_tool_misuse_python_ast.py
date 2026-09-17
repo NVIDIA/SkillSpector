@@ -2694,7 +2694,7 @@ def test_runtime_exit_reconciles_and_caps_deferred_mixed_findings(monkeypatch) -
         scanned, resource_limit = original_scan_path(*args, **kwargs)
         pattern_modules = args[2]
         if any(getattr(module, "USES_PYTHON_AST", False) for module in pattern_modules):
-            now[0] = 31.0
+            now[0] = tm_module.static_runner.MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT + 1.0
         return scanned, resource_limit
 
     monkeypatch.setattr(tm_module.static_runner, "_scan_path", expire_after_ast)
@@ -4755,7 +4755,7 @@ def test_output_limit_continuity_reconciliation_honors_runtime_deadline(monkeypa
     original = tm_module.reconcile_retained_findings
 
     def expire_before_reconciliation(content, findings, check_runtime, source_context):
-        now[0] = 31.0
+        now[0] = tm_module.static_runner.MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT + 1.0
         return original(content, findings, check_runtime, source_context)
 
     monkeypatch.setattr(
@@ -4859,6 +4859,7 @@ def test_malformed_python_does_not_defer_lexical_output_limit(
         python_ast_cache_key,
         *,
         python_source,
+        source_text,
     ):
         scanned_views.append(view.text)
         return original(
@@ -4868,6 +4869,7 @@ def test_malformed_python_does_not_defer_lexical_output_limit(
             finding_budget,
             python_ast_cache_key,
             python_source=python_source,
+            source_text=source_text,
         )
 
     monkeypatch.setattr(tm_module.static_runner, "_scan_view_windows", record_view)
