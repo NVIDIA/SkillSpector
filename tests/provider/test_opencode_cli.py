@@ -430,7 +430,7 @@ class TestOpencodeDenyAllPolicy:
         markers.mkdir()
         self._write_fake_opencode(binary)
         monkeypatch.setenv("ATTACK_MARKERS", str(markers))
-        monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.31")
+        monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match=f"only for version {_OPENCODE_SUPPORTED_VERSION}"):
