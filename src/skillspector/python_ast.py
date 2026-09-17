@@ -238,9 +238,12 @@ def _is_python_interpreter_filesystem_alias(command: str) -> bool:
     return _PYTHON_INTERPRETER_BASENAME.fullmatch(normalized) is not None
 
 
-def _is_uv_launcher(command: str) -> bool:
+def _is_uv_launcher(command: str, *, allow_filesystem_aliases: bool = False) -> bool:
     """Return whether a command names Astral's Python-capable ``uv`` launcher."""
-    return command.rsplit("/", 1)[-1] == "uv"
+    basename = command.rsplit("/", 1)[-1]
+    if basename == "uv":
+        return True
+    return allow_filesystem_aliases and unicodedata.normalize("NFD", basename).casefold() == "uv"
 
 
 def _is_trusted_env_filesystem_alias(command: str) -> bool:
@@ -1365,7 +1368,10 @@ def _record_source_execution(
             source_path,
             environment_inspect=execution.python_inspect,
         )
-    elif _is_uv_launcher(execution.utility):
+    elif _is_uv_launcher(
+        execution.utility,
+        allow_filesystem_aliases=allow_filesystem_aliases,
+    ):
         executes_script = _uv_arguments_execute_appended_script(execution.arguments)
     else:
         execution_kinds.add(False)

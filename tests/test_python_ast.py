@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -247,6 +248,38 @@ def test_real_uv_script_launcher_executes_extensionless_python(
 
     assert executed.returncode == 0, executed.stderr
     assert marker in executed.stdout
+
+
+def test_real_macos_uv_filesystem_alias_is_classified_ambiguous(tmp_path: Path) -> None:
+    if sys.platform != "darwin":
+        pytest.skip("case-insensitive uv alias proof is macOS-specific")
+    alias_probe = subprocess.run(
+        ["/usr/bin/env", "UV", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if alias_probe.returncode != 0:
+        pytest.skip("this macOS filesystem does not resolve UV to uv")
+
+    source = tmp_path / "runner"
+    marker = "UV_ALIAS_EXECUTED"
+    content = f'#!/usr/bin/env -S UV run --script\nprint("{marker}")\n'
+    source.write_text(content, encoding="utf-8")
+    source.chmod(0o755)
+
+    executed = subprocess.run(
+        [str(source)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert executed.returncode == 0, executed.stderr
+    assert marker in executed.stdout
+    assert classify_python_source("runner", content) is PythonSourceClassification.AMBIGUOUS
 
 
 @pytest.mark.parametrize(
