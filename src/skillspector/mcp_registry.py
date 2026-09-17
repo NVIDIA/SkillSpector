@@ -7,17 +7,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from itertools import chain
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, TypedDict
 
 import httpx
 
 REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
 OFFICIAL_META_KEY = "io.modelcontextprotocol.registry/official"
+MAX_REGISTRY_BYTES = 16 * 1024 * 1024
+MAX_REGISTRY_DEPTH = 64
+MAX_REGISTRY_RECORDS = 10_000
 FILE_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 MUTABLE_VERSION_TAGS = frozenset(
     {
@@ -224,6 +229,24 @@ def normalize_server(
 def normalize_payload(payload: dict[str, Any], *, source: str) -> list[RegistryServerSnapshot]:
     if not isinstance(payload, dict) or not isinstance(payload.get("servers"), list):
         raise ValueError(f"MCP Registry payload from {source} must contain a servers list")
+    # Check the full expansion before constructing any snapshots or findings.
+    records = len(payload["servers"])
+    if records <= MAX_REGISTRY_RECORDS:
+        for entry in payload["servers"]:
+            record = entry.get("server") if isinstance(entry, dict) else None
+            if isinstance(record, dict):
+                records += sum(
+                    len(record[field])
+                    for field in ("packages", "remotes")
+                    if isinstance(record.get(field), list)
+                )
+            if records > MAX_REGISTRY_RECORDS:
+                break
+    if records > MAX_REGISTRY_RECORDS:
+        raise ValueError(
+            f"MCP Registry payload from {source} exceeds {MAX_REGISTRY_RECORDS} records "
+            "(servers, packages, and remotes)"
+        )
     scanned_at = datetime.now(UTC).isoformat()
     return [
         normalize_server(entry, source=source, scanned_at=scanned_at)
@@ -344,14 +367,47 @@ def _dict_payload(payload: object, *, source: str) -> dict[str, Any]:
     return payload
 
 
+def _load_local_registry(path: Path) -> dict[str, Any]:
+    with open(
+        path,
+        "rb",
+        opener=lambda path, flags: os.open(path, flags | getattr(os, "O_NONBLOCK", 0)),
+    ) as source_file:
+        if not S_ISREG(os.fstat(source_file.fileno()).st_mode):
+            raise ValueError(f"Registry input must be a regular file: {path}")
+        raw = source_file.read(MAX_REGISTRY_BYTES + 1)
+    if len(raw) > MAX_REGISTRY_BYTES:
+        raise ValueError(f"input exceeds {MAX_REGISTRY_BYTES} bytes")
+    text = raw.decode("utf-8")
+    # The JSON decoder owns syntax validation; only bound nesting here, while
+    # ignoring delimiters in strings, before its recursive parser runs.
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_REGISTRY_DEPTH:
+                raise ValueError(f"JSON nesting exceeds {MAX_REGISTRY_DEPTH} levels")
+        elif char in "]}":
+            depth -= 1
+    return _dict_payload(json.loads(text), source=str(path))
+
+
 def _load_payload(input_path: str) -> dict[str, Any]:
     source = input_path
     try:
         if Path(input_path).is_file():
-            return _dict_payload(
-                json.loads(Path(input_path).read_text(encoding="utf-8")),
-                source=source,
-            )
+            return _load_local_registry(Path(input_path))
         if input_path.startswith(("http://", "https://")):
             if input_path != REGISTRY_URL:
                 raise ValueError(
@@ -372,7 +428,7 @@ def _load_payload(input_path: str) -> dict[str, Any]:
         # assesses the owner's latest record, not the historical tail.
         latest = [entry for entry in matches if _official_meta(entry).get("isLatest") is True]
         return {"servers": latest or matches}
-    except (OSError, json.JSONDecodeError, httpx.HTTPError, ValueError) as exc:
+    except (OSError, httpx.HTTPError, ValueError, RecursionError) as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("MCP Registry source"):
             raise
         raise ValueError(f"MCP Registry source failed: {source}: {exc}") from exc

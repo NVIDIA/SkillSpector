@@ -58,11 +58,13 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
 import posixpath
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 import yaml
@@ -73,9 +75,70 @@ from skillspector.models import Finding
 logger = get_logger(__name__)
 
 BASELINE_VERSION = 2
+MAX_BASELINE_BYTES = 2 * 1024 * 1024
+MAX_BASELINE_NODES = 100_000
+MAX_BASELINE_DEPTH = 64
+MAX_BASELINE_RECORDS = 10_000
+MAX_BASELINE_SCALAR_CHARS = 64 * 1024
 _FINGERPRINT_SCHEMA = "skillspector-finding-fingerprint-v2"
 _FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_IDENTITY_RE = re.compile(r"external/[0-9a-f]{64}\Z")
+
+
+class _BoundedBaselineLoader(yaml.SafeLoader):
+    """Bound composition and alias expansion before YAML object construction."""
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self._nodes = 0
+        self._depth = 0
+
+    def compose_node(self, parent: object, index: object) -> yaml.Node:
+        self._nodes += 1
+        if self._nodes > MAX_BASELINE_NODES:
+            raise ValueError("baseline exceeds YAML node limit")
+        if self._depth >= MAX_BASELINE_DEPTH:
+            raise ValueError("baseline exceeds YAML depth limit")
+        self._depth += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._depth -= 1
+
+    def construct_document(self, node: yaml.Node) -> Any:
+        nodes = 0
+        characters = 0
+        active: set[int] = set()
+
+        def visit(item: yaml.Node, depth: int) -> None:
+            nonlocal nodes, characters
+            nodes += 1
+            if nodes > MAX_BASELINE_NODES:
+                raise ValueError("baseline exceeds expanded YAML node limit")
+            if depth > MAX_BASELINE_DEPTH:
+                raise ValueError("baseline exceeds expanded YAML depth limit")
+            if id(item) in active:
+                raise ValueError("baseline contains cyclic YAML aliases")
+            if isinstance(item, yaml.ScalarNode):
+                if len(item.value) > MAX_BASELINE_SCALAR_CHARS:
+                    raise ValueError("baseline exceeds YAML scalar character limit")
+                characters += len(item.value)
+                if characters > MAX_BASELINE_BYTES:
+                    raise ValueError("baseline exceeds expanded YAML character limit")
+                return
+            active.add(id(item))
+            children = (
+                (child for pair in item.value for child in pair)
+                if isinstance(item, yaml.MappingNode)
+                else iter(item.value)
+            )
+            for child in children:
+                visit(child, depth + 1)
+            active.remove(id(item))
+
+        # Revisit each alias: counting only unique nodes misses merge amplification.
+        visit(node, 1)
+        return super().construct_document(node)
 
 
 def _has_exact_source_provenance(finding: Finding) -> bool:
@@ -308,7 +371,16 @@ def baseline_from_dict(data: dict[str, Any]) -> Baseline:
         raise ValueError(f"baseline must be a mapping (got {type(data).__name__})")
 
     version = data.get("version")
-    raw_fingerprints = data.get("fingerprints") or []
+    raw_rules = data.get("rules")
+    raw_fingerprints = data.get("fingerprints")
+    if raw_rules is None:
+        raw_rules = []
+    if raw_fingerprints is None:
+        raw_fingerprints = []
+    if not isinstance(raw_rules, list) or not isinstance(raw_fingerprints, list):
+        raise ValueError("baseline rules and fingerprints must be lists")
+    if len(raw_rules) + len(raw_fingerprints) > MAX_BASELINE_RECORDS:
+        raise ValueError(f"baseline exceeds record limit ({MAX_BASELINE_RECORDS})")
     is_legacy_rule_only = version in (None, 1) and not raw_fingerprints
     if version != BASELINE_VERSION and not is_legacy_rule_only:
         migration = (
@@ -328,7 +400,7 @@ def baseline_from_dict(data: dict[str, Any]) -> Baseline:
         )
 
     rules: list[SuppressionRule] = []
-    for raw in data.get("rules") or []:
+    for raw in raw_rules:
         if not isinstance(raw, dict):
             raise ValueError(f"each baseline rule must be a mapping, got: {raw!r}")
         reason = raw.get("reason", "")
@@ -382,10 +454,19 @@ def load_baseline(path: str | Path) -> Baseline:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Baseline file not found: {p}")
-    text = p.read_text(encoding="utf-8")
+    with open(
+        p,
+        "rb",
+        opener=lambda path, flags: os.open(path, flags | getattr(os, "O_NONBLOCK", 0)),
+    ) as source:
+        if not S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError(f"Baseline must be a regular file: {p}")
+        content = source.read(MAX_BASELINE_BYTES + 1)
+    if len(content) > MAX_BASELINE_BYTES:
+        raise ValueError(f"Baseline file exceeds byte limit ({MAX_BASELINE_BYTES}): {p}")
     try:
-        # yaml.safe_load parses JSON too, so a single path handles both formats.
-        data = yaml.safe_load(text) or {}
+        # SafeLoader parses JSON too, so a single path handles both formats.
+        data = yaml.load(content.decode("utf-8"), Loader=_BoundedBaselineLoader) or {}
     except yaml.YAMLError as e:  # pragma: no cover - error path
         raise ValueError(f"Could not parse baseline file {p}: {e}") from e
     return baseline_from_dict(data)
