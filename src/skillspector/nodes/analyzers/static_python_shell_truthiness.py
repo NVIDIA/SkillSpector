@@ -14,7 +14,6 @@ import ast
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from hashlib import sha256
 
 from skillspector.artifacts import (
     normalized_security_prefix,
@@ -46,7 +45,6 @@ _DIRECT_CALL_NAMES = frozenset({"subprocess", "Popen"})
 _DIRECT_CALLEE = re.compile(r"(?:subprocess\.\w+|Popen)", re.IGNORECASE)
 _SHELL_KEYWORD_PREFIX = re.compile(r"shell\s*=\s*", re.IGNORECASE)
 _MAX_CONTEXT_CHARS = 1024
-_MAX_FINGERPRINT_CHARS = 200
 _MAX_DIRECT_NAME_CHARS = len("subprocess") + 1
 
 
@@ -722,8 +720,7 @@ class _Analyzer:
             if function_end is not None and raw_method is not None:
                 canonical_start = function_end - len(raw_method.group("method"))
         raw_canonical = self.content[canonical_start:shell_start] + "True"
-        canonical = normalized_security_prefix(raw_canonical, _MAX_FINGERPRINT_CHARS)
-        normalized = " ".join(canonical.strip().split())
+        canonical = normalized_security_view(raw_canonical).text
         normalized_callee = normalized_security_view(raw_callee).text
         keyword_start = self._source_start(shell_keyword)
         raw_keyword = self.content[keyword_start:shell_start] if keyword_start is not None else ""
@@ -735,7 +732,7 @@ class _Analyzer:
             and _SHELL_KEYWORD_PREFIX.fullmatch(normalized_keyword) is not None
         )
         return (
-            sha256(f"TM1\x1f{normalized}".encode()).hexdigest(),
+            compute_match_fingerprint("TM1", canonical),
             normalization_exposed_direct_spelling,
             canonical_start,
         )

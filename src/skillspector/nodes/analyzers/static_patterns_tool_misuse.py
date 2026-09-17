@@ -3510,9 +3510,12 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
             continue
         reconciled.append(finding)
 
-    coordinate_slots: list[int] = []
-    coordinated: list[tuple[int, int, Finding]] = []
+    source_line_starts = (0, *(match.end() for match in LOGICAL_LINE_BREAK.finditer(content)))
+    tm1_slots: list[int] = []
+    tm1_by_source: list[tuple[int, int, Finding]] = []
     for index, finding in enumerate(reconciled):
+        if finding.rule_id != "TM1":
+            continue
         bound_start = finding.evidence.get(static_python_shell_truthiness.BOUND_CALL_START_EVIDENCE)
         lexical_coordinate = finding.evidence.get(static_runner._ABSOLUTE_START_EVIDENCE)
         source_start = (
@@ -3523,12 +3526,15 @@ def coalesce_path_findings(content: str, findings: list[Finding]) -> list[Findin
             else None
         )
         if source_start is None:
-            continue
-        coordinate_slots.append(index)
-        coordinated.append((source_start, index, finding))
+            line_index = min(max(finding.start_line - 1, 0), len(source_line_starts) - 1)
+            source_start = source_line_starts[line_index]
+            if type(finding.start_column) is int and finding.start_column > 0:
+                source_start += finding.start_column
+        tm1_slots.append(index)
+        tm1_by_source.append((source_start, index, finding))
     for slot, (_, _, finding) in zip(
-        coordinate_slots,
-        sorted(coordinated, key=lambda item: (item[0], item[1])),
+        tm1_slots,
+        sorted(tm1_by_source, key=lambda item: (item[0], item[1])),
         strict=True,
     ):
         reconciled[slot] = finding
