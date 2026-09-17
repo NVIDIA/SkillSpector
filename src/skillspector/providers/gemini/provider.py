@@ -30,11 +30,11 @@ Optional env vars:
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 import threading
 from pathlib import Path
+from time import monotonic
 from typing import ClassVar
 
 import google.auth
@@ -44,8 +44,6 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 from skillspector.providers import registry
 from skillspector.providers.chat_models import create_openai_compatible_chat_model
-
-logger = logging.getLogger(__name__)
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -103,7 +101,38 @@ def _reset_cached_credentials() -> None:
         _CACHED_CREDENTIALS = None
 
 
-def _get_credentials() -> str:
+def _deadline(timeout: float | None) -> float | None:
+    return None if timeout is None else monotonic() + max(0.0, timeout)
+
+
+def _remaining_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Gemini authentication timed out.")
+    return remaining
+
+
+def _bounded_request(deadline: float | None):
+    """Build one ADC request callable that caps HTTP timeouts at *deadline*."""
+    request = Request()
+
+    def call(*args: object, timeout: float | None = 120, **kwargs: object) -> object:
+        remaining = _remaining_seconds(deadline)
+        request_timeout = (
+            timeout
+            if remaining is None
+            else remaining
+            if timeout is None
+            else min(timeout, remaining)
+        )
+        return request(*args, timeout=request_timeout, **kwargs)
+
+    return call
+
+
+def _get_credentials(deadline: float | None) -> str:
     # ponytail: cache ADC credentials and refresh under a lock only when invalid/expired
     global _CACHED_CREDENTIALS
     creds = _CACHED_CREDENTIALS
@@ -112,42 +141,46 @@ def _get_credentials() -> str:
         if token:
             return str(token)
 
-    with _AUTH_LOCK:
+    remaining = _remaining_seconds(deadline)
+    acquired = _AUTH_LOCK.acquire() if remaining is None else _AUTH_LOCK.acquire(timeout=remaining)
+    if not acquired:
+        raise TimeoutError("Gemini authentication timed out waiting for credentials.")
+    try:
+        _remaining_seconds(deadline)
+        request = _bounded_request(deadline)
         if _CACHED_CREDENTIALS is None:
             try:
                 creds, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"], request=request
                 )
                 _CACHED_CREDENTIALS = creds
+            except TimeoutError:
+                raise
             except (DefaultCredentialsError, RefreshError) as exc:
                 raise ValueError(
                     f"Failed to obtain Google Cloud Application Default Credentials: {exc}"
                 ) from exc
             except Exception as exc:
-                logger.debug("Unexpected error obtaining Google Cloud credentials", exc_info=True)
                 raise ValueError(
                     f"Unexpected error obtaining Google Cloud credentials: {exc}"
                 ) from exc
 
         if not _CACHED_CREDENTIALS.valid:
+            _remaining_seconds(deadline)
             try:
-                _CACHED_CREDENTIALS.refresh(Request())
-            except (DefaultCredentialsError, RefreshError) as exc:
-                raise ValueError(
-                    f"Failed to refresh Google Cloud Application Default Credentials: {exc}"
-                ) from exc
-            except Exception as exc:
-                logger.debug("Unexpected error refreshing Google Cloud credentials", exc_info=True)
-                raise ValueError(
-                    f"Unexpected error refreshing Google Cloud credentials: {exc}"
-                ) from exc
+                _CACHED_CREDENTIALS.refresh(request)
+            except TimeoutError:
+                raise
+            except Exception:
+                raise RefreshError("Google Cloud credential refresh failed.") from None
 
+        _remaining_seconds(deadline)
         token = getattr(_CACHED_CREDENTIALS, "token", None)
         if not token:
-            raise ValueError(
-                "Google Cloud Application Default Credentials refresh yielded no access token."
-            )
+            raise RefreshError("Google Cloud credential refresh failed.")
         return str(token)
+    finally:
+        _AUTH_LOCK.release()
 
 
 class GeminiProvider:
@@ -156,13 +189,8 @@ class GeminiProvider:
     DEFAULT_MODEL: ClassVar[str] = "gemini-3.8-flash"
     SLOT_DEFAULTS: ClassVar[dict[str, str]] = {}
 
-    def resolve_credentials(self) -> tuple[str, str | None] | None:
-        """Return ``(access_token, base_url)`` using Google ADC.
-
-        Deliberately raises ``ValueError`` when ``GOOGLE_CLOUD_PROJECT`` is missing or
-        invalid, rather than returning ``None``. This enforces fail-closed behavior so
-        the scan never silently falls back to OpenAI when Gemini was explicitly chosen.
-        """
+    def _resolve_credentials(self, deadline: float | None) -> tuple[str, str | None]:
+        """Resolve Gemini credentials using an already-established deadline."""
         project = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
         if not project:
             raise ValueError(
@@ -172,9 +200,16 @@ class GeminiProvider:
         validate_project_id(project)
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip() or "global"
         validate_location(location)
-        base_url = get_base_url(project, location)
-        token = _get_credentials()
-        return token, base_url
+        return _get_credentials(deadline), get_base_url(project, location)
+
+    def resolve_credentials(self, timeout: float | None = None) -> tuple[str, str | None] | None:
+        """Return ``(access_token, base_url)`` using Google ADC.
+
+        Deliberately raises ``ValueError`` when ``GOOGLE_CLOUD_PROJECT`` is missing or
+        invalid, rather than returning ``None``. This enforces fail-closed behavior so
+        the scan never silently falls back to OpenAI when Gemini was explicitly chosen.
+        """
+        return self._resolve_credentials(_deadline(timeout))
 
     def create_chat_model(
         self,
@@ -185,19 +220,23 @@ class GeminiProvider:
     ) -> BaseChatModel | None:
         """Create ``ChatOpenAI`` for Google Cloud's OpenAI-compatible Gemini endpoint."""
         wire_model = model if model.startswith("google/") else f"google/{model}"
-        credentials = self.resolve_credentials()
+        deadline = _deadline(timeout)
+        credentials = self._resolve_credentials(deadline)
         default_headers: dict[str, str] = {}
         quota_project = getattr(_CACHED_CREDENTIALS, "quota_project_id", None)
         if quota_project:
             default_headers["x-goog-user-project"] = quota_project
 
-        return create_openai_compatible_chat_model(
+        remaining = _remaining_seconds(deadline)
+        chat_model = create_openai_compatible_chat_model(
             model=wire_model,
             credentials=credentials,
             max_tokens=max_tokens,
-            timeout=timeout,
+            timeout=remaining,
             default_headers=default_headers,
         )
+        _remaining_seconds(deadline)
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         bare_model = model.removeprefix("google/")

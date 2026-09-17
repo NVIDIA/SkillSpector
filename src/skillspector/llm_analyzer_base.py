@@ -641,7 +641,14 @@ class LLMAnalyzerBase:
         self._timeout = timeout
         self._dynamic_timeout = callable(timeout)
         self._input_budget = get_max_input_tokens(model)
-        self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        try:
+            self._llm = get_chat_model(model=model, timeout=self._require_time_remaining())
+        except ValueError:
+            raise
+        except Exception:
+            self._require_time_remaining()
+            raise
+        self._require_time_remaining()
         # Native SDK retries cannot re-read a workflow-wide deadline between
         # attempts.  A dynamic deadline therefore uses our explicit retry loop,
         # which checks and caps every retry/backoff against remaining time.
@@ -690,7 +697,14 @@ class LLMAnalyzerBase:
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
-        llm = get_chat_model(model=self.model, timeout=remaining)
+        try:
+            llm = get_chat_model(model=self.model, timeout=remaining)
+        except ValueError:
+            raise
+        except Exception:
+            self._require_time_remaining()
+            raise
+        self._require_time_remaining()
         _uses_native_connection_retries(llm, max_retries=0)
         structured = (
             llm.with_structured_output(self.response_schema) if self.response_schema else None

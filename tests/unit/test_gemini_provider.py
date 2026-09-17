@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import google.auth
 import pytest
@@ -117,7 +118,7 @@ class TestGeminiProvider:
         """2. With project only, location defaults to global and ADC is refreshed."""
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
         creds = MockCredentials(token="refreshed-token", valid=False)
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
 
         provider = GeminiProvider()
         resolved = provider.resolve_credentials()
@@ -135,7 +136,7 @@ class TestGeminiProvider:
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
         monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         creds = MockCredentials(token="token", valid=True)
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
 
         provider = GeminiProvider()
         resolved = provider.resolve_credentials()
@@ -146,17 +147,18 @@ class TestGeminiProvider:
             "https://us-central1-aiplatform.googleapis.com/v1/projects/test-project-123/locations/us-central1/endpoints/openapi"
         )
 
-    def test_missing_token_after_refresh_raises_value_error(
+    def test_missing_token_after_refresh_raises_sanitized_refresh_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """4. Missing token after refresh raises ValueError."""
+        """4. A refresh that yields no token never leaks credential material."""
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
         creds = MockCredentials(token=None, valid=False)
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
 
         provider = GeminiProvider()
-        with pytest.raises(ValueError, match="yielded no access token"):
+        with pytest.raises(RefreshError) as exc_info:
             provider.resolve_credentials()
+        assert str(exc_info.value) == "Google Cloud credential refresh failed."
 
     @pytest.mark.parametrize(
         "invalid_loc",
@@ -216,13 +218,13 @@ class TestGeminiProvider:
         validate_project_id("null-data-123")
         validate_project_id("billing-null-prod")
 
-    def test_default_credentials_error_and_refresh_error_wrapped(
+    def test_default_credentials_error_and_refresh_error_are_classified(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """8. DefaultCredentialsError and RefreshError are wrapped as ValueError."""
+        """8. ADC setup remains config-facing; refresh errors are sanitized."""
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
 
-        def mock_default_err(scopes: list[str]):
+        def mock_default_err(*, scopes: list[str], request: object):
             raise DefaultCredentialsError("ADC not found")
 
         monkeypatch.setattr(google.auth, "default", mock_default_err)
@@ -235,13 +237,116 @@ class TestGeminiProvider:
         creds = MockCredentials(
             token=None,
             valid=False,
-            raise_on_refresh=RefreshError("Token refresh failed"),
+            raise_on_refresh=RefreshError("Token refresh failed: sentinel-secret"),
         )
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
-        with pytest.raises(
-            ValueError, match="Failed to refresh Google Cloud Application Default Credentials"
-        ):
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
+        with pytest.raises(RefreshError) as exc_info:
             GeminiProvider().resolve_credentials()
+        assert str(exc_info.value) == "Google Cloud credential refresh failed."
+        assert "sentinel-secret" not in str(exc_info.value)
+
+    def test_bounded_request_caps_none_timeout_to_remaining_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller's None timeout still respects an active auth deadline."""
+        import skillspector.providers.gemini.provider as gemini_provider
+
+        request = MagicMock()
+
+        monkeypatch.setattr(gemini_provider, "Request", lambda: request)
+        monkeypatch.setattr(gemini_provider, "monotonic", lambda: 10.0)
+
+        gemini_provider._bounded_request(15.0)("https://example.invalid", timeout=None)
+
+        assert request.call_args.kwargs["timeout"] == 5.0
+
+    def test_credentials_skip_adc_when_lock_acquire_exhausts_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A just-in-time lock acquisition cannot start ADC work after expiry."""
+        import skillspector.providers.gemini.provider as gemini_provider
+
+        state = {"now": 0.0, "default_called": False}
+        lock = MagicMock()
+
+        def acquire(timeout: float) -> bool:
+            assert timeout == 10.0
+            state["now"] = 10.0
+            return True
+
+        lock.acquire.side_effect = acquire
+        monkeypatch.setattr(gemini_provider, "_AUTH_LOCK", lock)
+        monkeypatch.setattr(gemini_provider, "monotonic", lambda: state["now"])
+        monkeypatch.setattr(
+            google.auth,
+            "default",
+            lambda **_kwargs: state.__setitem__("default_called", True),
+        )
+
+        with pytest.raises(TimeoutError, match="Gemini authentication timed out"):
+            gemini_provider._get_credentials(10.0)
+
+        assert state == {"now": 10.0, "default_called": False}
+        lock.release.assert_called_once()
+
+    def test_create_chat_model_spends_one_budget_across_auth_and_construction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The auth lock, ADC lookup, refresh request, and model share one timeout."""
+        import skillspector.providers.gemini.provider as gemini_provider
+
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
+        observed: dict[str, object] = {}
+
+        class _Lock:
+            def acquire(self, timeout: float | None = None) -> bool:
+                observed["lock_timeout"] = timeout
+                return True
+
+            def release(self) -> None:
+                return None
+
+            def __enter__(self) -> _Lock:
+                self.acquire()
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                self.release()
+
+        class _Request:
+            def __call__(self, *_args: object, timeout: float = 120, **_kwargs: object) -> object:
+                observed["request_timeout"] = timeout
+                return object()
+
+        class _Credentials(MockCredentials):
+            def refresh(self, request: object) -> None:
+                request("https://token.invalid", timeout=120)  # type: ignore[operator]
+                super().refresh(request)
+
+        creds = _Credentials(token="token", valid=False)
+
+        def _default(*, scopes: list[str], request: object) -> tuple[MockCredentials, str]:
+            observed["default_request"] = request
+            return creds, "test-project-123"
+
+        model_factory = MagicMock(return_value=object())
+        clock = iter(float(i) for i in range(20))
+        monkeypatch.setattr(gemini_provider, "_AUTH_LOCK", _Lock())
+        monkeypatch.setattr(gemini_provider, "Request", _Request)
+        monkeypatch.setattr(gemini_provider, "monotonic", lambda: next(clock), raising=False)
+        monkeypatch.setattr(google.auth, "default", _default)
+        monkeypatch.setattr(gemini_provider, "create_openai_compatible_chat_model", model_factory)
+
+        GeminiProvider().create_chat_model("gemini-3.5-flash", max_tokens=100, timeout=20)
+
+        assert observed["default_request"] is not None
+        assert (
+            20
+            > float(observed["lock_timeout"])
+            > float(observed["request_timeout"])
+            > float(model_factory.call_args.kwargs["timeout"])
+            > 0
+        )
 
     def test_cached_credentials_reused_and_refresh_count(
         self, monkeypatch: pytest.MonkeyPatch
@@ -251,7 +356,7 @@ class TestGeminiProvider:
         creds = MockCredentials(token="initial-token", valid=False)
         auth_default_calls = 0
 
-        def mock_default(scopes: list[str]):
+        def mock_default(*, scopes: list[str], request: object):
             nonlocal auth_default_calls
             auth_default_calls += 1
             return creds, "test-project-123"
@@ -277,7 +382,7 @@ class TestGeminiProvider:
         creds = MockCredentials(token="token", valid=True)
         calls = 0
 
-        def mock_default(scopes: list[str]):
+        def mock_default(*, scopes: list[str], request: object):
             nonlocal calls
             calls += 1
             return creds, "test-project-123"
@@ -294,7 +399,7 @@ class TestGeminiProvider:
         """11. create_chat_model('gemini-3.5-flash') sends google/gemini-3.5-flash to OpenAI-compatible helper."""
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
         creds = MockCredentials(token="token", valid=True)
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
 
         provider = GeminiProvider()
         llm = provider.create_chat_model("gemini-3.5-flash", max_tokens=100)
@@ -309,7 +414,7 @@ class TestGeminiProvider:
         """Explicit quota_project_id from ADC credentials is forwarded in x-goog-user-project."""
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
         creds = MockCredentials(token="token", valid=True, quota_project_id="my-quota-project")
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
 
         provider = GeminiProvider()
         llm = provider.create_chat_model("gemini-3.5-flash", max_tokens=100)
@@ -322,7 +427,7 @@ class TestGeminiProvider:
         """12. Already-prefixed google/gemini-3.5-flash is not double-prefixed."""
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project-123")
         creds = MockCredentials(token="token", valid=True)
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
 
         provider = GeminiProvider()
         llm = provider.create_chat_model("google/gemini-3.5-flash", max_tokens=100)
@@ -370,7 +475,7 @@ class TestGeminiProvider:
         monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
         monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", "medium")
         creds = MockCredentials(token="token", valid=True)
-        monkeypatch.setattr(google.auth, "default", lambda scopes: (creds, "test-project-123"))
+        monkeypatch.setattr(google.auth, "default", lambda **_: (creds, "test-project-123"))
 
         provider = GeminiProvider()
         llm = provider.create_chat_model("gemini-3.5-flash", max_tokens=100)

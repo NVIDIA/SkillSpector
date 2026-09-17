@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1270,6 +1271,45 @@ def _meta_from_json_report(state: SkillspectorState) -> dict:
     return json.loads(report(state)["report_body"])["metadata"]
 
 
+def test_json_report_probes_availability_once_and_reuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float | None] = []
+    monkeypatch.setattr(
+        "skillspector.nodes.report.is_llm_available",
+        lambda *, timeout=120: calls.append(timeout) or (True, None),
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+    }
+
+    assert _meta_from_json_report(state)["llm_available"] is True
+    assert calls == [120]
+
+
+def test_json_report_does_not_probe_after_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skillspector.nodes.report.transitive_remaining_seconds", lambda _state: 0.0
+    )
+    probe = MagicMock(return_value=(True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", probe)
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "llm_call_log": [llm_call_record("semantic_security_discovery", ok=True)],
+    }
+
+    assert _meta_from_json_report(state)["llm_available"] is True
+    probe.assert_not_called()
+
+
 def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm requested + every semantic-analyzer call failed -> llm_degraded True.
 
@@ -1280,7 +1320,7 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     llm_degraded / llm_calls_attempted / llm_calls_succeeded / llm_error.
     """
     # Pre-flight reports available (binary/creds present); the failure is at runtime.
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1312,7 +1352,7 @@ def test_report_degraded_when_some_calls_fail(monkeypatch: pytest.MonkeyPatch) -
     analyzer) while the rest of the fan-out succeeds; that is still a coverage
     gap and must not read as a clean, fully-analyzed scan.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1347,7 +1387,7 @@ def test_report_meta_analysis_applied_survives_other_analyzer_partial_failure(
     one boolean. Matches the reported 3/4 scenario: 3 calls succeed
     (including meta_analyzer), 1 semantic-analyzer batch is dropped.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1380,7 +1420,7 @@ def test_report_meta_analysis_not_applied_when_meta_analyzer_itself_fails(
     This is the other half of the independent-contracts fix: the two fields
     are not blind to meta_analyzer - they just ignore everyone ELSE.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1412,7 +1452,7 @@ def test_report_meta_analysis_not_applied_when_no_meta_analyzer_record(
     llm_available stays True: provider availability is a separate contract
     from whether meta_analyzer had anything to do.
     """
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1430,7 +1470,7 @@ def test_report_meta_analysis_not_applied_when_no_meta_analyzer_record(
 
 def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm True but no LLM calls attempted (e.g. empty skill) -> not degraded."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1449,7 +1489,7 @@ def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) 
 def test_json_report_exposes_only_sanitized_provider_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1493,7 +1533,7 @@ def test_json_report_exposes_only_sanitized_provider_usage(
 
 def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm False -> failures (if any) never mark the scan degraded."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1509,7 +1549,7 @@ def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.Monk
 
 def test_report_terminal_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     """Terminal output surfaces a visible degraded-scan warning."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1526,7 +1566,7 @@ def test_report_terminal_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch)
 
 def test_report_markdown_shows_degraded_warning(monkeypatch: pytest.MonkeyPatch) -> None:
     """Markdown output surfaces a visible degraded-scan warning."""
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     state: SkillspectorState = {
         "filtered_findings": [],
         "component_metadata": [],
@@ -1756,7 +1796,7 @@ def test_unavailable_provider_floors_recommendation_even_with_success_records(
     """Provider truth wins when swallowed batch failures produced false success records."""
     monkeypatch.setattr(
         "skillspector.nodes.report.is_llm_available",
-        lambda: (False, "codex binary not found"),
+        lambda *, timeout=120: (False, "codex binary not found"),
     )
     state: SkillspectorState = {
         "filtered_findings": [],
@@ -1829,7 +1869,7 @@ def test_analyzer_partial_batch_failure_flows_through_to_report_degraded(
     )
     from skillspector.nodes.analyzers.semantic_developer_intent import node as di_node
 
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
 
     def _mock_get_chat_model(*_args: object, **_kwargs: object) -> MagicMock:
         mock_llm = MagicMock()
