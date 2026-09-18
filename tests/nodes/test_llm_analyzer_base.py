@@ -102,6 +102,12 @@ from skillspector.nodes.meta_analyzer import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def maximum_retry_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep retry-policy assertions deterministic at the worst-case delay."""
+    monkeypatch.setattr("skillspector.llm_analyzer_base.uniform", lambda low, high: high)
+
+
 class TestResolveMaxConcurrency:
     def test_unset_uses_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", raising=False)
@@ -424,7 +430,7 @@ class TestTransientProviderErrors:
         assert _provider_failure_class(wrapper) == "InternalServerError"
 
     def test_uses_provider_retry_after_for_http_responses(self) -> None:
-        assert _provider_retry_delay(_status_error(429, retry_after="12.5"), 0) == 12.5
+        assert _provider_retry_delay(_status_error(429, retry_after="12.5"), 0) == 17.5
 
     def test_prefers_retry_after_milliseconds_over_seconds(self) -> None:
         error = _status_error(429, retry_after="10", retry_after_ms="60000")
@@ -434,7 +440,7 @@ class TestTransientProviderErrors:
     def test_malformed_retry_after_milliseconds_falls_back_to_seconds(self) -> None:
         error = _status_error(429, retry_after="12.5", retry_after_ms="invalid")
 
-        assert _provider_retry_delay(error, 0) == 12.5
+        assert _provider_retry_delay(error, 0) == 17.5
 
     def test_malformed_standard_hints_fall_back_to_aws_header(self) -> None:
         error = _status_error(
@@ -444,7 +450,7 @@ class TestTransientProviderErrors:
             aws_retry_after="7",
         )
 
-        assert _provider_retry_delay(error, 0) == 7.0
+        assert _provider_retry_delay(error, 0) == 12.0
 
     def test_uses_http_date_retry_after(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("skillspector.llm_analyzer_base.time.time", lambda: 0.0)
@@ -453,13 +459,13 @@ class TestTransientProviderErrors:
             _provider_retry_delay(
                 _status_error(429, retry_after="Thu, 01 Jan 1970 00:00:12 GMT"), 0
             )
-            == 12.0
+            == 17.0
         )
 
     def test_uses_provider_retry_after_for_bedrock_responses(self) -> None:
         error = _bedrock_error("ThrottlingException", retry_after="7")
 
-        assert _provider_retry_delay(error, 0) == 7.0
+        assert _provider_retry_delay(error, 0) == 12.0
 
     def test_caps_provider_retry_after(self) -> None:
         assert (
@@ -471,6 +477,125 @@ class TestTransientProviderErrors:
         chat_model = type("ChatBedrockConverse", (), {})()
 
         assert not _uses_native_connection_retries(chat_model, max_retries=0)
+
+
+class TestProviderRetryJitter:
+    @pytest.mark.parametrize("status,schedule", [(503, (0.5, 1.0, 2.0)), (429, (5, 15, 30))])
+    @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+    def test_full_jitter_within_each_attempt_budget(
+        self, monkeypatch: pytest.MonkeyPatch, status: int, schedule: tuple, fraction: float
+    ) -> None:
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.uniform",
+            lambda low, high: low + fraction * (high - low),
+        )
+
+        delays = [_provider_retry_delay(_status_error(status), attempt) for attempt in range(3)]
+
+        assert delays == [budget * fraction for budget in schedule]
+
+    @pytest.mark.parametrize("requested", [0.0, 12.0, 59.0, 60.0, 3600.0])
+    @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+    def test_retry_after_is_minimum_and_total_delay_is_capped(
+        self, monkeypatch: pytest.MonkeyPatch, requested: float, fraction: float
+    ) -> None:
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.uniform",
+            lambda low, high: low + fraction * (high - low),
+        )
+        error = _bedrock_error("ThrottlingException", retry_after=str(requested))
+
+        for attempt in range(3):
+            delay = _provider_retry_delay(error, attempt)
+            assert min(requested, PROVIDER_RETRY_AFTER_MAX_SECONDS) <= delay <= 60.0
+            # A hint at the cap leaves no room for jitter without retrying early.
+            if requested >= 60:
+                assert delay == 60.0
+
+    def test_identical_throttling_hints_allow_different_batch_delays(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fractions = iter([0.25, 0.75])
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.uniform",
+            lambda low, high: low + next(fractions) * (high - low),
+        )
+        error = _bedrock_error("ThrottlingException", retry_after="7")
+
+        assert _provider_retry_delay(error, 0) == 8.25
+        assert _provider_retry_delay(error, 0) == 10.75
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("retry_after", [None, "6"])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_retry_loops_use_jitter_and_preserve_attempt_limit(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool, retry_after: str | None
+    ) -> None:
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.uniform", lambda low, high: (low + high) / 2
+        )
+        analyzer = LLMAnalyzerBase(base_prompt="test", model="nvidia/openai/gpt-oss-120b")
+        error = _bedrock_error("ThrottlingException", retry_after=retry_after)
+        batch = Batch(file_path="a.py", content="code")
+        invoke = AsyncMock(side_effect=error) if async_mode else MagicMock(side_effect=error)
+        sleep = AsyncMock() if async_mode else MagicMock()
+        monkeypatch.setattr(analyzer, "_ainvoke_batch" if async_mode else "_invoke_batch", invoke)
+        monkeypatch.setattr(
+            analyzer, "_asleep_before_retry" if async_mode else "_sleep_before_retry", sleep
+        )
+
+        with pytest.raises(ClientError) as caught:
+            if async_mode:
+                await analyzer._ainvoke_batch_with_retries(batch, "test")
+            else:
+                analyzer._invoke_batch_with_retries(batch, "test")
+
+        assert caught.value is error
+        assert invoke.call_count == 4
+        floor = float(retry_after or 0)
+        calls = sleep.await_args_list if async_mode else sleep.call_args_list
+        assert [call.args[0] for call in calls] == [floor + 2.5, floor + 7.5, floor + 15]
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("remaining", [6.0, 8.5, 8.50001])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_retry_loops_respect_deadline_after_jitter(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool, remaining: float
+    ) -> None:
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.uniform", lambda low, high: (low + high) / 2
+        )
+        analyzer = LLMAnalyzerBase(
+            base_prompt="test", model="nvidia/openai/gpt-oss-120b", timeout=lambda: remaining
+        )
+        error = _bedrock_error("ThrottlingException", retry_after="6")
+        batch = Batch(file_path="a.py", content="code")
+        mock_type = AsyncMock if async_mode else MagicMock
+        invoke = mock_type(side_effect=[error, (batch, [])])
+        sleep = mock_type()
+        monkeypatch.setattr(analyzer, "_ainvoke_batch" if async_mode else "_invoke_batch", invoke)
+        monkeypatch.setattr(
+            analyzer, "_asleep_before_retry" if async_mode else "_sleep_before_retry", sleep
+        )
+
+        async def run() -> tuple:
+            if async_mode:
+                return await analyzer._ainvoke_batch_with_retries(batch, "test")
+            return analyzer._invoke_batch_with_retries(batch, "test")
+
+        if remaining <= 8.5:
+            with pytest.raises(ClientError) as caught:
+                await run()
+            assert caught.value is error
+            assert invoke.call_count == 1
+            sleep.assert_not_called()
+        else:
+            assert await run() == (batch, [])
+            assert invoke.call_count == 2
+            if async_mode:
+                sleep.assert_awaited_once_with(8.5)
+            else:
+                sleep.assert_called_once_with(8.5)
 
 
 class _RawTextAnalyzer(LLMAnalyzerBase):
@@ -1671,7 +1796,7 @@ class TestARunBatches:
         assert len(outcome.successful) == 1
         assert outcome.failures == []
         assert analyzer._structured_llm.ainvoke.call_count == 2
-        sleep.assert_awaited_once_with(6.0)
+        sleep.assert_awaited_once_with(11.0)
 
     @patch(MOCK_PATCH_TARGET)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)

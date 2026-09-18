@@ -35,6 +35,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
+from random import uniform
 from typing import Any, Literal, cast
 
 from langchain_anthropic import ChatAnthropic
@@ -349,15 +350,18 @@ def _provider_retry_after_seconds(exc: BaseException) -> float | None:
 
 
 def _provider_retry_delay(exc: BaseException, retries_used: int) -> float:
-    """Combine bounded exponential backoff with a provider Retry-After hint."""
+    """Jitter each retry above the bounded provider-requested minimum delay."""
     schedule = (
         RATE_LIMIT_RETRY_DELAYS_SECONDS
         if _is_rate_limit_provider_error(exc)
         else API_CONNECTION_RETRY_DELAYS_SECONDS
     )
     scheduled = schedule[retries_used]
-    requested = _provider_retry_after_seconds(exc)
-    return max(scheduled, requested) if requested is not None else scheduled
+    minimum = _provider_retry_after_seconds(exc) or 0.0
+    # Full jitter spreads concurrent retries, including when the provider sends
+    # the same Retry-After hint to every batch. Keep the existing total delay cap;
+    # the invocation loops also check this sampled delay against the scan deadline.
+    return uniform(minimum, min(minimum + scheduled, PROVIDER_RETRY_AFTER_MAX_SECONDS))
 
 
 def _uses_native_connection_retries(
