@@ -474,7 +474,7 @@ def test_recursive_scan_exception_marks_combined_execution_as_failed(tmp_path: P
         "skillspector.cli.graph.invoke",
         side_effect=[
             {"report_body": '{"skill": {"name": "one"}}', "risk_score": 0},
-            RuntimeError("child scan crashed"),
+            RuntimeError("TOKEN=child-scan-secret"),
         ],
     ):
         with pytest.raises(typer.Exit) as exit_info:
@@ -490,7 +490,11 @@ def test_recursive_scan_exception_marks_combined_execution_as_failed(tmp_path: P
     assert exit_info.value.exit_code == 2
     payload = json.loads(output.read_text())
     assert payload["execution_successful"] is False
-    assert payload["skills"][1] == {"name": "two", "error": "child scan crashed"}
+    assert payload["skills"][1] == {
+        "name": "two",
+        "error": "A recursive child scan failed before complete inspection.",
+    }
+    assert "TOKEN=child-scan-secret" not in output.read_text()
 
 
 def test_recursive_scan_string_risk_score_counts_toward_exit_code(tmp_path: Path) -> None:
@@ -632,7 +636,11 @@ def test_recursive_dot_child_static_finding_never_reaches_a_provider(
     transports: list[MagicMock] = []
 
     def structured_output(schema: type) -> MagicMock:
-        response = schema(findings=[])
+        response = (
+            schema(is_mismatch=False)
+            if "is_mismatch" in schema.model_fields
+            else schema(findings=[])
+        )
         transport = MagicMock(
             invoke=MagicMock(return_value=response),
             ainvoke=AsyncMock(return_value=response),
@@ -1392,8 +1400,9 @@ def test_scan_multi_skill_json_stdout_survives_child_failure(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["execution_successful"] is False
-    assert payload["skills"][1] == {"name": "broken", "error": "boom"}
-    assert "Error: boom" in captured.err
+    expected_error = "A recursive child scan failed before complete inspection."
+    assert payload["skills"][1] == {"name": "broken", "error": expected_error}
+    assert f"Error: {expected_error}" in captured.err
 
 
 @pytest.mark.parametrize("output_format", ["json", "sarif"])
@@ -1599,6 +1608,229 @@ def test_recursive_json_uses_one_global_public_record_budget(
     }
 
 
+def test_recursive_oversized_failed_child_preserves_fatal_aggregate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A child failure is classified before its oversized body is omitted."""
+    skill = SkillDirectory(tmp_path / "failed", "failed", "failed")
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 1_000)
+    child = {
+        **_bounded_recursive_result("failed", finding_count=0),
+        "report_body": "x" * 1_001,
+        "execution_successful": False,
+        "analysis_completeness": {
+            "is_complete": False,
+            "status": "failed",
+            "execution_successful": False,
+        },
+    }
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
+
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+        )
+
+    assert exit_info.value.exit_code == 2
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["execution_successful"] is False
+    assert payload["risk_recommendation"] == "DO_NOT_INSTALL"
+    assert payload["analysis_completeness"]["status"] == "failed"
+    assert payload["analysis_completeness"]["execution_successful"] is False
+    assert payload["skills_scanned"] == 1
+    assert payload["skills_omitted"] == 0
+    assert payload["skills_output_omitted"] == 1
+    assert "x" * 1_001 not in output.read_text(encoding="utf-8")
+
+
+def test_recursive_postscan_failure_counts_child_once_and_cleans_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failure after scanning replaces, rather than duplicates, child accounting."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    output = tmp_path / "combined.json"
+    child = _bounded_recursive_result("one", finding_count=0)
+    child["report_body"] = ""
+    child["sarif_report"] = {"not_json_serializable": object()}
+    cleaned: list[dict[str, object]] = []
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
+    monkeypatch.setattr(cli, "cleanup_result", lambda result: cleaned.append(result))
+
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+        )
+
+    assert exit_info.value.exit_code == 2
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    completeness = payload["analysis_completeness"]
+    assert payload["skill_count"] == 1
+    assert payload["skills_scanned"] == 1
+    assert payload["skills_output_omitted"] == 0
+    assert completeness["fully_inspected_files"] == 0
+    assert completeness["entirely_uninspected_files"] == 1
+    assert completeness["total_files"] == 1
+    assert sum(result is child for result in cleaned) == 1
+
+
+def test_recursive_over_record_budget_child_preserves_risk_and_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Risk is aggregated before an over-record-budget child body is omitted."""
+    skill = SkillDirectory(tmp_path / "critical", "critical", "critical")
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+    child = {
+        **_bounded_recursive_result("critical", finding_count=2),
+        "risk_score": 100,
+        "risk_severity": "CRITICAL",
+        "risk_recommendation": "DO_NOT_INSTALL",
+    }
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
+
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+        )
+
+    assert exit_info.value.exit_code == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["max_risk_score"] == 100
+    assert payload["risk_recommendation"] == "DO_NOT_INSTALL"
+    assert payload["analysis_completeness"]["is_complete"] is False
+    assert payload["skills_scanned"] == 1
+    assert payload["skills_omitted"] == 0
+    assert payload["skills_output_omitted"] == 1
+    assert payload["skills"][-1] == {
+        "omitted": True,
+        "omitted_count": 1,
+        "reason": "aggregate_output_limit",
+    }
+
+
+@pytest.mark.parametrize(
+    "output_format",
+    list(FormatChoice),
+)
+@pytest.mark.parametrize("cap_kind", ["child-retention", "serialized-output"])
+def test_recursive_non_json_caps_preserve_aggregate_risk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    output_format: FormatChoice,
+    cap_kind: str,
+) -> None:
+    """Omitted child details never erase known high aggregate risk."""
+    relative_path = "critical"
+    child = {
+        **_bounded_recursive_result("critical", finding_count=2),
+        "risk_score": 100,
+        "risk_severity": "CRITICAL",
+        "risk_recommendation": "DO_NOT_INSTALL",
+    }
+    if cap_kind == "child-retention":
+        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+    elif output_format in {FormatChoice.terminal, FormatChoice.markdown}:
+        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 1_000)
+        relative_path = "p" * 400
+        child["report_body"] = "x" * 700
+    elif output_format is FormatChoice.json:
+        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 900)
+        child["report_body"] = json.dumps({"padding": "x" * 700})
+    else:
+        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 1_800)
+        sarif = cast(dict[str, object], child["sarif_report"])
+        runs = cast(list[dict[str, object]], sarif["runs"])
+        runs[0]["properties"] = {"padding": "x" * 2_000}
+
+    skill = SkillDirectory(tmp_path / "critical", "critical", relative_path)
+    output = tmp_path / f"combined.{output_format.value}"
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
+
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+            output_format,
+            output,
+            no_llm=True,
+        )
+
+    assert exit_info.value.exit_code == 1
+    body = output.read_text(encoding="utf-8")
+    if output_format is FormatChoice.json:
+        payload = json.loads(body)
+        assert payload["max_risk_score"] == 100
+        assert payload["risk_severity"] == "CRITICAL"
+        assert payload["risk_recommendation"] == "DO_NOT_INSTALL"
+    elif output_format is FormatChoice.sarif:
+        payload = json.loads(body)
+        validate_sarif_report(payload)
+        aggregate = payload["runs"][-1]["invocations"][0]["properties"]
+        risk = aggregate["riskAssessment"]
+        assert risk == {
+            "maxRiskScore": 100,
+            "severity": "CRITICAL",
+            "recommendation": "DO_NOT_INSTALL",
+        }
+    else:
+        assert "Maximum score: 100/100" in body
+        assert "Severity: CRITICAL" in body
+        # Human-readable report formats follow the single-skill convention.
+        assert "Recommendation: DO NOT INSTALL" in body
+
+
+@pytest.mark.parametrize(
+    "limit_kind",
+    ["public_records", "child_report_characters"],
+)
+def test_recursive_sarif_retention_caps_keep_exact_reason_without_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    limit_kind: str,
+) -> None:
+    """Pre-serialization retention caps are not mislabeled as output limits."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    output = tmp_path / "combined.sarif"
+    child = _bounded_recursive_result(
+        "one",
+        finding_count=2 if limit_kind == "public_records" else 0,
+    )
+    if limit_kind == "public_records":
+        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+        expected = "recursive public finding record budget 1 reached"
+    else:
+        monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_REPORT_CHARACTERS", 2_000)
+        child["report_body"] = "x" * 2_001
+        expected = "recursive report character budget 2000 reached"
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
+
+    cli._scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+        FormatChoice.sarif,
+        output,
+        no_llm=True,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    validate_sarif_report(payload)
+    notifications = payload["runs"][-1]["invocations"][0]["toolExecutionNotifications"]
+    exact = next(item for item in notifications if item["message"]["text"] == expected)
+    assert exact["properties"] == {"kind": "inspection_limitation"}
+    assert not any(
+        item.get("properties", {}).get("reasonCode") == "output_limit" for item in notifications
+    )
+
+
 def test_recursive_markdown_report_character_limit_is_explicit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1699,6 +1931,330 @@ def test_recursive_sarif_is_valid_and_carries_aggregate_completeness(
     assert aggregate_run["properties"]["kind"] == "recursiveAggregate"
     completeness = aggregate_run["invocations"][0]["properties"]["analysisCompleteness"]
     assert completeness["is_complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("status", "reason_code", "level", "execution_successful"),
+    [
+        ("partial", "static_parse_limit", "warning", True),
+        ("failed", "analyzer_runtime_error", "error", False),
+    ],
+)
+def test_recursive_sarif_preserves_intrinsic_child_state_without_output_limit(
+    tmp_path: Path,
+    status: str,
+    reason_code: str,
+    level: str,
+    execution_successful: bool,
+) -> None:
+    """Intrinsic child outcomes remain exact and are not mislabeled as output caps."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    child = _bounded_recursive_result("one", finding_count=0)
+    sarif = cast(dict[str, object], child["sarif_report"])
+    child_run = cast(list[dict[str, object]], sarif["runs"])[0]
+    child_run["invocations"] = [
+        {
+            "executionSuccessful": execution_successful,
+            "toolExecutionNotifications": [
+                {
+                    "message": {"text": f"Exact child {status} reason."},
+                    "level": level,
+                    "properties": {
+                        "kind": "inspection_failure"
+                        if status == "failed"
+                        else "inspection_limitation",
+                        "reasonCode": reason_code,
+                    },
+                }
+            ],
+        }
+    ]
+    completeness = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=0,
+        partial_skills=int(status == "partial"),
+        failed_skills=int(status == "failed"),
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [child], completeness)
+
+    validate_sarif_report(payload)
+    child_notifications = payload["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+    assert child_notifications[0]["properties"]["reasonCode"] == reason_code
+    aggregate = payload["runs"][-1]["invocations"][0]
+    assert aggregate["executionSuccessful"] is execution_successful
+    aggregate_notifications = aggregate["toolExecutionNotifications"]
+    assert not any(
+        item.get("properties", {}).get("reasonCode") == "output_limit"
+        for item in aggregate_notifications
+    )
+    assert "aggregate safety limit" not in json.dumps(aggregate_notifications)
+
+
+def test_recursive_sarif_labels_actual_serialized_output_cap() -> None:
+    """Only a real recursive output bound uses the output-limit reason code."""
+    reason = "recursive serialized report character budget 1800 reached"
+    completeness = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=0,
+        partial_skills=1,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[reason],
+    )
+
+    payload = cli._multi_skill_sarif_report([], [], completeness)
+
+    validate_sarif_report(payload)
+    aggregate = payload["runs"][-1]["invocations"][0]
+    notifications = aggregate["toolExecutionNotifications"]
+    assert notifications == [
+        {
+            "message": {"text": reason},
+            "level": "warning",
+            "properties": {
+                "kind": "inspection_limitation",
+                "reasonCode": "output_limit",
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize("output_format", [FormatChoice.terminal, FormatChoice.markdown])
+def test_recursive_text_report_labels_failed_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    output_format: FormatChoice,
+) -> None:
+    """A failed child is never rendered as merely partial in combined text output."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    child = _bounded_recursive_result("one", finding_count=0)
+    child.update(
+        {
+            "execution_successful": False,
+            "analysis_completeness": {
+                "is_complete": False,
+                "status": "failed",
+                "execution_successful": False,
+            },
+        }
+    )
+    monkeypatch.setattr(cli.graph, "invoke", lambda *_args, **_kwargs: child)
+    output = tmp_path / f"combined.{output_format.value}"
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+            output_format,
+            output,
+            no_llm=True,
+        )
+
+    assert exit_info.value.exit_code == 2
+    body = output.read_text(encoding="utf-8")
+    assert "Status: failed" in body
+    assert "Status: partial" not in body
+    assert "One or more recursive skill scans failed" in body
+
+
+@pytest.mark.parametrize("output_format", list(FormatChoice))
+def test_recursive_no_output_emits_selected_format_with_intrinsic_partial_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    output_format: FormatChoice,
+) -> None:
+    """Without --output, stdout is still the selected bounded recursive report."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    child = _bounded_recursive_result("one", finding_count=0)
+    child_completeness = {
+        "is_complete": False,
+        "status": "partial",
+        "execution_successful": True,
+        "ledger_exceptions": [
+            {
+                "outcome": "partial",
+                "reason_code": "static_parse_limit",
+                "message": "A security expression exceeded its bounded parser span.",
+                "path": "runner",
+            }
+        ],
+    }
+    child["analysis_completeness"] = child_completeness
+    child["risk_recommendation"] = "CAUTION"
+    if output_format is FormatChoice.json:
+        child["report_body"] = json.dumps({"analysis_completeness": child_completeness})
+    elif output_format is FormatChoice.sarif:
+        sarif = cast(dict[str, object], child["sarif_report"])
+        run = cast(list[dict[str, object]], sarif["runs"])[0]
+        run["invocations"] = [
+            {
+                "executionSuccessful": True,
+                "toolExecutionNotifications": [
+                    {
+                        "message": {
+                            "text": "A security expression exceeded its bounded parser span."
+                        },
+                        "level": "warning",
+                        "properties": {
+                            "kind": "inspection_limitation",
+                            "reasonCode": "static_parse_limit",
+                        },
+                    }
+                ],
+            }
+        ]
+        child["report_body"] = json.dumps(sarif)
+    else:
+        child["report_body"] = "A security expression exceeded its bounded parser span."
+
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: child)
+    cli._scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+        output_format,
+        None,
+        no_llm=True,
+    )
+
+    captured = capsys.readouterr()
+    if output_format is FormatChoice.json:
+        payload = json.loads(captured.out)
+        assert payload["analysis_completeness"]["status"] == "partial"
+        assert (
+            payload["skills"][0]["analysis_completeness"]["ledger_exceptions"][0]["reason_code"]
+            == "static_parse_limit"
+        )
+    elif output_format is FormatChoice.sarif:
+        payload = json.loads(captured.out)
+        validate_sarif_report(payload)
+        aggregate = payload["runs"][-1]["invocations"][0]
+        assert aggregate["properties"]["analysisCompleteness"]["status"] == "partial"
+        assert "static_parse_limit" in captured.out
+    else:
+        assert "Recursive Inspection Completeness" in captured.out
+        assert "Status: partial" in captured.out
+        assert "A security expression exceeded its bounded parser span" in captured.out
+    if output_format is not FormatChoice.terminal:
+        assert "Multi-skill directory detected" not in captured.out
+        assert "Multi-skill directory detected" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("output_format", "report_body"),
+    [
+        (FormatChoice.json, "{}"),
+        (FormatChoice.sarif, '{"version":"2.1.0","runs":[]}'),
+        (FormatChoice.markdown, "# Report"),
+    ],
+)
+@pytest.mark.parametrize("warning_kind", ["recursive-empty", "multi-skill"])
+def test_directory_discovery_warnings_do_not_corrupt_machine_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    output_format: FormatChoice,
+    report_body: str,
+    warning_kind: str,
+) -> None:
+    """Directory discovery diagnostics stay off report-only machine stdout."""
+    if warning_kind == "recursive-empty":
+        detection = MultiSkillDetectionResult(
+            is_multi_skill=False,
+            skills=[],
+            has_root_skill=False,
+        )
+        recursive_args = ["--recursive"]
+        expected_warning = "no sub-skills detected"
+    else:
+        detection = MultiSkillDetectionResult(
+            is_multi_skill=True,
+            skills=[
+                SkillDirectory(tmp_path / "one", "one", "one"),
+                SkillDirectory(tmp_path / "two", "two", "two"),
+            ],
+            has_root_skill=False,
+        )
+        recursive_args = []
+        expected_warning = "Found 2 skills"
+
+    monkeypatch.setattr(cli, "detect_skills", lambda _path: detection)
+    monkeypatch.setattr(
+        cli,
+        "_scan_skill",
+        lambda *args, **kwargs: {
+            "report_body": report_body,
+            "execution_successful": True,
+            "risk_score": 0,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            *recursive_args,
+            "--format",
+            output_format.value,
+            "--no-llm",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == report_body + "\n"
+    assert expected_warning not in result.stdout
+    assert expected_warning in result.stderr
+
+
+@pytest.mark.parametrize("output_format", list(FormatChoice))
+@pytest.mark.parametrize("write_file", [False, True], ids=["stdout", "file"])
+def test_recursive_child_exception_is_sanitized_across_public_formats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    output_format: FormatChoice,
+    write_file: bool,
+) -> None:
+    """Recursive child exceptions expose a generic failure, never their payload."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    output = tmp_path / f"combined.{output_format.value}" if write_file else None
+    secret = "TOKEN=secret-child-payload"
+
+    def fail_child(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(cli, "_scan_skill", fail_child)
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=[skill]),
+            output_format,
+            output,
+            no_llm=True,
+        )
+
+    assert exit_info.value.exit_code == 2
+    captured = capsys.readouterr()
+    public = captured.out + captured.err
+    if output is not None:
+        public += output.read_text(encoding="utf-8")
+    assert secret not in public
+    assert "A recursive child scan failed before complete inspection." in public
+    if output_format is FormatChoice.json:
+        report = output.read_text(encoding="utf-8") if output else captured.out
+        payload = json.loads(report)
+        assert payload["execution_successful"] is False
+        assert payload["skills"][0]["error"] == (
+            "A recursive child scan failed before complete inspection."
+        )
+    elif output_format is FormatChoice.sarif:
+        report = output.read_text(encoding="utf-8") if output else captured.out
+        payload = json.loads(report)
+        validate_sarif_report(payload)
+        assert payload["runs"][-1]["invocations"][0]["executionSuccessful"] is False
+    else:
+        report = output.read_text(encoding="utf-8") if output else captured.out
+        assert "Status: failed" in report
 
 
 def test_recursive_sarif_without_output_writes_only_the_log_to_stdout(
@@ -2495,6 +3051,101 @@ def test_transitive_artifact_budget_allows_exact_limit() -> None:
     assert traversal.truncation_reasons == ["artifact budget 2 reached"]
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "inspection ledger budget 1 reached",
+        "analyzer status budget 1 reached",
+        "finding budget 1 reached",
+        "component budget 1 reached",
+        "provider cache budget 1 reached",
+        "report output budget 1 reached",
+    ],
+)
+def test_transitive_retention_limits_do_not_exhaust_execution(reason: str) -> None:
+    """Public storage truncation remains partial without skipping planned work."""
+    traversal = cli._TransitiveTraversalState()
+
+    traversal.note_truncation(reason)
+
+    assert traversal.resource_limit_reached is True
+    assert traversal.budget_exhausted is False
+    assert traversal.can_scan_more() is True
+    assert traversal.truncation_reasons == [reason]
+
+
+def test_child_failure_target_text_cannot_exhaust_traversal_by_substring() -> None:
+    """An untrusted target containing 'budget' cannot control traversal state."""
+    traversal = cli._TransitiveTraversalState()
+
+    traversal.note_child_scan_failure("https://github.com/org/budget")
+
+    assert traversal.budget_exhausted is False
+    assert traversal.can_scan_more() is True
+
+
+def test_transitive_failed_attempt_consumes_shared_target_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed target attempt still consumes one shared execution slot."""
+    traversal = cli._TransitiveTraversalState(
+        budget=cli._TransitiveBudget(max_targets=1),
+    )
+    attempted_targets: list[str] = []
+
+    def fail_child(*args: object, **kwargs: object) -> dict[str, object]:
+        input_path = kwargs.get("input_path") if kwargs else args[0]
+        attempted_targets.append(str(input_path))
+        raise RuntimeError("TOKEN=private-child-failure")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fail_child)
+    targets = ["https://github.com/org/failed-one", "https://github.com/org/failed-two"]
+    for target in targets:
+        root = {
+            **_mock_graph_result(file_cache={"SKILL.md": target}),
+            "local_file_cache": {"SKILL.md": target},
+        }
+        cli._scan_transitive(
+            initial_result=root,
+            format=cli.FormatChoice.json,
+            no_llm=True,
+            max_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            baseline=None,
+            show_suppressed=False,
+            visited=set(),
+            traversal=traversal,
+        )
+
+    assert attempted_targets == [targets[0]]
+    assert traversal.scanned_targets == 1
+    assert traversal.budget_exhausted is True
+    assert traversal.truncation_reasons[-1] == "target budget 1 reached"
+
+
+@pytest.mark.parametrize(
+    ("budget_kwargs", "expected_reason"),
+    [
+        ({"max_targets": 0}, "target budget 0 reached"),
+        ({"max_bytes": 0}, "byte budget 0 reached"),
+        ({"max_artifacts": 0}, "artifact budget 0 reached"),
+        ({"max_seconds": 0.0}, "time budget 0s reached"),
+    ],
+)
+def test_transitive_execution_limits_still_stop_planned_work(
+    budget_kwargs: dict[str, object], expected_reason: str
+) -> None:
+    """Only executable target, byte, artifact, and time ceilings stop traversal."""
+    traversal = cli._TransitiveTraversalState(
+        budget=cli._TransitiveBudget(**budget_kwargs),
+    )
+
+    assert traversal.can_scan_more() is False
+    assert traversal.budget_exhausted is True
+    assert traversal.truncation_reasons == [expected_reason]
+
+
 def test_scan_transitive_depth_one_merges_provenance(tmp_path: Path, monkeypatch) -> None:
     """--transitive-depth 1 follows one approved external target and merges provenance."""
     direct_output = "See dependency: https://github.com/org/transitive.git"
@@ -2801,8 +3452,11 @@ def test_single_and_recursive_transitive_route_through_shared_helper(
     assert len(recursive_calls) == 2
 
 
-def test_transitive_resolver_failure_preserves_direct_report(tmp_path: Path, monkeypatch) -> None:
-    """A transitive resolver failure should preserve the direct report result."""
+@pytest.mark.parametrize("strict", [False, True], ids=["default", "strict"])
+def test_transitive_resolver_failure_preserves_fatal_report(
+    tmp_path: Path, monkeypatch, strict: bool
+) -> None:
+    """A transitive resolver failure writes a sanitized report and exits two."""
     target = "https://github.com/org/broken.git"
     file_cache = {"SKILL.md": f"deps {target}"}
 
@@ -2824,21 +3478,70 @@ def test_transitive_resolver_failure_preserves_direct_report(tmp_path: Path, mon
         raise ValueError("resolver failure")
 
     monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
-    result = runner.invoke(
-        app,
-        [
-            "scan",
-            str(tmp_path),
-            "--format",
-            "json",
-            "--transitive",
-            "--no-llm",
-        ],
-    )
-    assert result.exit_code == 0
+    arguments = [
+        "scan",
+        str(tmp_path),
+        "--format",
+        "json",
+        "--transitive",
+        "--no-llm",
+    ]
+    if strict:
+        arguments.append("--fail-on-incomplete")
+    result = runner.invoke(app, arguments)
+    assert result.exit_code == 2
     data = json.loads(result.output)
     assert len(data["issues"]) == 1
     assert data["issues"][0]["id"] == "D1"
+    assert data["execution_successful"] is False
+    assert data["analysis_completeness"]["status"] == "failed"
+    failures = [
+        item
+        for item in data["analysis_completeness"]["ledger_exceptions"]
+        if item["reason_code"] == "transitive_child_scan_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["fatal"] is True
+    assert failures[0]["path"].startswith("external/")
+    assert target not in failures[0]["path"]
+    assert "resolver failure" not in result.output
+
+
+def test_transitive_resolver_failure_keeps_sarif_stdout_parseable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child warning is diagnostic stderr, never a prefix before SARIF JSON."""
+    target = "https://github.com/org/broken-sarif.git"
+
+    def fake_run_graph_scan(
+        input_path: str,
+        format,
+        no_llm: bool,
+        yara_dir: str | None = None,
+        baseline=None,
+        show_suppressed: bool = False,
+        transitive_traversal=None,
+    ) -> dict[str, object]:
+        if input_path == str(tmp_path):
+            return _mock_graph_result(
+                file_cache={"SKILL.md": target},
+                output_format=format.value,
+            )
+        raise RuntimeError("TOKEN=private-resolver-detail")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fake_run_graph_scan)
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "sarif", "--transitive", "--no-llm"],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    validate_sarif_report(payload)
+    invocation = payload["runs"][0]["invocations"][0]
+    assert invocation["executionSuccessful"] is False
+    assert "TOKEN=private-resolver-detail" not in result.stdout
+    assert "Transitive scan failed" not in result.stdout
 
 
 def test_transitive_failure_warning_stays_off_sarif_stdout(tmp_path: Path, monkeypatch) -> None:
@@ -2860,7 +3563,7 @@ def test_transitive_failure_warning_stays_off_sarif_stdout(tmp_path: Path, monke
         ["scan", str(tmp_path), "--format", "sarif", "--transitive", "--no-llm"],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 2, result.output
     assert "Transitive scan failed" not in result.stdout
     payload = json.loads(result.stdout)
     validate_sarif_report(payload)
@@ -3560,8 +4263,106 @@ def test_scan_transitive_merges_current_effective_finding_ids(monkeypatch) -> No
     assert merged["transitive_finding_count"] == 1
 
 
+@pytest.mark.parametrize("output_format", list(cli.FormatChoice))
+def test_scan_transitive_intrinsic_child_partial_is_not_traversal_truncation(
+    monkeypatch: pytest.MonkeyPatch, output_format: cli.FormatChoice
+) -> None:
+    """A fully traversed partial child keeps its exact cause without a false limit."""
+    target = "https://github.com/org/partial"
+    root_event = ledger_event(
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path="SKILL.md",
+        analyzer_id="root-analyzer",
+    )
+    child_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        path="runner",
+        analyzer_id="child-analyzer",
+        reason=LedgerReason.STATIC_PARSE_LIMIT,
+    )
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}, output_format=output_format.value),
+        "local_file_cache": {"SKILL.md": target},
+        "component_metadata": [
+            {
+                "path": "SKILL.md",
+                "type": "markdown",
+                "lines": 1,
+                "executable": False,
+                "size_bytes": len(target),
+            }
+        ],
+        "inspection_ledger": [root_event],
+        "analyzer_status_events": [analyzer_status_for_events("root-analyzer", [root_event])],
+    }
+    child_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"runner": "pass\n"}, output_format=output_format.value),
+        "components": ["runner"],
+        "local_file_cache": {"runner": "pass\n"},
+        "component_metadata": [
+            {
+                "path": "runner",
+                "type": "other",
+                "lines": 1,
+                "executable": True,
+                "size_bytes": 5,
+            }
+        ],
+        "inspection_ledger": [child_event],
+        "analyzer_status_events": [analyzer_status_for_events("child-analyzer", [child_event])],
+        "analysis_completeness": {
+            "is_complete": False,
+            "status": "partial",
+            "execution_successful": True,
+        },
+        "execution_successful": True,
+    }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", lambda *args, **kwargs: child_result)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=output_format,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    assert merged["transitive_truncated"] is False
+    assert merged["transitive_truncation_reasons"] == []
+    completeness = cast(dict[str, object], merged["analysis_completeness"])
+    assert completeness["is_complete"] is False
+    assert completeness["status"] == "partial"
+    assert completeness["execution_successful"] is True
+    exceptions = cast(list[dict[str, object]], completeness["ledger_exceptions"])
+    assert {item["reason_code"] for item in exceptions} == {"static_parse_limit"}
+    report_body = cast(str, merged["report_body"])
+    assert "Inspection reached its configured output limit." not in report_body
+    assert "Transitive traversal truncated" not in report_body
+    if output_format is cli.FormatChoice.json:
+        payload = json.loads(report_body)
+        assert "transitive_truncated" not in payload["metadata"]
+    elif output_format is cli.FormatChoice.sarif:
+        payload = json.loads(report_body)
+        invocation = payload["runs"][0]["invocations"][0]
+        assert invocation["executionSuccessful"] is True
+        reason_codes = {
+            item["properties"].get("reasonCode")
+            for item in invocation.get("toolExecutionNotifications", [])
+            if item["properties"].get("reasonCode") is not None
+        }
+        assert reason_codes == {"static_parse_limit"}
+    else:
+        assert "bounded static parser's span limit" in report_body
+
+
 def test_scan_transitive_child_failure_stays_visible_and_fail_closed(monkeypatch) -> None:
-    """Child scan exceptions should degrade the report without leaking raw error text."""
+    """Child scan exceptions fail execution without leaking raw error text."""
     failed_target = "https://github.com/org/broken"
     initial_result = {
         "findings": [_finding("D1", "direct finding")],
@@ -3610,13 +4411,16 @@ def test_scan_transitive_child_failure_stays_visible_and_fail_closed(monkeypatch
     body = json.loads(merged["report_body"])
     assert merged["temp_dir_for_cleanup"] == "root-temp"
     assert merged["transitive_sources"] == [failed_target]
-    assert merged["transitive_targets_scanned"] == 0
+    assert merged["transitive_targets_scanned"] == 1
     assert merged["transitive_truncated"] is True
     assert merged["transitive_truncation_reasons"] == [
         f"transitive child scan failed for {failed_target}"
     ]
     assert merged["risk_recommendation"] == "CAUTION"
     assert body["analysis_completeness"]["is_complete"] is False
+    assert body["analysis_completeness"]["status"] == "failed"
+    assert body["analysis_completeness"]["execution_successful"] is False
+    assert merged["execution_successful"] is False
     assert body["metadata"]["transitive_truncated"] is True
     assert any(
         "transitive child scan failed for https://github.com/org/broken" in limitation
@@ -3624,6 +4428,372 @@ def test_scan_transitive_child_failure_stays_visible_and_fail_closed(monkeypatch
     )
     assert "secret token should stay private" not in merged["transitive_truncation_reasons"][0]
     assert "secret token should stay private" not in merged["report_body"]
+    failures = [
+        item
+        for item in body["analysis_completeness"]["ledger_exceptions"]
+        if item["reason_code"] == "transitive_child_scan_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["outcome"] == "failed"
+    assert failures[0]["fatal"] is True
+    assert failures[0]["path"].startswith("external/")
+    assert failed_target not in failures[0]["path"]
+    assert not any(
+        item["reason_code"] == "output_limit"
+        for item in body["analysis_completeness"]["ledger_exceptions"]
+    )
+
+
+def test_scan_transitive_preserves_returned_child_failure_without_synthetic_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact FAILED child ledger row remains the sole fatal diagnostic."""
+    target = "https://github.com/org/failed-result"
+    child_event = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        phase="static",
+        path="runner.py",
+        analyzer_id="child-analyzer",
+        reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+    )
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}),
+        "local_file_cache": {"SKILL.md": target},
+    }
+    child_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"runner.py": "pass\n"}),
+        "components": ["runner.py"],
+        "local_file_cache": {"runner.py": "pass\n"},
+        "inspection_ledger": [child_event],
+        "analyzer_status_events": [analyzer_status_for_events("child-analyzer", [child_event])],
+        "analysis_completeness": {
+            "is_complete": False,
+            "status": "failed",
+            "execution_successful": False,
+        },
+        "execution_successful": False,
+    }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", lambda *args, **kwargs: child_result)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    assert merged["execution_successful"] is False
+    exceptions = body["analysis_completeness"]["ledger_exceptions"]
+    assert [item["reason_code"] for item in exceptions] == ["analyzer_runtime_error"]
+    assert exceptions[0]["fatal"] is True
+    assert not any(item["reason_code"] == "output_limit" for item in exceptions)
+
+
+@pytest.mark.parametrize("ledger_cap", [1, 2])
+def test_transitive_child_failure_survives_shared_ledger_cap(
+    monkeypatch: pytest.MonkeyPatch, ledger_cap: int
+) -> None:
+    """A required fatal row wins over an output sentinel at the smallest caps."""
+    target = "https://github.com/org/capped-failure"
+    root_event = ledger_event(
+        outcome=LedgerOutcome.COMPLETED,
+        phase="static",
+        path="SKILL.md",
+        analyzer_id="root-analyzer",
+    )
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}),
+        "local_file_cache": {"SKILL.md": target},
+        "inspection_ledger": [root_event],
+        "analyzer_status_events": [analyzer_status_for_events("root-analyzer", [root_event])],
+    }
+
+    def fail_child(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("private child error")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fail_child)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=ledger_cap),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    assert merged["execution_successful"] is False
+    exceptions = body["analysis_completeness"]["ledger_exceptions"]
+    assert any(item["reason_code"] == "transitive_child_scan_failed" for item in exceptions)
+    assert not any(item["reason_code"] == "output_limit" for item in exceptions)
+    assert not any(item["reason_code"] == "unaccounted_work" for item in exceptions)
+    assert "private child error" not in merged["report_body"]
+
+
+@pytest.mark.parametrize("ledger_cap", [1, 2])
+def test_transitive_child_failure_runs_after_real_root_ledger_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ledger_cap: int,
+) -> None:
+    """A root output cap cannot prevent planned transitive execution."""
+    target = "https://github.com/org/real-root-capped-failure"
+    (tmp_path / "SKILL.md").write_text(
+        f"---\nname: capped-root\ndescription: Root cap regression\n---\n\n{target}\n",
+        encoding="utf-8",
+    )
+    initial_result = cli._run_graph_scan(
+        input_path=str(tmp_path),
+        format=cli.FormatChoice.json,
+        no_llm=True,
+    )
+    root_ledger = cast(list[dict[str, object]], initial_result["inspection_ledger"])
+    root_statuses = cast(list[dict[str, object]], initial_result["analyzer_status_events"])
+    assert len(root_ledger) > ledger_cap
+    assert len(root_statuses) > ledger_cap
+
+    calls: list[str] = []
+    secret = "TOKEN=private-real-root-child-error"
+
+    def fail_child(*args: object, **kwargs: object) -> dict[str, object]:
+        input_path = kwargs.get("input_path") if kwargs else args[0]
+        calls.append(str(input_path))
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fail_child)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=ledger_cap),
+    )
+
+    assert calls == [target]
+    assert merged["execution_successful"] is False
+    completeness = cast(dict[str, object], merged["analysis_completeness"])
+    assert completeness["status"] == "failed"
+    assert completeness["execution_successful"] is False
+    exceptions = cast(list[dict[str, object]], completeness["ledger_exceptions"])
+    reasons = {str(item["reason_code"]) for item in exceptions}
+    if ledger_cap == 1:
+        assert reasons == {"transitive_child_scan_failed"}
+    else:
+        assert reasons == {"output_limit", "transitive_child_scan_failed"}
+    assert "unaccounted_work" not in reasons
+    assert secret not in cast(str, merged["report_body"])
+
+
+@pytest.mark.parametrize("ledger_cap", [1, 2])
+def test_transitive_child_exact_failure_survives_pre_cache_ledger_cap(
+    monkeypatch: pytest.MonkeyPatch, ledger_cap: int
+) -> None:
+    """Bounding a child ledger cannot replace an available exact fatal reason."""
+    target = "https://github.com/org/exact-capped-failure"
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}),
+        "local_file_cache": {"SKILL.md": target},
+    }
+    child_events = [
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            analyzer_id="child-analyzer",
+        )
+        for path in ("one.py", "two.py")
+    ]
+    child_events.append(
+        ledger_event(
+            outcome=LedgerOutcome.FAILED,
+            phase="static",
+            path="failed.py",
+            analyzer_id="child-analyzer",
+            reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+        )
+    )
+    child_result: dict[str, object] = {
+        **_mock_graph_result(
+            file_cache={"one.py": "pass\n", "two.py": "pass\n", "failed.py": "pass\n"}
+        ),
+        "components": ["one.py", "two.py", "failed.py"],
+        "local_file_cache": {
+            "one.py": "pass\n",
+            "two.py": "pass\n",
+            "failed.py": "pass\n",
+        },
+        "inspection_ledger": child_events,
+        "analyzer_status_events": [analyzer_status_for_events("child-analyzer", child_events)],
+        "analysis_completeness": {
+            "is_complete": False,
+            "status": "failed",
+            "execution_successful": False,
+        },
+        "execution_successful": False,
+    }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", lambda *args, **kwargs: child_result)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=ledger_cap),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    reasons = {item["reason_code"] for item in body["analysis_completeness"]["ledger_exceptions"]}
+    assert "analyzer_runtime_error" in reasons
+    assert "transitive_child_scan_failed" not in reasons
+    assert "unaccounted_work" not in reasons
+
+
+def test_transitive_ledger_cap_preserves_distinct_root_and_child_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ledger cap retains both fatal scopes before completed work."""
+    target = "https://github.com/org/root-and-child-failures"
+    root_events = [
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            analyzer_id="root-analyzer",
+        )
+        for path in ("one.py", "two.py")
+    ]
+    root_events.append(
+        ledger_event(
+            outcome=LedgerOutcome.FAILED,
+            phase="static",
+            path="root-failed.py",
+            analyzer_id="root-analyzer",
+            reason=LedgerReason.READ_ERROR,
+        )
+    )
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}),
+        "components": ["one.py", "two.py", "root-failed.py", "SKILL.md"],
+        "local_file_cache": {"SKILL.md": target},
+        "inspection_ledger": root_events,
+        "analyzer_status_events": [analyzer_status_for_events("root-analyzer", root_events)],
+        "execution_successful": False,
+    }
+    child_event = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        phase="static",
+        path="child-failed.py",
+        analyzer_id="child-analyzer",
+        reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+    )
+    child_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"child-failed.py": "pass\n"}),
+        "components": ["child-failed.py"],
+        "local_file_cache": {"child-failed.py": "pass\n"},
+        "inspection_ledger": [child_event],
+        "analyzer_status_events": [analyzer_status_for_events("child-analyzer", [child_event])],
+        "execution_successful": False,
+    }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", lambda *args, **kwargs: child_result)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=3),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    reasons = {item["reason_code"] for item in body["analysis_completeness"]["ledger_exceptions"]}
+    assert reasons == {"read_error", "analyzer_runtime_error", "output_limit"}
+
+
+@pytest.mark.parametrize("ledger_cap", [1, 2])
+@pytest.mark.parametrize("no_llm", [True, False])
+def test_transitive_root_exact_failure_survives_initial_ledger_cap(
+    ledger_cap: int,
+    no_llm: bool,
+) -> None:
+    """Initialization and late semantic accounting cannot cap away a root fatal fact."""
+    root_events = [
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path="one.py",
+            analyzer_id="root-analyzer",
+        ),
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path="two.py",
+            analyzer_id="root-analyzer",
+        ),
+        ledger_event(
+            outcome=LedgerOutcome.FAILED,
+            phase="static",
+            path="failed.py",
+            analyzer_id="root-analyzer",
+            reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+        ),
+    ]
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={}),
+        "components": ["one.py", "two.py", "failed.py"],
+        "local_file_cache": {},
+        "inspection_ledger": root_events,
+        "analyzer_status_events": [analyzer_status_for_events("root-analyzer", root_events)],
+        "analysis_completeness": {
+            "is_complete": False,
+            "status": "failed",
+            "execution_successful": False,
+        },
+        "execution_successful": False,
+    }
+
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=no_llm,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=ledger_cap),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    reasons = {item["reason_code"] for item in body["analysis_completeness"]["ledger_exceptions"]}
+    assert merged["execution_successful"] is False
+    assert "analyzer_runtime_error" in reasons
+    assert "unaccounted_work" not in reasons
 
 
 def test_scan_transitive_keeps_source_aware_component_coverage(monkeypatch) -> None:
@@ -4456,7 +5626,11 @@ def _mcp_module_missing(d: Path) -> FatalPath:
             "not supported for recursive",
             id="recursive-baseline",
         ),
-        pytest.param(_multi_skill_child_crashes, "child scan crashed", id="multi-skill-child"),
+        pytest.param(
+            _multi_skill_child_crashes,
+            "A recursive child scan failed before complete inspection.",
+            id="multi-skill-child",
+        ),
         pytest.param(_scan_input_missing, "skill vanished", id="scan-input-missing"),
         pytest.param(_scan_crashes, "scan crashed", id="scan-crashes"),
         pytest.param(_scan_crashes_verbose, "RuntimeError", id="scan-crashes-verbose"),
