@@ -95,7 +95,7 @@ _JAVASCRIPT_EXPRESSION_PREFIX_KEYWORDS = frozenset(
 )
 
 # OH1: Unvalidated Output Injection — model output used directly in dangerous sinks
-OH1_PATTERNS = [
+OH1_CODE_PATTERNS = [
     # Python: output piped into exec/eval. Subprocess calls are inspected via AST below.
     (_EXEC_OUTPUT_PATTERN, 0.9),
     (r"eval\s*\(\s*(?:response|output|result|answer|completion|reply|generated)", 0.9),
@@ -112,6 +112,8 @@ OH1_PATTERNS = [
         0.85,
     ),
     (r"f['\"](?:SELECT|INSERT|UPDATE|DELETE)\s+.*?\{(?:response|output|result)", 0.9),
+]
+OH1_PROSE_PATTERNS = [
     # Shell: output in command strings
     (
         r"(?:run|execute|shell)\s+(?:the\s+)?(?:generated|model|llm|ai)\s+(?:output|response|code|command)",
@@ -127,6 +129,7 @@ OH1_PATTERNS = [
         0.8,
     ),
 ]
+OH1_PATTERNS = OH1_CODE_PATTERNS + OH1_PROSE_PATTERNS
 
 # OH2: Cross-Context Output — output from one context used in another
 OH2_PATTERNS = [
@@ -157,12 +160,15 @@ OH2_PATTERNS = [
 ]
 
 # OH3: Unbounded Output — output size or rate not bounded
-OH3_PATTERNS = [
+OH3_CODE_PATTERNS = [
+    (r"max[_-]?tokens?\s*=\s*(?:None|float\s*\(\s*['\"]inf['\"]|math\.inf|999999|1000000)", 0.8),
+    (r"max[_-]?(?:output[_-]?)?length\s*=\s*(?:None|0|-1|float\s*\(\s*['\"]inf)", 0.75),
+]
+OH3_PROSE_PATTERNS = [
     (
         r"(?:no|without|disable)\s+(?:output\s+)?(?:length|size|token)\s+(?:limit|cap|maximum|restriction)",
         0.75,
     ),
-    (r"max[_-]?tokens?\s*=\s*(?:None|float\s*\(\s*['\"]inf['\"]|math\.inf|999999|1000000)", 0.8),
     (
         r"(?:generate|produce|output)\s+(?:as\s+much|unlimited|unbounded|infinite)\s+(?:text|content|output|tokens?)",
         0.8,
@@ -178,8 +184,8 @@ OH3_PATTERNS = [
     ),
     (r"(?:stream|emit)\s+(?:output|tokens?|response)\s+(?:without\s+(?:limit|bound|end))", 0.75),
     (r"(?:flood|spam|fill)\s+(?:the\s+)?(?:output|log|console|terminal|channel)", 0.8),
-    (r"max[_-]?(?:output[_-]?)?length\s*=\s*(?:None|0|-1|float\s*\(\s*['\"]inf)", 0.75),
 ]
+OH3_PATTERNS = OH3_CODE_PATTERNS + OH3_PROSE_PATTERNS
 
 
 def _contains_output_name(node: ast.AST) -> bool:
@@ -625,7 +631,12 @@ def analyze(
     tag = [PatternCategory.OUTPUT_HANDLING.value]
 
     for pattern, confidence in OH1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in OH1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if pattern == _EXEC_OUTPUT_PATTERN and _is_javascript_regexp_literal_exec(
                 content, match, file_path, file_type
             ):
@@ -658,7 +669,9 @@ def analyze(
     findings.extend(subprocess_findings)
 
     for pattern, confidence in OH2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -674,7 +687,12 @@ def analyze(
                 )
             )
     for pattern, confidence in OH3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in OH3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
