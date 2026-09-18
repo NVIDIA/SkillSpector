@@ -349,6 +349,150 @@ def test_cli_fail_on_incomplete_exits_one_after_writing_report(
     assert output.exists()
 
 
+@pytest.mark.parametrize(
+    ("coverage", "threshold", "exit_code"),
+    [(86.9, 87.0, 1), (87.0, 87.0, 0)],
+)
+def test_cli_min_coverage_uses_strict_boundary_and_writes_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    coverage: float,
+    threshold: float,
+    exit_code: int,
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        "skillspector.cli.graph.invoke",
+        lambda state, config: {
+            "report_body": json.dumps({"analysis_completeness": {"coverage_percent": coverage}}),
+            "execution_successful": True,
+            "analysis_completeness": {"coverage_percent": coverage},
+            "risk_score": 0,
+        },
+    )
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--min-coverage",
+            str(threshold),
+        ],
+    )
+    assert result.exit_code == exit_code
+    assert json.loads(output.read_text())["analysis_completeness"]["coverage_percent"] == coverage
+
+
+@pytest.mark.parametrize(
+    ("analysis_completeness", "threshold"),
+    [
+        (None, 87),
+        ({"coverage_percent": None}, 87),
+        ({"coverage_percent": "unknown"}, 87),
+        ({"coverage_percent": True}, 0),
+        ({"coverage_percent": float("nan")}, 0),
+        ({"coverage_percent": float("inf")}, 0),
+    ],
+    ids=["missing", "null", "non-numeric", "boolean", "nan", "infinity"],
+)
+def test_cli_min_coverage_fails_closed_for_malformed_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    analysis_completeness: dict[str, object] | None,
+    threshold: float,
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    graph_result: dict[str, object] = {
+        "report_body": json.dumps(
+            {"analysis_completeness": analysis_completeness}
+            if analysis_completeness is not None
+            else {}
+        ),
+        "execution_successful": True,
+        "risk_score": 0,
+    }
+    if analysis_completeness is not None:
+        graph_result["analysis_completeness"] = analysis_completeness
+    monkeypatch.setattr("skillspector.cli.graph.invoke", lambda state, config: graph_result)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--min-coverage",
+            str(threshold),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert output.exists()
+
+
+@pytest.mark.parametrize("value", ["-1", "101", "nan", "inf"])
+def test_cli_min_coverage_rejects_invalid_values(tmp_path: Path, value: str) -> None:
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    result = runner.invoke(app, ["scan", str(tmp_path), "--min-coverage", value])
+    assert result.exit_code == 2
+    plain_output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    assert "--min-coverage" in plain_output
+
+
+def test_cli_mcp_registry_rejects_min_coverage(tmp_path: Path) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text('{"servers": []}', encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["scan", str(payload), "--mcp-registry", "--min-coverage", "87"],
+    )
+    assert result.exit_code == 2
+    assert "--min-coverage" in result.output
+
+
+def test_recursive_min_coverage_checks_each_child_and_writes_report(tmp_path: Path) -> None:
+    s1 = SkillDirectory(path=tmp_path / "one", name="one", relative_path="one")
+    s2 = SkillDirectory(path=tmp_path / "two", name="two", relative_path="two")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+    output = tmp_path / "combined.json"
+    with patch(
+        "skillspector.cli.graph.invoke",
+        side_effect=[
+            {
+                "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 100}}),
+                "analysis_completeness": {"coverage_percent": 100},
+                "risk_score": 0,
+            },
+            {
+                "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 80}}),
+                "analysis_completeness": {"coverage_percent": 80},
+                "risk_score": 0,
+            },
+        ],
+    ):
+        with pytest.raises(typer.Exit) as exit_info:
+            _scan_multi_skill(
+                detection,
+                FormatChoice.json,
+                output,
+                no_llm=True,
+                min_coverage=87,
+            )
+    assert exit_info.value.exit_code == 1
+    assert output.exists()
+
+
 def test_cli_fail_on_incomplete_rejects_missing_semantic_telemetry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -424,6 +568,168 @@ def test_cli_fail_on_findings_exits_one_below_risk_threshold(
     )
 
     assert result.exit_code == 1
+    assert output.exists()
+
+
+def test_recursive_min_coverage_passes_when_all_children_meet_threshold(
+    tmp_path: Path,
+) -> None:
+    skills = [
+        SkillDirectory(path=tmp_path / "one", name="one", relative_path="one"),
+        SkillDirectory(path=tmp_path / "two", name="two", relative_path="two"),
+    ]
+    output = tmp_path / "combined.json"
+    child = {
+        "report_body": json.dumps({"analysis_completeness": {"coverage_percent": 100}}),
+        "analysis_completeness": {"coverage_percent": 100},
+        "risk_score": 0,
+    }
+    with patch("skillspector.cli.graph.invoke", side_effect=[child.copy(), child.copy()]):
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills, has_root_skill=False),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=90,
+        )
+    assert output.exists()
+    assert (
+        json.loads(output.read_text(encoding="utf-8"))["analysis_completeness"]["coverage_percent"]
+        == 100.0
+    )
+
+
+def test_recursive_min_coverage_fails_when_skills_are_omitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+    monkeypatch.setattr(
+        cli.graph, "invoke", lambda *_args, **_kwargs: _bounded_recursive_result("one")
+    )
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=30,
+        )
+
+    assert exit_info.value.exit_code == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["analysis_completeness"]["coverage_percent"] == pytest.approx(33.33)
+    assert payload["skills_omitted"] == 2
+    assert payload["skills"][-1]["omitted_count"] == 2
+
+
+def test_recursive_min_coverage_allows_omitted_skills_at_threshold_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(cli, "_MULTI_SKILL_MAX_PUBLIC_RECORDS", 1)
+    monkeypatch.setattr(
+        cli.graph, "invoke", lambda *_args, **_kwargs: _bounded_recursive_result("one")
+    )
+
+    _scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+        FormatChoice.json,
+        output,
+        no_llm=True,
+        min_coverage=0,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["skills_omitted"] == 2
+    assert payload["skills"][-1]["omitted_count"] == 2
+
+
+def test_recursive_min_coverage_ignores_aggregate_completeness_for_partial_children(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    skills = [SkillDirectory(tmp_path / name, name, name) for name in ("one", "two", "three")]
+    output = tmp_path / "combined.json"
+
+    def partial_result(label: str) -> dict[str, object]:
+        result = _bounded_recursive_result(label, finding_count=0)
+        result["analysis_completeness"] = {"is_complete": False, "coverage_percent": 95}
+        result["report_body"] = json.dumps(
+            {"analysis_completeness": result["analysis_completeness"]}
+        )
+        return result
+
+    results = iter(partial_result(name) for name in ("one", "two", "three"))
+    monkeypatch.setattr(cli.graph, "invoke", lambda *_args, **_kwargs: next(results))
+
+    _scan_multi_skill(
+        MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+        FormatChoice.json,
+        output,
+        no_llm=True,
+        min_coverage=90,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["skills_omitted"] == 0
+    assert payload["analysis_completeness"]["coverage_percent"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("analysis_completeness", "threshold"),
+    [
+        (None, 87),
+        ({"coverage_percent": None}, 87),
+        ({"coverage_percent": "unknown"}, 87),
+        ({"coverage_percent": True}, 0),
+        ({"coverage_percent": float("nan")}, 0),
+        ({"coverage_percent": float("inf")}, 0),
+    ],
+    ids=["missing", "null", "non-numeric", "boolean", "nan", "infinity"],
+)
+def test_recursive_min_coverage_fails_closed_for_malformed_child_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    analysis_completeness: dict[str, object] | None,
+    threshold: float,
+) -> None:
+    skills = [
+        SkillDirectory(tmp_path / "one", "one", "one"),
+        SkillDirectory(tmp_path / "two", "two", "two"),
+    ]
+    output = tmp_path / "combined.json"
+    malformed_child: dict[str, object] = {
+        "report_body": json.dumps(
+            {"analysis_completeness": analysis_completeness}
+            if analysis_completeness is not None
+            else {}
+        ),
+        "execution_successful": True,
+        "risk_score": 0,
+    }
+    if analysis_completeness is not None:
+        malformed_child["analysis_completeness"] = analysis_completeness
+    valid_child = _bounded_recursive_result("two", finding_count=0)
+    results = iter([malformed_child, valid_child])
+
+    def invoke(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return next(results)
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=threshold,
+        )
+
+    assert exit_info.value.exit_code == 1
     assert output.exists()
 
 
@@ -1534,7 +1840,7 @@ def _bounded_recursive_result(label: str, *, finding_count: int = 1) -> dict[str
         "risk_severity": "LOW",
         "risk_recommendation": "SAFE",
         "execution_successful": True,
-        "analysis_completeness": {"is_complete": True},
+        "analysis_completeness": {"is_complete": True, "coverage_percent": 100},
         "findings": findings,
         "filtered_findings": findings,
         "suppressed_findings": [],
