@@ -160,6 +160,7 @@ _MAX_WARNED_INSTALLER_LINE_CHARS = 4_096
 _MAX_LITERAL_XOR_KEY_BYTES = 256
 _MAX_LITERAL_XOR_VALUES = 4_096
 
+
 def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     """Decode literal byte arrays passed to a recognizable local XOR helper.
 
@@ -176,12 +177,7 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
     for function in function_pattern.finditer(content):
         body = function.group("body")
         key_match = key_pattern.search(body)
-        if (
-            key_match is None
-            or "bytes(" not in body
-            or "^" not in body
-            or ".decode(" not in body
-        ):
+        if key_match is None or "bytes(" not in body or "^" not in body or ".decode(" not in body:
             continue
         try:
             key = codecs.decode(key_match.group("key"), "unicode_escape").encode("latin1")
@@ -212,6 +208,8 @@ def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
                 continue
             decoded.append((get_line_number(content, call.start()), command))
     return decoded
+
+
 SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
