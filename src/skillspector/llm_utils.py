@@ -49,6 +49,7 @@ from langchain_core.runnables import Runnable
 from skillspector.inference_usage import InferenceUsageCollector, provider_name
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
+    UnknownProviderError,
     create_chat_model,
     create_chat_model_with_provider,
     get_active_provider,
@@ -133,7 +134,10 @@ def is_llm_available() -> tuple[bool, str | None]:
     :func:`get_chat_model`; unbound HTTP providers keep the
     credential-resolution and OpenAI fallback path.
     """
-    provider = get_active_provider()
+    try:
+        provider = get_active_provider()
+    except UnknownProviderError as exc:
+        return False, str(exc)
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
 
