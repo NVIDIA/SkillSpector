@@ -1938,8 +1938,9 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
 # SC8: Shipped Python bytecode (closes silent __pycache__ / .pyc skip)
 # ---------------------------------------------------------------------------
 
-# Still skip heavy/vendor trees for SC8, but *do* descend into __pycache__.
-_SC8_SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"})
+# Still skip non-runtime metadata and vendor trees for SC8, but descend into
+# Python environments: their bytecode is importable by the bundled runtime.
+_SC8_SKIP_DIRS = frozenset({".git", "node_modules", ".pytest_cache"})
 _SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 MAX_SC8_DISCOVERED_ENTRIES = 10_000
 MAX_SC8_DIRECTORY_ENTRIES = 10_000
