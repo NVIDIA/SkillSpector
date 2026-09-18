@@ -93,7 +93,10 @@ class LedgerReason(StrEnum):
     RUNTIME_LIMIT = "runtime_limit"
     EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
     OUTPUT_LIMIT = "output_limit"
+    TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    PYTHON_SOURCE_AMBIGUOUS = "python_source_ambiguous"
+    PYTHON_SOURCE_DECODE_ERROR = "python_source_decode_error"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
@@ -186,8 +189,17 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Executable content was inventoried but excluded from content analysis."
     ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
+    LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
+        "A transitive child scan failed before complete inspection."
+    ),
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
+    ),
+    LedgerReason.PYTHON_SOURCE_AMBIGUOUS: (
+        "Python execution intent depends on runtime or platform-specific shebang semantics."
+    ),
+    LedgerReason.PYTHON_SOURCE_DECODE_ERROR: (
+        "Python source bytes could not be decoded under their declared encoding."
     ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
