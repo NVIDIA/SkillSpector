@@ -2780,7 +2780,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 path=primary_path,
                 start_line=int(reference["line"]),
                 end_line=int(reference["line"]),
-                reason=LedgerReason.REFERENCE_UNRESOLVED,
+                reason=(
+                    LedgerReason.REFERENCE_MISSING
+                    if reference["status"] == "missing"
+                    else LedgerReason.REFERENCE_UNRESOLVED
+                ),
             )
             for reference in references
             if reference["status"] in {"missing", "ambiguous"}
