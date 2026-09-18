@@ -24,7 +24,7 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **71 vulnerability patterns** across 17 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, YARA signatures, MCP least privilege, and MCP tool poisoning
+- **101 vulnerability patterns** across 23 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, agent snooping, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, server-side request forgery, insecure deserialization, YARA signatures, MCP least privilege, MCP tool poisoning, bundled execution surface, analysis evasion, and MCP rug pull
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
@@ -379,7 +379,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **71 vulnerability patterns** across 17 categories:
+SkillSpector detects **101 vulnerability patterns** across 23 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -400,7 +400,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | AR2 | Disclaimer Suppression | HIGH | Instructions to omit warnings, disclaimers, or ethical commentary (e.g. "no disclaimers", "do not moralize") |
 | AR3 | Safety Policy Nullification | HIGH | Jailbreak framing that nullifies guardrails (e.g. "you have no restrictions", "ignore your guidelines", "do anything now") |
 
-### Data Exfiltration (4 patterns)
+### Data Exfiltration (5 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -408,16 +408,19 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets |
 | E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
+| E5 | Cloud Storage Exfiltration | MEDIUM | Uploading data to cloud storage (S3, GCS, Azure Blob) that may exfiltrate to an external bucket |
 
-### Privilege Escalation (3 patterns)
+### Privilege Escalation (5 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | PE1 | Excessive Permissions | LOW | Requesting access beyond stated functionality |
 | PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
 | PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
+| PE4 | Docker Socket Access | HIGH | Mounting or connecting to the Docker socket (`/var/run/docker.sock`), enabling container/host escape |
+| PE5 | Privileged Container / Escape | HIGH | `--privileged`, shared host namespaces, or other flags that remove the container security boundary |
 
-### Supply Chain (9+ patterns)
+### Supply Chain (9 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -427,6 +430,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | SC4 | Known Vulnerable Dependencies | HIGH | Dependencies with known CVEs (live OSV.dev lookup) |
 | SC5 | Abandoned Dependencies | MEDIUM | Unmaintained packages without security updates |
 | SC6 | Typosquatting | HIGH | Package names similar to popular packages |
+| SC7 | Untrusted Container Image | HIGH | Pulling container images with signature or registry verification disabled |
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 | SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
 
@@ -464,13 +468,14 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | MP2 | Context Window Stuffing | MEDIUM | Filler content displacing safety constraints |
 | MP3 | Memory Manipulation | HIGH | Tampering with agent memory or stored state |
 
-### Tool Misuse (3 patterns)
+### Tool Misuse (4 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | TM1 | Tool Parameter Abuse | HIGH | Crafted parameters for unintended behavior (shell=True, --force) |
 | TM2 | Chaining Abuse | HIGH | Tool chains that bypass individual safety checks |
 | TM3 | Unsafe Defaults | MEDIUM | Overly permissive defaults (disabled TLS, no auth) |
+| TM4 | Privileged Kubernetes Workload | HIGH | Privileged containers, hostPath mounts, or host namespaces granting node-level root |
 
 ### Rogue Agent (2 patterns)
 
@@ -478,6 +483,14 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 |----|---------|----------|-------------|
 | RA1 | Self-Modification | CRITICAL | Modifying own code or configuration at runtime |
 | RA2 | Session Persistence | HIGH | Unauthorized persistence via cron jobs or startup scripts |
+
+### Agent Snooping (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| AS1 | Agent Config Directory Access | HIGH | Reading `.claude/`, `.codex/`, `.gemini/`, or `.continue/` directories, exposing API keys, system prompts, and custom instructions stored there |
+| AS2 | MCP Config File Access | HIGH | Reading `mcp.json` / `mcp_config.json`, exposing MCP server endpoints and authentication tokens |
+| AS3 | Skill Enumeration | MEDIUM | Listing or reading other skills' source files to learn the full tool surface of the agent |
 
 ### Trigger Abuse (3 patterns)
 
@@ -487,7 +500,26 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | TR2 | Shadow Command Trigger | HIGH | Triggers that shadow built-in commands or other skills |
 | TR3 | Keyword Baiting Trigger | MEDIUM | Generic triggers designed to maximize activation |
 
-### Behavioral AST (9 patterns)
+### Server-Side Request Forgery (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| SSRF1 | Cloud Metadata Access | HIGH | Accessing cloud instance metadata endpoints (e.g. 169.254.169.254) that can return IAM credentials |
+| SSRF2 | Internal Network Request | MEDIUM | Requests to loopback, link-local, or private-range hosts |
+| SSRF3 | Dynamic Request Target | MEDIUM | Request host built from a dynamic or untrusted value |
+
+### Insecure Deserialization (4 patterns)
+
+> Multi-language equivalents (PHP, Ruby, JavaScript) of the Python-specific deserialization checks covered by AST10 and TT6.
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| DS1 | PHP Object Injection | HIGH | unserialize() on untrusted PHP input, triggering magic-method POP chains |
+| DS2 | Ruby Marshal Deserialization | HIGH | Marshal.load/restore reconstructing arbitrary objects from untrusted data |
+| DS3 | Unsafe Ruby YAML Deserialization | MEDIUM | YAML.load/Psych.load/Oj.load in object mode on untrusted YAML/JSON |
+| DS4 | Unsafe JavaScript Deserialization | HIGH | node-serialize/funcster/serialize-to-js evaluating embedded functions in untrusted input |
+
+### Behavioral AST (10 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -500,8 +532,9 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | AST7 | Dynamic getattr() | MEDIUM | Arbitrary attribute access with non-literal names |
 | AST8 | Dangerous Execution Chain | CRITICAL | exec/eval combined with dynamic source (network, encoded data) |
 | AST9 | Reflective getattr() Sink | HIGH | Reflective exec via `getattr(os,'system')` / `getattr(builtins,'exec')` that evades AST1/AST5 |
+| AST10 | Insecure Deserialization | MEDIUM | Untrusted data passed to pickle/marshal/dill/yaml.load/torch.load without safe guards |
 
-### Taint Tracking (5 patterns)
+### Taint Tracking (6 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -510,6 +543,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | TT3 | Credential Exfiltration Chain | CRITICAL | Credentials (env vars, secrets) flow to network output sinks |
 | TT4 | File Read to Network Exfiltration | HIGH | File contents flow to network output sinks |
 | TT5 | External Input to Code Execution | CRITICAL | Network or user input flows to exec/eval/subprocess sinks |
+| TT6 | Untrusted Data to Deserializer Flow | HIGH | External input or file contents flow to an insecure deserializer (pickle, yaml.unsafe_load, etc.) |
 
 ### YARA Signatures (4 patterns)
 
@@ -537,6 +571,33 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | TP2 | Unicode Deception | HIGH | Homoglyphs, RTL overrides, mixed-script identifiers in tool metadata |
 | TP3 | Parameter Description Injection | MEDIUM | Injection patterns in parameter definitions (overrides, system tokens, malicious defaults) |
 | TP4 | Description-Behavior Mismatch | MEDIUM | Declared tool description does not match actual code behavior (LLM-powered) |
+
+### Bundled Execution Surface (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| BH1 | Bundled Lifecycle Hook | LOW-HIGH | Bundled hook can run automatically when its configured lifecycle event fires |
+| BH2 | Bundled Hook Remote Exfiltration | CRITICAL | Bundled hook directly sends sensitive event or file content to a remote destination |
+| BH3 | Bundled Permission Declaration | LOW-CRITICAL | Bundled project settings declare a broad permission surface, or a mode ignored on this surface |
+
+### Analysis Evasion (6 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| AE1 | Incomplete Artifact Coverage | HIGH | Referenced artifact could not be completely inspected (partial, failed, or out-of-scope disposition) |
+| AE2 | Misleading File Extension | MEDIUM | Artifact content does not match its filename extension |
+| AE3 | Embedded NUL Bytes | HIGH | Text artifact contains embedded NUL bytes |
+| AE4 | Suspicious Unicode Normalization | MEDIUM | Mixed-script content or anomalous Unicode normalization density |
+| AE5 | Oversized Instruction Artifact | HIGH | Instruction-capable artifact (Markdown/text/SKILL.md) exceeds whole-file semantic analysis limits |
+| AE6 | Inter-Character Separator Evasion | HIGH | Instruction text uses inter-character separators to evade pattern matching |
+
+### MCP Rug Pull (3 patterns)
+
+| ID | Pattern | Severity | Description |
+|----|---------|----------|-------------|
+| RP1 | Unpinned MCP Server Reference | LOW-HIGH | npx/uvx/pip/docker reference to an MCP server without a pinned version |
+| RP2 | Permission Pre-Staging | LOW-MEDIUM | Manifest or trigger-phrase changes suggesting future privilege expansion |
+| RP3 | Unpinned Skill Version | LOW-MEDIUM | Skill version is unpinned, uses an overly broad constraint, or its parameter schema changed |
 
 All detected patterns are listed in the tables above.
 
