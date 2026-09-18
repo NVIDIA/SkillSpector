@@ -1838,11 +1838,19 @@ def _analyze_dependencies_detailed(
 
 
 def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Finding]:
-    """Analyze the triggers field from SKILL.md manifest for abuse patterns."""
+    """Analyze trigger-like manifest content for abuse patterns.
+
+    Agent Skills exposes activation intent through ``description``; legacy
+    ``triggers`` metadata remains supported when present.
+    """
     triggers: list[str] = []
     raw = manifest.get("triggers", [])
     if isinstance(raw, list):
         triggers = [str(t).strip() for t in raw if str(t).strip()]
+    if not triggers:
+        description = manifest.get("description")
+        if isinstance(description, str) and description.strip():
+            triggers = [description.strip()]
     if not triggers:
         return []
 
