@@ -16,6 +16,7 @@ from skillspector.nodes.analyzers import (
     behavioral_taint_tracking,
     static_patterns_data_exfiltration,
     static_patterns_output_handling,
+    static_patterns_tool_misuse,
 )
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.deduplicate import deduplicate
@@ -62,7 +63,8 @@ def test_preparsed_python_is_reused_by_all_ast_analyzers(tmp_path, monkeypatch) 
         "import subprocess\n"
         "payload = input()\n"
         "environment = os.environ.copy()\n"
-        "subprocess.run(output)\n"
+        "enabled = True\n"
+        "subprocess.run(output, shell=enabled)\n"
         "exec(payload)\n",
         encoding="utf-8",
     )
@@ -90,11 +92,13 @@ def test_preparsed_python_is_reused_by_all_ast_analyzers(tmp_path, monkeypatch) 
 
     data_findings = static_patterns_data_exfiltration.node(state)["findings"]
     output_findings = static_patterns_output_handling.node(state)["findings"]
+    tool_misuse_findings = static_patterns_tool_misuse.node(state)["findings"]
     ast_findings = behavioral_ast.node(state)["findings"]
     taint_findings = behavioral_taint_tracking.node(state)["findings"]
 
     assert any(finding.rule_id == "E2" for finding in data_findings)
     assert any(finding.rule_id == "OH1" for finding in output_findings)
+    assert any(finding.rule_id == "TM1" for finding in tool_misuse_findings)
     assert any(finding.rule_id == "AST1" for finding in ast_findings)
     assert any(finding.rule_id == "TT5" for finding in taint_findings)
     assert parse_calls == 1
