@@ -417,7 +417,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
 | PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
 
-### Supply Chain (9+ patterns)
+### Supply Chain (10+ patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -429,6 +429,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | SC6 | Typosquatting | HIGH | Package names similar to popular packages |
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 | SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
+| SC10 | Dependency Source Redirection | HIGH | Package-manager source added, replaced, or unresolved |
 
 ### Excessive Agency (5 patterns)
 
