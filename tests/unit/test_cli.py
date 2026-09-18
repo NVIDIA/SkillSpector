@@ -222,6 +222,7 @@ def test_cli_scan_help_lists_every_available_provider() -> None:
         "ollama",
         "azure_openai",
         "openai_compatible",
+        "gemini",
         "claude_cli",
         "codex_cli",
         "gemini_cli",
@@ -645,7 +646,7 @@ def test_recursive_dot_child_static_finding_never_reaches_a_provider(
     get_chat_model = MagicMock(return_value=model)
     monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", get_chat_model)
-    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda **_: (True, None))
     monkeypatch.setattr(cli_module, "graph", import_module("skillspector.graph").create_graph())
     monkeypatch.setattr(cli_module, "RISK_THRESHOLD", 100)
     output = tmp_path / "recursive.json"

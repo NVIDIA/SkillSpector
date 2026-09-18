@@ -43,6 +43,7 @@ import weakref
 from collections.abc import Coroutine
 from typing import Any, NoReturn
 
+from google.auth.exceptions import RefreshError
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable
 
@@ -59,6 +60,7 @@ from skillspector.providers import (
     resolve_chat_model_credentials,
     resolve_provider_credentials,
 )
+from skillspector.providers.gemini import GeminiProvider
 from skillspector.providers.openai import OpenAIProvider
 
 _CHAT_MODEL_PROVIDERS: dict[int, tuple[weakref.ReferenceType[object], str]] = {}
@@ -124,7 +126,7 @@ def _resolve_default_chat_model() -> str:
     raise_no_llm_api_key_configured()
 
 
-def is_llm_available() -> tuple[bool, str | None]:
+def is_llm_available(timeout: float | None = 120) -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
     CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
@@ -143,9 +145,15 @@ def is_llm_available() -> tuple[bool, str | None]:
             create_chat_model(
                 model=model,
                 max_tokens=get_max_output_tokens(model),
-                timeout=120,
+                timeout=timeout,
             )
-        except ValueError as exc:
+        except (ValueError, RefreshError, TimeoutError) as exc:
+            return False, str(exc)
+        return True, None
+    if isinstance(provider, GeminiProvider):
+        try:
+            provider.resolve_credentials(timeout=timeout)
+        except (ValueError, RefreshError, TimeoutError) as exc:
             return False, str(exc)
         return True, None
     try:

@@ -552,7 +552,7 @@ def scan(
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
-                               openai_compatible | claude_cli | codex_cli |
+                               openai_compatible | gemini | claude_cli | codex_cli |
                                gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
@@ -574,6 +574,9 @@ def scan(
           AZURE_OPENAI_ENDPOINT              for azure_openai
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
+        GOOGLE_CLOUD_PROJECT [+ GOOGLE_CLOUD_LOCATION]
+                                             for gemini (uses Application
+                                             Default Credentials / Workload Identity)
 
         ollama uses the local Ollama service. claude_cli, codex_cli,
         gemini_cli, and opencode_cli use their CLI's existing local

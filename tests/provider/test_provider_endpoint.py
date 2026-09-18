@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from typing import Literal
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -109,3 +110,45 @@ def test_nv_build_provider_makes_live_structured_request() -> None:
     )
 
     assert result == ProviderResult(ok=True)
+
+
+class GeminiDetail(BaseModel):
+    item: str
+    tags: list[str] = Field(default_factory=list)
+
+
+class GeminiStructuredResult(BaseModel):
+    ok: bool = Field(description="Whether the request succeeded.")
+    ambiguity: Literal["active", "inactive"] = Field(description="Ambiguity status enum.")
+    details: list[GeminiDetail] = Field(description="List of details.")
+    notes: str | None = Field(default=None, description="Optional notes.")
+
+
+def test_gemini_provider_makes_live_structured_request() -> None:
+    """Gemini provider reaches its Google Cloud endpoint and returns structured output."""
+    from skillspector.providers.gemini import GeminiProvider
+
+    _skip_without_env("GOOGLE_CLOUD_PROJECT")
+
+    model = _model_from_env("SKILLSPECTOR_GEMINI_TEST_MODEL", GeminiProvider.DEFAULT_MODEL)
+    llm = GeminiProvider().create_chat_model(model, max_tokens=128, timeout=60)
+    assert llm is not None
+
+    result = llm.with_structured_output(GeminiStructuredResult).invoke(
+        [
+            HumanMessage(
+                content=(
+                    "Return structured output matching the schema: ok=true, ambiguity='active', "
+                    "details=[{'item': 'sample', 'tags': ['tag1']}], notes='tested'."
+                )
+            )
+        ]
+    )
+
+    assert isinstance(result, GeminiStructuredResult)
+    assert result.ok is True
+    assert result.ambiguity == "active"
+    assert len(result.details) == 1
+    assert result.details[0].item == "sample"
+    assert result.details[0].tags == ["tag1"]
+    assert result.notes == "tested"

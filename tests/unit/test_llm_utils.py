@@ -272,6 +272,16 @@ class TestChatCompletion:
 
 
 class TestIsLlmAvailable:
+    def test_unbound_gemini_uses_bounded_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "gemini")
+        resolve = MagicMock(return_value=("token", "https://example.invalid"))
+        monkeypatch.setattr(
+            "skillspector.providers.gemini.provider.GeminiProvider.resolve_credentials", resolve
+        )
+
+        assert is_llm_available(timeout=7) == (True, None)
+        resolve.assert_called_once_with(timeout=7)
+
     def test_returns_true_when_credentials_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "k")
         ok, msg = is_llm_available()

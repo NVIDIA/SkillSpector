@@ -74,7 +74,7 @@ from skillspector.semantic_runtime import (
     semantic_runtime_ledger_event,
     successful_llm_record,
 )
-from skillspector.state import SkillspectorState
+from skillspector.state import SkillspectorState, transitive_remaining_seconds
 from skillspector.suppression import Baseline, SuppressedFinding, partition_findings
 
 logger = get_logger(__name__)
@@ -1111,10 +1111,11 @@ def _build_metadata(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
-    provider_available, llm_error = is_llm_available()
+    provider_available, llm_error = provider_availability or is_llm_available()
     attempted, succeeded, call_log_degraded = _llm_runtime_status(use_llm, llm_call_log)
     # meta_analyzer's own record, independent of whether a DIFFERENT
     # LLM-backed node (a semantic_* analyzer) lost coverage to a dropped
@@ -1230,6 +1231,7 @@ def _format_json(
     llm_execution_enabled: bool | None = None,
     semantic_runtime_incomplete: bool = False,
     runtime_available: bool | None = None,
+    provider_availability: tuple[bool, str | None] | None = None,
 ) -> str:
     """Generate JSON report string."""
     suppressed = suppressed or []
@@ -1274,6 +1276,7 @@ def _format_json(
             llm_execution_enabled,
             semantic_runtime_incomplete,
             runtime_available,
+            provider_availability,
         ),
         "execution_successful": execution_successful,
     }
@@ -1574,7 +1577,18 @@ def report(state: SkillspectorState) -> dict[str, object]:
         if analysis_completeness.get("status", "complete") == "complete":
             analysis_completeness["status"] = "partial"
     _attempted, _succeeded, degraded = _llm_runtime_status(llm_requested, llm_call_log)
-    provider_available, provider_error = is_llm_available()
+    remaining = transitive_remaining_seconds(state)
+    if remaining is not None and remaining <= 0:
+        provider_available = any(successful_llm_record(record) for record in llm_call_log)
+        provider_error = (
+            None
+            if provider_available
+            else "Workflow deadline reached before LLM availability could be confirmed."
+        )
+    else:
+        provider_available, provider_error = is_llm_available(
+            timeout=remaining if remaining is not None else 120
+        )
     runtime_available = llm_runtime_available(
         preflight_available=provider_available,
         result=state,
@@ -1727,6 +1741,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             llm_execution_enabled=use_llm,
             semantic_runtime_incomplete=semantic_runtime_incomplete,
             runtime_available=runtime_available,
+            provider_availability=(provider_available, provider_error),
         )
     elif output_format == "markdown":
         report_body = _format_markdown(

@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from google.auth.exceptions import RefreshError
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
@@ -856,6 +857,78 @@ class TestRunBatches:
 
 
 class TestDynamicTimeout:
+    def test_model_construction_rechecks_the_shared_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Construction that consumes the budget cannot start an LLM call."""
+        timeout_values = iter([10.0, 0.0])
+
+        class _LLM:
+            def with_structured_output(self, schema: type) -> _LLM:
+                return self
+
+        monkeypatch.setattr(
+            "skillspector.llm_analyzer_base.get_chat_model", lambda **_kwargs: _LLM()
+        )
+
+        with pytest.raises(LLMRuntimeLimitError, match="runtime limit"):
+            LLMAnalyzerBase(
+                base_prompt="test",
+                model="nvidia/openai/gpt-oss-120b",
+                timeout=lambda: next(timeout_values),
+            )
+
+    def test_second_dynamic_model_refresh_failure_keeps_first_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refresh failure is isolated to its batch after an earlier success."""
+
+        class _LLM:
+            def with_structured_output(self, schema: type) -> _LLM:
+                return self
+
+            def invoke(self, prompt: str, **kwargs: object) -> LLMAnalysisResult:
+                return LLMAnalysisResult(
+                    findings=[
+                        LLMFinding(
+                            rule_id="retained",
+                            message="retained finding",
+                            severity="LOW",
+                            start_line=1,
+                        )
+                    ]
+                )
+
+        models: list[object] = [_LLM(), _LLM(), RefreshError("refresh failed")]
+
+        def _get_model(**_kwargs: object) -> _LLM:
+            model = models.pop(0)
+            if isinstance(model, Exception):
+                raise model
+            return model  # type: ignore[return-value]
+
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", _get_model)
+        analyzer = LLMAnalyzerBase(
+            base_prompt="test",
+            model="nvidia/openai/gpt-oss-120b",
+            timeout=lambda: 10.0,
+        )
+
+        outcome = analyzer.run_batches_detailed(
+            [Batch(file_path="first.py", content="ok"), Batch(file_path="second.py", content="bad")]
+        )
+
+        assert [batch.file_path for batch, _ in outcome.successful] == ["first.py"]
+        assert outcome.successful[0][1][0].rule_id == "retained"
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("second.py", "RefreshError")
+        ]
+        events, _ = ledger_events_for_batches("semantic_test", outcome)
+        assert [(event["path"], event["outcome"]) for event in events] == [
+            ("first.py", "completed"),
+            ("second.py", "failed"),
+        ]
+
     def test_dynamic_deadline_disables_unobservable_native_retries(self) -> None:
         chat_model = ChatOpenAI(model="nvidia/openai/gpt-oss-120b", api_key="sk-test")
         assert chat_model.root_client is not None
@@ -900,7 +973,7 @@ class TestDynamicTimeout:
             return chat_model
 
         calls = 200
-        countdown = iter(float(seconds) for seconds in range(calls + 1, 0, -1))
+        countdown = iter(float(seconds) for seconds in range(calls + 2, 0, -1))
         with patch(MOCK_PATCH_TARGET, side_effect=_factory):
             analyzer = LLMAnalyzerBase(
                 base_prompt="test",
@@ -927,10 +1000,46 @@ class TestDynamicTimeout:
         assert sync_client.timeout == 1.0
         assert _cached_async_httpx_client.cache_info().misses == cache_misses_before
 
+    def test_gemini_reuses_client_until_adc_token_changes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skillspector.providers.gemini import GeminiProvider
+
+        provider = GeminiProvider()
+        tokens = iter(["first", "second", "second"])
+        monkeypatch.setattr(
+            provider,
+            "resolve_credentials",
+            lambda *, timeout: (next(tokens), "https://example.invalid"),
+        )
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_active_provider", lambda: provider)
+        built: list[ChatOpenAI] = []
+
+        def _factory(*, model: str, timeout: float | None = None) -> ChatOpenAI:
+            chat_model = ChatOpenAI(
+                model=model,
+                api_key="first" if not built else "second",
+                timeout=timeout,
+            )
+            built.append(chat_model)
+            return chat_model
+
+        monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", _factory)
+        analyzer = LLMAnalyzerBase(base_prompt="test", model="gemini-test", timeout=lambda: 10.0)
+
+        first, _ = analyzer._model_for_call()
+        second, _ = analyzer._model_for_call()
+        third, _ = analyzer._model_for_call()
+
+        assert first is built[0]
+        assert second is built[1]
+        assert third is second
+        assert len(built) == 2
+
     def test_run_batches_resolves_timeout_per_batch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Dynamic timeout providers are called again before every LLM call."""
         captured_timeouts: list[float | None] = []
-        timeout_values = iter([30.0, 20.0, 10.0])
+        timeout_values = iter([30.0, 30.0, 20.0, 20.0, 10.0, 10.0])
 
         class _Structured:
             def invoke(self, prompt: str) -> LLMAnalysisResult:
@@ -963,7 +1072,7 @@ class TestDynamicTimeout:
     def test_sync_retry_backoff_and_next_attempt_honor_remaining_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        timeout_values = iter([5.0, 4.0, 0.1, 0.0])
+        timeout_values = iter([5.0, 5.0, 4.0, 4.0, 0.1, 0.0])
         sleeps: list[float] = []
 
         class _LLM:
@@ -1032,7 +1141,7 @@ class TestDynamicTimeout:
     async def test_async_retry_backoff_and_next_attempt_honor_remaining_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        timeout_values = iter([5.0, 4.0, 0.2, 0.0])
+        timeout_values = iter([5.0, 5.0, 4.0, 4.0, 0.2, 0.0])
         sleeps: list[float] = []
 
         class _LLM:
