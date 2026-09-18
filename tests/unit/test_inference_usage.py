@@ -7,12 +7,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 from skillspector.inference_usage import (
     InferenceUsageCollector,
     _usage_record,
+    chat_model_controls,
+    chat_model_requested_controls,
+    register_chat_model_controls,
     sanitize_inference_usage,
 )
 
@@ -69,7 +73,37 @@ def test_collector_marks_response_received_without_usage_counters() -> None:
     collector.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]], llm_output={}))
 
     assert collector.response_received is True
-    assert collector.snapshot() == []
+    observation = collector.snapshot()
+    assert observation[0]["provider"] == "codex_cli"
+    assert observation[0]["usage_source"] == "provider_response"
+    assert sanitize_inference_usage(observation) == []
+
+
+@pytest.mark.parametrize(
+    "effort",
+    ["github_pat_fake-value", "Bearer synthetic-secret-token-123456", "unrecognized setting"],
+)
+def test_constructor_control_registry_drops_credential_shaped_effort(effort: str) -> None:
+    class _ChatModel:
+        pass
+
+    model = _ChatModel()
+    register_chat_model_controls(
+        model,
+        {
+            "temperature": 0.2,
+            "seed": 7,
+            "reasoning_effort": effort,
+        },
+        requested_controls={
+            "temperature": 0.2,
+            "seed": 7,
+            "reasoning_effort": effort,
+        },
+    )
+
+    assert chat_model_controls(model) == {"temperature": 0.2, "seed": 7}
+    assert chat_model_requested_controls(model) == {"temperature": 0.2, "seed": 7}
 
 
 def test_raw_anthropic_usage_adds_external_cache_counters_to_prompt_total() -> None:
@@ -364,6 +398,9 @@ def test_report_sanitizer_rejects_url_and_userinfo_model_labels() -> None:
             [
                 {**common, "model": "https://key@private-host/v1"},
                 {**common, "model": "key@private-host"},
+                {**common, "model": "github_pat_fake-value"},
+                {**common, "model": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.signature"},
+                {**common, "model": "0123456789abcdef" * 2},
             ]
         )
         == []

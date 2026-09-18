@@ -40,6 +40,10 @@ from botocore.config import Config as BotocoreConfig
 from langchain_aws import ChatBedrockConverse
 from langchain_core.language_models.chat_models import BaseChatModel
 
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_sampling_parameters
 
@@ -130,9 +134,16 @@ class BedrockProvider:
         }
         if model.startswith("arn:"):
             kwargs["provider"] = "anthropic"
-        kwargs.update(resolve_sampling_parameters())
+        sampling_parameters = resolve_sampling_parameters()
+        kwargs.update(sampling_parameters)
 
-        return ChatBedrockConverse(**kwargs)
+        chat_model = ChatBedrockConverse(**kwargs)
+        register_chat_model_controls(
+            chat_model,
+            retained_chat_model_controls(chat_model, ("temperature",)),
+            requested_controls={"temperature": sampling_parameters.get("temperature")},
+        )
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)
