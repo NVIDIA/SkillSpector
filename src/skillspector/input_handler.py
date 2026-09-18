@@ -54,6 +54,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from skillspector.cleanup import remove_temp_tree
 from skillspector.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -760,7 +761,7 @@ class InputHandler:
     def cleanup(self) -> None:
         """Clean up temporary files created during resolution."""
         if self._temp_dir and self._temp_dir.exists():
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            remove_temp_tree(self._temp_dir)
             self._temp_dir = None
 
     def temp_dir_for_cleanup(self) -> Path | None:
