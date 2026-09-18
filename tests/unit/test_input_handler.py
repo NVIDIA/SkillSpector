@@ -455,6 +455,29 @@ def test_scp_url_is_git_url() -> None:
     assert InputHandler()._is_git_url("git@github.com:org/repo.git") is True
 
 
+def test_github_tree_url_resolves_a_checked_out_subdirectory(tmp_path: Path) -> None:
+    handler = InputHandler()
+    clone = tmp_path / "repo"
+    (clone / "skills" / "biome-gritql").mkdir(parents=True)
+    with patch.object(handler, "_clone_git", return_value=clone) as clone_git:
+        resolved, source_type = handler.resolve(
+            "https://github.com/somtougeh/somto-dev-toolkit/tree/main/skills/biome-gritql"
+        )
+    assert resolved == clone / "skills" / "biome-gritql"
+    assert source_type == "git"
+    clone_git.assert_called_once_with(
+        "https://github.com/somtougeh/somto-dev-toolkit.git", branch="main"
+    )
+
+
+@pytest.mark.parametrize("segment", ["%2Fetc", "%2E%2E%2Frepo", "%5Coutside"])
+def test_github_tree_url_rejects_encoded_path_escapes(segment: str) -> None:
+    with pytest.raises(ValueError, match="stay within the repository"):
+        InputHandler()._github_tree_target(
+            f"https://github.com/example/repo/tree/main/skills/{segment}"
+        )
+
+
 def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
     """Network inputs require HTTPS unless they use SSH's scp-style syntax."""
     handler = InputHandler()

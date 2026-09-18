@@ -50,7 +50,7 @@ from pathlib import Path, PurePosixPath
 from stat import S_IFMT, S_ISDIR, S_ISLNK, S_ISREG
 from time import monotonic
 from typing import BinaryIO, NoReturn, cast
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
@@ -739,6 +739,19 @@ class InputHandler:
         """
         input_path = input_path.strip()
 
+        git_target = self._github_tree_target(input_path)
+        if git_target is not None:
+            repository_url, branch, subdirectory = git_target
+            clone_dir = self._clone_git(repository_url, branch=branch)
+            clone_root = clone_dir.resolve()
+            target = (clone_root / subdirectory).resolve()
+            try:
+                target.relative_to(clone_root)
+            except ValueError as exc:
+                raise ValueError("Git URL subdirectory must stay within the repository") from exc
+            if not target.is_dir() or target.is_symlink():
+                raise ValueError("Git URL subdirectory does not exist or is not a directory")
+            return target, "git"
         if self._is_git_url(input_path):
             return self._clone_git(input_path), "git"
         if self._is_file_url(input_path):
@@ -1009,6 +1022,24 @@ class InputHandler:
             return True
         return False
 
+    @staticmethod
+    def _github_tree_target(path: str) -> tuple[str, str, PurePosixPath] | None:
+        """Return a canonical clone target for a GitHub ``/tree/<ref>/<dir>`` URL."""
+        parsed = urlparse(path)
+        if parsed.scheme != "https" or parsed.hostname != "github.com":
+            return None
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(parts) < 5 or parts[2] != "tree":
+            return None
+        owner, repository, _tree, branch, *subdirectory = parts
+        if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in subdirectory):
+            raise ValueError("Git URL subdirectory must stay within the repository")
+        return (
+            f"https://github.com/{owner}/{repository}.git",
+            branch,
+            PurePosixPath(*subdirectory),
+        )
+
     def _is_file_url(self, path: str) -> bool:
         """Check if path is a direct file URL."""
         if not path.startswith("https://"):
@@ -1044,7 +1075,7 @@ class InputHandler:
             )
         return host
 
-    def _clone_git(self, url: str) -> Path:
+    def _clone_git(self, url: str, *, branch: str | None = None) -> Path:
         """Clone a Git repository to a temporary directory, bounded by ``INGEST_MAX_BYTES``."""
         remaining_seconds = self._remaining_seconds()
         remaining_bytes = self._remaining_bytes()
@@ -1070,6 +1101,8 @@ class InputHandler:
             url,
             str(clone_dir),
         ]
+        if branch is not None:
+            clone_command[6:6] = ["--branch", branch]
         if remaining_bytes is not None:
             clone_command.insert(6, f"--filter=blob:limit={remaining_bytes}")
         process: subprocess.Popen[bytes] | None = None
