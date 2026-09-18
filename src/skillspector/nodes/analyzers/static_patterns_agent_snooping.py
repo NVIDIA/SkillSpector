@@ -33,6 +33,7 @@ import re
 from collections.abc import Mapping
 from contextvars import ContextVar
 
+from skillspector.input_handler import selected_source_identity_for_input
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -50,6 +51,8 @@ _AS3_SKILL_PATH_FULLMATCH = re.compile(_AS3_SKILL_PATH_PATTERN, re.IGNORECASE)
 _CURRENT_SKILL_IDENTIFIERS: ContextVar[frozenset[str]] = ContextVar(
     "agent_snooping_current_skill_identifiers", default=frozenset()
 )
+# Ephemeral basenames created by InputHandler for git/zip/file materialization.
+_EPHEMERAL_SCAN_ROOT_BASENAMES = frozenset({"repo", "extracted"})
 
 # AS1: Agent Config Directory Access
 # Matches code/instructions that read from well-known agent config directories.
@@ -208,8 +211,32 @@ def _normalize_skill_identifier(value: object) -> str | None:
     return normalized or None
 
 
+def _is_ephemeral_scan_root_basename(identifier: str) -> bool:
+    """Return whether a scan-root basename is an InputHandler materialization stub."""
+    return identifier in _EPHEMERAL_SCAN_ROOT_BASENAMES or identifier.startswith("skillspector_")
+
+
+def _selected_source_identifier(state: SkillspectorState) -> str | None:
+    """Return the trusted repository/archive/selected-source identity from state."""
+    selected = _normalize_skill_identifier(state.get("selected_source_identity"))
+    if selected is not None:
+        return selected
+    input_path = state.get("input_path")
+    if isinstance(input_path, str) and input_path.strip():
+        return _normalize_skill_identifier(selected_source_identity_for_input(input_path.strip()))
+    return None
+
+
 def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
-    """Derive current-skill identities from scan-root basename and/or manifest name."""
+    """Derive trusted current-skill identities for AS3 self-reference suppression.
+
+    Host-derived scan-root basenames and selected repository/archive identities
+    are authoritative. Contributor-controlled ``manifest.name`` may only
+    corroborate those trusted identities; it never introduces a suppression
+    identity on its own. Ephemeral temp-clone basenames such as ``repo`` are
+    ignored so a matching selected-source identity can still suppress the real
+    skill self-path without opening a peer-skill false negative.
+    """
 
     skill_path: object = state.get("skill_path")
     path_text: str | bytes | None = None
@@ -225,21 +252,25 @@ def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
         normalized_path = path_text.replace("\\", "/").rstrip("/")
         path_identifier = _normalize_skill_identifier(normalized_path.rsplit("/", 1)[-1])
 
+    source_identifier = _selected_source_identifier(state)
+
     manifest = state.get("manifest")
     manifest_identifier: str | None = None
     if isinstance(manifest, Mapping):
         manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
 
-    # Accept both host-derived scan-root basename and declared manifest name as
-    # independent current-skill identities. Temp clones extract to directories
-    # like ``.../repo`` while SKILL.md keeps the real skill name; treating only
-    # the path as authoritative false-positives those self-references as AS3.
-    # Peer-skill paths still fire because they match neither identity.
     identifiers: set[str] = set()
-    if path_identifier is not None:
+    if path_identifier is not None and not _is_ephemeral_scan_root_basename(path_identifier):
         identifiers.add(path_identifier)
-    if manifest_identifier is not None:
+    if source_identifier is not None:
+        identifiers.add(source_identifier)
+
+    # Manifest data is contributor-controlled. Keep it only when it already
+    # matches a trusted host/operator identity (no-op add) so mismatched names
+    # such as ``name: victim`` cannot suppress peer ``skills/victim/SKILL.md``.
+    if manifest_identifier is not None and manifest_identifier in identifiers:
         identifiers.add(manifest_identifier)
+
     return frozenset(identifiers)
 
 

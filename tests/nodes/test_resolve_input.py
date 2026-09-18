@@ -30,6 +30,7 @@ def test_resolve_input_with_input_path_directory(tmp_path: Path) -> None:
     update = resolve_input(state)
     assert update["skill_path"] == str(tmp_path.resolve())
     assert update.get("temp_dir_for_cleanup") is None
+    assert update.get("selected_source_identity") == tmp_path.name
 
 
 def test_resolve_input_with_skill_path_only(tmp_path: Path) -> None:
@@ -39,6 +40,7 @@ def test_resolve_input_with_skill_path_only(tmp_path: Path) -> None:
     update = resolve_input(state)
     assert update["skill_path"] == str(tmp_path.resolve())
     assert update.get("temp_dir_for_cleanup") is None
+    assert update.get("selected_source_identity") == tmp_path.name
 
 
 def test_resolve_input_rejects_skill_path_with_symlinked_parent(tmp_path: Path) -> None:
@@ -131,3 +133,19 @@ def test_transitive_truncation_is_typed_sanitized_and_cleaned(
     }
     assert cleaned == [True]
     assert "private/source" not in str(raised.value)
+
+
+def test_selected_source_identity_from_git_and_archive_inputs() -> None:
+    """Repository and archive names become trusted selected-source identities."""
+    from skillspector.input_handler import selected_source_identity_for_input
+
+    assert (
+        selected_source_identity_for_input("https://github.com/acme/example-skill.git")
+        == "example-skill"
+    )
+    assert (
+        selected_source_identity_for_input("git@github.com:acme/example-skill.git")
+        == "example-skill"
+    )
+    assert selected_source_identity_for_input("/tmp/packs/example-skill.zip") == "example-skill"
+    assert selected_source_identity_for_input("/tmp/skillspector_abc/repo") is None

@@ -27,6 +27,7 @@ from pathlib import Path
 from skillspector.input_handler import (
     InputHandler,
     TransitiveIngestTruncatedError,
+    selected_source_identity_for_input,
     validate_local_input_path,
 )
 from skillspector.logging_config import get_logger
@@ -60,6 +61,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             resolved, source_type = handler.resolve(input_path.strip())
             update: dict[str, object] = {
                 "skill_path": str(resolved),
+                "selected_source_identity": selected_source_identity_for_input(input_path.strip()),
                 "workflow_resource_budget": workflow_budget,
             }
             temp_dir = handler.temp_dir_for_cleanup()
@@ -87,6 +89,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             resolved = validate_local_input_path(Path(skill_path))
             return {
                 "skill_path": str(resolved),
+                "selected_source_identity": selected_source_identity_for_input(skill_path.strip()),
                 "temp_dir_for_cleanup": None,
                 "workflow_resource_budget": workflow_budget,
             }
@@ -94,12 +97,14 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             logger.warning("Could not resolve skill_path: %s", e)
             return {
                 "skill_path": None,
+                "selected_source_identity": None,
                 "temp_dir_for_cleanup": None,
                 "workflow_resource_budget": workflow_budget,
             }
 
     return {
         "skill_path": None,
+        "selected_source_identity": None,
         "temp_dir_for_cleanup": None,
         "workflow_resource_budget": workflow_budget,
     }
