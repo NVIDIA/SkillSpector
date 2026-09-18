@@ -895,10 +895,11 @@ class TestRunStaticPatternsAgentSnooping:
         assert readme_event["emitted_finding_ids"] == []
         assert not any(f.rule_id == "AS3" for f in result["findings"])
 
-    def test_as3_inconsistent_manifest_identity_fails_closed(self):
-        """A contributor-controlled manifest cannot override the scan-root identity."""
+    def test_as3_selected_source_identity_suppresses_temp_clone_self_reference(self):
+        """Temp-clone basename ``repo`` still suppresses when source identity corroborates."""
         state = {
-            "skill_path": "/tmp/checkout-root",
+            "skill_path": "/tmp/skillspector_abc123/repo",
+            "selected_source_identity": "example-skill",
             "manifest": {"name": "example-skill"},
             "components": ["README.md"],
             "file_cache": {"README.md": "Root skill: skills/example-skill/SKILL.md"},
@@ -906,10 +907,52 @@ class TestRunStaticPatternsAgentSnooping:
 
         result = agent_snooping_module.node(state)
 
+        readme_event = next(
+            event for event in result["inspection_ledger"] if event["path"] == "README.md"
+        )
+        assert readme_event["outcome"] == "completed"
+        assert readme_event["emitted_finding_ids"] == []
+        assert not any(f.rule_id == "AS3" for f in result["findings"])
+
+    def test_as3_path_basename_suppresses_without_trusting_mismatched_manifest(self):
+        """Scan-root basename suppresses self-paths; uncorroborated manifest names do not."""
+        state = {
+            "skill_path": "/tmp/checkout-root/example-skill",
+            "manifest": {"name": "published-name"},
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": (
+                    "Root skill: skills/example-skill/SKILL.md\n"
+                    "Also: skills/published-name/SKILL.md\n"
+                    "Peer: skills/other-skill/SKILL.md"
+                )
+            },
+        }
+
+        result = agent_snooping_module.node(state)
+
         as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
         assert [finding.matched_text for finding in as3_findings] == [
-            "skills/example-skill/SKILL.md"
+            "skills/published-name/SKILL.md",
+            "skills/other-skill/SKILL.md",
         ]
+
+    def test_as3_adversarial_mismatched_manifest_does_not_suppress_peer_path(self):
+        """Malicious manifest name unequal to trusted source identity cannot hide AS3."""
+        state = {
+            "skill_path": "/tmp/skillspector_abc123/repo",
+            "selected_source_identity": "evil-skill",
+            "manifest": {"name": "victim"},
+            "components": ["README.md"],
+            "file_cache": {
+                "README.md": ("Self: skills/evil-skill/SKILL.md\nPeer: skills/victim/SKILL.md")
+            },
+        }
+
+        result = agent_snooping_module.node(state)
+
+        as3_findings = [finding for finding in result["findings"] if finding.rule_id == "AS3"]
+        assert [finding.matched_text for finding in as3_findings] == ["skills/victim/SKILL.md"]
 
     def test_as3_long_current_skill_path_is_not_snooping(self):
         """Self-reference comparison uses the full path before evidence truncation."""

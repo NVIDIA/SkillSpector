@@ -709,6 +709,57 @@ def _validate_zip_member_type(info: zipfile.ZipInfo) -> None:
         raise ValueError("Zip directory entry contains file data")
 
 
+def selected_source_identity_for_input(input_path: str) -> str | None:
+    """Return a host/operator-selected skill identity from the original input.
+
+    Temporary git/zip materialization uses ephemeral scan-root basenames such as
+    ``repo`` or ``extracted``. The repository, archive, or selected local path
+    name remains a trusted corroborating identity for AS3 self-reference
+    suppression without trusting contributor-controlled manifest data alone.
+    """
+    text = input_path.strip()
+    if not text:
+        return None
+
+    if text.startswith("git@"):
+        match = re.match(r"^git@[^:]+:(.+)$", text)
+        if match is None:
+            return None
+        repo_path = match.group(1).removesuffix(".git").rstrip("/")
+        name = repo_path.rsplit("/", 1)[-1]
+        return name.strip() or None
+
+    if text.startswith(("https://", "http://")):
+        parsed = urlparse(text)
+        path = (parsed.path or "").removesuffix(".git").rstrip("/")
+        parts = [part for part in path.split("/") if part]
+        if not parts:
+            return None
+        # github.com/owner/repo[/...], raw.githubusercontent.com/owner/repo/...
+        name = parts[1] if len(parts) >= 2 else parts[0]
+        return name.strip() or None
+
+    local = Path(text)
+    if local.suffix.lower() == ".zip":
+        stem = local.stem.strip()
+        return stem or None
+    if local.suffix.lower() == ".md":
+        parent_name = local.parent.name.strip()
+        if parent_name and parent_name not in {".", ".."}:
+            return parent_name
+        stem = local.stem.strip()
+        if stem and stem.casefold() != "skill":
+            return stem
+        return None
+
+    name = local.name.strip()
+    if not name or name in {".", ".."}:
+        return None
+    if name in {"repo", "extracted"} or name.startswith("skillspector_"):
+        return None
+    return name
+
+
 class InputHandler:
     """
     Handles input resolution for different source types.
