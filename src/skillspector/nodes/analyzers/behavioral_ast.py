@@ -78,6 +78,26 @@ _DANGEROUS_GETATTR_NAMES = frozenset({"exec", "eval", "system", "popen", "__impo
 # access the subscript form catches, so all three get identical treatment.
 _REFLECTIVE_DICT_READ_METHODS = frozenset({"get", "setdefault", "pop"})
 
+
+def _constant_string(node: ast.expr) -> str | None:
+    """Resolve a deliberately small safe subset of constant string expressions."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        parts = [_constant_string(item) for item in node.args[0].elts]
+        if all(part is not None for part in parts):
+            return node.func.value.value.join(part for part in parts if part is not None)
+    return None
+
+
 _SUBPROCESS_CALLS = frozenset(
     {
         "call",
@@ -541,9 +561,10 @@ def _analyze_python(
 
         elif call_name == "getattr" and len(ast_node.args) >= 2:
             second_arg = ast_node.args[1]
-            if not isinstance(second_arg, ast.Constant):
+            resolved_name = _constant_string(second_arg)
+            if resolved_name is None:
                 _emit("AST7", ast_node)
-            elif isinstance(second_arg.value, str) and second_arg.value in _DANGEROUS_GETATTR_NAMES:
+            elif resolved_name in _DANGEROUS_GETATTR_NAMES:
                 _emit("AST9", ast_node)
 
     return findings if budget is None else list(budget.current_findings)
