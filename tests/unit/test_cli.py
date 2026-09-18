@@ -388,6 +388,57 @@ def test_cli_min_coverage_uses_strict_boundary_and_writes_report(
     assert json.loads(output.read_text())["analysis_completeness"]["coverage_percent"] == coverage
 
 
+@pytest.mark.parametrize(
+    ("analysis_completeness", "threshold"),
+    [
+        (None, 87),
+        ({"coverage_percent": None}, 87),
+        ({"coverage_percent": "unknown"}, 87),
+        ({"coverage_percent": True}, 0),
+        ({"coverage_percent": float("nan")}, 0),
+        ({"coverage_percent": float("inf")}, 0),
+    ],
+    ids=["missing", "null", "non-numeric", "boolean", "nan", "infinity"],
+)
+def test_cli_min_coverage_fails_closed_for_malformed_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    analysis_completeness: dict[str, object] | None,
+    threshold: float,
+) -> None:
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    graph_result: dict[str, object] = {
+        "report_body": json.dumps(
+            {"analysis_completeness": analysis_completeness}
+            if analysis_completeness is not None
+            else {}
+        ),
+        "execution_successful": True,
+        "risk_score": 0,
+    }
+    if analysis_completeness is not None:
+        graph_result["analysis_completeness"] = analysis_completeness
+    monkeypatch.setattr("skillspector.cli.graph.invoke", lambda state, config: graph_result)
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "-f",
+            "json",
+            "-o",
+            str(output),
+            "--min-coverage",
+            str(threshold),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert output.exists()
+
+
 @pytest.mark.parametrize("value", ["-1", "101", "nan", "inf"])
 def test_cli_min_coverage_rejects_invalid_values(tmp_path: Path, value: str) -> None:
     (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
@@ -625,6 +676,61 @@ def test_recursive_min_coverage_ignores_aggregate_completeness_for_partial_child
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["skills_omitted"] == 0
     assert payload["analysis_completeness"]["coverage_percent"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("analysis_completeness", "threshold"),
+    [
+        (None, 87),
+        ({"coverage_percent": None}, 87),
+        ({"coverage_percent": "unknown"}, 87),
+        ({"coverage_percent": True}, 0),
+        ({"coverage_percent": float("nan")}, 0),
+        ({"coverage_percent": float("inf")}, 0),
+    ],
+    ids=["missing", "null", "non-numeric", "boolean", "nan", "infinity"],
+)
+def test_recursive_min_coverage_fails_closed_for_malformed_child_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    analysis_completeness: dict[str, object] | None,
+    threshold: float,
+) -> None:
+    skills = [
+        SkillDirectory(tmp_path / "one", "one", "one"),
+        SkillDirectory(tmp_path / "two", "two", "two"),
+    ]
+    output = tmp_path / "combined.json"
+    malformed_child: dict[str, object] = {
+        "report_body": json.dumps(
+            {"analysis_completeness": analysis_completeness}
+            if analysis_completeness is not None
+            else {}
+        ),
+        "execution_successful": True,
+        "risk_score": 0,
+    }
+    if analysis_completeness is not None:
+        malformed_child["analysis_completeness"] = analysis_completeness
+    valid_child = _bounded_recursive_result("two", finding_count=0)
+    results = iter([malformed_child, valid_child])
+
+    def invoke(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return next(results)
+
+    monkeypatch.setattr(cli.graph, "invoke", invoke)
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            MultiSkillDetectionResult(is_multi_skill=True, skills=skills),
+            FormatChoice.json,
+            output,
+            no_llm=True,
+            min_coverage=threshold,
+        )
+
+    assert exit_info.value.exit_code == 1
+    assert output.exists()
 
 
 def test_recursive_scan_exits_two_after_writing_all_child_reports(tmp_path: Path) -> None:

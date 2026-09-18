@@ -361,8 +361,12 @@ def _coverage_below_threshold(result: dict[str, object], threshold: float | None
     if threshold is None:
         return False
     completeness = result.get("analysis_completeness")
-    coverage = completeness["coverage_percent"] if isinstance(completeness, dict) else None
-    return float(coverage) < threshold
+    coverage = completeness.get("coverage_percent") if isinstance(completeness, dict) else None
+    if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
+        return True
+    if not math.isfinite(coverage):
+        return True
+    return coverage < threshold
 
 
 def _recursive_json_payload(result: dict[str, object]) -> dict[str, object] | None:
