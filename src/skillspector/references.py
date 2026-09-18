@@ -151,6 +151,20 @@ def _normalize_candidate(raw: str, source_path: str) -> str | None:
     return joined.removeprefix("./")
 
 
+def _looks_like_bare_version_token(basename: str) -> bool:
+    """Return True when a basename resembles a version number, not a filename.
+
+    A purely numeric "extension" (e.g. "1.2", "v1.2", "1.2.0-beta.1") is
+    indistinguishable from a root-level file name without another path
+    signal: real file extensions are never all digits. This is only
+    consulted once exact and basename resolution against known_paths have
+    both failed, so a bundled file with a numeric extension (e.g. a
+    root-level "tool.1") still resolves normally rather than being rejected
+    outright.
+    """
+    return "." in basename and basename.rsplit(".", 1)[-1].isdigit()
+
+
 def resolve_bundle_references_with_metadata(
     skill_dir: Path,
     *,
@@ -228,6 +242,10 @@ def resolve_bundle_references_with_metadata(
                 elif len(matches) > 1:
                     status = "ambiguous"
                     disposition = ArtifactDisposition.PARTIAL
+                elif _looks_like_bare_version_token(PurePosixPath(target).name):
+                    status = "rejected"
+                    disposition = ArtifactDisposition.OUT_OF_SCOPE
+                    target = None
                 else:
                     status = "missing"
                     disposition = ArtifactDisposition.PARTIAL
