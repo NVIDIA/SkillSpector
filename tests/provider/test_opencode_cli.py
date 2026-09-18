@@ -258,7 +258,7 @@ class TestOpencodeAuthCheck:
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_rejects_unverified_version(self, mock_run: MagicMock) -> None:
-        mock_run.return_value = _ok_result(b"1.18.31\n")
+        mock_run.return_value = _ok_result(b"1.18.99\n")
         ok, reason = _opencode_auth_check(OPENCODE_BINARY)
         assert ok is False
         assert _OPENCODE_SUPPORTED_VERSION in (reason or "")
@@ -430,7 +430,7 @@ class TestOpencodeDenyAllPolicy:
         markers.mkdir()
         self._write_fake_opencode(binary)
         monkeypatch.setenv("ATTACK_MARKERS", str(markers))
-        monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.31")
+        monkeypatch.setenv("FAKE_OPENCODE_VERSION", "1.18.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match=f"only for version {_OPENCODE_SUPPORTED_VERSION}"):
@@ -443,7 +443,7 @@ class TestOpencodeDenyAllPolicy:
 # ---------------------------------------------------------------------------
 
 
-# Real opencode 1.18.30 envelope shapes (Step-0 probe:
+# Real opencode 1.18.31 envelope shapes (Step-0 probe:
 # `opencode run "say hi" --format json` in an empty dir; verbatim raw saved
 # to Temp scratch only). Top-level `type` is one of step_start / text /
 # step_finish; the reply text lives at part.text of `text` events.
@@ -484,7 +484,7 @@ class TestParseOpencodeOutput:
 
     def test_skips_non_json_noise_lines(self) -> None:
         # Banner/TUI noise must never leak into the extracted output.
-        raw = f"opencode v1.18.30\n{_TEXT_EVENT}\nattaching session...\n"
+        raw = f"opencode v1.18.31\n{_TEXT_EVENT}\nattaching session...\n"
         assert _parse_opencode_output(raw) == "hi"
 
     def test_empty_stdout_raises(self) -> None:
