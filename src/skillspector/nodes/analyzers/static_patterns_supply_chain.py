@@ -29,6 +29,7 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import codecs
 import io
 import json
 import os
@@ -156,6 +157,59 @@ _PIPE_TO_SHELL = re.compile(
     re.IGNORECASE,
 )
 _MAX_WARNED_INSTALLER_LINE_CHARS = 4_096
+_MAX_LITERAL_XOR_KEY_BYTES = 256
+_MAX_LITERAL_XOR_VALUES = 4_096
+
+
+def _decoded_literal_xor_calls(content: str) -> list[tuple[int, str]]:
+    """Decode literal byte arrays passed to a recognizable local XOR helper.
+
+    This stays regex-based because the workflow shares one Python AST parse among
+    behavioral analyzers. A second parse in static pattern analysis breaks that
+    graph-level cache.
+    """
+    function_pattern = re.compile(
+        r"^def\s+(?P<name>[A-Za-z_]\w*)\([^)]*\):(?P<body>(?:\n[ \t]+.*)+)",
+        re.MULTILINE,
+    )
+    key_pattern = re.compile(r"\b\w+\s*=\s*b(['\"])(?P<key>(?:\\.|[^'\"])*)\1")
+    decoded: list[tuple[int, str]] = []
+    for function in function_pattern.finditer(content):
+        body = function.group("body")
+        key_match = key_pattern.search(body)
+        if key_match is None or "bytes(" not in body or "^" not in body or ".decode(" not in body:
+            continue
+        try:
+            key = codecs.decode(key_match.group("key"), "unicode_escape").encode("latin1")
+        except (UnicodeError, ValueError):
+            continue
+        if not key or len(key) > _MAX_LITERAL_XOR_KEY_BYTES:
+            continue
+        call_pattern = re.compile(
+            rf"\b{re.escape(function.group('name'))}\(\s*\[(?P<values>[\d,\s]+)\]\s*\)"
+        )
+        for call in call_pattern.finditer(content):
+            try:
+                values = [int(value) for value in call.group("values").split(",") if value.strip()]
+            except ValueError:
+                continue
+            if (
+                not values
+                or len(values) > _MAX_LITERAL_XOR_VALUES
+                or any(value < 0 or value > 255 for value in values)
+            ):
+                continue
+            try:
+                decoded_bytes = bytes(
+                    value ^ key[index % len(key)] for index, value in enumerate(values)
+                )
+                command = decoded_bytes.decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                continue
+            decoded.append((get_line_number(content, call.start()), command))
+    return decoded
+
+
 SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
@@ -1300,6 +1354,26 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=mt,
                 )
             )
+    if file_type == "python":
+        line_offsets = [0]
+        line_offsets.extend(index + 1 for index, char in enumerate(content) if char == "\n")
+        for line_num, command in _decoded_literal_xor_calls(content):
+            for pattern, confidence in SC2_PATTERNS:
+                if not re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
+                    continue
+                findings.append(
+                    AnalyzerFinding(
+                        rule_id="SC2",
+                        message="External Script Fetching",
+                        severity=Severity.HIGH,
+                        location=loc(line_num),
+                        confidence=confidence,
+                        tags=list(tag),
+                        context=ctx(line_offsets[line_num - 1]),
+                        matched_text=command[:200],
+                    )
+                )
+                break
     if file_type in ("python", "javascript", "shell", "other"):
         for pattern, confidence in SC3_PATTERNS:
             matches = (
