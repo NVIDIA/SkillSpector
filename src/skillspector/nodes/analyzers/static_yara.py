@@ -28,6 +28,7 @@ import hashlib
 import math
 import os
 import stat
+import threading
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -46,6 +47,7 @@ from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
+    LedgerRecordType,
     analyzer_status_event,
     ledger_event,
 )
@@ -173,8 +175,18 @@ def _enforce_rule_load_deadline() -> None:
 
 
 # Module-level cache keyed by a content hash of all rule directories.
+#
+# These three are one logical value: the compiled rules, the hash they were
+# compiled from, and how many files were dropped producing them. They must only
+# ever be written or read as a set, under ``_RULES_LOCK`` -- see
+# :func:`load_rules_with_skips` for why reading them separately is unsafe.
 _compiled_rules: yara.Rules | None = None
 _rules_hash: str | None = None
+_rules_skipped_count: int = 0
+
+# Reentrant so the load-and-read transaction in :func:`load_rules_with_skips`
+# can hold it across its own call to :func:`_load_rules`.
+_RULES_LOCK = threading.RLock()
 
 
 def _collect_rule_files(*dirs: Path) -> list[Path]:
@@ -334,13 +346,36 @@ def _read_rule_source(rule_file: Path, data: bytes | None = None) -> str:
     return base64.b64decode("".join(encoded_source.split())).decode("utf-8")
 
 
+#: Cap on how much of a decode/compile error is echoed into logs. Rule sources
+#: are attacker-influenced when ``--yara-rules-dir`` points at untrusted content,
+#: and YARA syntax errors can quote the offending source line, so the reason is
+#: truncated rather than passed through whole.
+MAX_RULE_REJECTION_REASON_CHARS = 200
+
+
+def _bounded_rejection_reason(exc: Exception) -> str:
+    """Return a single-line, length-capped description of a rule rejection."""
+    reason = " ".join(str(exc).split())
+    if len(reason) > MAX_RULE_REJECTION_REASON_CHARS:
+        reason = f"{reason[:MAX_RULE_REJECTION_REASON_CHARS]}..."
+    return reason or exc.__class__.__name__
+
+
 def _build_namespace_map(
     rule_files: list[Path],
     temp_dir: Path | None = None,
     *,
     raw_cache: dict[Path, bytes] | None = None,
+    namespace_files: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], int]:
-    """Build a {namespace: source} dict and count malformed rule files."""
+    """Build a {namespace: source} dict and count malformed rule files.
+
+    If ``namespace_files`` is given it is populated with ``{namespace: filename}``
+    so a later compile failure can name the file the operator has to fix -- a
+    namespace has its extension stripped, so it is not a usable filename on its
+    own. Passed in rather than returned to keep this function's two-value
+    signature, which existing callers and tests unpack directly.
+    """
     del temp_dir
     sources: dict[str, str] = {}
     skipped = 0
@@ -351,16 +386,34 @@ def _build_namespace_map(
         ns = _rule_namespace(rf)
         if ns in sources:
             ns = f"{rf.parent.name}/{ns}"
+        if namespace_files is not None:
+            namespace_files[ns] = rf.name
         try:
             sources[ns] = _read_rule_source(rf, raw_cache[rf])
         except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
             skipped += 1
-            logger.debug("%s: skipping malformed encoded rule %s: %s", ANALYZER_ID, rf, exc)
+            # WARNING, not DEBUG: a dropped rule silently removes a detector, so
+            # the operator has to be able to identify and repair the file from a
+            # default-level run (#554). The filename is named explicitly because
+            # the ledger event is scoped to the rule set, not to one file.
+            logger.warning(
+                "%s: rejected rule file %s (could not decode): %s",
+                ANALYZER_ID,
+                rf.name,
+                _bounded_rejection_reason(exc),
+            )
     return sources, skipped
 
 
-def _compile_rules(sources: dict[str, str]) -> tuple[yara.Rules | None, int]:
+def _compile_rules(
+    sources: dict[str, str],
+    *,
+    namespace_files: dict[str, str] | None = None,
+) -> tuple[yara.Rules | None, int]:
     """Compile YARA rules from a namespace map. Falls back to per-source compilation on error.
+
+    ``namespace_files`` maps namespace to filename so a rejection can name the
+    file the operator has to fix rather than its extension-stripped namespace.
 
     Returns (compiled_rules, skipped_count).
     """
@@ -382,7 +435,14 @@ def _compile_rules(sources: dict[str, str]) -> tuple[yara.Rules | None, int]:
             good[ns] = source
         except (yara.SyntaxError, yara.Error) as exc:
             skipped += 1
-            logger.debug("%s: skipping %s: %s", ANALYZER_ID, ns, exc)
+            # WARNING for the same reason as the decode path above: without it a
+            # broken detector disappears with no default-level trace (#554).
+            logger.warning(
+                "%s: rejected rule file %s (could not compile): %s",
+                ANALYZER_ID,
+                (namespace_files or {}).get(ns, ns),
+                _bounded_rejection_reason(exc),
+            )
 
     _enforce_rule_load_deadline()
     compiled = yara.compile(sources=good) if good else None
@@ -394,38 +454,94 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     """Compile YARA rules from built-in and optional user-supplied directories.
 
     Results are cached at module level and reused if directory contents haven't changed.
+
+    Rule files that fail to decode (malformed base64) or fail to compile (YARA
+    syntax errors) are dropped from the active rule set. The count is recorded
+    in the module-level ``_rules_skipped_count`` (read via
+    :func:`rules_skipped_count`) rather than returned here, so this keeps its
+    original single-value signature and every existing
+    ``monkeypatch.setattr(static_yara, "_load_rules", ...)`` test double stays
+    valid; callers that care about the skip count must surface it themselves
+    or a scan can report ``completed``/SAFE while some of its own detections
+    never ran (#554).
+
+    Callers should prefer :func:`load_rules_with_skips`, which returns both
+    halves as one value; reading the count separately after this returns is
+    racy across concurrent scans.
     """
-    global _compiled_rules, _rules_hash  # noqa: PLW0603
+    global _compiled_rules, _rules_hash, _rules_skipped_count  # noqa: PLW0603
 
-    dirs = [_BUILTIN_RULES_DIR]
-    if extra_dir and extra_dir.is_dir():
-        dirs.append(extra_dir)
-    elif extra_dir:
-        logger.warning("%s: user rules directory %s does not exist", ANALYZER_ID, extra_dir)
+    with _RULES_LOCK:
+        dirs = [_BUILTIN_RULES_DIR]
+        if extra_dir and extra_dir.is_dir():
+            dirs.append(extra_dir)
+        elif extra_dir:
+            logger.warning("%s: user rules directory %s does not exist", ANALYZER_ID, extra_dir)
 
-    rule_files = _collect_rule_files(*dirs)
-    if not rule_files:
-        logger.info("%s: no YARA rule files found", ANALYZER_ID)
-        return None
+        rule_files = _collect_rule_files(*dirs)
+        if not rule_files:
+            logger.info("%s: no YARA rule files found", ANALYZER_ID)
+            _rules_skipped_count = 0
+            return None
 
-    raw_cache = _read_rule_bytes_cache(rule_files)
-    current_hash = _content_hash(rule_files, raw_cache)
-    if _compiled_rules is not None and _rules_hash == current_hash:
-        return _compiled_rules
+        raw_cache = _read_rule_bytes_cache(rule_files)
+        current_hash = _content_hash(rule_files, raw_cache)
+        if _compiled_rules is not None and _rules_hash == current_hash:
+            # Cache hit: _rules_skipped_count already describes this exact file
+            # set, because it is only ever written together with _rules_hash.
+            return _compiled_rules
 
-    sources, materialize_skipped = _build_namespace_map(rule_files, raw_cache=raw_cache)
-    compiled, compile_skipped = _compile_rules(sources)
-    skipped = materialize_skipped + compile_skipped
+        namespace_files: dict[str, str] = {}
+        sources, materialize_skipped = _build_namespace_map(
+            rule_files, raw_cache=raw_cache, namespace_files=namespace_files
+        )
+        compiled, compile_skipped = _compile_rules(sources, namespace_files=namespace_files)
+        skipped = materialize_skipped + compile_skipped
+        _rules_skipped_count = skipped
 
-    if compiled is None:
-        logger.warning("%s: failed to compile any YARA rules", ANALYZER_ID)
-        return None
+        if compiled is None:
+            logger.warning("%s: failed to compile any YARA rules", ANALYZER_ID)
+            return None
 
-    _compiled_rules = compiled
-    _rules_hash = current_hash
-    loaded = len(sources) - compile_skipped
-    logger.info("%s: compiled %d YARA rule file(s) (%d skipped)", ANALYZER_ID, loaded, skipped)
-    return compiled
+        _compiled_rules = compiled
+        _rules_hash = current_hash
+        loaded = len(sources) - compile_skipped
+        logger.info("%s: compiled %d YARA rule file(s) (%d skipped)", ANALYZER_ID, loaded, skipped)
+        return compiled
+
+
+def load_rules_with_skips(extra_dir: Path | None = None) -> tuple[yara.Rules | None, int]:
+    """Load rules and return them with their own skip count, as one value.
+
+    The two halves must be obtained in a single locked transaction. Reading the
+    count separately after :func:`_load_rules` returns lets two concurrent
+    MCP/graph scans interleave: scan A loads rule set A, scan B loads rule set B
+    and overwrites the module-level count, then scan A reads B's count. Scan A
+    would then run rules A while reporting B's skip total -- and if B skipped
+    nothing, A reports ``completed`` even though one of A's own rules was
+    dropped, which is exactly the false-clean result #554 is about.
+
+    :func:`_load_rules` is called through the module global so existing
+    ``monkeypatch.setattr(static_yara, "_load_rules", ...)`` doubles still apply.
+    """
+    with _RULES_LOCK:
+        rules = _load_rules(extra_dir)
+        return rules, _rules_skipped_count
+
+
+def rules_skipped_count() -> int:
+    """Return how many rule files the most recent :func:`_load_rules` call dropped.
+
+    Zero both when nothing was skipped and when a cache hit meant no reload
+    ran; a cache hit implies the same file set was already validated by the
+    load that populated the cache, so nothing new could have been skipped.
+
+    Retained for callers that already hold :data:`_RULES_LOCK` or run
+    single-threaded. Anything reading this straight after :func:`_load_rules`
+    should use :func:`load_rules_with_skips` instead.
+    """
+    with _RULES_LOCK:
+        return _rules_skipped_count
 
 
 def _bounded_match_instances(
@@ -916,7 +1032,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     )
     deadline_token = _RULE_LOAD_DEADLINE.set(load_budget)
     try:
-        rules = _load_rules(extra_dir)
+        # One transaction: the skip count must describe *these* rules, not
+        # whatever a concurrent scan loaded in between.
+        rules, rules_skipped = load_rules_with_skips(extra_dir)
     except _YaraRuleResourceLimitError as exc:
         return _rule_limit_response(exc.reason, dict(exc.metrics))
     finally:
@@ -1072,6 +1190,41 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
+    if rules_skipped:
+        # A rule that fails to compile or decode is dropped from the active
+        # set with no per-file signal: every scanned component can still
+        # report COMPLETED, because the rule that would have flagged it
+        # simply never ran. Surface that as its own ledger event, scoped to
+        # the rule directory rather than a skill file, so it isn't silently
+        # absorbed into a clean-looking events list (#554).
+        events.append(
+            ledger_event(
+                # analyzer_id is deliberately omitted. ledger_event derives the
+                # work identity as ``analyzer_id or f"{record_type}:{phase}"``,
+                # so passing it would identify this event as
+                # ``static_yara`` + path -- identical to the planned work item
+                # for a *scanned component of the same name*. A skill file
+                # literally named ``yara_rules`` then collides with this event,
+                # both planned targets resolve to two matching events, and
+                # reconciliation raises a fatal ``unaccounted_work`` instead of
+                # the nonfatal partial scan this is meant to record. Falling
+                # back to ``system:static`` makes the identity disjoint from
+                # every analyzer work item by construction, so no choice of
+                # filename can collide -- renaming the synthetic path alone
+                # would only move the collision to the next unlucky name.
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="static",
+                # Not a scanned skill file: a synthetic scope for the rule
+                # set itself. Ledger paths must be relative POSIX paths, and
+                # the real rules directory (builtin or --yara-rules-dir) is
+                # absolute, so it cannot be used here.
+                path="yara_rules/",
+                reason=LedgerReason.READ_ERROR,
+                observed_artifacts=rules_skipped,
+                limit_artifacts=0,
+            )
+        )
     if not events:
         status = analyzer_status_event(
             analyzer_id=ANALYZER_ID,
