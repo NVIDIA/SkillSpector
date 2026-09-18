@@ -1355,6 +1355,10 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     assert meta["llm_degraded"] is True
     assert meta["llm_calls_attempted"] == 3
     assert meta["llm_calls_succeeded"] == 0
+    # Attempted calls remain execution evidence even when none returns a response.
+    assert meta["llm_provenance"]["provider"]["effective_adapter"] == "unknown"
+    assert meta["llm_provenance"]["determinism"]["classification"] == "nondeterministic"
+    assert meta["llm_provenance"]["determinism"]["control_status"] == "configuration_unknown"
     # Distinct error reasons are surfaced (deduped).
     assert "claude empty stdout" in meta["llm_error"]
     assert "static analysis only" in meta["llm_error"]
@@ -1698,6 +1702,7 @@ def test_json_report_preserves_counterless_cli_provider_observation(
 
     assert meta["inference_usage"] == []
     assert meta["llm_provenance"]["provider"]["effective_adapter"] == "claude_cli"
+    assert meta["llm_provenance"]["determinism"]["classification"] == "nondeterministic"
     assert meta["llm_provenance"]["determinism"]["control_status"] == "provider_defaults"
 
 
@@ -2171,6 +2176,14 @@ def test_explicit_all_not_applicable_semantic_pass_stays_safe(
 
     assert result["risk_recommendation"] == "SAFE"
     assert "llm_degraded" not in metadata
+    assert "llm_calls_attempted" not in metadata
+    assert metadata["llm_provenance"]["provider"]["effective_adapter"] == "not_applicable"
+    assert metadata["llm_provenance"]["determinism"] == {
+        "classification": "not_applicable",
+        "control_status": "not_applied",
+        "provider_guarantee": False,
+        "reason": "LLM analysis was not executed for this scan.",
+    }
 
 
 def test_unavailable_provider_floors_recommendation_even_with_success_records(

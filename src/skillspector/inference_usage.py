@@ -10,6 +10,8 @@ otherwise discard the provider message that carries token counters.
 
 from __future__ import annotations
 
+import base64
+import json
 import re
 import threading
 import weakref
@@ -32,7 +34,9 @@ _MAX_TOKEN_COUNT = (1 << 63) - 1
 _MIN_SAMPLING_SEED = -(1 << 63)
 _MAX_SAMPLING_SEED = (1 << 63) - 1
 _FORWARDED_CONTROL_NAMES = ("temperature", "seed", "reasoning_effort")
-_SAFE_SETTING_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:/+\-]{0,255}")
+# Public effort telemetry is an enum, even when a provider accepts arbitrary text.
+# Unrecognized provider-specific values must not become a channel for credentials.
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "auto"})
 _CREDENTIAL_PREFIXES = (
     "sk-",
     "nvapi-",
@@ -54,7 +58,9 @@ _CREDENTIAL_PREFIXES = (
     "asia",
     "aws-secret-",
 )
-_UNPREFIXED_CREDENTIAL = re.compile(r"(?:[0-9a-fA-F]{32,64}|[A-Za-z0-9_+/=-]{40,88})\Z")
+_UNPREFIXED_CREDENTIAL = re.compile(r"(?:[0-9a-fA-F]{32,64}|[A-Za-z0-9_+/=]{40,88})\Z")
+_AUTHORIZATION_CREDENTIAL = re.compile(r"(?:authorization\s*:\s*)?(?:bearer|basic)(?:\s|:)", re.I)
+_COMPACT_CREDENTIAL = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*){2,4}\Z")
 
 _CHAT_MODEL_CONTROLS: dict[
     int,
@@ -67,15 +73,38 @@ _CHAT_MODEL_CONTROLS: dict[
 _CHAT_MODEL_CONTROLS_LOCK = threading.Lock()
 
 
+def _is_compact_credential(value: str) -> bool:
+    """Recognize JSON JWT/JWE headers without rejecting dotted model versions."""
+    if not _COMPACT_CREDENTIAL.fullmatch(value):
+        return False
+    header = value.partition(".")[0]
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(decoded, dict)
+
+
 def looks_like_credential(value: object) -> bool:
     """Return whether a printable label resembles a common secret value."""
     if not isinstance(value, str):
         return False
     candidate = value.strip()
     lowered = candidate.lower()
-    return lowered.startswith(_CREDENTIAL_PREFIXES) or bool(
-        _UNPREFIXED_CREDENTIAL.fullmatch(candidate)
+    return (
+        lowered.startswith(_CREDENTIAL_PREFIXES)
+        or bool(_AUTHORIZATION_CREDENTIAL.match(candidate))
+        or _is_compact_credential(candidate)
+        # A full hyphenated model name is not an opaque base64 credential.
+        # Still reject long opaque components embedded in a namespaced label.
+        or any(_UNPREFIXED_CREDENTIAL.fullmatch(part) for part in candidate.split("-"))
     )
+
+
+def safe_reasoning_effort(value: object) -> str | None:
+    """Return a recognized effort value safe for public configuration telemetry."""
+    candidate = value.strip() if isinstance(value, str) else ""
+    return candidate if candidate in _REASONING_EFFORTS else None
 
 
 class InferenceUsageRecord(TypedDict):
@@ -120,15 +149,8 @@ def _forwarded_controls(value: Mapping[str, object] | None) -> dict[str, float |
                 and _MIN_SAMPLING_SEED <= raw <= _MAX_SAMPLING_SEED
             ):
                 controls[name] = raw
-        elif isinstance(raw, str):
-            setting = raw.strip()
-            if (
-                _SAFE_SETTING_RE.fullmatch(setting)
-                and "://" not in setting
-                and "@" not in setting
-                and not looks_like_credential(setting)
-            ):
-                controls[name] = setting
+        elif (setting := safe_reasoning_effort(raw)) is not None:
+            controls[name] = setting
     return controls
 
 

@@ -428,6 +428,10 @@ def test_public_projection_drops_unknown_fields_and_redacts_unsafe_labels() -> N
         "xoxb-fake-value",
         "hf_fake-value",
         "AIza-fake-value",
+        "Bearer synthetic-secret-token-123456",
+        "Basic c3ludGhldGljOnNlY3JldA==",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.fake_signature",
+        "ewogICJhbGciOiAibm9uZSIKfQ.eyJzdWIiOiJzeW50aGV0aWMifQ.",
         "0123456789abcdef" * 2,
         "AbCdEfGhIjKlMnOpQrSt" * 2,
     ],
@@ -541,7 +545,7 @@ def test_public_projection_ignores_unhashable_analyzer_ids() -> None:
     assert {item["model"] for item in result["analyzers"]} == {"redacted"}
 
 
-def test_provider_specific_reasoning_effort_is_recorded_exactly(
+def test_unknown_provider_specific_reasoning_effort_is_not_published(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skillspector.llm_provenance.get_active_provider", lambda: OpenAIProvider())
@@ -559,10 +563,9 @@ def test_provider_specific_reasoning_effort_is_recorded_exactly(
         ),
     )
 
-    assert result["sampling"]["reasoning_effort"]["requested"] == "provider specific value"
-    assert (
-        result["sampling"]["reasoning_effort"]["forwarded_to_client"] == "provider specific value"
-    )
+    assert result["sampling"]["reasoning_effort"]["requested"] is None
+    assert result["sampling"]["reasoning_effort"]["forwarded_to_client"] is None
+    assert "provider specific value" not in json.dumps(result)
 
 
 def test_invalid_and_unknown_controls_are_not_called_provider_defaults(

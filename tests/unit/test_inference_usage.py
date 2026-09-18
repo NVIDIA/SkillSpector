@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
@@ -78,7 +79,11 @@ def test_collector_marks_response_received_without_usage_counters() -> None:
     assert sanitize_inference_usage(observation) == []
 
 
-def test_constructor_control_registry_drops_credential_shaped_effort() -> None:
+@pytest.mark.parametrize(
+    "effort",
+    ["github_pat_fake-value", "Bearer synthetic-secret-token-123456", "unrecognized setting"],
+)
+def test_constructor_control_registry_drops_credential_shaped_effort(effort: str) -> None:
     class _ChatModel:
         pass
 
@@ -88,12 +93,12 @@ def test_constructor_control_registry_drops_credential_shaped_effort() -> None:
         {
             "temperature": 0.2,
             "seed": 7,
-            "reasoning_effort": "github_pat_fake-value",
+            "reasoning_effort": effort,
         },
         requested_controls={
             "temperature": 0.2,
             "seed": 7,
-            "reasoning_effort": "github_pat_fake-value",
+            "reasoning_effort": effort,
         },
     )
 
@@ -394,6 +399,7 @@ def test_report_sanitizer_rejects_url_and_userinfo_model_labels() -> None:
                 {**common, "model": "https://key@private-host/v1"},
                 {**common, "model": "key@private-host"},
                 {**common, "model": "github_pat_fake-value"},
+                {**common, "model": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.signature"},
                 {**common, "model": "0123456789abcdef" * 2},
             ]
         )

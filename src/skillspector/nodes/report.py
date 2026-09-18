@@ -1150,7 +1150,14 @@ def _build_metadata(
     # some coverage was lost) into one boolean.
     execution_enabled = use_llm if llm_execution_enabled is None else llm_execution_enabled
     unavailable_before_execution = bool(use_llm and not execution_enabled)
-    llm_executed = bool(use_llm and execution_enabled)
+    response_observed = any(
+        isinstance(record, Mapping) and record.get("usage_source") == "provider_response"
+        for record in inference_usage or []
+    )
+    # Enablement alone does not prove execution: every analyzer may have
+    # returned not_applicable. Failed attempts still count, as do successful
+    # provider responses whose transport supplied no token counters.
+    llm_executed = bool(use_llm and execution_enabled and (attempted or response_observed))
     meta_analysis_applied = (
         use_llm and execution_enabled and provider_available and meta_analyzer_succeeded
     )

@@ -12,7 +12,7 @@ import re
 from collections.abc import Mapping, Sequence
 from importlib.metadata import distribution, version
 
-from skillspector.inference_usage import looks_like_credential, provider_name
+from skillspector.inference_usage import looks_like_credential, provider_name, safe_reasoning_effort
 from skillspector.providers import get_active_provider, get_model_config_provider
 from skillspector.providers.chat_models import (
     MAX_SAMPLING_SEED,
@@ -59,7 +59,8 @@ _REASONING_EFFORT_ADAPTERS = frozenset(
     }
 )
 _SAFE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,255}")
-_SAFE_SETTING = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:/+\-]{0,255}")
+_SAFE_DEPLOYMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]{0,255}")
+_SAFE_API_VERSION = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-preview)?")
 _MAX_SAFE_SEED = MAX_SAMPLING_SEED
 _MIN_SAFE_SEED = MIN_SAMPLING_SEED
 _CONTROL_SOURCES = frozenset(
@@ -85,24 +86,22 @@ def _safe_label(value: object, fallback: str = "unknown") -> str:
     return fallback
 
 
-def _safe_setting(value: object, fallback: str = "unknown") -> str:
-    """Return a bounded printable setting while allowing provider-specific spaces."""
-    candidate = value if isinstance(value, str) else ""
-    candidate = candidate.strip()
-    if (
-        _SAFE_SETTING.fullmatch(candidate)
-        and "://" not in candidate
-        and "@" not in candidate
-        and not looks_like_credential(candidate)
-    ):
-        return candidate
-    return fallback
-
-
 def _safe_optional_label(value: object) -> str | None:
     """Return a safe label or ``None`` without inventing a placeholder."""
     label = _safe_label(value, fallback="")
     return label or None
+
+
+def _safe_deployment(value: object) -> str | None:
+    """Deployment names have a narrower alphabet than namespaced model IDs."""
+    candidate = _safe_optional_label(value)
+    return candidate if candidate and _SAFE_DEPLOYMENT.fullmatch(candidate) else None
+
+
+def _safe_api_version(value: object) -> str | None:
+    """Azure API versions are dates with an optional preview suffix."""
+    candidate = value.strip() if isinstance(value, str) else ""
+    return candidate if _SAFE_API_VERSION.fullmatch(candidate) else None
 
 
 def _capture_source_revision() -> tuple[str, str]:
@@ -135,9 +134,9 @@ def _capture_provider_routing(resolved_adapter: str) -> dict[str, object]:
         }
 
     raw_deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
-    deployment = _safe_optional_label(raw_deployment)
+    deployment = _safe_deployment(raw_deployment)
     raw_api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "").strip()
-    api_version = _safe_optional_label(raw_api_version or _AZURE_OPENAI_DEFAULT_API_VERSION)
+    api_version = _safe_api_version(raw_api_version or _AZURE_OPENAI_DEFAULT_API_VERSION)
     return {
         "deployment_override": deployment,
         "deployment_source": (
@@ -182,7 +181,7 @@ def _requested_effort(raw: str) -> tuple[str | None, str]:
     if not raw:
         return None, "provider_default"
     value = resolve_reasoning_effort()
-    value = _safe_setting(value, fallback="")
+    value = safe_reasoning_effort(value)
     return (value, "environment") if value else (None, "invalid_environment")
 
 
@@ -297,7 +296,7 @@ def _sanitize_observed_control_values(
             else:
                 invalid = True
         else:
-            setting = _safe_setting(candidate, fallback="")
+            setting = safe_reasoning_effort(candidate)
             if setting:
                 observed.append(setting)
             else:
@@ -349,7 +348,7 @@ def _sanitize_control(
             else None
         )
     else:
-        requested = _safe_setting(requested, fallback="") or None
+        requested = safe_reasoning_effort(requested)
     if source == "environment" and requested is None:
         source = (
             "out_of_range"
@@ -432,7 +431,7 @@ def _sanitize_provider_routing(value: object, *, resolved_adapter: str) -> dict[
         }
 
     raw = value if isinstance(value, Mapping) else {}
-    deployment = _safe_optional_label(raw.get("deployment_override"))
+    deployment = _safe_deployment(raw.get("deployment_override"))
     deployment_source = raw.get("deployment_source")
     if not isinstance(deployment_source, str) or deployment_source not in _DEPLOYMENT_SOURCES:
         deployment_source = "unknown"
@@ -441,7 +440,7 @@ def _sanitize_provider_routing(value: object, *, resolved_adapter: str) -> dict[
     elif deployment_source != "environment":
         deployment = None
 
-    api_version = _safe_optional_label(raw.get("api_version"))
+    api_version = _safe_api_version(raw.get("api_version"))
     api_version_source = raw.get("api_version_source")
     if not isinstance(api_version_source, str) or api_version_source not in _API_VERSION_SOURCES:
         api_version_source = "unknown"
