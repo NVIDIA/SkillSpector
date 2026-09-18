@@ -115,6 +115,15 @@ TM1_CODE_PATTERNS = [
     # shell=True is a classic command injection vector
     (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True", 0.8),
     (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
+    # Preserve the direct-call signal when a Python boolean is assigned to a
+    # local name immediately before the invocation. The bounded newline gap
+    # avoids treating an arbitrary distant assignment as a data-flow fact.
+    (
+        r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
+        r"(?:(?![^\n]*\b\1\s*=)[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+        r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b",
+        0.8,
+    ),
     # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
     # Memory Manager headers) are not interpreted as destructive commands.
     # Keep the scan within one bounded shell command.  The former ``[^|]*``

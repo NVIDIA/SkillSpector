@@ -1448,6 +1448,14 @@ class TestToolMisuse:
         [
             pytest.param("subprocess.run(cmd, shell=True)", "runner.py", "python", id="shell_true"),
             pytest.param("Popen(cmd, shell=True)", "runner.py", "python", id="popen_shell_true"),
+            pytest.param(
+                "command = 'python a.py'\n"
+                "use_shell = True\n"
+                "subprocess.run(command, shell=use_shell)",
+                "runner.py",
+                "python",
+                id="static_true_shell_variable",
+            ),
             pytest.param("rm -rf /", "cleanup.sh", "shell", id="rm_rf_root"),
             pytest.param("chmod 777 /tmp/secrets", "setup.sh", "shell", id="chmod_777"),
             pytest.param("git push --force", "deploy.sh", "shell", id="git_force_push"),
@@ -1464,6 +1472,14 @@ class TestToolMisuse:
         findings = tm_mod.analyze("subprocess.run(cmd, shell=True)", "runner.py", "python")
         tm1 = [f for f in findings if f.rule_id == "TM1"]
         assert all(f.confidence >= 0.8 for f in tm1)
+
+    def test_tm1_ignores_reassigned_shell_variable(self) -> None:
+        findings = tm_mod.analyze(
+            "use_shell = True\nuse_shell = False\nsubprocess.run(cmd, shell=use_shell)",
+            "runner.py",
+            "python",
+        )
+        assert not any(finding.rule_id == "TM1" for finding in findings)
 
     def test_application_specific_no_verify_flag_is_not_tool_misuse(self) -> None:
         content = """\
