@@ -44,7 +44,34 @@ ANALYZER_ID = "static_patterns_excessive_agency"
 
 # EA1: Unrestricted Tool Access
 EA1_PATTERNS = [
-    (r"(?:tools?|permissions?)\s*:[ \t]*\[?[ \t]*['\"]?\*(?!\*|\w)['\"]?[ \t]*\]?", 0.85),
+    # Same-line wildcard grant. The key may be quoted (JSON). A quoted '*' is
+    # unambiguous as a scalar or a top-level list element — the list branch
+    # excludes '{', '}', and '[' so it never descends into a nested object or
+    # array: in tools: [{name: grep, pattern: "*"}] or
+    # tools: ["search", ["grep", "*"]] the '*' is not a top-level tool-list
+    # element and is not a grant. (Ceiling: a quoted element containing one
+    # of those delimiters before a genuine top-level "*" also stops the scan;
+    # walking quoted strings needs a parser, not a pattern.) A bare '*'
+    # counts only when it ends the line (optionally closed by ']' and/or a
+    # '#' comment), so a footnote legend like "Tools: * = requires auth" is
+    # not a grant. The gap around the colon stays on one line so the match
+    # can never bridge paragraphs (#405, #444).
+    (
+        r"['\"]?(?:tools?|permissions?)['\"]?[ \t]*:[ \t]*"
+        r"(?:\[[^\][{}\r\n]*['\"]\*['\"]"
+        r"|\[?[ \t]*['\"]\*['\"]"
+        r"|\[?[ \t]*\*(?![\*\w])[ \t]*\]?[ \t]*(?:#[^\r\n]*)?\r?$)",
+        0.85,
+    ),
+    # YAML block list whose first item is the wildcard (#445). Bounded to a
+    # single newline — a blank line still breaks the match — and the item's
+    # '*' must be standalone, so markdown lists ("- **Read**", "- *note*")
+    # do not collide. Later items are out of scope until seen in practice.
+    (
+        r"['\"]?(?:tools?|permissions?)['\"]?[ \t]*:[ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"[ \t]*-[ \t]+['\"]?\*(?![\*\w])['\"]?[ \t]*(?:#[^\r\n]*)?\r?$",
+        0.85,
+    ),
     (r"(?:allow|grant|enable)\s+(?:access\s+to\s+)?(?:all|any|every)\s+tools?", 0.8),
     (
         r"(?:no|without)\s+(?:tool|permission|access|capability)\s+(?:restrictions?|constraints?|limitations?)",
