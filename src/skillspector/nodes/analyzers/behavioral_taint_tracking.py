@@ -326,9 +326,7 @@ def _dynamic_module_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
     return _constant_string(node.args[0])
 
 
-def _build_reflective_sink_aliases(
-    tree: ast.Module, aliases: dict[str, str]
-) -> dict[str, str]:
+def _build_reflective_sink_aliases(tree: ast.Module, aliases: dict[str, str]) -> dict[str, str]:
     """Resolve statically-known module/getattr assignments to existing sink names."""
     modules: dict[str, str] = {}
     callables: dict[str, str] = {}
