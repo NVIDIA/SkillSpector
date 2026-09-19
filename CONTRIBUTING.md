@@ -19,6 +19,34 @@ by the [Developer Certificate of Origin](#developer-certificate-of-origin).
 - New analyzers should include corresponding unit tests and, where applicable,
   test fixtures.
 
+## Provider CLI Validation Expectations
+
+A new or re-verified agent-CLI provider scans untrusted skills, so its
+safety boundary must be enforcement, not documentation. Proposals that
+only describe a gap without closing it will be sent back. Concretely:
+
+- **Exact-version preflight before stdin, on every completion path.**
+  Pin the verified CLI release and re-check it immediately before each
+  inference call — not just in the availability probe, which direct
+  `complete()` calls never touch. A synthetic future-version binary must
+  be rejected before any prompt bytes move (test this).
+- **No hook material, no hooks.** User/plugin lifecycle hooks usually
+  have no argv off-switch. Where home isolation is usable, redirect the
+  CLI's config, plugin, and hook directories to per-invocation temp
+  dirs; where the CLI refuses to run isolated (probed and documented),
+  refuse inference when hook-capable material such as a non-empty
+  `installed-plugins/` tree is present instead. Either way, carry over
+  the minimum auth material and never a whole home directory.
+- **Adversarial fake-host tests proving zero side effects.** A fake
+  binary asserting the exact argv posture plus a marker for any executed
+  tool, hook, or weakened env var; empty marker directory or the test
+  fails.
+- **Synthetic-version gate tests.** A fake binary reporting an
+  unverified version must fail closed, including stdin-never-delivered
+  where the transport allows asserting it.
+- **No silent fallbacks.** Unknown agents, unparseable versions, missing
+  auth, and empty output all raise — never degrade to a weaker policy.
+
 ## Commit Sign-Off
 
 All contributions must include a `Signed-off-by` line in the commit message,
