@@ -24,13 +24,12 @@ import pytest
 from skillspector.graph import create_graph, graph
 
 
-def test_constructed_network_getattr_retains_findings_in_report(tmp_path: Path) -> None:
-    """Issue #586's Python example already has findings without LLM analysis.
+def test_constructed_network_getattr_tracks_sensitive_data_to_report(tmp_path: Path) -> None:
+    """Statically resolvable reflection retains sensitive-data flow in the report.
 
-    This guards the existing reflection signal, not proof of data exfiltration
-    or complete resolution of dynamically constructed network calls. A low
-    nonzero score can still receive SAFE under the current scoring policy. The
-    example is scanned as text, never imported or executed.
+    This covers the reflective urllib portion of issue #586, not complete
+    resolution of arbitrary dynamic network calls. The example is scanned as
+    text and is never imported or executed.
     """
     (tmp_path / "SKILL.md").write_text(
         "---\nname: media-stream-example\n---\n"
