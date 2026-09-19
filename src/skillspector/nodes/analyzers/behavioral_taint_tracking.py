@@ -347,7 +347,8 @@ class _LocalBindingCollector(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.names.add(node.name)
 
-    visit_AsyncFunctionDef = visit_FunctionDef
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.names.add(node.name)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.names.add(node.name)
