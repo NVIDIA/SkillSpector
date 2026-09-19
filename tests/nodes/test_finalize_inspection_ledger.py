@@ -901,3 +901,65 @@ def test_guard_analyzer_node_converts_unexpected_exception_to_fatal_facts() -> N
     assert result["inspection_ledger"][0]["error_class"] == "RuntimeError"
     assert "provider detail" not in result["inspection_ledger"][0]["message"]
     assert result["analyzer_status_events"][0]["status"] == "failed"
+
+
+def test_analyzer_registry_load_failure_marks_scan_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A module the registry dropped at import time must not report a clean scan.
+
+    ``_discover_analyzers`` never wires a node for a module it fails to import,
+    so nothing else in the graph would otherwise notice that analyzer is
+    missing: no ledger event, no analyzer_status_events entry, no limitation.
+    """
+    monkeypatch.setattr(
+        finalizer_module,
+        "ANALYZER_LOAD_ERRORS",
+        {"static_patterns_data_exfiltration": "ImportError: no module named 'yara'"},
+    )
+
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        }
+    )
+
+    load_error_events = [
+        event
+        for event in result["inspection_ledger"]
+        if event.get("reason_code") == LedgerReason.ANALYZER_LOAD_ERROR
+    ]
+    assert len(load_error_events) == 1
+    assert load_error_events[0]["record_type"] == LedgerRecordType.SYSTEM
+    assert load_error_events[0]["outcome"] == LedgerOutcome.PARTIAL
+    assert load_error_events[0]["path"] == "analyzer_registry/static_patterns_data_exfiltration"
+
+    completeness = result["analysis_completeness"]
+    assert completeness["status"] == "partial"
+    assert completeness["is_complete"] is False
+    # A dropped analyzer is a coverage gap, not an execution crash: the run
+    # must not be forced into `cli.py`'s unconditional exit(2) for
+    # execution_successful is False.
+    assert completeness["execution_successful"] is True
+
+
+def test_no_analyzer_load_errors_leaves_completeness_untouched() -> None:
+    monkeypatch_free_result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [],
+        }
+    )
+
+    assert monkeypatch_free_result["analysis_completeness"]["status"] == "complete"
+    assert not any(
+        event.get("reason_code") == LedgerReason.ANALYZER_LOAD_ERROR
+        for event in monkeypatch_free_result["inspection_ledger"]
+    )

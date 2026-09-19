@@ -56,6 +56,7 @@ class LedgerReason(StrEnum):
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
+    ANALYZER_LOAD_ERROR = "analyzer_load_error"
     UNACCOUNTED_WORK = "unaccounted_work"
     SEMANTIC_RUNTIME_INCOMPLETE = "semantic_runtime_incomplete"
     FINDING_ACCOUNTING_ERROR = "finding_accounting_error"
@@ -118,6 +119,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
+    LedgerReason.ANALYZER_LOAD_ERROR: (
+        "Analyzer module failed to load and never began any inspection work."
+    ),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
     LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE: (
         "Requested semantic analysis did not produce complete per-source runtime telemetry."

@@ -18,7 +18,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.models import Finding
-from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.nodes.analyzers import ANALYZER_LOAD_ERRORS, ANALYZER_MODULES
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
     semantic_runtime_intent,
@@ -147,6 +147,27 @@ def _size_coverage_findings(
     return findings
 
 
+def _analyzer_load_error_events() -> list[InspectionLedgerEvent]:
+    """Surface analyzer modules dropped by the registry before any node ran.
+
+    ``_discover_analyzers`` logs an import failure and moves on, so a module
+    that cannot be imported never gets a graph node and never emits a
+    work-item event of its own. Recorded here as a SYSTEM record so a dropped
+    analyzer degrades ``analysis_completeness`` instead of leaving a scan
+    silently short of whatever that analyzer would have looked for.
+    """
+    return [
+        ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="analyzer_registry",
+            path=f"analyzer_registry/{module_name}",
+            reason=LedgerReason.ANALYZER_LOAD_ERROR,
+        )
+        for module_name in sorted(ANALYZER_LOAD_ERRORS)
+    ]
+
+
 def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
     """Validate full internal facts and derive the public completeness projection."""
     reference_findings = _reference_coverage_findings(state)
@@ -195,6 +216,7 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
                 limit_findings=MAX_FINDING_OUTPUT_RECORDS,
             )
         )
+    load_error_events = _analyzer_load_error_events()
     merged_state["findings"] = all_findings
     merged_state["effective_finding_ids"] = [
         *(state.get("effective_finding_ids") or []),
@@ -218,6 +240,7 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         *reference_events,
         *output_events,
         *runtime_events,
+        *load_error_events,
     ]
     reference_statuses = (
         [analyzer_status_for_events("reference_coverage", reference_events)]
@@ -239,6 +262,11 @@ def finalize_inspection_ledger(state: SkillspectorState) -> dict[str, object]:
         "execution_successful": completeness["execution_successful"],
         "findings": coverage_findings,
         "effective_finding_ids": effective_finding_ids,
-        "inspection_ledger": [*reference_events, *output_events, *runtime_events],
+        "inspection_ledger": [
+            *reference_events,
+            *output_events,
+            *runtime_events,
+            *load_error_events,
+        ],
         "analyzer_status_events": reference_statuses,
     }
