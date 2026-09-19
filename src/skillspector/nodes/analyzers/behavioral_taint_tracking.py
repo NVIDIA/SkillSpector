@@ -473,6 +473,15 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._visit_function(node)
 
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # A method does not close over its class namespace. Keep this focused
+        # resolver conservative instead of leaking class-body handles into methods.
+        for expression in [*node.decorator_list, *node.bases]:
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        self._shadow_names([node.name])
+
 
 def _build_reflective_sink_aliases(
     tree: ast.Module, aliases: dict[str, str]
