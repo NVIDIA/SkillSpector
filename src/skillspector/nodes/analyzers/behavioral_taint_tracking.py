@@ -304,6 +304,7 @@ def _constant_string(node: ast.expr, *, depth: int = 0) -> str | None:
         and len(node.args) == 1
         and not node.keywords
         and isinstance(node.args[0], (ast.List, ast.Tuple))
+        and len(node.args[0].elts) <= 64
     ):
         separator = _constant_string(node.func.value, depth=depth + 1)
         pieces = [_constant_string(item, depth=depth + 1) for item in node.args[0].elts]
@@ -338,6 +339,9 @@ def _build_reflective_sink_aliases(tree: ast.Module, aliases: dict[str, str]) ->
         targets = [target.id for target in assignment.targets if isinstance(target, ast.Name)]
         if not targets:
             continue
+        for target in targets:
+            modules.pop(target, None)
+            callables.pop(target, None)
         module = _dynamic_module_name(assignment.value, aliases)
         if module is not None:
             for target in targets:
