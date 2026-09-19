@@ -315,18 +315,6 @@ def _constant_string(node: ast.expr, *, depth: int = 0) -> str | None:
     return None
 
 
-def _dynamic_module_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
-    if not isinstance(node, ast.Call) or not node.args:
-        return None
-    function = resolve_dotted_name(node.func)
-    if function is None:
-        return None
-    function = apply_import_aliases(function, aliases)
-    if function != "importlib.import_module":
-        return None
-    return _constant_string(node.args[0])
-
-
 @dataclass
 class _ReflectiveScope:
     modules: dict[str, str] = field(default_factory=dict)
@@ -363,8 +351,7 @@ class _LocalBindingCollector(ast.NodeVisitor):
 class _ReflectiveSinkResolver(ast.NodeVisitor):
     """Resolve reflective sink handles at each call site with lexical scoping."""
 
-    def __init__(self, aliases: dict[str, str]) -> None:
-        self.aliases = aliases
+    def __init__(self) -> None:
         self.scopes = [_ReflectiveScope()]
         self.call_sinks: dict[ast.Call, str] = {}
 
@@ -379,7 +366,22 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
                 return values[name]
             if name in scope.shadowed:
                 return None
-        return self.aliases.get(name) if kind == "module" else None
+        return None
+
+    def _dynamic_module_name(self, node: ast.expr) -> str | None:
+        if not isinstance(node, ast.Call) or not node.args:
+            return None
+        function = resolve_dotted_name(node.func)
+        if function is None:
+            return None
+        root, separator, rest = function.partition(".")
+        resolved_root = self._lookup("module", root)
+        if resolved_root is None:
+            return None
+        function = f"{resolved_root}.{rest}" if separator else resolved_root
+        if function != "importlib.import_module":
+            return None
+        return _constant_string(node.args[0])
 
     @staticmethod
     def _target_names(targets: list[ast.expr]) -> list[str]:
@@ -402,7 +404,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
     def _bind(self, targets: list[ast.expr], value: ast.expr) -> None:
         names = self._target_names(targets)
         self._shadow_names(names)
-        module = _dynamic_module_name(value, self.aliases)
+        module = self._dynamic_module_name(value)
         if module is not None:
             for name in names:
                 self.scope.modules[name] = module
@@ -416,7 +418,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         base = value.args[0]
         module = self._lookup("module", base.id) if isinstance(base, ast.Name) else None
         if module is None:
-            module = _dynamic_module_name(base, self.aliases)
+            module = self._dynamic_module_name(base)
         attribute = _constant_string(value.args[1])
         if module is None or attribute is None:
             return
@@ -435,6 +437,23 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             self._bind([node.target], node.value)
         else:
             self._bind([node.target], node.annotation)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for imported in node.names:
+            local_name = imported.asname or imported.name.partition(".")[0]
+            canonical = imported.name if imported.asname else local_name
+            self._shadow_names([local_name])
+            self.scope.modules[local_name] = canonical
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module is None:
+            return
+        for imported in node.names:
+            if imported.name == "*":
+                continue
+            local_name = imported.asname or imported.name
+            self._shadow_names([local_name])
+            self.scope.modules[local_name] = f"{node.module}.{imported.name}"
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name):
@@ -483,10 +502,8 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         self._shadow_names([node.name])
 
 
-def _build_reflective_sink_aliases(
-    tree: ast.Module, aliases: dict[str, str]
-) -> dict[ast.Call, str]:
-    resolver = _ReflectiveSinkResolver(aliases)
+def _build_reflective_sink_aliases(tree: ast.Module) -> dict[ast.Call, str]:
+    resolver = _ReflectiveSinkResolver()
     resolver.visit(tree)
     return resolver.call_sinks
 
@@ -671,7 +688,7 @@ def _analyze_python(
 
     aliases = python_ast.import_aliases
     type_map = build_type_map(tree, aliases)
-    reflective_sinks = _build_reflective_sink_aliases(tree, aliases)
+    reflective_sinks = _build_reflective_sink_aliases(tree)
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
