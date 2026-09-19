@@ -327,52 +327,162 @@ def _dynamic_module_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
     return _constant_string(node.args[0])
 
 
-def _build_reflective_sink_aliases(tree: ast.Module, aliases: dict[str, str]) -> dict[str, str]:
-    """Resolve statically-known module/getattr assignments to existing sink names."""
-    modules: dict[str, str] = {}
-    callables: dict[str, str] = {}
-    assignments = sorted(
-        (node for node in ast.walk(tree) if isinstance(node, ast.Assign)),
-        key=lambda node: (node.lineno, node.col_offset),
-    )
-    for assignment in assignments:
-        targets = [target.id for target in assignment.targets if isinstance(target, ast.Name)]
-        if not targets:
-            continue
-        for target in targets:
-            modules.pop(target, None)
-            callables.pop(target, None)
-        module = _dynamic_module_name(assignment.value, aliases)
+@dataclass
+class _ReflectiveScope:
+    modules: dict[str, str] = field(default_factory=dict)
+    callables: dict[str, str] = field(default_factory=dict)
+    shadowed: set[str] = field(default_factory=set)
+
+
+class _LocalBindingCollector(ast.NodeVisitor):
+    """Collect names local to one function without entering nested scopes."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.names.add(node.id)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.names.update(alias.asname or alias.name.partition(".")[0] for alias in node.names)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.names.update(alias.asname or alias.name for alias in node.names)
+
+
+class _ReflectiveSinkResolver(ast.NodeVisitor):
+    """Resolve reflective sink handles at each call site with lexical scoping."""
+
+    def __init__(self, aliases: dict[str, str]) -> None:
+        self.aliases = aliases
+        self.scopes = [_ReflectiveScope()]
+        self.call_sinks: dict[ast.Call, str] = {}
+
+    @property
+    def scope(self) -> _ReflectiveScope:
+        return self.scopes[-1]
+
+    def _lookup(self, kind: str, name: str) -> str | None:
+        for scope in reversed(self.scopes):
+            values = scope.modules if kind == "module" else scope.callables
+            if name in values:
+                return values[name]
+            if name in scope.shadowed:
+                return None
+        return self.aliases.get(name) if kind == "module" else None
+
+    @staticmethod
+    def _target_names(targets: list[ast.expr]) -> list[str]:
+        names: list[str] = []
+        pending = list(targets)
+        while pending:
+            target = pending.pop()
+            if isinstance(target, ast.Name):
+                names.append(target.id)
+            elif isinstance(target, (ast.List, ast.Tuple)):
+                pending.extend(target.elts)
+        return names
+
+    def _bind(self, targets: list[ast.expr], value: ast.expr) -> None:
+        names = self._target_names(targets)
+        for name in names:
+            self.scope.shadowed.add(name)
+            self.scope.modules.pop(name, None)
+            self.scope.callables.pop(name, None)
+        module = _dynamic_module_name(value, self.aliases)
         if module is not None:
-            for target in targets:
-                modules[target] = module
-            continue
+            for name in names:
+                self.scope.modules[name] = module
+            return
         if not (
-            isinstance(assignment.value, ast.Call)
-            and resolve_dotted_name(assignment.value.func) == "getattr"
-            and len(assignment.value.args) >= 2
+            isinstance(value, ast.Call)
+            and resolve_dotted_name(value.func) == "getattr"
+            and len(value.args) >= 2
         ):
-            continue
-        base = assignment.value.args[0]
-        if isinstance(base, ast.Name):
-            module = modules.get(base.id) or aliases.get(base.id)
-        else:
-            module = _dynamic_module_name(base, aliases)
-        attribute = _constant_string(assignment.value.args[1])
+            return
+        base = value.args[0]
+        module = self._lookup("module", base.id) if isinstance(base, ast.Name) else None
+        if module is None:
+            module = _dynamic_module_name(base, self.aliases)
+        attribute = _constant_string(value.args[1])
         if module is None or attribute is None:
-            continue
+            return
         canonical = f"{module}.{attribute}"
         if canonical in _ALL_SINKS:
-            for target in targets:
-                callables[target] = canonical
-    return callables
+            for name in names:
+                self.scope.callables[name] = canonical
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        self._bind(node.targets, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self.visit(node.value)
+            self._bind([node.target], node.value)
+        else:
+            self._bind([node.target], node.annotation)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name):
+            sink = self._lookup("callable", node.func.id)
+            if sink is not None:
+                self.call_sinks[node] = sink
+        self.generic_visit(node)
+
+    @staticmethod
+    def _argument_names(arguments: ast.arguments) -> set[str]:
+        positional = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+        names = {argument.arg for argument in positional}
+        if arguments.vararg is not None:
+            names.add(arguments.vararg.arg)
+        if arguments.kwarg is not None:
+            names.add(arguments.kwarg.arg)
+        return names
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for expression in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+            if expression is not None:
+                self.visit(expression)
+        collector = _LocalBindingCollector()
+        for statement in node.body:
+            collector.visit(statement)
+        local_names = collector.names | self._argument_names(node.args)
+        self.scopes.append(_ReflectiveScope(shadowed=local_names))
+        for statement in node.body:
+            self.visit(statement)
+        self.scopes.pop()
+        self._bind([ast.Name(id=node.name, ctx=ast.Store())], node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+
+def _build_reflective_sink_aliases(
+    tree: ast.Module, aliases: dict[str, str]
+) -> dict[ast.Call, str]:
+    resolver = _ReflectiveSinkResolver(aliases)
+    resolver.visit(tree)
+    return resolver.call_sinks
 
 
 def _resolve_sink_name(
     node: ast.Call,
     type_map: dict[str, str] | None = None,
     aliases: dict[str, str] | None = None,
-    reflective_sinks: dict[str, str] | None = None,
+    reflective_sinks: dict[ast.Call, str] | None = None,
 ) -> str | None:
     """Resolve a call to its canonical sink name, including dynamic-import chains.
 
@@ -381,9 +491,9 @@ def _resolve_sink_name(
     ``importlib.import_module('subprocess').run(...)`` resolves to ``'subprocess.run'``
     and re-enters ``_EXEC_SINKS`` like the statically-imported form would.
     """
+    if reflective_sinks and node in reflective_sinks:
+        return reflective_sinks[node]
     name = resolve_call_name_typed(node, type_map, aliases)
-    if name is not None and reflective_sinks:
-        name = reflective_sinks.get(name, name)
     if name is None:
         name = resolve_dynamic_import_call(node, aliases)
     return name
