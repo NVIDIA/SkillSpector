@@ -393,12 +393,15 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
                 pending.extend(target.elts)
         return names
 
-    def _bind(self, targets: list[ast.expr], value: ast.expr) -> None:
-        names = self._target_names(targets)
+    def _shadow_names(self, names: list[str]) -> None:
         for name in names:
             self.scope.shadowed.add(name)
             self.scope.modules.pop(name, None)
             self.scope.callables.pop(name, None)
+
+    def _bind(self, targets: list[ast.expr], value: ast.expr) -> None:
+        names = self._target_names(targets)
+        self._shadow_names(names)
         module = _dynamic_module_name(value, self.aliases)
         if module is not None:
             for name in names:
@@ -462,7 +465,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         for statement in node.body:
             self.visit(statement)
         self.scopes.pop()
-        self._bind([ast.Name(id=node.name, ctx=ast.Store())], node)
+        self._shadow_names([node.name])
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function(node)
