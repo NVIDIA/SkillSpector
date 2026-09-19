@@ -320,6 +320,17 @@ class _ReflectiveScope:
     modules: dict[str, str] = field(default_factory=dict)
     callables: dict[str, str] = field(default_factory=dict)
     shadowed: set[str] = field(default_factory=set)
+    global_names: set[str] = field(default_factory=set)
+    nonlocal_names: set[str] = field(default_factory=set)
+
+    def clone(self) -> _ReflectiveScope:
+        return _ReflectiveScope(
+            modules=dict(self.modules),
+            callables=dict(self.callables),
+            shadowed=set(self.shadowed),
+            global_names=set(self.global_names),
+            nonlocal_names=set(self.nonlocal_names),
+        )
 
 
 class _LocalBindingCollector(ast.NodeVisitor):
@@ -327,6 +338,8 @@ class _LocalBindingCollector(ast.NodeVisitor):
 
     def __init__(self) -> None:
         self.names: set[str] = set()
+        self.global_names: set[str] = set()
+        self.nonlocal_names: set[str] = set()
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store):
@@ -340,6 +353,47 @@ class _LocalBindingCollector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.names.add(node.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        return
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        return
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        return
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        return
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.global_names.update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.nonlocal_names.update(node.names)
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if isinstance(node, ast.expr):
+            pending: list[ast.expr] = [node]
+            while pending:
+                expression = pending.pop()
+                if isinstance(
+                    expression,
+                    (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+                ):
+                    continue
+                if isinstance(expression, ast.Name):
+                    self.visit_Name(expression)
+                pending.extend(
+                    child
+                    for child in ast.iter_child_nodes(expression)
+                    if isinstance(child, ast.expr)
+                )
+            return
+        super().generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
         self.names.update(alias.asname or alias.name.partition(".")[0] for alias in node.names)
@@ -367,6 +421,24 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             if name in scope.shadowed:
                 return None
         return None
+
+    def _binding_scope(self, name: str) -> _ReflectiveScope:
+        current = self.scope
+        if name in current.global_names:
+            return self.scopes[0]
+        if name in current.nonlocal_names:
+            for scope in reversed(self.scopes[:-1]):
+                if name in scope.modules or name in scope.callables or name in scope.shadowed:
+                    return scope
+            if len(self.scopes) > 1:
+                return self.scopes[-2]
+        return current
+
+    def _is_unshadowed_builtin(self, name: str) -> bool:
+        for scope in reversed(self.scopes):
+            if name in scope.modules or name in scope.callables or name in scope.shadowed:
+                return False
+        return True
 
     def _dynamic_module_name(self, node: ast.expr) -> str | None:
         if not isinstance(node, ast.Call) or not node.args:
@@ -397,53 +469,73 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
 
     def _shadow_names(self, names: list[str]) -> None:
         for name in names:
-            self.scope.shadowed.add(name)
-            self.scope.modules.pop(name, None)
-            self.scope.callables.pop(name, None)
+            scope = self._binding_scope(name)
+            scope.shadowed.add(name)
+            scope.modules.pop(name, None)
+            scope.callables.pop(name, None)
+
+    def _set_binding(self, kind: str, name: str, value: str) -> None:
+        scope = self._binding_scope(name)
+        values = scope.modules if kind == "module" else scope.callables
+        values[name] = value
+        scope.shadowed.add(name)
 
     def _bind(self, targets: list[ast.expr], value: ast.expr) -> None:
         names = self._target_names(targets)
-        self._shadow_names(names)
         module = self._dynamic_module_name(value)
-        if module is not None:
-            for name in names:
-                self.scope.modules[name] = module
-            return
-        if not (
+        canonical: str | None = None
+        if (
             isinstance(value, ast.Call)
-            and resolve_dotted_name(value.func) == "getattr"
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "getattr"
+            and self._is_unshadowed_builtin("getattr")
             and len(value.args) >= 2
         ):
-            return
-        base = value.args[0]
-        module = self._lookup("module", base.id) if isinstance(base, ast.Name) else None
-        if module is None:
-            module = self._dynamic_module_name(base)
-        attribute = _constant_string(value.args[1])
-        if module is None or attribute is None:
-            return
-        canonical = f"{module}.{attribute}"
-        if canonical in _ALL_SINKS:
+            base = value.args[0]
+            reflected_module = (
+                self._lookup("module", base.id) if isinstance(base, ast.Name) else None
+            )
+            if reflected_module is None:
+                reflected_module = self._dynamic_module_name(base)
+            attribute = _constant_string(value.args[1])
+            candidate = (
+                f"{reflected_module}.{attribute}"
+                if reflected_module is not None and attribute is not None
+                else None
+            )
+            if candidate in _ALL_SINKS:
+                canonical = candidate
+
+        self._shadow_names(names)
+        if module is not None:
             for name in names:
-                self.scope.callables[name] = canonical
+                self._set_binding("module", name, module)
+            return
+        if canonical is not None:
+            for name in names:
+                self._set_binding("callable", name, canonical)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         self._bind(node.targets, node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
             self._bind([node.target], node.value)
-        else:
-            self._bind([node.target], node.annotation)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.target)
+        self.visit(node.value)
+        self._shadow_names([node.target.id] if isinstance(node.target, ast.Name) else [])
 
     def visit_Import(self, node: ast.Import) -> None:
         for imported in node.names:
             local_name = imported.asname or imported.name.partition(".")[0]
             canonical = imported.name if imported.asname else local_name
             self._shadow_names([local_name])
-            self.scope.modules[local_name] = canonical
+            self._set_binding("module", local_name, canonical)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module is None:
@@ -453,14 +545,65 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
                 continue
             local_name = imported.asname or imported.name
             self._shadow_names([local_name])
-            self.scope.modules[local_name] = f"{node.module}.{imported.name}"
+            if node.level == 0:
+                self._set_binding("module", local_name, f"{node.module}.{imported.name}")
 
-    def visit_Call(self, node: ast.Call) -> None:
+    def _record_call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name):
             sink = self._lookup("callable", node.func.id)
             if sink is not None:
                 self.call_sinks[node] = sink
-        self.generic_visit(node)
+
+    def _visit_comprehension(
+        self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
+    ) -> None:
+        if not node.generators:
+            return
+        self.visit(node.generators[0].iter)
+        targets = [
+            name for generator in node.generators for name in self._target_names([generator.target])
+        ]
+        self.scopes.append(_ReflectiveScope(shadowed=set(targets)))
+        for index, generator in enumerate(node.generators):
+            if index:
+                self.visit(generator.iter)
+            for condition in generator.ifs:
+                self.visit(condition)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+        self.scopes.pop()
+
+    def _visit_expression(self, expression: ast.expr) -> None:
+        pending: list[ast.expr] = [expression]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, ast.Lambda):
+                self.visit_Lambda(node)
+                continue
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                self._visit_comprehension(node)
+                continue
+            if isinstance(node, ast.NamedExpr):
+                self.visit(node.value)
+                self._bind([node.target], node.value)
+                continue
+            if isinstance(node, ast.Call):
+                self._record_call(node)
+            pending.extend(
+                child for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr)
+            )
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if isinstance(node, ast.expr):
+            self._visit_expression(node)
+            return
+        super().generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self._visit_expression(node)
 
     @staticmethod
     def _argument_names(arguments: ast.arguments) -> set[str]:
@@ -472,25 +615,48 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             names.add(arguments.kwarg.arg)
         return names
 
-    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    def _prepare_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for expression in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
             if expression is not None:
                 self.visit(expression)
+
+    def _analyze_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         collector = _LocalBindingCollector()
         for statement in node.body:
             collector.visit(statement)
-        local_names = collector.names | self._argument_names(node.args)
-        self.scopes.append(_ReflectiveScope(shadowed=local_names))
-        for statement in node.body:
-            self.visit(statement)
+        local_names = (collector.names | self._argument_names(node.args)) - (
+            collector.global_names | collector.nonlocal_names
+        )
+        self.scopes.append(
+            _ReflectiveScope(
+                shadowed=local_names,
+                global_names=collector.global_names,
+                nonlocal_names=collector.nonlocal_names,
+            )
+        )
+        self._visit_statements(node.body)
         self.scopes.pop()
-        self._shadow_names([node.name])
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._visit_function(node)
+        self._prepare_function(node)
+        self._shadow_names([node.name])
+        self._analyze_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._visit_function(node)
+        self._prepare_function(node)
+        self._shadow_names([node.name])
+        self._analyze_function(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for expression in [*node.args.defaults, *node.args.kw_defaults]:
+            if expression is not None:
+                self.visit(expression)
+        collector = _LocalBindingCollector()
+        collector.visit(node.body)
+        local_names = collector.names | self._argument_names(node.args)
+        self.scopes.append(_ReflectiveScope(shadowed=local_names))
+        self.visit(node.body)
+        self.scopes.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         # A method does not close over its class namespace. Keep this focused
@@ -500,6 +666,110 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         for keyword in node.keywords:
             self.visit(keyword.value)
         self._shadow_names([node.name])
+
+    @staticmethod
+    def _merge_scope(
+        base: _ReflectiveScope, left: _ReflectiveScope, right: _ReflectiveScope
+    ) -> _ReflectiveScope:
+        merged = base.clone()
+        for kind in ("modules", "callables"):
+            destination = getattr(merged, kind)
+            left_values = getattr(left, kind)
+            right_values = getattr(right, kind)
+            for name in set(destination) | set(left_values) | set(right_values):
+                left_value = left_values.get(name)
+                right_value = right_values.get(name)
+                if left_value == right_value:
+                    if left_value is not None:
+                        destination[name] = left_value
+                    else:
+                        destination.pop(name, None)
+                elif left_value is not None and right_value is None:
+                    destination[name] = left_value
+                elif right_value is not None and left_value is None:
+                    destination[name] = right_value
+                else:
+                    destination.pop(name, None)
+        all_names = left.shadowed | right.shadowed
+        merged.shadowed.update(all_names)
+        merged.shadowed.update(merged.modules)
+        merged.shadowed.update(merged.callables)
+        return merged
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        base = [scope.clone() for scope in self.scopes]
+        self.scopes = [scope.clone() for scope in base]
+        self._visit_statements(node.body)
+        left = self.scopes
+        self.scopes = [scope.clone() for scope in base]
+        self._visit_statements(node.orelse)
+        right = self.scopes
+        self.scopes = [
+            self._merge_scope(original, body_scope, else_scope)
+            for original, body_scope, else_scope in zip(base, left, right, strict=True)
+        ]
+
+    def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
+        self.visit(node.iter)
+        self._shadow_names(self._target_names([node.target]))
+        self._visit_statements(node.body)
+        self._visit_statements(node.orelse)
+
+    def visit_For(self, node: ast.For) -> None:
+        self._visit_for(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self._visit_for(node)
+
+    def _visit_with(self, node: ast.With | ast.AsyncWith) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._shadow_names(self._target_names([item.optional_vars]))
+        self._visit_statements(node.body)
+
+    def visit_With(self, node: ast.With) -> None:
+        self._visit_with(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self._visit_with(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self._shadow_names([node.name])
+        self._visit_statements(node.body)
+        if node.name is not None:
+            self._shadow_names([node.name])
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        self._shadow_names(self._target_names(node.targets))
+
+    def _visit_statements(self, statements: list[ast.stmt]) -> None:
+        deferred: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._prepare_function(statement)
+                self._shadow_names([statement.name])
+                deferred.append(statement)
+                continue
+            if isinstance(statement, ast.ClassDef):
+                self.visit_ClassDef(statement)
+                for child in statement.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        self._prepare_function(child)
+                        deferred.append(child)
+                continue
+            self.visit(statement)
+        for function in deferred:
+            outer_scopes = [scope.clone() for scope in self.scopes]
+            self._analyze_function(function)
+            self.scopes = outer_scopes
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._visit_statements(node.body)
 
 
 def _build_reflective_sink_aliases(tree: ast.Module) -> dict[ast.Call, str]:
