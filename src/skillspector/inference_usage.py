@@ -115,6 +115,7 @@ def provider_name(provider: object) -> str:
         "BedrockProvider": "bedrock",
         "ClaudeCLIProvider": "claude_cli",
         "CodexCLIProvider": "codex_cli",
+        "CopilotCLIProvider": "copilot_cli",
         "GeminiCLIProvider": "gemini_cli",
         "NvBuildProvider": "nv_build",
         "NvInferenceProvider": "nv_inference",

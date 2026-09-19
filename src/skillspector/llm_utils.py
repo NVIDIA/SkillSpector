@@ -17,9 +17,9 @@
 
 Credentials are resolved in this order:
     1. The active provider (see :mod:`skillspector.providers`):
-       - CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
-         ``opencode_cli``): use ``is_available()`` and ``complete()`` — no
-         API key needed.
+       - CLI providers (``claude_cli``, ``codex_cli``, ``copilot_cli``,
+         ``gemini_cli``, ``opencode_cli``): use ``is_available()`` and
+         ``complete()`` — no API key needed.
        - HTTP providers (``anthropic``, ``openai``, ``nv_build``): read their
          respective credential env vars and supply a base URL.
     2. ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` (the langchain-openai
@@ -127,7 +127,7 @@ def _resolve_default_chat_model() -> str:
 def is_llm_available() -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
-    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    CLI providers (``claude_cli``, ``codex_cli``, ``copilot_cli``, ``gemini_cli``,
     ``opencode_cli``) are checked through their ``is_available()`` method
     first. Other providers probe the same native chat-model path used by
     :func:`get_chat_model`; unbound HTTP providers keep the
@@ -362,7 +362,7 @@ def get_chat_model(
 ) -> BaseChatModel | AgentCLIChatModel:
     """Return a chat model for the active provider.
 
-    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    For CLI providers (``claude_cli``, ``codex_cli``, ``copilot_cli``, ``gemini_cli``,
     ``opencode_cli``) this returns an :class:`AgentCLIChatModel` adapter
     backed by the provider's ``complete()`` subprocess transport — so the
     LLM analyzers (which use ``.invoke()`` and ``.with_structured_output()``)

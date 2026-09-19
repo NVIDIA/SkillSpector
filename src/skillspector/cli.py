@@ -552,8 +552,8 @@ def scan(
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
-                               openai_compatible | claude_cli | codex_cli |
-                               gemini_cli | opencode_cli. Defaults to the NVIDIA path
+                                openai_compatible | claude_cli | codex_cli |
+                                copilot_cli | gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default
@@ -577,7 +577,8 @@ def scan(
 
         ollama uses the local Ollama service. claude_cli, codex_cli,
         gemini_cli, and opencode_cli use their CLI's existing local
-        authentication session.
+        authentication session. copilot_cli uses the CLI login session or
+        one of COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN.
     """
     if mcp_registry:
         if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
