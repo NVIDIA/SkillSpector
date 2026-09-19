@@ -27,8 +27,9 @@ Security invariants verified:
     argv.
   - Ambient instruction files, built-in MCP servers, and mid-scan CLI
     updates stay off (``--no-custom-instructions``,
-    ``--disable-builtin-mcps``, ``--no-auto-update``); ``COPILOT_HOME``
-    is preserved for login while argv denies hold regardless of config.
+    ``--disable-builtin-mcps``, ``--no-auto-update``); user/plugin
+    lifecycle hooks stay off via home isolation (``HOME``/``COPILOT_HOME``
+    redirected to empty temp dirs, auth only via forwarded token vars).
   - Only the exactly verified Copilot CLI version is accepted.
   - The auth probe (``copilot --version``) is cheap, non-inference, bounded,
     uses the scrubbed environment, and fail-closed.
@@ -54,10 +55,12 @@ from skillspector.providers import (
 )
 from skillspector.providers._agent_cli import (
     AgentCLIError,
+    _audit_copilot_home,
     _build_copilot_argv,
     _copilot_auth_check,
     _parse_copilot_output,
     _parse_copilot_version,
+    _preflight_copilot_policy,
     _prepare_copilot_env,
     _run_bounded,
     run_agent_cli,
@@ -131,7 +134,7 @@ class TestBuildCopilotArgv:
 
     def test_argv_disables_custom_instructions_mcp_and_auto_update(self) -> None:
         # Ambient instruction files, built-in MCP servers, and mid-scan CLI
-        # updates must stay off: COPILOT_HOME is retained for login.
+        # updates must stay off (hooks additionally die via home isolation).
         argv = _build_copilot_argv(COPILOT_BINARY, "", 0)
         assert "--no-custom-instructions" in argv
         assert "--disable-builtin-mcps" in argv
@@ -248,6 +251,77 @@ class TestCopilotAuthCheck:
 
 
 # ---------------------------------------------------------------------------
+# _preflight_copilot_policy: version re-verified before stdin, every completion
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightCopilotPolicy:
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_pinned_version_passes(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = _version_result()
+        _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, "/tmp")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_synthetic_future_version_rejected_before_stdin(self, mock_run: MagicMock) -> None:
+        # The reviewer's repro: a 9.9.99 binary must never receive scan content.
+        mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
+        with pytest.raises(AgentCLIError, match="1.0.86"):
+            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, "/tmp")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_nonzero_exit_rejected(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
+        with pytest.raises(AgentCLIError, match="preflight|1.0.86"):
+            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_timeout_rejected(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="copilot", timeout=15)
+        with pytest.raises(AgentCLIError, match="preflight failed"):
+            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_preflight_uses_child_env_shell_false_bounded(self, mock_run: MagicMock) -> None:
+        mock_run.return_value = _version_result()
+        child = {"PATH": "/bin", "COPILOT_HOME": "/tmp/iso/home"}
+        _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], child, "/tmp")
+        assert mock_run.call_args[0][0][:2] == [COPILOT_BINARY, "--version"]
+        kwargs = mock_run.call_args[1]
+        assert kwargs.get("env") == child
+        assert kwargs.get("shell") is False
+        assert kwargs["timeout"] <= 15
+
+
+# ---------------------------------------------------------------------------
+# _audit_copilot_home: no plugin hook material, no inference
+# ---------------------------------------------------------------------------
+
+
+class TestAuditCopilotHome:
+    def test_nonempty_plugins_raise(self, tmp_path: Path) -> None:
+        (tmp_path / "installed-plugins" / "evil").mkdir(parents=True)
+        with pytest.raises(AgentCLIError, match="installed plugins"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_empty_plugins_pass(self, tmp_path: Path) -> None:
+        (tmp_path / "installed-plugins").mkdir()
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_missing_tree_passes(self, tmp_path: Path) -> None:
+        # No home tree at all: no hooks to load (missing auth fails later).
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path / "absent")})
+
+    def test_defaults_to_dot_copilot(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        home = tmp_path / "home"
+        (home / ".copilot" / "installed-plugins" / "evil").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("COPILOT_HOME", raising=False)
+        with pytest.raises(AgentCLIError, match="installed plugins"):
+            _audit_copilot_home({})
+
+
+# ---------------------------------------------------------------------------
 # _parse_copilot_output
 # ---------------------------------------------------------------------------
 
@@ -358,9 +432,13 @@ class TestPrepareCopilotEnv:
 
     def test_preserves_copilot_home_for_login(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A path, not a policy control: argv denies hold regardless of config.
+        # (Home isolation was probed and rejected 2026-09-19: the CLI
+        # silently refuses inference under ANY redirected home, so hooks
+        # are handled by the preflight home audit instead.)
         monkeypatch.setenv("COPILOT_HOME", "/home/op")
         env = _prepare_copilot_env({}, "/tmp", ["copilot"])
         assert env["COPILOT_HOME"] == "/home/op"
+        assert "HOME" not in env and "USERPROFILE" not in env
 
 
 # ---------------------------------------------------------------------------

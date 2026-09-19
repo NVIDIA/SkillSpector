@@ -902,15 +902,22 @@ def _prepare_copilot_env(
     documented token variables (``COPILOT_GITHUB_TOKEN``, ``GH_TOKEN``,
     ``GITHUB_TOKEN`` — re-read from the operator environment because the
     shared scrub strips ``GITHUB_TOKEN``) and ``COPILOT_HOME`` (a path, not
-    a policy control — argv-level deny rules take precedence over anything
-    a config file could add, so hiding it would only break login-file auth
-    without hardening anything). The tokens are the CLI's supported
-    headless auth path and therefore work at inference time. In particular
-    ``COPILOT_ALLOW_ALL`` never reaches the child, so ambient shell config
-    cannot re-enable tools; ``COPILOT_PROVIDER_*`` cannot redirect inference
-    to an arbitrary endpoint; and ``COPILOT_CUSTOM_INSTRUCTIONS_DIRS``
-    cannot inject instructions. ``COPILOT_AUTO_UPDATE`` is forced off so the
-    version gate cannot be invalidated mid-scan.
+    a policy control — and, as probed 2026-09-19, the CLI silently refuses
+    inference under ANY redirected home, even a byte-identical copy, so
+    home isolation is not a usable lever; argv-level deny rules take
+    precedence over anything a config file could add). The tokens are the
+    CLI's supported headless auth path and therefore work at inference
+    time. In particular ``COPILOT_ALLOW_ALL`` never reaches the child, so
+    ambient shell config cannot re-enable tools; ``COPILOT_PROVIDER_*``
+    cannot redirect inference to an arbitrary endpoint; and
+    ``COPILOT_CUSTOM_INSTRUCTIONS_DIRS`` cannot inject instructions.
+    ``COPILOT_AUTO_UPDATE`` is forced off so the version gate cannot be
+    invalidated mid-scan.
+
+    User/plugin lifecycle hooks are handled NOT by home isolation (broken
+    as above) but by the preflight home audit: inference refuses to run
+    when ``installed-plugins/`` under the resolved copilot home is
+    present and non-empty. No hook material on disk means no hooks load.
     """
     env = {key: value for key, value in base_env.items() if not key.upper().startswith("COPILOT_")}
     for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_HOME"):
@@ -938,10 +945,11 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 
     ``--no-custom-instructions``
         Disable loading of custom instructions from AGENTS.md and related
-        files, so ambient instruction files in the operator's home or
-        project cannot steer the semantic verdict. (`COPILOT_HOME` is
-        deliberately retained for login, which is why flag-level disabling
-        is required rather than home isolation.)
+        files, so ambient instruction files cannot steer the semantic
+        verdict. (Belt-and-braces alongside the preflight home audit:
+        user/plugin lifecycle hooks have no argv off-switch, so inference
+        refuses to run when ``installed-plugins/`` is present and
+        non-empty under the resolved copilot home.)
 
     ``--disable-builtin-mcps``
         Disable all built-in MCP servers as defense in depth alongside the
@@ -1046,6 +1054,78 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def _preflight_copilot_policy(
+    binary: str, argv: list[str], child_env: dict[str, str], tmp_cwd: str
+) -> None:
+    """Reject an unverified Copilot runtime before stdin delivery.
+
+    Two checks, both before ``run_agent_cli`` writes the prompt:
+
+    1. Version: the availability probe runs once per scan, so a swapped
+       or updated binary (or a direct ``complete()`` call that never
+       probes) would otherwise deliver scan content to an unsupported
+       runtime. Re-verifies ``[binary, --version]`` under the isolated
+       child env on EVERY completion. ``argv``/``tmp_cwd`` are unused
+       (CliSpec signature uniformity). Fail-closed: probe error/timeout,
+       non-zero exit, or a version other than the verified 1.0.86 all
+       raise before any prompt bytes move.
+    2. Home audit: user/plugin lifecycle hooks have no argv off-switch,
+       so ``installed-plugins/`` present-and-non-empty under the resolved
+       copilot home raises (see ``_audit_copilot_home``).
+    """
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            shell=False,
+            timeout=15,
+            env=child_env,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        raise AgentCLIError(f"copilot version preflight failed: {exc}") from exc
+    if result.returncode != 0 or _parse_copilot_version(result.stdout or b"") != "1.0.86":
+        version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+        raise AgentCLIError(
+            "copilot_cli requires exactly GitHub Copilot CLI 1.0.86 "
+            f"for its verified tool-deny policy; found {version_text[:80]!r}"
+        )
+    _audit_copilot_home(child_env)
+
+
+def _copilot_home(child_env: dict[str, str]) -> str:
+    """Resolve the copilot home dir as the CLI does (``COPILOT_HOME`` or ``~/.copilot``)."""
+    override = (child_env.get("COPILOT_HOME") or "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".copilot")
+
+
+def _audit_copilot_home(child_env: dict[str, str]) -> None:
+    """Refuse inference when plugin hook material is present.
+
+    Plugins extend the CLI with lifecycle hooks and no argv flag disables
+    them — and, as probed 2026-09-19, the CLI silently refuses inference
+    under ANY redirected home (even a byte-identical copy), so home
+    isolation is not a usable lever. The enforceable property is absence:
+    ``installed-plugins/`` present-and-non-empty raises fail-closed before
+    stdin. A missing tree passes (no hooks to load; missing auth fails
+    later, also fail-closed).
+    """
+    plugins = os.path.join(_copilot_home(child_env), "installed-plugins")
+    try:
+        has_plugins = any(os.scandir(plugins))
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
+    if has_plugins:
+        raise AgentCLIError(
+            "copilot home contains installed plugins, which may carry "
+            f"lifecycle hooks: {plugins}; remove them or point COPILOT_HOME "
+            "at a plugin-free tree"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Antigravity CLI  (registered but DISABLED — verified incompatible)
 #
@@ -1146,6 +1226,7 @@ _REGISTRY: dict[str, CliSpec] = {
         _parse_copilot_output,
         _copilot_auth_check,
         _prepare_copilot_env,
+        _preflight_copilot_policy,
     ),
     # Disabled (fails closed via _build_agy_argv). agy's backend is Gemini, so it
     # reuses _parse_gemini_output rather than duplicating it — though parse is
