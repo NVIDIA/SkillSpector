@@ -344,7 +344,7 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `openai_compatible/` — generic compatible endpoint (`SKILLSPECTOR_COMPAT_API_KEY`, `SKILLSPECTOR_COMPAT_BASE_URL`)
   - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
   - `codex_cli/` — **local `codex` binary; no API key**. Uses the CLI's own auth session (`codex login`). Set `SKILLSPECTOR_PROVIDER=codex_cli`.
-  - `copilot_cli/` — **local `copilot` 1.0.85 binary; no API key**. Uses the CLI's own auth session (`copilot login`) or token env, stdin prompt transport, deny-all tool posture; fails closed on every other runtime version. Set `SKILLSPECTOR_PROVIDER=copilot_cli`.
+  - `copilot_cli/` — **local `copilot` 1.0.86 binary; no API key**. Uses the CLI's own auth session (`copilot login`) or token env, stdin prompt transport, deny-all tool posture; fails closed on every other runtime version. Set `SKILLSPECTOR_PROVIDER=copilot_cli`.
   - `gemini_cli/` — **local `gemini` binary; no API key**. Uses the CLI's own auth session. Set `SKILLSPECTOR_PROVIDER=gemini_cli`.
   - `opencode_cli/` — **local `opencode` 1.18.31 binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version because the deny-all policy is verified against that exact release. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
 

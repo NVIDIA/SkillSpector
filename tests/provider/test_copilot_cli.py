@@ -67,7 +67,7 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.85.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.86.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
@@ -182,7 +182,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.85"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.86"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -190,7 +190,7 @@ class TestCopilotAuthCheck:
 
     def test_version_rejects_suffixed_build(self) -> None:
         # fullmatch: a trailing pre-release suffix must not parse as the pin.
-        assert _parse_copilot_version(b"GitHub Copilot CLI 1.0.85-beta.\n") is None
+        assert _parse_copilot_version(b"GitHub Copilot CLI 1.0.86-beta.\n") is None
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_success(self, mock_run: MagicMock) -> None:
@@ -237,7 +237,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.85" in (reason or "")
+        assert "1.0.86" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -384,7 +384,7 @@ class TestAdversarialTransport:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.85"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.86"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])

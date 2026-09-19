@@ -876,7 +876,7 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI invocation  (verified against copilot 1.0.85)
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.86)
 # ---------------------------------------------------------------------------
 
 
@@ -924,7 +924,7 @@ def _prepare_copilot_env(
 def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build the argv list for a non-interactive ``copilot`` call.
 
-    Flags chosen (verified against Copilot CLI 1.0.85 ``--help``):
+    Flags chosen (verified against Copilot CLI 1.0.86 ``--help``):
 
     (no ``-p``)
         With no prompt flag, the prompt is piped to stdin by run_agent_cli —
@@ -993,7 +993,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 def _parse_copilot_output(raw: str) -> str:
     """Extract the assistant reply from ``copilot -s`` plain-text output.
 
-    Verified against Copilot CLI 1.0.85: ``-s`` emits only the response text.
+    Verified against Copilot CLI 1.0.86: ``-s`` emits only the response text.
     The whole stripped output is the reply; empty output raises fail-closed
     (an empty response must never be mistaken for a clean analysis).
     """
@@ -1010,7 +1010,7 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     shared scrubbed environment (token re-injection is inference-only and
     version output does not depend on it), performs no inference, and
     completes well under 15s. Fail-closed: probe error/timeout, non-zero
-    exit, or a version other than the verified 1.0.85 all return
+    exit, or a version other than the verified 1.0.86 all return
     ``(False, reason)``.
 
     There is no status subcommand, so a passing probe means the binary runs
@@ -1037,10 +1037,10 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
             f"(exit {result.returncode}); check the binary, then `copilot login`"
         )
     version = _parse_copilot_version(result.stdout or b"")
-    if version != "1.0.85":
+    if version != "1.0.86":
         version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         return False, (
-            "copilot_cli requires exactly GitHub Copilot CLI 1.0.85 "
+            "copilot_cli requires exactly GitHub Copilot CLI 1.0.86 "
             f"for its verified tool-deny policy; found {version_text[:80]!r}"
         )
     return True, None
