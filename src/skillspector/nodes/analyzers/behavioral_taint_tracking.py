@@ -285,10 +285,92 @@ _SINK_CATEGORIES: list[tuple[frozenset[str], str]] = [
 ]
 
 
+def _constant_string(node: ast.expr, *, depth: int = 0) -> str | None:
+    """Evaluate a small, bounded subset of side-effect-free string expressions."""
+    if depth > 8:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value if len(node.value) <= 512 else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_string(node.left, depth=depth + 1)
+        right = _constant_string(node.right, depth=depth + 1)
+        if left is None or right is None or len(left) + len(right) > 512:
+            return None
+        return left + right
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        separator = _constant_string(node.func.value, depth=depth + 1)
+        pieces = [_constant_string(item, depth=depth + 1) for item in node.args[0].elts]
+        if separator is None or any(piece is None for piece in pieces):
+            return None
+        value = separator.join(piece for piece in pieces if piece is not None)
+        return value if len(value) <= 512 else None
+    return None
+
+
+def _dynamic_module_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+    function = resolve_dotted_name(node.func)
+    if function is None:
+        return None
+    function = apply_import_aliases(function, aliases)
+    if function != "importlib.import_module":
+        return None
+    return _constant_string(node.args[0])
+
+
+def _build_reflective_sink_aliases(
+    tree: ast.Module, aliases: dict[str, str]
+) -> dict[str, str]:
+    """Resolve statically-known module/getattr assignments to existing sink names."""
+    modules: dict[str, str] = {}
+    callables: dict[str, str] = {}
+    assignments = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Assign)),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    for assignment in assignments:
+        targets = [target.id for target in assignment.targets if isinstance(target, ast.Name)]
+        if not targets:
+            continue
+        module = _dynamic_module_name(assignment.value, aliases)
+        if module is not None:
+            for target in targets:
+                modules[target] = module
+            continue
+        if not (
+            isinstance(assignment.value, ast.Call)
+            and resolve_dotted_name(assignment.value.func) == "getattr"
+            and len(assignment.value.args) >= 2
+        ):
+            continue
+        base = assignment.value.args[0]
+        if isinstance(base, ast.Name):
+            module = modules.get(base.id) or aliases.get(base.id)
+        else:
+            module = _dynamic_module_name(base, aliases)
+        attribute = _constant_string(assignment.value.args[1])
+        if module is None or attribute is None:
+            continue
+        canonical = f"{module}.{attribute}"
+        if canonical in _ALL_SINKS:
+            for target in targets:
+                callables[target] = canonical
+    return callables
+
+
 def _resolve_sink_name(
     node: ast.Call,
     type_map: dict[str, str] | None = None,
     aliases: dict[str, str] | None = None,
+    reflective_sinks: dict[str, str] | None = None,
 ) -> str | None:
     """Resolve a call to its canonical sink name, including dynamic-import chains.
 
@@ -298,6 +380,8 @@ def _resolve_sink_name(
     and re-enters ``_EXEC_SINKS`` like the statically-imported form would.
     """
     name = resolve_call_name_typed(node, type_map, aliases)
+    if name is not None and reflective_sinks:
+        name = reflective_sinks.get(name, name)
     if name is None:
         name = resolve_dynamic_import_call(node, aliases)
     return name
@@ -462,6 +546,7 @@ def _analyze_python(
 
     aliases = python_ast.import_aliases
     type_map = build_type_map(tree, aliases)
+    reflective_sinks = _build_reflective_sink_aliases(tree, aliases)
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
@@ -558,7 +643,7 @@ def _analyze_python(
         if not isinstance(ast_node, ast.Call):
             continue
 
-        sink_name = _resolve_sink_name(ast_node, type_map, aliases)
+        sink_name = _resolve_sink_name(ast_node, type_map, aliases, reflective_sinks)
         if not sink_name or sink_name not in _ALL_SINKS:
             continue
 
