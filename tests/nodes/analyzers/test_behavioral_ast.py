@@ -197,7 +197,7 @@ class TestDynamicGetattr:
         ast7 = [finding for finding in findings if finding.rule_id == "AST7"]
         assert len(ast7) == 1
         assert ast7[0].severity == "LOW"
-        assert ast7[0].complete_match == f"getattr(_mod, {attribute})"
+        assert ast7[0].matched_text == f"getattr(_mod, {attribute})"
 
     def test_getattr_with_variable_produces_ast7(self):
         code = "attr = 'secret'\nval = getattr(obj, attr)"
