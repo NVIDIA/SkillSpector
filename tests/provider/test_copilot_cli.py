@@ -25,6 +25,10 @@ Security invariants verified:
     implausible tool, and ``--deny-tool`` denies the ``shell`` and ``write``
     kinds (deny wins over allow); ``--allow-all*``/``--yolo`` are NEVER in
     argv.
+  - Ambient instruction files, built-in MCP servers, and mid-scan CLI
+    updates stay off (``--no-custom-instructions``,
+    ``--disable-builtin-mcps``, ``--no-auto-update``); ``COPILOT_HOME``
+    is preserved for login while argv denies hold regardless of config.
   - Only the exactly verified Copilot CLI version is accepted.
   - The auth probe (``copilot --version``) is cheap, non-inference, bounded,
     uses the scrubbed environment, and fail-closed.
@@ -86,6 +90,9 @@ class TestBuildCopilotArgv:
             COPILOT_BINARY,
             "-s",
             "--no-ask-user",
+            "--no-custom-instructions",
+            "--disable-builtin-mcps",
+            "--no-auto-update",
             "--available-tools",
             "skillspector-no-tools",
             "--deny-tool",
@@ -121,6 +128,14 @@ class TestBuildCopilotArgv:
         assert "--deny-tool" in argv
         denied = argv[argv.index("--deny-tool") + 1]
         assert "shell" in denied and "write" in denied
+
+    def test_argv_disables_custom_instructions_mcp_and_auto_update(self) -> None:
+        # Ambient instruction files, built-in MCP servers, and mid-scan CLI
+        # updates must stay off: COPILOT_HOME is retained for login.
+        argv = _build_copilot_argv(COPILOT_BINARY, "", 0)
+        assert "--no-custom-instructions" in argv
+        assert "--disable-builtin-mcps" in argv
+        assert "--no-auto-update" in argv
 
     def test_argv_max_output_tokens_accepted_but_not_forwarded(self) -> None:
         # CliSpec uniformity: the parameter exists but copilot has no
@@ -341,6 +356,12 @@ class TestPrepareCopilotEnv:
         env = _prepare_copilot_env({}, "/tmp", ["copilot"])
         assert env["COPILOT_AUTO_UPDATE"] == "false"
 
+    def test_preserves_copilot_home_for_login(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A path, not a policy control: argv denies hold regardless of config.
+        monkeypatch.setenv("COPILOT_HOME", "/home/op")
+        env = _prepare_copilot_env({}, "/tmp", ["copilot"])
+        assert env["COPILOT_HOME"] == "/home/op"
+
 
 # ---------------------------------------------------------------------------
 # Adversarial transport: a fake copilot host asserts the deny posture on
@@ -388,6 +409,9 @@ class TestAdversarialTransport:
                     or "write" not in denied
                     or "--allow-all" in " ".join(argv)
                     or "--yolo" in argv
+                    or "--no-custom-instructions" not in argv
+                    or "--disable-builtin-mcps" not in argv
+                    or "--no-auto-update" not in argv
                     or not prompt
                     or os.environ.get("COPILOT_ALLOW_ALL", "") not in ("", "0", "false")
                 ):

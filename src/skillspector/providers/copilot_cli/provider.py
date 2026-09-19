@@ -22,9 +22,10 @@ token environment variables; no OpenAI/Anthropic API key is read or required.
 All behaviour is inherited from
 :class:`skillspector.providers._agent_cli_base.AgentCLIProviderBase`; the
 "copilot"-specific argv (``copilot -s --no-ask-user`` with an implausible
-``--available-tools`` allowlist plus ``--deny-tool shell,write``; never
-``--allow-all*``), output parsing, and auth probe live in the
-:mod:`skillspector.providers._agent_cli` registry.
+``--available-tools`` allowlist plus ``--deny-tool shell,write``;
+``--no-custom-instructions``, ``--disable-builtin-mcps`` and
+``--no-auto-update``; never ``--allow-all*``), output parsing, and auth
+probe live in the :mod:`skillspector.providers._agent_cli` registry.
 """
 
 from __future__ import annotations

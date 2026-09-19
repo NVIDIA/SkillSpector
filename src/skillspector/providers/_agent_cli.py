@@ -901,18 +901,19 @@ def _prepare_copilot_env(
     to ``COPILOT_*``: every such variable is dropped EXCEPT the three
     documented token variables (``COPILOT_GITHUB_TOKEN``, ``GH_TOKEN``,
     ``GITHUB_TOKEN`` — re-read from the operator environment because the
-    shared scrub strips ``GITHUB_TOKEN``), which are the CLI's supported
+    shared scrub strips ``GITHUB_TOKEN``) and ``COPILOT_HOME`` (a path, not
+    a policy control — argv-level deny rules take precedence over anything
+    a config file could add, so hiding it would only break login-file auth
+    without hardening anything). The tokens are the CLI's supported
     headless auth path and therefore work at inference time. In particular
     ``COPILOT_ALLOW_ALL`` never reaches the child, so ambient shell config
     cannot re-enable tools; ``COPILOT_PROVIDER_*`` cannot redirect inference
     to an arbitrary endpoint; and ``COPILOT_CUSTOM_INSTRUCTIONS_DIRS``
     cannot inject instructions. ``COPILOT_AUTO_UPDATE`` is forced off so the
-    version gate cannot be invalidated mid-scan. ``COPILOT_HOME`` is
-    deliberately left alone: pinning it would hide the login session this
-    provider relies on when no token is set.
+    version gate cannot be invalidated mid-scan.
     """
     env = {key: value for key, value in base_env.items() if not key.upper().startswith("COPILOT_")}
-    for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+    for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_HOME"):
         value = os.environ.get(name, "").strip()
         if value:
             env[name] = value
@@ -934,6 +935,21 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 
     ``--no-ask-user``
         Disable the ask_user tool so the agent cannot pause for input.
+
+    ``--no-custom-instructions``
+        Disable loading of custom instructions from AGENTS.md and related
+        files, so ambient instruction files in the operator's home or
+        project cannot steer the semantic verdict. (`COPILOT_HOME` is
+        deliberately retained for login, which is why flag-level disabling
+        is required rather than home isolation.)
+
+    ``--disable-builtin-mcps``
+        Disable all built-in MCP servers as defense in depth alongside the
+        tool allowlist below.
+
+    ``--no-auto-update``
+        Disable CLI auto-updates so the pinned-version gate cannot be
+        invalidated mid-scan.
 
     ``--available-tools skillspector-no-tools``
         Allowlist holding a fixed implausible name, so the model is offered
@@ -963,6 +979,9 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
         binary,
         "-s",
         "--no-ask-user",
+        "--no-custom-instructions",
+        "--disable-builtin-mcps",
+        "--no-auto-update",
         "--available-tools",
         "skillspector-no-tools",
         "--deny-tool",
