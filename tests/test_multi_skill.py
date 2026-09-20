@@ -338,6 +338,52 @@ class TestDetectSkills:
         assert result.limitations[0].reason_code == "read_error"
         assert result.limitations[0].resource == "multi_skill_symlinked_entry"
 
+    def test_ignored_name_symlinks_do_not_mark_discovery_incomplete(self, tmp_path: Path) -> None:
+        """Symlinks with intentionally ignored names are skipped, not recorded.
+
+        Closes rng1995 review on #499: a symlinked `.git`, `.venv`, or
+        `node_modules` must not make an otherwise complete scan incomplete,
+        while a genuinely eligible symlinked child still records the
+        `multi_skill_symlinked_entry` limitation.
+        """
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        external = tmp_path.parent / f"{tmp_path.name}-external-skill-499"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+        try:
+            for ignored in (".git", ".venv", "node_modules"):
+                (tmp_path / ignored).symlink_to(external, target_is_directory=True)
+            (tmp_path / "linked-skill").symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert [lim.resource for lim in result.limitations] == ["multi_skill_symlinked_entry"]
+
+        ignored_only = tmp_path / "ignored-only"
+        ignored_only.mkdir()
+        for name in ("skill-c", "skill-d"):
+            sub = ignored_only / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        try:
+            for ignored in (".git", "node_modules"):
+                (ignored_only / ignored).symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(ignored_only)
+
+        assert result.complete is True
+        assert result.limitations == ()
+        assert {skill.name for skill in result.skills} == {"skill-c", "skill-d"}
+
     def test_symlinked_root_is_not_detected(self, tmp_path: Path) -> None:
         """Direct callers cannot use detection to inspect a symlinked root."""
         external = tmp_path / "external"

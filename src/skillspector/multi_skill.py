@@ -282,6 +282,14 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
             child = Path(entry.path)
             try:
                 if entry.is_symlink() or _is_link_or_junction(child):
+                    if entry.name in _SKIP_DIRS or (
+                        entry.name.startswith(".") and entry.name != ".aisop"
+                    ):
+                        # Intentionally ignored names (e.g. `.git`, `.venv`,
+                        # `node_modules`) are not a discovery gap even when
+                        # they are symlinks; skip them before recording the
+                        # symlink limitation.
+                        continue
                     limitations.append(
                         MultiSkillDetectionLimitation(
                             reason_code="read_error",
