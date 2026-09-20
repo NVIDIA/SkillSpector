@@ -202,6 +202,14 @@ class TestDynamicGetattr:
         findings = _run(code)
         assert not any(f.rule_id == "AST7" for f in findings)
 
+    def test_getattr_with_direct_non_string_literal_is_silent(self):
+        findings = _run("getattr(obj, 42)")
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    def test_getattr_with_constructed_benign_name_remains_dynamic(self):
+        findings = _run("getattr(subprocess, ''.join(['P', 'o', 'p', 'e', 'n']))(cmd)")
+        assert any(f.rule_id == "AST7" for f in findings)
+
 
 class TestReflectiveGetattrExec:
     """getattr(obj, "<sink>")(...) is a reflective handle on an exec/os sink.

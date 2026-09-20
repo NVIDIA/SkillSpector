@@ -562,10 +562,15 @@ def _analyze_python(
         elif call_name == "getattr" and len(ast_node.args) >= 2:
             second_arg = ast_node.args[1]
             resolved_name = _constant_string(second_arg)
-            if resolved_name is None:
-                _emit("AST7", ast_node)
-            elif resolved_name in _DANGEROUS_GETATTR_NAMES:
+            # A direct non-string literal cannot name an attribute.  Do not
+            # conflate it with a dynamic or constructed expression, which
+            # remains an AST7 signal unless it resolves to an AST9 sink.
+            if isinstance(second_arg, ast.Constant) and not isinstance(second_arg.value, str):
+                continue
+            if resolved_name in _DANGEROUS_GETATTR_NAMES:
                 _emit("AST9", ast_node)
+            elif resolved_name is None or not isinstance(second_arg, ast.Constant):
+                _emit("AST7", ast_node)
 
     return findings if budget is None else list(budget.current_findings)
 
