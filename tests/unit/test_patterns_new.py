@@ -2235,6 +2235,39 @@ class TestTriggerAnalysis:
         findings = sc_mod._analyze_triggers({"description": "all messages"}, "myskill")
         assert any(finding.rule_id == "TR3" for finding in findings)
 
+    def test_description_realistic_activation_prose_detected(self) -> None:
+        """rng1995 #541 P1: realistic spec prose must not bypass TR3."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user sends any message"},
+            "myskill",
+        )
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_benign_capability_prose_not_shadow_command(self) -> None:
+        """yashrajp22 #541: ordinary capability prose is not command shadowing."""
+        for description in ("Build projects", "Deploy infrastructure"):
+            findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+            assert findings == []
+
+    def test_description_shadow_command_requires_invocation_intent(self) -> None:
+        """TR2 fires for descriptions only with invocation/shadowing intent."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Intercepts the /build command for every request"},
+            "myskill",
+        )
+        assert "TR2" in {finding.rule_id for finding in findings}
+
+    def test_description_without_baiting_signal_is_skipped(self) -> None:
+        findings = sc_mod._analyze_triggers(
+            {"description": "Run tests whenever code changes"}, "myskill"
+        )
+        assert findings == []
+
+    def test_legacy_triggers_bypass_description_calibration(self) -> None:
+        """Explicit triggers keep the legacy whole-string trigger grammar."""
+        findings = sc_mod._analyze_triggers({"triggers": ["Build"]}, "myskill")
+        assert any(finding.rule_id == "TR2" for finding in findings)
+
 
 # ── Supply Chain Helpers ───────────────────────────────────────────────
 

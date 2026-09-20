@@ -499,6 +499,62 @@ _OVERLY_BROAD_SINGLE_WORDS: set[str] = {
     "hey",
 }
 
+# Bounded activation-intent signals for skill descriptions. Only description
+# clauses carrying one of these signals are treated as trigger-like; ordinary
+# capability prose (e.g. "Build projects") is skipped.
+_DESCRIPTION_ACTIVATION_RE = re.compile(
+    r"\b(?:"
+    r"whenever|every\s+time|each\s+time|"
+    r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)|"
+    r"any\s+(?:question|request|task|input|message)|"
+    r"anything|everything|whatever|always"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Invocation/shadowing intent signals. A description only counts as a shadow
+# command when it shows the skill means to intercept or override a command.
+_DESCRIPTION_INVOCATION_RE = re.compile(
+    r"\b(?:commands?|slash|invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
+    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|/[a-z]",
+    re.IGNORECASE,
+)
+
+# Unanchored baiting patterns for description clauses. The legacy TR3 patterns
+# are whole-string anchored for the explicit triggers field; descriptions need
+# substring matching so realistic activation prose is detected.
+_DESCRIPTION_BAITING_PATTERNS = (
+    r"(?:anything|everything|whatever|always|"
+    r"any\s+(?:question|request|task|input|message))",
+    r"(?:when(?:ever)?|if|every\s+time)\s+(?:the\s+)?user\s+"
+    r"(?:says?|asks?|types?|sends?)\s+"
+    r"(?:anything|something|any\s+messages?|a\s+message)",
+    r"(?:all|any|every)\s+(?:messages?|inputs?|requests?|queries?|questions?)",
+)
+
+# Bounds for description clause extraction: keep the analysis cheap and the
+# extracted trigger phrases reviewable.
+_MAX_DESCRIPTION_CLAUSES = 8
+_MAX_DESCRIPTION_CLAUSE_CHARS = 120
+
+
+def _extract_description_trigger_clauses(description: str) -> list[str]:
+    """Extract bounded trigger-like clauses from a skill description.
+
+    Splits the description into clauses and keeps only clauses carrying an
+    activation-intent signal, so realistic activation prose is analyzed while
+    ordinary capability prose is left alone.
+    """
+    clauses = re.split(r"[.;:!?]\s*|\s+-\s+", description)
+    extracted: list[str] = []
+    for clause in clauses[:_MAX_DESCRIPTION_CLAUSES]:
+        text = clause.strip().strip(",")
+        if not text or len(text) > _MAX_DESCRIPTION_CLAUSE_CHARS:
+            continue
+        if _DESCRIPTION_ACTIVATION_RE.search(text):
+            extracted.append(text)
+    return extracted
+
 
 def _pinned_version(operator: str | None, version: str | None) -> str | None:
     """Return *version* only when the specifier pins one concrete release.
@@ -1841,17 +1897,22 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
     """Analyze trigger-like manifest content for abuse patterns.
 
     Agent Skills exposes activation intent through ``description``; legacy
-    ``triggers`` metadata remains supported when present.
+    ``triggers`` metadata remains supported when present. Descriptions are not
+    passed to the legacy trigger grammar directly: only clauses carrying an
+    activation-intent signal are analyzed, with TR2 requiring invocation or
+    shadowing intent and TR3 using unanchored baiting patterns, so realistic
+    activation prose is detected while ordinary capability prose is skipped.
     """
     triggers: list[str] = []
     raw = manifest.get("triggers", [])
     if isinstance(raw, list):
         triggers = [str(t).strip() for t in raw if str(t).strip()]
+    description_clauses: list[str] = []
     if not triggers:
         description = manifest.get("description")
         if isinstance(description, str) and description.strip():
-            triggers = [description.strip()]
-    if not triggers:
+            description_clauses = _extract_description_trigger_clauses(description.strip())
+    if not triggers and not description_clauses:
         return []
 
     findings: list[Finding] = []
@@ -1931,6 +1992,59 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
                         start_line=i,
                         tags=tag,
                         matched_text=trigger,
+                        category=PatternCategory.TRIGGER_ABUSE.value,
+                        pattern="Keyword Baiting Trigger",
+                    )
+                )
+                break
+
+    for i, clause in enumerate(description_clauses, 1):
+        clause_lower = clause.lower().strip()
+        words = clause_lower.split()
+
+        # TR2 (description-calibrated): only flag a shadow command when the
+        # clause shows invocation or shadowing intent; ordinary capability
+        # prose such as "Build projects" stays out of the trigger path.
+        shadowed = sorted(
+            {cmd for cmd in _BUILTIN_COMMANDS if cmd in {w.lstrip("/") for w in words}}
+        )
+        if shadowed and _DESCRIPTION_INVOCATION_RE.search(clause):
+            findings.append(
+                Finding(
+                    rule_id="TR2",
+                    message=(
+                        f"Shadow Command Trigger: description clause '{clause}' "
+                        f"conflicts with built-in command '{shadowed[0]}'"
+                    ),
+                    severity="MEDIUM",
+                    confidence=0.7,
+                    file=file_ref,
+                    start_line=i,
+                    tags=tag,
+                    matched_text=clause,
+                    category=PatternCategory.TRIGGER_ABUSE.value,
+                    pattern="Shadow Command Trigger",
+                )
+            )
+
+        # TR3 (description-calibrated): unanchored baiting patterns detect
+        # realistic activation prose such as "whenever the user sends any
+        # message", which the whole-string legacy grammar misses.
+        for bp in _DESCRIPTION_BAITING_PATTERNS:
+            if re.search(bp, clause_lower):
+                findings.append(
+                    Finding(
+                        rule_id="TR3",
+                        message=(
+                            f"Keyword Baiting Trigger: description clause '{clause}' "
+                            "is designed to match all or most user inputs"
+                        ),
+                        severity="MEDIUM",
+                        confidence=0.8,
+                        file=file_ref,
+                        start_line=i,
+                        tags=tag,
+                        matched_text=clause,
                         category=PatternCategory.TRIGGER_ABUSE.value,
                         pattern="Keyword Baiting Trigger",
                     )
