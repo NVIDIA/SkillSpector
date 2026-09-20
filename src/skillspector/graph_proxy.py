@@ -49,4 +49,18 @@ class LazyGraph:
         return getattr(self._get_compiled(), name)
 
 
+def restore_package_graph_export() -> None:
+    """Re-assert the lazy proxy as the package-level ``graph`` export.
+
+    Importing the ``skillspector.graph`` submodule assigns the module object
+    to the parent package's ``graph`` attribute, shadowing this proxy. Call
+    this after any eager submodule import (the ``create_graph()`` factory
+    wrapper, ``mcp_server``) so ``skillspector.graph`` stays invokable
+    regardless of import order.
+    """
+    import skillspector as _pkg
+
+    _pkg.graph = graph
+
+
 graph = LazyGraph()

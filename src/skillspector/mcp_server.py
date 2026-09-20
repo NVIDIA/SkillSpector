@@ -35,12 +35,19 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.graph_proxy import restore_package_graph_export
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
+
+# Importing `skillspector.graph` above assigns the submodule to the parent
+# package's `graph` attribute, shadowing the documented lazy proxy. Restore
+# the proxy so `skillspector.graph` stays invokable when MCP is imported
+# before any other graph access.
+restore_package_graph_export()
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
