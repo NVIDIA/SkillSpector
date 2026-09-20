@@ -311,6 +311,31 @@ class TestNumberLines:
         lines = "\n".join(f"line{i}" for i in range(11))
         assert number_lines(lines).startswith("L1: line0")
 
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes", "  true  "])
+    def test_compact_prompts_normalized_truthy_values(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", value)
+        lines = "\n".join(f"line{i}" for i in range(11))
+        assert number_lines(lines).startswith("L1: line0")
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", ""])
+    def test_compact_prompts_falsy_values_keep_default(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_COMPACT_PROMPTS", value)
+        lines = "\n".join(f"line{i}" for i in range(11))
+        result = number_lines(lines)
+        assert result.startswith("L01: line0")
+        assert "L11: line10" in result
+
+    def test_compact_prompts_unset_keeps_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_COMPACT_PROMPTS", raising=False)
+        lines = "\n".join(f"line{i}" for i in range(11))
+        result = number_lines(lines)
+        assert result.startswith("L01: line0")
+        assert "L11: line10" in result
+
 
 # ---------------------------------------------------------------------------
 # LLMAnalyzerBase.build_prompt (default implementation)

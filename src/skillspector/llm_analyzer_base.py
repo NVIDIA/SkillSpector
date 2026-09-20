@@ -592,7 +592,7 @@ def number_lines(content: str, start_line: int = 1) -> str:
     lines = content.splitlines()
     if not lines:
         return ""
-    if os.environ.get("SKILLSPECTOR_COMPACT_PROMPTS", "").lower() in {"1", "true", "yes"}:
+    if os.environ.get("SKILLSPECTOR_COMPACT_PROMPTS", "").strip().lower() in {"1", "true", "yes"}:
         return "\n".join(f"L{start_line + i}: {line}" for i, line in enumerate(lines))
     end = start_line + len(lines) - 1
     width = len(str(end))
