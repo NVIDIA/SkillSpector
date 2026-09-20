@@ -1025,23 +1025,77 @@ class InputHandler:
             return True
         return False
 
-    @staticmethod
-    def _github_tree_target(path: str) -> tuple[str, str, PurePosixPath] | None:
-        """Return a canonical clone target for a GitHub ``/tree/<ref>/<dir>`` URL."""
+    def _github_tree_target(self, path: str) -> tuple[str, str, PurePosixPath] | None:
+        """Return a canonical clone target for a GitHub ``/tree/<ref>/<dir>`` URL.
+
+        The ref itself may contain ``/`` (for example ``feature/foo``), so the
+        split between ref and subdirectory is resolved against the remote's
+        advertised refs: the longest ``refs/heads/`` or ``refs/tags/`` name
+        that prefixes the ``/tree/`` segments wins.  Without this, a URL for
+        branch ``feature/foo`` would clone branch ``feature`` and treat
+        ``foo`` as part of the subdirectory.
+        """
         parsed = urlparse(path)
         if parsed.scheme != "https" or parsed.hostname != "github.com":
             return None
         parts = [unquote(part) for part in parsed.path.split("/") if part]
-        if len(parts) < 5 or parts[2] != "tree":
+        if len(parts) < 4 or parts[2] != "tree":
             return None
-        owner, repository, _tree, branch, *subdirectory = parts
-        if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in subdirectory):
+        owner, repository = parts[0], parts[1]
+        segments = parts[3:]
+        if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in segments):
             raise ValueError("Git URL subdirectory must stay within the repository")
-        return (
-            f"https://github.com/{owner}/{repository}.git",
-            branch,
-            PurePosixPath(*subdirectory),
+        repository_url = f"https://github.com/{owner}/{repository}.git"
+        ref, subdirectory = self._resolve_tree_ref(repository_url, segments)
+        return (repository_url, ref, PurePosixPath(*subdirectory))
+
+    def _resolve_tree_ref(self, repository_url: str, segments: list[str]) -> tuple[str, list[str]]:
+        """Split ``/tree/`` *segments* into ``(ref, subdirectory)``.
+
+        Uses the longest remote branch/tag name that prefixes the segments, so
+        refs containing ``/`` resolve to the intended tree.  Raises ValueError
+        when no advertised ref matches the URL.
+        """
+        remote_refs = self._list_remote_refs(repository_url)
+        for end in range(len(segments), 0, -1):
+            candidate = "/".join(segments[:end])
+            if candidate in remote_refs:
+                return candidate, segments[end:]
+        raise ValueError(
+            "GitHub tree URL does not name a known branch or tag: "
+            f"{repository_url} ({'/'.join(segments)})"
         )
+
+    def _list_remote_refs(self, repository_url: str) -> set[str]:
+        """Return the branch/tag names advertised by the remote repository.
+
+        Bounded by the ingest deadline; the host allowlist and private-IP
+        checks from URL validation apply.
+        """
+        self._validate_url_host(repository_url, ALLOWED_GIT_HOSTS)
+        deadline = self._deadline()
+        self._check_deadline(deadline, "git")
+        timeout = max(1.0, deadline - monotonic())
+        try:
+            process = subprocess.run(
+                ["git", "ls-remote", repository_url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise IngestLimitExceededError("Git ref listing exceeded its time limit") from exc
+        if process.returncode != 0:
+            raise ValueError(f"Could not list refs for GitHub tree URL: {repository_url}")
+        refs: set[str] = set()
+        for line in process.stdout.decode("utf-8", errors="replace").splitlines():
+            _, _, ref = line.partition("\t")
+            for prefix in ("refs/heads/", "refs/tags/"):
+                if ref.startswith(prefix):
+                    refs.add(ref[len(prefix) :])
+                    break
+        return refs
 
     def _is_file_url(self, path: str) -> bool:
         """Check if path is a direct file URL."""

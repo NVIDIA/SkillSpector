@@ -19,7 +19,7 @@ import ctypes
 import os
 import sys
 from errno import ENOENT
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -459,7 +459,10 @@ def test_github_tree_url_resolves_a_checked_out_subdirectory(tmp_path: Path) -> 
     handler = InputHandler()
     clone = tmp_path / "repo"
     (clone / "skills" / "biome-gritql").mkdir(parents=True)
-    with patch.object(handler, "_clone_git", return_value=clone) as clone_git:
+    with (
+        patch.object(handler, "_clone_git", return_value=clone) as clone_git,
+        patch.object(handler, "_list_remote_refs", return_value={"main"}),
+    ):
         resolved, source_type = handler.resolve(
             "https://github.com/somtougeh/somto-dev-toolkit/tree/main/skills/biome-gritql"
         )
@@ -468,6 +471,55 @@ def test_github_tree_url_resolves_a_checked_out_subdirectory(tmp_path: Path) -> 
     clone_git.assert_called_once_with(
         "https://github.com/somtougeh/somto-dev-toolkit.git", branch="main"
     )
+
+
+def test_github_tree_url_resolves_slash_containing_ref(tmp_path: Path) -> None:
+    """A branch name containing / must not be split into ref + subdirectory."""
+    handler = InputHandler()
+    clone = tmp_path / "repo"
+    (clone / "skills" / "demo").mkdir(parents=True)
+    with (
+        patch.object(handler, "_clone_git", return_value=clone) as clone_git,
+        patch.object(handler, "_list_remote_refs", return_value={"main", "feature", "feature/foo"}),
+    ):
+        resolved, source_type = handler.resolve(
+            "https://github.com/example/repo/tree/feature/foo/skills/demo"
+        )
+    assert resolved == clone / "skills" / "demo"
+    assert source_type == "git"
+    clone_git.assert_called_once_with("https://github.com/example/repo.git", branch="feature/foo")
+
+
+def test_github_tree_url_prefers_shorter_ref_when_longest_absent() -> None:
+    """The longest *advertised* ref wins, not the longest URL prefix."""
+    handler = InputHandler()
+    with patch.object(handler, "_list_remote_refs", return_value={"feature"}):
+        repository_url, ref, subdirectory = handler._github_tree_target(
+            "https://github.com/example/repo/tree/feature/sub"
+        )
+    assert repository_url == "https://github.com/example/repo.git"
+    assert ref == "feature"
+    assert subdirectory == PurePosixPath("sub")
+
+
+def test_github_tree_url_rejects_unknown_ref() -> None:
+    handler = InputHandler()
+    with (
+        patch.object(handler, "_list_remote_refs", return_value={"main"}),
+        pytest.raises(ValueError, match="does not name a known branch or tag"),
+    ):
+        handler._github_tree_target("https://github.com/example/repo/tree/nope/sub")
+
+
+def test_github_tree_url_supports_ref_without_subdirectory() -> None:
+    handler = InputHandler()
+    with patch.object(handler, "_list_remote_refs", return_value={"main"}):
+        repository_url, ref, subdirectory = handler._github_tree_target(
+            "https://github.com/example/repo/tree/main"
+        )
+    assert repository_url == "https://github.com/example/repo.git"
+    assert ref == "main"
+    assert subdirectory == PurePosixPath(".")
 
 
 @pytest.mark.parametrize("segment", ["%2Fetc", "%2E%2E%2Frepo", "%5Coutside"])
@@ -487,7 +539,10 @@ def test_github_tree_url_selection_failure_cleans_owned_clone(tmp_path: Path, ta
     if target == "SKILL.md":
         (clone / target).write_text("# skill\n")
     handler._temp_dir = tmp_path
-    with patch.object(handler, "_clone_git", return_value=clone):
+    with (
+        patch.object(handler, "_clone_git", return_value=clone),
+        patch.object(handler, "_list_remote_refs", return_value={"main"}),
+    ):
         with pytest.raises(ValueError):
             handler.resolve(f"https://github.com/example/repo/tree/main/{target}")
     assert not tmp_path.exists()
