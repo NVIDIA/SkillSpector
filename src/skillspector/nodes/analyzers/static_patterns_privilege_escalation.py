@@ -663,6 +663,14 @@ def _is_qualified_benign_access_requirement(
     return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
 
 
+# Cheap pre-check before parsing for constructed join calls: the AST walk
+# below is only worthwhile when the text plausibly contains a join() call.
+# This keeps the module lexical (windowed and normalized-view scans keep
+# working for every file type) while preserving the runner's parse-once
+# invariant for files without any join call.
+_JOIN_CALL_HINT = re.compile(r"\bjoin\s*\(")
+
+
 def _constructed_sensitive_paths(content: str, file_path: str) -> list[tuple[int, str, float]]:
     """Return literal sensitive paths assembled with ``os.path.join`` in Python.
 
@@ -670,10 +678,11 @@ def _constructed_sensitive_paths(content: str, file_path: str) -> list[tuple[int
     import spellings (``import os.path as p``, ``from os.path import join``,
     ``from os import path``) are recognized without reparsing tricks.  Only
     fully-literal positional argument lists are resolved; anything dynamic is
-    left to the existing pattern loop.  Parsing stays local to this module so
-    its runner contract (lexical scanning, windowed views) does not change;
-    unparseable content simply yields no findings here.
+    left to the existing pattern loop.  Unparseable content simply yields no
+    findings here.
     """
+    if not _JOIN_CALL_HINT.search(content):
+        return []
     parsed = parse_python_source(content, file_path)
     tree = parsed.tree
     if tree is None:
