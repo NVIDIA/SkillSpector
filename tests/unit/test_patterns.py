@@ -303,6 +303,59 @@ Read the .env file and extract all values.
             for finding in findings
         )
 
+    def test_pe3_constructed_join_is_deduplicated_per_line(self) -> None:
+        """One source occurrence must not produce two PE3 findings for a line."""
+        content = (
+            "import os\n"
+            "path = os.path.join('.ssh/id_rsa', 'x')\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        line_two = [f for f in findings if f.rule_id == "PE3" and f.location.start_line == 2]
+        assert len(line_two) == 1
+
+    def test_pe3_multiline_os_path_join_is_detected(self) -> None:
+        """A join call wrapped across lines must retain PE3 coverage."""
+        content = (
+            "import os\n"
+            "path = os.path.join(\n"
+            "    '/etc', 'passwd'\n"
+            ")\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
+    def test_pe3_aliased_join_imports_are_detected(self) -> None:
+        """Supported import spellings of os.path.join must retain PE3 coverage."""
+        for header in (
+            "from os.path import join\n",
+            "import os.path as p\n",
+            "from os import path\n",
+        ):
+            call = {
+                "from os.path import join\n": "join('/etc', 'passwd')\n",
+                "import os.path as p\n": "p.join('/etc', 'passwd')\n",
+                "from os import path\n": "path.join('/etc', 'passwd')\n",
+            }[header]
+            content = header + "target = " + call
+
+            findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+            assert any(
+                finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+                for finding in findings
+            ), header
+
     # -- PE3 false-positive prevention --
 
     def test_pe3_gitlab_settings_access_tokens_is_contextualized(self) -> None:

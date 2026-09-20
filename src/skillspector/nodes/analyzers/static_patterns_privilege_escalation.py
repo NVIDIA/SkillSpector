@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import ast
 import posixpath
 import re
 import sys
@@ -24,6 +25,7 @@ from bisect import bisect_right
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import parse_python_source
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -35,6 +37,7 @@ from .common import (
     get_context,
     get_context_from_lines,
     get_line_number,
+    resolve_call_name,
 )
 from .pattern_defaults import PatternCategory
 
@@ -660,26 +663,37 @@ def _is_qualified_benign_access_requirement(
     return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
 
 
-def _constructed_sensitive_paths(content: str) -> list[tuple[int, str, float]]:
+def _constructed_sensitive_paths(content: str, file_path: str) -> list[tuple[int, str, float]]:
     """Return literal sensitive paths assembled with ``os.path.join`` in Python.
 
-    Keep this expression-level recognizer regex-based: Python AST parsing is shared
-    across the analyzer graph, so a second parse here would defeat that cache.
+    Resolved from the Python AST so calls split across lines and supported
+    import spellings (``import os.path as p``, ``from os.path import join``,
+    ``from os import path``) are recognized without reparsing tricks.  Only
+    fully-literal positional argument lists are resolved; anything dynamic is
+    left to the existing pattern loop.  Parsing stays local to this module so
+    its runner contract (lexical scanning, windowed views) does not change;
+    unparseable content simply yields no findings here.
     """
-    call_pattern = re.compile(r"os\.path\.join\((?P<args>[^()\n]+)\)")
-    string_pattern = re.compile(r"(['\"])(?P<value>[^'\"]*)\1")
-
+    parsed = parse_python_source(content, file_path)
+    tree = parsed.tree
+    if tree is None:
+        return []
+    aliases = parsed.import_aliases
     resolved: list[tuple[int, str, float]] = []
-    for match in call_pattern.finditer(content):
-        args = match.group("args")
-        parts = [item.group("value") for item in string_pattern.finditer(args)]
-        residual = string_pattern.sub("", args).replace(",", "").strip()
-        if len(parts) < 2 or residual:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if resolve_call_name(node, aliases) != "os.path.join":
+            continue
+        if node.keywords or len(node.args) < 2:
+            continue
+        parts = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+        if len(parts) != len(node.args) or not all(isinstance(part, str) for part in parts):
             continue
         value = posixpath.join(*parts)
         for pattern, confidence in PE3_PATTERNS:
             if re.search(pattern, value, re.IGNORECASE):
-                resolved.append((get_line_number(content, match.start()), value, confidence))
+                resolved.append((node.lineno, value, confidence))
                 break
     return resolved
 
@@ -834,19 +848,33 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     if file_type == "python":
-        for line_num, path, confidence in _constructed_sensitive_paths(content):
-            findings.append(
-                AnalyzerFinding(
-                    rule_id="PE3",
-                    message="Credential Access",
-                    severity=Severity.HIGH,
-                    location=loc(line_num),
-                    confidence=confidence,
-                    tags=list(tag),
-                    context=get_context(content, line_starts[line_num - 1]),
-                    matched_text=path,
-                )
+        for line_num, path, confidence in _constructed_sensitive_paths(content, file_path):
+            constructed = AnalyzerFinding(
+                rule_id="PE3",
+                message="Credential Access",
+                severity=Severity.HIGH,
+                location=loc(line_num),
+                confidence=confidence,
+                tags=list(tag),
+                context=get_context(content, line_starts[line_num - 1]),
+                matched_text=path,
             )
+            # One PE3 per source occurrence: the pattern loop above may already
+            # have fired on this line's raw text (for example the literal
+            # '.ssh/id_rsa' inside the join call).  Keep the best-confidence
+            # finding, mirroring the PE4/PE5 per-line aggregation below.
+            duplicate = next(
+                (
+                    existing
+                    for existing in findings
+                    if existing.rule_id == "PE3" and existing.location.start_line == line_num
+                ),
+                None,
+            )
+            if duplicate is None:
+                findings.append(constructed)
+            elif confidence > duplicate.confidence:
+                findings[findings.index(duplicate)] = constructed
     # Collect best-confidence PE4 finding per line to avoid double-counting lines
     # that match multiple patterns (e.g. DockerClient(base_url=".../docker.sock")).
     pe4_best: dict[int, AnalyzerFinding] = {}
