@@ -478,6 +478,22 @@ def test_github_tree_url_rejects_encoded_path_escapes(segment: str) -> None:
         )
 
 
+@pytest.mark.parametrize("target", ["missing", "SKILL.md"])
+def test_github_tree_url_selection_failure_cleans_owned_clone(tmp_path: Path, target: str) -> None:
+    """A post-clone tree selection error must not strand the owned checkout."""
+    handler = InputHandler()
+    clone = tmp_path / "repo"
+    clone.mkdir()
+    if target == "SKILL.md":
+        (clone / target).write_text("# skill\n")
+    handler._temp_dir = tmp_path
+    with patch.object(handler, "_clone_git", return_value=clone):
+        with pytest.raises(ValueError):
+            handler.resolve(f"https://github.com/example/repo/tree/main/{target}")
+    assert not tmp_path.exists()
+    assert handler.temp_dir_for_cleanup() is None
+
+
 def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
     """Network inputs require HTTPS unless they use SSH's scp-style syntax."""
     handler = InputHandler()

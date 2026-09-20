@@ -743,15 +743,18 @@ class InputHandler:
         if git_target is not None:
             repository_url, branch, subdirectory = git_target
             clone_dir = self._clone_git(repository_url, branch=branch)
-            clone_root = clone_dir.resolve()
-            target = (clone_root / subdirectory).resolve()
             try:
+                clone_root = clone_dir.resolve()
+                target = (clone_root / subdirectory).resolve()
                 target.relative_to(clone_root)
-            except ValueError as exc:
-                raise ValueError("Git URL subdirectory must stay within the repository") from exc
-            if not target.is_dir() or target.is_symlink():
-                raise ValueError("Git URL subdirectory does not exist or is not a directory")
-            return target, "git"
+                if not target.is_dir() or target.is_symlink():
+                    raise ValueError("Git URL subdirectory does not exist or is not a directory")
+                return target, "git"
+            except (OSError, ValueError):
+                # No caller receives the resolver after a failed selection, so it
+                # cannot clean an owned clone on our behalf.
+                self.cleanup()
+                raise
         if self._is_git_url(input_path):
             return self._clone_git(input_path), "git"
         if self._is_file_url(input_path):
