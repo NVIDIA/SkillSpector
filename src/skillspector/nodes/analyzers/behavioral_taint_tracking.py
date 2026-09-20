@@ -331,6 +331,29 @@ class _TaintedVar(NamedTuple):
     lineno: int
 
 
+def _walk_source_order(tree: ast.AST) -> list[ast.AST]:
+    """Depth-first pre-order walk, unlike :func:`ast.walk`'s breadth-first order.
+
+    ``_analyze_python`` records a source assignment into ``tainted`` and later,
+    while still walking the SAME tree, looks that variable up at a sink call
+    site. ``ast.walk`` yields nodes level-by-level, so a source nested two or
+    more AST levels deeper than the sink it feeds (e.g. assigned inside a
+    doubly-nested ``if``/``try`` block, then used at a shallower sink) is
+    visited AFTER the sink, not before, even though it appears earlier in the
+    source text. The lookup then misses and the flow goes unreported. A
+    pre-order walk visits an entire earlier statement's subtree — including
+    any nested assignment — before moving on to a later sibling statement, so
+    it always agrees with a top-to-bottom source-order reading of the file.
+    """
+    ordered: list[ast.AST] = []
+    stack: list[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
+        ordered.append(node)
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+    return ordered
+
+
 def _is_open_for_write(node: ast.Call) -> bool:
     """Heuristic: open() is a write sink if mode arg contains 'w' or 'a'."""
     if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
@@ -519,7 +542,7 @@ def _analyze_python(
         else:
             budget.emit(finding)
 
-    for ast_node in ast.walk(tree):
+    for ast_node in _walk_source_order(tree):
         if budget is not None:
             budget.check_runtime()
         # Record tainted assignments.
