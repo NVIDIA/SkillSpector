@@ -592,6 +592,22 @@ class TestBuiltInMalwarePackaging:
         assert _has_rule(findings, "reverse_shell")
         assert any(f.rule_id == "YR1" for f in findings)
 
+    @pytest.mark.parametrize(
+        "content, filename",
+        [
+            (
+                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                's.connect(("10.0.0.1", 4444))\n',
+                "shell.py",
+            ),
+            ("use Socket;\nsocket(SOCKET, PF_INET, SOCK_STREAM, 6);\n", "shell.pl"),
+        ],
+    )
+    def test_builtin_reverse_shell_matches_multiline_socket_forms(
+        self, content: str, filename: str
+    ) -> None:
+        assert _has_rule(_run_builtin(content, filename), "reverse_shell")
+
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
             tmp_path,
