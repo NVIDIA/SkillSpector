@@ -2843,6 +2843,19 @@ def _scan_multi_skill(
         len(skills) - scanned_skill_count,
     )
     output_omitted_skill_count = max(0, scanned_skill_count - len(processed_skills))
+    omitted_symlink_entry_count = detection.omitted_symlink_entries
+    if omitted_symlink_entry_count:
+        analysis_incomplete = True
+        aggregate_limitations.append(
+            f"{omitted_symlink_entry_count} symlinked recursive skill(s) omitted "
+            "(directory symlinks are not followed)"
+        )
+        progress_console.print(
+            f"[yellow]Warning:[/yellow] {omitted_symlink_entry_count} symlinked skill "
+            "directories were skipped during recursive discovery and are not "
+            "included in this scan."
+        )
+    skills_omitted_total = unscanned_skill_count + omitted_symlink_entry_count
     if output_omitted_skill_count:
         analysis_incomplete = True
         aggregate_limitations.append(
@@ -2860,7 +2873,7 @@ def _scan_multi_skill(
         complete_skills=complete_skill_count,
         partial_skills=partial_skill_count,
         failed_skills=failed_skill_count,
-        omitted_skills=unscanned_skill_count,
+        omitted_skills=skills_omitted_total,
         limitations=aggregate_limitations,
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
@@ -2898,10 +2911,15 @@ def _scan_multi_skill(
         progress_console.print(
             f"  {'<unscanned>':<30} {'—':<8} {'—':<12} {unscanned_skill_count:<10} {'partial':<10}"
         )
-    if output_omitted_skill_count or unscanned_skill_count:
+    if omitted_symlink_entry_count:
+        progress_console.print(
+            f"  {'<symlink omitted>':<30} {'—':<8} {'—':<12} "
+            f"{omitted_symlink_entry_count:<10} {'skipped':<10}"
+        )
+    if output_omitted_skill_count or unscanned_skill_count or omitted_symlink_entry_count:
         progress_console.print(
             "[yellow]Recursive scan incomplete:[/yellow] one or more skills were omitted "
-            "after an aggregate safety limit."
+            "after an aggregate safety limit or skipped as symlinks."
         )
 
     if format == FormatChoice.json:
@@ -2914,7 +2932,7 @@ def _scan_multi_skill(
             "risk_recommendation": aggregate_risk_assessment["recommendation"],
             "analysis_completeness": aggregate_completeness,
             "skills_scanned": scanned_skill_count,
-            "skills_omitted": unscanned_skill_count,
+            "skills_omitted": skills_omitted_total,
             "skills_output_omitted": output_omitted_skill_count,
             "public_finding_records": retained_public_records,
             "report_characters": retained_report_characters,
@@ -2963,6 +2981,14 @@ def _scan_multi_skill(
                     "omitted": True,
                     "omitted_count": unscanned_skill_count,
                     "reason": "aggregate_scan_limit",
+                }
+            )
+        if omitted_symlink_entry_count:
+            combined_skills.append(
+                {
+                    "omitted": True,
+                    "omitted_count": omitted_symlink_entry_count,
+                    "reason": "symlink_not_followed",
                 }
             )
         rendered = json.dumps(combined, indent=2)

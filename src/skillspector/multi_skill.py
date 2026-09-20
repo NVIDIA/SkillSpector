@@ -132,6 +132,7 @@ class MultiSkillDetectionResult:
     entries_examined: int = 0
     structured_candidates_examined: int = 0
     structured_input_bytes_examined: int = 0
+    omitted_symlink_entries: int = 0
 
     @property
     def complete(self) -> bool:
@@ -276,11 +277,13 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
             return MultiSkillDetectionResult(is_multi_skill=False, has_root_skill=True)
 
         skills: list[SkillDirectory] = []
+        omitted_symlink_entries = 0
         for entry in _bounded_scandir(directory, budget=budget):
             budget.check_runtime()
             child = Path(entry.path)
             try:
                 if entry.is_symlink() or _is_link_or_junction(child):
+                    omitted_symlink_entries += 1
                     continue
                 if not entry.is_dir(follow_symlinks=False):
                     continue
@@ -317,6 +320,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
         entries_examined=budget.entries,
         structured_candidates_examined=budget.structured_candidates,
         structured_input_bytes_examined=budget.structured_bytes,
+        omitted_symlink_entries=omitted_symlink_entries,
     )
 
 

@@ -315,6 +315,7 @@ class TestDetectSkills:
             "skill-b",
         }
         assert [skill.local_only for skill in result.skills] == [True, False, False]
+        assert result.omitted_symlink_entries == 1
 
     def test_symlinked_skill_directory_is_skipped(self, tmp_path: Path) -> None:
         """Detection must not read a skill manifest through a directory symlink."""
@@ -334,6 +335,7 @@ class TestDetectSkills:
 
         assert result.is_multi_skill is True
         assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.omitted_symlink_entries == 1
 
     def test_symlinked_root_is_not_detected(self, tmp_path: Path) -> None:
         """Direct callers cannot use detection to inspect a symlinked root."""
