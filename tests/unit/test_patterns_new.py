@@ -1481,6 +1481,37 @@ class TestToolMisuse:
         )
         assert not any(finding.rule_id == "TM1" for finding in findings)
 
+    def test_tm1_ignores_shell_variable_from_unrelated_scope(self) -> None:
+        content = (
+            "def helper():\n"
+            "    use_shell = True\n"
+            "\n"
+            "def main():\n"
+            "    subprocess.run(cmd, shell=use_shell)\n"
+        )
+        findings = tm_mod.analyze(content, "runner.py", "python")
+        assert not any(finding.rule_id == "TM1" for finding in findings)
+
+    def test_tm1_keeps_shell_variable_read_through_closure(self) -> None:
+        content = (
+            "def outer():\n"
+            "    use_shell = True\n"
+            "    def inner():\n"
+            "        subprocess.run(cmd, shell=use_shell)\n"
+        )
+        findings = tm_mod.analyze(content, "runner.py", "python")
+        assert any(finding.rule_id == "TM1" for finding in findings)
+
+    def test_tm1_keeps_global_shell_variable(self) -> None:
+        content = (
+            "use_shell = True\n"
+            "def main():\n"
+            "    global use_shell\n"
+            "    subprocess.run(cmd, shell=use_shell)\n"
+        )
+        findings = tm_mod.analyze(content, "runner.py", "python")
+        assert any(finding.rule_id == "TM1" for finding in findings)
+
     def test_application_specific_no_verify_flag_is_not_tool_misuse(self) -> None:
         content = """\
 print("verification: skipped (--no-verify)")
