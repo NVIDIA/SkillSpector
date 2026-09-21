@@ -9,7 +9,7 @@ import zlib
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
-from skillspector.artifacts import ContentKind
+from skillspector.artifacts import ContentKind, ReferenceKind
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
@@ -485,6 +485,7 @@ def _reference_coverage_findings(
             and target_path not in invalid_status_paths
             and target_path not in duplicate_inventory_paths
             and reference_disposition == disposition
+            and str(reference.get("reference_kind", "")) == ReferenceKind.MARKDOWN_IMAGE
             and _has_only_format_limitations(
                 target_path,
                 inventory_item,

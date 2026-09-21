@@ -865,6 +865,7 @@ def test_format_only_reference_keeps_coverage_without_ae1(
                 "target_path": "assets/diagram.png",
                 "status": "resolved",
                 "disposition": disposition,
+                "reference_kind": "markdown_image",
             }
         ],
         "inspection_ledger": [
@@ -919,6 +920,7 @@ def test_reference_disposition_must_match_inventory_before_ae1_is_suppressed(
         "line": 7,
         "target_path": path,
         "status": "resolved",
+        "reference_kind": "markdown_image",
     }
     if reference_disposition is not None:
         reference["disposition"] = reference_disposition
@@ -952,6 +954,90 @@ def test_reference_disposition_must_match_inventory_before_ae1_is_suppressed(
     )
 
     assert bool(findings) is expected_ae1
+
+
+@pytest.mark.parametrize(
+    "reference_kind",
+    [None, "markdown_link", "inline_command", "quoted_or_code", "plain_path", "unknown"],
+)
+def test_format_only_png_requires_a_positive_passive_image_reference(
+    reference_kind: str | None,
+) -> None:
+    path = "assets/diagram.png"
+    reference: dict[str, object] = {
+        "source_path": "SKILL.md",
+        "line": 7,
+        "target_path": path,
+        "status": "resolved",
+        "disposition": "out_of_scope",
+    }
+    if reference_kind is not None:
+        reference["reference_kind"] = reference_kind
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "out_of_scope",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [reference],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.BINARY_CONTENT,
+                )
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+def test_active_reference_to_passively_embedded_png_still_produces_ae1() -> None:
+    path = "assets/diagram.png"
+    base_reference = {
+        "source_path": "SKILL.md",
+        "target_path": path,
+        "status": "resolved",
+        "disposition": "out_of_scope",
+    }
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "out_of_scope",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [
+                {**base_reference, "line": 7, "reference_kind": "markdown_image"},
+                {**base_reference, "line": 7, "reference_kind": "inline_command"},
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.OUT_OF_SCOPE,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.BINARY_CONTENT,
+                )
+            ],
+        }
+    )
+
+    assert [(finding.rule_id, finding.start_line) for finding in findings] == [("AE1", 7)]
 
 
 @pytest.mark.parametrize(
@@ -1043,6 +1129,7 @@ def test_format_reason_does_not_hide_other_reference_failures(
                 "target_path": path,
                 "status": "resolved",
                 "disposition": "partial",
+                "reference_kind": "markdown_image",
             }
         ],
         "inspection_ledger": events,
@@ -1148,6 +1235,7 @@ def test_noncanonical_ledger_path_cannot_hide_a_reference_failure(alias: str) ->
                     "target_path": path,
                     "status": "resolved",
                     "disposition": "partial",
+                    "reference_kind": "markdown_image",
                 }
             ],
             "inspection_ledger": [format_event, size_event],
@@ -1189,6 +1277,7 @@ def test_noncanonical_inventory_path_cannot_hide_a_reference_failure(alias: str)
                     "target_path": path,
                     "status": "resolved",
                     "disposition": "partial",
+                    "reference_kind": "markdown_image",
                 }
             ],
             "inspection_ledger": [
@@ -1327,6 +1416,7 @@ def test_non_dict_ledger_mapping_cannot_prove_a_format_only_reference() -> None:
                 "target_path": path,
                 "status": "resolved",
                 "disposition": "partial",
+                "reference_kind": "markdown_image",
             }
         ],
     }
@@ -1529,6 +1619,7 @@ def test_degraded_analyzer_status_accepts_matching_format_only_evidence() -> Non
                     "target_path": path,
                     "status": "resolved",
                     "disposition": "partial",
+                    "reference_kind": "markdown_image",
                 }
             ],
             "inspection_ledger": [format_event],
@@ -1569,6 +1660,7 @@ def test_unrelated_fatal_does_not_reclassify_a_format_only_reference() -> None:
                     "target_path": path,
                     "status": "resolved",
                     "disposition": "partial",
+                    "reference_kind": "markdown_image",
                 }
             ],
             "inspection_ledger": [

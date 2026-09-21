@@ -86,13 +86,14 @@ Truncated extraction and missing or ambiguous local references are explicit part
 conditions. A referenced binary, opaque, or otherwise uninspected artifact is not treated as a
 successfully analyzed reference.
 
-When a binary or opaque target's only limitation is an unsupported content format, its
-coverage exception remains visible without an AE1 analysis-evasion finding. Other failures,
-unknown reasons, and mixed limitations still produce AE1. This distinction does not change
-coverage metrics, incomplete-scan recommendations, or `--fail-on-incomplete` behavior.
-Executable or concealed content retains its non-format coverage reason and AE1 signal. A
-format-only scan may report LOW severity after AE1 is removed, while still recommending
-`CAUTION` because the scan remains incomplete.
+AE1 is suppressed only for a positively identified rendered Markdown image whose complete
+bytes verify as a minimal, non-interlaced PNG and whose canonical inspection evidence has
+only unsupported-format limitations. Active, ambiguous, escaped, code, and missing-kind
+references retain AE1, as do non-PNG formats, executable or concealed content, other failures,
+unknown reasons, and mixed limitations. Suppression leaves the coverage exception, coverage
+metrics, incomplete-scan recommendation, and `--fail-on-incomplete` behavior unchanged. Such
+an image-only limitation may report LOW severity while still recommending `CAUTION` because
+the scan remains incomplete.
 
 ## Structured skill data
 

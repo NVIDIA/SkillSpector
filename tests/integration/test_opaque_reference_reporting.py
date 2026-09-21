@@ -168,8 +168,9 @@ def test_graph_keeps_png_coverage_without_ae1(
         _assert_completeness(result["analysis_completeness"], count)
         _assert_report(result["report_body"], "json", count)
         references = result["artifact_references"]
-        assert len(references) == count * (2 if duplicate_label else 1)
+        assert len(references) == count
         assert all(reference["status"] == "resolved" for reference in references)
+        assert all(reference["reference_kind"] == "markdown_image" for reference in references)
         binary_items = [
             item for item in result["artifact_inventory"] if item["content_kind"] == "binary"
         ]
@@ -244,6 +245,71 @@ def test_graph_keeps_ae1_for_valid_png_with_trailing_payload(tmp_path: Path) -> 
     result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
 
     assert any(finding.rule_id == "AE1" for finding in result["findings"])
+
+
+def test_cli_keeps_ae1_for_valid_png_used_as_a_command_operand(tmp_path: Path) -> None:
+    skill = _write_single_asset_skill(tmp_path, "helper.png", _valid_png_payload())
+    (skill / "SKILL.md").write_text(
+        "---\nname: asset-guide\n"
+        "description: Run one bundled helper when the user asks.\n"
+        "---\n# Asset guide\n\n"
+        "Run `bash assets/helper.png`.\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "skillspector.cli",
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--format",
+            "json",
+            "--fail-on-findings",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "120"},
+    )
+
+    assert result.returncode == 1, result.stderr
+    report = json.loads(result.stdout)
+    assert any(issue["id"] == "AE1" for issue in report["issues"])
+
+
+@pytest.mark.parametrize(
+    "reference_text",
+    [
+        "> ~~~text\n> ![Chart](assets/helper.png)\n> ~~~",
+        "- ~~~text\n  ![Chart](assets/helper.png)\n  ~~~",
+        " \t![Chart](assets/helper.png)",
+        "<!--\n![Chart](assets/helper.png)\n-->",
+        "<pre>\n![Chart](assets/helper.png)\n</pre>",
+        "[Inspect assets/helper.png](SKILL.md)",
+    ],
+    ids=["quote-fence", "list-fence", "tab-indent", "comment", "html", "distinct-label"],
+)
+def test_graph_retains_ae1_for_non_image_reference_contexts(
+    tmp_path: Path, reference_text: str
+) -> None:
+    skill = _write_single_asset_skill(tmp_path, "helper.png", _valid_png_payload())
+    instructions = skill / "SKILL.md"
+    instructions.write_text(
+        instructions.read_text(encoding="utf-8").replace(
+            "Review [the bundled asset](assets/helper.png).", reference_text
+        ),
+        encoding="utf-8",
+    )
+
+    result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
+
+    assert any(finding.rule_id == "AE1" for finding in result["findings"])
+    assert result["analysis_completeness"]["is_complete"] is False
+    report = json.loads(result["report_body"])
+    assert any(issue["id"] == "AE1" for issue in report["issues"])
 
 
 def test_graph_keeps_ae1_for_active_pdf(tmp_path: Path) -> None:

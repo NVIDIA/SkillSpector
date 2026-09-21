@@ -43,6 +43,16 @@ class ArtifactDisposition(StrEnum):
     OUT_OF_SCOPE = "out_of_scope"
 
 
+class ReferenceKind(StrEnum):
+    """Syntactic use that produced one intra-bundle reference."""
+
+    MARKDOWN_IMAGE = "markdown_image"
+    MARKDOWN_LINK = "markdown_link"
+    INLINE_COMMAND = "inline_command"
+    QUOTED_OR_CODE = "quoted_or_code"
+    PLAIN_PATH = "plain_path"
+
+
 class ArtifactRecord(TypedDict):
     """Serializable inventory row for one discovered bundle artifact."""
 
@@ -68,6 +78,7 @@ class BundleReference(TypedDict):
     target_path: str | None
     status: str
     disposition: ArtifactDisposition
+    reference_kind: ReferenceKind
 
 
 @dataclass(frozen=True)

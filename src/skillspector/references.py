@@ -15,7 +15,7 @@ from io import StringIO
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
-from skillspector.artifacts import ArtifactDisposition, BundleReference
+from skillspector.artifacts import ArtifactDisposition, BundleReference, ReferenceKind
 
 MAX_REFERENCE_SOURCE_BYTES = 1_000_000
 MAX_RAW_REFERENCE_CANDIDATES = 4096
@@ -23,7 +23,17 @@ MAX_ACCEPTED_REFERENCES = 256
 MAX_REFERENCE_RECORDS = 1024
 MAX_REFERENCE_RUNTIME_SECONDS = 2.0
 _MAX_EVIDENCE = 160
-_MARKDOWN_DESTINATION = re.compile(r"\[[^\]\n]{1,200}\]\(([^)\n]{1,512})\)")
+_MARKDOWN_IMAGE_DESTINATION = re.compile(r"!\[[^\]\n]{0,200}\]\(([^)\n]{1,512})\)")
+_MARKDOWN_LINK_DESTINATION = re.compile(r"(?<!!)\[[^\]\n]{1,200}\]\(([^)\n]{1,512})\)")
+_PASSIVE_IMAGE_DESTINATION = re.compile(
+    r"[^\s\\()\[\]<>]+(?:[ \t]+(?:\"[^\"\\\r\n()]*\"|'[^'\\\r\n()]*'))?"
+)
+_MARKDOWN_FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)$")
+_MARKDOWN_CONTAINER_PREFIX = re.compile(r"[ ]{0,3}(?:(>)[ ]?|(?:[-+*]|\d{1,9}[.)])[ ]+)")
+_HTML_CONTEXT_START = re.compile(
+    r"<!--|<\?|<!\[CDATA\[|<![A-Z]|</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>])",
+    re.IGNORECASE,
+)
 _QUOTED_OR_CODE_PATH = re.compile(
     r"(?:`|'|\")((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:`|'|\")"
 )
@@ -65,12 +75,81 @@ def _evidence(cleaned_line: str, column: int) -> str:
     return cleaned_line[start : start + _MAX_EVIDENCE]
 
 
+def _advance_inline_code_state(
+    line: str,
+    end: int,
+    cursor: int,
+    delimiter_length: int | None,
+) -> tuple[int, int | None]:
+    """Advance a bounded CommonMark-style backtick-span state to ``end``."""
+    while cursor < end:
+        if line[cursor] != "`":
+            cursor += 1
+            continue
+        preceding_backslashes = 0
+        probe = cursor - 1
+        while probe >= 0 and line[probe] == "\\":
+            preceding_backslashes += 1
+            probe -= 1
+        run_end = cursor + 1
+        while run_end < end and line[run_end] == "`":
+            run_end += 1
+        if preceding_backslashes % 2 == 0:
+            run_length = run_end - cursor
+            if delimiter_length is None:
+                delimiter_length = run_length
+            elif delimiter_length == run_length:
+                delimiter_length = None
+        cursor = run_end
+    return cursor, delimiter_length
+
+
+def _is_escaped_marker(line: str, offset: int) -> bool:
+    """Return whether the character at ``offset`` has an odd backslash escape."""
+    backslashes = 0
+    offset -= 1
+    while offset >= 0 and line[offset] == "\\":
+        backslashes += 1
+        offset -= 1
+    return backslashes % 2 == 1
+
+
+def _markdown_block_view(line: str) -> tuple[str, int, bool, int]:
+    """Expose fences inside containers without claiming to parse their rendering."""
+    expanded = line.expandtabs(4)
+    cursor = 0
+    quote_depth = 0
+    has_list = False
+    while match := _MARKDOWN_CONTAINER_PREFIX.match(expanded, cursor):
+        quote_depth += int(match.group(1) is not None)
+        has_list |= match.group(1) is None
+        cursor = match.end()
+    return expanded[cursor:], quote_depth, has_list, cursor
+
+
+def _html_context_end(match: re.Match[str]) -> re.Pattern[str] | None:
+    """Recognize literal terminators; other HTML contexts end at a blank line."""
+    marker = match.group(0)
+    if marker == "<!--":
+        return re.compile(r"-->")
+    if marker == "<?":
+        return re.compile(r"\?>")
+    if marker.upper() == "<![CDATA[":
+        return re.compile(r"\]\]>")
+    if marker.startswith("<!"):
+        return re.compile(r">")
+    tag = (match.group(1) or "").lower()
+    if tag in {"pre", "script", "style", "textarea"}:
+        return re.compile(rf"</{tag}\s*>", re.IGNORECASE)
+    return None
+
+
 def _candidate_strings(
     text: str,
     *,
     deadline: float,
     clock: Callable[[], float],
-) -> tuple[list[tuple[str, int, int, str]], tuple[str, ...]]:
+) -> tuple[list[tuple[str, int, int, str, ReferenceKind]], tuple[str, ...]]:
     """Extract path-like strings without materializing all matches or lines.
 
     Each regular expression contributes at most one pending match to a small
@@ -78,58 +157,167 @@ def _candidate_strings(
     attacker-controlled line cannot be fully enumerated and sorted before the
     candidate and time ceilings are enforced.
     """
-    candidates: list[tuple[str, int, int, str]] = []
+    candidates: list[tuple[str, int, int, str, ReferenceKind]] = []
     seen: set[tuple[int, int, str]] = set()
     patterns = (
-        _MARKDOWN_DESTINATION,
-        _QUOTED_OR_CODE_PATH,
-        _INLINE_CODE_COMMAND_PATH,
-        _PLAIN_RELATIVE_PATH,
+        (_MARKDOWN_IMAGE_DESTINATION, ReferenceKind.MARKDOWN_IMAGE, True),
+        (_MARKDOWN_LINK_DESTINATION, ReferenceKind.MARKDOWN_LINK, True),
+        (_INLINE_CODE_COMMAND_PATH, ReferenceKind.INLINE_COMMAND, False),
+        (_QUOTED_OR_CODE_PATH, ReferenceKind.QUOTED_OR_CODE, False),
+        (_PLAIN_RELATIVE_PATH, ReferenceKind.PLAIN_PATH, False),
     )
+    active_fence: tuple[str, int, int, int] | None = None
+    in_html = False
+    html_end: re.Pattern[str] | None = None
+    inline_code_delimiter: int | None = None
     for line_number, line in enumerate(StringIO(text), 1):
         if clock() >= deadline:
             return candidates, ("runtime",)
+        stripped_line = line.rstrip("\r\n")
+        block_line, quote_depth, has_list, prefix_width = _markdown_block_view(stripped_line)
+        fence_match = _MARKDOWN_FENCE.fullmatch(block_line)
+        line_in_fence = active_fence is not None
+        closes_fence = False
+        if active_fence is not None and fence_match is not None:
+            marker = fence_match.group(1)
+            closes_fence = (
+                marker[0] == active_fence[0]
+                and len(marker) >= active_fence[1]
+                and quote_depth == active_fence[2]
+                and prefix_width + fence_match.start(1) >= active_fence[3]
+                and not has_list
+                and not fence_match.group(2).strip(" \t")
+            )
+        elif active_fence is None and fence_match is not None and not in_html:
+            marker = fence_match.group(1)
+            required_indent = prefix_width + fence_match.start(1) if has_list else 0
+            active_fence = (marker[0], len(marker), quote_depth, required_indent)
+            line_in_fence = True
+        line_is_indented_code = stripped_line.expandtabs(4).startswith(
+            "    "
+        ) or block_line.startswith("    ")
+        if in_html and html_end is None and not block_line.strip():
+            in_html = False
+        line_in_html = in_html
+        html_search_start = 0
+        if not line_in_fence and not line_is_indented_code:
+            while True:
+                if clock() >= deadline:
+                    return candidates, ("runtime",)
+                if not in_html:
+                    html_start = _HTML_CONTEXT_START.search(block_line, html_search_start)
+                    if html_start is None:
+                        break
+                    in_html = True
+                    line_in_html = True
+                    html_end = _html_context_end(html_start)
+                    html_search_start = html_start.end()
+                if html_end is None:
+                    break
+                html_close = html_end.search(block_line, html_search_start)
+                if html_close is None:
+                    break
+                html_search_start = html_close.end()
+                in_html = False
+                html_end = None
         cleaned_line = " ".join(line.strip().split())
-        iterators: list[Iterator[re.Match[str]]] = [pattern.finditer(line) for pattern in patterns]
-        pending: list[tuple[int, int, int, re.Match[str]]] = []
+        iterators: list[Iterator[re.Match[str]]] = [
+            pattern.finditer(line) for pattern, _, _ in patterns
+        ]
+        pending: list[tuple[int, int, int, int, re.Match[str]]] = []
+        image_label_spans: list[tuple[int, int, str]] = []
+        inline_code_cursor = 0
         for pattern_index, iterator in enumerate(iterators):
             match = next(iterator, None)
             if match is not None:
+                _, _, is_markdown = patterns[pattern_index]
                 heapq.heappush(
                     pending,
-                    (match.start(1), match.end(1), pattern_index, match),
+                    (
+                        match.start(0) if is_markdown else match.start(1),
+                        match.start(1),
+                        match.end(1),
+                        pattern_index,
+                        match,
+                    ),
                 )
             if clock() >= deadline:
                 return candidates, ("runtime",)
         while pending:
             if clock() >= deadline:
                 return candidates, ("runtime",)
-            _, _, pattern_index, match = heapq.heappop(pending)
-            raw = match.group(1).strip().split(maxsplit=1)[0]
-            key = (line_number, match.start(1), raw)
-            if key not in seen:
-                seen.add(key)
-                candidates.append(
-                    (
-                        raw,
-                        line_number,
-                        match.start(1) + 1,
-                        _evidence(cleaned_line, match.start(1) + 1),
-                    )
+            sort_start, _, _, pattern_index, match = heapq.heappop(pending)
+            _, reference_kind, is_markdown = patterns[pattern_index]
+            if not line_in_fence and not line_is_indented_code and not line_in_html:
+                inline_code_cursor, inline_code_delimiter = _advance_inline_code_state(
+                    line,
+                    sort_start,
+                    inline_code_cursor,
+                    inline_code_delimiter,
                 )
-                if len(candidates) >= MAX_RAW_REFERENCE_CANDIDATES:
-                    return candidates, ("raw_candidates",)
+            if reference_kind is ReferenceKind.MARKDOWN_IMAGE:
+                label = line[match.start(0) + 2 : match.start(1) - 2]
+                unambiguous_image = not any(char in label for char in "[]\\") and bool(
+                    _PASSIVE_IMAGE_DESTINATION.fullmatch(match.group(1))
+                )
+                if (
+                    line_in_fence
+                    or line_is_indented_code
+                    or line_in_html
+                    or prefix_width
+                    or inline_code_delimiter is not None
+                    or not unambiguous_image
+                ):
+                    reference_kind = ReferenceKind.QUOTED_OR_CODE
+                elif _is_escaped_marker(line, match.start(0)):
+                    reference_kind = ReferenceKind.PLAIN_PATH
+            raw = match.group(1).strip().split(maxsplit=1)[0]
+            if reference_kind is ReferenceKind.MARKDOWN_IMAGE:
+                # Only the same literal target in passive image alt text is
+                # redundant. Visible link labels and command operands can name
+                # independent artifacts whose coverage must still be checked.
+                image_label_spans.append((match.start(0), match.start(1), raw))
+            redundant_image_label = reference_kind is ReferenceKind.PLAIN_PATH and any(
+                start <= match.start(1) < end and raw == destination
+                for start, end, destination in image_label_spans
+            )
+            if not redundant_image_label:
+                key = (line_number, match.start(1), raw)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(
+                        (
+                            raw,
+                            line_number,
+                            match.start(1) + 1,
+                            _evidence(cleaned_line, match.start(1) + 1),
+                            reference_kind,
+                        )
+                    )
+                    if len(candidates) >= MAX_RAW_REFERENCE_CANDIDATES:
+                        return candidates, ("raw_candidates",)
             next_match = next(iterators[pattern_index], None)
             if next_match is not None:
+                _, _, next_is_markdown = patterns[pattern_index]
                 heapq.heappush(
                     pending,
                     (
+                        next_match.start(0) if next_is_markdown else next_match.start(1),
                         next_match.start(1),
                         next_match.end(1),
                         pattern_index,
                         next_match,
                     ),
                 )
+        if not line_in_fence and not line_is_indented_code and not line_in_html:
+            _, inline_code_delimiter = _advance_inline_code_state(
+                line,
+                len(line),
+                inline_code_cursor,
+                inline_code_delimiter,
+            )
+        if closes_fence:
+            active_fence = None
     return candidates, ()
 
 
@@ -202,7 +390,7 @@ def resolve_bundle_references_with_metadata(
     limitations.extend(candidate_limitations)
     records: list[BundleReference] = []
     accepted_keys: set[tuple[str, str]] = set()
-    for raw, line, column, evidence in candidates:
+    for raw, line, column, evidence, reference_kind in candidates:
         if clock() > effective_deadline:
             limitations.append("runtime")
             break
@@ -253,6 +441,7 @@ def resolve_bundle_references_with_metadata(
                 "target_path": resolved_target,
                 "status": status,
                 "disposition": disposition,
+                "reference_kind": reference_kind,
             }
         )
     stable_limitations = tuple(dict.fromkeys(limitations))
