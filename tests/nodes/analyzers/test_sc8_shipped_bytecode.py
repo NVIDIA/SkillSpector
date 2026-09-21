@@ -51,6 +51,18 @@ def test_sc8_flags_pycache_and_pyc(tmp_path: Path) -> None:
     assert all(f.severity == "HIGH" for f in findings)
 
 
+def test_sc8_flags_bytecode_inside_a_shipped_virtual_environment(tmp_path: Path) -> None:
+    payload = tmp_path / ".venv" / "lib" / "payload.pyc"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"\x00")
+
+    findings = supply_chain._analyze_shipped_bytecode(str(tmp_path))
+
+    assert any(
+        finding.rule_id == "SC8" and finding.file == ".venv/lib/payload.pyc" for finding in findings
+    )
+
+
 def test_sc8_clean_tree_has_no_findings(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text("# demo\n", encoding="utf-8")
     (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")

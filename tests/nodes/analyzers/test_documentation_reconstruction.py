@@ -35,7 +35,12 @@ def successful_llm_transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         def invoke_with_usage(self, _prompt, collector):
             calls.append(self.schema.__name__)
             collector.mark_response_received()
-            return self.schema.model_validate({"findings": []})
+            payload = (
+                {"is_mismatch": False}
+                if "is_mismatch" in self.schema.model_fields
+                else {"findings": []}
+            )
+            return self.schema.model_validate(payload)
 
         async def ainvoke_with_usage(self, prompt, collector):
             return self.invoke_with_usage(prompt, collector)

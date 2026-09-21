@@ -111,7 +111,7 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
 )
 
 # TM1: Tool Parameter Abuse — dangerous parameter values
-TM1_PATTERNS = [
+TM1_CODE_PATTERNS = [
     # shell=True is a classic command injection vector
     (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True", 0.8),
     (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
@@ -163,20 +163,29 @@ TM1_PATTERNS = [
         r"(?:execute|query)\s*\(\s*f?['\"].*?\{.*?\}.*?\b(?:DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE)\b",
         0.85,
     ),
+]
+TM1_PROSE_PATTERNS = [
     # Dangerous tool parameter patterns in instructions
     (
         r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|-rf)\b",
         0.8,
     ),
 ]
+TM1_PATTERNS = TM1_CODE_PATTERNS + TM1_PROSE_PATTERNS
 
 # TM2: Chaining Abuse — chained commands to bypass safety
-TM2_PATTERNS = [
+TM2_CODE_PATTERNS = [
     # Shell command chaining with dangerous commands (\b prevents substring matches)
     (r"(?:&&|;)\s*\b(?:rm\b|del\b|erase\b)\s+-", 0.75),
     (r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh", 0.9),
     (r"(?:&&|;)\s*(?:sudo|su\s+)", 0.75),
     (r"(?:&&|;)\s*(?:chmod|chown)\s+(?:777|666|a\+rwx|-R)", 0.75),
+    # Pipe chains with escalating danger
+    (r"\|\s*(?:sudo|su)\s+", 0.75),
+    (r"\|\s*(?:sh|bash|zsh|python|node|ruby|perl)\s*$", 0.7),
+    (r"\|\s*(?:tee|xargs)\s+.*?\b(?:rm|del|sudo|curl)\b", 0.75),
+]
+TM2_PROSE_PATTERNS = [
     # Multi-step chains designed to circumvent individual checks
     # Bounded to ~500 chars per gap to avoid spanning entire documents
     (
@@ -191,19 +200,16 @@ TM2_PATTERNS = [
         r"(?:use|call)\s+(?:tool\s+)?(?:A|one|the\s+first)\s+(?:to|and)[^\n]{0,300}(?:then\s+)?(?:use|call|pass\s+(?:the\s+)?(?:output|result)\s+to)\s+(?:tool\s+)?(?:B|two|another)",
         0.6,
     ),
-    # Pipe chains with escalating danger
-    (r"\|\s*(?:sudo|su)\s+", 0.75),
-    (r"\|\s*(?:sh|bash|zsh|python|node|ruby|perl)\s*$", 0.7),
-    (r"\|\s*(?:tee|xargs)\s+.*?\b(?:rm|del|sudo|curl)\b", 0.75),
     # Natural language chaining instructions
     (
         r"(?:after|once)\s+(?:the\s+)?(?:first|initial)\s+(?:tool|command|action)\s+(?:succeeds|completes|runs)[^\n]{0,300}(?:immediately|then|next)\s+(?:run|execute|call|invoke)",
         0.6,
     ),
 ]
+TM2_PATTERNS = TM2_CODE_PATTERNS + TM2_PROSE_PATTERNS
 
 # TM3: Unsafe Defaults — overly permissive default settings
-TM3_PATTERNS = [
+TM3_CODE_PATTERNS = [
     # TLS/SSL verification disabled
     (r"verify\s*=\s*False", 0.75),
     (r"VERIFY_SSL\s*=\s*False", 0.8),
@@ -217,7 +223,6 @@ TM3_PATTERNS = [
     # Overly permissive CORS / access
     (r"(?:CORS|cors)[^=]*=\s*['\"]?\*['\"]?", 0.65),
     (r"(?:allow|access)[_-]?(?:origin|hosts?)\s*=\s*['\"]?\*['\"]?", 0.7),
-    (r"(?:allow|trust)\s+(?:all|any|every)\s+(?:origins?|hosts?|domains?|ips?)", 0.7),
     # Unsafe permissions
     (r"(?:mode|permission|umask)\s*=\s*(?:0?o?777|0?o?666)", 0.8),
     (r"world[_-]?(?:readable|writable|executable)", 0.7),
@@ -233,6 +238,9 @@ TM3_PATTERNS = [
         0.8,
     ),
     (r"(?:safe[_-]?mode|secure[_-]?mode|sandbox)\s*=\s*(?:False|false|0|off|no|disable)", 0.8),
+]
+TM3_PROSE_PATTERNS = [
+    (r"(?:allow|trust)\s+(?:all|any|every)\s+(?:origins?|hosts?|domains?|ips?)", 0.7),
     # Natural language unsafe defaults
     (r"(?:by\s+default|default\s+to)\s+(?:allow|accept|trust)\s+(?:all|any|everything)", 0.7),
     (
@@ -240,6 +248,7 @@ TM3_PATTERNS = [
         0.7,
     ),
 ]
+TM3_PATTERNS = TM3_CODE_PATTERNS + TM3_PROSE_PATTERNS
 
 # TM4: Privileged Kubernetes Workload — manifest/CLI primitives that grant
 # node/host takeover (the cluster-scale counterpart of a privileged container).
@@ -2104,7 +2113,12 @@ def _tm1_candidates(
     content: str,
 ) -> Iterator[tuple[int, int, str, float]]:
     for pattern, confidence in TM1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             yield match.start(), match.end(), match.group(0), confidence
 
     seen_commands: set[tuple[int, int]] = set()
@@ -2605,7 +2619,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
     for pattern, confidence in TM2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
@@ -2630,7 +2649,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in TM3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
