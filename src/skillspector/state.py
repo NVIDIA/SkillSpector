@@ -304,6 +304,9 @@ class SkillspectorState(TypedDict, total=False):
 
     # Model IDs per LLM-using node: e.g. {"default": "...", "meta_analyzer": "..."}
     model_config: dict[str, str]
+    # Sanitized LLM configuration captured with model resolution. The report
+    # projects this independently from provider token-usage telemetry.
+    llm_provenance: dict[str, object]
 
     # Component metadata for reporting and risk scoring (from build_context)
     component_metadata: list[dict[str, object]]
