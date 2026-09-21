@@ -601,7 +601,7 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
                 {
                     "path": "assets/blob.bin",
                     "disposition": "partial",
-                    "content_kind": "binary",
+                    "content_kind": "text",
                 }
             ],
             "artifact_references": [
@@ -621,7 +621,7 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
                     record_type=LedgerRecordType.SYSTEM,
                     phase="cache",
                     path="assets/blob.bin",
-                    reason=LedgerReason.OPAQUE_CONTENT,
+                    reason=LedgerReason.STATIC_PARSE_LIMIT,
                 )
             ],
             "analyzer_status_events": [],
@@ -713,7 +713,8 @@ def test_reference_findings_share_one_terminal_event_per_source_line(
         ("analyzed", LedgerOutcome.COMPLETED, None, False),
         ("partial", LedgerOutcome.PARTIAL, LedgerReason.SIZE_LIMIT, True),
         ("failed", LedgerOutcome.FAILED, LedgerReason.READ_ERROR, True),
-        ("out_of_scope", LedgerOutcome.OUT_OF_SCOPE, LedgerReason.BINARY_CONTENT, True),
+        ("out_of_scope", LedgerOutcome.OUT_OF_SCOPE, LedgerReason.BINARY_CONTENT, False),
+        ("out_of_scope", LedgerOutcome.OUT_OF_SCOPE, LedgerReason.EXCLUDED_DIRECTORY, True),
     ],
 )
 def test_resolved_reference_ae1_disposition_matrix_is_llm_independent(
@@ -778,6 +779,130 @@ def test_resolved_reference_ae1_disposition_matrix_is_llm_independent(
         assert len(result["effective_finding_ids"]) == 1
     else:
         assert result["effective_finding_ids"] == []
+
+
+@pytest.mark.parametrize("content_kind", ["binary", "opaque"])
+@pytest.mark.parametrize("disposition", ["partial", "out_of_scope"])
+@pytest.mark.parametrize("reason", [LedgerReason.BINARY_CONTENT, LedgerReason.OPAQUE_CONTENT])
+def test_format_only_reference_keeps_coverage_without_ae1(
+    content_kind: str, disposition: str, reason: LedgerReason
+) -> None:
+    state = {
+        "components": ["assets/diagram.png"],
+        "artifact_inventory": [
+            {"path": "assets/diagram.png", "content_kind": content_kind, "disposition": disposition}
+        ],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 7,
+                "target_path": "assets/diagram.png",
+                "status": "resolved",
+            }
+        ],
+        "inspection_ledger": [
+            ledger_event(
+                outcome=LedgerOutcome(disposition),
+                record_type=LedgerRecordType.SYSTEM,
+                phase="static",
+                path="assets/diagram.png",
+                reason=reason,
+            )
+        ],
+    }
+
+    # Public JSON carries strings instead of enums; both representations must agree.
+    for candidate in (state, json.loads(json.dumps(state))):
+        result = finalize_inspection_ledger(candidate)
+        assert result["findings"] == []
+        assert result["effective_finding_ids"] == []
+        completeness = result["analysis_completeness"]
+        assert completeness["is_complete"] is False
+        assert completeness["coverage_percent"] == 0.0
+        assert completeness["findings_after_filtering"] == 0
+
+
+@pytest.mark.parametrize(
+    ("inventory_patch", "extra_event", "format_event_patch", "keep_format_event"),
+    [
+        ({"disposition": "failed"}, None, {}, True),
+        ({"content_kind": "text"}, None, {}, True),
+        ({"content_kind": "unknown"}, None, {}, True),
+        ({"content_kind": ["binary"]}, None, {}, True),
+        ({"disposition": ["partial"]}, None, {}, True),
+        ({"reason": {"code": "opaque_content"}}, None, {}, True),
+        ({"reason": "size_limit"}, None, {}, True),
+        ({"reason": "read_error"}, None, {}, True),
+        ({"reason": "oms_signature"}, None, {}, True),
+        ({}, {"outcome": "partial", "reason_code": "static_parse_limit"}, {}, True),
+        ({}, {"outcome": "failed", "reason_code": "read_error"}, {}, True),
+        ({}, {"outcome": "out_of_scope", "reason_code": "excluded_directory"}, {}, True),
+        ({}, {"outcome": "partial", "reason_code": "excluded_executable_content"}, {}, True),
+        ({}, {"outcome": "skipped", "reason_code": "unsupported_format"}, {}, True),
+        ({}, None, {"outcome": "failed"}, True),
+        ({}, None, {"fatal": True}, True),
+        ({}, None, {"reason_code": None}, True),
+        ({}, None, {"reason_code": "unknown_reason"}, True),
+        ({}, None, {"reason_code": ["opaque_content"]}, True),
+        ({}, None, {"outcome": ["partial"]}, True),
+        ({"reason": "opaque_content"}, None, {}, False),
+    ],
+)
+def test_format_reason_does_not_hide_other_reference_failures(
+    inventory_patch: dict,
+    extra_event: dict | None,
+    format_event_patch: dict,
+    keep_format_event: bool,
+) -> None:
+    path = "assets/diagram.png"
+    format_event = {
+        "path": path,
+        "outcome": "partial",
+        "reason_code": "opaque_content",
+        **format_event_patch,
+    }
+    events = [format_event] if keep_format_event else []
+    if extra_event:
+        events.append({"path": path, **extra_event})
+    state = {
+        "artifact_inventory": [
+            {"path": path, "content_kind": "binary", "disposition": "partial", **inventory_patch}
+        ],
+        "artifact_references": [
+            {"source_path": "SKILL.md", "line": 7, "target_path": path, "status": "resolved"}
+        ],
+        "inspection_ledger": events,
+    }
+
+    findings = finalizer_module._reference_coverage_findings(state)
+
+    assert len(findings) == 1
+    assert findings[0].rule_id == "AE1"
+    assert findings[0].severity == "HIGH"
+    assert findings[0].confidence == 1.0
+    assert findings[0].category == "analysis-evasion"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_inventory_cannot_hide_a_reference_failure(reverse: bool) -> None:
+    path = "assets/diagram.png"
+    inventory = [
+        {"path": path, "content_kind": "opaque", "disposition": "failed", "reason": "read_error"},
+        {"path": path, "content_kind": "binary", "disposition": "out_of_scope"},
+    ]
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": list(reversed(inventory)) if reverse else inventory,
+            "artifact_references": [
+                {"source_path": "SKILL.md", "line": 7, "target_path": path, "status": "resolved"}
+            ],
+            "inspection_ledger": [
+                {"path": path, "outcome": "partial", "reason_code": "opaque_content"}
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
 
 
 @pytest.mark.parametrize(

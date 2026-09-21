@@ -86,6 +86,11 @@ Truncated extraction and missing or ambiguous local references are explicit part
 conditions. A referenced binary, opaque, or otherwise uninspected artifact is not treated as a
 successfully analyzed reference.
 
+When a binary or opaque target's only limitation is an unsupported content format, its
+coverage exception remains visible without an AE1 analysis-evasion finding. Other failures,
+unknown reasons, and mixed limitations still produce AE1. This distinction does not change
+coverage metrics, incomplete-scan recommendations, or `--fail-on-incomplete` behavior.
+
 ## Structured skill data
 
 AISOP/AISP structured extraction consumes the already-bounded cache and shares the enclosing

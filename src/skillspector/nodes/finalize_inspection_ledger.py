@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from skillspector.artifacts import ContentKind
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     InspectionLedgerEvent,
@@ -27,23 +28,56 @@ from skillspector.semantic_runtime import (
 from skillspector.state import SkillspectorState
 
 
+def _has_only_format_limitations(
+    inventory_item: Mapping[str, object] | None,
+    events: list[Mapping[str, object]],
+) -> bool:
+    """Recognize unsupported content without hiding other coverage failures."""
+    if not inventory_item or str(inventory_item.get("content_kind")) not in {
+        ContentKind.BINARY,
+        ContentKind.OPAQUE,
+    }:
+        return False
+    if str(inventory_item.get("disposition")) not in {"partial", "out_of_scope"}:
+        return False
+    format_reasons = {LedgerReason.BINARY_CONTENT, LedgerReason.OPAQUE_CONTENT}
+    inventory_reason = inventory_item.get("reason")
+    if inventory_reason is not None and str(inventory_reason) not in format_reasons:
+        return False
+    # Classifying an asset is insufficient: require explicit ledger evidence.
+    # Missing/unknown reasons, skipped work, failed work and mixed limitations
+    # must continue to produce AE1. Completed analyzers do not erase exceptions.
+    exceptions = [event for event in events if event.get("outcome") != "completed"]
+    return (
+        bool(exceptions)
+        and not any(event.get("fatal") for event in events)
+        and all(
+            str(event.get("outcome")) in {"partial", "out_of_scope"}
+            and str(event.get("reason_code")) in format_reasons
+            for event in exceptions
+        )
+    )
+
+
 def _reference_coverage_findings(
     state: SkillspectorState,
 ) -> list[Finding]:
     """Create AE1 only for canonical resolved targets with incomplete disposition."""
     raw_references = state.get("artifact_references") or []
-    inventory: dict[str, Mapping[str, object]] = {
-        str(item.get("path", "")): item
-        for item in state.get("artifact_inventory") or []
-        if isinstance(item, dict)
-    }
-    exceptional_outcomes: dict[str, set[str]] = {}
+    inventory: dict[str, Mapping[str, object]] = {}
+    duplicate_inventory_paths: set[str] = set()
+    for item in state.get("artifact_inventory") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", ""))
+        if path in inventory:
+            duplicate_inventory_paths.add(path)
+        inventory[path] = item
+    events_by_path: dict[str, list[Mapping[str, object]]] = {}
     for event in state.get("inspection_ledger") or []:
         if not isinstance(event, Mapping):
             continue
-        outcome = str(event.get("outcome", ""))
-        if outcome in {"partial", "failed", "out_of_scope"}:
-            exceptional_outcomes.setdefault(str(event.get("path", "")), set()).add(outcome)
+        events_by_path.setdefault(str(event.get("path", "")), []).append(event)
     findings: list[Finding] = []
     seen_locations: set[tuple[str, int, str]] = set()
     for reference in raw_references:
@@ -56,7 +90,8 @@ def _reference_coverage_findings(
         target_path = str(target) if target else ""
         inventory_item = inventory.get(target_path)
         disposition = str(inventory_item.get("disposition", "")) if inventory_item else ""
-        exceptional = exceptional_outcomes.get(target_path, set())
+        target_events = events_by_path.get(target_path, [])
+        exceptional = {str(event.get("outcome", "")) for event in target_events}
         final_disposition = (
             "failed"
             if "failed" in exceptional
@@ -67,6 +102,10 @@ def _reference_coverage_findings(
             else disposition
         )
         if final_disposition not in {"partial", "failed", "out_of_scope"}:
+            continue
+        if target_path not in duplicate_inventory_paths and _has_only_format_limitations(
+            inventory_item, target_events
+        ):
             continue
         line_value = reference.get("line", 1)
         source_path = str(reference.get("source_path", "SKILL.md"))
