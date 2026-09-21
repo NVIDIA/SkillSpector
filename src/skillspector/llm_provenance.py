@@ -210,6 +210,42 @@ def capture_llm_provenance(model_config: Mapping[str, object]) -> dict[str, obje
     # This provider resolves model defaults before any client is constructed.
     # Runtime response telemetry supplies the actual effective provider later.
     resolved_adapter = provider_name(get_model_config_provider())
+    return _capture_llm_provenance(
+        model_config,
+        configured_adapter=configured_adapter,
+        resolved_adapter=resolved_adapter,
+        routing_adapter=resolved_adapter,
+    )
+
+
+def capture_static_llm_provenance(
+    fallback_model_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Capture static-scan configuration without resolving an inactive provider."""
+    default_model = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
+    model_config = {
+        slot: os.environ.get(f"SKILLSPECTOR_MODEL_{slot.upper()}", "").strip()
+        or default_model
+        or fallback_model_config.get(slot)
+        for slot in LLM_ANALYZER_SLOTS
+    }
+    configured_adapter = os.environ.get("SKILLSPECTOR_PROVIDER", "").strip().lower()
+    return _capture_llm_provenance(
+        model_config,
+        configured_adapter=configured_adapter or "unknown",
+        resolved_adapter="unknown",
+        routing_adapter=configured_adapter,
+    )
+
+
+def _capture_llm_provenance(
+    model_config: Mapping[str, object],
+    *,
+    configured_adapter: str,
+    resolved_adapter: str,
+    routing_adapter: str,
+) -> dict[str, object]:
+    """Build a sanitized capture from already selected configuration labels."""
     package_version = version("skillspector")
     source_revision, source_revision_source = _capture_source_revision()
 
@@ -259,7 +295,7 @@ def capture_llm_provenance(model_config: Mapping[str, object]) -> dict[str, obje
         "provider": {
             "configured_adapter": _safe_label(configured_adapter),
             "resolved_adapter": _safe_label(resolved_adapter),
-            "routing": _capture_provider_routing(resolved_adapter),
+            "routing": _capture_provider_routing(routing_adapter),
             "service": "unknown",
         },
         "analyzers": analyzers,

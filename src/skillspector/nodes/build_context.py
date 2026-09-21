@@ -45,6 +45,7 @@ from skillspector.constants import (
     MAX_ANALYZABLE_FILE_BYTES,
     MAX_FILE_BYTES,
     MAX_LLM_TRUNCATED_FILE_CHARS,
+    MODEL_CONFIG,
     build_model_config,
 )
 from skillspector.input_handler import (
@@ -60,7 +61,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
-from skillspector.llm_provenance import capture_llm_provenance
+from skillspector.llm_provenance import capture_llm_provenance, capture_static_llm_provenance
 from skillspector.logging_config import get_logger
 from skillspector.nested_artifacts import (
     expected_container_type,
@@ -3284,6 +3285,11 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
 
     use_llm = state.get("use_llm", True)
     model_config = build_model_config() if use_llm else {}
+    llm_provenance = (
+        capture_llm_provenance(model_config)
+        if use_llm
+        else capture_static_llm_provenance(MODEL_CONFIG)
+    )
     result: dict[str, object] = {
         "components": components,
         "llm_components": llm_components,
@@ -3317,7 +3323,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "manifest": manifest,
         "previous_manifest": None,
         "model_config": model_config,
-        "llm_provenance": capture_llm_provenance(model_config) if use_llm else None,
+        "llm_provenance": llm_provenance,
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
         "workflow_resource_budget": workflow_budget,
