@@ -60,6 +60,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
+from skillspector.llm_provenance import capture_llm_provenance
 from skillspector.logging_config import get_logger
 from skillspector.nested_artifacts import (
     expected_container_type,
@@ -3281,6 +3282,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         or any(bool(metadata.get("executable")) for metadata in excluded_component_metadata)
     )
 
+    use_llm = state.get("use_llm", True)
+    model_config = build_model_config() if use_llm else {}
     result: dict[str, object] = {
         "components": components,
         "llm_components": llm_components,
@@ -3313,7 +3316,8 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "python_ast_cache_key": python_ast_cache_key,
         "manifest": manifest,
         "previous_manifest": None,
-        "model_config": build_model_config() if state.get("use_llm", True) else {},
+        "model_config": model_config,
+        "llm_provenance": capture_llm_provenance(model_config) if use_llm else None,
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
         "workflow_resource_budget": workflow_budget,

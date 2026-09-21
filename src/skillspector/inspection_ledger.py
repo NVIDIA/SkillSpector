@@ -94,6 +94,7 @@ class LedgerReason(StrEnum):
     RUNTIME_LIMIT = "runtime_limit"
     EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
     OUTPUT_LIMIT = "output_limit"
+    TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
@@ -116,7 +117,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM returned a malformed structured response after bounded retries."
     ),
-    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
+    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
+        "Transient LLM provider failure persisted after bounded retries."
+    ),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
     LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE: (
@@ -192,6 +195,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "Executable content was inventoried but excluded from content analysis."
     ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
+    LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
+        "A transitive child scan failed before complete inspection."
+    ),
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
     ),

@@ -46,7 +46,12 @@ from typing import Any, NoReturn
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable
 
-from skillspector.inference_usage import InferenceUsageCollector, provider_name
+from skillspector.inference_usage import (
+    InferenceUsageCollector,
+    chat_model_controls,
+    chat_model_requested_controls,
+    provider_name,
+)
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
     UnknownProviderError,
@@ -448,6 +453,8 @@ def new_inference_usage_collector(
         request_kind=request_kind,
         provider=effective_provider,
         requested_model=model,
+        requested_controls=chat_model_requested_controls(chat_model),
+        forwarded_controls=chat_model_controls(chat_model),
     )
 
 
@@ -484,8 +491,13 @@ def chat_completion(
         chat_model=chat_model,
     )
     effective_provider = chat_model_provider_name(chat_model)
-    if usage_collector is not None and effective_provider is not None:
-        collector.set_provider(effective_provider)
+    if usage_collector is not None:
+        if effective_provider is not None:
+            collector.set_provider(effective_provider)
+        collector.set_controls(
+            chat_model_requested_controls(chat_model),
+            chat_model_controls(chat_model),
+        )
     response = _invoke_with_usage(chat_model, prompt, collector)
     if hasattr(response, "text"):
         return response.text  # type: ignore[union-attr]

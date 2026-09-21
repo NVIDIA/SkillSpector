@@ -42,6 +42,7 @@ from skillspector.inspection_ledger import (
     AnalysisCompleteness,
     finalize_ledger,
 )
+from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -1105,6 +1106,7 @@ def _build_metadata(
     use_llm: bool,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
     inference_usage: Sequence[Mapping[str, object]] | None = None,
+    llm_provenance: object = None,
     transitive_targets_scanned: int | None = None,
     transitive_bytes_scanned: int | None = None,
     transitive_truncation_reasons: Sequence[str] | None = None,
@@ -1148,10 +1150,19 @@ def _build_metadata(
     # some coverage was lost) into one boolean.
     execution_enabled = use_llm if llm_execution_enabled is None else llm_execution_enabled
     unavailable_before_execution = bool(use_llm and not execution_enabled)
+    response_observed = any(
+        isinstance(record, Mapping) and record.get("usage_source") == "provider_response"
+        for record in inference_usage or []
+    )
+    # Enablement alone does not prove execution: every analyzer may have
+    # returned not_applicable. Failed attempts still count, as do successful
+    # provider responses whose transport supplied no token counters.
+    llm_executed = bool(use_llm and execution_enabled and (attempted or response_observed))
     meta_analysis_applied = (
         use_llm and execution_enabled and provider_available and meta_analyzer_succeeded
     )
 
+    sanitized_inference_usage = sanitize_inference_usage(inference_usage)
     meta: dict[str, object] = {
         "has_executable_scripts": has_executable_scripts,
         "skillspector_version": skillspector_version,
@@ -1163,7 +1174,16 @@ def _build_metadata(
         # A list (including an empty list) makes observability explicit. Empty
         # means the provider/transport supplied no counters; it is never an
         # estimated zero-cost assertion.
-        "inference_usage": sanitize_inference_usage(inference_usage),
+        "inference_usage": sanitized_inference_usage,
+        "llm_provenance": sanitize_llm_provenance(
+            llm_provenance,
+            use_llm=llm_executed,
+            # Counter-less responses and constructor controls are internal
+            # provenance evidence. The public inference_usage projection above
+            # intentionally omits both, so provenance must inspect the raw
+            # records and apply its own fixed-field sanitizer.
+            inference_usage=inference_usage,
+        ),
     }
     if not meta_analysis_applied:
         meta["filtering_mode"] = "heuristic"
@@ -1220,6 +1240,7 @@ def _format_json(
     use_llm: bool = True,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
     inference_usage: Sequence[Mapping[str, object]] | None = None,
+    llm_provenance: object = None,
     analysis_completeness: Mapping[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     execution_successful: bool = True,
@@ -1268,6 +1289,7 @@ def _format_json(
             use_llm,
             llm_call_log,
             inference_usage,
+            llm_provenance,
             transitive_targets_scanned,
             transitive_bytes_scanned,
             transitive_truncation_reasons,
@@ -1532,6 +1554,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         else []
     )
     inference_usage = state.get("inference_usage") or []
+    llm_provenance = state.get("llm_provenance")
     transitive_targets_scanned = state.get("transitive_targets_scanned")
     transitive_bytes_scanned = state.get("transitive_bytes_scanned")
     transitive_truncation_reasons = [
@@ -1711,6 +1734,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             use_llm=llm_requested,
             llm_call_log=llm_call_log,
             inference_usage=inference_usage,
+            llm_provenance=llm_provenance,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
             execution_successful=execution_successful,
