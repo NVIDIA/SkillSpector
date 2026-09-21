@@ -327,6 +327,9 @@ class TestOpenAIProvider:
         assert provider.get_max_output_tokens("gpt-5.4") == 128_000
         assert provider.get_context_length("gemini-3.5-flash") == 1_048_576
         assert provider.get_max_output_tokens("gemini-3.5-flash") == 65_536
+        for model in ("gpt-5.6-terra", "gpt-5.6-luna"):
+            assert provider.get_context_length(model) == 1_050_000
+            assert provider.get_max_output_tokens(model) == 128_000
 
 
 class TestAnthropicProvider:

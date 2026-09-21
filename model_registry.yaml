@@ -20,6 +20,20 @@ models:
     context_length: 128000
     max_output_tokens: 16384
 
+  # Pricing (USD per 1M tokens) is informational only; SkillSpector does not
+  # compute cost.  Prompts over 272K input tokens bill at 2x input / 1.5x output.
+  # Source: https://developers.openai.com/api/docs/models/<model> (as of 2026-09-21)
+
+  # $2.00 input / $0.20 cached input / $12.00 output
+  "gpt-5.6-terra":
+    context_length: 1050000
+    max_output_tokens: 128000
+
+  # $0.20 input / $0.02 cached input / $1.20 output
+  "gpt-5.6-luna":
+    context_length: 1050000
+    max_output_tokens: 128000
+
   # Provider-prefixed IDs for inference gateways that accept them.
   "azure/anthropic/claude-opus-4-5":
     context_length: 200000
