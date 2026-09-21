@@ -4540,6 +4540,63 @@ def test_transitive_child_failure_survives_shared_ledger_cap(
     assert "private child error" not in merged["report_body"]
 
 
+def test_new_child_failure_remains_required_when_only_one_fatal_slot_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new opaque child failure keeps the prior tight-cap replacement contract."""
+    target = "https://github.com/org/root-and-child-tight-cap"
+    root_events = [
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            analyzer_id="root-analyzer",
+        )
+        for path in ("one.py", "two.py")
+    ]
+    root_events.append(
+        ledger_event(
+            outcome=LedgerOutcome.FAILED,
+            phase="static",
+            path="root-failed.py",
+            analyzer_id="root-analyzer",
+            reason=LedgerReason.READ_ERROR,
+        )
+    )
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}),
+        "components": ["one.py", "two.py", "root-failed.py", "SKILL.md"],
+        "local_file_cache": {"SKILL.md": target},
+        "inspection_ledger": root_events,
+        "execution_successful": False,
+    }
+
+    def fail_child(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("private child failure")
+
+    monkeypatch.setattr(cli, "_run_graph_scan", fail_child)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=2),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    exceptions = body["analysis_completeness"]["ledger_exceptions"]
+    assert {item["reason_code"] for item in exceptions} == {
+        "output_limit",
+        "transitive_child_scan_failed",
+    }
+    assert "private child failure" not in merged["report_body"]
+
+
 @pytest.mark.parametrize("ledger_cap", [1, 2])
 def test_transitive_child_failure_runs_after_real_root_ledger_overflow(
     monkeypatch: pytest.MonkeyPatch,
@@ -4666,6 +4723,151 @@ def test_transitive_child_exact_failure_survives_pre_cache_ledger_cap(
     assert "analyzer_runtime_error" in reasons
     assert "transitive_child_scan_failed" not in reasons
     assert "unaccounted_work" not in reasons
+
+
+def test_transitive_root_ledger_cap_preserves_all_distinct_failures() -> None:
+    """All pre-cap root failures displace completed work before the sentinel."""
+    root_events = [
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            analyzer_id="root-analyzer",
+        )
+        for path in ("one.py", "two.py")
+    ]
+    root_events.extend(
+        [
+            ledger_event(
+                outcome=LedgerOutcome.FAILED,
+                phase="static",
+                path="read-failed.py",
+                analyzer_id="root-reader",
+                reason=LedgerReason.READ_ERROR,
+            ),
+            ledger_event(
+                outcome=LedgerOutcome.FAILED,
+                phase="static",
+                path="runtime-failed.py",
+                analyzer_id="root-runtime",
+                reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+            ),
+        ]
+    )
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={}),
+        "components": ["one.py", "two.py", "read-failed.py", "runtime-failed.py"],
+        "local_file_cache": {},
+        "inspection_ledger": root_events,
+        "execution_successful": False,
+    }
+
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=3),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    exceptions = body["analysis_completeness"]["ledger_exceptions"]
+    assert [(item["reason_code"], item["path"]) for item in exceptions] == [
+        ("output_limit", "read-failed.py"),
+        ("read_error", "read-failed.py"),
+        ("analyzer_runtime_error", "runtime-failed.py"),
+    ]
+    assert merged["execution_successful"] is False
+
+
+def test_transitive_child_ledger_cap_preserves_all_distinct_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child failures are scoped, deduplicated, and retained before completed work."""
+    target = "https://github.com/org/multiple-child-failures"
+    initial_result: dict[str, object] = {
+        **_mock_graph_result(file_cache={"SKILL.md": target}),
+        "local_file_cache": {"SKILL.md": target},
+    }
+    completed_events = [
+        ledger_event(
+            outcome=LedgerOutcome.COMPLETED,
+            phase="static",
+            path=path,
+            analyzer_id="child-analyzer",
+        )
+        for path in ("one.py", "two.py")
+    ]
+    read_failure = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        phase="static",
+        path="read-failed.py",
+        analyzer_id="child-reader",
+        reason=LedgerReason.READ_ERROR,
+    )
+    runtime_failure = ledger_event(
+        outcome=LedgerOutcome.FAILED,
+        phase="static",
+        path="runtime-failed.py",
+        analyzer_id="child-runtime",
+        reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+    )
+    child_result: dict[str, object] = {
+        **_mock_graph_result(
+            file_cache={
+                "one.py": "pass\n",
+                "two.py": "pass\n",
+                "read-failed.py": "pass\n",
+                "runtime-failed.py": "pass\n",
+            }
+        ),
+        "components": ["one.py", "two.py", "read-failed.py", "runtime-failed.py"],
+        "local_file_cache": {
+            "one.py": "pass\n",
+            "two.py": "pass\n",
+            "read-failed.py": "pass\n",
+            "runtime-failed.py": "pass\n",
+        },
+        "inspection_ledger": [
+            *completed_events,
+            read_failure,
+            dict(read_failure),
+            runtime_failure,
+        ],
+        "execution_successful": False,
+    }
+
+    monkeypatch.setattr(cli, "_run_graph_scan", lambda *args, **kwargs: child_result)
+    merged = cli._scan_transitive(
+        initial_result=initial_result,
+        format=cli.FormatChoice.json,
+        no_llm=True,
+        max_depth=1,
+        transitive_allow_prefix=(),
+        transitive_deny_prefix=(),
+        baseline=None,
+        show_suppressed=False,
+        visited=set(),
+        budget=cli._TransitiveBudget(max_ledger_events=3),
+    )
+
+    body = json.loads(cast(str, merged["report_body"]))
+    exceptions = body["analysis_completeness"]["ledger_exceptions"]
+    reasons = [item["reason_code"] for item in exceptions]
+    assert reasons.count("read_error") == 1
+    assert reasons.count("analyzer_runtime_error") == 1
+    assert reasons.count("output_limit") == 1
+    paths_by_reason = {item["reason_code"]: item["path"] for item in exceptions}
+    assert paths_by_reason["read_error"].startswith("external/")
+    assert paths_by_reason["read_error"].endswith("/read-failed.py")
+    assert paths_by_reason["analyzer_runtime_error"].startswith("external/")
+    assert paths_by_reason["analyzer_runtime_error"].endswith("/runtime-failed.py")
+    assert merged["execution_successful"] is False
 
 
 def test_transitive_ledger_cap_preserves_distinct_root_and_child_failures(

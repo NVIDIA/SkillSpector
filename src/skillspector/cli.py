@@ -1200,10 +1200,7 @@ def _cache_transitive_result(
         source_digest=source_digest,
         finding_id_map=finding_id_map,
     )
-    required_failure_event = next(
-        (event for event in scoped_ledger if _is_failed_ledger_event(event)),
-        None,
-    )
+    required_failure_events = _distinct_failed_ledger_events(scoped_ledger)
     retained_finding_ids = {item.finding_id for item in scoped_findings}
     for event in scoped_ledger:
         for id_field in ("input_finding_ids", "emitted_finding_ids"):
@@ -1235,12 +1232,13 @@ def _cache_transitive_result(
         limit=traversal.budget.max_ledger_events,
         traversal=traversal,
     )
-    if required_failure_event is not None:
-        scoped_ledger = _ensure_required_failure_event(
+    if required_failure_events:
+        scoped_ledger = _ensure_required_failure_events(
             scoped_ledger,
-            required_failure_event,
+            required_failure_events,
             limit=traversal.budget.max_ledger_events,
             traversal=traversal,
+            failures_already_observed=True,
         )
     retained_work_ids = {
         str(event.get("work_id", "")) for event in scoped_ledger if event.get("work_id")
@@ -1705,6 +1703,21 @@ def _is_failed_ledger_event(event: dict[str, object]) -> bool:
     return getattr(outcome, "value", outcome) == LedgerOutcome.FAILED.value
 
 
+def _distinct_failed_ledger_events(
+    events: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return failed work items once each, preserving their observed order."""
+    failures: list[dict[str, object]] = []
+    work_ids: set[str] = set()
+    for event in events:
+        work_id = str(event.get("work_id", ""))
+        if not _is_failed_ledger_event(event) or work_id in work_ids:
+            continue
+        failures.append(event)
+        work_ids.add(work_id)
+    return failures
+
+
 def _transitive_child_failure_event(source_identity: str) -> dict[str, object]:
     """Return one deterministic, payload-free fatal fact for an opaque child failure."""
     return dict(
@@ -1718,36 +1731,37 @@ def _transitive_child_failure_event(source_identity: str) -> dict[str, object]:
     )
 
 
-def _ensure_required_failure_event(
+def _ensure_required_failure_events(
     events: list[dict[str, object]],
-    failure: dict[str, object],
+    failures: list[dict[str, object]],
     *,
     limit: int,
     traversal: _TransitiveTraversalState,
+    failures_already_observed: bool = False,
 ) -> list[dict[str, object]]:
-    """Retain distinct fatal facts before non-fatal rows at the shared bound."""
+    """Retain distinct fatal facts before non-fatal rows at the shared bound.
+
+    Pre-observed failures came from the input that produced an existing sentinel;
+    synthesized failures are new observations and remain the required fatal facts.
+    """
     effective_limit = max(1, limit)
-    failure_work_id = str(failure.get("work_id", ""))
-    required_failures: list[dict[str, object]] = []
-    required_work_ids: set[str] = set()
-    for event in events:
-        work_id = str(event.get("work_id", ""))
-        if not _is_failed_ledger_event(event) or work_id in required_work_ids:
-            continue
-        required_failures.append(event)
-        required_work_ids.add(work_id)
-    failure_missing = failure_work_id not in required_work_ids
-    if failure_missing:
-        required_failures.append(failure)
-        required_work_ids.add(failure_work_id)
+    incoming_failures = _distinct_failed_ledger_events(failures)
+    required_failures = _distinct_failed_ledger_events([*events, *failures])
+    if not required_failures:
+        return events[:effective_limit]
+    required_work_ids = {str(event.get("work_id", "")) for event in required_failures}
+    event_work_ids = {str(event.get("work_id", "")) for event in events}
+    missing_failures = [
+        event for event in required_failures if str(event.get("work_id", "")) not in event_work_ids
+    ]
 
     prior_sentinel = next(
         (event for event in reversed(events) if event.get("phase") == "ledger_output"),
         None,
     )
-    would_overflow = len(events) + int(failure_missing) > effective_limit
+    would_overflow = len(events) + len(missing_failures) > effective_limit
     if prior_sentinel is None and not would_overflow:
-        combined = [*events, *([failure] if failure_missing else [])]
+        combined = [*events, *missing_failures]
         if len(combined) < effective_limit:
             return combined
         non_failures = [
@@ -1757,24 +1771,40 @@ def _ensure_required_failure_event(
 
     traversal.note_truncation(f"inspection ledger budget {effective_limit} reached")
     if effective_limit == 1:
-        return [failure]
+        return (incoming_failures or required_failures)[:1]
     observed_value = prior_sentinel.get("observed_records") if prior_sentinel else None
     observed_records = observed_value if isinstance(observed_value, int) else len(events)
+    newly_observed = (
+        0 if prior_sentinel is not None and failures_already_observed else len(missing_failures)
+    )
+    sentinel_path = (
+        str(prior_sentinel.get("path", "SKILL.md"))
+        if prior_sentinel is not None and failures_already_observed
+        else str((incoming_failures or required_failures)[0].get("path", "SKILL.md"))
+    )
     sentinel = dict(
         ledger_event(
             outcome=LedgerOutcome.PARTIAL,
             record_type=LedgerRecordType.SYSTEM,
             phase="ledger_output",
-            path=str(failure.get("path", "SKILL.md")),
+            path=sentinel_path,
             reason=LedgerReason.OUTPUT_LIMIT,
-            observed_records=max(observed_records, len(events)) + int(failure_missing),
+            observed_records=max(observed_records, len(events)) + newly_observed,
             limit_records=effective_limit,
         )
     )
     failure_slots = effective_limit - 1
-    retained_failures = required_failures[:failure_slots]
-    if failure_work_id not in {str(event.get("work_id", "")) for event in retained_failures}:
-        retained_failures = [*required_failures[: failure_slots - 1], failure]
+    if failures_already_observed:
+        retained_failures = required_failures[:failure_slots]
+    else:
+        incoming_work_ids = {str(event.get("work_id", "")) for event in incoming_failures}
+        retained_incoming = incoming_failures[:failure_slots]
+        retained_existing = [
+            event
+            for event in required_failures
+            if str(event.get("work_id", "")) not in incoming_work_ids
+        ][: failure_slots - len(retained_incoming)]
+        retained_failures = [*retained_existing, *retained_incoming]
     retained_work_ids = {str(event.get("work_id", "")) for event in retained_failures}
     retained_non_failures = [
         event
@@ -1839,22 +1869,20 @@ def _scan_transitive(
         : traversal.budget.max_findings
     ]
     root_inspection_ledger = _coerce_dict_list(initial_result.get("inspection_ledger"))
-    required_root_failure_event = next(
-        (event for event in root_inspection_ledger if _is_failed_ledger_event(event)),
-        None,
-    )
+    required_root_failure_events = _distinct_failed_ledger_events(root_inspection_ledger)
     merged_inspection_ledger = _merge_bounded_ledger(
         [],
         root_inspection_ledger,
         limit=traversal.budget.max_ledger_events,
         traversal=traversal,
     )
-    if required_root_failure_event is not None:
-        merged_inspection_ledger = _ensure_required_failure_event(
+    if required_root_failure_events:
+        merged_inspection_ledger = _ensure_required_failure_events(
             merged_inspection_ledger,
-            required_root_failure_event,
+            required_root_failure_events,
             limit=traversal.budget.max_ledger_events,
             traversal=traversal,
+            failures_already_observed=True,
         )
     retained_work_ids = {
         str(event.get("work_id", "")) for event in merged_inspection_ledger if event.get("work_id")
@@ -1979,9 +2007,9 @@ def _scan_transitive(
                     if not any(
                         _is_failed_ledger_event(event) for event in cached.inspection_ledger
                     ):
-                        cached.inspection_ledger = _ensure_required_failure_event(
+                        cached.inspection_ledger = _ensure_required_failure_events(
                             cached.inspection_ledger,
-                            _transitive_child_failure_event(cached.source_identity),
+                            [_transitive_child_failure_event(cached.source_identity)],
                             limit=traversal.budget.max_ledger_events,
                             traversal=traversal,
                         )
@@ -1992,16 +2020,14 @@ def _scan_transitive(
                     limit=traversal.budget.max_ledger_events,
                     traversal=traversal,
                 )
-                child_failure_event = next(
-                    (event for event in cached.inspection_ledger if _is_failed_ledger_event(event)),
-                    None,
-                )
-                if child_failure_event is not None:
-                    merged_inspection_ledger = _ensure_required_failure_event(
+                child_failure_events = _distinct_failed_ledger_events(cached.inspection_ledger)
+                if child_failure_events:
+                    merged_inspection_ledger = _ensure_required_failure_events(
                         merged_inspection_ledger,
-                        child_failure_event,
+                        child_failure_events,
                         limit=traversal.budget.max_ledger_events,
                         traversal=traversal,
+                        failures_already_observed=True,
                     )
                 global_work_ids = {
                     str(event.get("work_id", ""))
@@ -2157,11 +2183,13 @@ def _scan_transitive(
             except Exception:
                 transitive_sources.add(target)
                 traversal.note_child_scan_failure(target)
-                merged_inspection_ledger = _ensure_required_failure_event(
+                merged_inspection_ledger = _ensure_required_failure_events(
                     merged_inspection_ledger,
-                    _transitive_child_failure_event(
-                        _source_identity(target, "transitive-child-scan-failed")
-                    ),
+                    [
+                        _transitive_child_failure_event(
+                            _source_identity(target, "transitive-child-scan-failed")
+                        )
+                    ],
                     limit=traversal.budget.max_ledger_events,
                     traversal=traversal,
                 )
@@ -2189,10 +2217,7 @@ def _scan_transitive(
         )
 
     if traversal.resource_limit_reached:
-        required_failure_event = next(
-            (event for event in merged_inspection_ledger if _is_failed_ledger_event(event)),
-            None,
-        )
+        required_failure_events = _distinct_failed_ledger_events(merged_inspection_ledger)
         traversal_event = ledger_event(
             outcome=LedgerOutcome.PARTIAL,
             record_type=LedgerRecordType.SYSTEM,
@@ -2206,12 +2231,13 @@ def _scan_transitive(
             limit=traversal.budget.max_ledger_events,
             traversal=traversal,
         )
-        if required_failure_event is not None:
-            merged_inspection_ledger = _ensure_required_failure_event(
+        if required_failure_events:
+            merged_inspection_ledger = _ensure_required_failure_events(
                 merged_inspection_ledger,
-                required_failure_event,
+                required_failure_events,
                 limit=traversal.budget.max_ledger_events,
                 traversal=traversal,
+                failures_already_observed=True,
             )
 
     retained_work_ids = {
@@ -2258,10 +2284,7 @@ def _scan_transitive(
         result=merged_result,
         discovered_modules=ANALYZER_MODULES,
     )
-    pre_runtime_failure_event = next(
-        (event for event in merged_inspection_ledger if _is_failed_ledger_event(event)),
-        None,
-    )
+    pre_runtime_failure_events = _distinct_failed_ledger_events(merged_inspection_ledger)
     if runtime_event is not None and not has_semantic_runtime_event(
         merged_inspection_ledger, runtime_event
     ):
@@ -2271,12 +2294,13 @@ def _scan_transitive(
             limit=traversal.budget.max_ledger_events,
             traversal=traversal,
         )
-        if pre_runtime_failure_event is not None:
-            merged_inspection_ledger = _ensure_required_failure_event(
+        if pre_runtime_failure_events:
+            merged_inspection_ledger = _ensure_required_failure_events(
                 merged_inspection_ledger,
-                pre_runtime_failure_event,
+                pre_runtime_failure_events,
                 limit=traversal.budget.max_ledger_events,
                 traversal=traversal,
+                failures_already_observed=True,
             )
         merged_result["inspection_ledger"] = merged_inspection_ledger
     if merged_inspection_ledger or merged_analyzer_status_events:
