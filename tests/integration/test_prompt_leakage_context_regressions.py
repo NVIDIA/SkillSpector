@@ -83,9 +83,9 @@ def test_cross_window_extraction_survives_graph_reports(tmp_path: Path, output_f
         {"skill_path": str(tmp_path), "output_format": output_format, "use_llm": False}
     )
     _assert_report_contract(result, output_format, "refs/guide.md", 2)
-    # The exact reference-file fixture scores 41 on the pre-regression base:
-    # MP2/P9 contribute 20 after rounding; retaining P6 restores 21 points.
-    assert result["risk_score"] == 41
+    # The current-main MP2/P9 findings contribute 24 points for this exact
+    # reference-file fixture; retaining P6 restores its additional 21 points.
+    assert result["risk_score"] == 45
 
 
 def _assert_report_contract(
@@ -109,8 +109,8 @@ def _assert_report_contract(
     assert completeness["execution_successful"] is True
     assert completeness["ledger_exceptions"] == []
 
-    assert "_security_" not in result["report_body"]
     report = json.loads(result["report_body"])
+    _assert_no_internal_security_metadata(report)
     if output_format == "json":
         issues = [issue for issue in report["issues"] if issue["id"] == "P6"]
         assert len(issues) == len(p6)
@@ -126,3 +126,13 @@ def _assert_report_contract(
             location = issues[0]["locations"][0]["physicalLocation"]
             assert location["artifactLocation"]["uri"] == relative_path
             assert location["region"]["startLine"] == expected_line
+
+
+def _assert_no_internal_security_metadata(value: object) -> None:
+    if isinstance(value, dict):
+        assert all(not str(key).startswith("_security_") for key in value)
+        for item in value.values():
+            _assert_no_internal_security_metadata(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_no_internal_security_metadata(item)

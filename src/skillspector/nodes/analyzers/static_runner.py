@@ -251,6 +251,53 @@ def deduplicate_analyzer_findings(
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
+_PARAGRAPH_BOUNDARY = re.compile(
+    rf"(?>{LOGICAL_LINE_BREAK.pattern})[ \t]*(?>{LOGICAL_LINE_BREAK.pattern})"
+)
+_PARAGRAPH_RANGE_CACHE: dict[int, tuple[str, tuple[tuple[int, int], ...]]] = {}
+_PARAGRAPH_RANGE_CACHE_SIZE = 2
+_PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS = 1_000_000
+_PARAGRAPH_RANGE_CACHE_MAX_RANGES = 4_096
+
+
+def _paragraph_ranges(content: str) -> tuple[tuple[int, int], ...]:
+    cache_key = id(content)
+    cached = _PARAGRAPH_RANGE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is content:
+        return cached[1]
+
+    start = 0
+    ranges: list[tuple[int, int]] = []
+    for boundary in _PARAGRAPH_BOUNDARY.finditer(content):
+        ranges.append((start, boundary.start()))
+        start = boundary.end()
+    if not ranges:
+        result = ()
+    else:
+        ranges.append((start, len(content)))
+        result = tuple(ranges)
+
+    if (
+        len(content) <= _PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS
+        and len(result) <= _PARAGRAPH_RANGE_CACHE_MAX_RANGES
+    ):
+        if len(_PARAGRAPH_RANGE_CACHE) >= _PARAGRAPH_RANGE_CACHE_SIZE:
+            _PARAGRAPH_RANGE_CACHE.clear()
+        _PARAGRAPH_RANGE_CACHE[cache_key] = (content, result)
+    return result
+
+
+def iter_paragraph_matches(
+    pattern: str | re.Pattern[str], content: str, flags: int = 0
+) -> Iterator[re.Match[str]]:
+    """Match prose within paragraphs; executable and structured rules use finditer."""
+    regex = re.compile(pattern, flags)
+    ranges = _paragraph_ranges(content)
+    if not ranges:
+        yield from regex.finditer(content)
+        return
+    for start, end in ranges:
+        yield from regex.finditer(content, start, end)
 
 
 def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
@@ -996,6 +1043,7 @@ def _scan_view_windows(
     source_text: str,
     prepared_analyses: Mapping[int, object] | None = None,
     source_view: SecurityTextView | None = None,
+    evidence_source_view: SecurityTextView | None = None,
     analysis_method: str = "analyze",
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Scan one already-bounded view."""
@@ -1013,17 +1061,20 @@ def _scan_view_windows(
         )
     finally:
         _ACTIVE_SECURITY_VIEW.reset(view_token)
+    coordinate_view = evidence_source_view or view
     for finding in findings:
         finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
         if not isinstance(local_start, int) and finding.start_column is not None:
             local_start = _line_start_offset(view.text, finding.start_line) + finding.start_column
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
-            finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
+            finding.evidence[_SOURCE_START_EVIDENCE] = coordinate_view.source_offset(local_start)
         if finding.end_line is not None and finding.end_column is not None:
             local_end = _line_start_offset(view.text, finding.end_line) + finding.end_column
             if 0 < local_end <= len(view.text):
-                finding.evidence[_SOURCE_END_EVIDENCE] = view.source_offset(local_end - 1) + 1
+                finding.evidence[_SOURCE_END_EVIDENCE] = (
+                    coordinate_view.source_offset(local_end - 1) + 1
+                )
     if view.name != "raw":
         for finding in findings:
             if "normalized-view" not in finding.tags:
@@ -1955,6 +2006,7 @@ def _scan_all_views_detailed(
                                 source_text=projection.text,
                                 prepared_analyses=prepared_analyses,
                                 source_view=source_view,
+                                evidence_source_view=source_view,
                                 analysis_method="analyze_whitespace_continuity",
                             )
                             _restore_source_lines(

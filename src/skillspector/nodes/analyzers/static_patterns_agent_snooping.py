@@ -53,20 +53,22 @@ _CURRENT_SKILL_IDENTIFIERS: ContextVar[frozenset[str]] = ContextVar(
 
 # AS1: Agent Config Directory Access
 # Matches code/instructions that read from well-known agent config directories.
-AS1_PATTERNS = [
+AS1_CODE_PATTERNS = [
     # Direct filesystem access to .claude/, .codex/, .gemini/ directories
     (r"open\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)/", 0.9),
     (r"(?:Path|pathlib\.Path)\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)/", 0.9),
     (r"os\.path\.(?:join|exists|isfile)\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)", 0.85),
-    (
-        r"(?:read|load|open|access|fetch)\s+(?:the\s+)?(?:agent|claude|codex|gemini)\s+(?:config|configuration|settings?)\s+(?:from|at|in)\s+~?/?\.(?:claude|codex|gemini)",
-        0.9,
-    ),
     # Shell commands targeting config dirs
     (r"(?:cat|less|head|tail|grep|find)\s+[^|&;\n]*~?/?\.(claude|codex|gemini)/", 0.85),
     # Home-directory config paths
     (
         r"~?/\.(?:claude|codex|gemini|continue)/(?:config|settings?|preferences?|credentials?)(?:\.(?:json|yaml|yml|toml))?",
+        0.9,
+    ),
+]
+AS1_PROSE_PATTERNS = [
+    (
+        r"(?:read|load|open|access|fetch)\s+(?:the\s+)?(?:agent|claude|codex|gemini)\s+(?:config|configuration|settings?)\s+(?:from|at|in)\s+~?/?\.(?:claude|codex|gemini)",
         0.9,
     ),
     # Generic "agent config" snooping instructions
@@ -75,32 +77,36 @@ AS1_PATTERNS = [
         0.8,
     ),
 ]
+AS1_PATTERNS = AS1_CODE_PATTERNS + AS1_PROSE_PATTERNS
 
 # AS2: MCP Config Access
 # Matches code/instructions specifically targeting MCP server configuration.
-AS2_PATTERNS = [
+AS2_CODE_PATTERNS = [
     # Direct access to mcp.json files
     (r"open\s*\(\s*['\"][^'\"]*mcp(?:_config)?\.json['\"]", 0.95),
     (r"(?:Path|pathlib\.Path)\s*\(\s*['\"][^'\"]*mcp(?:_config)?\.json['\"]", 0.9),
     (r"(?:cat|less|head|grep)\s+[^|&;\n]*mcp(?:_config)?\.json", 0.9),
+    (r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json", 0.95),
+    # Accessing MCP server URLs or API keys from config
+    (r"mcp(?:_config)?\.json.*?(?:api_?key|token|secret|url|endpoint)", 0.9),
+]
+AS2_PROSE_PATTERNS = [
     # Instructions referencing MCP config
     (
         r"(?:read|access|load|inspect)\s+(?:the\s+)?mcp(?:\.json|_config)?\s+(?:file|config(?:uration)?|settings?)",
         0.9,
     ),
-    (r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json", 0.95),
     # Listing MCP servers
     (
         r"(?:list|enumerate|discover)\s+(?:all\s+)?(?:available\s+)?mcp\s+(?:servers?|tools?|services?)",
         0.8,
     ),
-    # Accessing MCP server URLs or API keys from config
-    (r"mcp(?:_config)?\.json.*?(?:api_?key|token|secret|url|endpoint)", 0.9),
 ]
+AS2_PATTERNS = AS2_CODE_PATTERNS + AS2_PROSE_PATTERNS
 
 # AS3: Skill Enumeration / Snooping
 # Matches code/instructions that enumerate or read other installed skills.
-AS3_PATTERNS = [
+AS3_CODE_PATTERNS = [
     # Listing skill directories
     (
         r"(?:os\.listdir|os\.scandir|glob\.glob|Path\.iterdir)\s*\([^)]*\.(?:claude|codex|gemini)/skills?",
@@ -109,6 +115,10 @@ AS3_PATTERNS = [
     (r"(?:ls|find|dir)\s+[^|&;\n]*\.(?:claude|codex|gemini)/skills?", 0.85),
     # Reading other skills' SKILL.md files
     (r"open\s*\(\s*['\"][^'\"]*SKILL\.md['\"].*?\bother\b", 0.85),
+    # Accessing skills/CURRENT or adjacent skill directories
+    (_AS3_SKILL_PATH_PATTERN, 0.8),
+]
+AS3_PROSE_PATTERNS = [
     (
         r"(?:read|access|inspect|enumerate)\s+(?:all\s+)?(?:installed|available|other)\s+skills?(?:\s+in\s+(?:the\s+)?(?:skills?|agent)\s+(?:directory|folder))?",
         0.85,
@@ -118,14 +128,13 @@ AS3_PATTERNS = [
         r"(?:list|discover|find|enumerate|identify)\s+(?:all\s+)?(?:other|installed|available)\s+(?:skills?|agents?|tools?)\s+(?:in\s+)?(?:the\s+)?(?:\.(?:claude|codex|gemini)|\$HOME)",
         0.85,
     ),
-    # Accessing skills/CURRENT or adjacent skill directories
-    (_AS3_SKILL_PATH_PATTERN, 0.8),
     # Reading tool manifests of other agents
     (
         r"(?:read|access|load)\s+(?:the\s+)?(?:SKILL|skill)\.md\s+(?:file\s+)?(?:of|from|for)\s+(?:another|other|different|all)\s+(?:skill|agent|tool)",
         0.9,
     ),
 ]
+AS3_PATTERNS = AS3_CODE_PATTERNS + AS3_PROSE_PATTERNS
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -141,7 +150,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.AGENT_SNOOPING.value]
 
     for pattern, confidence in AS1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in AS1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -158,7 +172,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
 
     for pattern, confidence in AS2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in AS2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -175,7 +194,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
 
     for pattern, confidence in AS3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in AS3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             full_match = match.group(0)
             if _is_current_skill_path_reference(
                 full_match, _CURRENT_SKILL_IDENTIFIERS.get()

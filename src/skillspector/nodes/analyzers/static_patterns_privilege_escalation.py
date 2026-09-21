@@ -41,14 +41,16 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
 
-PE1_PATTERNS = [
+PE1_CODE_PATTERNS = [
     (r"permissions?\s*:\s*\[?\s*['\"]?\*['\"]?\s*\]?", 0.8),
-    (r"(?:request|require|need)s?\s+(?:full|all|complete)\s+(?:access|permissions?)", 0.7),
-    (r"(?:grant|give|allow)\s+(?:me\s+)?(?:full|all|complete)\s+(?:access|permissions?)", 0.75),
     (
         r"permissions?\s*:.*?(?:shell_execute|file_write|network).*?(?:shell_execute|file_write|network)",
         0.6,
     ),
+]
+PE1_PROSE_PATTERNS = [
+    (r"(?:request|require|need)s?\s+(?:full|all|complete)\s+(?:access|permissions?)", 0.7),
+    (r"(?:grant|give|allow)\s+(?:me\s+)?(?:full|all|complete)\s+(?:access|permissions?)", 0.75),
     (
         r"(?:also\s+)?(?:need|require)s?\s+(?:write|execute|admin)\s+(?:access|permissions?)\s+(?:for|to)\s+(?:read|view|display)",
         0.7,
@@ -56,17 +58,20 @@ PE1_PATTERNS = [
     (r"(?:escalate|elevate|upgrade)\s+(?:my\s+)?(?:permissions?|privileges?|access)", 0.8),
     (r"(?:bypass|skip|ignore)\s+(?:permission|access)\s+(?:check|validation|restriction)", 0.85),
 ]
-PE2_PATTERNS = [
+PE1_PATTERNS = PE1_CODE_PATTERNS + PE1_PROSE_PATTERNS
+PE2_CODE_PATTERNS = [
     (r"sudo\s+(?!-v|-l|--version|--list)", 0.7),
     (r"sudo\s+-[isSE]", 0.8),
     (r"sudo\s+su\b", 0.9),
-    (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
-    (r"(?:requires?|needs?)\s+root\s+(?:access|privileges?|permissions?)", 0.6),
     (r"su\s+-\s*$|su\s+root", 0.8),
     (r"doas\s+", 0.7),
     (r"pkexec\s+", 0.75),
     (r"chmod\s+[ugo]*[+-=]*s", 0.85),
     (r"chmod\s+[0-7]*[4567][0-7]{2}", 0.8),
+]
+PE2_PROSE_PATTERNS = [
+    (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
+    (r"(?:requires?|needs?)\s+root\s+(?:access|privileges?|permissions?)", 0.6),
     (r"(?:edit|modify|write|change)\s+(?:/etc/|system)\s+(?:files?|config)", 0.6),
     (
         r"(?:run|execute)\s+(?:this|the)\s+(?:script|command)\s+(?:as|with)\s+(?:sudo|root|admin)",
@@ -74,7 +79,8 @@ PE2_PATTERNS = [
     ),
     (r"(?:you\s+)?(?:will\s+)?need\s+(?:to\s+)?(?:use\s+)?sudo", 0.5),
 ]
-PE3_PATTERNS = [
+PE2_PATTERNS = PE2_CODE_PATTERNS + PE2_PROSE_PATTERNS
+PE3_CODE_PATTERNS = [
     (r"~?/?\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts)", 0.9),
     (r"(?:home|HOME)/\w+/\.ssh/", 0.9),
     (r"Path\s*\.\s*home\s*\(\s*\)\s*/\s*['\"]\.ssh['\"]", 0.9),
@@ -98,10 +104,13 @@ PE3_PATTERNS = [
     (r"(?<!\w)\.env(?:\.local|\.production|\.development)?(?:\s|$|['\"])", 0.6),
     (r"(?:keychain|keyring|gnome-keyring)", 0.7),
     (r"(?:Chrome|Firefox|Safari)/.*?(?:Cookies|Login Data|key4\.db)", 0.8),
+]
+PE3_PROSE_PATTERNS = [
     (r"read\s+(?:the\s+)?(?:ssh|private)\s+key", 0.8),
     (r"access\s+(?:the\s+)?(?:credentials?|secrets?|tokens?)", 0.7),
     (r"(?:extract|copy|get)\s+(?:api\s+)?keys?\s+from", 0.7),
 ]
+PE3_PATTERNS = PE3_CODE_PATTERNS + PE3_PROSE_PATTERNS
 PE4_PATTERNS = [
     (r"/var/run/docker\.sock", 0.9),
     (r"docker\.from_env\(\)", 0.85),
@@ -674,7 +683,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.PRIVILEGE_ESCALATION.value]
 
     for pattern, confidence in PE1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
             context = context_at(match.start())
             findings.append(
@@ -691,7 +705,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
@@ -711,7 +730,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if _is_bare_credential_store_noun(
                 content, match, file_type, fence_ranges, line_starts, line_ends
             ):

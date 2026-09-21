@@ -42,10 +42,14 @@ ANALYZER_ID = "static_patterns_rogue_agent"
 _SECURITY_VIEW_START_EVIDENCE = "_security_view_start"
 
 # RA1: Self-Modification — skill modifies its own code, config, or behavior
-RA1_PATTERNS = [
+RA1_CODE_PATTERNS = [
     # Python: writing to own file
     (r"open\s*\(\s*__file__\s*,\s*['\"]w", 0.95),
     (r"(?:Path|pathlib)\s*\(\s*__file__\s*\)\s*\.\s*write_text", 0.95),
+    (r"(?:self[_-]?modify|self[_-]?update|self[_-]?rewrite|self[_-]?patch|self[_-]?evolve)", 0.9),
+    (r"open\s*\(\s*['\"](?:SKILL\.md|skill\.md)['\"].*?['\"]w", 0.9),
+]
+RA1_PROSE_PATTERNS = [
     (
         r"(?:write|modify|edit|update|overwrite|patch)\s+(?:this\s+)?(?:skill(?:'s)?|SKILL\.md|skill\.md)",
         0.85,
@@ -54,7 +58,6 @@ RA1_PATTERNS = [
         r"(?:modify|edit|change|rewrite|update|alter)\s+(?:your\s+own|its\s+own|this\s+skill(?:'s)?)\s+(?:code|source|file|script|config|configuration|instructions?|rules?)",
         0.9,
     ),
-    (r"(?:self[_-]?modify|self[_-]?update|self[_-]?rewrite|self[_-]?patch|self[_-]?evolve)", 0.9),
     (
         r"(?:rewrite|replace|overwrite)\s+(?:the\s+)?(?:current|existing|original)\s+(?:code|script|file|config|skill)",
         0.85,
@@ -68,7 +71,6 @@ RA1_PATTERNS = [
         r"(?:generate|create|write)\s+(?:new|updated|replacement)\s+(?:code|version)\s+(?:for|of)\s+(?:this|itself|the\s+skill)",
         0.8,
     ),
-    (r"open\s*\(\s*['\"](?:SKILL\.md|skill\.md)['\"].*?['\"]w", 0.9),
     # Modifying own config at runtime
     (
         r"(?:update|modify|change|edit)\s+(?:the\s+)?(?:config|configuration|settings|parameters)\s+(?:of\s+)?(?:this|the\s+current)\s+(?:skill|agent|tool)",
@@ -84,6 +86,7 @@ RA1_PATTERNS = [
         0.7,
     ),
 ]
+RA1_PATTERNS = RA1_CODE_PATTERNS + RA1_PROSE_PATTERNS
 
 _VERIFY_SIGNATURE_FLAG = re.compile(
     r"--verify-signature(?:=(?P<value>1|on|true|yes))?",
@@ -153,9 +156,22 @@ _PROTECTED_UPDATE_SUBJECT_PARTS = frozenset(
 _MAX_COMPANION_UPDATE_LINE_CHARS = 4_096
 
 # RA2: Session Persistence — unauthorized persistence across boundaries
-RA2_PATTERNS = [
+RA2_CODE_PATTERNS = [
     # Cron jobs and scheduled tasks
     (r"crontab\s+(?:-[el]|.*?>>?\s*/)", 0.85),
+    (
+        r"(?:systemd|systemctl|launchd|launchctl|init\.d)\s+.*?(?:enable|install|register|create)",
+        0.8,
+    ),
+    # Hidden files and directories for persistence
+    (r"(?:create|write|mkdir)\s+[^|]*(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+", 0.6),
+    # Background processes
+    (r"(?:nohup|disown|setsid)\s+", 0.65),
+    # Registry / plist for Windows/macOS persistence
+    (r"(?:HKEY_|RegOpenKey|RegSetValue|reg\s+add)\s+", 0.8),
+    (r"(?:defaults\s+write|plist|launchctl\s+load)", 0.75),
+]
+RA2_PROSE_PATTERNS = [
     (
         r"(?:add|create|install|register)\s+(?:a\s+)?(?:cron\s+)?(?:job|task|entry)\s+(?:for|to|that)",
         0.8,
@@ -174,10 +190,6 @@ RA2_PATTERNS = [
         0.85,
     ),
     (
-        r"(?:systemd|systemctl|launchd|launchctl|init\.d)\s+.*?(?:enable|install|register|create)",
-        0.8,
-    ),
-    (
         r"(?:create|install|register|add)\s+(?:a\s+)?(?:systemd\s+)?(?:service|daemon|agent)\s+(?:file|unit)",
         0.8,
     ),
@@ -194,20 +206,14 @@ RA2_PATTERNS = [
         r"(?:persist|maintain|keep|preserve)\s+(?:state|data|context|session)\s+(?:across|between|through)\s+(?:sessions?|restarts?|reboots?|invocations?)",
         0.75,
     ),
-    # Hidden files and directories for persistence
-    (r"(?:create|write|mkdir)\s+[^|]*(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+", 0.6),
     (r"(?:create|make|write)\s+(?:a\s+)?(?:hidden|dot)\s+(?:file|directory|folder)", 0.65),
-    # Background processes
-    (r"(?:nohup|disown|setsid)\s+", 0.65),
     (
         r"(?:start|launch|spawn|fork)\s+(?:a\s+)?(?:background|daemon|detached)\s+(?:process|service|worker|task)",
         0.7,
     ),
     (r"(?:run|execute)\s+(?:in\s+the\s+)?background\s+(?:and\s+)?(?:detach|persist|survive)", 0.75),
-    # Registry / plist for Windows/macOS persistence
-    (r"(?:HKEY_|RegOpenKey|RegSetValue|reg\s+add)\s+", 0.8),
-    (r"(?:defaults\s+write|plist|launchctl\s+load)", 0.75),
 ]
+RA2_PATTERNS = RA2_CODE_PATTERNS + RA2_PROSE_PATTERNS
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -230,7 +236,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.ROGUE_AGENT.value]
 
     for pattern, confidence in RA1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in RA1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = bisect_right(line_starts, match.start())
             context = ctx(match.start())
             if _is_negated_safety_constraint(content, match, line_starts, line_ends):
@@ -277,7 +288,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in RA2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in RA2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = bisect_right(line_starts, match.start())
             findings.append(
                 AnalyzerFinding(

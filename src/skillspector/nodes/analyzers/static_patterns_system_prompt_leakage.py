@@ -188,7 +188,9 @@ _REPORT_OBJECTS = frozenset(
     "report reports document documents chart charts figure figures file files table tables".split()
 )
 _CONTEXT_TOKENS = re.compile(r"[\w]+|[.!?;:]")
-_HEADING_ACTIONS = frozenset("interpret treat read execute perform follow obey do carry".split())
+_HEADING_ACTIONS = frozenset(
+    "interpret treat read execute perform follow obey do carry use apply run".split()
+)
 _HEADING_OBJECTS = frozenset(
     "heading title label command instruction operation following below above".split()
 )
@@ -567,7 +569,9 @@ def _analyze(
     tag = [PatternCategory.SYSTEM_PROMPT_LEAKAGE.value]
 
     for pattern, confidence in P6_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             if prepared.is_report_label(match, source_view):
                 continue
             if _is_benign_print_rules_taxonomy(content, match):
@@ -589,7 +593,9 @@ def _analyze(
     if p6_only:
         return findings
     for pattern, confidence in P7_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -605,7 +611,9 @@ def _analyze(
                 )
             )
     for pattern, confidence in P8_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
