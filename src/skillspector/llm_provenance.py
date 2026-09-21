@@ -567,6 +567,11 @@ def sanitize_llm_provenance(
         if effective_adapters
         else "unknown"
     )
+    routing_adapter = (
+        "azure_openai"
+        if not use_llm and resolved_adapter == "unknown" and configured_adapter == "azure_openai"
+        else resolved_adapter
+    )
 
     raw_analyzers = raw.get("analyzers")
     by_id: dict[str, Mapping[object, object]] = {}
@@ -670,7 +675,7 @@ def sanitize_llm_provenance(
             "effective_adapters": effective_adapters,
             "service": "unknown",
             "routing": _sanitize_provider_routing(
-                provider.get("routing"), resolved_adapter=resolved_adapter
+                provider.get("routing"), resolved_adapter=routing_adapter
             ),
         },
         "analyzers": analyzers,
