@@ -709,55 +709,54 @@ def _validate_zip_member_type(info: zipfile.ZipInfo) -> None:
         raise ValueError("Zip directory entry contains file data")
 
 
-def selected_source_identity_for_input(input_path: str) -> str | None:
-    """Return a host/operator-selected skill identity from the original input.
+def selected_source_identity_for_input(
+    input_path: str,
+    *,
+    source_type: str,
+    resolved_path: Path,
+    temp_dir: Path | None,
+) -> str | None:
+    """Identify the selected skill without treating materialization names as aliases.
 
-    Temporary git/zip materialization uses ephemeral scan-root basenames such as
-    ``repo`` or ``extracted``. The repository, archive, or selected local path
-    name remains a trusted corroborating identity for AS3 self-reference
-    suppression without trusting contributor-controlled manifest data alone.
+    Call only after successful input resolution, using the source type and
+    temporary directory returned by that handler. A preserved archive root is
+    stronger evidence than the archive filename; neither introduces a second
+    identity. Unknown source layouts deliberately have no suppression identity.
     """
-    text = input_path.strip()
-    if not text:
+    if source_type == "directory":
+        return resolved_path.name or None
+
+    if source_type == "git":
+        text = input_path.strip()
+        if text.startswith("git@"):
+            match = re.fullmatch(r"git@[^:]+:(.+)", text)
+            if match is None:
+                return None
+            source_path = match.group(1)
+        else:
+            source_path = urlparse(text).path
+        return source_path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or None
+
+    if temp_dir is None:
         return None
 
-    if text.startswith("git@"):
-        match = re.match(r"^git@[^:]+:(.+)$", text)
-        if match is None:
+    extraction_root = temp_dir / "extracted"
+    if source_type in {"zip", "url"} and resolved_path.parent == extraction_root:
+        # InputHandler preserves a unique outer directory from an archive.
+        return resolved_path.name or None
+    if source_type == "zip" and resolved_path == extraction_root:
+        return Path(input_path.strip()).stem or None
+
+    if source_type == "file":
+        original = Path(input_path.strip())
+        if original.name not in {"SKILL.md", "skill.md"}:
             return None
-        repo_path = match.group(1).removesuffix(".git").rstrip("/")
-        name = repo_path.rsplit("/", 1)[-1]
-        return name.strip() or None
+        return Path(os.path.abspath(original)).parent.name or None
 
-    if text.startswith(("https://", "http://")):
-        parsed = urlparse(text)
-        path = (parsed.path or "").removesuffix(".git").rstrip("/")
-        parts = [part for part in path.split("/") if part]
-        if not parts:
-            return None
-        # github.com/owner/repo[/...], raw.githubusercontent.com/owner/repo/...
-        name = parts[1] if len(parts) >= 2 else parts[0]
-        return name.strip() or None
-
-    local = Path(text)
-    if local.suffix.lower() == ".zip":
-        stem = local.stem.strip()
-        return stem or None
-    if local.suffix.lower() == ".md":
-        parent_name = local.parent.name.strip()
-        if parent_name and parent_name not in {".", ".."}:
-            return parent_name
-        stem = local.stem.strip()
-        if stem and stem.casefold() != "skill":
-            return stem
-        return None
-
-    name = local.name.strip()
-    if not name or name in {".", ".."}:
-        return None
-    if name in {"repo", "extracted"} or name.startswith("skillspector_"):
-        return None
-    return name
+    # Direct-download URLs cannot reliably distinguish repository, slash-
+    # containing ref, and skill-directory segments. Keep those identities
+    # unknown rather than allowing a ref or repository name to hide a peer.
+    return None
 
 
 class InputHandler:

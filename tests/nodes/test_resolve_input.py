@@ -135,17 +135,54 @@ def test_transitive_truncation_is_typed_sanitized_and_cleaned(
     assert "private/source" not in str(raised.value)
 
 
-def test_selected_source_identity_from_git_and_archive_inputs() -> None:
-    """Repository and archive names become trusted selected-source identities."""
+def test_selected_source_identity_from_resolved_git_and_archive_inputs() -> None:
+    """Identity follows successful materialization, including preserved archive roots."""
     from skillspector.input_handler import selected_source_identity_for_input
 
+    temp_dir = Path("/tmp/skillspector_abc")
+    clone_root = temp_dir / "repo"
     assert (
-        selected_source_identity_for_input("https://github.com/acme/example-skill.git")
+        selected_source_identity_for_input(
+            "https://github.com/acme/example-skill.git",
+            source_type="git",
+            resolved_path=clone_root,
+            temp_dir=temp_dir,
+        )
         == "example-skill"
     )
     assert (
-        selected_source_identity_for_input("git@github.com:acme/example-skill.git")
+        selected_source_identity_for_input(
+            "git@github.com:acme/example-skill.git",
+            source_type="git",
+            resolved_path=clone_root,
+            temp_dir=temp_dir,
+        )
         == "example-skill"
     )
-    assert selected_source_identity_for_input("/tmp/packs/example-skill.zip") == "example-skill"
-    assert selected_source_identity_for_input("/tmp/skillspector_abc/repo") is None
+    assert (
+        selected_source_identity_for_input(
+            "/tmp/packs/example-skill.zip",
+            source_type="zip",
+            resolved_path=temp_dir / "extracted",
+            temp_dir=temp_dir,
+        )
+        == "example-skill"
+    )
+    assert (
+        selected_source_identity_for_input(
+            "/tmp/packs/peer-skill.zip",
+            source_type="zip",
+            resolved_path=temp_dir / "extracted" / "example-skill",
+            temp_dir=temp_dir,
+        )
+        == "example-skill"
+    )
+    assert (
+        selected_source_identity_for_input(
+            "/tmp/skillspector_abc/repo",
+            source_type="directory",
+            resolved_path=clone_root,
+            temp_dir=None,
+        )
+        == "repo"
+    )

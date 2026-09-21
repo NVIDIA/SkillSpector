@@ -59,12 +59,17 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
         handler = InputHandler(transitive_budget=workflow_budget)
         try:
             resolved, source_type = handler.resolve(input_path.strip())
+            temp_dir = handler.temp_dir_for_cleanup()
             update: dict[str, object] = {
                 "skill_path": str(resolved),
-                "selected_source_identity": selected_source_identity_for_input(input_path.strip()),
+                "selected_source_identity": selected_source_identity_for_input(
+                    input_path.strip(),
+                    source_type=source_type,
+                    resolved_path=resolved,
+                    temp_dir=temp_dir,
+                ),
                 "workflow_resource_budget": workflow_budget,
             }
-            temp_dir = handler.temp_dir_for_cleanup()
             if temp_dir is not None:
                 update["temp_dir_for_cleanup"] = str(temp_dir)
             else:
@@ -89,7 +94,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             resolved = validate_local_input_path(Path(skill_path))
             return {
                 "skill_path": str(resolved),
-                "selected_source_identity": selected_source_identity_for_input(skill_path.strip()),
+                "selected_source_identity": resolved.name or None,
                 "temp_dir_for_cleanup": None,
                 "workflow_resource_budget": workflow_budget,
             }

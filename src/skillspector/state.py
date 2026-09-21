@@ -236,9 +236,9 @@ class SkillspectorState(TypedDict, total=False):
     # Input: resolve_input node consumes input_path or skill_path, sets skill_path
     input_path: str | None
     skill_path: str | None
-    # Host/operator-selected repository, archive, or path identity used to
-    # corroborate AS3 current-skill suppression when temp clones use ephemeral
-    # scan-root basenames such as ``repo`` / ``extracted``.
+    # Set/reset by resolve_input from the actual selected source. None means
+    # materialization could not establish a current-skill identity; analyzers
+    # must not substitute generated directory names or manifest-only aliases.
     selected_source_identity: str | None
     # Set by resolve_input when a temp dir was created (git/url/zip/file); caller should clean up
     temp_dir_for_cleanup: str | None

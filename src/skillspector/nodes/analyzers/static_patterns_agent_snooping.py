@@ -33,7 +33,6 @@ import re
 from collections.abc import Mapping
 from contextvars import ContextVar
 
-from skillspector.input_handler import selected_source_identity_for_input
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
@@ -51,8 +50,6 @@ _AS3_SKILL_PATH_FULLMATCH = re.compile(_AS3_SKILL_PATH_PATTERN, re.IGNORECASE)
 _CURRENT_SKILL_IDENTIFIERS: ContextVar[frozenset[str]] = ContextVar(
     "agent_snooping_current_skill_identifiers", default=frozenset()
 )
-# Ephemeral basenames created by InputHandler for git/zip/file materialization.
-_EPHEMERAL_SCAN_ROOT_BASENAMES = frozenset({"repo", "extracted"})
 
 # AS1: Agent Config Directory Access
 # Matches code/instructions that read from well-known agent config directories.
@@ -211,34 +208,33 @@ def _normalize_skill_identifier(value: object) -> str | None:
     return normalized or None
 
 
-def _is_ephemeral_scan_root_basename(identifier: str) -> bool:
-    """Return whether a scan-root basename is an InputHandler materialization stub."""
-    return identifier in _EPHEMERAL_SCAN_ROOT_BASENAMES or identifier.startswith("skillspector_")
-
-
-def _selected_source_identifier(state: SkillspectorState) -> str | None:
-    """Return the trusted repository/archive/selected-source identity from state."""
-    selected = _normalize_skill_identifier(state.get("selected_source_identity"))
-    if selected is not None:
-        return selected
-    input_path = state.get("input_path")
-    if isinstance(input_path, str) and input_path.strip():
-        return _normalize_skill_identifier(selected_source_identity_for_input(input_path.strip()))
-    return None
-
-
 def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
-    """Derive trusted current-skill identities for AS3 self-reference suppression.
+    """Derive a trusted, internally consistent current-skill identity."""
 
-    Host-derived scan-root basenames and selected repository/archive identities
-    are authoritative. Contributor-controlled ``manifest.name`` may only
-    corroborate those trusted identities; it never introduces a suppression
-    identity on its own. Ephemeral temp-clone basenames such as ``repo`` are
-    ignored so a matching selected-source identity can still suppress the real
-    skill self-path without opening a peer-skill false negative.
-    """
+    # Normal graph scans carry one resolver-owned source identity, including
+    # an explicit None when the input layout is ambiguous. Direct analyzer
+    # callers retain the scan-root fallback used before provenance existed.
+    if "selected_source_identity" in state:
+        path_identifier = _normalize_skill_identifier(state.get("selected_source_identity"))
+    else:
+        path_identifier = _scan_root_identifier(state.get("skill_path"))
 
-    skill_path: object = state.get("skill_path")
+    manifest = state.get("manifest")
+    manifest_identifier: str | None = None
+    if isinstance(manifest, Mapping):
+        manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
+
+    # Manifest data can corroborate the selected source but cannot override a
+    # disagreement or add an alias that could conceal access to a peer skill.
+    if path_identifier is None:
+        return frozenset()
+    if manifest_identifier is not None and manifest_identifier != path_identifier:
+        return frozenset()
+    return frozenset({path_identifier})
+
+
+def _scan_root_identifier(skill_path: object) -> str | None:
+    """Return the root basename for callers without resolved input provenance."""
     path_text: str | bytes | None = None
     if isinstance(skill_path, str):
         path_text = skill_path
@@ -252,26 +248,7 @@ def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
         normalized_path = path_text.replace("\\", "/").rstrip("/")
         path_identifier = _normalize_skill_identifier(normalized_path.rsplit("/", 1)[-1])
 
-    source_identifier = _selected_source_identifier(state)
-
-    manifest = state.get("manifest")
-    manifest_identifier: str | None = None
-    if isinstance(manifest, Mapping):
-        manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
-
-    identifiers: set[str] = set()
-    if path_identifier is not None and not _is_ephemeral_scan_root_basename(path_identifier):
-        identifiers.add(path_identifier)
-    if source_identifier is not None:
-        identifiers.add(source_identifier)
-
-    # Manifest data is contributor-controlled. Keep it only when it already
-    # matches a trusted host/operator identity (no-op add) so mismatched names
-    # such as ``name: victim`` cannot suppress peer ``skills/victim/SKILL.md``.
-    if manifest_identifier is not None and manifest_identifier in identifiers:
-        identifiers.add(manifest_identifier)
-
-    return frozenset(identifiers)
+    return path_identifier
 
 
 def _is_current_skill_path_reference(
