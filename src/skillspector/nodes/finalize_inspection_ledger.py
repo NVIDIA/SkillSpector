@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import zlib
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
 from skillspector.artifacts import ContentKind
+from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     MAX_INSPECTION_LEDGER_EVENTS,
@@ -30,18 +32,165 @@ from skillspector.semantic_runtime import (
 )
 from skillspector.state import SkillspectorState
 
-# Unknown formats may be actively invoked, so they retain AE1 even when their
-# only recorded limitation is format-related.
-_FORMAT_ONLY_AE1_SUPPRESSION_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".pdf", ".png"})
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_ALLOWED_CHUNKS = frozenset({b"IHDR", b"PLTE", b"IDAT", b"IEND"})
+_PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+_PNG_BIT_DEPTHS = {
+    0: frozenset({1, 2, 4, 8, 16}),
+    2: frozenset({8, 16}),
+    3: frozenset({1, 2, 4, 8}),
+    4: frozenset({8, 16}),
+    6: frozenset({8, 16}),
+}
+_MAX_PASSIVE_PNG_CHUNKS = 4_096
+
+
+def _png_scanlines_are_valid(compressed: bytes, expected_size: int, row_size: int) -> bool:
+    """Decode one bounded PNG stream and validate its non-interlaced scanlines."""
+    if expected_size <= 0 or expected_size > MAX_ANALYZABLE_FILE_BYTES:
+        return False
+    try:
+        decoder = zlib.decompressobj()
+        decoded = decoder.decompress(compressed, expected_size + 1)
+        if len(decoded) > expected_size or decoder.unconsumed_tail:
+            return False
+        remaining = expected_size + 1 - len(decoded)
+        if remaining > 0:
+            decoded += decoder.flush(remaining)
+    except zlib.error:
+        return False
+    return (
+        len(decoded) == expected_size
+        and decoder.eof
+        and not decoder.unused_data
+        and not decoder.unconsumed_tail
+        and all(decoded[offset] <= 4 for offset in range(0, expected_size, row_size))
+    )
+
+
+def _is_structurally_valid_passive_png(data: bytes) -> bool:
+    """Accept only a bounded, minimal, fully decoded non-interlaced PNG."""
+    if len(data) > MAX_ANALYZABLE_FILE_BYTES or not data.startswith(_PNG_SIGNATURE):
+        return False
+
+    offset = len(_PNG_SIGNATURE)
+    chunk_count = 0
+    seen_ihdr = False
+    seen_plte = False
+    seen_idat = False
+    idat_finished = False
+    color_type = -1
+    bit_depth = -1
+    expected_size = 0
+    row_size = 0
+    compressed_parts: list[bytes] = []
+
+    while offset < len(data):
+        chunk_count += 1
+        if chunk_count > _MAX_PASSIVE_PNG_CHUNKS or len(data) - offset < 12:
+            return False
+        chunk_length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_type = data[offset + 4 : offset + 8]
+        chunk_end = offset + 12 + chunk_length
+        if (
+            chunk_length > 0x7FFFFFFF
+            or chunk_end > len(data)
+            or chunk_type not in _PNG_ALLOWED_CHUNKS
+        ):
+            return False
+        chunk_data = data[offset + 8 : offset + 8 + chunk_length]
+        recorded_crc = int.from_bytes(data[offset + 8 + chunk_length : chunk_end], "big")
+        computed_crc = zlib.crc32(chunk_type)
+        computed_crc = zlib.crc32(chunk_data, computed_crc) & 0xFFFFFFFF
+        if recorded_crc != computed_crc:
+            return False
+
+        if chunk_type == b"IHDR":
+            if seen_ihdr or chunk_count != 1 or chunk_length != 13:
+                return False
+            width = int.from_bytes(chunk_data[0:4], "big")
+            height = int.from_bytes(chunk_data[4:8], "big")
+            bit_depth, color_type, compression, filtering, interlace = chunk_data[8:13]
+            if (
+                width == 0
+                or height == 0
+                or bit_depth not in _PNG_BIT_DEPTHS.get(color_type, ())
+                or compression != 0
+                or filtering != 0
+                or interlace != 0
+            ):
+                return False
+            scanline_bytes = (width * _PNG_CHANNELS[color_type] * bit_depth + 7) // 8
+            row_size = scanline_bytes + 1
+            expected_size = row_size * height
+            if expected_size > MAX_ANALYZABLE_FILE_BYTES:
+                return False
+            seen_ihdr = True
+        elif chunk_type == b"PLTE":
+            if (
+                not seen_ihdr
+                or seen_plte
+                or seen_idat
+                or color_type in {0, 4}
+                or chunk_length == 0
+                or chunk_length > 768
+                or chunk_length % 3 != 0
+                or (color_type == 3 and chunk_length // 3 > 2**bit_depth)
+            ):
+                return False
+            seen_plte = True
+        elif chunk_type == b"IDAT":
+            if not seen_ihdr or idat_finished or (color_type == 3 and not seen_plte):
+                return False
+            seen_idat = True
+            compressed_parts.append(chunk_data)
+        else:
+            if (
+                chunk_type != b"IEND"
+                or not seen_ihdr
+                or not seen_idat
+                or chunk_length != 0
+                or chunk_end != len(data)
+            ):
+                return False
+            return _png_scanlines_are_valid(
+                b"".join(compressed_parts),
+                expected_size,
+                row_size,
+            )
+
+        if seen_idat and chunk_type != b"IDAT":
+            idat_finished = True
+        offset = chunk_end
+    return False
+
+
+def _has_verified_passive_png(
+    target_path: str,
+    inventory_item: Mapping[str, object] | None,
+    raw_file_cache: Mapping[str, object],
+) -> bool:
+    """Require complete canonical bytes for the one proven-passive image format."""
+    if PurePosixPath(target_path).suffix.lower() != ".png" or not inventory_item:
+        return False
+    raw = raw_file_cache.get(target_path)
+    size_bytes = inventory_item.get("size_bytes")
+    return (
+        isinstance(raw, bytes)
+        and type(size_bytes) is int
+        and size_bytes == len(raw)
+        and _is_structurally_valid_passive_png(raw)
+    )
 
 
 def _has_only_format_limitations(
     target_path: str,
     inventory_item: Mapping[str, object] | None,
     events: list[Mapping[str, object]],
+    raw_file_cache: Mapping[str, object],
 ) -> bool:
     """Recognize unsupported content without hiding other coverage failures."""
-    if PurePosixPath(target_path).suffix.lower() not in _FORMAT_ONLY_AE1_SUPPRESSION_SUFFIXES:
+    if not _has_verified_passive_png(target_path, inventory_item, raw_file_cache):
         return False
     if not inventory_item or str(inventory_item.get("content_kind")) not in {
         ContentKind.BINARY,
@@ -246,6 +395,8 @@ def _reference_coverage_findings(
 ) -> list[Finding]:
     """Create AE1 only for canonical resolved targets with incomplete disposition."""
     raw_references = state.get("artifact_references") or []
+    raw_cache = state.get("raw_file_cache")
+    raw_file_cache: Mapping[str, object] = raw_cache if isinstance(raw_cache, Mapping) else {}
     raw_inventory = state.get("artifact_inventory")
     inventory_shape_complete = isinstance(raw_inventory, list) and all(
         isinstance(item, dict) and _path_is_canonical(item.get("path")) for item in raw_inventory
@@ -334,7 +485,12 @@ def _reference_coverage_findings(
             and target_path not in invalid_status_paths
             and target_path not in duplicate_inventory_paths
             and reference_disposition == disposition
-            and _has_only_format_limitations(target_path, inventory_item, target_events)
+            and _has_only_format_limitations(
+                target_path,
+                inventory_item,
+                target_events,
+                raw_file_cache,
+            )
         ):
             continue
         line_value = reference.get("line", 1)

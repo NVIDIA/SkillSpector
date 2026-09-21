@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pickle
 import struct
 import subprocess
 import sys
@@ -42,17 +43,22 @@ def _png_chunk(kind: bytes, content: bytes) -> bytes:
     )
 
 
-def _write_image_skill(root: Path, count: int, *, duplicate_label: bool = False) -> Path:
-    skill = root / "chart-guide"
-    assets = skill / "assets"
-    assets.mkdir(parents=True)
-    # A complete 1x1 RGBA PNG, including correct lengths, CRCs and image data.
-    png = (
+def _valid_png_payload() -> bytes:
+    """Return the complete minimal PNG used by the benign integration matrix."""
+    return (
         b"\x89PNG\r\n\x1a\n"
         + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
         + _png_chunk(b"IDAT", zlib.compress(b"\x00\x40\x80\xc0\xff"))
         + _png_chunk(b"IEND", b"")
     )
+
+
+def _write_image_skill(root: Path, count: int, *, duplicate_label: bool = False) -> Path:
+    skill = root / "chart-guide"
+    assets = skill / "assets"
+    assets.mkdir(parents=True)
+    # A complete 1x1 RGBA PNG, including correct lengths, CRCs and image data.
+    png = _valid_png_payload()
     images = []
     for index in range(count):
         path = f"assets/chart-{index}.png"
@@ -186,7 +192,7 @@ def test_graph_keeps_png_coverage_without_ae1(
     ],
     ids=["jpeg", "gif", "pdf"],
 )
-def test_graph_applies_format_reason_policy_beyond_png(
+def test_graph_keeps_ae1_for_unverified_binary_formats(
     tmp_path: Path, filename: str, payload: bytes
 ) -> None:
     skill = _write_single_asset_skill(tmp_path, filename, payload)
@@ -197,8 +203,7 @@ def test_graph_applies_format_reason_policy_beyond_png(
     artifact = next(item for item in result["artifact_inventory"] if item["path"] == target)
     assert artifact["content_kind"] == "binary"
     assert artifact["disposition"] == "out_of_scope"
-    assert not any(finding.rule_id == "AE1" for finding in result["findings"])
-    assert result["risk_recommendation"] == "CAUTION"
+    assert any(finding.rule_id == "AE1" for finding in result["findings"])
     assert result["analysis_completeness"]["is_complete"] is False
     target_exceptions = [
         event
@@ -210,6 +215,49 @@ def test_graph_applies_format_reason_policy_beyond_png(
         "binary_content",
         "opaque_content",
     }
+
+
+class _ActivePicklePayload:
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (print, ("payload executed",))
+
+
+@pytest.mark.parametrize("prefix", [b"", b"\x89PNG\r\n\x1a\n"], ids=["renamed", "png-prefixed"])
+def test_graph_keeps_ae1_for_pickle_disguised_as_png(tmp_path: Path, prefix: bytes) -> None:
+    payload = prefix + pickle.dumps(_ActivePicklePayload(), protocol=4)
+    skill = _write_single_asset_skill(tmp_path, "helper.png", payload)
+
+    result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
+
+    artifact = next(
+        item for item in result["artifact_inventory"] if item["path"] == "assets/helper.png"
+    )
+    assert artifact["content_kind"] == "binary"
+    assert artifact["misleading_extension"] is False
+    assert any(finding.rule_id == "AE1" for finding in result["findings"])
+
+
+def test_graph_keeps_ae1_for_valid_png_with_trailing_payload(tmp_path: Path) -> None:
+    payload = _valid_png_payload() + pickle.dumps(_ActivePicklePayload(), protocol=4)
+    skill = _write_single_asset_skill(tmp_path, "helper.png", payload)
+
+    result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
+
+    assert any(finding.rule_id == "AE1" for finding in result["findings"])
+
+
+def test_graph_keeps_ae1_for_active_pdf(tmp_path: Path) -> None:
+    payload = (
+        b"%PDF-1.7\n"
+        b"1 0 obj\n<< /Type /Catalog /OpenAction 2 0 R >>\nendobj\n"
+        b"2 0 obj\n<< /S /JavaScript /JS (app.alert('executed')) >>\nendobj\n"
+        b"trailer << /Root 1 0 R >>\n%%EOF\n"
+    )
+    skill = _write_single_asset_skill(tmp_path, "manual.pdf", payload)
+
+    result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
+
+    assert any(finding.rule_id == "AE1" for finding in result["findings"])
 
 
 def test_graph_does_not_treat_dex_word_prefix_as_binary_or_executable(tmp_path: Path) -> None:

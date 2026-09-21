@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import struct
+import zlib
 from types import MappingProxyType
 
 import pytest
@@ -32,6 +34,61 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 def _target(work_id: str, path: str) -> dict[str, str | int | None]:
     return {"work_id": work_id, "path": path, "start_line": None, "end_line": None}
+
+
+def _png_chunk(kind: bytes, content: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(content))
+        + kind
+        + content
+        + struct.pack(">I", zlib.crc32(kind + content))
+    )
+
+
+_VALID_PASSIVE_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    + _png_chunk(b"IDAT", zlib.compress(b"\x00\x40\x80\xc0\xff"))
+    + _png_chunk(b"IEND", b"")
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "reported_size", "expected"),
+    [
+        ("assets/diagram.png", _VALID_PASSIVE_PNG, len(_VALID_PASSIVE_PNG), True),
+        ("assets/diagram.PNG", _VALID_PASSIVE_PNG, len(_VALID_PASSIVE_PNG), True),
+        ("assets/diagram.jpg", _VALID_PASSIVE_PNG, len(_VALID_PASSIVE_PNG), False),
+        (
+            "assets/diagram.png",
+            _VALID_PASSIVE_PNG + b"trailing payload",
+            len(_VALID_PASSIVE_PNG) + len(b"trailing payload"),
+            False,
+        ),
+        (
+            "assets/diagram.png",
+            _VALID_PASSIVE_PNG[:-1] + bytes([_VALID_PASSIVE_PNG[-1] ^ 1]),
+            len(_VALID_PASSIVE_PNG),
+            False,
+        ),
+        ("assets/diagram.png", _VALID_PASSIVE_PNG, len(_VALID_PASSIVE_PNG) + 1, False),
+    ],
+    ids=["png", "uppercase", "wrong-suffix", "trailing", "bad-crc", "size-mismatch"],
+)
+def test_verified_passive_png_requires_matching_identity_and_complete_bytes(
+    path: str,
+    payload: bytes,
+    reported_size: int,
+    expected: bool,
+) -> None:
+    assert (
+        finalizer_module._has_verified_passive_png(
+            path,
+            {"size_bytes": reported_size},
+            {path: payload},
+        )
+        is expected
+    )
 
 
 def test_completed_work_is_covered_and_resolves_emitted_finding_ids() -> None:
@@ -791,11 +848,13 @@ def test_format_only_reference_keeps_coverage_without_ae1(
 ) -> None:
     state = {
         "components": ["assets/diagram.png"],
+        "raw_file_cache": {"assets/diagram.png": _VALID_PASSIVE_PNG},
         "artifact_inventory": [
             {
                 "path": "assets/diagram.png",
                 "content_kind": content_kind,
                 "disposition": disposition,
+                "size_bytes": len(_VALID_PASSIVE_PNG),
                 "referenced": True,
             }
         ],
@@ -820,7 +879,11 @@ def test_format_only_reference_keeps_coverage_without_ae1(
     }
 
     # Public JSON carries strings instead of enums; both representations must agree.
-    for candidate in (state, json.loads(json.dumps(state))):
+    json_candidate = json.loads(
+        json.dumps({key: value for key, value in state.items() if key != "raw_file_cache"})
+    )
+    json_candidate["raw_file_cache"] = state["raw_file_cache"]
+    for candidate in (state, json_candidate):
         result = finalize_inspection_ledger(candidate)
         assert result["findings"] == []
         assert result["effective_finding_ids"] == []
@@ -861,11 +924,13 @@ def test_reference_disposition_must_match_inventory_before_ae1_is_suppressed(
         reference["disposition"] = reference_disposition
     findings = finalizer_module._reference_coverage_findings(
         {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": inventory_disposition,
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 }
             ],
@@ -960,11 +1025,13 @@ def test_format_reason_does_not_hide_other_reference_failures(
                 )
             )
     state = {
+        "raw_file_cache": {path: _VALID_PASSIVE_PNG},
         "artifact_inventory": [
             {
                 "path": path,
                 "content_kind": "binary",
                 "disposition": "partial",
+                "size_bytes": len(_VALID_PASSIVE_PNG),
                 "referenced": True,
                 **inventory_patch,
             }
@@ -999,17 +1066,20 @@ def test_duplicate_inventory_cannot_hide_a_reference_failure(reverse: bool) -> N
             "content_kind": "opaque",
             "disposition": "failed",
             "reason": "read_error",
+            "size_bytes": len(_VALID_PASSIVE_PNG),
             "referenced": True,
         },
         {
             "path": path,
             "content_kind": "binary",
             "disposition": "out_of_scope",
+            "size_bytes": len(_VALID_PASSIVE_PNG),
             "referenced": True,
         },
     ]
     findings = finalizer_module._reference_coverage_findings(
         {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": list(reversed(inventory)) if reverse else inventory,
             "artifact_references": [
                 {
@@ -1061,11 +1131,13 @@ def test_noncanonical_ledger_path_cannot_hide_a_reference_failure(alias: str) ->
 
     findings = finalizer_module._reference_coverage_findings(
         {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 }
             ],
@@ -1093,11 +1165,13 @@ def test_noncanonical_inventory_path_cannot_hide_a_reference_failure(alias: str)
     path = "assets/diagram.png"
     findings = finalizer_module._reference_coverage_findings(
         {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 },
                 {
@@ -1148,11 +1222,13 @@ def test_truncated_ledger_cannot_prove_a_format_only_reference(canonical_phase: 
 
     findings = finalizer_module._reference_coverage_findings(
         {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 }
             ],
@@ -1189,11 +1265,13 @@ def test_malformed_ledger_row_cannot_prove_a_format_only_reference(bad_event: ob
     path = "assets/diagram.png"
     findings = finalizer_module._reference_coverage_findings(
         {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 }
             ],
@@ -1232,11 +1310,13 @@ def test_non_dict_ledger_mapping_cannot_prove_a_format_only_reference() -> None:
         reason=LedgerReason.OPAQUE_CONTENT,
     )
     base_state = {
+        "raw_file_cache": {path: _VALID_PASSIVE_PNG},
         "artifact_inventory": [
             {
                 "path": path,
                 "content_kind": "binary",
                 "disposition": "partial",
+                "size_bytes": len(_VALID_PASSIVE_PNG),
                 "referenced": True,
             }
         ],
@@ -1284,11 +1364,13 @@ def test_malformed_analyzer_status_cannot_hide_ae1_in_reference_classification(
     path = "assets/diagram.png"
     findings = finalizer_module._reference_coverage_findings(
         {
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 }
             ],
@@ -1322,11 +1404,13 @@ def test_unaccounted_planned_work_cannot_hide_ae1_behind_format_evidence() -> No
     missing_work_id = inspection_work_id("behavioral_ast", path, None, None)
     state = {
         "components": [path],
+        "raw_file_cache": {path: _VALID_PASSIVE_PNG},
         "artifact_inventory": [
             {
                 "path": path,
                 "content_kind": "binary",
                 "disposition": "partial",
+                "size_bytes": len(_VALID_PASSIVE_PNG),
                 "referenced": True,
             }
         ],
@@ -1382,11 +1466,13 @@ def test_contradictory_analyzer_status_cannot_hide_ae1(status_name: str) -> None
     result = finalize_inspection_ledger(
         {
             "components": [path],
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 }
             ],
@@ -1426,11 +1512,13 @@ def test_degraded_analyzer_status_accepts_matching_format_only_evidence() -> Non
     result = finalize_inspection_ledger(
         {
             "components": [path],
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 }
             ],
@@ -1463,11 +1551,13 @@ def test_unrelated_fatal_does_not_reclassify_a_format_only_reference() -> None:
     result = finalize_inspection_ledger(
         {
             "components": [path, "broken.txt"],
+            "raw_file_cache": {path: _VALID_PASSIVE_PNG},
             "artifact_inventory": [
                 {
                     "path": path,
                     "content_kind": "binary",
                     "disposition": "partial",
+                    "size_bytes": len(_VALID_PASSIVE_PNG),
                     "referenced": True,
                 },
                 {"path": "broken.txt", "content_kind": "opaque", "disposition": "failed"},
