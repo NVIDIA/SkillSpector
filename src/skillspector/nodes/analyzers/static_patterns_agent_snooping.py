@@ -235,7 +235,30 @@ def _normalize_skill_identifier(value: object) -> str | None:
 def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
     """Derive a trusted, internally consistent current-skill identity."""
 
-    skill_path: object = state.get("skill_path")
+    # Normal graph scans carry one resolver-owned source identity, including
+    # an explicit None when the input layout is ambiguous. Direct analyzer
+    # callers retain the scan-root fallback used before provenance existed.
+    if "selected_source_identity" in state:
+        path_identifier = _normalize_skill_identifier(state.get("selected_source_identity"))
+    else:
+        path_identifier = _scan_root_identifier(state.get("skill_path"))
+
+    manifest = state.get("manifest")
+    manifest_identifier: str | None = None
+    if isinstance(manifest, Mapping):
+        manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
+
+    # Manifest data can corroborate the selected source but cannot override a
+    # disagreement or add an alias that could conceal access to a peer skill.
+    if path_identifier is None:
+        return frozenset()
+    if manifest_identifier is not None and manifest_identifier != path_identifier:
+        return frozenset()
+    return frozenset({path_identifier})
+
+
+def _scan_root_identifier(skill_path: object) -> str | None:
+    """Return the root basename for callers without resolved input provenance."""
     path_text: str | bytes | None = None
     if isinstance(skill_path, str):
         path_text = skill_path
@@ -249,19 +272,7 @@ def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
         normalized_path = path_text.replace("\\", "/").rstrip("/")
         path_identifier = _normalize_skill_identifier(normalized_path.rsplit("/", 1)[-1])
 
-    manifest = state.get("manifest")
-    manifest_identifier: str | None = None
-    if isinstance(manifest, Mapping):
-        manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
-
-    # The path is the only host-derived identity available here.  A manifest
-    # name is contributor-controlled, so it may corroborate the path but must
-    # never introduce a second identity or override a disagreement.
-    if path_identifier is None:
-        return frozenset()
-    if manifest_identifier is not None and manifest_identifier != path_identifier:
-        return frozenset()
-    return frozenset({path_identifier})
+    return path_identifier
 
 
 def _is_current_skill_path_reference(
