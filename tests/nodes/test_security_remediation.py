@@ -101,9 +101,10 @@ Describe the diagram in assets/diagram.png to the user.
     findings = [finding for finding in result["findings"] if finding.file == "assets/diagram.png"]
     assert artifact["content_kind"] in {ContentKind.BINARY, ContentKind.OPAQUE}
     assert not {finding.rule_id for finding in findings} & {"AE3", "AE4"}
-    assert any(
+    assert not any(
         finding.rule_id == "AE1" and finding.file == "SKILL.md" for finding in result["findings"]
     )
+    assert result["analysis_completeness"]["is_complete"] is False
     assert any(
         event.get("analyzer_id") == "artifact_integrity"
         and event.get("path") == "assets/diagram.png"
