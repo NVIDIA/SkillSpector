@@ -90,6 +90,9 @@ When a binary or opaque target's only limitation is an unsupported content forma
 coverage exception remains visible without an AE1 analysis-evasion finding. Other failures,
 unknown reasons, and mixed limitations still produce AE1. This distinction does not change
 coverage metrics, incomplete-scan recommendations, or `--fail-on-incomplete` behavior.
+Executable or concealed content retains its non-format coverage reason and AE1 signal. A
+format-only scan may report LOW severity after AE1 is removed, while still recommending
+`CAUTION` because the scan remains incomplete.
 
 ## Structured skill data
 

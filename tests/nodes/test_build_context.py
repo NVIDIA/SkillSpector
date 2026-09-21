@@ -1370,7 +1370,7 @@ def test_excluded_artifact_probe_checks_deadline_after_open(
     assert metadata[0]["excluded_inspection_incomplete"] is True
     assert metadata[0]["excluded_from_analysis"] is True
     assert archive_cache == {}
-    assert input_bytes == len("ordi")
+    assert input_bytes == len("ordinary")
     assert len(inventory) == 1
     assert inventory[0]["path"] == "node_modules/README"
     assert inventory[0]["disposition"] == ArtifactDisposition.PARTIAL

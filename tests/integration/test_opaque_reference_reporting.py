@@ -70,6 +70,21 @@ def _write_image_skill(root: Path, count: int, *, duplicate_label: bool = False)
     return skill
 
 
+def _write_single_asset_skill(root: Path, filename: str, payload: bytes) -> Path:
+    skill = root / f"asset-{Path(filename).suffix.removeprefix('.')}"
+    assets = skill / "assets"
+    assets.mkdir(parents=True)
+    (assets / filename).write_bytes(payload)
+    (skill / "SKILL.md").write_text(
+        "---\nname: asset-guide\n"
+        "description: Explain one bundled reference asset when the user asks.\n"
+        "---\n# Asset guide\n\n"
+        f"Review [the bundled asset](assets/{filename}).\n",
+        encoding="utf-8",
+    )
+    return skill
+
+
 def _assert_completeness(completeness: dict[str, Any], count: int) -> None:
     assert completeness["is_complete"] is False
     assert completeness["status"] == "partial"
@@ -157,6 +172,85 @@ def test_graph_keeps_png_coverage_without_ae1(
         assert all(item["disposition"] == "out_of_scope" for item in binary_items)
 
     assert invoked["analysis_completeness"] == streamed["analysis_completeness"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("photo.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 32),
+        (
+            "pixel.gif",
+            b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x01L\x00;",
+        ),
+        ("manual.pdf", b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"),
+    ],
+    ids=["jpeg", "gif", "pdf"],
+)
+def test_graph_applies_format_reason_policy_beyond_png(
+    tmp_path: Path, filename: str, payload: bytes
+) -> None:
+    skill = _write_single_asset_skill(tmp_path, filename, payload)
+
+    result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
+
+    target = f"assets/{filename}"
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == target)
+    assert artifact["content_kind"] == "binary"
+    assert artifact["disposition"] == "out_of_scope"
+    assert not any(finding.rule_id == "AE1" for finding in result["findings"])
+    assert result["risk_recommendation"] == "CAUTION"
+    assert result["analysis_completeness"]["is_complete"] is False
+    target_exceptions = [
+        event
+        for event in result["analysis_completeness"]["ledger_exceptions"]
+        if event["path"] == target
+    ]
+    assert target_exceptions
+    assert {event["reason_code"] for event in target_exceptions} <= {
+        "binary_content",
+        "opaque_content",
+    }
+
+
+def test_graph_does_not_treat_dex_word_prefix_as_binary_or_executable(tmp_path: Path) -> None:
+    payload = b"dex\nA short term for dexterity.\n"
+    skill = _write_single_asset_skill(tmp_path, "glossary.txt", payload)
+
+    result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
+
+    artifact = next(
+        item for item in result["artifact_inventory"] if item["path"] == "assets/glossary.txt"
+    )
+    assert artifact["content_kind"] == "text"
+    assert artifact["disposition"] == "analyzed"
+    assert not {finding.rule_id for finding in result["findings"]} & {"AE1", "AE2", "SC9"}
+    assert result["analysis_completeness"]["is_complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("program.exe", b"MZ" + b"\x00" * 62),
+        ("classes.dex", b"dex\n035\0" + b"\x00" * 120),
+        ("chunk.luac", b"\x1bLua\x54\x00" + b"\x00" * 120),
+    ],
+    ids=["pe", "dex", "lua-bytecode"],
+)
+def test_referenced_executable_binary_keeps_ae1_and_concealment_signal(
+    tmp_path: Path, filename: str, payload: bytes
+) -> None:
+    skill = _write_single_asset_skill(tmp_path, filename, payload)
+
+    result = graph.invoke({"skill_path": str(skill), "use_llm": False, "output_format": "json"})
+
+    assert any(finding.rule_id == "AE1" for finding in result["findings"])
+    assert any(finding.rule_id == "SC9" for finding in result["findings"])
+    assert result["risk_recommendation"] == "DO_NOT_INSTALL"
+    assert any(
+        event["path"] == f"assets/{filename}"
+        and event["reason_code"] == "excluded_executable_content"
+        for event in result["analysis_completeness"]["ledger_exceptions"]
+    )
 
 
 @pytest.mark.parametrize(

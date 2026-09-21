@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from types import MappingProxyType
 
 import pytest
 
@@ -735,6 +736,7 @@ def test_resolved_reference_ae1_disposition_matrix_is_llm_independent(
                     "path": "assets/target.bin",
                     "disposition": disposition,
                     "content_kind": "binary" if disposition == "out_of_scope" else "text",
+                    "referenced": True,
                 }
             ],
             "artifact_references": [
@@ -790,7 +792,12 @@ def test_format_only_reference_keeps_coverage_without_ae1(
     state = {
         "components": ["assets/diagram.png"],
         "artifact_inventory": [
-            {"path": "assets/diagram.png", "content_kind": content_kind, "disposition": disposition}
+            {
+                "path": "assets/diagram.png",
+                "content_kind": content_kind,
+                "disposition": disposition,
+                "referenced": True,
+            }
         ],
         "artifact_references": [
             {
@@ -798,6 +805,7 @@ def test_format_only_reference_keeps_coverage_without_ae1(
                 "line": 7,
                 "target_path": "assets/diagram.png",
                 "status": "resolved",
+                "disposition": disposition,
             }
         ],
         "inspection_ledger": [
@@ -823,6 +831,65 @@ def test_format_only_reference_keeps_coverage_without_ae1(
 
 
 @pytest.mark.parametrize(
+    ("inventory_disposition", "reference_disposition", "expected_ae1"),
+    [
+        ("partial", "partial", False),
+        ("out_of_scope", "out_of_scope", False),
+        ("partial", None, True),
+        ("partial", "analyzed", True),
+        ("partial", "failed", True),
+        ("partial", "out_of_scope", True),
+        ("out_of_scope", "partial", True),
+        ("analyzed", "partial", True),
+        ("analyzed", "failed", True),
+        ("analyzed", "out_of_scope", True),
+    ],
+)
+def test_reference_disposition_must_match_inventory_before_ae1_is_suppressed(
+    inventory_disposition: str,
+    reference_disposition: str | None,
+    expected_ae1: bool,
+) -> None:
+    path = "assets/diagram.png"
+    reference: dict[str, object] = {
+        "source_path": "SKILL.md",
+        "line": 7,
+        "target_path": path,
+        "status": "resolved",
+    }
+    if reference_disposition is not None:
+        reference["disposition"] = reference_disposition
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": inventory_disposition,
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [reference],
+            "inspection_ledger": (
+                []
+                if inventory_disposition == "analyzed"
+                else [
+                    ledger_event(
+                        outcome=LedgerOutcome(inventory_disposition),
+                        record_type=LedgerRecordType.SYSTEM,
+                        phase="static",
+                        path=path,
+                        reason=LedgerReason.OPAQUE_CONTENT,
+                    )
+                ]
+            ),
+        }
+    )
+
+    assert bool(findings) is expected_ae1
+
+
+@pytest.mark.parametrize(
     ("inventory_patch", "extra_event", "format_event_patch", "keep_format_event"),
     [
         ({"disposition": "failed"}, None, {}, True),
@@ -834,17 +901,20 @@ def test_format_only_reference_keeps_coverage_without_ae1(
         ({"reason": "size_limit"}, None, {}, True),
         ({"reason": "read_error"}, None, {}, True),
         ({"reason": "oms_signature"}, None, {}, True),
+        ({"inherited_exclusion_reason": "archive_time_limit"}, None, {}, True),
         ({}, {"outcome": "partial", "reason_code": "static_parse_limit"}, {}, True),
         ({}, {"outcome": "failed", "reason_code": "read_error"}, {}, True),
         ({}, {"outcome": "out_of_scope", "reason_code": "excluded_directory"}, {}, True),
         ({}, {"outcome": "partial", "reason_code": "excluded_executable_content"}, {}, True),
-        ({}, {"outcome": "skipped", "reason_code": "unsupported_format"}, {}, True),
+        ({}, {"outcome": "skipped", "reason_code": "disabled_by_configuration"}, {}, True),
+        ({}, {"outcome": "completed", "reason_code": "read_error"}, {}, True),
         ({}, None, {"outcome": "failed"}, True),
         ({}, None, {"fatal": True}, True),
         ({}, None, {"reason_code": None}, True),
         ({}, None, {"reason_code": "unknown_reason"}, True),
         ({}, None, {"reason_code": ["opaque_content"]}, True),
         ({}, None, {"outcome": ["partial"]}, True),
+        ({}, None, {}, False),
         ({"reason": "opaque_content"}, None, {}, False),
     ],
 )
@@ -856,20 +926,57 @@ def test_format_reason_does_not_hide_other_reference_failures(
 ) -> None:
     path = "assets/diagram.png"
     format_event = {
-        "path": path,
-        "outcome": "partial",
-        "reason_code": "opaque_content",
+        **ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="static",
+            path=path,
+            reason=LedgerReason.OPAQUE_CONTENT,
+        ),
         **format_event_patch,
     }
     events = [format_event] if keep_format_event else []
     if extra_event:
-        events.append({"path": path, **extra_event})
+        outcome = LedgerOutcome(str(extra_event["outcome"]))
+        if outcome is LedgerOutcome.COMPLETED:
+            completed_event = dict(
+                ledger_event(
+                    outcome=outcome,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                )
+            )
+            completed_event.update(extra_event)
+            events.append(completed_event)
+        else:
+            events.append(
+                ledger_event(
+                    outcome=outcome,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path=path,
+                    reason=LedgerReason(str(extra_event["reason_code"])),
+                )
+            )
     state = {
         "artifact_inventory": [
-            {"path": path, "content_kind": "binary", "disposition": "partial", **inventory_patch}
+            {
+                "path": path,
+                "content_kind": "binary",
+                "disposition": "partial",
+                "referenced": True,
+                **inventory_patch,
+            }
         ],
         "artifact_references": [
-            {"source_path": "SKILL.md", "line": 7, "target_path": path, "status": "resolved"}
+            {
+                "source_path": "SKILL.md",
+                "line": 7,
+                "target_path": path,
+                "status": "resolved",
+                "disposition": "partial",
+            }
         ],
         "inspection_ledger": events,
     }
@@ -887,22 +994,518 @@ def test_format_reason_does_not_hide_other_reference_failures(
 def test_duplicate_inventory_cannot_hide_a_reference_failure(reverse: bool) -> None:
     path = "assets/diagram.png"
     inventory = [
-        {"path": path, "content_kind": "opaque", "disposition": "failed", "reason": "read_error"},
-        {"path": path, "content_kind": "binary", "disposition": "out_of_scope"},
+        {
+            "path": path,
+            "content_kind": "opaque",
+            "disposition": "failed",
+            "reason": "read_error",
+            "referenced": True,
+        },
+        {
+            "path": path,
+            "content_kind": "binary",
+            "disposition": "out_of_scope",
+            "referenced": True,
+        },
     ]
     findings = finalizer_module._reference_coverage_findings(
         {
             "artifact_inventory": list(reversed(inventory)) if reverse else inventory,
             "artifact_references": [
-                {"source_path": "SKILL.md", "line": 7, "target_path": path, "status": "resolved"}
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "out_of_scope",
+                }
             ],
             "inspection_ledger": [
-                {"path": path, "outcome": "partial", "reason_code": "opaque_content"}
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
+                )
             ],
         }
     )
 
     assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["./assets/diagram.png", "assets//diagram.png", "assets/./diagram.png", "assets\\diagram.png"],
+)
+def test_noncanonical_ledger_path_cannot_hide_a_reference_failure(alias: str) -> None:
+    path = "assets/diagram.png"
+    format_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="static",
+        path=path,
+        reason=LedgerReason.OPAQUE_CONTENT,
+    )
+    size_event = dict(
+        ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="cache",
+            path=path,
+            reason=LedgerReason.SIZE_LIMIT,
+        )
+    )
+    size_event["path"] = alias
+
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [format_event, size_event],
+        }
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["./assets/diagram.png", "assets//diagram.png", "assets/./diagram.png", "assets\\diagram.png"],
+)
+def test_noncanonical_inventory_path_cannot_hide_a_reference_failure(alias: str) -> None:
+    path = "assets/diagram.png"
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                },
+                {
+                    "path": alias,
+                    "content_kind": "opaque",
+                    "disposition": "failed",
+                    "reason": "read_error",
+                    "referenced": True,
+                },
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
+                )
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+@pytest.mark.parametrize("canonical_phase", [False, True])
+def test_truncated_ledger_cannot_prove_a_format_only_reference(canonical_phase: bool) -> None:
+    path = "assets/diagram.png"
+    limit = inspection_ledger_module.MAX_INSPECTION_LEDGER_EVENTS
+    truncation = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="ledger_output" if canonical_phase else "static",
+        path="other.bin",
+        reason=LedgerReason.OUTPUT_LIMIT,
+        observed_records=limit + 1,
+        limit_records=limit,
+    )
+
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
+                ),
+                truncation,
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+@pytest.mark.parametrize(
+    "bad_event",
+    [None, {}, {"path": "other.txt", "outcome": "wat"}, {"outcome": "completed"}],
+)
+def test_malformed_ledger_row_cannot_prove_a_format_only_reference(bad_event: object) -> None:
+    path = "assets/diagram.png"
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
+                ),
+                bad_event,
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+def test_non_dict_ledger_mapping_cannot_prove_a_format_only_reference() -> None:
+    path = "assets/diagram.png"
+    format_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        record_type=LedgerRecordType.SYSTEM,
+        phase="static",
+        path=path,
+        reason=LedgerReason.OPAQUE_CONTENT,
+    )
+    base_state = {
+        "artifact_inventory": [
+            {
+                "path": path,
+                "content_kind": "binary",
+                "disposition": "partial",
+                "referenced": True,
+            }
+        ],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 7,
+                "target_path": path,
+                "status": "resolved",
+                "disposition": "partial",
+            }
+        ],
+    }
+
+    assert (
+        finalizer_module._reference_coverage_findings(
+            {**base_state, "inspection_ledger": [format_event]}
+        )
+        == []
+    )
+    findings = finalizer_module._reference_coverage_findings(
+        {**base_state, "inspection_ledger": [MappingProxyType(format_event)]}
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+@pytest.mark.parametrize(
+    "bad_statuses",
+    [
+        "not-a-list",
+        [{}],
+        [
+            MappingProxyType(
+                {"analyzer_id": "behavioral_ast", "status": "completed", "planned_work": []}
+            )
+        ],
+        [{"analyzer_id": "behavioral_ast", "status": "completed", "planned_work": {}}],
+        [{"analyzer_id": "behavioral_ast", "status": "completed", "planned_work": ["oops"]}],
+    ],
+)
+def test_malformed_analyzer_status_cannot_hide_ae1_in_reference_classification(
+    bad_statuses: object,
+) -> None:
+    path = "assets/diagram.png"
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="static",
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
+                )
+            ],
+            "analyzer_status_events": bad_statuses,
+        }
+    )
+
+    assert [finding.rule_id for finding in findings] == ["AE1"]
+
+
+def test_unaccounted_planned_work_cannot_hide_ae1_behind_format_evidence() -> None:
+    path = "assets/diagram.png"
+    missing_work_id = inspection_work_id("behavioral_ast", path, None, None)
+    state = {
+        "components": [path],
+        "artifact_inventory": [
+            {
+                "path": path,
+                "content_kind": "binary",
+                "disposition": "partial",
+                "referenced": True,
+            }
+        ],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 7,
+                "target_path": path,
+                "status": "resolved",
+                "disposition": "partial",
+            }
+        ],
+        "inspection_ledger": [
+            ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                phase="static",
+                analyzer_id="static_patterns_agent_snooping",
+                path=path,
+                reason=LedgerReason.OPAQUE_CONTENT,
+            )
+        ],
+        "analyzer_status_events": [
+            analyzer_status_event(
+                analyzer_id="behavioral_ast",
+                status="completed",
+                planned_work=[_target(missing_work_id, path)],
+            )
+        ],
+    }
+
+    result = finalize_inspection_ledger(state)
+
+    assert [finding.rule_id for finding in result["findings"]] == ["AE1"]
+    assert result["execution_successful"] is False
+    assert any(
+        event["path"] == path
+        and event["reason_code"] == LedgerReason.UNACCOUNTED_WORK
+        and event["fatal"] is True
+        for event in result["analysis_completeness"]["ledger_exceptions"]
+    )
+
+
+@pytest.mark.parametrize("status_name", ["failed", "unknown", "completed", "degraded"])
+def test_contradictory_analyzer_status_cannot_hide_ae1(status_name: str) -> None:
+    path = "assets/diagram.png"
+    format_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="behavioral_ast",
+        path=path,
+        reason=LedgerReason.OPAQUE_CONTENT,
+    )
+    result = finalize_inspection_ledger(
+        {
+            "components": [path],
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [format_event],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id="behavioral_ast",
+                    status=status_name,
+                    planned_work=[_target(format_event["work_id"], path)],
+                    reason=LedgerReason.ANALYZER_RUNTIME_ERROR,
+                )
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in result["findings"]] == ["AE1"]
+
+
+def test_degraded_analyzer_status_accepts_matching_format_only_evidence() -> None:
+    path = "assets/diagram.png"
+    format_event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="behavioral_ast",
+        path=path,
+        reason=LedgerReason.OPAQUE_CONTENT,
+    )
+    result = finalize_inspection_ledger(
+        {
+            "components": [path],
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                }
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [format_event],
+            "analyzer_status_events": [
+                analyzer_status_event(
+                    analyzer_id="behavioral_ast",
+                    status="degraded",
+                    planned_work=[_target(format_event["work_id"], path)],
+                )
+            ],
+        }
+    )
+
+    assert result["findings"] == []
+    assert result["execution_successful"] is True
+
+
+def test_unrelated_fatal_does_not_reclassify_a_format_only_reference() -> None:
+    path = "assets/diagram.png"
+    result = finalize_inspection_ledger(
+        {
+            "components": [path, "broken.txt"],
+            "artifact_inventory": [
+                {
+                    "path": path,
+                    "content_kind": "binary",
+                    "disposition": "partial",
+                    "referenced": True,
+                },
+                {"path": "broken.txt", "content_kind": "opaque", "disposition": "failed"},
+            ],
+            "artifact_references": [
+                {
+                    "source_path": "SKILL.md",
+                    "line": 7,
+                    "target_path": path,
+                    "status": "resolved",
+                    "disposition": "partial",
+                }
+            ],
+            "inspection_ledger": [
+                ledger_event(
+                    outcome=LedgerOutcome.PARTIAL,
+                    phase="static",
+                    analyzer_id="static_patterns_agent_snooping",
+                    path=path,
+                    reason=LedgerReason.OPAQUE_CONTENT,
+                ),
+                ledger_event(
+                    outcome=LedgerOutcome.FAILED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="cache",
+                    path="broken.txt",
+                    reason=LedgerReason.READ_ERROR,
+                ),
+            ],
+        }
+    )
+
+    assert result["findings"] == []
+    assert result["execution_successful"] is False
+    assert any(
+        event["path"] == "broken.txt" and event["fatal"] is True
+        for event in result["analysis_completeness"]["ledger_exceptions"]
+    )
 
 
 @pytest.mark.parametrize(

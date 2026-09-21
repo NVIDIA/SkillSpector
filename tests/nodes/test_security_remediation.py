@@ -56,6 +56,27 @@ def test_content_classification_uses_bytes_not_extension() -> None:
     assert binary["misleading_extension"] is True
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("classes.dex", b"dex\n035\0" + b"\0" * 104),
+        ("chunk.luac", b"\x1bLua" + b"\0" * 108),
+    ],
+)
+def test_utf8_decodable_bytecode_magic_is_still_binary(path: str, payload: bytes) -> None:
+    artifact = classify_artifact(path, payload, referenced=True)
+
+    assert artifact["content_kind"] is ContentKind.BINARY
+    assert artifact["disposition"] is ArtifactDisposition.PARTIAL
+
+
+def test_dex_word_prefix_remains_text_content() -> None:
+    artifact = classify_artifact("glossary.txt", b"dex\nA short term for dexterity.\n")
+
+    assert artifact["content_kind"] is ContentKind.TEXT
+    assert artifact["disposition"] is ArtifactDisposition.ANALYZED
+
+
 def test_referenced_opaque_artifact_is_partial() -> None:
     artifact = classify_artifact("assets/blob.bin", b"\x89PNG\r\n\x1a\n\x00data", referenced=True)
     assert artifact["disposition"] == ArtifactDisposition.PARTIAL

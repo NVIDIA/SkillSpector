@@ -184,6 +184,7 @@ _BINARY_MAGIC = (
     b"\x7fELF",
     b"MZ",
     b"\x00asm",
+    b"\x1bLua",
     b"%PDF-",
 )
 
@@ -198,9 +199,11 @@ _BINARY_EXTENSIONS = frozenset(
         ".gz",
         ".exe",
         ".dll",
+        ".dex",
         ".so",
         ".dylib",
         ".wasm",
+        ".luac",
         ".pyc",
         ".class",
         ".mp3",
@@ -326,10 +329,15 @@ def _suffix(path: str) -> str:
     return name[index:].lower() if index >= 0 else ""
 
 
+def has_dex_magic(data: bytes) -> bool:
+    """Return whether bytes start with the versioned eight-byte DEX signature."""
+    return len(data) >= 8 and data.startswith(b"dex\n") and data[4:7].isdigit() and data[7] == 0
+
+
 def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> ArtifactRecord:
     """Classify from bytes and decodability; an extension is never authoritative."""
     contains_nul = b"\x00" in data
-    has_binary_magic = any(data.startswith(magic) for magic in _BINARY_MAGIC)
+    has_binary_magic = has_dex_magic(data) or any(data.startswith(magic) for magic in _BINARY_MAGIC)
     try:
         decoded = data.decode("utf-8")
         decodable = True
