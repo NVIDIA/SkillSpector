@@ -10,6 +10,7 @@ import io
 import time
 import tracemalloc
 import zipfile
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -1397,9 +1398,18 @@ def test_static_only_graph_surfaces_sanitized_bypass_fixture(
     )
 
 
-def test_missing_primary_reference_blocks_complete_verdict(tmp_path: Path) -> None:
+def test_reported_self_and_existing_file_references_remain_complete(tmp_path: Path) -> None:
+    references = tmp_path / "references"
+    references.mkdir()
+    (references / "windows-host-setup.md").write_text(
+        "# Windows host setup\n\nUse the documented lab defaults.\n",
+        encoding="utf-8",
+    )
     (tmp_path / "SKILL.md").write_text(
-        "# Skill\n\nContinue with [the local guide](missing-guide.md).\n",
+        "# Skill\n\n"
+        "Keep `SKILL.md` concise.\n"
+        "Read [this skill](./SKILL.md) before updating it.\n"
+        "Follow `references/windows-host-setup.md` before setup.\n",
         encoding="utf-8",
     )
 
@@ -1411,10 +1421,60 @@ def test_missing_primary_reference_blocks_complete_verdict(tmp_path: Path) -> No
         }
     )
 
+    resolved_targets = [
+        reference["target_path"]
+        for reference in result["artifact_references"]
+        if reference["status"] == "resolved"
+    ]
+    assert Counter(resolved_targets) == Counter(
+        {
+            "SKILL.md": 2,
+            "references/windows-host-setup.md": 1,
+        }
+    )
+    assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
+    assert not any(
+        row["reason_code"] == "reference_unresolved"
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+    )
+    assert result["analysis_completeness"]["is_complete"] is True
+    assert result["risk_recommendation"] == "SAFE"
+
+
+@pytest.mark.parametrize("case", ["missing", "ambiguous"])
+def test_unresolved_primary_reference_blocks_complete_verdict(tmp_path: Path, case: str) -> None:
+    reference = "references/windows-host-setup.md" if case == "missing" else "guide.md"
+    if case == "ambiguous":
+        for subdirectory in ("first", "second"):
+            target = tmp_path / "references" / subdirectory / reference
+            target.parent.mkdir(parents=True)
+            target.write_text("# Guide\n", encoding="utf-8")
+    (tmp_path / "SKILL.md").write_text(
+        f"# Skill\n\nContinue with [the local guide]({reference}).\n",
+        encoding="utf-8",
+    )
+
+    result = graph.invoke(
+        {
+            "input_path": str(tmp_path),
+            "output_format": "json",
+            "use_llm": False,
+        }
+    )
+
+    unresolved = [
+        reference
+        for reference in result["artifact_references"]
+        if reference["status"] in {"missing", "ambiguous"}
+    ]
+    assert len(unresolved) == 1
+    assert unresolved[0]["status"] == case
+    assert unresolved[0]["target_path"] is None
     assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
     assert result["analysis_completeness"]["is_complete"] is False
+    expected_reason = "reference_missing" if case == "missing" else "reference_unresolved"
     assert any(
-        row["reason_code"] == "reference_missing"
+        row["reason_code"] == expected_reason
         for row in result["analysis_completeness"]["ledger_exceptions"]
     )
     assert result["risk_recommendation"] != "SAFE"
