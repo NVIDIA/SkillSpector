@@ -1450,8 +1450,9 @@ def test_unresolved_primary_reference_blocks_complete_verdict(tmp_path: Path, ca
     assert unresolved[0]["target_path"] is None
     assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
     assert result["analysis_completeness"]["is_complete"] is False
+    expected_reason = "reference_missing" if case == "missing" else "reference_unresolved"
     assert any(
-        row["reason_code"] == "reference_missing"
+        row["reason_code"] == expected_reason
         for row in result["analysis_completeness"]["ledger_exceptions"]
     )
     assert result["risk_recommendation"] != "SAFE"
