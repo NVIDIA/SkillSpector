@@ -153,6 +153,9 @@ class SarifRun(BaseModel):
 
     tool: SarifTool
     results: list[SarifResult] = Field(default_factory=list)
+    column_kind: Literal["utf16CodeUnits", "unicodeCodePoints"] | None = Field(
+        default=None, alias="columnKind"
+    )
     artifacts: list[SarifArtifact] | None = None
     invocations: list[SarifInvocation] | None = None
 
