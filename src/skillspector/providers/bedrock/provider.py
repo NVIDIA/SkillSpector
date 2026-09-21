@@ -56,6 +56,7 @@ BEDROCK_DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6-20250915-v1:0"
 # Connect timeout for the Bedrock Runtime client. The per-call
 # ``timeout`` from ``create_chat_model`` is applied as the read timeout.
 _BEDROCK_CONNECT_TIMEOUT = 10
+BEDROCK_SDK_TOTAL_MAX_ATTEMPTS = 1
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -123,6 +124,12 @@ class BedrockProvider:
             config=BotocoreConfig(
                 read_timeout=timeout,
                 connect_timeout=_BEDROCK_CONNECT_TIMEOUT,
+                retries={
+                    "mode": "standard",
+                    # The analyzer coordinator owns the shared retry budget so
+                    # it can honor Retry-After and the workflow deadline.
+                    "total_max_attempts": BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
+                },
             ),
         )
 
