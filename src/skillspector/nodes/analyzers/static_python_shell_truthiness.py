@@ -4,8 +4,9 @@
 """Find direct subprocess calls using a definitely truthy local name.
 
 This companion recognizes the straight-line ordinary-Python form reported in
-issue #475. Call arguments must be passive, and unsupported expressions or
-compound statements discard facts rather than guessing about Python execution.
+issue #475. Arguments evaluated through ``shell=`` must be passive, and
+unsupported expressions or compound statements discard facts rather than
+guessing about Python execution.
 """
 
 from __future__ import annotations
@@ -482,6 +483,23 @@ def _call_arguments_are_passive(call: ast.Call) -> bool:
     )
 
 
+def _shell_argument_is_captured_before_effects(call: ast.Call) -> bool:
+    """Return whether evaluation reaches ``shell=`` without user-code effects.
+
+    Python evaluates every positional argument, including starred expansions,
+    before keyword arguments. Keyword values are then evaluated in their stored
+    order. Effects after ``shell=`` cannot change the already captured value.
+    """
+    if any(not _is_passive_argument(argument) for argument in call.args):
+        return False
+    for keyword in call.keywords:
+        if keyword.arg == "shell":
+            return _is_passive_argument(keyword.value)
+        if keyword.arg is None or not _is_passive_argument(keyword.value):
+            return False
+    return False
+
+
 def _is_finalizer_safe_value(expression: ast.expr, safe_names: set[str]) -> bool:
     """Return whether releasing the resulting value cannot run user code."""
     if not _is_passive_argument(expression):
@@ -664,8 +682,9 @@ class _Analyzer:
         if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
             resolved = None
             safe_value = _call_arguments_are_passive(value)
-            if safe_value:
+            if _shell_argument_is_captured_before_effects(value):
                 self._inspect_call(value, facts)
+            if safe_value:
                 call_has_protocol_effects = not _call_arguments_are_protocol_safe(
                     value,
                     finalizer_safe_names,
@@ -801,7 +820,7 @@ class _Analyzer:
                 if (
                     isinstance(value, ast.Call)
                     and _is_direct_subprocess_call(value, trusted_names)
-                    and _call_arguments_are_passive(value)
+                    and _shell_argument_is_captured_before_effects(value)
                 ):
                     self._inspect_call(value, facts)
                 facts.clear()
@@ -816,10 +835,10 @@ class _Analyzer:
                 trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
             elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
                 call = statement.value
-                if _is_direct_subprocess_call(call, trusted_names) and _call_arguments_are_passive(
-                    call
-                ):
+                direct_call = _is_direct_subprocess_call(call, trusted_names)
+                if direct_call and _shell_argument_is_captured_before_effects(call):
                     self._inspect_call(call, facts)
+                if direct_call and _call_arguments_are_passive(call):
                     if not _call_arguments_are_protocol_safe(call, finalizer_safe_names):
                         facts.clear()
                         finalizer_safe_names.clear()

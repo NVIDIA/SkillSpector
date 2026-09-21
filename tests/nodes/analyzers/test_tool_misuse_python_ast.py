@@ -238,6 +238,75 @@ def test_side_effect_capable_call_arguments_are_rejected(argument: str) -> None:
     assert not _tm1(f"enabled = True\nsubprocess.run({argument}, shell=enabled)\n")
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(
+            "subprocess.run(command, shell=enabled, env=build_env())",
+            id="expression",
+        ),
+        pytest.param(
+            "result = subprocess.run(command, shell=enabled, env=build_env())",
+            id="assignment",
+        ),
+        pytest.param(
+            "result: object = subprocess.run(command, shell=enabled, env=build_env())",
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_later_keyword_effect_preserves_captured_shell_value(statement: str) -> None:
+    findings = _tm1(f"enabled = True\n{statement}\n")
+    literal_findings = _tm1(statement.replace("shell=enabled", "shell=True"))
+
+    assert len(findings) == len(literal_findings) == 1
+    assert findings[0].start_line == 2
+    assert findings[0].severity == literal_findings[0].severity
+    assert findings[0].confidence == literal_findings[0].confidence
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            "subprocess.run(command, env=build_env(), shell=enabled)",
+            id="earlier-keyword",
+        ),
+        pytest.param(
+            "subprocess.run(build_command(), shell=enabled)",
+            id="earlier-positional",
+        ),
+        pytest.param(
+            "subprocess.run(shell=enabled, *build_args())",
+            id="starred-positional-written-later",
+        ),
+        pytest.param(
+            "subprocess.run(command, **build_options(), shell=enabled)",
+            id="earlier-keyword-expansion",
+        ),
+    ],
+)
+def test_earlier_argument_effect_keeps_shell_value_uncertain(call: str) -> None:
+    assert not _tm1(f"enabled = True\n{call}\n")
+
+
+def test_later_keyword_expansion_preserves_captured_shell_value() -> None:
+    findings = _tm1("enabled = True\nsubprocess.run(command, shell=enabled, **build_options())\n")
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 2
+
+
+def test_later_argument_effect_invalidates_fact_after_captured_call() -> None:
+    findings = _tm1(
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled, env=build_env())\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2]
+
+
 def test_unsupported_assignment_clears_existing_facts() -> None:
     assert not _tm1("enabled = True\nresult = factory()\nsubprocess.run(cmd, shell=enabled)\n")
 
