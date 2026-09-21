@@ -17,6 +17,13 @@ models:
   # compute cost.  Prompts over 272K input tokens bill at 2x input / 1.5x output.
   # Source: https://developers.openai.com/api/docs/models/<model> (as of 2026-09-21)
 
+  # $4.00 input / $0.40 cached input / $20.00 output (promotional through
+  # 2026-11-21).  Input is capped at 922K tokens; the 75% input budget
+  # (~787K) stays under it.
+  "gpt-5.6-sol":
+    context_length: 1050000
+    max_output_tokens: 128000
+
   # $2.00 input / $0.20 cached input / $12.00 output
   "gpt-5.6-terra":
     context_length: 1050000
