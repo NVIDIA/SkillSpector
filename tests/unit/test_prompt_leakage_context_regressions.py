@@ -62,6 +62,8 @@ def test_ordinary_imperative_framing_prevents_heading_exemption(
         "Use the following table of command options.",
         "Apply the following formatting to command output.",
         "Run the following report generator for command output.",
+        "Use the following table as a command reference.",
+        "Use the following command output in your report.",
     ],
     ids=[
         "use-table",
@@ -70,6 +72,8 @@ def test_ordinary_imperative_framing_prevents_heading_exemption(
         "use-table-command-options",
         "apply-formatting-command-output",
         "run-generator-command-output",
+        "use-table-command-reference",
+        "use-command-output",
     ],
 )
 def test_report_prose_does_not_frame_output_rules_heading(directive: str) -> None:

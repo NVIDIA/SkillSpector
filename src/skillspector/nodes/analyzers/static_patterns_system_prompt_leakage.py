@@ -197,6 +197,8 @@ _HEADING_OBJECTS = frozenset(
     "heading title label command instruction operation following below above".split()
 )
 _DIRECT_HEADING_OBJECTS = frozenset("heading title label command instruction operation".split())
+_COMPOUND_DOCUMENTATION_HEADS = frozenset("command instruction".split())
+_COMPOUND_DOCUMENTATION_TAILS = frozenset("output reference options".split())
 _REFERENCE_ACTIONS = frozenset(
     "print output show display reveal expose return echo repeat share disclose "
     "publish provide send copy extract dump recite summarize translate encode "
@@ -344,6 +346,7 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
     pending_referent_required_action = False
     referent_required_action_seen = False
     pending_explicit_cast = False
+    pending_compound_documentation = False
     pending_heading = False
     pending_reference = False
     previous = ""
@@ -358,6 +361,11 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
             if token not in _REPORT_OBJECTS:
                 return True
             pending_reference = False
+        if pending_compound_documentation:
+            if token not in _COMPOUND_DOCUMENTATION_TAILS:
+                return True
+            pending_compound_documentation = False
+            pending_referent_required_action = pending_explicit_cast = False
         if token in ".!?;:":
             pending_action = pending_referent_required_action = pending_heading = False
             referent_required_action_seen = pending_explicit_cast = False
@@ -381,14 +389,19 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
             return True
         if previous not in {"not", "never"}:
             if pending_explicit_cast:
-                if token in _DIRECT_HEADING_OBJECTS:
+                if token in _COMPOUND_DOCUMENTATION_HEADS:
+                    pending_compound_documentation = True
+                elif token in _DIRECT_HEADING_OBJECTS:
                     return True
                 if token not in {"a", "an", "the"}:
                     pending_explicit_cast = False
             if pending_action and token in _HEADING_OBJECTS:
                 return True
             if pending_referent_required_action and token in _DIRECT_HEADING_OBJECTS:
-                return True
+                if token in _COMPOUND_DOCUMENTATION_HEADS:
+                    pending_compound_documentation = True
+                else:
+                    return True
             if token in _REPORT_FRAMING_OBJECTS:
                 pending_referent_required_action = False
             if referent_required_action_seen and token == "as":
@@ -401,7 +414,7 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
             pending_heading |= token in {"heading", "title", "label"}
         before_previous, previous = previous, token
     check_runtime()
-    return pending_reference
+    return pending_reference or pending_compound_documentation
 
 
 def _has_reconstructed_framing(content: str, check_runtime: Callable[[], None]) -> bool:
