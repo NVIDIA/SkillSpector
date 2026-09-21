@@ -332,7 +332,10 @@ class TestMetaLedgerResponse:
 
         assert events[0]["outcome"] is LedgerOutcome.FAILED
         assert events[0]["reason_code"] == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-        assert events[0]["message"] == "LLM connection failed after bounded retries."
+        assert (
+            events[0]["message"]
+            == "Transient LLM provider failure persisted after bounded retries."
+        )
         assert status["status"] == "failed"
 
         completeness, _ = finalize_ledger(
