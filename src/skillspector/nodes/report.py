@@ -120,15 +120,25 @@ def _clean_text(value: str | None) -> str | None:
 
 
 def _sanitize_finding(finding: Finding) -> Finding:
-    """Return a copy of *finding* with control/ANSI bytes stripped from text fields."""
+    """Clean finding text and recursively redact credentials from evidence."""
 
     def clean(value: str | None) -> str | None:
         cleaned = _clean_text(value)
         return redact_text(cleaned) if isinstance(cleaned, str) else cleaned
 
+    def clean_evidence(value: object) -> object:
+        if isinstance(value, str):
+            return clean(value)
+        if isinstance(value, dict):
+            return {clean(str(key)) or "": clean_evidence(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [clean_evidence(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(clean_evidence(item) for item in value)
+        return value
+
     evidence = {
-        clean(str(key)) or "": clean(value) if isinstance(value, str) else value
-        for key, value in finding.evidence.items()
+        clean(str(key)) or "": clean_evidence(value) for key, value in finding.evidence.items()
     }
     return replace(
         finding,

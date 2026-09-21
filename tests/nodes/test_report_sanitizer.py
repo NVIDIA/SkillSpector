@@ -98,7 +98,11 @@ def test_report_redacts_url_credentials_from_every_finding_field(fmt: str, schem
         context=url,
         matched_text=url,
         code_snippet=url,
-        evidence={"destination": url},
+        evidence={
+            "destination": url,
+            "redirects": [{"nested": {url: [url, {"destination": url}]}}],
+            "tuple": (url, {"destination": url}),
+        },
     )
     state: SkillspectorState = {
         "filtered_findings": [finding],
@@ -115,3 +119,25 @@ def test_report_redacts_url_credentials_from_every_finding_field(fmt: str, schem
     for secret in (username, password, token):
         assert secret not in rendered
         assert secret not in serialized_findings
+
+
+def test_nested_evidence_preserves_scalar_types_and_original_finding() -> None:
+    scalar_values = [None, True, False, 42, 1.25]
+    finding = _dirty_finding()
+    finding.evidence = {
+        "nested": [{"values": scalar_values, "dirty\x00key": "readable\x1b[31m text\x00"}],
+        "tuple": (None, True, 42),
+    }
+
+    cleaned = _sanitize_finding(finding)
+
+    assert cleaned.evidence == {
+        "nested": [{"values": scalar_values, "dirtykey": "readable text"}],
+        "tuple": (None, True, 42),
+    }
+    for actual, original in zip(
+        cleaned.evidence["nested"][0]["values"], scalar_values, strict=True
+    ):
+        assert type(actual) is type(original)
+    assert "dirty\x00key" in finding.evidence["nested"][0]
+    assert "\x1b" in finding.evidence["nested"][0]["dirty\x00key"]
