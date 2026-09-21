@@ -233,9 +233,15 @@ def retained_chat_model_controls(
     if payload is not None:
         output_config = payload.get("output_config")
         output_config = output_config if isinstance(output_config, Mapping) else {}
+        reasoning = payload.get("reasoning")
+        reasoning = reasoning if isinstance(reasoning, Mapping) else {}
         for name in selected:
             if name == "reasoning_effort":
-                controls[name] = payload.get(name, output_config.get("effort"))
+                # Chat Completions, Responses, and Anthropic use different
+                # payload fields for the same control. Preserve explicit nulls.
+                controls[name] = payload.get(
+                    name, reasoning.get("effort", output_config.get("effort"))
+                )
             else:
                 controls[name] = payload.get(name)
     else:

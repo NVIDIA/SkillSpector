@@ -17,6 +17,7 @@ from skillspector.inference_usage import (
     chat_model_controls,
     chat_model_requested_controls,
     register_chat_model_controls,
+    retained_chat_model_controls,
     sanitize_inference_usage,
 )
 
@@ -104,6 +105,32 @@ def test_constructor_control_registry_drops_credential_shaped_effort(effort: str
 
     assert chat_model_controls(model) == {"temperature": 0.2, "seed": 7}
     assert chat_model_requested_controls(model) == {"temperature": 0.2, "seed": 7}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"reasoning_effort": "high"}, {"reasoning_effort": "high"}),
+        ({"reasoning": {"effort": "high"}}, {"reasoning_effort": "high"}),
+        ({"output_config": {"effort": "high"}}, {"reasoning_effort": "high"}),
+        (
+            {"reasoning_effort": None, "reasoning": {"effort": "high"}},
+            {"reasoning_effort": None},
+        ),
+        (
+            {"reasoning": {"effort": None}, "output_config": {"effort": "high"}},
+            {"reasoning_effort": None},
+        ),
+        ({"reasoning": "high"}, {"reasoning_effort": None}),
+        ({"reasoning": {"effort": "Bearer synthetic-secret-token"}}, {}),
+    ],
+)
+def test_retained_reasoning_effort_uses_provider_payload_fields(
+    payload: dict[str, object], expected: dict[str, str | None]
+) -> None:
+    model = SimpleNamespace(_get_request_payload=lambda _prompt: payload)
+
+    assert retained_chat_model_controls(model, ("reasoning_effort",)) == expected
 
 
 def test_raw_anthropic_usage_adds_external_cache_counters_to_prompt_total() -> None:
