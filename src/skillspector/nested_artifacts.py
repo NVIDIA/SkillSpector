@@ -12,6 +12,7 @@ deterministic analyzers.
 from __future__ import annotations
 
 import io
+import re
 import stat
 import struct
 import time
@@ -382,6 +383,38 @@ _BINARY_EXECUTABLE_MAGICS = (
     b"\xbf\xba\xfe\xca",
 )
 
+_TYPESCRIPT_DECLARATION_SUFFIXES = (".d.ts", ".d.cts", ".d.mts")
+_TYPESCRIPT_DECLARATION_MARKERS = re.compile(
+    r"\b(?:declare|interface|type|import\s+type|export\s+"
+    r"(?:declare|interface|type|namespace))\b"
+)
+_TYPESCRIPT_RUNTIME_MARKERS = re.compile(
+    r"\b(?:require|eval|Function|module\.exports|process\.|console\."
+    r"|fetch|new|setTimeout|setInterval|exec(?:Sync)?|spawn(?:Sync)?|"
+    r"child_process)\b|\b(?:const|let|var)\s+[A-Za-z_$]"
+    r"[\w$]*\s*=|(?:^|[;{}])\s*[A-Za-z_$][\w$]*\s*\([^)]*\)"
+)
+
+
+def _looks_like_typescript_declaration(path: str, data: bytes) -> bool:
+    """Recognize clearly inert TypeScript declaration content conservatively.
+
+    Declaration suffixes alone are not trusted: a file named ``evil.d.cts``
+    can still contain executable CommonJS. Unknown or non-text content stays
+    executable so this check cannot create a name-based security bypass.
+    """
+    name = Path(path).name.lower()
+    if not name.endswith(_TYPESCRIPT_DECLARATION_SUFFIXES) or not data:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    text = re.sub(r"/\*.*?\*/|//[^\r\n]*", "", text, flags=re.DOTALL)
+    if not text.strip() or _TYPESCRIPT_RUNTIME_MARKERS.search(text):
+        return False
+    return bool(_TYPESCRIPT_DECLARATION_MARKERS.search(text))
+
 
 def has_binary_executable_magic(data: bytes) -> bool:
     """Return whether canonical bytes begin with supported executable magic."""
@@ -392,7 +425,12 @@ def is_executable_content(path: str, data: bytes, mode: int = 0) -> bool:
     """Classify filesystem and archive content with one static-only policy."""
     suffix = Path(path).suffix.lower()
     executable_magic = data.startswith(b"#!") or has_binary_executable_magic(data)
-    return suffix in _EXECUTABLE_SUFFIXES or executable_magic or bool(mode & 0o111)
+    declaration_only = _looks_like_typescript_declaration(path, data)
+    return (
+        (suffix in _EXECUTABLE_SUFFIXES and not declaration_only)
+        or executable_magic
+        or bool(mode & 0o111)
+    )
 
 
 def _member_executable(info: zipfile.ZipInfo, safe_name: str, data: bytes) -> bool:

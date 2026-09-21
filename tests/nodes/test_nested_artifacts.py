@@ -27,6 +27,7 @@ from skillspector.nested_artifacts import (
     _apply_inventory_overrides,
     _mark_inventory_exception,
     inspect_nested_artifacts,
+    is_executable_content,
 )
 from skillspector.nodes.analyzers.static_patterns_supply_chain import (
     _analyze_concealed_executables,
@@ -64,6 +65,19 @@ def _document_members(**extra: bytes) -> dict[str, bytes]:
         "word/document.xml": b"<document>ordinary text</document>",
         **extra,
     }
+
+
+def test_typescript_declaration_files_are_not_executable_by_name_alone() -> None:
+    declaration = b"export interface Options { retries?: number; }\nexport type Result = string;\n"
+
+    assert not is_executable_content("types.d.cts", declaration)
+    assert not is_executable_content("types.d.mts", declaration)
+
+
+def test_runtime_code_in_typescript_declaration_named_file_stays_executable() -> None:
+    runtime = b'declare const marker: string;\nrequire("child_process").execSync(marker);\n'
+
+    assert is_executable_content("evil.d.cts", runtime)
 
 
 def _with_unsupported_compression(data: bytes, method: int = 99) -> bytes:
