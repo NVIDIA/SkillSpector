@@ -12,12 +12,14 @@ from __future__ import annotations
 import configparser
 import re
 import shlex
+import time
 import tomllib
 import urllib.parse
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+from skillspector.inspection_ledger import MAX_FINDING_OUTPUT_RECORDS, LedgerReason
 from skillspector.models import Finding
 
 _URL_RE = re.compile(
@@ -40,6 +42,7 @@ _SHELL_SUFFIXES = frozenset({".sh", ".bash", ".zsh"})
 _SHELL_SHEBANG_RE = re.compile(r"^#![^\n]*(?:^|/|\s)(?:ba|z|da|k)?sh(?:\s|$)", re.I)
 
 Assignments = dict[str, list[tuple[int, str | None]]]
+_MAX_ANALYSIS_SECONDS = 5.0
 
 _CANONICAL_DESTINATIONS: dict[str, frozenset[str]] = {
     "npm": frozenset({"https://registry.npmjs.org/"}),
@@ -77,7 +80,75 @@ class SourceChange:
     destination: str
     file: str
     line: int
-    matched_text: str
+    matched_text: str = field(compare=False)
+
+
+@dataclass(frozen=True)
+class DependencySourceLimitation:
+    """One omission caused by the aggregate dependency-source budget."""
+
+    path: str
+    reason: LedgerReason
+    observed_findings: int | None = None
+    limit_findings: int | None = None
+    observed_seconds: float | None = None
+    limit_seconds: float | None = None
+    error_class: str | None = None
+
+
+@dataclass(frozen=True)
+class DependencySourceScanResult:
+    findings: list[Finding]
+    limitations: list[DependencySourceLimitation]
+
+
+class _ScanStoppedError(Exception):
+    """Unwind parsing without discarding findings already collected."""
+
+    def __init__(self, limitation: DependencySourceLimitation) -> None:
+        self.limitation = limitation
+
+
+@dataclass
+class _SourceScan:
+    max_findings: int
+    timeout_seconds: float
+    local_only_paths: set[str]
+    findings: list[Finding] = field(default_factory=list)
+    seen: set[SourceChange] = field(default_factory=set)
+    started_at: float = field(default_factory=lambda: time.monotonic())
+    path: str = "SKILL.md"
+
+    def check_time(self) -> None:
+        elapsed = max(0.0, time.monotonic() - self.started_at)
+        if elapsed >= self.timeout_seconds:
+            raise _ScanStoppedError(
+                DependencySourceLimitation(
+                    path=self.path,
+                    reason=LedgerReason.RUNTIME_LIMIT,
+                    observed_seconds=elapsed,
+                    limit_seconds=self.timeout_seconds,
+                )
+            )
+
+    def check(self) -> None:
+        self.check_time()
+        if len(self.findings) >= self.max_findings:
+            raise _ScanStoppedError(
+                DependencySourceLimitation(
+                    path=self.path,
+                    reason=LedgerReason.OUTPUT_LIMIT,
+                    observed_findings=len(self.findings) + 1,
+                    limit_findings=self.max_findings,
+                )
+            )
+
+    def add(self, change: SourceChange) -> None:
+        if change in self.seen:
+            return
+        self.check()
+        self.seen.add(change)
+        self.findings.append(_finding(change, local_only=change.file in self.local_only_paths))
 
 
 @dataclass(frozen=True)
@@ -813,13 +884,16 @@ def _normalize_heredoc_word(word: str) -> tuple[str, bool] | None:
     return (normalized, quoted) if normalized else None
 
 
-def _function_context(content: str, data_lines: set[int]) -> tuple[set[int], dict[str, set[str]]]:
+def _function_context(
+    content: str, data_lines: set[int], scan: _SourceScan
+) -> tuple[set[int], dict[str, set[str]]]:
     """Locate function definitions and variables they may assign, without executing them."""
     lines = content.splitlines()
     function_lines: set[int] = set()
     assigned_by_function: dict[str, set[str]] = {}
     index = 0
     while index < len(lines):
+        scan.check()
         line_number = index + 1
         if line_number in data_lines:
             index += 1
@@ -847,10 +921,11 @@ def _function_context(content: str, data_lines: set[int]) -> tuple[set[int], dic
         cursor = opening_index
         assigned_names: set[str] = set()
         while cursor < len(lines):
+            scan.check()
             function_lines.add(cursor + 1)
             fragment = rest if cursor == index else lines[cursor]
             depth += _brace_delta(fragment)
-            for _, segment in _shell_parts(fragment):
+            for _, segment in _shell_parts(fragment, scan):
                 assignment_words, remainder = _leading_assignments(
                     _command_segment_body(segment, allow_case_arm=True)
                 )
@@ -864,7 +939,7 @@ def _function_context(content: str, data_lines: set[int]) -> tuple[set[int], dic
     return function_lines, assigned_by_function
 
 
-def _literal_assignments(content: str) -> Assignments:
+def _literal_assignments(content: str, scan: _SourceScan) -> Assignments:
     """Collect definite top-level assignments without evaluating shell syntax.
 
     Heredoc data and function bodies are inert at their physical location, so
@@ -873,13 +948,14 @@ def _literal_assignments(content: str) -> Assignments:
     make an earlier possible destination appear canonical.
     """
     assignments: Assignments = {}
-    heredoc_data_lines = _heredoc_data_lines(content)
-    function_lines, assigned_by_function = _function_context(content, heredoc_data_lines)
+    heredoc_data_lines = _heredoc_data_lines(content, scan)
+    function_lines, assigned_by_function = _function_context(content, heredoc_data_lines, scan)
     control_depth = 0
     for line_number, line in enumerate(content.splitlines(), 1):
+        scan.check()
         if line_number in heredoc_data_lines or line_number in function_lines:
             continue
-        for separator, segment in _shell_parts(line):
+        for separator, segment in _shell_parts(line, scan):
             stripped = _command_segment_body(segment, allow_case_arm=bool(control_depth))
             if re.match(r"^(?:fi|done|esac)\b", stripped):
                 control_depth = max(0, control_depth - 1)
@@ -943,7 +1019,12 @@ def _resolve_value(value: str, assignments: Assignments, use_line: int) -> tuple
 
     def replacement(match: re.Match[str]) -> str:
         name = match.group("braced") or match.group("plain") or ""
-        prior = [assigned for line, assigned in assignments.get(name, []) if line < use_line]
+        history = assignments.get(name, [])
+        # A line number cannot establish statement order. Never let an older
+        # canonical value hide a reassignment or function call on this line.
+        if any(line == use_line for line, _ in history):
+            return match.group(0)
+        prior = [assigned for line, assigned in history if line < use_line]
         return prior[-1] if prior and prior[-1] is not None else match.group(0)
 
     resolved = _VARIABLE_RE.sub(replacement, resolved).strip().strip("\"'")
@@ -1035,7 +1116,7 @@ def _line_for(content: str, needle: str, default: int = 1) -> int:
 
 
 def _add_change(
-    changes: list[SourceChange],
+    scan: _SourceScan,
     *,
     ecosystem: str,
     operation: str,
@@ -1050,7 +1131,7 @@ def _add_change(
     destination, resolved = _resolve_value(raw_destination, assignments, line)
     if resolved and _is_canonical(ecosystem, destination):
         return
-    changes.append(
+    scan.add(
         SourceChange(
             ecosystem=ecosystem,
             operation=operation,
@@ -1065,7 +1146,7 @@ def _add_change(
 
 
 def _add_environment_assignment_changes(
-    changes: list[SourceChange],
+    scan: _SourceScan,
     assignment_words: list[tuple[str, str]],
     *,
     file: str,
@@ -1091,7 +1172,7 @@ def _add_environment_assignment_changes(
         if required_ecosystem is not None and ecosystem != required_ecosystem:
             continue
         _add_change(
-            changes,
+            scan,
             ecosystem=ecosystem,
             operation=operation,
             surface="environment variable",
@@ -1105,10 +1186,10 @@ def _add_environment_assignment_changes(
 
 
 def _parse_npmrc(
-    content: str, file: str, start_line: int, assignments: Assignments
-) -> list[SourceChange]:
-    changes: list[SourceChange] = []
+    content: str, file: str, start_line: int, assignments: Assignments, scan: _SourceScan
+) -> None:
     for offset, line in enumerate(content.splitlines()):
+        scan.check()
         stripped = line.strip()
         if not stripped or stripped.startswith(("#", ";")):
             continue
@@ -1117,7 +1198,7 @@ def _parse_npmrc(
             continue
         scope = match.group("key").split(":", 1)[0] if match.group("key").startswith("@") else None
         _add_change(
-            changes,
+            scan,
             ecosystem="npm",
             operation="replace",
             surface=".npmrc",
@@ -1128,16 +1209,16 @@ def _parse_npmrc(
             matched_text=line,
             assignments=assignments,
         )
-    return changes
+    return
 
 
 def _parse_yarnrc(
-    content: str, file: str, start_line: int, assignments: Assignments
-) -> list[SourceChange]:
-    changes: list[SourceChange] = []
+    content: str, file: str, start_line: int, assignments: Assignments, scan: _SourceScan
+) -> None:
     current_scope: str | None = None
     scope_indent = -1
     for offset, line in enumerate(content.splitlines()):
+        scan.check()
         stripped = line.strip()
         if not stripped or stripped.startswith(("#", ";")):
             continue
@@ -1157,7 +1238,7 @@ def _parse_yarnrc(
         if not match:
             continue
         _add_change(
-            changes,
+            scan,
             ecosystem="yarn",
             operation="replace",
             surface=".yarnrc.yml" if file.lower().endswith((".yml", ".yaml")) else ".yarnrc",
@@ -1168,15 +1249,15 @@ def _parse_yarnrc(
             matched_text=line,
             assignments=assignments,
         )
-    return changes
+    return
 
 
 def _parse_pip_config(
-    content: str, file: str, start_line: int, assignments: Assignments
-) -> list[SourceChange]:
-    changes: list[SourceChange] = []
+    content: str, file: str, start_line: int, assignments: Assignments, scan: _SourceScan
+) -> None:
     section: str | None = None
     for offset, line in enumerate(content.splitlines()):
+        scan.check()
         stripped = line.strip()
         if not stripped or stripped.startswith(("#", ";")):
             continue
@@ -1188,7 +1269,7 @@ def _parse_pip_config(
             continue
         key = match.group("key").lower()
         _add_change(
-            changes,
+            scan,
             ecosystem="pip",
             operation="add" if key == "extra-index-url" else "replace",
             surface="pip config",
@@ -1199,55 +1280,76 @@ def _parse_pip_config(
             matched_text=line,
             assignments=assignments,
         )
-    return changes
+    return
 
 
-def _parse_poetry(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
-    changes: list[SourceChange] = []
+def _parse_poetry(
+    content: str,
+    file: str,
+    assignments: Assignments,
+    scan: _SourceScan,
+    *,
+    start_line: int = 1,
+    generated: bool = False,
+) -> None:
+    scan.check()
     try:
         parsed = tomllib.loads(content)
     except tomllib.TOMLDecodeError:
-        return changes
-    poetry = parsed.get("tool", {}).get("poetry", {})
+        return
+    tool = parsed.get("tool", {})
+    if not isinstance(tool, dict):
+        return
+    poetry = tool.get("poetry", {})
     if not isinstance(poetry, dict):
-        return changes
+        return
     sources = poetry.get("source", [])
     if isinstance(sources, dict):
         sources = [sources]
     if not isinstance(sources, list):
-        return changes
+        return
     for source in sources:
+        scan.check()
         if not isinstance(source, dict) or not isinstance(source.get("url"), str):
             continue
         destination = str(source["url"])
         _add_change(
-            changes,
+            scan,
             ecosystem="poetry",
             operation="add",
-            surface="pyproject.toml source",
+            surface=("generated " if generated else "") + "pyproject.toml source",
             scope=str(source.get("name")) if source.get("name") is not None else None,
             raw_destination=destination,
             file=file,
-            line=_line_for(content, destination),
+            line=start_line + _line_for(content, destination) - 1,
             matched_text=next(
                 (line for line in content.splitlines() if destination in line), destination
             ),
             assignments=assignments,
         )
-    return changes
+    return
 
 
-def _parse_maven(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
-    changes: list[SourceChange] = []
+def _parse_maven(
+    content: str,
+    file: str,
+    assignments: Assignments,
+    scan: _SourceScan,
+    *,
+    start_line: int = 1,
+    generated: bool = False,
+) -> None:
+    scan.check()
     try:
         root = ET.fromstring(content)
     except ET.ParseError:
-        return changes
+        return
 
     def local_name(tag: str) -> str:
         return tag.rsplit("}", 1)[-1]
 
     for element in root.iter():
+        scan.check()
         if local_name(element.tag) not in {"mirror", "repository", "pluginRepository"}:
             continue
         values = {local_name(child.tag): (child.text or "").strip() for child in element}
@@ -1256,31 +1358,41 @@ def _parse_maven(content: str, file: str, assignments: Assignments) -> list[Sour
             continue
         is_mirror = local_name(element.tag) == "mirror"
         _add_change(
-            changes,
+            scan,
             ecosystem="maven",
             operation="replace" if is_mirror else "add",
-            surface="settings.xml mirror" if is_mirror else "Maven repository",
+            surface=("generated " if generated else "")
+            + ("settings.xml mirror" if is_mirror else "Maven repository"),
             scope=values.get("mirrorOf") or values.get("id"),
             raw_destination=destination,
             file=file,
-            line=_line_for(content, destination),
+            line=start_line + _line_for(content, destination) - 1,
             matched_text=next(
                 (line for line in content.splitlines() if destination in line), destination
             ),
             assignments=assignments,
         )
-    return changes
+    return
 
 
-def _parse_cargo(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
-    changes: list[SourceChange] = []
+def _parse_cargo(
+    content: str,
+    file: str,
+    assignments: Assignments,
+    scan: _SourceScan,
+    *,
+    start_line: int = 1,
+    generated: bool = False,
+) -> None:
+    scan.check()
     try:
         parsed = tomllib.loads(content)
     except tomllib.TOMLDecodeError:
-        return changes
+        return
     sources = parsed.get("source", {})
     if isinstance(sources, dict):
         for name, source in sources.items():
+            scan.check()
             if not isinstance(source, dict):
                 continue
             replacement = source.get("replace-with")
@@ -1289,14 +1401,14 @@ def _parse_cargo(content: str, file: str, assignments: Assignments) -> list[Sour
                 destination = target.get("registry") if isinstance(target, dict) else None
                 raw_destination = str(destination) if destination else "unresolved"
                 _add_change(
-                    changes,
+                    scan,
                     ecosystem="cargo",
                     operation="replace",
-                    surface="Cargo source.replace-with",
+                    surface=("generated " if generated else "") + "Cargo source.replace-with",
                     scope=str(name),
                     raw_destination=raw_destination,
                     file=file,
-                    line=_line_for(content, "replace-with"),
+                    line=start_line + _line_for(content, "replace-with") - 1,
                     matched_text=next(
                         (line for line in content.splitlines() if "replace-with" in line),
                         "replace-with",
@@ -1306,14 +1418,14 @@ def _parse_cargo(content: str, file: str, assignments: Assignments) -> list[Sour
             elif isinstance(source.get("registry"), str):
                 destination = str(source["registry"])
                 _add_change(
-                    changes,
+                    scan,
                     ecosystem="cargo",
                     operation="add" if name != "crates-io" else "replace",
-                    surface="Cargo source registry",
+                    surface=("generated " if generated else "") + "Cargo source registry",
                     scope=str(name),
                     raw_destination=destination,
                     file=file,
-                    line=_line_for(content, destination),
+                    line=start_line + _line_for(content, destination) - 1,
                     matched_text=next(
                         (line for line in content.splitlines() if destination in line), destination
                     ),
@@ -1322,24 +1434,25 @@ def _parse_cargo(content: str, file: str, assignments: Assignments) -> list[Sour
     registries = parsed.get("registries", {})
     if isinstance(registries, dict):
         for name, registry in registries.items():
+            scan.check()
             if not isinstance(registry, dict) or not isinstance(registry.get("index"), str):
                 continue
             destination = str(registry["index"])
             _add_change(
-                changes,
+                scan,
                 ecosystem="cargo",
                 operation="add",
-                surface="Cargo registry index",
+                surface=("generated " if generated else "") + "Cargo registry index",
                 scope=str(name),
                 raw_destination=destination,
                 file=file,
-                line=_line_for(content, destination),
+                line=start_line + _line_for(content, destination) - 1,
                 matched_text=next(
                     (line for line in content.splitlines() if destination in line), destination
                 ),
                 assignments=assignments,
             )
-    return changes
+    return
 
 
 def _redirection_word(line: str, start: int) -> tuple[str, int, bool]:
@@ -1456,6 +1569,7 @@ def _static_redirection_target(raw: str, dynamic: bool) -> str | None:
 
 def _scan_shell_redirections(
     line: str,
+    scan: _SourceScan | None = None,
 ) -> tuple[
     list[_ShellHeredocSpec],
     dict[tuple[int, int], str | None],
@@ -1482,6 +1596,8 @@ def _scan_shell_redirections(
             command_characters[start:end] = [" "] * (end - start)
 
     while index < len(line):
+        if scan is not None and index % 256 == 0:
+            scan.check()
         character = line[index]
         if escaped:
             escaped = False
@@ -1619,7 +1735,7 @@ def _scan_shell_redirections(
 
 
 def _ordered_heredoc_bodies(
-    lines: list[str], header_index: int, specs: list[_ShellHeredocSpec]
+    lines: list[str], header_index: int, specs: list[_ShellHeredocSpec], scan: _SourceScan
 ) -> tuple[list[_HeredocBody], int, bool]:
     """Bind sequential heredoc bodies to their declarations in shell order."""
     bodies: list[_HeredocBody] = []
@@ -1627,6 +1743,7 @@ def _ordered_heredoc_bodies(
     for spec in specs:
         end = body_index
         while end < len(lines):
+            scan.check()
             terminator = lines[end].lstrip("\t") if spec.strip_tabs else lines[end]
             if terminator == spec.delimiter:
                 break
@@ -1711,19 +1828,20 @@ def _generated_cat_heredoc(
     return target, spec_index
 
 
-def _heredocs(content: str) -> list[_HeredocRegion]:
+def _heredocs(content: str, scan: _SourceScan) -> list[_HeredocRegion]:
     """Return generated-config heredocs using ordered, linear redirection scans."""
     lines = content.splitlines()
     regions: list[_HeredocRegion] = []
     index = 0
     while index < len(lines):
+        scan.check()
         specs, stdout_targets, stdin_heredocs, command_text, valid = _scan_shell_redirections(
-            lines[index]
+            lines[index], scan
         )
         if not valid or not specs:
             index += 1
             continue
-        bodies, next_index, complete = _ordered_heredoc_bodies(lines, index, specs)
+        bodies, next_index, complete = _ordered_heredoc_bodies(lines, index, specs, scan)
         if not complete:
             # Avoid repeated suffix scans; executable command parsing remains
             # fail-open because the unmatched body is not added to data lines.
@@ -1757,17 +1875,18 @@ def _shell_heredoc_specs(line: str) -> list[tuple[str, bool]]:
     return [(spec.delimiter, spec.strip_tabs) for spec in specs]
 
 
-def _heredoc_data_lines(content: str) -> set[int]:
+def _heredoc_data_lines(content: str, scan: _SourceScan) -> set[int]:
     """Return all complete shell heredoc body and terminator lines in one pass."""
     lines = content.splitlines()
     data_lines: set[int] = set()
     index = 0
     while index < len(lines):
-        specs, _, _, _, valid = _scan_shell_redirections(lines[index])
+        scan.check()
+        specs, _, _, _, valid = _scan_shell_redirections(lines[index], scan)
         if not valid or not specs:
             index += 1
             continue
-        bodies, next_index, complete = _ordered_heredoc_bodies(lines, index, specs)
+        bodies, next_index, complete = _ordered_heredoc_bodies(lines, index, specs, scan)
         for body in bodies:
             data_lines.update(range(body.start_line, body.end_line + 1))
         if not complete:
@@ -1779,72 +1898,51 @@ def _heredoc_data_lines(content: str) -> set[int]:
 
 
 def _parse_generated_configs(
-    content: str, file: str, assignments: Assignments
-) -> list[SourceChange]:
-    changes: list[SourceChange] = []
-    heredoc_data_lines = _heredoc_data_lines(content)
-    for region in _heredocs(content):
+    content: str, file: str, assignments: Assignments, scan: _SourceScan
+) -> None:
+    heredoc_data_lines = _heredoc_data_lines(content, scan)
+    for region in _heredocs(content, scan):
+        scan.check()
         if not region.complete or region.declaration_line in heredoc_data_lines:
             continue
         lower = region.target.lower()
         region_assignments = assignments if region.expand_variables else {}
         if lower.endswith(".npmrc"):
-            changes.extend(_parse_npmrc(region.body, file, region.start_line, region_assignments))
+            _parse_npmrc(region.body, file, region.start_line, region_assignments, scan)
         elif lower.endswith(".yarnrc") or lower.endswith((".yarnrc.yml", ".yarnrc.yaml")):
-            changes.extend(_parse_yarnrc(region.body, file, region.start_line, region_assignments))
+            _parse_yarnrc(region.body, file, region.start_line, region_assignments, scan)
         elif lower.endswith(("pip.conf", "pip.ini")):
-            changes.extend(
-                _parse_pip_config(region.body, file, region.start_line, region_assignments)
-            )
+            _parse_pip_config(region.body, file, region.start_line, region_assignments, scan)
         elif lower.endswith(("settings.xml", "pom.xml")):
-            generated = _parse_maven(region.body, file, region_assignments)
-            changes.extend(
-                SourceChange(
-                    ecosystem=change.ecosystem,
-                    operation=change.operation,
-                    surface=f"generated {change.surface}",
-                    scope=change.scope,
-                    destination=change.destination,
-                    file=change.file,
-                    line=region.start_line + change.line - 1,
-                    matched_text=change.matched_text,
-                )
-                for change in generated
+            _parse_maven(
+                region.body,
+                file,
+                region_assignments,
+                scan,
+                start_line=region.start_line,
+                generated=True,
             )
         elif lower.endswith("pyproject.toml"):
-            generated = _parse_poetry(region.body, file, region_assignments)
-            changes.extend(
-                SourceChange(
-                    ecosystem=change.ecosystem,
-                    operation=change.operation,
-                    surface=f"generated {change.surface}",
-                    scope=change.scope,
-                    destination=change.destination,
-                    file=change.file,
-                    line=region.start_line + change.line - 1,
-                    matched_text=change.matched_text,
-                )
-                for change in generated
+            _parse_poetry(
+                region.body,
+                file,
+                region_assignments,
+                scan,
+                start_line=region.start_line,
+                generated=True,
             )
         elif ".cargo/" in lower and lower.endswith(("/config", "/config.toml")):
-            generated = _parse_cargo(region.body, file, region_assignments)
-            changes.extend(
-                SourceChange(
-                    ecosystem=change.ecosystem,
-                    operation=change.operation,
-                    surface=f"generated {change.surface}",
-                    scope=change.scope,
-                    destination=change.destination,
-                    file=change.file,
-                    line=region.start_line + change.line - 1,
-                    matched_text=change.matched_text,
-                )
-                for change in generated
+            _parse_cargo(
+                region.body,
+                file,
+                region_assignments,
+                scan,
+                start_line=region.start_line,
+                generated=True,
             )
-    return changes
 
 
-def _shell_parts(line: str) -> list[tuple[str | None, str]]:
+def _shell_parts(line: str, scan: _SourceScan | None = None) -> list[tuple[str | None, str]]:
     """Split shell command lists while retaining the preceding control operator."""
     parts: list[tuple[str | None, str]] = []
     current: list[str] = []
@@ -1855,6 +1953,8 @@ def _shell_parts(line: str) -> list[tuple[str | None, str]]:
     grouping_depth = 0
     index = 0
     while index < len(line):
+        if scan is not None and index % 256 == 0:
+            scan.check()
         character = line[index]
         if escaped:
             current.append(character)
@@ -1914,27 +2014,28 @@ def _shell_parts(line: str) -> list[tuple[str | None, str]]:
     return parts
 
 
-def _shell_segments(line: str) -> list[str]:
+def _shell_segments(line: str, scan: _SourceScan) -> list[str]:
     """Split executable shell command lists without evaluating shell syntax."""
     segments: list[str] = []
-    for _, segment in _shell_parts(line):
+    for _, segment in _shell_parts(line, scan):
         unwrapped = _strip_outer_subshell(segment)
         if unwrapped != segment:
-            segments.extend(_shell_segments(unwrapped))
+            segments.extend(_shell_segments(unwrapped, scan))
         else:
             segments.append(segment)
     return segments
 
 
-def _parse_commands(content: str, file: str, assignments: Assignments) -> list[SourceChange]:
-    changes: list[SourceChange] = []
-    heredoc_data_lines = _heredoc_data_lines(content)
+def _parse_commands(content: str, file: str, assignments: Assignments, scan: _SourceScan) -> None:
+    heredoc_data_lines = _heredoc_data_lines(content, scan)
     for line_number, line in enumerate(content.splitlines(), 1):
+        scan.check()
         if line_number in heredoc_data_lines:
             continue
-        for segment in _shell_segments(line):
+        for segment in _shell_segments(line, scan):
+            scan.check()
             _add_environment_assignment_changes(
-                changes,
+                scan,
                 _persistent_environment_assignments(segment),
                 file=file,
                 line=line_number,
@@ -1949,7 +2050,7 @@ def _parse_commands(content: str, file: str, assignments: Assignments) -> list[S
             command_ecosystem = _command_environment_ecosystem(command_candidate)
             if command_ecosystem is not None:
                 _add_environment_assignment_changes(
-                    changes,
+                    scan,
                     command_assignments,
                     file=file,
                     line=line_number,
@@ -1961,7 +2062,7 @@ def _parse_commands(content: str, file: str, assignments: Assignments) -> list[S
                 command_candidate
             ):
                 _add_change(
-                    changes,
+                    scan,
                     ecosystem=ecosystem,
                     operation=operation,
                     surface=surface,
@@ -1972,7 +2073,7 @@ def _parse_commands(content: str, file: str, assignments: Assignments) -> list[S
                     matched_text=line,
                     assignments=assignments,
                 )
-    return changes
+    return
 
 
 def _markdown_shell_content(content: str) -> str:
@@ -1993,18 +2094,21 @@ def _markdown_shell_content(content: str) -> str:
     return "\n".join(output)
 
 
-def _changes_for_file(content: str, file: str, *, executable: bool = False) -> list[SourceChange]:
+def _changes_for_file(
+    content: str, file: str, scan: _SourceScan, *, executable: bool = False
+) -> None:
     normalized = file.replace("\\", "/")
     lower = normalized.lower()
     name = PurePosixPath(normalized).name.lower()
-    assignments = _literal_assignments(content)
-    changes: list[SourceChange] = []
+    # Direct configuration is data, not shell state. Environment interpolation
+    # cannot be resolved from assignment-shaped keys in the same config file.
+    assignments: Assignments = {}
     if name == ".npmrc":
-        changes.extend(_parse_npmrc(content, file, 1, assignments))
+        _parse_npmrc(content, file, 1, assignments, scan)
     elif name == ".yarnrc":
-        changes.extend(_parse_yarnrc(content, file, 1, assignments))
+        _parse_yarnrc(content, file, 1, assignments, scan)
     elif name in {".yarnrc.yml", ".yarnrc.yaml"}:
-        changes.extend(_parse_yarnrc(content, file, 1, assignments))
+        _parse_yarnrc(content, file, 1, assignments, scan)
     elif name in {"pip.conf", "pip.ini"}:
         # ConfigParser validates basic INI structure without executing interpolation.
         parser = configparser.ConfigParser(interpolation=None)
@@ -2012,13 +2116,13 @@ def _changes_for_file(content: str, file: str, *, executable: bool = False) -> l
             parser.read_string(content)
         except configparser.Error:
             pass
-        changes.extend(_parse_pip_config(content, file, 1, assignments))
+        _parse_pip_config(content, file, 1, assignments, scan)
     elif name == "pyproject.toml":
-        changes.extend(_parse_poetry(content, file, assignments))
+        _parse_poetry(content, file, assignments, scan)
     elif name in {"settings.xml", "pom.xml"}:
-        changes.extend(_parse_maven(content, file, assignments))
+        _parse_maven(content, file, assignments, scan)
     elif name in {"config", "config.toml"} and "/.cargo/" in f"/{lower}":
-        changes.extend(_parse_cargo(content, file, assignments))
+        _parse_cargo(content, file, assignments, scan)
 
     suffix = PurePosixPath(normalized).suffix.lower()
     is_script = suffix in _SHELL_SUFFIXES or (
@@ -2026,10 +2130,10 @@ def _changes_for_file(content: str, file: str, *, executable: bool = False) -> l
     )
     actionable = _markdown_shell_content(content) if name in {"skill.md", "readme.md"} else content
     if is_script or actionable != content:
-        command_assignments = _literal_assignments(actionable) or assignments
-        changes.extend(_parse_generated_configs(actionable, file, command_assignments))
-        changes.extend(_parse_commands(actionable, file, command_assignments))
-    return changes
+        command_assignments = _literal_assignments(actionable, scan)
+        _parse_generated_configs(actionable, file, command_assignments, scan)
+        _parse_commands(actionable, file, command_assignments, scan)
+    return
 
 
 def _finding(change: SourceChange, *, local_only: bool) -> Finding:
@@ -2077,43 +2181,54 @@ def _finding(change: SourceChange, *, local_only: bool) -> Finding:
     )
 
 
+def analyze_dependency_sources_detailed(
+    components: list[str],
+    file_cache: dict[str, str],
+    component_metadata: list[dict[str, object]] | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    max_findings: int = MAX_FINDING_OUTPUT_RECORDS,
+) -> DependencySourceScanResult:
+    """Parse incrementally within aggregate time and finding allowances."""
+    scan = _SourceScan(
+        max_findings=max(0, max_findings),
+        timeout_seconds=(
+            _MAX_ANALYSIS_SECONDS
+            if timeout_seconds is None
+            else min(_MAX_ANALYSIS_SECONDS, max(0.0, timeout_seconds))
+        ),
+        local_only_paths={
+            str(metadata.get("path", ""))
+            for metadata in component_metadata or []
+            if metadata.get("local_only") is True
+        },
+    )
+    executable_paths = {
+        str(metadata.get("path", ""))
+        for metadata in component_metadata or []
+        if metadata.get("executable") is True
+    }
+    limitations: list[DependencySourceLimitation] = []
+    try:
+        for file in components:
+            scan.path = file
+            scan.check()
+            content = file_cache.get(file)
+            if content is None or "\x00" in content[:8192]:
+                continue
+            _changes_for_file(content, file, scan, executable=file in executable_paths)
+            # Whole-document TOML/XML parsing is not preemptible. Account for
+            # elapsed time even when it returned no sources or malformed data.
+            scan.check_time()
+    except _ScanStoppedError as stopped:
+        limitations.append(stopped.limitation)
+    return DependencySourceScanResult(scan.findings, limitations)
+
+
 def analyze_dependency_sources(
     components: list[str],
     file_cache: dict[str, str],
     component_metadata: list[dict[str, object]] | None = None,
 ) -> list[Finding]:
     """Return deterministic HIGH findings for dependency-source trust changes."""
-    local_only_paths = {
-        str(metadata.get("path", ""))
-        for metadata in component_metadata or []
-        if metadata.get("local_only") is True
-    }
-    executable_paths = {
-        str(metadata.get("path", ""))
-        for metadata in component_metadata or []
-        if metadata.get("executable") is True
-    }
-    changes: list[SourceChange] = []
-    for file in components:
-        content = file_cache.get(file)
-        if content is None or "\x00" in content[:8192]:
-            continue
-        changes.extend(_changes_for_file(content, file, executable=file in executable_paths))
-
-    findings: list[Finding] = []
-    seen: set[tuple[object, ...]] = set()
-    for change in changes:
-        key = (
-            change.ecosystem,
-            change.operation,
-            change.surface,
-            change.scope,
-            change.destination,
-            change.file,
-            change.line,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        findings.append(_finding(change, local_only=change.file in local_only_paths))
-    return findings
+    return analyze_dependency_sources_detailed(components, file_cache, component_metadata).findings

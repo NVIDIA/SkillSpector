@@ -46,7 +46,10 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
-from skillspector.dependency_sources import analyze_dependency_sources
+from skillspector.dependency_sources import (
+    DependencySourceLimitation,
+    analyze_dependency_sources_detailed,
+)
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     LedgerOutcome,
@@ -2343,7 +2346,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     def record_limitation(
         path: str,
-        limitation: OsvQueryLimitation | _SupplementalLimitation,
+        limitation: OsvQueryLimitation | _SupplementalLimitation | DependencySourceLimitation,
         fallback_analyzer_id: str,
     ) -> None:
         """Project one supplemental omission into canonical partial accounting."""
@@ -2606,16 +2609,26 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
         )
 
     # SC10: deterministic dependency registry/source trust-boundary changes.
-    dependency_source_findings = analyze_dependency_sources(
+    dependency_source_scan = analyze_dependency_sources_detailed(
         components,
         file_cache,
         component_metadata,
+        timeout_seconds=transitive_remaining_seconds(state),
+        max_findings=max(0, MAX_FINDING_OUTPUT_RECORDS - len(findings)),
     )
+    dependency_source_findings = dependency_source_scan.findings
     findings.extend(dependency_source_findings)
     for finding_path in sorted({finding.file for finding in dependency_source_findings}):
         record_extra_findings(
             finding_path,
             [finding for finding in dependency_source_findings if finding.file == finding_path],
+            f"{ANALYZER_ID}_dependency_source",
+        )
+
+    for source_limitation in dependency_source_scan.limitations:
+        record_limitation(
+            source_limitation.path,
+            source_limitation,
             f"{ANALYZER_ID}_dependency_source",
         )
 
