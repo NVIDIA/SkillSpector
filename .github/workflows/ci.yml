@@ -102,6 +102,8 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
       - run: node --test tests/opencode/skillspector_scan_lib.test.ts
+      - name: Run Pi extension security tests
+        run: node --test tests/unit/test_pi_extension.mjs
 
   docker-smoke:
     needs: changes
