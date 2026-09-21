@@ -78,6 +78,7 @@ from skillspector.llm_analyzer_base import (
     _provider_failure_class,
     _provider_retry_delay,
     _shared_limiter,
+    _StructuredResponseValidationError,
     _uses_native_connection_retries,
     append_output_language_instruction,
     chunk_file_by_lines,
@@ -598,6 +599,143 @@ class TestProviderRetryJitter:
                 sleep.assert_called_once_with(8.5)
 
 
+class TestProviderRetryOutcomes:
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("provider_retries", [0, 1, 2])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_deadline_stop_is_not_provider_retry_exhaustion(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool, provider_retries: int
+    ) -> None:
+        """The public ledger reports deadlines after zero or partial retry budgets."""
+        calls = 0
+        provider_error = RuntimeError("wrapped provider error")
+        provider_error.__cause__ = InternalServerError("private provider detail")
+
+        def fail(*_args: object) -> None:
+            nonlocal calls
+            calls += 1
+            raise provider_error
+
+        analyzer = LLMAnalyzerBase(
+            base_prompt="test",
+            model="nvidia/openai/gpt-oss-120b",
+            timeout=lambda: 100.0 if calls <= provider_retries else 0.25,
+        )
+        invoke = AsyncMock(side_effect=fail) if async_mode else MagicMock(side_effect=fail)
+        sleep = AsyncMock() if async_mode else MagicMock()
+        monkeypatch.setattr(analyzer, "_ainvoke_batch" if async_mode else "_invoke_batch", invoke)
+        monkeypatch.setattr(
+            analyzer, "_asleep_before_retry" if async_mode else "_sleep_before_retry", sleep
+        )
+        batch = Batch(file_path="a.py", content="code")
+        outcome = (
+            await analyzer.arun_batches_detailed([batch])
+            if async_mode
+            else analyzer.run_batches_detailed([batch])
+        )
+
+        assert calls == provider_retries + 1
+        assert sleep.call_count == provider_retries
+        assert outcome.successful == []
+        assert outcome.failures == [
+            BatchFailure(batch, "InternalServerError", LedgerReason.RUNTIME_LIMIT)
+        ]
+        events, status = ledger_events_for_batches("semantic_test", outcome)
+        assert events[0]["reason_code"] is LedgerReason.RUNTIME_LIMIT
+        assert events[0]["error_class"] == "InternalServerError"
+        assert events[0]["outcome"] is LedgerOutcome.PARTIAL
+        assert status["status"] == "degraded"
+        assert "private provider detail" not in json.dumps(events)
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize(
+        ("sequence", "reason"),
+        [
+            ("ssp", LedgerReason.LLM_BATCH_FAILED),
+            ("psp", LedgerReason.LLM_BATCH_FAILED),
+            ("ppp", LedgerReason.LLM_BATCH_FAILED),
+            ("pppp", LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED),
+            ("spspspp", LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED),
+        ],
+    )
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_combined_attempt_cap_preserves_actual_provider_retry_outcome(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        async_mode: bool,
+        sequence: str,
+        reason: LedgerReason,
+    ) -> None:
+        """Structured retries cannot stand in for an exhausted provider budget."""
+        # A smaller combined cap exercises early budget termination without
+        # depending on the current relationship between the two retry limits.
+        monkeypatch.setattr("skillspector.llm_analyzer_base.LLM_BATCH_MAX_ATTEMPTS", len(sequence))
+        provider_error = InternalServerError("private provider detail")
+        failures = [
+            _StructuredResponseValidationError() if kind == "s" else provider_error
+            for kind in sequence
+        ]
+        analyzer = LLMAnalyzerBase(base_prompt="test", model="nvidia/openai/gpt-oss-120b")
+        invoke = AsyncMock(side_effect=failures) if async_mode else MagicMock(side_effect=failures)
+        sleep = AsyncMock() if async_mode else MagicMock()
+        monkeypatch.setattr(analyzer, "_ainvoke_batch" if async_mode else "_invoke_batch", invoke)
+        monkeypatch.setattr(
+            analyzer, "_asleep_before_retry" if async_mode else "_sleep_before_retry", sleep
+        )
+        batch = Batch(file_path="a.py", content="code")
+        outcome = (
+            await analyzer.arun_batches_detailed([batch])
+            if async_mode
+            else analyzer.run_batches_detailed([batch])
+        )
+
+        assert invoke.call_count == len(sequence)
+        assert sleep.call_count == len(sequence) - 1
+        assert outcome.failures == [BatchFailure(batch, "InternalServerError", reason)]
+        events, status = ledger_events_for_batches("semantic_test", outcome)
+        assert events[0]["reason_code"] is reason
+        assert events[0]["error_class"] == "InternalServerError"
+        assert events[0]["outcome"] is LedgerOutcome.FAILED
+        assert status["status"] == "failed"
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_retry_outcomes_are_isolated_between_batches(
+        self, monkeypatch: pytest.MonkeyPatch, async_mode: bool
+    ) -> None:
+        monkeypatch.setattr("skillspector.llm_analyzer_base.LLM_BATCH_MAX_ATTEMPTS", 4)
+        # Even an adapter reusing one exception across batches must not leak
+        # exhausted retry state into a batch which made only structured retries.
+        provider_error = InternalServerError("private provider detail")
+        sequences = {
+            "exhausted.py": iter([provider_error] * 4),
+            "capped.py": iter([_StructuredResponseValidationError()] * 3 + [provider_error]),
+        }
+
+        def fail(batch: Batch, _prompt: str) -> None:
+            raise next(sequences[batch.file_path])
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model="nvidia/openai/gpt-oss-120b")
+        invoke = AsyncMock(side_effect=fail) if async_mode else MagicMock(side_effect=fail)
+        sleep = AsyncMock() if async_mode else MagicMock()
+        monkeypatch.setattr(analyzer, "_ainvoke_batch" if async_mode else "_invoke_batch", invoke)
+        monkeypatch.setattr(
+            analyzer, "_asleep_before_retry" if async_mode else "_sleep_before_retry", sleep
+        )
+        batches = [Batch(file_path=path, content="code") for path in sequences]
+        outcome = (
+            await analyzer.arun_batches_detailed(batches)
+            if async_mode
+            else analyzer.run_batches_detailed(batches)
+        )
+
+        assert invoke.call_count == 8
+        assert [(failure.batch.file_path, failure.reason) for failure in outcome.failures] == [
+            ("exhausted.py", LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED),
+            ("capped.py", LedgerReason.LLM_BATCH_FAILED),
+        ]
+
+
 class _RawTextAnalyzer(LLMAnalyzerBase):
     """Test analyzer for raw-string mode."""
 
@@ -970,9 +1108,7 @@ class TestRunBatches:
 
         assert analyzer._invoke_batch.call_count == 1
         sleep.assert_not_called()
-        assert [failure.reason for failure in outcome.failures] == [
-            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-        ]
+        assert [failure.reason for failure in outcome.failures] == [LedgerReason.LLM_BATCH_FAILED]
 
     @patch(MOCK_PATCH_TARGET)
     @patch("skillspector.llm_analyzer_base.time.sleep")
@@ -1482,12 +1618,12 @@ class TestDynamicTimeout:
         outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
 
         assert sleeps == []
-        assert outcome.failures[0].reason is LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        assert outcome.failures[0].reason is LedgerReason.RUNTIME_LIMIT
         assert outcome.failures[0].error_class == "APIConnectionError"
         events, status = ledger_events_for_batches("semantic_test", outcome)
-        assert events[0]["outcome"] is LedgerOutcome.FAILED
-        assert events[0]["reason_code"] is LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-        assert status["status"] == "failed"
+        assert events[0]["outcome"] is LedgerOutcome.PARTIAL
+        assert events[0]["reason_code"] is LedgerReason.RUNTIME_LIMIT
+        assert status["status"] == "degraded"
         completeness, _ = finalize_ledger(
             {
                 "components": ["a.py"],
@@ -1496,7 +1632,7 @@ class TestDynamicTimeout:
                 "analyzer_status_events": [status],
             }
         )
-        assert completeness["execution_successful"] is False
+        assert completeness["execution_successful"] is True
         assert completeness["is_complete"] is False
 
     def test_provider_timeout_at_shared_deadline_preserves_primary_cause(
@@ -1523,7 +1659,7 @@ class TestDynamicTimeout:
 
         outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
 
-        assert outcome.failures[0].reason is LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        assert outcome.failures[0].reason is LedgerReason.RUNTIME_LIMIT
         assert outcome.failures[0].error_class == "TimeoutError"
 
     async def test_async_retry_preserves_provider_failure_when_deadline_cannot_fund_backoff(
@@ -1559,7 +1695,7 @@ class TestDynamicTimeout:
         )
 
         assert sleeps == []
-        assert outcome.failures[0].reason is LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        assert outcome.failures[0].reason is LedgerReason.RUNTIME_LIMIT
         assert outcome.failures[0].error_class == "APIConnectionError"
 
 
@@ -1812,9 +1948,7 @@ class TestARunBatches:
 
         assert analyzer._ainvoke_batch.call_count == 1
         sleep.assert_not_awaited()
-        assert [failure.reason for failure in outcome.failures] == [
-            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-        ]
+        assert [failure.reason for failure in outcome.failures] == [LedgerReason.LLM_BATCH_FAILED]
 
     @patch(MOCK_PATCH_TARGET)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)

@@ -281,9 +281,11 @@ def _native_retries_cover_provider_error(exc: BaseException) -> bool:
     return False
 
 
-def _provider_retries_exhausted(exc: BaseException) -> bool:
-    """Return whether a failed provider call was eligible for bounded retries."""
-    return _is_retryable_provider_error(exc)
+@dataclass
+class _ProviderRetryOutcome:
+    """Per-batch evidence of why the coordinator stopped retrying."""
+
+    reason: LedgerReason = LedgerReason.LLM_BATCH_FAILED
 
 
 def _provider_failure_class(exc: BaseException) -> str:
@@ -1092,8 +1094,15 @@ class LLMAnalyzerBase:
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
-    def _invoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+    def _invoke_batch_with_retries(
+        self,
+        batch: Batch,
+        prompt: str,
+        *,
+        retry_outcome: _ProviderRetryOutcome | None = None,
+    ) -> tuple[Batch, list]:
         """Run one batch with bounded retries for malformed output and transient failures."""
+        retry_outcome = retry_outcome or _ProviderRetryOutcome()
         structured_retries = 0
         connection_retries = 0
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
@@ -1120,23 +1129,28 @@ class LLMAnalyzerBase:
                 raise
             except Exception as exc:
                 retryable = _is_retryable_provider_error(exc)
-                if (
-                    not retryable
-                    or (
-                        self._uses_native_connection_retries
-                        and _native_retries_cover_provider_error(exc)
-                    )
-                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
-                    or attempt == LLM_BATCH_MAX_ATTEMPTS
+                if not retryable:
+                    self._require_time_remaining()
+                    raise
+                if self._uses_native_connection_retries and _native_retries_cover_provider_error(
+                    exc
                 ):
-                    if not retryable:
-                        self._require_time_remaining()
+                    # Ownership does not establish how many native requests ran.
+                    # Keep an unobserved SDK retry outcome generic.
+                    raise
+                if connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS):
+                    retry_outcome.reason = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                    raise
+                if attempt == LLM_BATCH_MAX_ATTEMPTS:
+                    # Structured-output attempts may have used the shared cap
+                    # before the provider retry budget was exhausted.
                     raise
                 delay = _provider_retry_delay(exc, connection_retries)
                 remaining = self._remaining_timeout()
                 if remaining is not None and remaining <= delay:
-                    # Preserve the provider failure as the primary cause when
-                    # the shared deadline cannot fund another complete retry.
+                    # Preserve the provider exception while recording the actual
+                    # stop condition, even if no provider retry could begin.
+                    retry_outcome.reason = LedgerReason.RUNTIME_LIMIT
                     raise
                 connection_retries += 1
                 logger.warning(
@@ -1171,8 +1185,15 @@ class LLMAnalyzerBase:
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
-    async def _ainvoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+    async def _ainvoke_batch_with_retries(
+        self,
+        batch: Batch,
+        prompt: str,
+        *,
+        retry_outcome: _ProviderRetryOutcome | None = None,
+    ) -> tuple[Batch, list]:
         """Asynchronously run one batch with bounded malformed-output and provider retries."""
+        retry_outcome = retry_outcome or _ProviderRetryOutcome()
         structured_retries = 0
         connection_retries = 0
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
@@ -1199,23 +1220,28 @@ class LLMAnalyzerBase:
                 raise
             except Exception as exc:
                 retryable = _is_retryable_provider_error(exc)
-                if (
-                    not retryable
-                    or (
-                        self._uses_native_connection_retries
-                        and _native_retries_cover_provider_error(exc)
-                    )
-                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
-                    or attempt == LLM_BATCH_MAX_ATTEMPTS
+                if not retryable:
+                    self._require_time_remaining()
+                    raise
+                if self._uses_native_connection_retries and _native_retries_cover_provider_error(
+                    exc
                 ):
-                    if not retryable:
-                        self._require_time_remaining()
+                    # Ownership does not establish how many native requests ran.
+                    # Keep an unobserved SDK retry outcome generic.
+                    raise
+                if connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS):
+                    retry_outcome.reason = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                    raise
+                if attempt == LLM_BATCH_MAX_ATTEMPTS:
+                    # Structured-output attempts may have used the shared cap
+                    # before the provider retry budget was exhausted.
                     raise
                 delay = _provider_retry_delay(exc, connection_retries)
                 remaining = self._remaining_timeout()
                 if remaining is not None and remaining <= delay:
-                    # Preserve the provider failure as the primary cause when
-                    # the shared deadline cannot fund another complete retry.
+                    # Preserve the provider exception while recording the actual
+                    # stop condition, even if no provider retry could begin.
+                    retry_outcome.reason = LedgerReason.RUNTIME_LIMIT
                     raise
                 connection_retries += 1
                 logger.warning(
@@ -1252,9 +1278,10 @@ class LLMAnalyzerBase:
         """Execute batches and retain each sanitized failure alongside successes."""
         outcome = BatchExecutionResult()
         for batch in batches:
+            retry_outcome = _ProviderRetryOutcome()
             try:
                 prompt = self.build_prompt(batch, **kwargs)
-                result = self._invoke_batch_with_retries(batch, prompt)
+                result = self._invoke_batch_with_retries(batch, prompt, retry_outcome=retry_outcome)
                 outcome.successful.append(result)
             except _StructuredResponseValidationError:
                 logger.warning(
@@ -1285,11 +1312,7 @@ class LLMAnalyzerBase:
                     BatchFailure(
                         batch=batch,
                         error_class=_provider_failure_class(exc),
-                        reason=(
-                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _provider_retries_exhausted(exc)
-                            else LedgerReason.LLM_BATCH_FAILED
-                        ),
+                        reason=retry_outcome.reason,
                     )
                 )
         return outcome
@@ -1362,14 +1385,22 @@ class LLMAnalyzerBase:
         else:
             sem = asyncio.Semaphore(max_concurrency)
 
-        async def _process(batch: Batch) -> tuple[Batch, list]:
+        async def _process(
+            batch: Batch, retry_outcome: _ProviderRetryOutcome
+        ) -> tuple[Batch, list]:
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
-                return await self._ainvoke_batch_with_retries(batch, prompt)
+                return await self._ainvoke_batch_with_retries(
+                    batch, prompt, retry_outcome=retry_outcome
+                )
 
-        results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
+        retry_outcomes = [_ProviderRetryOutcome() for _ in batches]
+        results = await asyncio.gather(
+            *[_process(b, retry) for b, retry in zip(batches, retry_outcomes, strict=True)],
+            return_exceptions=True,
+        )
         outcome = BatchExecutionResult()
-        for batch, result in zip(batches, results, strict=True):
+        for batch, result, retry_outcome in zip(batches, results, retry_outcomes, strict=True):
             if isinstance(result, _StructuredResponseValidationError):
                 logger.warning(
                     "LLM structured response validation failed for %s after %d attempts",
@@ -1403,11 +1434,7 @@ class LLMAnalyzerBase:
                     BatchFailure(
                         batch=batch,
                         error_class=_provider_failure_class(result),
-                        reason=(
-                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _provider_retries_exhausted(result)
-                            else LedgerReason.LLM_BATCH_FAILED
-                        ),
+                        reason=retry_outcome.reason,
                     )
                 )
                 continue
