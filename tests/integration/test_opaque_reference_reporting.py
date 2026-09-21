@@ -53,7 +53,9 @@ def _valid_png_payload() -> bytes:
     )
 
 
-def _write_image_skill(root: Path, count: int, *, duplicate_label: bool = False) -> Path:
+def _write_image_skill(
+    root: Path, count: int, *, duplicate_label: bool = False, reference_prefix: str = ""
+) -> Path:
     skill = root / "chart-guide"
     assets = skill / "assets"
     assets.mkdir(parents=True)
@@ -64,7 +66,7 @@ def _write_image_skill(root: Path, count: int, *, duplicate_label: bool = False)
         path = f"assets/chart-{index}.png"
         (skill / path).write_bytes(png)
         label = path if duplicate_label else f"Chart {index}"
-        images.append(f"![{label}]({path})")
+        images.append(f"{reference_prefix}![{label}]({path})")
     (skill / "SKILL.md").write_text(
         "---\nname: chart-guide\n"
         "description: Explain the chart colors when the user asks for a chart guide.\n"
@@ -150,10 +152,13 @@ def _assert_report(body: str, output_format: str, count: int) -> None:
 
 @pytest.mark.parametrize("count", [1, 4, 8])
 @pytest.mark.parametrize("duplicate_label", [False, True], ids=["image-label", "path-label"])
+@pytest.mark.parametrize("reference_prefix", ["", "- ", "> "], ids=["plain", "list", "quote"])
 def test_graph_keeps_png_coverage_without_ae1(
-    tmp_path: Path, count: int, duplicate_label: bool
+    tmp_path: Path, count: int, duplicate_label: bool, reference_prefix: str
 ) -> None:
-    skill = _write_image_skill(tmp_path, count, duplicate_label=duplicate_label)
+    skill = _write_image_skill(
+        tmp_path, count, duplicate_label=duplicate_label, reference_prefix=reference_prefix
+    )
     initial = {"skill_path": str(skill), "use_llm": False, "output_format": "json"}
     # Exercise both Python APIs against the same actual files.
     invoked = graph.invoke(initial)

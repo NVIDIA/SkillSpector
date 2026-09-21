@@ -29,7 +29,9 @@ _PASSIVE_IMAGE_DESTINATION = re.compile(
     r"[^\s\\()\[\]<>]+(?:[ \t]+(?:\"[^\"\\\r\n()]*\"|'[^'\\\r\n()]*'))?"
 )
 _MARKDOWN_FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)$")
-_MARKDOWN_CONTAINER_PREFIX = re.compile(r"[ ]{0,3}(?:(>)[ ]?|(?:[-+*]|\d{1,9}[.)])[ ]+)")
+_MARKDOWN_CONTAINER_PREFIX = re.compile(
+    r"[ ]{0,3}(?:(>)[ ]?|(?:[-+*]|\d{1,9}[.)])(?:[ ]{1,4}(?![ ])|[ ](?=[ ]{4})))"
+)
 _HTML_CONTEXT_START = re.compile(
     r"<!--|<\?|<!\[CDATA\[|<![A-Z]|</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>])",
     re.IGNORECASE,
@@ -120,6 +122,8 @@ def _markdown_block_view(line: str) -> tuple[str, int, bool, int]:
     cursor = 0
     quote_depth = 0
     has_list = False
+    # More than four spaces after a list marker are content indentation;
+    # retain that indentation so a code block cannot become a passive image.
     while match := _MARKDOWN_CONTAINER_PREFIX.match(expanded, cursor):
         quote_depth += int(match.group(1) is not None)
         has_list |= match.group(1) is None
@@ -264,7 +268,6 @@ def _candidate_strings(
                     line_in_fence
                     or line_is_indented_code
                     or line_in_html
-                    or prefix_width
                     or inline_code_delimiter is not None
                     or not unambiguous_image
                 ):
