@@ -342,6 +342,8 @@ def _render_context(
 def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
     pending_action = False
     pending_referent_required_action = False
+    referent_required_action_seen = False
+    pending_explicit_cast = False
     pending_heading = False
     pending_reference = False
     previous = ""
@@ -358,10 +360,12 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
             pending_reference = False
         if token in ".!?;:":
             pending_action = pending_referent_required_action = pending_heading = False
+            referent_required_action_seen = pending_explicit_cast = False
             previous = before_previous = ""
             continue
         if token in {"not", "never"}:
             pending_action = pending_referent_required_action = pending_heading = False
+            referent_required_action_seen = pending_explicit_cast = False
         if previous in _SENSITIVE_QUALIFIERS and token in _SENSITIVE_OBJECTS:
             return True
         if previous in _REFERENCE_ACTIONS and token in _REFERENCE_OBJECTS:
@@ -376,16 +380,24 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
         ):
             return True
         if previous not in {"not", "never"}:
+            if pending_explicit_cast:
+                if token in _DIRECT_HEADING_OBJECTS:
+                    return True
+                if token not in {"a", "an", "the"}:
+                    pending_explicit_cast = False
             if pending_action and token in _HEADING_OBJECTS:
                 return True
             if pending_referent_required_action and token in _DIRECT_HEADING_OBJECTS:
                 return True
             if token in _REPORT_FRAMING_OBJECTS:
                 pending_referent_required_action = False
+            if referent_required_action_seen and token == "as":
+                pending_explicit_cast = True
             if pending_heading and token in {"command", "instruction", "commands", "instructions"}:
                 return True
             pending_action |= token in _HEADING_ACTIONS
             pending_referent_required_action |= token in _REFERENT_REQUIRED_HEADING_ACTIONS
+            referent_required_action_seen |= token in _REFERENT_REQUIRED_HEADING_ACTIONS
             pending_heading |= token in {"heading", "title", "label"}
         before_previous, previous = previous, token
     check_runtime()

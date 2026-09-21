@@ -88,6 +88,20 @@ def test_report_prose_does_not_frame_output_rules_heading(directive: str) -> Non
 
 
 @pytest.mark.parametrize(
+    "directive",
+    [
+        "Run the following report generator as a command:",
+        "Use the following file as a command:",
+    ],
+    ids=["report-generator-as-command", "file-as-command"],
+)
+def test_explicit_command_after_report_object_frames_output_rules_heading(
+    directive: str,
+) -> None:
+    _assert_heading_extraction(f"{directive}\n{HEADING}", 2)
+
+
+@pytest.mark.parametrize(
     ("placement", "comments"),
     [("before", 30), ("before", 31), ("before", 34), ("after", 31), ("after", 34)],
 )
