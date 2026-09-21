@@ -218,6 +218,20 @@ def _sarif_artifact_location(
     return SarifArtifactLocation(uri=uri, properties=properties or None)
 
 
+def _occurrence_columns(
+    finding: Finding, occurrence: Mapping[str, object]
+) -> tuple[int | None, int | None]:
+    """Do not borrow representative columns for an occurrence with unknown columns."""
+    start = occurrence.get(
+        "start_column", finding.start_column if not finding.occurrences else None
+    )
+    end = occurrence.get("end_column", finding.end_column if not finding.occurrences else None)
+    return (
+        start if isinstance(start, int) else None,
+        end if isinstance(end, int) else None,
+    )
+
+
 def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
     """Expand compacted findings for human/JSON output without losing locations."""
     expanded: list[Finding] = []
@@ -234,6 +248,7 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
             start_line = start_value if isinstance(start_value, int) else finding.start_line
             end_value = occurrence.get("end_line")
             end_line = end_value if isinstance(end_value, int) else None
+            start_column, end_column = _occurrence_columns(finding, occurrence)
             provenance = _occurrence_provenance(finding, occurrence)
             depth_value = provenance.get("transitive_depth")
             expanded.append(
@@ -242,6 +257,8 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
                     file=str(occurrence.get("file", finding.file)),
                     start_line=start_line,
                     end_line=end_line,
+                    start_column=start_column,
+                    end_column=end_column,
                     source_identity=(
                         str(provenance["source_identity"])
                         if "source_identity" in provenance
@@ -602,6 +619,7 @@ def _build_sarif(
             start_line = start_value if isinstance(start_value, int) else finding.start_line
             end_value = occurrence.get("end_line")
             end_line = int(end_value) if isinstance(end_value, int) else None
+            start_column, end_column = _occurrence_columns(finding, occurrence)
             results.append(
                 SarifResult(
                     ruleId=finding.rule_id,
@@ -612,7 +630,14 @@ def _build_sarif(
                         SarifLocation(
                             physicalLocation=SarifPhysicalLocation(
                                 artifactLocation=_sarif_artifact_location(finding, occurrence),
-                                region=SarifRegion(startLine=start_line, endLine=end_line),
+                                region=SarifRegion(
+                                    startLine=start_line,
+                                    endLine=end_line,
+                                    startColumn=start_column + 1
+                                    if start_column is not None
+                                    else None,
+                                    endColumn=end_column + 1 if end_column is not None else None,
+                                ),
                             )
                         )
                     ],
@@ -639,6 +664,7 @@ def _build_sarif(
             start_line = start_value if isinstance(start_value, int) else finding.start_line
             end_value = occurrence.get("end_line")
             end_line = int(end_value) if isinstance(end_value, int) else None
+            start_column, end_column = _occurrence_columns(finding, occurrence)
             results.append(
                 SarifResult(
                     ruleId=finding.rule_id,
@@ -649,7 +675,14 @@ def _build_sarif(
                         SarifLocation(
                             physicalLocation=SarifPhysicalLocation(
                                 artifactLocation=_sarif_artifact_location(finding, occurrence),
-                                region=SarifRegion(startLine=start_line, endLine=end_line),
+                                region=SarifRegion(
+                                    startLine=start_line,
+                                    endLine=end_line,
+                                    startColumn=start_column + 1
+                                    if start_column is not None
+                                    else None,
+                                    endColumn=end_column + 1 if end_column is not None else None,
+                                ),
                             )
                         )
                     ],
@@ -875,6 +908,7 @@ def _build_sarif(
                         )
                     ),
                     results=results,
+                    columnKind="unicodeCodePoints",
                     invocations=invocations,
                 )
             ],
