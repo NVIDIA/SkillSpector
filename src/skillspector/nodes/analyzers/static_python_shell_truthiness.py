@@ -580,7 +580,17 @@ def _passive_direct_call(statement: ast.stmt) -> ast.Call | None:
 
 
 def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None:
-    """Apply one statement's explicit receiver-binding effects."""
+    """Apply one statement's receiver-trust effects."""
+    value = (
+        statement.value if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign)) else None
+    )
+    if (
+        isinstance(value, ast.Call)
+        and _is_direct_subprocess_call(value, trusted_names)
+        and not _call_arguments_are_passive(value)
+    ):
+        trusted_names.clear()
+        return
     if isinstance(statement, (ast.Import, ast.ImportFrom)):
         _update_trusted_names_from_import(statement, trusted_names)
         return
@@ -679,9 +689,11 @@ class _Analyzer:
         )
         result_is_finalizer_safe = _is_finalizer_safe_value(value, finalizer_safe_names)
         call_has_protocol_effects = False
+        effectful_direct_call = False
         if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
             resolved = None
             safe_value = _call_arguments_are_passive(value)
+            effectful_direct_call = not safe_value
             if _shell_argument_is_captured_before_effects(value):
                 self._inspect_call(value, facts)
             if safe_value:
@@ -699,7 +711,12 @@ class _Analyzer:
             for target in targets:
                 if isinstance(target, ast.Name):
                     bound_names.add(target.id)
-            trusted_names.difference_update(_changed_direct_names([value, *targets], trusted_names))
+            if effectful_direct_call:
+                trusted_names.clear()
+            else:
+                trusted_names.difference_update(
+                    _changed_direct_names([value, *targets], trusted_names)
+                )
             return
         if releases_unsafe_value:
             facts.clear()
@@ -817,17 +834,21 @@ class _Analyzer:
                 )
             elif isinstance(statement, ast.AnnAssign):
                 value = statement.value
-                if (
-                    isinstance(value, ast.Call)
-                    and _is_direct_subprocess_call(value, trusted_names)
-                    and _shell_argument_is_captured_before_effects(value)
-                ):
-                    self._inspect_call(value, facts)
+                effectful_direct_call = False
+                if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
+                    if _shell_argument_is_captured_before_effects(value):
+                        self._inspect_call(value, facts)
+                    effectful_direct_call = not _call_arguments_are_passive(value)
                 facts.clear()
                 finalizer_safe_names.clear()
                 if value is not None:
                     bound_names.update(_direct_bound_names(statement))
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+                if effectful_direct_call:
+                    trusted_names.clear()
+                else:
+                    trusted_names.difference_update(
+                        _changed_direct_names([statement], trusted_names)
+                    )
             elif isinstance(statement, (ast.AugAssign, ast.Delete)):
                 facts.clear()
                 finalizer_safe_names.clear()
@@ -838,7 +859,8 @@ class _Analyzer:
                 direct_call = _is_direct_subprocess_call(call, trusted_names)
                 if direct_call and _shell_argument_is_captured_before_effects(call):
                     self._inspect_call(call, facts)
-                if direct_call and _call_arguments_are_passive(call):
+                arguments_are_passive = _call_arguments_are_passive(call)
+                if direct_call and arguments_are_passive:
                     if not _call_arguments_are_protocol_safe(call, finalizer_safe_names):
                         facts.clear()
                         finalizer_safe_names.clear()
@@ -846,7 +868,12 @@ class _Analyzer:
                 else:
                     facts.clear()
                     finalizer_safe_names.clear()
-                    trusted_names.difference_update(_changed_direct_names([call], trusted_names))
+                    if direct_call:
+                        trusted_names.clear()
+                    else:
+                        trusted_names.difference_update(
+                            _changed_direct_names([call], trusted_names)
+                        )
             elif isinstance(statement, ast.Pass) or (
                 isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
             ):

@@ -307,6 +307,51 @@ def test_later_argument_effect_invalidates_fact_after_captured_call() -> None:
     assert [finding.start_line for finding in findings] == [2]
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(
+            "subprocess.run(command, shell=enabled, env=replace_subprocess())",
+            id="expression",
+        ),
+        pytest.param(
+            "result = subprocess.run(command, shell=enabled, env=replace_subprocess())",
+            id="assignment",
+        ),
+        pytest.param(
+            "result: object = subprocess.run(command, shell=enabled, env=replace_subprocess())",
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_later_argument_effect_invalidates_receiver_after_captured_call(statement: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "enabled = True\n"
+        f"{statement}\n"
+        "later_enabled = True\n"
+        "subprocess.run(command, shell=later_enabled)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [4]
+
+
+def test_later_argument_effect_invalidates_receiver_for_called_function() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled, env=replace_subprocess())\n"
+        "def execute():\n"
+        "    later_enabled = True\n"
+        "    subprocess.run(command, shell=later_enabled)\n"
+        "execute()\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [4]
+
+
 def test_unsupported_assignment_clears_existing_facts() -> None:
     assert not _tm1("enabled = True\nresult = factory()\nsubprocess.run(cmd, shell=enabled)\n")
 
