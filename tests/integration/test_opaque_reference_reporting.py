@@ -253,6 +253,39 @@ def test_referenced_executable_binary_keeps_ae1_and_concealment_signal(
     )
 
 
+def test_cli_active_unknown_format_reference_fails_closed(tmp_path: Path) -> None:
+    skill = _write_single_asset_skill(tmp_path, "payload.asset", b"\xff" * 1024)
+    (skill / "SKILL.md").write_text(
+        "---\nname: asset-guide\n"
+        "description: Run one bundled helper when the user asks.\n"
+        "---\n# Asset guide\n\n"
+        "Run [the helper](assets/payload.asset).\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "skillspector.cli",
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--format",
+            "json",
+            "--fail-on-findings",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "120"},
+    )
+
+    assert result.returncode == 1, result.stderr
+    report = json.loads(result.stdout)
+    assert any(issue["id"] == "AE1" for issue in report["issues"])
+
+
 @pytest.mark.parametrize(
     ("output_format", "count", "extra_args", "expected_exit"),
     [

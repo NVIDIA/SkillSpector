@@ -30,16 +30,25 @@ from skillspector.semantic_runtime import (
 )
 from skillspector.state import SkillspectorState
 
+# Unknown formats may be actively invoked, so they retain AE1 even when their
+# only recorded limitation is format-related.
+_FORMAT_ONLY_AE1_SUPPRESSION_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".pdf", ".png"})
+
 
 def _has_only_format_limitations(
+    target_path: str,
     inventory_item: Mapping[str, object] | None,
     events: list[Mapping[str, object]],
 ) -> bool:
     """Recognize unsupported content without hiding other coverage failures."""
+    if PurePosixPath(target_path).suffix.lower() not in _FORMAT_ONLY_AE1_SUPPRESSION_SUFFIXES:
+        return False
     if not inventory_item or str(inventory_item.get("content_kind")) not in {
         ContentKind.BINARY,
         ContentKind.OPAQUE,
     }:
+        return False
+    if inventory_item.get("misleading_extension") is True:
         return False
     if str(inventory_item.get("disposition")) not in {"partial", "out_of_scope"}:
         return False
@@ -325,7 +334,7 @@ def _reference_coverage_findings(
             and target_path not in invalid_status_paths
             and target_path not in duplicate_inventory_paths
             and reference_disposition == disposition
-            and _has_only_format_limitations(inventory_item, target_events)
+            and _has_only_format_limitations(target_path, inventory_item, target_events)
         ):
             continue
         line_value = reference.get("line", 1)

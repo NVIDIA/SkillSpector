@@ -714,7 +714,7 @@ def test_reference_findings_share_one_terminal_event_per_source_line(
         ("analyzed", LedgerOutcome.COMPLETED, None, False),
         ("partial", LedgerOutcome.PARTIAL, LedgerReason.SIZE_LIMIT, True),
         ("failed", LedgerOutcome.FAILED, LedgerReason.READ_ERROR, True),
-        ("out_of_scope", LedgerOutcome.OUT_OF_SCOPE, LedgerReason.BINARY_CONTENT, False),
+        ("out_of_scope", LedgerOutcome.OUT_OF_SCOPE, LedgerReason.BINARY_CONTENT, True),
         ("out_of_scope", LedgerOutcome.OUT_OF_SCOPE, LedgerReason.EXCLUDED_DIRECTORY, True),
     ],
 )
