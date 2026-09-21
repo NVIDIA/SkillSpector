@@ -54,6 +54,40 @@ def test_ordinary_imperative_framing_prevents_heading_exemption(
 
 
 @pytest.mark.parametrize(
+    "directive",
+    [
+        "Use the following table in your report.",
+        "Apply the following formatting to your report.",
+        "Run the following report generator.",
+        "Use the following table of command options.",
+        "Apply the following formatting to command output.",
+        "Run the following report generator for command output.",
+    ],
+    ids=[
+        "use-table",
+        "apply-formatting",
+        "run-generator",
+        "use-table-command-options",
+        "apply-formatting-command-output",
+        "run-generator-command-output",
+    ],
+)
+def test_report_prose_does_not_frame_output_rules_heading(directive: str) -> None:
+    content = f"{directive}\n{HEADING}"
+
+    assert [
+        finding
+        for finding in leakage.analyze(content, "SKILL.md", "markdown")
+        if finding.rule_id == "P6"
+    ] == []
+    findings, reason, _ = static_runner._scan_all_views_detailed(
+        "SKILL.md", content, [leakage], None
+    )
+    assert reason is None
+    assert [finding for finding in findings if finding.rule_id == "P6"] == []
+
+
+@pytest.mark.parametrize(
     ("placement", "comments"),
     [("before", 30), ("before", 31), ("before", 34), ("after", 31), ("after", 34)],
 )

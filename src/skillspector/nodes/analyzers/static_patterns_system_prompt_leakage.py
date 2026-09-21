@@ -187,13 +187,16 @@ _MARKDOWN_DELIMITERS = str.maketrans("", "", "*_`")
 _REPORT_OBJECTS = frozenset(
     "report reports document documents chart charts figure figures file files table tables".split()
 )
-_CONTEXT_TOKENS = re.compile(r"[\w]+|[.!?;:]")
-_HEADING_ACTIONS = frozenset(
-    "interpret treat read execute perform follow obey do carry use apply run".split()
+_REPORT_FRAMING_OBJECTS = _REPORT_OBJECTS | frozenset(
+    "format formats formatting generator generators".split()
 )
+_CONTEXT_TOKENS = re.compile(r"[\w]+|[.!?;:]")
+_HEADING_ACTIONS = frozenset("interpret treat read execute perform follow obey do carry".split())
+_REFERENT_REQUIRED_HEADING_ACTIONS = frozenset("use apply run".split())
 _HEADING_OBJECTS = frozenset(
     "heading title label command instruction operation following below above".split()
 )
+_DIRECT_HEADING_OBJECTS = frozenset("heading title label command instruction operation".split())
 _REFERENCE_ACTIONS = frozenset(
     "print output show display reveal expose return echo repeat share disclose "
     "publish provide send copy extract dump recite summarize translate encode "
@@ -338,6 +341,7 @@ def _render_context(
 
 def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
     pending_action = False
+    pending_referent_required_action = False
     pending_heading = False
     pending_reference = False
     previous = ""
@@ -353,11 +357,11 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
                 return True
             pending_reference = False
         if token in ".!?;:":
-            pending_action = pending_heading = False
+            pending_action = pending_referent_required_action = pending_heading = False
             previous = before_previous = ""
             continue
         if token in {"not", "never"}:
-            pending_action = pending_heading = False
+            pending_action = pending_referent_required_action = pending_heading = False
         if previous in _SENSITIVE_QUALIFIERS and token in _SENSITIVE_OBJECTS:
             return True
         if previous in _REFERENCE_ACTIONS and token in _REFERENCE_OBJECTS:
@@ -374,9 +378,14 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
         if previous not in {"not", "never"}:
             if pending_action and token in _HEADING_OBJECTS:
                 return True
+            if pending_referent_required_action and token in _DIRECT_HEADING_OBJECTS:
+                return True
+            if token in _REPORT_FRAMING_OBJECTS:
+                pending_referent_required_action = False
             if pending_heading and token in {"command", "instruction", "commands", "instructions"}:
                 return True
             pending_action |= token in _HEADING_ACTIONS
+            pending_referent_required_action |= token in _REFERENT_REQUIRED_HEADING_ACTIONS
             pending_heading |= token in {"heading", "title", "label"}
         before_previous, previous = previous, token
     check_runtime()
