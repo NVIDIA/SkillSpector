@@ -43,8 +43,12 @@ logger = get_logger(__name__)
 ANALYZER_ID = "static_patterns_excessive_agency"
 
 # EA1: Unrestricted Tool Access
-EA1_PATTERNS = [
+# Configuration syntax can span blank lines; prose instructions cannot.
+EA1_CODE_PATTERNS = [
     (r"(?:tools?|permissions?)\s*:[ \t]*\[?[ \t]*['\"]?\*(?!\*|\w)['\"]?[ \t]*\]?", 0.85),
+    (r"tools?\s*:\s*\[\s*['\"]shell['\"].*?['\"](?:file_write|network|http)['\"]", 0.7),
+]
+EA1_PROSE_PATTERNS = [
     (r"(?:allow|grant|enable)\s+(?:access\s+to\s+)?(?:all|any|every)\s+tools?", 0.8),
     (
         r"(?:no|without)\s+(?:tool|permission|access|capability)\s+(?:restrictions?|constraints?|limitations?)",
@@ -59,7 +63,6 @@ EA1_PATTERNS = [
         r"(?:can|may|should)\s+(?:freely|always)\s+(?:use|call|invoke)\s+(?:any|all)\s+(?:tools?|functions?|apis?)",
         0.75,
     ),
-    (r"tools?\s*:\s*\[\s*['\"]shell['\"].*?['\"](?:file_write|network|http)['\"]", 0.7),
     (r"(?:grant|give)\s+(?:full|complete|total)\s+(?:tool|function|api)\s+access", 0.85),
     (r"(?:execute|run)\s+(?:arbitrary|any)\s+(?:commands?|code|scripts?)", 0.8),
     (
@@ -67,9 +70,14 @@ EA1_PATTERNS = [
         0.7,
     ),
 ]
+EA1_PATTERNS = EA1_CODE_PATTERNS + EA1_PROSE_PATTERNS
 
 # EA2: Autonomous Decision Making
-EA2_PATTERNS = [
+EA2_CODE_PATTERNS = [
+    (r"(?:auto[_-]?approve|auto[_-]?confirm|auto[_-]?execute|auto[_-]?deploy)", 0.85),
+    (r"(?:--auto-?approve|--no-?confirm)\b", 0.65),
+]
+EA2_PROSE_PATTERNS = [
     (r"(?:without|no)\s+(?:asking|confirmation|approval|consent|verification|checking)", 0.75),
     (
         r"(?:auto(?:matically)?|autonomously)\s+(?:execute|run|perform|delete|remove|modify|send|deploy)",
@@ -83,7 +91,6 @@ EA2_PATTERNS = [
         r"(?:do\s+not|don't|never)\s+(?:ask|prompt|confirm|verify|check)\s+(?:the\s+)?(?:user|before)",
         0.8,
     ),
-    (r"(?:auto[_-]?approve|auto[_-]?confirm|auto[_-]?execute|auto[_-]?deploy)", 0.85),
     (
         r"(?:proceed|continue|execute)\s+without\s+(?:waiting|asking)\s+(?:for\s+)?(?:user|human|permission)",
         0.8,
@@ -93,8 +100,8 @@ EA2_PATTERNS = [
         r"(?:if|when)\s+(?:unsure|uncertain).*?(?:proceed|continue|execute)\s+(?:anyway|regardless)",
         0.75,
     ),
-    (r"(?:--auto-?approve|--no-?confirm)\b", 0.65),
 ]
+EA2_PATTERNS = EA2_CODE_PATTERNS + EA2_PROSE_PATTERNS
 
 # EA3: Scope Creep
 EA3_PATTERNS = [
@@ -130,7 +137,11 @@ EA3_PATTERNS = [
 ]
 
 # EA4: Unbounded Resource Access
-EA4_PATTERNS = [
+EA4_CODE_PATTERNS = [
+    (r"max[_-]?retries?\s*=\s*(?:None|0|float\s*\(\s*['\"]inf['\"]|math\.inf|infinity)", 0.8),
+    (r"timeout\s*=\s*(?:None|0|float\s*\(\s*['\"]inf['\"]|math\.inf)", 0.75),
+]
+EA4_PROSE_PATTERNS = [
     (
         r"(?:unlimited|infinite|unbounded|no\s+limit(?:s)?(?:\s+on)?)\s+(?:api\s+)?(?:calls?|requests?|queries?|invocations?)",
         0.8,
@@ -145,8 +156,6 @@ EA4_PATTERNS = [
     ),
     (r"(?:loop|iterate|repeat)\s+(?:indefinitely|forever|infinitely|endlessly)", 0.75),
     (r"(?:retry|attempt)\s+(?:indefinitely|forever|without\s+limit|unlimited\s+times)", 0.75),
-    (r"max[_-]?retries?\s*=\s*(?:None|0|float\s*\(\s*['\"]inf['\"]|math\.inf|infinity)", 0.8),
-    (r"timeout\s*=\s*(?:None|0|float\s*\(\s*['\"]inf['\"]|math\.inf)", 0.75),
     (
         r"(?:allocate|consume|use)\s+(?:as\s+much|unlimited|unbounded)\s+(?:memory|storage|disk|compute|cpu|gpu)",
         0.8,
@@ -156,6 +165,7 @@ EA4_PATTERNS = [
         0.7,
     ),
 ]
+EA4_PATTERNS = EA4_CODE_PATTERNS + EA4_PROSE_PATTERNS
 
 # EA5: External Model or Provider Selection
 _EA5_FRONTMATTER_KEY = re.compile(
@@ -370,7 +380,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.EXCESSIVE_AGENCY.value]
 
     for pattern, confidence in EA1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in EA1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -386,7 +401,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in EA2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in EA2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             findings.append(
@@ -403,7 +423,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in EA3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -419,7 +441,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in EA4_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in EA4_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

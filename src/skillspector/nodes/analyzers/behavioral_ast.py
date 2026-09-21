@@ -67,6 +67,17 @@ _DANGEROUS_BUILTINS = frozenset({"exec", "eval", "compile", "__import__"})
 # benign reflection such as ``getattr(obj, "name")`` stays unflagged.
 _DANGEROUS_GETATTR_NAMES = frozenset({"exec", "eval", "system", "popen", "__import__"})
 
+# dict methods that can retrieve an existing key's value exactly like a subscript
+# does. All three take the key as their first positional argument and, for any
+# key that already exists (every name in _DANGEROUS_GETATTR_NAMES always does,
+# on the module that defines it), return that same object: ``.get(key)`` reads
+# without mutating; ``.setdefault(key)`` reads without mutating *because* the
+# key is already present (the "set" branch never triggers); ``.pop(key)`` reads
+# and additionally removes the entry, which is irrelevant to whether the read
+# itself must be caught. Each is a further spelling of the same reflective
+# access the subscript form catches, so all three get identical treatment.
+_REFLECTIVE_DICT_READ_METHODS = frozenset({"get", "setdefault", "pop"})
+
 _SUBPROCESS_CALLS = frozenset(
     {
         "call",
@@ -326,6 +337,47 @@ def _deserialization_message(call_name: str, node: ast.Call) -> str | None:
     return None
 
 
+def _reflective_module_dict_container(container: ast.expr, aliases: dict[str, str]) -> str | None:
+    """Return the module name when *container* is an imported module's namespace.
+
+    Matches ``<module>.__dict__`` and ``vars(<module>)`` as a bare expression, so
+    callers can apply this to either a subscript target (``container[key]``) or a
+    ``.get(key)`` receiver (``container.get(key)``) — both read the module
+    namespace by key, so both must get the same treatment as ``getattr(module,
+    key)``. The base must resolve through the import-alias map to a plain
+    (non-dotted) module (``import os`` / ``import os as o``), which keeps
+    idiomatic instance attribute bags (``self.__dict__[...]``) and from-imported
+    classes out of scope.
+    """
+    base: ast.expr
+    if isinstance(container, ast.Attribute) and container.attr == "__dict__":
+        base = container.value
+    elif (
+        isinstance(container, ast.Call)
+        and isinstance(container.func, ast.Name)
+        and container.func.id == "vars"
+        and len(container.args) == 1
+    ):
+        base = container.args[0]
+    else:
+        return None
+    if not isinstance(base, ast.Name):
+        return None
+    resolved = aliases.get(base.id)
+    if resolved is None or "." in resolved:
+        return None
+    return resolved
+
+
+def _reflective_module_dict_base(node: ast.Subscript, aliases: dict[str, str]) -> str | None:
+    """Return the module name when *node* subscripts an imported module's namespace.
+
+    See :func:`_reflective_module_dict_container` — this is the subscript
+    (``<module>.__dict__[key]`` / ``vars(<module>)[key]``) entry point.
+    """
+    return _reflective_module_dict_container(node.value, aliases)
+
+
 def _analyze_python(
     python_ast: ParsedPythonFile,
     file_path: str,
@@ -387,8 +439,56 @@ def _analyze_python(
     for ast_node in ast.walk(tree):
         if budget is not None:
             budget.check_runtime()
+        if isinstance(ast_node, ast.Subscript):
+            module = _reflective_module_dict_base(ast_node, aliases)
+            if module is not None:
+                key = ast_node.slice
+                if isinstance(key, ast.Constant):
+                    if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
+                        _emit(
+                            "AST9",
+                            ast_node,
+                            f"Reflective dangerous access via {module}.__dict__ subscript "
+                            "with a literal sink name",
+                        )
+                else:
+                    _emit(
+                        "AST7",
+                        ast_node,
+                        f"Dynamic attribute access via {module}.__dict__ subscript",
+                    )
+            continue
         if not isinstance(ast_node, ast.Call):
             continue
+
+        if (
+            isinstance(ast_node.func, ast.Attribute)
+            and ast_node.func.attr in _REFLECTIVE_DICT_READ_METHODS
+            and ast_node.args
+        ):
+            # <module>.__dict__.get(key) / .setdefault(key) / .pop(key), and the
+            # same three on vars(<module>), all return the object a subscript
+            # would — further spellings of the same reflective access that must
+            # not evade AST7/AST9 either.
+            method = ast_node.func.attr
+            module = _reflective_module_dict_container(ast_node.func.value, aliases)
+            if module is not None:
+                key = ast_node.args[0]
+                if isinstance(key, ast.Constant):
+                    if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
+                        _emit(
+                            "AST9",
+                            ast_node,
+                            f"Reflective dangerous access via {module}.__dict__.{method}() "
+                            "with a literal sink name",
+                        )
+                else:
+                    _emit(
+                        "AST7",
+                        ast_node,
+                        f"Dynamic attribute access via {module}.__dict__.{method}()",
+                    )
+                continue
 
         call_name = resolve_call_name(ast_node, aliases)
         if call_name is None:
