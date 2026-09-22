@@ -499,16 +499,27 @@ _OVERLY_BROAD_SINGLE_WORDS: set[str] = {
     "hey",
 }
 
-# Bounded activation-intent signals for skill descriptions. Only description
-# clauses carrying one of these signals are treated as trigger-like; ordinary
-# capability prose (e.g. "Build projects") is skipped.
-_DESCRIPTION_ACTIVATION_RE = re.compile(
+# Activation-condition signals for description clauses. A description clause
+# only counts as trigger-like when it says *when* the skill activates (a
+# bounded condition), not merely what it does: bare behavior prose such as
+# "Always preserves file permissions when copying files" does not qualify.
+_DESCRIPTION_ACTIVATION_CONDITION_RE = re.compile(
     r"\b(?:"
-    r"whenever|every\s+time|each\s+time|"
-    r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)|"
-    r"any\s+(?:question|request|task|input|message)|"
-    r"anything|everything|whatever|always"
+    r"whenever|"
+    r"(?:when|if)\s+(?:the\s+)?user\s+(?:says?|asks?|types?|sends?|requests?)|"
+    r"every\s+time|each\s+time"
     r")\b",
+    re.IGNORECASE,
+)
+
+# Universal-scope signals for description clauses. The scope must be
+# unconditional: a subject qualifier such as "about PostgreSQL" keeps the
+# clause describing a capability, not a catch-all trigger.
+_DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
+    r"\b(?:"
+    r"anything|everything|whatever|"
+    r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)"
+    r")\b(?!\s+about\b)",
     re.IGNORECASE,
 )
 
@@ -520,16 +531,21 @@ _DESCRIPTION_INVOCATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Unanchored baiting patterns for description clauses. The legacy TR3 patterns
-# are whole-string anchored for the explicit triggers field; descriptions need
-# substring matching so realistic activation prose is detected.
-_DESCRIPTION_BAITING_PATTERNS = (
-    r"(?:anything|everything|whatever|always|"
-    r"any\s+(?:question|request|task|input|message))",
-    r"(?:when(?:ever)?|if|every\s+time)\s+(?:the\s+)?user\s+"
-    r"(?:says?|asks?|types?|sends?)\s+"
-    r"(?:anything|something|any\s+messages?|a\s+message)",
+# Trigger-phrase extraction for the TR1 broad/short-trigger rule on
+# descriptions: the word or phrase the skill claims to activate on, as in
+# "whenever the user says hello".
+_DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
+    r"\b(?:whenever|when|if)\s+(?:the\s+)?user\s+"
+    r"(?:says?|asks?|types?|sends?|requests?)\s+"
+    r"(?:the\s+(?:word|phrase)\s+)?['\"]?(?P<phrase>[A-Za-z][\w-]{0,31})['\"]?",
+    re.IGNORECASE,
+)
+
+# Bare universal-scope statements: the whole clause is a catch-all scope
+# ("all messages"), which the legacy trigger grammar also flags as TR3.
+_DESCRIPTION_BARE_SCOPE_RE = re.compile(
     r"(?:all|any|every)\s+(?:messages?|inputs?|requests?|queries?|questions?)",
+    re.IGNORECASE,
 )
 
 # Bounds for description clause extraction: keep the analysis cheap and the
@@ -538,21 +554,40 @@ _MAX_DESCRIPTION_CLAUSES = 8
 _MAX_DESCRIPTION_CLAUSE_CHARS = 120
 
 
+def _description_clause_has_signal(text: str) -> bool:
+    """Cheap gate: does this clause carry any trigger-relevant intent?"""
+    return (
+        _DESCRIPTION_ACTIVATION_CONDITION_RE.search(text) is not None
+        or _DESCRIPTION_UNIVERSAL_SCOPE_RE.search(text) is not None
+        or _DESCRIPTION_INVOCATION_RE.search(text) is not None
+    )
+
+
 def _extract_description_trigger_clauses(description: str) -> list[str]:
     """Extract bounded trigger-like clauses from a skill description.
 
-    Splits the description into clauses and keeps only clauses carrying an
-    activation-intent signal, so realistic activation prose is analyzed while
-    ordinary capability prose is left alone.
+    Every clause is scanned for cheap intent signals, so benign padding
+    sentences never consume the clause budget and cannot push a trigger
+    clause out of the analysis. Overlong clauses are analyzed through
+    bounded head/tail windows (joined with an explicit " ..." marker) so
+    activation intent at the start or end of a padded clause is still
+    inspected while per-clause work stays bounded.
     """
     clauses = re.split(r"[.;:!?]\s*|\s+-\s+", description)
     extracted: list[str] = []
-    for clause in clauses[:_MAX_DESCRIPTION_CLAUSES]:
+    for clause in clauses:
         text = clause.strip().strip(",")
-        if not text or len(text) > _MAX_DESCRIPTION_CLAUSE_CHARS:
+        if not text or not _description_clause_has_signal(text):
             continue
-        if _DESCRIPTION_ACTIVATION_RE.search(text):
-            extracted.append(text)
+        if len(text) > _MAX_DESCRIPTION_CLAUSE_CHARS:
+            text = (
+                text[:_MAX_DESCRIPTION_CLAUSE_CHARS]
+                + " ... "
+                + text[-_MAX_DESCRIPTION_CLAUSE_CHARS:]
+            )
+        extracted.append(text)
+        if len(extracted) >= _MAX_DESCRIPTION_CLAUSES:
+            break
     return extracted
 
 
@@ -1898,10 +1933,14 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
 
     Agent Skills exposes activation intent through ``description``; legacy
     ``triggers`` metadata remains supported when present. Descriptions are not
-    passed to the legacy trigger grammar directly: only clauses carrying an
-    activation-intent signal are analyzed, with TR2 requiring invocation or
-    shadowing intent and TR3 using unanchored baiting patterns, so realistic
-    activation prose is detected while ordinary capability prose is skipped.
+    passed to the legacy trigger grammar directly: every clause is scanned
+    for cheap intent signals, and only clauses carrying one are analyzed.
+    TR1 extracts the trigger phrase from activation prose and applies the
+    broad/short-trigger rule to it; TR2 requires invocation or shadowing
+    intent (reachable without broad-activation wording); TR3 requires a
+    bounded activation condition plus an unconditional scope (or a bare
+    universal-scope statement). Realistic activation prose is detected while
+    ordinary capability prose is skipped.
     """
     triggers: list[str] = []
     raw = manifest.get("triggers", [])
@@ -2002,9 +2041,58 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
         clause_lower = clause.lower().strip()
         words = clause_lower.split()
 
+        # TR1 (description-calibrated): extract the trigger phrase the skill
+        # claims to activate on ("whenever the user says hello") and apply
+        # the broad/short-trigger rule to it, as the legacy triggers field
+        # does.
+        phrase_match = _DESCRIPTION_TRIGGER_PHRASE_RE.search(clause)
+        if phrase_match:
+            phrase = phrase_match.group("phrase")
+            phrase_lower = phrase.lower()
+            if len(phrase_lower.split()) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS:
+                findings.append(
+                    Finding(
+                        rule_id="TR1",
+                        message=(
+                            f"Overly Broad Trigger: description clause '{clause}' "
+                            f"activates on '{phrase}', a common word that will "
+                            "activate in many unintended contexts"
+                        ),
+                        severity="LOW",
+                        confidence=0.75,
+                        file=file_ref,
+                        start_line=i,
+                        tags=tag,
+                        matched_text=clause,
+                        category=PatternCategory.TRIGGER_ABUSE.value,
+                        pattern="Overly Broad Trigger",
+                    )
+                )
+            elif len(phrase_lower) <= 2:
+                findings.append(
+                    Finding(
+                        rule_id="TR1",
+                        message=(
+                            f"Overly Broad Trigger: description clause '{clause}' "
+                            f"activates on '{phrase}', which is too short and may "
+                            "match unintended inputs"
+                        ),
+                        severity="LOW",
+                        confidence=0.7,
+                        file=file_ref,
+                        start_line=i,
+                        tags=tag,
+                        matched_text=clause,
+                        category=PatternCategory.TRIGGER_ABUSE.value,
+                        pattern="Overly Broad Trigger",
+                    )
+                )
+
         # TR2 (description-calibrated): only flag a shadow command when the
         # clause shows invocation or shadowing intent; ordinary capability
         # prose such as "Build projects" stays out of the trigger path.
+        # Invocation clauses pass the extraction gate on their own, so no
+        # broad-activation wording is required.
         shadowed = sorted(
             {cmd for cmd in _BUILTIN_COMMANDS if cmd in {w.lstrip("/") for w in words}}
         )
@@ -2027,29 +2115,33 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
                 )
             )
 
-        # TR3 (description-calibrated): unanchored baiting patterns detect
-        # realistic activation prose such as "whenever the user sends any
-        # message", which the whole-string legacy grammar misses.
-        for bp in _DESCRIPTION_BAITING_PATTERNS:
-            if re.search(bp, clause_lower):
-                findings.append(
-                    Finding(
-                        rule_id="TR3",
-                        message=(
-                            f"Keyword Baiting Trigger: description clause '{clause}' "
-                            "is designed to match all or most user inputs"
-                        ),
-                        severity="MEDIUM",
-                        confidence=0.8,
-                        file=file_ref,
-                        start_line=i,
-                        tags=tag,
-                        matched_text=clause,
-                        category=PatternCategory.TRIGGER_ABUSE.value,
-                        pattern="Keyword Baiting Trigger",
-                    )
+        # TR3 (description-calibrated): require a bounded activation condition
+        # *and* an unconditional scope in the same clause. Bare behavior
+        # prose ("Always preserves file permissions when copying files") and
+        # subject-qualified scopes ("any questions about PostgreSQL") stay
+        # negative; a bare universal-scope statement ("all messages") still
+        # fires, as in the legacy trigger grammar.
+        has_condition = _DESCRIPTION_ACTIVATION_CONDITION_RE.search(clause) is not None
+        has_scope = _DESCRIPTION_UNIVERSAL_SCOPE_RE.search(clause) is not None
+        is_bare_scope = _DESCRIPTION_BARE_SCOPE_RE.fullmatch(clause_lower) is not None
+        if (has_condition and has_scope) or is_bare_scope:
+            findings.append(
+                Finding(
+                    rule_id="TR3",
+                    message=(
+                        f"Keyword Baiting Trigger: description clause '{clause}' "
+                        "is designed to match all or most user inputs"
+                    ),
+                    severity="MEDIUM",
+                    confidence=0.8,
+                    file=file_ref,
+                    start_line=i,
+                    tags=tag,
+                    matched_text=clause,
+                    category=PatternCategory.TRIGGER_ABUSE.value,
+                    pattern="Keyword Baiting Trigger",
                 )
-                break
+            )
 
     return findings
 

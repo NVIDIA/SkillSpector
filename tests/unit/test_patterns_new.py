@@ -2268,6 +2268,96 @@ class TestTriggerAnalysis:
         findings = sc_mod._analyze_triggers({"triggers": ["Build"]}, "myskill")
         assert any(finding.rule_id == "TR2" for finding in findings)
 
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param(
+                "Always preserves file permissions when copying files",
+                id="behavior_always",
+            ),
+            pytest.param(
+                "Answers any questions about PostgreSQL",
+                id="qualified_subject",
+            ),
+        ],
+    )
+    def test_description_benign_prose_not_tr3(self, description: str) -> None:
+        """rng1995 #541 P1: behavior prose needs a bounded condition + scope."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
+    def test_description_catch_all_positive_still_tr3(self) -> None:
+        """rng1995 #541 P1: bounded condition + scope still fires TR3."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user sends any message"},
+            "myskill",
+        )
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_shadow_command_without_activation_wording(self) -> None:
+        """rng1995 #541 P1: invocation intent alone opens the TR2 path."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Intercepts the /build command"},
+            "myskill",
+        )
+        assert "TR2" in {finding.rule_id for finding in findings}
+
+    @pytest.mark.parametrize("target_len", [120, 121])
+    def test_description_long_clause_window_still_analyzed(self, target_len: int) -> None:
+        """rng1995 #541 P1: 120/121-char clauses keep start-of-clause intent."""
+        base = "Use this skill whenever the user sends any message"
+        description = f"{base} {'x' * (target_len - len(base) - 1)}"
+        assert len(description) == target_len
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    @pytest.mark.parametrize("benign_count", [7, 8])
+    def test_description_trigger_clause_after_benign_padding(self, benign_count: int) -> None:
+        """rng1995 #541 P1: benign sentences cannot push a trigger clause out."""
+        benign = ". ".join(
+            f"Benign capability sentence number {n}" for n in range(1, benign_count + 1)
+        )
+        description = f"{benign}. Use this skill whenever the user sends any message"
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_broad_trigger_word_reaches_tr1(self) -> None:
+        """rng1995 #541 P2: TR1 fires on the trigger phrase in a description."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user says hello"},
+            "myskill",
+        )
+        tr1 = [finding for finding in findings if finding.rule_id == "TR1"]
+        assert len(tr1) == 1
+        assert "hello" in tr1[0].message
+
+    def test_description_tr1_from_skill_md_frontmatter(self, tmp_path) -> None:
+        """rng1995 #541 P2: TR1 is reachable end to end from SKILL.md frontmatter."""
+        from skillspector.nodes.build_context import _parse_manifest
+
+        skill_dir = tmp_path / "hello-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: hello-skill\n"
+            "description: Use this skill whenever the user says hello\n"
+            "---\n"
+            "# hello-skill\n",
+            encoding="utf-8",
+        )
+        manifest = _parse_manifest(skill_dir)
+        assert manifest["description"] == "Use this skill whenever the user says hello"
+        findings = sc_mod._analyze_triggers(manifest, "hello-skill")
+        assert any(finding.rule_id == "TR1" for finding in findings)
+
+    def test_description_capability_prose_reaches_no_trigger_rules(self) -> None:
+        """rng1995 #541 P2: normal capability prose stays negative on TR1."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Helps developers review pull requests efficiently"},
+            "myskill",
+        )
+        assert findings == []
+
 
 # ── Supply Chain Helpers ───────────────────────────────────────────────
 
