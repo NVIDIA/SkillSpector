@@ -193,12 +193,32 @@ _DISABLE_TRUSTED_TOP_LEVEL_KEYS: Final = frozenset(
         "$schema",
         "disableAllHooks",
         "env",
+        "fileSuggestion",
         "hooks",
         "includeCoAuthoredBy",
         "model",
         "permissions",
+        "statusLine",
     }
 )
+# Settings keys whose values are shell commands Claude Code runs on its own
+# once the settings are active (same execution surface as hook handlers).
+# apiKeyHelper and the auth/telemetry helpers run regardless of hooks;
+# statusLine and fileSuggestion commands are disabled by disableAllHooks.
+_SETTINGS_COMMAND_STRING_KEYS: Final = frozenset(
+    {
+        "apiKeyHelper",
+        "awsAuthRefresh",
+        "awsCredentialExport",
+        "gcpAuthRefresh",
+        "otelHeadersHelper",
+    }
+)
+_SETTINGS_COMMAND_OBJECT_KEYS: Final = frozenset({"fileSuggestion", "statusLine"})
+_SETTINGS_COMMAND_KEYS: Final = _SETTINGS_COMMAND_STRING_KEYS | _SETTINGS_COMMAND_OBJECT_KEYS
+# Command keys that disableAllHooks turns off (per the settings reference).
+_DISABLE_SUPPRESSED_COMMAND_KEYS: Final = frozenset({"fileSuggestion", "statusLine"})
+_ANTHROPIC_DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
 _HookIdentity = tuple[str, str, str]
 
 
@@ -235,9 +255,16 @@ class _PermissionDeclaration:
 
 
 @dataclass(frozen=True)
+class _SettingsCommandDeclaration:
+    key: str
+    command: str
+
+
+@dataclass(frozen=True)
 class _DeclarationScan:
     hooks: list[_HookDeclaration]
     permissions: list[_PermissionDeclaration]
+    settings_commands: list[_SettingsCommandDeclaration]
     partial: bool
     observed: int
 
@@ -1258,13 +1285,124 @@ def _permission_declarations(
     return declarations, partial, observed
 
 
+def _settings_command_value(key: str, value: object) -> str | None:
+    """Return the shell command a settings key causes Claude Code to run.
+
+    Returns "" for a recognized non-command variant (no command runs) and None
+    when the value shape is unmodeled.
+    """
+    if key in _SETTINGS_COMMAND_STRING_KEYS:
+        return value if isinstance(value, str) else None
+    if key in _SETTINGS_COMMAND_OBJECT_KEYS:
+        if not isinstance(value, dict):
+            return None
+        command_type = value.get("type")
+        if command_type != "command":
+            return "" if isinstance(command_type, str) else None
+        command = value.get("command")
+        if isinstance(command, str):
+            return command
+        if isinstance(command, list) and all(isinstance(part, str) for part in command):
+            return " ".join(command)
+        return None
+    return None
+
+
+def _settings_command_object_is_valid(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    command_type = value.get("type")
+    if command_type is not None and not _is_bounded_string(command_type):
+        return False
+    command = value.get("command")
+    if command is not None and not (
+        _is_bounded_string(command)
+        or (isinstance(command, list) and all(_is_bounded_string(part) for part in command))
+    ):
+        return False
+    return True
+
+
+def _settings_command_declarations(
+    document: dict[str, object], *, hooks_disabled: bool, limit: int
+) -> tuple[list[_SettingsCommandDeclaration], bool, int]:
+    """Extract command-running settings keys (BH4 declarations)."""
+    declarations: list[_SettingsCommandDeclaration] = []
+    partial = False
+    observed = 0
+    for key in sorted(set(document) & _SETTINGS_COMMAND_KEYS):
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        if key in _DISABLE_SUPPRESSED_COMMAND_KEYS and hooks_disabled:
+            continue
+        command = _settings_command_value(key, document[key])
+        if command is None:
+            partial = True
+            continue
+        if not command.strip():
+            continue
+        if not _is_bounded_string(command):
+            partial = True
+            continue
+        declarations.append(_SettingsCommandDeclaration(key=key, command=command))
+    return declarations, partial, observed
+
+
+def _settings_surface_declarations(
+    document: dict[str, object], *, limit: int
+) -> tuple[list[_PermissionDeclaration], bool, int]:
+    """Extract risky settings-level surface declarations (BH3 declarations)."""
+    declarations: list[_PermissionDeclaration] = []
+    partial = False
+    observed = 0
+    env = document.get("env")
+    if env is not None:
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        if not _is_bounded_string_map(env):
+            partial = True
+        else:
+            base_url = env.get("ANTHROPIC_BASE_URL")
+            if (
+                isinstance(base_url, str)
+                and base_url.strip()
+                and base_url.strip().rstrip("/").lower() != _ANTHROPIC_DEFAULT_BASE_URL
+            ):
+                declarations.append(_PermissionDeclaration(Severity.HIGH, "traffic_redirect"))
+    if "enableAllProjectMcpServers" in document:
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        value = document.get("enableAllProjectMcpServers")
+        if not _is_bool(value):
+            partial = True
+        elif value:
+            declarations.append(_PermissionDeclaration(Severity.CRITICAL, "mcp_auto_approve"))
+    servers = document.get("enabledMcpjsonServers")
+    if servers is not None:
+        observed += 1
+        if observed > limit:
+            return declarations, True, observed
+        if not _is_bounded_string_list(servers):
+            partial = True
+        elif servers:
+            declarations.append(_PermissionDeclaration(Severity.HIGH, "mcp_auto_approve"))
+    return declarations, partial, observed
+
+
 def _scan_declarations(
     path: str,
     document: object,
     previous_settings_hook_ids: set[_HookIdentity] | None = None,
+    *,
+    hooks_disabled: bool = False,
 ) -> _DeclarationScan:
     if not isinstance(document, dict):
-        return _DeclarationScan(hooks=[], permissions=[], partial=True, observed=0)
+        return _DeclarationScan(
+            hooks=[], permissions=[], settings_commands=[], partial=True, observed=0
+        )
     hooks, hook_partial, hook_observed = _hook_declarations(
         document,
         limit=_MAX_DECLARATIONS,
@@ -1274,13 +1412,34 @@ def _scan_declarations(
     permissions, permission_partial, permission_observed = _permission_declarations(
         path, document, limit=remaining
     )
+    observed = hook_observed + permission_observed
     is_settings = path in {".claude/settings.json", ".claude/settings.local.json"}
+    settings_commands: list[_SettingsCommandDeclaration] = []
+    settings_partial = False
+    settings_observed = 0
+    surface_partial = False
+    surface_observed = 0
+    if is_settings:
+        settings_commands, settings_partial, settings_observed = _settings_command_declarations(
+            document,
+            hooks_disabled=hooks_disabled,
+            limit=max(0, _MAX_DECLARATIONS - observed),
+        )
+        observed += settings_observed
+        surface_declarations, surface_partial, surface_observed = _settings_surface_declarations(
+            document, limit=max(0, _MAX_DECLARATIONS - observed)
+        )
+        permissions.extend(surface_declarations)
+        observed += surface_observed
     return _DeclarationScan(
         hooks=hooks,
         permissions=permissions,
+        settings_commands=settings_commands,
         partial=(
             hook_partial
             or permission_partial
+            or settings_partial
+            or surface_partial
             or (is_settings and not _modeled_settings_fields_are_valid(document))
             or (
                 is_settings
@@ -1289,7 +1448,7 @@ def _scan_declarations(
             )
             or (path == "hooks/hooks.json" and "hooks" not in document)
         ),
-        observed=hook_observed + permission_observed,
+        observed=observed,
     )
 
 
@@ -1407,6 +1566,20 @@ def _modeled_settings_fields_are_valid(document: dict[str, object]) -> bool:
     if "includeCoAuthoredBy" in document and not _is_bool(document.get("includeCoAuthoredBy")):
         return False
     if "env" in document and not _is_bounded_string_map(document.get("env")):
+        return False
+    for key in _SETTINGS_COMMAND_STRING_KEYS:
+        if key in document and not _is_bounded_string(document.get(key)):
+            return False
+    for key in _SETTINGS_COMMAND_OBJECT_KEYS:
+        if key in document and not _settings_command_object_is_valid(document.get(key)):
+            return False
+    if "enableAllProjectMcpServers" in document and not _is_bool(
+        document.get("enableAllProjectMcpServers")
+    ):
+        return False
+    if "enabledMcpjsonServers" in document and not _is_bounded_string_list(
+        document.get("enabledMcpjsonServers")
+    ):
         return False
     return _permissions_schema_allows_disable(document)
 
@@ -1617,6 +1790,29 @@ def _bh3_finding(path: str, declarations: list[_PermissionDeclaration]) -> Findi
     return finding
 
 
+def _bh4_finding(path: str, declarations: list[_SettingsCommandDeclaration]) -> Finding:
+    analyzer_finding = AnalyzerFinding(
+        rule_id="BH4",
+        message="Bundled settings keys run commands when the settings activate.",
+        severity=Severity.MEDIUM,
+        location=Location(path, 1),
+        confidence=0.95,
+        remediation=(
+            "Review bundled settings command keys before install; remove or narrow "
+            "any helper the skill does not need."
+        ),
+        tags=["Bundled Execution Surface", "Settings"],
+        matched_text=f"document:{path}",
+        evidence={
+            "activation_reason": "requires_settings_activation",
+            "activation_state": "conditional",
+            "command_keys": sorted({declaration.key for declaration in declarations})[:32],
+            "declaration_count": len(declarations),
+        },
+    )
+    return analyzer_finding_to_finding(analyzer_finding)
+
+
 def _analyze_document(
     path: str,
     content: str,
@@ -1646,7 +1842,9 @@ def _analyze_document(
             reason=LedgerReason.OPAQUE_CONTENT,
         )
 
-    scan = _scan_declarations(path, document, previous_settings_hook_ids)
+    scan = _scan_declarations(
+        path, document, previous_settings_hook_ids, hooks_disabled=hooks_disabled
+    )
     declarations = [] if hooks_disabled else scan.hooks
     proofs = [proof for declaration in declarations if (proof := _bh2_proof(declaration))]
     payload_unmodeled = _payload_analysis_level(declarations) == "unmodeled"
@@ -1658,6 +1856,8 @@ def _analyze_document(
         findings.append(_bh2_finding(path, proofs))
     if permission_declarations:
         findings.append(_bh3_finding(path, permission_declarations))
+    if scan.settings_commands:
+        findings.append(_bh4_finding(path, scan.settings_commands))
     if scan.partial or payload_unmodeled:
         return findings, ledger_event(
             outcome=LedgerOutcome.PARTIAL,
