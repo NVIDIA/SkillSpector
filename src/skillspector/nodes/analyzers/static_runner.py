@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -26,6 +27,7 @@ import unicodedata
 from array import array
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -111,7 +113,11 @@ _VIEW_START_EVIDENCE = "_security_view_start"
 _SOURCE_START_EVIDENCE = "_security_source_start"
 _SOURCE_END_EVIDENCE = "_security_source_end"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
-_BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
+_CONTEXTUAL_TRIAGE_TAG = "contextual-triage"
+_ActiveSecurityView = tuple[SecurityTextView, str]
+_ACTIVE_SECURITY_VIEW: ContextVar[_ActiveSecurityView | None] = ContextVar(
+    "static_runner_active_security_view", default=None
+)
 _ViewFindingKey = tuple[
     str,
     str,
@@ -244,6 +250,78 @@ def deduplicate_analyzer_findings(
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
+_PARAGRAPH_BOUNDARY = re.compile(
+    rf"(?>{LOGICAL_LINE_BREAK.pattern})[ \t]*(?>{LOGICAL_LINE_BREAK.pattern})"
+)
+_PARAGRAPH_RANGE_CACHE: dict[int, tuple[str, tuple[tuple[int, int], ...]]] = {}
+_PARAGRAPH_RANGE_CACHE_SIZE = 2
+_PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS = 1_000_000
+_PARAGRAPH_RANGE_CACHE_MAX_RANGES = 4_096
+
+
+def _paragraph_ranges(content: str) -> tuple[tuple[int, int], ...]:
+    cache_key = id(content)
+    cached = _PARAGRAPH_RANGE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is content:
+        return cached[1]
+
+    start = 0
+    ranges: list[tuple[int, int]] = []
+    for boundary in _PARAGRAPH_BOUNDARY.finditer(content):
+        ranges.append((start, boundary.start()))
+        start = boundary.end()
+    if not ranges:
+        result = ()
+    else:
+        ranges.append((start, len(content)))
+        result = tuple(ranges)
+
+    if (
+        len(content) <= _PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS
+        and len(result) <= _PARAGRAPH_RANGE_CACHE_MAX_RANGES
+    ):
+        if len(_PARAGRAPH_RANGE_CACHE) >= _PARAGRAPH_RANGE_CACHE_SIZE:
+            _PARAGRAPH_RANGE_CACHE.clear()
+        _PARAGRAPH_RANGE_CACHE[cache_key] = (content, result)
+    return result
+
+
+def iter_paragraph_matches(
+    pattern: str | re.Pattern[str], content: str, flags: int = 0
+) -> Iterator[re.Match[str]]:
+    """Match prose within paragraphs; executable and structured rules use finditer."""
+    regex = re.compile(pattern, flags)
+    ranges = _paragraph_ranges(content)
+    if not ranges:
+        yield from regex.finditer(content)
+        return
+    for start, end in ranges:
+        yield from regex.finditer(content, start, end)
+
+
+def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
+    """Return whether an active-view span is unchanged from its source text."""
+    active_view = _ACTIVE_SECURITY_VIEW.get()
+    if active_view is None or not 0 <= start < end <= len(content):
+        return False
+    view, source_text = active_view
+    if view.text is not content:
+        return False
+    if view.source_offsets is None:
+        return view.text is source_text
+    if end > len(view.source_offsets):
+        return False
+
+    source_start = view.source_offsets[start]
+    match_length = end - start
+    source_end = source_start + match_length
+    if source_end > len(source_text):
+        return False
+    if any(
+        view.source_offsets[index] != source_start + index - start for index in range(start, end)
+    ):
+        return False
+    return source_text[source_start:source_end] == content[start:end]
 
 
 def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
@@ -540,7 +618,7 @@ def analyzer_finding_to_finding(
         category=category,
         pattern=pattern,
         finding=finding_snippet,
-        explanation=get_explanation(af.rule_id),
+        explanation=af.explanation or get_explanation(af.rule_id),
         code_snippet=af.context,
         intent=None,
         evidence=dict(af.evidence),
@@ -551,6 +629,35 @@ def analyzer_finding_to_finding(
 def _uses_python_ast(module: object) -> bool:
     """Return whether a pattern module explicitly opts into the shared AST hook."""
     return getattr(module, "USES_PYTHON_AST", False) is True
+
+
+def _requires_python_ast(pattern_modules: list) -> bool:
+    """Return whether an analyzer or its postprocessor consumes the shared AST."""
+    return any(_uses_python_ast(module) for module in pattern_modules) or bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_PYTHON_AST") is True
+    )
+
+
+def _python_ast_for_path(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    python_ast_cache_key: str | None,
+) -> ParsedPythonFile | None:
+    """Return the shared parse needed by analyzer or postprocessor hooks."""
+    if len(content) > MAX_FILE_CHARS or not _requires_python_ast(pattern_modules):
+        return None
+    if _infer_file_type(path) != "python":
+        return None
+    return get_python_ast(python_ast_cache_key, content, path)
+
+
+def _explicit_module_hook(module: object, name: str) -> object | None:
+    """Return a hook only when the module or its class actually declares it."""
+    if inspect.getattr_static(module, name, None) is None:
+        return None
+    return getattr(module, name, None)
 
 
 def _uses_runtime_check(module: object) -> bool:
@@ -739,6 +846,7 @@ def _scan_path(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
@@ -749,10 +857,9 @@ def _scan_path(
         if _is_license_basename(path, file_type)
         else None
     )
-    python_ast: ParsedPythonFile | None = None
     if file_type == "python" and any(_uses_python_ast(module) for module in pattern_modules):
         finding_budget.check_runtime()
-        python_ast = get_python_ast(python_ast_cache_key, content, path)
+        python_ast = python_ast or get_python_ast(python_ast_cache_key, content, path)
         finding_budget.check_runtime()
 
     line_starts = logical_line_starts(content)
@@ -824,6 +931,12 @@ def _view_finding_key(finding: Finding) -> _ViewFindingKey:
 
 
 def _view_scope_key(finding: Finding) -> _ViewScopeKey:
+    # A mapped start column identifies the exact raw occurrence (and the end
+    # column scopes it further when available). Alternate security views may
+    # normalize characters inside that span and therefore produce a different
+    # content fingerprint; keep the fingerprint only as a fallback for legacy
+    # producers that lack precise columns.
+    occurrence_fingerprint = None if finding.start_column is not None else finding.fingerprint()
     return (
         finding.rule_id,
         finding.file,
@@ -831,8 +944,19 @@ def _view_scope_key(finding: Finding) -> _ViewScopeKey:
         finding.end_line,
         finding.start_column,
         finding.end_column,
-        finding.fingerprint(),
+        occurrence_fingerprint,
     )
+
+
+def _view_finding_strength(finding: Finding) -> tuple[int, float]:
+    """Rank classification without assuming public severity strings are valid."""
+    try:
+        severity = Severity(finding.severity)
+    except ValueError:
+        severity_rank = len(_ANALYZER_SEVERITY_ORDER)
+    else:
+        severity_rank = _ANALYZER_SEVERITY_ORDER[severity]
+    return severity_rank, -finding.confidence
 
 
 def _projection_finding_key(finding: Finding) -> tuple[object, ...]:
@@ -884,23 +1008,30 @@ def _deduplicate_view_findings(findings: list[Finding]) -> list[Finding]:
     raw_keys = {
         _view_finding_key(finding) for finding in findings if "normalized-view" not in finding.tags
     }
-    raw_non_benign_scopes = {
-        _view_scope_key(finding)
-        for finding in findings
-        if "normalized-view" not in finding.tags and not _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
-    }
+    raw_non_contextual_strength: dict[_ViewScopeKey, tuple[int, float]] = {}
+    for finding in findings:
+        if "normalized-view" in finding.tags or _CONTEXTUAL_TRIAGE_TAG in finding.tags:
+            continue
+        scope = _view_scope_key(finding)
+        strength = _view_finding_strength(finding)
+        previous = raw_non_contextual_strength.get(scope)
+        if previous is None or strength < previous:
+            raw_non_contextual_strength[scope] = strength
     for finding in findings:
         key = _view_finding_key(finding)
         if "normalized-view" in finding.tags and key in raw_keys:
             continue
         if (
             "normalized-view" in finding.tags
-            and _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
-            and _view_scope_key(finding) in raw_non_benign_scopes
+            and _CONTEXTUAL_TRIAGE_TAG in finding.tags
+            and (raw_strength := raw_non_contextual_strength.get(_view_scope_key(finding)))
+            is not None
+            and raw_strength <= _view_finding_strength(finding)
         ):
-            # Normalization may make an ambiguous raw occurrence look benign.
-            # Prefer the raw non-benign signal, but never suppress a derived
-            # unsafe classification that exposes obfuscated content.
+            # Normalization may erase a raw separator and make the same exact
+            # occurrence appear contextually qualified. Prefer an equally or
+            # more severe raw classification; retain a stronger derived signal
+            # that actually exposes obfuscated content.
             continue
         if key in seen:
             continue
@@ -915,16 +1046,23 @@ def _scan_view_windows(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None,
+    *,
+    source_text: str,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Scan one already-bounded view."""
-    findings, resource_limit = _scan_path(
-        path,
-        view.text,
-        pattern_modules,
-        finding_budget,
-        python_ast_cache_key,
-    )
+    view_token = _ACTIVE_SECURITY_VIEW.set((view, source_text))
+    try:
+        findings, resource_limit = _scan_path(
+            path,
+            view.text,
+            pattern_modules,
+            finding_budget,
+            python_ast_cache_key,
+        )
+    finally:
+        _ACTIVE_SECURITY_VIEW.reset(view_token)
     for finding in findings:
+        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
         if not isinstance(local_start, int) and finding.start_column is not None:
             local_start = _line_start_offset(view.text, finding.start_line) + finding.start_column
@@ -1324,6 +1462,7 @@ def _scan_declared_marker_views(
                         pattern_modules,
                         view_budget,
                         None,
+                        source_text=raw_window,
                     )
                     _restore_source_lines(
                         view_findings,
@@ -1374,13 +1513,29 @@ def _scan_all_views_detailed(
     *,
     max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
     timeout_seconds: float | None = None,
+    started_at: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
+    started_at = time.monotonic() if started_at is None else started_at
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
+    if python_ast is None:
+        python_ast = _python_ast_for_path(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+        )
+    python_syntax_error = bool(
+        _infer_file_type(path) == "python"
+        and len(content) <= MAX_FILE_CHARS
+        and _requires_python_ast(pattern_modules)
+        and python_ast is not None
+        and python_ast.tree is None
+    )
     findings: list[Finding] = []
     seen_findings: set[_ViewFindingKey] = set()
-    started_at = time.monotonic()
     runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
     if timeout_seconds is not None:
         runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
@@ -1477,6 +1632,7 @@ def _scan_all_views_detailed(
                 ast_modules,
                 finding_budget,
                 python_ast_cache_key,
+                python_ast,
             )
         except _StaticResourceLimitError as exc:
             return _deduplicate_view_findings(findings), exc.reason, exc.metrics
@@ -1571,6 +1727,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            source_text=raw_window,
                         )
                     except _StaticResourceLimitError as exc:
                         return (
@@ -1653,6 +1810,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            source_text=continuity.view.text,
                         )
                         _restore_source_lines(
                             view_findings,
@@ -1707,7 +1865,9 @@ def _scan_all_views_detailed(
     return (
         deduplicated,
         (
-            LedgerReason.STATIC_PARSE_LIMIT
+            LedgerReason.SYNTAX_ERROR
+            if python_syntax_error
+            else LedgerReason.STATIC_PARSE_LIMIT
             if bounded_parse_limited
             else LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
             if marker_projection_limited
@@ -1725,6 +1885,8 @@ def _scan_all_views(
     *,
     max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
     timeout_seconds: float | None = None,
+    started_at: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -1733,8 +1895,72 @@ def _scan_all_views(
         python_ast_cache_key,
         max_findings=max_findings,
         timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        python_ast=python_ast,
     )
     return findings
+
+
+def _postprocess_path_findings(
+    content: str,
+    pattern_modules: list,
+    findings: list[Finding],
+    *,
+    python_ast: ParsedPythonFile | None = None,
+    started_at: float | None = None,
+    timeout_seconds: float | None = None,
+) -> list[Finding]:
+    """Let one analyzer family reconcile findings after every view has run."""
+    hook = (
+        _explicit_module_hook(pattern_modules[0], "postprocess_path_findings")
+        if pattern_modules
+        else None
+    )
+    if not callable(hook):
+        return findings
+    uses_python_ast = bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_PYTHON_AST") is True
+    )
+    uses_runtime_budget = bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_RUNTIME_BUDGET") is True
+    )
+    if uses_python_ast or uses_runtime_budget:
+        kwargs: dict[str, object] = {}
+        if uses_python_ast:
+            kwargs["python_ast"] = python_ast
+        if uses_runtime_budget:
+            kwargs.update(
+                {
+                    "started_at": started_at,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+        return cast(list[Finding], hook(content, findings, **kwargs))
+    return cast(list[Finding], hook(content, findings))
+
+
+def _cleanup_expired_path_findings(
+    pattern_modules: list,
+    findings: list[Finding],
+) -> list[Finding]:
+    """Run only a module's bounded private-evidence cleanup after a deadline."""
+    hook = (
+        _explicit_module_hook(pattern_modules[0], "cleanup_path_findings")
+        if pattern_modules
+        else None
+    )
+    if callable(hook):
+        return cast(list[Finding], hook(findings))
+    has_postprocessor = bool(
+        pattern_modules
+        and callable(_explicit_module_hook(pattern_modules[0], "postprocess_path_findings"))
+    )
+    # A module requiring postprocessing owns the contract that turns its private
+    # intermediate findings into public objects. Without an explicit bounded
+    # cleanup hook, dropping that partial prefix is safer than leaking it.
+    return [] if has_postprocessor else findings
 
 
 def run_static_patterns(
@@ -1783,19 +2009,51 @@ def run_static_patterns(
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
         if remaining <= 0:
             break
+        path_started_at = time.monotonic()
         shared_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
         if shared_remaining is not None and shared_remaining <= 0:
             break
-        findings.extend(
-            _scan_all_views(
-                path,
+        python_ast = _python_ast_for_path(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+        )
+        path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
+        path_findings, resource_limit, _ = _scan_all_views_detailed(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+            max_findings=path_limit,
+            timeout_seconds=shared_remaining,
+            started_at=path_started_at,
+            python_ast=python_ast,
+        )
+        runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+        if shared_remaining is not None:
+            runtime_limit = min(runtime_limit, max(0.0, shared_remaining))
+        expired = (
+            resource_limit is LedgerReason.RUNTIME_LIMIT
+            or time.monotonic() - path_started_at >= runtime_limit
+        )
+        if expired:
+            path_findings = _cleanup_expired_path_findings(pattern_modules, path_findings)
+        else:
+            path_findings = _postprocess_path_findings(
                 content,
                 pattern_modules,
-                python_ast_cache_key,
-                max_findings=min(MAX_FINDINGS_PER_ARTIFACT, remaining),
-                timeout_seconds=shared_remaining,
+                path_findings,
+                python_ast=python_ast,
+                started_at=path_started_at,
+                timeout_seconds=runtime_limit,
             )
-        )
+            if time.monotonic() - path_started_at >= runtime_limit:
+                path_findings = _cleanup_expired_path_findings(
+                    pattern_modules,
+                    path_findings,
+                )
+        findings.extend(path_findings[:path_limit])
 
     return findings
 
@@ -1882,6 +2140,7 @@ def run_static_patterns_with_ledger(
                 )
             else:
                 remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
+                path_started_at = time.monotonic()
                 shared_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
                 path_findings: list[Finding]
                 resource_limit: LedgerReason | None
@@ -1895,14 +2154,98 @@ def run_static_patterns_with_ledger(
                     }
                 else:
                     try:
+                        python_ast = _python_ast_for_path(
+                            path,
+                            content,
+                            pattern_modules,
+                            python_ast_cache_key,
+                        )
+                        path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
                         path_findings, resource_limit, resource_metrics = _scan_all_views_detailed(
                             path,
                             content,
                             pattern_modules,
                             python_ast_cache_key,
-                            max_findings=min(MAX_FINDINGS_PER_ARTIFACT, remaining),
+                            max_findings=path_limit,
                             timeout_seconds=shared_remaining,
+                            started_at=path_started_at,
+                            python_ast=python_ast,
                         )
+                        has_postprocessor = bool(
+                            pattern_modules
+                            and callable(
+                                _explicit_module_hook(
+                                    pattern_modules[0],
+                                    "postprocess_path_findings",
+                                )
+                            )
+                        )
+                        runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+                        if shared_remaining is not None:
+                            runtime_limit = min(runtime_limit, max(0.0, shared_remaining))
+                        observed_seconds = (
+                            float(resource_metrics.get("observed_seconds", 0.0))
+                            if resource_limit is LedgerReason.RUNTIME_LIMIT
+                            else max(0.0, time.monotonic() - path_started_at)
+                        )
+                        expired = (
+                            resource_limit is LedgerReason.RUNTIME_LIMIT
+                            or observed_seconds >= runtime_limit
+                        )
+                        if expired:
+                            resource_limit = LedgerReason.RUNTIME_LIMIT
+                            resource_metrics = {
+                                "observed_seconds": observed_seconds,
+                                "limit_seconds": runtime_limit,
+                            }
+                            path_findings = _cleanup_expired_path_findings(
+                                pattern_modules,
+                                path_findings,
+                            )
+                        elif has_postprocessor:
+                            path_findings = _postprocess_path_findings(
+                                content,
+                                pattern_modules,
+                                path_findings,
+                                python_ast=python_ast,
+                                started_at=path_started_at,
+                                timeout_seconds=runtime_limit,
+                            )
+                            observed_seconds = max(0.0, time.monotonic() - path_started_at)
+                            if observed_seconds >= runtime_limit:
+                                resource_limit = LedgerReason.RUNTIME_LIMIT
+                                resource_metrics = {
+                                    "observed_seconds": observed_seconds,
+                                    "limit_seconds": runtime_limit,
+                                }
+                                path_findings = _cleanup_expired_path_findings(
+                                    pattern_modules,
+                                    path_findings,
+                                )
+                        if len(path_findings) > path_limit:
+                            postprocessed_count = len(path_findings)
+                            path_findings = path_findings[:path_limit]
+                            if resource_limit is not LedgerReason.RUNTIME_LIMIT:
+                                if remaining < MAX_FINDINGS_PER_ARTIFACT:
+                                    observed_findings = len(findings) + postprocessed_count
+                                    limit_findings = MAX_FINDINGS_PER_ANALYZER
+                                else:
+                                    observed_findings = postprocessed_count
+                                    limit_findings = MAX_FINDINGS_PER_ARTIFACT
+                                if resource_limit is LedgerReason.OUTPUT_LIMIT:
+                                    observed_findings = max(
+                                        observed_findings,
+                                        int(resource_metrics.get("observed_findings", 0)),
+                                    )
+                                resource_limit = LedgerReason.OUTPUT_LIMIT
+                                resource_metrics = {
+                                    "observed_findings": observed_findings,
+                                    "limit_findings": limit_findings,
+                                }
+                    except _StaticResourceLimitError as exc:
+                        path_findings = []
+                        resource_limit = exc.reason
+                        resource_metrics = exc.metrics
                     except Exception as exc:
                         logger.warning("%s: scan error on %s: %s", analyzer_id, path, exc)
                         event = ledger_event(
@@ -1926,7 +2269,7 @@ def run_static_patterns_with_ledger(
                 partial = resource_limit is not None or (
                     _infer_file_type(path) == "python"
                     and len(content) > MAX_FILE_CHARS
-                    and any(_uses_python_ast(module) for module in pattern_modules)
+                    and _requires_python_ast(pattern_modules)
                 )
                 partial_reason = resource_limit or LedgerReason.SIZE_LIMIT
                 event = ledger_event(

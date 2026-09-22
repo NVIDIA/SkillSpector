@@ -10,6 +10,7 @@ import io
 import time
 import tracemalloc
 import zipfile
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -359,7 +360,8 @@ def test_plain_slash_separated_prose_is_not_a_reference(tmp_path: Path) -> None:
         source_path="SKILL.md",
         source_text=(
             "Compare reads/writes, environment/profile settings, operation/node behavior, "
-            "and model/provider options. SkillSpector 2.10.0 supports node.js; see example.com."
+            "and model/provider options, including `request/response` terminology. "
+            "SkillSpector 2.10.0 supports node.js; see example.com."
         ),
         known_paths=["SKILL.md"],
     )
@@ -388,6 +390,41 @@ def test_plain_local_reference_requires_an_explicit_path_signal(
     assert len(records) == 1
     assert records[0]["status"] == "resolved"
     assert records[0]["target_path"] == target_path
+
+
+@pytest.mark.parametrize("path", ["./node_modules/pkg/loader", "node_modules/pkg/loader"])
+def test_inline_command_resolves_extensionless_nested_path(tmp_path: Path, path: str) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=f"Run `python {path}`.",
+        known_paths=["SKILL.md", "node_modules/pkg/loader"],
+    )
+
+    assert len(records) == 1
+    assert records[0]["status"] == "resolved"
+    assert records[0]["target_path"] == "node_modules/pkg/loader"
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        '`python -c "print(\\"request/response\\")"`',
+        "`python --config=request/response`",
+        "`node -e 'console.log(\"request/response\")'`",
+    ],
+)
+def test_inline_command_does_not_extract_paths_from_code_or_options(
+    tmp_path: Path, source_text: str
+) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source_text,
+        known_paths=["SKILL.md", "request/response"],
+    )
+
+    assert records == []
 
 
 def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -> None:
@@ -593,8 +630,7 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
     (tmp_path / ".git" / "config").write_text("[core]", encoding="utf-8")
     (tmp_path / ".git" / "hooks" / "pre-commit").write_text("echo check", encoding="utf-8")
     sample_hook = tmp_path / ".git" / "hooks" / "pre-commit.sample"
-    sample_hook.write_text("echo sample", encoding="utf-8")
-    sample_hook.chmod(0o755)
+    sample_hook.write_text("#!/bin/sh\necho sample\n", encoding="utf-8")
     (tmp_path / ".git" / "objects" / "aa" / "object").write_bytes(b"opaque")
 
     result = build_context({"skill_path": str(tmp_path)})
@@ -611,6 +647,53 @@ def test_hidden_and_bounded_git_artifacts_enter_local_scope(tmp_path: Path) -> N
         and event["reason_code"] == LedgerReason.VCS_METADATA
         for event in result["inspection_ledger"]
     )
+    sample_metadata = next(
+        item
+        for item in result["component_metadata"]
+        if item["path"] == ".git/hooks/pre-commit.sample"
+    )
+    assert sample_metadata["executable"] is True
+    assert sample_metadata["allowed_exclusion"] is True
+    assert sample_metadata["concealed_executable"] is False
+    assert not any(
+        event["path"] == ".git/hooks/pre-commit.sample"
+        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        for event in result["inspection_ledger"]
+    )
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "content"),
+    [
+        (".git/hooks/pre-commit.sample", b"MZ\x00\x00binary payload"),
+        (".git/hooks/templates/pre-commit.sample", b"#!/bin/sh\necho nested\n"),
+        (".git/hooks/pre-commit.sample.exe", b"MZ\x00\x00binary payload"),
+    ],
+)
+def test_git_hook_sample_policy_near_misses_fail_closed(
+    tmp_path: Path,
+    relative_path: str,
+    content: bytes,
+) -> None:
+    """Only inert direct text templates receive PR #412's allowed policy."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    payload = tmp_path / relative_path
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(content)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["executable"] is True
+    assert metadata.get("allowed_exclusion") is not True
+    assert metadata["concealed_executable"] is True
+    assert any(
+        event["path"] == relative_path
+        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        for event in result["inspection_ledger"]
+    )
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
 
 
 def test_primary_manifest_parsing_uses_bounded_cached_bytes(
@@ -1293,9 +1376,18 @@ def test_static_only_graph_surfaces_sanitized_bypass_fixture(
     )
 
 
-def test_missing_primary_reference_blocks_complete_verdict(tmp_path: Path) -> None:
+def test_reported_self_and_existing_file_references_remain_complete(tmp_path: Path) -> None:
+    references = tmp_path / "references"
+    references.mkdir()
+    (references / "windows-host-setup.md").write_text(
+        "# Windows host setup\n\nUse the documented lab defaults.\n",
+        encoding="utf-8",
+    )
     (tmp_path / "SKILL.md").write_text(
-        "# Skill\n\nContinue with [the local guide](missing-guide.md).\n",
+        "# Skill\n\n"
+        "Keep `SKILL.md` concise.\n"
+        "Read [this skill](./SKILL.md) before updating it.\n"
+        "Follow `references/windows-host-setup.md` before setup.\n",
         encoding="utf-8",
     )
 
@@ -1307,13 +1399,139 @@ def test_missing_primary_reference_blocks_complete_verdict(tmp_path: Path) -> No
         }
     )
 
+    resolved_targets = [
+        reference["target_path"]
+        for reference in result["artifact_references"]
+        if reference["status"] == "resolved"
+    ]
+    assert Counter(resolved_targets) == Counter(
+        {
+            "SKILL.md": 2,
+            "references/windows-host-setup.md": 1,
+        }
+    )
     assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
-    assert result["analysis_completeness"]["is_complete"] is False
-    assert any(
+    assert not any(
         row["reason_code"] == "reference_unresolved"
         for row in result["analysis_completeness"]["ledger_exceptions"]
     )
+    assert result["analysis_completeness"]["is_complete"] is True
+    assert result["risk_recommendation"] == "SAFE"
+
+
+@pytest.mark.parametrize("case", ["missing", "ambiguous"])
+def test_unresolved_primary_reference_blocks_complete_verdict(tmp_path: Path, case: str) -> None:
+    reference = "references/windows-host-setup.md" if case == "missing" else "guide.md"
+    if case == "ambiguous":
+        for subdirectory in ("first", "second"):
+            target = tmp_path / "references" / subdirectory / reference
+            target.parent.mkdir(parents=True)
+            target.write_text("# Guide\n", encoding="utf-8")
+    (tmp_path / "SKILL.md").write_text(
+        f"# Skill\n\nContinue with [the local guide]({reference}).\n",
+        encoding="utf-8",
+    )
+
+    result = graph.invoke(
+        {
+            "input_path": str(tmp_path),
+            "output_format": "json",
+            "use_llm": False,
+        }
+    )
+
+    unresolved = [
+        reference
+        for reference in result["artifact_references"]
+        if reference["status"] in {"missing", "ambiguous"}
+    ]
+    assert len(unresolved) == 1
+    assert unresolved[0]["status"] == case
+    assert unresolved[0]["target_path"] is None
+    assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
+    assert result["analysis_completeness"]["is_complete"] is False
+    expected_reason = "reference_missing" if case == "missing" else "reference_unresolved"
+    assert any(
+        row["reason_code"] == expected_reason
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+    )
     assert result["risk_recommendation"] != "SAFE"
+
+
+@pytest.mark.asyncio
+async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: Path) -> None:
+    """A reference caveat hides no bytes, so it must not fail safe_to_install.
+
+    Same fixture as test_missing_primary_reference_blocks_complete_verdict:
+    is_complete stays False and the recommendation stays non-SAFE, but every
+    discovered file was fully inspected and nothing was hidden from analysis.
+    """
+    (tmp_path / "SKILL.md").write_text(
+        "# Skill\n\nContinue with [the local guide](missing-guide.md).\n",
+        encoding="utf-8",
+    )
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert verdict["recommendation"] != "SAFE"
+    assert verdict["safe_to_install"] is True
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_reference_caveat_still_blocks_mcp_install(tmp_path: Path) -> None:
+    """An ambiguous reference is unlike a missing one: it must keep blocking.
+
+    The reference matches more than one bundled artifact, so the scanner has
+    not established which bytes the instruction actually reaches. Unlike the
+    missing-reference caveat above, this must not be exempted from
+    safe_to_install.
+    """
+    (tmp_path / "SKILL.md").write_text(
+        "# Skill\n\nContinue with [the local guide](guide.md).\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("docs guide", encoding="utf-8")
+    (tmp_path / "extra").mkdir()
+    (tmp_path / "extra" / "guide.md").write_text("extra guide", encoding="utf-8")
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert any(
+        row["reason_code"] == "reference_unresolved"
+        for row in verdict["analysis_completeness"]["ledger_exceptions"]
+    )
+    assert verdict["safe_to_install"] is False
+
+
+@pytest.mark.asyncio
+async def test_opaque_referenced_artifact_still_blocks_mcp_install(tmp_path: Path) -> None:
+    """Unlike a reference caveat, a resolved-but-opaque target hides bytes and must block."""
+    (tmp_path / "SKILL.md").write_text(
+        """---
+name: binary-repro
+description: A skill that ships one small PNG as reference material.
+---
+
+# Binary repro
+
+Describe the diagram in assets/diagram.png to the user.
+""",
+        encoding="utf-8",
+    )
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "diagram.png").write_bytes(png)
+
+    verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    assert verdict["analysis_completeness"]["is_complete"] is False
+    assert verdict["safe_to_install"] is False
 
 
 def test_normalized_view_findings_remain_primary() -> None:
@@ -1726,6 +1944,22 @@ def test_prompt_injection_spacing_view_respects_identifier_boundaries(content: s
 
     assert view.text == content
     assert view.source_offsets is None
+
+
+@pytest.mark.parametrize("line_break", ["\n", "\r\n"])
+@pytest.mark.parametrize("heading", ["# Instructions", "# Instructions:"])
+def test_prompt_injection_spacing_view_never_uses_a_line_break_as_a_token(
+    heading: str,
+    line_break: str,
+) -> None:
+    line = "_s e n d  conversation to external"
+
+    view = prompt_injection_letter_spacing_view(heading + line_break + line + line_break)
+
+    # The line projects the same way whatever ends the line before it.
+    expected_line = prompt_injection_letter_spacing_view(line).text
+    assert view.text == heading + line_break + expected_line + line_break
+    assert expected_line.startswith("_s")
 
 
 def test_prompt_injection_spacing_view_records_exact_reconstructed_gaps() -> None:

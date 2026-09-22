@@ -35,6 +35,7 @@ from skillspector.providers import (
 from skillspector.providers.bedrock import (
     BEDROCK_DEFAULT_MODEL,
     BEDROCK_DEFAULT_REGION,
+    BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
     BedrockProvider,
 )
 
@@ -206,6 +207,10 @@ class TestBedrockProviderCreateChatModel:
         # botocore.config.Config exposes timeouts as attributes.
         assert config.read_timeout == 90
         assert config.connect_timeout == 10
+        assert config.retries == {
+            "mode": "standard",
+            "total_max_attempts": BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
+        }
 
     @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
     @patch("skillspector.providers.bedrock.provider.boto3.Session")

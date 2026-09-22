@@ -47,6 +47,7 @@
 * fix(provider): preserve the original custom CLI-provider call contract for ordinary scans
 * build: move LangGraph Studio tooling to the langgraph-dev optional extra (550b9f0)
 * ci: keep eligible pull-request branches current after main changes (#376)
+* Report HIGH SC10 findings when package-manager configuration changes a dependency source trust boundary.
 ---
 ### 2.9.6 (Tuesday, August 18, 2026)
 ### Features/Bug Fixes

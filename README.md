@@ -4,8 +4,6 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/NVIDIA/SkillSpector/badge)](https://scorecard.dev/viewer/?uri=github.com/NVIDIA/SkillSpector)
-[![HVTrust](https://hvtracker.net/badge/skillspector.svg)](https://hvtracker.net/agents/skillspector/)
 
 ## Overview
 
@@ -21,11 +19,12 @@ SkillSpector is part of the [NVIDIA Verified Skills pipeline](https://docs.nvidi
 - **[Development guide](docs/DEVELOPMENT.md)** — Architecture, package layout, and how to extend the analyzer pipeline.
 - **[Analysis resource bounds](docs/ANALYSIS_RESOURCE_BOUNDS.md)** — Fail-closed bundle, parser, nested-artifact, ledger, and finding ceilings.
 - **[Pi extension](docs/PI_EXTENSION.md)** — Install SkillSpector as a Pi tool for scanning skills from inside agent sessions.
+- **[OpenCode extension](docs/OPENCODE_EXTENSION.md)** — Install SkillSpector as an OpenCode tool and `/skillspector` command for scanning skills from inside agent sessions.
 
 ## Features
 
 - **Multi-format input**: Scan Git repos, URLs, zip files, directories, or single files
-- **101 vulnerability patterns** across 23 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, agent snooping, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, server-side request forgery, insecure deserialization, YARA signatures, MCP least privilege, MCP tool poisoning, bundled execution surface, analysis evasion, and MCP rug pull
+- **102 vulnerability patterns** across 23 categories: prompt injection, data exfiltration, privilege escalation, supply chain, excessive agency, output handling, system prompt leakage, memory poisoning, tool misuse, rogue agent, agent snooping, anti-refusal, trigger abuse, dangerous code (AST), taint tracking, server-side request forgery, insecure deserialization, YARA signatures, MCP least privilege, MCP tool poisoning, bundled execution surface, analysis evasion, and MCP rug pull
 - **Two-stage analysis**: Fast static analysis + optional LLM semantic evaluation
 - **Live vulnerability lookups**: SC4 queries [OSV.dev](https://osv.dev) for real-time CVE data with automatic offline fallback
 - **Multiple output formats**: Terminal, JSON, Markdown, and SARIF reports
@@ -243,6 +242,7 @@ inference gateways.
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.31 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
 
 ```bash
 # Stock OpenAI
@@ -289,6 +289,13 @@ skillspector scan ./my-skill/
 # Local Codex CLI — no API key; uses your existing `codex login` session
 # Requires: codex CLI installed and authenticated
 export SKILLSPECTOR_PROVIDER=codex_cli
+skillspector scan ./my-skill/
+
+# Gemini (via OpenAI compatibility layer)
+export SKILLSPECTOR_PROVIDER=openai
+export OPENAI_API_KEY="YOUR_GEMINI_API_KEY"
+export OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+export SKILLSPECTOR_MODEL=gemini-3.5-flash
 skillspector scan ./my-skill/
 
 # Local Ollama — no API key
@@ -372,7 +379,7 @@ claude mcp add skillspector -- skillspector mcp
 
 ## Vulnerability Patterns
 
-SkillSpector detects **101 vulnerability patterns** across 23 categories:
+SkillSpector detects **102 vulnerability patterns** across 23 categories:
 
 ### Prompt Injection (6 patterns)
 
@@ -413,7 +420,7 @@ SkillSpector detects **101 vulnerability patterns** across 23 categories:
 | PE4 | Docker Socket Access | HIGH | Mounting or connecting to the Docker socket (`/var/run/docker.sock`), enabling container/host escape |
 | PE5 | Privileged Container / Escape | HIGH | `--privileged`, shared host namespaces, or other flags that remove the container security boundary |
 
-### Supply Chain (9 patterns)
+### Supply Chain (10 patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -426,6 +433,7 @@ SkillSpector detects **101 vulnerability patterns** across 23 categories:
 | SC7 | Untrusted Container Image | HIGH | Pulling container images with signature or registry verification disabled |
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 | SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
+| SC10 | Dependency Source Redirection | HIGH | Package-manager source added, replaced, or unresolved |
 
 ### Excessive Agency (5 patterns)
 
@@ -659,7 +667,7 @@ Issues (2)
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `codex_cli`, or `gemini_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `codex_cli`, `gemini_cli`, or `opencode_cli`. Hosted providers use bundled `model_registry.yaml` defaults; CLI providers fall back to the local runtime's default model unless `SKILLSPECTOR_MODEL` is set. Defaults to `nv_build`. | Optional |
 | `NVIDIA_INFERENCE_KEY` | Credential for the `nv_build` provider (build.nvidia.com). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=nv_build` |
 | `OPENAI_API_KEY` | Credential for the OpenAI provider (`SKILLSPECTOR_PROVIDER=openai`). Also serves as the tier-2 fallback in the credential waterfall when the active provider returns no credentials. | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=openai` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | Optional |
@@ -685,7 +693,9 @@ Issues (2)
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 
-> **CLI providers** (`claude_cli`, `codex_cli`, `gemini_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
+> **CLI providers** (`claude_cli`, `codex_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
+>
+> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.31`, the version whose configuration precedence and deny-all semantics are verified by this release.
 
 ### CLI Options
 

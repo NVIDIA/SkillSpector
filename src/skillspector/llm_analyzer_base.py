@@ -32,16 +32,22 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
+from random import uniform
 from typing import Any, Literal, cast
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from skillspector.inference_usage import InferenceUsageRecord
+from skillspector.inference_usage import (
+    InferenceUsageRecord,
+    chat_model_controls,
+    chat_model_requested_controls,
+)
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
@@ -52,10 +58,12 @@ from skillspector.inspection_ledger import (
     outcome_for_llm_batch_failure,
 )
 from skillspector.llm_utils import (
+    AgentCLIChatModel,
     StructuredOutputParseError,
     _AgentCLIMessage,
     _ainvoke_with_usage,
     _invoke_with_usage,
+    chat_model_provider_name,
     get_chat_model,
     new_inference_usage_collector,
 )
@@ -68,6 +76,8 @@ logger = get_logger(__name__)
 DEFAULT_MAX_LLM_CONCURRENCY = 10
 API_CONNECTION_MAX_RETRIES = 3
 API_CONNECTION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+RATE_LIMIT_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0)
+PROVIDER_RETRY_AFTER_MAX_SECONDS = 60.0
 STRUCTURED_RESPONSE_MAX_RETRIES = 3
 STRUCTURED_RESPONSE_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_RETRIES + 1
 STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS = API_CONNECTION_RETRY_DELAYS_SECONDS
@@ -113,9 +123,252 @@ class LLMRuntimeLimitError(RuntimeError):
     """Signal that no shared scan time remains for an LLM operation."""
 
 
-def _is_retryable_api_connection_error(exc: BaseException) -> bool:
-    """Return whether *exc* is the narrowly supported transient provider failure."""
-    return type(exc).__name__ == "APIConnectionError"
+_RETRYABLE_PROVIDER_ERROR_NAMES = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectionClosedError",
+        "ConnectionError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ConnectTimeoutError",
+        "EndpointConnectionError",
+        "HTTPClientError",
+        "InternalServerError",
+        "ModelNotReadyException",
+        "PoolTimeout",
+        "ProxyConnectionError",
+        "RateLimitError",
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "RemoteProtocolError",
+        "ResponseStreamingError",
+        "ServiceUnavailableError",
+        "SSLError",
+        "ThrottlingException",
+        "WriteTimeout",
+    }
+)
+_RETRYABLE_PROVIDER_STATUS_CODES = frozenset({408, 409, 425, 429})
+_NATIVE_RETRYABLE_PROVIDER_ERROR_NAMES = frozenset({"APIConnectionError", "APITimeoutError"})
+_NATIVE_RETRYABLE_PROVIDER_STATUS_CODES = frozenset({408, 409, 429})
+_RETRYABLE_BEDROCK_ERROR_CODES = frozenset(
+    {
+        "ec2throttledexception",
+        "internalserverexception",
+        "modelnotreadyexception",
+        "priorrequestnotcomplete",
+        "requestlimitexceeded",
+        "requesttimeout",
+        "requesttimeoutexception",
+        "servicetemporarilyunavailable",
+        "serviceunavailableexception",
+        "slowdown",
+        "throttling",
+        "throttlingexception",
+        "toomanyrequestsexception",
+    }
+)
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Return a short, cycle-safe exception chain for provider wrappers."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(chain) < 8:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _provider_status_code(exc: BaseException) -> int | None:
+    """Read an HTTP status from OpenAI, Anthropic, httpx, or botocore shapes."""
+    response = getattr(exc, "response", None)
+    candidates: list[object] = [getattr(exc, "status_code", None)]
+    if isinstance(response, Mapping):
+        metadata = response.get("ResponseMetadata")
+        if isinstance(metadata, Mapping):
+            candidates.append(metadata.get("HTTPStatusCode"))
+    elif response is not None:
+        candidates.append(getattr(response, "status_code", None))
+    for value in candidates:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _bedrock_error_code(exc: BaseException) -> str | None:
+    """Read the stable AWS error code from a botocore ClientError-like object."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, Mapping):
+        return None
+    error = response.get("Error")
+    if not isinstance(error, Mapping):
+        return None
+    code = error.get("Code")
+    return str(code).strip().lower() if code else None
+
+
+def _provider_headers(exc: BaseException) -> list[Mapping[object, object]]:
+    """Return response-header mappings without assuming one provider SDK."""
+    response = getattr(exc, "response", None)
+    sources: list[object] = [getattr(exc, "headers", None)]
+    if isinstance(response, Mapping):
+        metadata = response.get("ResponseMetadata")
+        if isinstance(metadata, Mapping):
+            sources.append(metadata.get("HTTPHeaders"))
+        sources.append(response.get("headers"))
+    elif response is not None:
+        sources.append(getattr(response, "headers", None))
+    return [source for source in sources if isinstance(source, Mapping)]
+
+
+def _provider_retry_override(exc: BaseException) -> bool | None:
+    """Read the common explicit provider retry override, when present."""
+    for source in _provider_headers(exc):
+        headers = {str(key).lower(): str(value).strip().lower() for key, value in source.items()}
+        value = headers.get("x-should-retry")
+        if value == "false":
+            return False
+        if value == "true":
+            return True
+    return None
+
+
+def _transient_provider_cause(exc: BaseException) -> BaseException | None:
+    """Return the causal exception that identifies a transient provider failure."""
+    for candidate in _exception_chain(exc):
+        if isinstance(candidate, (ConnectionError, TimeoutError)):
+            return candidate
+        if type(candidate).__name__ in _RETRYABLE_PROVIDER_ERROR_NAMES:
+            return candidate
+        status_code = _provider_status_code(candidate)
+        if status_code in _RETRYABLE_PROVIDER_STATUS_CODES or (
+            status_code is not None and 500 <= status_code <= 599
+        ):
+            return candidate
+        if _bedrock_error_code(candidate) in _RETRYABLE_BEDROCK_ERROR_CODES:
+            return candidate
+    return None
+
+
+def _is_retryable_provider_error(exc: BaseException) -> bool:
+    """Return whether coordinator policy permits retrying this provider failure."""
+    for candidate in _exception_chain(exc):
+        override = _provider_retry_override(candidate)
+        if override is not None:
+            return override
+    return _transient_provider_cause(exc) is not None
+
+
+def _native_retries_cover_provider_error(exc: BaseException) -> bool:
+    """Return whether the configured OpenAI/Anthropic SDK retries this failure.
+
+    Their locked SDK versions cover connection failures, 408/409/429, and 5xx,
+    but not 425. Keeping this narrower than the coordinator policy prevents a
+    retryable status that the SDK does not own from being dropped after one call.
+    """
+    for candidate in _exception_chain(exc):
+        override = _provider_retry_override(candidate)
+        if override is not None:
+            return override
+        if isinstance(candidate, (ConnectionError, TimeoutError)):
+            return True
+        if type(candidate).__name__ in _NATIVE_RETRYABLE_PROVIDER_ERROR_NAMES:
+            return True
+        status_code = _provider_status_code(candidate)
+        if status_code in _NATIVE_RETRYABLE_PROVIDER_STATUS_CODES or (
+            status_code is not None and 500 <= status_code <= 599
+        ):
+            return True
+    return False
+
+
+@dataclass
+class _ProviderRetryOutcome:
+    """Per-batch evidence of why the coordinator stopped retrying."""
+
+    reason: LedgerReason = LedgerReason.LLM_BATCH_FAILED
+
+
+def _provider_failure_class(exc: BaseException) -> str:
+    """Preserve the initiating transient exception class through wrappers."""
+    cause = _transient_provider_cause(exc)
+    return type(cause or exc).__name__
+
+
+def _is_rate_limit_provider_error(exc: BaseException) -> bool:
+    """Return whether a retryable provider failure represents quota throttling."""
+    rate_limit_codes = {
+        "ec2throttledexception",
+        "requestlimitexceeded",
+        "slowdown",
+        "throttling",
+        "throttlingexception",
+        "toomanyrequestsexception",
+    }
+    for candidate in _exception_chain(exc):
+        override = _provider_retry_override(candidate)
+        if override is False:
+            return False
+        if type(candidate).__name__ in {"RateLimitError", "ThrottlingException"}:
+            return True
+        if _provider_status_code(candidate) == 429:
+            return True
+        if _bedrock_error_code(candidate) in rate_limit_codes:
+            return True
+    return False
+
+
+def _provider_retry_after_seconds(exc: BaseException) -> float | None:
+    """Return a bounded provider-requested retry delay from common response shapes."""
+    for candidate in _exception_chain(exc):
+        for source in _provider_headers(candidate):
+            headers = {str(key).lower(): value for key, value in source.items()}
+            raw_milliseconds = headers.get("retry-after-ms")
+            if raw_milliseconds is not None:
+                try:
+                    delay = float(str(raw_milliseconds)) / 1000.0
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if delay >= 0:
+                        return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
+
+            for header in ("retry-after", "x-amz-retry-after"):
+                raw_delay = headers.get(header)
+                if raw_delay is None:
+                    continue
+                try:
+                    delay = float(str(raw_delay))
+                except (TypeError, ValueError):
+                    try:
+                        retry_at = parsedate_to_datetime(str(raw_delay))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if retry_at.tzinfo is None:
+                        continue
+                    delay = max(0.0, retry_at.timestamp() - time.time())
+                if delay >= 0:
+                    return min(delay, PROVIDER_RETRY_AFTER_MAX_SECONDS)
+    return None
+
+
+def _provider_retry_delay(exc: BaseException, retries_used: int) -> float:
+    """Jitter each retry above the bounded provider-requested minimum delay."""
+    schedule = (
+        RATE_LIMIT_RETRY_DELAYS_SECONDS
+        if _is_rate_limit_provider_error(exc)
+        else API_CONNECTION_RETRY_DELAYS_SECONDS
+    )
+    scheduled = schedule[retries_used]
+    minimum = _provider_retry_after_seconds(exc) or 0.0
+    # Full jitter spreads concurrent retries, including when the provider sends
+    # the same Retry-After hint to every batch. Keep the existing total delay cap;
+    # the invocation loops also check this sampled delay against the scan deadline.
+    return uniform(minimum, min(minimum + scheduled, PROVIDER_RETRY_AFTER_MAX_SECONDS))
 
 
 def _uses_native_connection_retries(
@@ -124,7 +377,7 @@ def _uses_native_connection_retries(
     max_retries: int = API_CONNECTION_MAX_RETRIES,
 ) -> bool:
     """Set the native retry budget and report whether native retries remain enabled."""
-    if isinstance(chat_model, ChatOpenAI):
+    if isinstance(chat_model, BaseChatOpenAI):
         for client in (chat_model.root_client, chat_model.root_async_client):
             if client is not None:
                 client.max_retries = max_retries
@@ -132,6 +385,33 @@ def _uses_native_connection_retries(
     if isinstance(chat_model, ChatAnthropic):
         chat_model.max_retries = max_retries
         return max_retries > 0
+    return False
+
+
+def _retarget_request_timeout(chat_model: object, timeout: float | None) -> bool:
+    """Point an existing chat model at *timeout* and report whether it took effect.
+
+    Returns ``False`` for transports that keep no mutable deadline, so the caller can
+    fall back to constructing a replacement model for that call.
+    """
+    if isinstance(chat_model, BaseChatOpenAI):
+        clients = (chat_model.root_client, chat_model.root_async_client)
+        if any(client is None for client in clients):
+            return False
+        for client in clients:
+            client.timeout = timeout
+        chat_model.request_timeout = timeout
+        return True
+    if isinstance(chat_model, ChatAnthropic):
+        # ``timeout <= 0`` is how ChatAnthropic spells "leave the SDK default alone"; an
+        # expired deadline never reaches here because ``_require_time_remaining`` raises first.
+        for client in (chat_model._client, chat_model._async_client):
+            client.timeout = timeout
+        chat_model.default_request_timeout = timeout
+        return True
+    if isinstance(chat_model, AgentCLIChatModel):
+        chat_model.set_timeout(timeout)
+        return True
     return False
 
 
@@ -690,8 +970,19 @@ class LLMAnalyzerBase:
         remaining = self._require_time_remaining()
         if not self._dynamic_timeout:
             return self._llm, self._structured_llm
+        if _retarget_request_timeout(self._llm, remaining):
+            # Native retries were already disabled for the dynamic-deadline case in
+            # ``__init__``, and the structured runnable wraps this same model instance.
+            return self._llm, self._structured_llm
         llm = get_chat_model(model=self.model, timeout=remaining)
         _uses_native_connection_retries(llm, max_retries=0)
+        effective_provider = chat_model_provider_name(llm)
+        if effective_provider is not None:
+            self._usage_collector.set_provider(effective_provider)
+        self._usage_collector.set_controls(
+            chat_model_requested_controls(llm),
+            chat_model_controls(llm),
+        )
         structured = (
             llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
@@ -815,8 +1106,15 @@ class LLMAnalyzerBase:
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
-    def _invoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
-        """Run one batch with bounded retries for malformed output and connection failures."""
+    def _invoke_batch_with_retries(
+        self,
+        batch: Batch,
+        prompt: str,
+        *,
+        retry_outcome: _ProviderRetryOutcome | None = None,
+    ) -> tuple[Batch, list]:
+        """Run one batch with bounded retries for malformed output and transient failures."""
+        retry_outcome = retry_outcome or _ProviderRetryOutcome()
         structured_retries = 0
         connection_retries = 0
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
@@ -842,18 +1140,33 @@ class LLMAnalyzerBase:
             except LLMRuntimeLimitError:
                 raise
             except Exception as exc:
-                if (
-                    not _is_retryable_api_connection_error(exc)
-                    or self._uses_native_connection_retries
-                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
-                    or attempt == LLM_BATCH_MAX_ATTEMPTS
-                ):
+                retryable = _is_retryable_provider_error(exc)
+                if not retryable:
                     self._require_time_remaining()
                     raise
-                delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
+                if self._uses_native_connection_retries and _native_retries_cover_provider_error(
+                    exc
+                ):
+                    # Ownership does not establish how many native requests ran.
+                    # Keep an unobserved SDK retry outcome generic.
+                    raise
+                if connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS):
+                    retry_outcome.reason = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                    raise
+                if attempt == LLM_BATCH_MAX_ATTEMPTS:
+                    # Structured-output attempts may have used the shared cap
+                    # before the provider retry budget was exhausted.
+                    raise
+                delay = _provider_retry_delay(exc, connection_retries)
+                remaining = self._remaining_timeout()
+                if remaining is not None and remaining <= delay:
+                    # Preserve the provider exception while recording the actual
+                    # stop condition, even if no provider retry could begin.
+                    retry_outcome.reason = LedgerReason.RUNTIME_LIMIT
+                    raise
                 connection_retries += 1
                 logger.warning(
-                    "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
+                    "Transient LLM provider failure for %s; retrying in %.2fs (%d/%d)",
                     batch.file_label,
                     delay,
                     connection_retries,
@@ -884,8 +1197,15 @@ class LLMAnalyzerBase:
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
-    async def _ainvoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
-        """Asynchronously run one batch with bounded malformed-output and connection retries."""
+    async def _ainvoke_batch_with_retries(
+        self,
+        batch: Batch,
+        prompt: str,
+        *,
+        retry_outcome: _ProviderRetryOutcome | None = None,
+    ) -> tuple[Batch, list]:
+        """Asynchronously run one batch with bounded malformed-output and provider retries."""
+        retry_outcome = retry_outcome or _ProviderRetryOutcome()
         structured_retries = 0
         connection_retries = 0
         for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
@@ -911,18 +1231,33 @@ class LLMAnalyzerBase:
             except LLMRuntimeLimitError:
                 raise
             except Exception as exc:
-                if (
-                    not _is_retryable_api_connection_error(exc)
-                    or self._uses_native_connection_retries
-                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
-                    or attempt == LLM_BATCH_MAX_ATTEMPTS
-                ):
+                retryable = _is_retryable_provider_error(exc)
+                if not retryable:
                     self._require_time_remaining()
                     raise
-                delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
+                if self._uses_native_connection_retries and _native_retries_cover_provider_error(
+                    exc
+                ):
+                    # Ownership does not establish how many native requests ran.
+                    # Keep an unobserved SDK retry outcome generic.
+                    raise
+                if connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS):
+                    retry_outcome.reason = LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                    raise
+                if attempt == LLM_BATCH_MAX_ATTEMPTS:
+                    # Structured-output attempts may have used the shared cap
+                    # before the provider retry budget was exhausted.
+                    raise
+                delay = _provider_retry_delay(exc, connection_retries)
+                remaining = self._remaining_timeout()
+                if remaining is not None and remaining <= delay:
+                    # Preserve the provider exception while recording the actual
+                    # stop condition, even if no provider retry could begin.
+                    retry_outcome.reason = LedgerReason.RUNTIME_LIMIT
+                    raise
                 connection_retries += 1
                 logger.warning(
-                    "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
+                    "Transient LLM provider failure for %s; retrying in %.2fs (%d/%d)",
                     batch.file_label,
                     delay,
                     connection_retries,
@@ -955,9 +1290,10 @@ class LLMAnalyzerBase:
         """Execute batches and retain each sanitized failure alongside successes."""
         outcome = BatchExecutionResult()
         for batch in batches:
+            retry_outcome = _ProviderRetryOutcome()
             try:
                 prompt = self.build_prompt(batch, **kwargs)
-                result = self._invoke_batch_with_retries(batch, prompt)
+                result = self._invoke_batch_with_retries(batch, prompt, retry_outcome=retry_outcome)
                 outcome.successful.append(result)
             except _StructuredResponseValidationError:
                 logger.warning(
@@ -983,16 +1319,12 @@ class LLMAnalyzerBase:
             except (ValueError, NotImplementedError):
                 raise
             except Exception as exc:
-                logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
+                logger.warning("LLM batch failed for %s (%s)", batch.file_label, type(exc).__name__)
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,
-                        error_class=type(exc).__name__,
-                        reason=(
-                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _is_retryable_api_connection_error(exc)
-                            else LedgerReason.LLM_BATCH_FAILED
-                        ),
+                        error_class=_provider_failure_class(exc),
+                        reason=retry_outcome.reason,
                     )
                 )
         return outcome
@@ -1015,12 +1347,18 @@ class LLMAnalyzerBase:
         so users on rate-limited providers can serialize the fan-out; an
         explicit argument still wins.
 
-        Failures are isolated per batch: a provider ``APIConnectionError``
-        receives three bounded exponential-backoff retries (500ms, then 1s,
-        then 2s) when the chat model has no native retry support. OpenAI and
-        Anthropic chat models use their native three-retry policy instead when
-        the timeout is static. A dynamic workflow deadline disables native
-        retries so every coordinator retry can re-check remaining time.
+        Failures are isolated per batch: transient provider failures (including
+        connection and timeout errors, 408/409/425/429 and 5xx responses, and
+        Bedrock throttling/service errors) receive three bounded retries when
+        the chat model has no native retry support. Backoff is 500ms, 1s, and
+        2s for transport and service failures, or 5s, 15s, and 30s for rate
+        limits, unless a bounded provider ``Retry-After`` hint asks for longer.
+        OpenAI and Anthropic chat models use their native three-retry policy
+        instead when the timeout is static. Bedrock SDK retries are disabled so
+        the same coordinator budget handles its failures without a second
+        retry layer. A dynamic workflow deadline disables configurable native
+        retries so each coordinator retry can re-check and cap its delay
+        against remaining time.
         Unrecovered errors cost only their own batch and are omitted from the result.
         Malformed structured responses (Pydantic ``ValidationError`` or CLI
         JSON parse failures) receive three bounded exponential-backoff retries
@@ -1059,14 +1397,22 @@ class LLMAnalyzerBase:
         else:
             sem = asyncio.Semaphore(max_concurrency)
 
-        async def _process(batch: Batch) -> tuple[Batch, list]:
+        async def _process(
+            batch: Batch, retry_outcome: _ProviderRetryOutcome
+        ) -> tuple[Batch, list]:
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
-                return await self._ainvoke_batch_with_retries(batch, prompt)
+                return await self._ainvoke_batch_with_retries(
+                    batch, prompt, retry_outcome=retry_outcome
+                )
 
-        results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
+        retry_outcomes = [_ProviderRetryOutcome() for _ in batches]
+        results = await asyncio.gather(
+            *[_process(b, retry) for b, retry in zip(batches, retry_outcomes, strict=True)],
+            return_exceptions=True,
+        )
         outcome = BatchExecutionResult()
-        for batch, result in zip(batches, results, strict=True):
+        for batch, result, retry_outcome in zip(batches, results, retry_outcomes, strict=True):
             if isinstance(result, _StructuredResponseValidationError):
                 logger.warning(
                     "LLM structured response validation failed for %s after %d attempts",
@@ -1093,16 +1439,14 @@ class LLMAnalyzerBase:
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
             if isinstance(result, BaseException):
-                logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
+                logger.warning(
+                    "LLM batch failed for %s (%s)", batch.file_label, type(result).__name__
+                )
                 outcome.failures.append(
                     BatchFailure(
                         batch=batch,
-                        error_class=type(result).__name__,
-                        reason=(
-                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-                            if _is_retryable_api_connection_error(result)
-                            else LedgerReason.LLM_BATCH_FAILED
-                        ),
+                        error_class=_provider_failure_class(result),
+                        reason=retry_outcome.reason,
                     )
                 )
                 continue

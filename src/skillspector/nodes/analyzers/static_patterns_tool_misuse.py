@@ -24,6 +24,7 @@ Framework: ASI02.
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from collections.abc import Callable, Iterator
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import parse_python_source
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
@@ -110,11 +112,26 @@ _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Match a literal True assigned to a local name shortly before it is passed as
+# shell=<name> to a subprocess invocation.  The bounded newline gap and the
+# intervening-write guard keep this a local data-flow fact; Python scope
+# visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
+_VARIABLE_SHELL_FLAG_PATTERN = (
+    r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
+    r"(?:(?![^\n]*\b\1\s*=)[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
+)
+_VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
+
 # TM1: Tool Parameter Abuse — dangerous parameter values
-TM1_PATTERNS = [
+TM1_CODE_PATTERNS = [
     # shell=True is a classic command injection vector
     (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True", 0.8),
     (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
+    # Preserve the direct-call signal when a Python boolean is assigned to a
+    # local name immediately before the invocation. The bounded newline gap
+    # avoids treating an arbitrary distant assignment as a data-flow fact.
+    (_VARIABLE_SHELL_FLAG_PATTERN, 0.8),
     # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
     # Memory Manager headers) are not interpreted as destructive commands.
     # Keep the scan within one bounded shell command.  The former ``[^|]*``
@@ -163,20 +180,29 @@ TM1_PATTERNS = [
         r"(?:execute|query)\s*\(\s*f?['\"].*?\{.*?\}.*?\b(?:DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE)\b",
         0.85,
     ),
+]
+TM1_PROSE_PATTERNS = [
     # Dangerous tool parameter patterns in instructions
     (
         r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|-rf)\b",
         0.8,
     ),
 ]
+TM1_PATTERNS = TM1_CODE_PATTERNS + TM1_PROSE_PATTERNS
 
 # TM2: Chaining Abuse — chained commands to bypass safety
-TM2_PATTERNS = [
+TM2_CODE_PATTERNS = [
     # Shell command chaining with dangerous commands (\b prevents substring matches)
     (r"(?:&&|;)\s*\b(?:rm\b|del\b|erase\b)\s+-", 0.75),
     (r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh", 0.9),
     (r"(?:&&|;)\s*(?:sudo|su\s+)", 0.75),
     (r"(?:&&|;)\s*(?:chmod|chown)\s+(?:777|666|a\+rwx|-R)", 0.75),
+    # Pipe chains with escalating danger
+    (r"\|\s*(?:sudo|su)\s+", 0.75),
+    (r"\|\s*(?:sh|bash|zsh|python|node|ruby|perl)\s*$", 0.7),
+    (r"\|\s*(?:tee|xargs)\s+.*?\b(?:rm|del|sudo|curl)\b", 0.75),
+]
+TM2_PROSE_PATTERNS = [
     # Multi-step chains designed to circumvent individual checks
     # Bounded to ~500 chars per gap to avoid spanning entire documents
     (
@@ -191,19 +217,16 @@ TM2_PATTERNS = [
         r"(?:use|call)\s+(?:tool\s+)?(?:A|one|the\s+first)\s+(?:to|and)[^\n]{0,300}(?:then\s+)?(?:use|call|pass\s+(?:the\s+)?(?:output|result)\s+to)\s+(?:tool\s+)?(?:B|two|another)",
         0.6,
     ),
-    # Pipe chains with escalating danger
-    (r"\|\s*(?:sudo|su)\s+", 0.75),
-    (r"\|\s*(?:sh|bash|zsh|python|node|ruby|perl)\s*$", 0.7),
-    (r"\|\s*(?:tee|xargs)\s+.*?\b(?:rm|del|sudo|curl)\b", 0.75),
     # Natural language chaining instructions
     (
         r"(?:after|once)\s+(?:the\s+)?(?:first|initial)\s+(?:tool|command|action)\s+(?:succeeds|completes|runs)[^\n]{0,300}(?:immediately|then|next)\s+(?:run|execute|call|invoke)",
         0.6,
     ),
 ]
+TM2_PATTERNS = TM2_CODE_PATTERNS + TM2_PROSE_PATTERNS
 
 # TM3: Unsafe Defaults — overly permissive default settings
-TM3_PATTERNS = [
+TM3_CODE_PATTERNS = [
     # TLS/SSL verification disabled
     (r"verify\s*=\s*False", 0.75),
     (r"VERIFY_SSL\s*=\s*False", 0.8),
@@ -217,7 +240,6 @@ TM3_PATTERNS = [
     # Overly permissive CORS / access
     (r"(?:CORS|cors)[^=]*=\s*['\"]?\*['\"]?", 0.65),
     (r"(?:allow|access)[_-]?(?:origin|hosts?)\s*=\s*['\"]?\*['\"]?", 0.7),
-    (r"(?:allow|trust)\s+(?:all|any|every)\s+(?:origins?|hosts?|domains?|ips?)", 0.7),
     # Unsafe permissions
     (r"(?:mode|permission|umask)\s*=\s*(?:0?o?777|0?o?666)", 0.8),
     (r"world[_-]?(?:readable|writable|executable)", 0.7),
@@ -233,6 +255,9 @@ TM3_PATTERNS = [
         0.8,
     ),
     (r"(?:safe[_-]?mode|secure[_-]?mode|sandbox)\s*=\s*(?:False|false|0|off|no|disable)", 0.8),
+]
+TM3_PROSE_PATTERNS = [
+    (r"(?:allow|trust)\s+(?:all|any|every)\s+(?:origins?|hosts?|domains?|ips?)", 0.7),
     # Natural language unsafe defaults
     (r"(?:by\s+default|default\s+to)\s+(?:allow|accept|trust)\s+(?:all|any|everything)", 0.7),
     (
@@ -240,6 +265,7 @@ TM3_PATTERNS = [
         0.7,
     ),
 ]
+TM3_PATTERNS = TM3_CODE_PATTERNS + TM3_PROSE_PATTERNS
 
 # TM4: Privileged Kubernetes Workload — manifest/CLI primitives that grant
 # node/host takeover (the cluster-scale counterpart of a privileged container).
@@ -2100,11 +2126,181 @@ def _has_unsupported_brace_expansion(tokens: tuple[_ShellToken, ...]) -> bool:
     )
 
 
+_SCOPE_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _scope_chain(tree: ast.Module, target: ast.AST) -> tuple[ast.AST, ...] | None:
+    """Return the chain of enclosing scopes for *target*, outermost first.
+
+    The module itself is the outermost scope.  Returns None when *target* is
+    not part of *tree*.
+    """
+    parents: dict[ast.AST, ast.AST] = {}
+    stack: list[ast.AST] = [tree]
+    found = False
+    while stack:
+        node = stack.pop()
+        if node is target:
+            found = True
+            break
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+            stack.append(child)
+    if not found:
+        return None
+    chain: list[ast.AST] = []
+    current: ast.AST | None = target
+    while current is not None:
+        if isinstance(current, _SCOPE_NODE_TYPES) or current is tree:
+            chain.append(current)
+        current = parents.get(current)
+    chain.reverse()
+    return tuple(chain)
+
+
+def _scope_binds_name(scope_node: ast.AST, name: str) -> bool:
+    """Return whether *name* is bound directly in *scope_node*.
+
+    Nested function/class/lambda bodies are not descended into: their bindings
+    belong to those scopes, not this one.
+    """
+    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        args = scope_node.args
+        named = [arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+        if args.vararg is not None:
+            named.append(args.vararg.arg)
+        if args.kwarg is not None:
+            named.append(args.kwarg.arg)
+        if name in named:
+            return True
+        bodies: list[ast.AST] = (
+            [scope_node.body] if isinstance(scope_node, ast.Lambda) else list(scope_node.body)
+        )
+    elif isinstance(scope_node, (ast.ClassDef, ast.Module)):
+        bodies = list(scope_node.body)
+    else:
+        return False
+    stack = list(bodies)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _SCOPE_NODE_TYPES):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name:
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def _direct_global_nonlocal(scope_node: ast.AST, name: str) -> str | None:
+    """Return 'global'/'nonlocal' when *scope_node* declares *name* as such.
+
+    Only declarations directly in the scope are considered; nested scopes are
+    not descended into.
+    """
+    if isinstance(scope_node, ast.Lambda):
+        return None
+    bodies: list[ast.stmt] | None = None
+    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+        bodies = scope_node.body
+    if bodies is None:
+        return None
+    stack: list[ast.AST] = list(bodies)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _SCOPE_NODE_TYPES):
+            continue
+        if isinstance(node, ast.Global) and name in node.names:
+            return "global"
+        if isinstance(node, ast.Nonlocal) and name in node.names:
+            return "nonlocal"
+        stack.extend(ast.iter_child_nodes(node))
+    return None
+
+
+def _variable_shell_flag_same_scope(content: str, file_path: str, match: re.Match[str]) -> bool:
+    """Return whether a variable-shell-flag match is a same-scope data flow.
+
+    The regex cannot see Python scopes, so ``use_shell = True`` in one
+    function followed by ``shell=use_shell`` in another still matches.  Resolve
+    the matched assignment and the ``shell=`` use through the Python AST and
+    require the assignment to be visible from the use: identical scope chains,
+    a closure read from an enclosing scope, or a matching global/nonlocal
+    declaration.  Unparseable content keeps the candidate so a syntax error
+    cannot silence the signal.
+    """
+    var_name = match.group(1)
+    assign_line = content.count("\n", 0, match.start()) + 1
+    use_line = content.count("\n", 0, match.end()) + 1
+    tree = parse_python_source(content, file_path).tree
+    if tree is None:
+        return True
+    assign_node: ast.Assign | None = None
+    call_node: ast.Call | None = None
+    for node in ast.walk(tree):
+        if (
+            assign_node is None
+            and isinstance(node, ast.Assign)
+            and node.lineno == assign_line
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+            and any(
+                isinstance(target, ast.Name) and target.id == var_name for target in node.targets
+            )
+        ):
+            assign_node = node
+        if (
+            call_node is None
+            and isinstance(node, ast.Call)
+            and any(
+                keyword.arg == "shell"
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == var_name
+                and assign_line <= keyword.value.lineno <= use_line
+                for keyword in node.keywords
+            )
+        ):
+            call_node = node
+    if assign_node is None or call_node is None:
+        return True
+    assign_chain = _scope_chain(tree, assign_node)
+    use_chain = _scope_chain(tree, call_node)
+    if assign_chain is None or use_chain is None:
+        return True
+    if assign_chain == use_chain:
+        return True
+    if len(assign_chain) < len(use_chain) and use_chain[: len(assign_chain)] == assign_chain:
+        # Closure read: the use sits in a scope nested inside the assignment's
+        # scope, so the name resolves to the assigned value.
+        return True
+    use_scope = use_chain[-1]
+    if use_scope is not tree:
+        declaration = _direct_global_nonlocal(use_scope, var_name)
+        if declaration == "global":
+            return assign_chain == (tree,)
+        if declaration == "nonlocal":
+            binding = next(
+                (
+                    scope
+                    for scope in use_chain[-2::-1]
+                    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                    and _scope_binds_name(scope, var_name)
+                ),
+                None,
+            )
+            return binding is not None and assign_chain == _scope_chain(tree, binding)
+    return False
+
+
 def _tm1_candidates(
     content: str,
 ) -> Iterator[tuple[int, int, str, float]]:
     for pattern, confidence in TM1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             yield match.start(), match.end(), match.group(0), confidence
 
     seen_commands: set[tuple[int, int]] = set()
@@ -2488,7 +2684,6 @@ def has_bounded_parse_exhaustion(
     structural_quote_closers = None
     structural_quote_openers = None
     json_strings: list[tuple[int, int]] = []
-    raw_content = content
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
@@ -2524,11 +2719,14 @@ def has_bounded_parse_exhaustion(
     # whole-content parser reaches its structural opener. Recover each proven
     # string independently, without bypassing that parser's forward watermark
     # and reparsing overlapping suffixes. These raw spans are disjoint and
-    # bounded by JSON validation; their projection retains both outer quotes
-    # and escaped bytes while preserving ordinary inline-code documentation.
+    # bounded by JSON validation. Reuse the whole-document projection so each
+    # string retains its original fenced/literal or inline-code ownership.
+    # Reinterpreting a string as standalone Markdown could mask shell backticks
+    # that were literal inside its surrounding code fence. The projection keeps
+    # source offsets, outer JSON quotes and escaped bytes unchanged.
     for start, end in json_strings:
         check_runtime()
-        projected = _markdown_shell_text(raw_content[start:end], check_runtime)
+        projected = content[start:end]
         if _has_shell_command_word_exhaustion(
             projected,
             check_runtime,
@@ -2561,7 +2759,18 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.TOOL_MISUSE.value]
     tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
 
+    # The variable-shell-flag regex cannot see Python scopes, so an assignment
+    # in one function and a shell= use in another still match.  Drop those
+    # cross-scope candidates for Python files.
+    cross_scope_starts: set[int] = set()
+    if file_type == "python":
+        for variable_match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+            if not _variable_shell_flag_same_scope(content, file_path, variable_match):
+                cross_scope_starts.add(variable_match.start())
+
     for match_start, match_end, matched_text, confidence in _tm1_candidates(content):
+        if match_start in cross_scope_starts:
+            continue
         line_num = get_line_number(content, match_start)
         context_text = ctx(match_start)
         matched = matched_text[:200]
@@ -2603,7 +2812,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
     for pattern, confidence in TM2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             context_text = ctx(match.start())
             matched = match.group(0)[:200]
@@ -2628,7 +2842,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in TM3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(

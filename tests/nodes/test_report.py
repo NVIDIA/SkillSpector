@@ -113,6 +113,51 @@ class TestComputeRiskScoreBasic:
         assert band == "HIGH"
         assert recommendation == "DO_NOT_INSTALL"
 
+    def test_excluded_executable_enforces_blocking_risk_floor(self) -> None:
+        finding = _finding(
+            "SC9",
+            "HIGH",
+            confidence=1.0,
+            file="node_modules/pkg/index.js",
+            evidence={"excluded_from_analysis": True},
+        )
+
+        score, band, recommendation = _compute_risk_score([finding], False)
+
+        assert score == 51
+        assert band == "HIGH"
+        assert recommendation == "DO_NOT_INSTALL"
+
+    def test_analyzed_sc9_artifact_keeps_existing_score(self) -> None:
+        finding = _finding(
+            "SC9",
+            "HIGH",
+            confidence=1.0,
+            file="archive.docx!/payload.sh",
+            evidence={"excluded_from_analysis": False},
+        )
+
+        score, _, _ = _compute_risk_score([finding], False)
+
+        assert score == 25
+
+    def test_incomplete_excluded_artifact_blocks_even_if_finding_output_is_limited(self) -> None:
+        score, band, recommendation = _compute_risk_score(
+            [],
+            False,
+            [
+                {
+                    "path": "node_modules/cache.zip",
+                    "excluded_from_analysis": True,
+                    "excluded_inspection_incomplete": True,
+                }
+            ],
+        )
+
+        assert score == 51
+        assert band == "HIGH"
+        assert recommendation == "DO_NOT_INSTALL"
+
     @pytest.mark.parametrize(
         ("finding", "expected_score"),
         [
@@ -1310,6 +1355,10 @@ def test_report_llm_degraded_when_all_calls_failed(monkeypatch: pytest.MonkeyPat
     assert meta["llm_degraded"] is True
     assert meta["llm_calls_attempted"] == 3
     assert meta["llm_calls_succeeded"] == 0
+    # Attempted calls remain execution evidence even when none returns a response.
+    assert meta["llm_provenance"]["provider"]["effective_adapter"] == "unknown"
+    assert meta["llm_provenance"]["determinism"]["classification"] == "nondeterministic"
+    assert meta["llm_provenance"]["determinism"]["control_status"] == "configuration_unknown"
     # Distinct error reasons are surfaced (deduped).
     assert "claude empty stdout" in meta["llm_error"]
     assert "static analysis only" in meta["llm_error"]
@@ -1500,6 +1549,161 @@ def test_json_report_exposes_only_sanitized_provider_usage(
             "total_tokens": 168,
         }
     ]
+
+
+def test_json_report_exposes_captured_llm_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [],
+        "inference_usage": [
+            {
+                "node": "semantic_developer_intent",
+                "request_kind": "structured_output",
+                "provider": "openai",
+                "model": "safe/model:1",
+                "model_source": "requested_model",
+                "usage_source": "provider_response",
+                "total_tokens": 1,
+                "requested_controls": {
+                    "temperature": 0.0,
+                    "seed": 7,
+                    "reasoning_effort": None,
+                },
+                "forwarded_controls": {
+                    "temperature": 0.0,
+                    "seed": 7,
+                    "reasoning_effort": None,
+                },
+            }
+        ],
+        "llm_provenance": {
+            "provider": {
+                "configured_adapter": "anthropic",
+                "resolved_adapter": "openai",
+                "service": "private-service-name",
+            },
+            "analyzers": [
+                {
+                    "analyzer_id": "semantic_developer_intent",
+                    "model": "safe/model:1",
+                    "analyzer_revision": {"value": "2.11.2", "prompt": "must not leak"},
+                }
+            ],
+            "sampling": {
+                "temperature": {
+                    "requested": 0.0,
+                    "source": "environment",
+                    "forwarded_to_client": 0.0,
+                    "adapter_support": True,
+                },
+                "seed": {
+                    "requested": 7,
+                    "source": "environment",
+                    "forwarded_to_client": 7,
+                    "adapter_support": True,
+                },
+            },
+            "endpoint": "https://private.example.test",
+        },
+    }
+
+    meta = _meta_from_json_report(state)
+    provenance = meta["llm_provenance"]
+
+    assert provenance["provider"] == {
+        "configured_adapter": "anthropic",
+        "resolved_adapter": "openai",
+        "effective_adapter": "openai",
+        "effective_adapters": ["openai"],
+        "service": "unknown",
+        "routing": {
+            "deployment_override": None,
+            "deployment_source": "not_applicable",
+            "api_version": None,
+            "api_version_source": "not_applicable",
+        },
+    }
+    intent = next(
+        item
+        for item in provenance["analyzers"]
+        if item["analyzer_id"] == "semantic_developer_intent"
+    )
+    assert intent["model"] == "safe/model:1"
+    assert intent["analyzer_revision"] == {
+        "value": "2.11.2",
+        "source": "skillspector_package",
+        "source_revision": {"value": "unknown", "source": "unknown"},
+    }
+    assert provenance["sampling"]["temperature"]["forwarded_to_client"] == 0.0
+    assert provenance["sampling"]["seed"]["forwarded_to_client"] == 7
+    assert provenance["determinism"]["classification"] == "nondeterministic"
+    assert "private.example" not in json.dumps(meta)
+    assert "must not leak" not in json.dumps(meta)
+
+
+def test_json_report_preserves_counterless_cli_provider_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI success remains provenance evidence even without token counters."""
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [],
+        "inference_usage": [
+            {
+                "node": "semantic_developer_intent",
+                "request_kind": "structured_output",
+                "provider": "claude_cli",
+                "model": "claude-sonnet-4-6",
+                "model_source": "requested_model",
+                "usage_source": "provider_response",
+                "forwarded_controls": {},
+            }
+        ],
+        "llm_provenance": {
+            "provider": {
+                "configured_adapter": "claude_cli",
+                "resolved_adapter": "claude_cli",
+            },
+            "sampling": {
+                "temperature": {
+                    "requested": None,
+                    "source": "provider_default",
+                    "adapter_support": False,
+                },
+                "seed": {
+                    "requested": None,
+                    "source": "unset",
+                    "adapter_support": False,
+                },
+                "reasoning_effort": {
+                    "requested": None,
+                    "source": "provider_default",
+                    "adapter_support": False,
+                },
+            },
+        },
+    }
+
+    meta = _meta_from_json_report(state)
+
+    assert meta["inference_usage"] == []
+    assert meta["llm_provenance"]["provider"]["effective_adapter"] == "claude_cli"
+    assert meta["llm_provenance"]["determinism"]["classification"] == "nondeterministic"
+    assert meta["llm_provenance"]["determinism"]["control_status"] == "provider_defaults"
 
 
 def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1972,6 +2176,14 @@ def test_explicit_all_not_applicable_semantic_pass_stays_safe(
 
     assert result["risk_recommendation"] == "SAFE"
     assert "llm_degraded" not in metadata
+    assert "llm_calls_attempted" not in metadata
+    assert metadata["llm_provenance"]["provider"]["effective_adapter"] == "not_applicable"
+    assert metadata["llm_provenance"]["determinism"] == {
+        "classification": "not_applicable",
+        "control_status": "not_applied",
+        "provider_guarantee": False,
+        "reason": "LLM analysis was not executed for this scan.",
+    }
 
 
 def test_unavailable_provider_floors_recommendation_even_with_success_records(
@@ -2113,13 +2325,35 @@ def test_preflight_unavailable_log_does_not_claim_runtime_calls_failed(
         "output_format": "json",
         "use_llm": False,
         "llm_requested": True,
+        # Stale/caller-supplied response evidence cannot turn a preflight-
+        # disabled scan into one that claims LLM execution.
+        "inference_usage": [
+            {
+                "node": "semantic_developer_intent",
+                "request_kind": "structured_output",
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "model_source": "requested_model",
+                "usage_source": "provider_response",
+                "total_tokens": 1,
+                "forwarded_controls": {"seed": 7},
+            }
+        ],
     }
 
     with caplog.at_level(logging.WARNING, logger="skillspector.nodes.report"):
-        report(state)
+        result = report(state)
 
     assert "unavailable during preflight" in caplog.text
     assert "0/0" not in caplog.text
+    provenance = json.loads(result["report_body"])["metadata"]["llm_provenance"]
+    assert provenance["provider"]["effective_adapter"] == "not_applicable"
+    assert provenance["determinism"] == {
+        "classification": "not_applicable",
+        "control_status": "not_applied",
+        "provider_guarantee": False,
+        "reason": "LLM analysis was not executed for this scan.",
+    }
 
 
 def test_non_degraded_clean_scan_stays_safe() -> None:

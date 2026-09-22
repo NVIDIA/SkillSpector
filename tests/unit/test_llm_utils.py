@@ -33,7 +33,7 @@ from pydantic import BaseModel
 
 from skillspector import llm_utils
 from skillspector.constants import build_model_config
-from skillspector.inference_usage import InferenceUsageCollector
+from skillspector.inference_usage import InferenceUsageCollector, sanitize_inference_usage
 from skillspector.llm_utils import (
     AgentCLIChatModel,
     StructuredOutputParseError,
@@ -530,6 +530,22 @@ class TestGetChatModelCLIAdapter:
                     "x"
                 )
 
+    def test_set_timeout_reaches_structured_wrapper(self) -> None:
+        """A retargeted deadline applies to structured wrappers made earlier."""
+
+        class _Schema(BaseModel):
+            verdict: str
+
+        provider = MagicMock()
+        provider.complete.return_value = '{"verdict": "ok"}'
+        model = AgentCLIChatModel(provider, "claude-sonnet-4-6", 1024, timeout=30.0)
+        runnable = model.with_structured_output(_Schema)
+
+        model.set_timeout(4.5)
+        runnable.invoke("prompt")
+
+        assert provider.complete.call_args.kwargs["timeout"] == 4.5
+
     def test_structured_usage_marks_response_before_sync_parse_failure(self) -> None:
         class _Schema(BaseModel):
             verdict: str
@@ -550,7 +566,8 @@ class TestGetChatModelCLIAdapter:
             _invoke_with_usage(runnable, "prompt", collector)
 
         assert collector.response_received is True
-        assert collector.snapshot() == []
+        assert collector.snapshot()[0]["provider"] == "claude_cli"
+        assert sanitize_inference_usage(collector.snapshot()) == []
 
     async def test_concurrent_structured_usage_marks_each_async_response(self) -> None:
         class _Schema(BaseModel):
@@ -581,7 +598,8 @@ class TestGetChatModelCLIAdapter:
 
         assert all(isinstance(result, ValueError) for result in results)
         assert all(collector.response_received for collector in collectors)
-        assert all(collector.snapshot() == [] for collector in collectors)
+        assert all(collector.snapshot()[0]["provider"] == "claude_cli" for collector in collectors)
+        assert all(sanitize_inference_usage(collector.snapshot()) == [] for collector in collectors)
 
     def test_structured_usage_does_not_mark_pre_response_transport_failure(self) -> None:
         class _Schema(BaseModel):

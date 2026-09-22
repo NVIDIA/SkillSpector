@@ -17,6 +17,7 @@ from array import array
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 from io import StringIO
 from typing import NotRequired
 
@@ -54,6 +55,7 @@ class ArtifactRecord(TypedDict):
     misleading_extension: bool
     referenced: bool
     reason: NotRequired[str]
+    inherited_exclusion_reason: NotRequired[str]
 
 
 class BundleReference(TypedDict):
@@ -226,6 +228,13 @@ _TEXT_EXTENSIONS = frozenset(
 )
 
 _ALLOWED_FORMAT_CHARS = frozenset({"\n", "\r", "\t"})
+# A scan runs every analyzer over the same file content, and each one asks the
+# same questions about that text again. These predicates are pure functions of
+# the text, so the answers are memoized rather than recomputed: measured on one
+# real skill, `_has_letter_spacing_run` ran 780 times over 23 distinct texts.
+# The bound keeps a long-lived process from retaining file content indefinitely.
+_TEXT_PREDICATE_CACHE_SIZE = 64
+
 _IGNORED_ASCII_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _LETTER_SPACING_CANDIDATE = re.compile(
     r"(?:[^\W\d_](?:[^\w\r\n]|_)+){5}[^\W\d_]",
@@ -390,12 +399,27 @@ def _contains_default_ignorable(text: str) -> bool:
     return _DEFAULT_IGNORABLE_PATTERN.search(text) is not None
 
 
-def _is_unconditionally_ignored(ch: str) -> bool:
+def _compute_unconditionally_ignored(ch: str) -> bool:
     return (
         bool(_IGNORED_ASCII_CONTROL.fullmatch(ch))
         or unicodedata.category(ch) in {"Cf", "Cc"}
         and ch not in _ALLOWED_FORMAT_CHARS
     )
+
+
+# Skill content is overwhelmingly ASCII, and the classification of an ASCII
+# character never changes, so resolve that range once at import instead of
+# paying a regex match plus a unicodedata lookup for every character scanned.
+# The table is derived from the predicate itself, so it cannot drift from it.
+_ASCII_UNCONDITIONALLY_IGNORED = frozenset(
+    ch for ch in map(chr, range(128)) if _compute_unconditionally_ignored(ch)
+)
+
+
+def _is_unconditionally_ignored(ch: str) -> bool:
+    if ch.isascii():
+        return ch in _ASCII_UNCONDITIONALLY_IGNORED
+    return _compute_unconditionally_ignored(ch)
 
 
 def _is_word_character(ch: str) -> bool:
@@ -1458,9 +1482,21 @@ def _obfuscated_instruction_gap_offsets(text: str) -> Iterator[int]:
             yield from range(start, end)
 
 
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
 def _has_letter_spacing_run(text: str) -> bool:
     """Use a C-level ASCII prefilter before the exact Unicode-aware scan."""
     return next(_letter_spacing_run_spans(text), None) is not None
+
+
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
+def _has_obfuscated_instruction(text: str) -> bool:
+    """Return whether any obfuscated instruction is present.
+
+    Existence is all ``security_text_views`` needs, and unlike the generator it
+    is a plain bool, so it can be memoized without materializing the matches or
+    handing the same iterator to two consumers.
+    """
+    return next(_obfuscated_instruction_matches(text), None) is not None
 
 
 def _letter_spacing_gap_offsets(text: str) -> Iterator[int]:
@@ -1471,13 +1507,34 @@ def _letter_spacing_gap_offsets(text: str) -> Iterator[int]:
                 yield offset
 
 
-def _is_token_gap_character(ch: str) -> bool:
+def _compute_token_gap_character(ch: str) -> bool:
     return (
         _is_unconditionally_ignored(ch)
         or is_default_ignorable(ch)
         or _is_non_ascii_separator(ch)
         or ch == "\ufffd"
     )
+
+
+_ASCII_TOKEN_GAP_CHARS = frozenset(
+    ch for ch in map(chr, range(128)) if _compute_token_gap_character(ch)
+)
+
+# Any character that cannot be a token gap need not be examined at all. Every
+# ASCII character outside this class is settled by the table above, so a text
+# built only from them has no gap spans and the per-character walk below is
+# pure overhead.
+_TOKEN_GAP_CANDIDATE = re.compile(
+    "[^"
+    + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
+    + "]"
+)
+
+
+def _is_token_gap_character(ch: str) -> bool:
+    if ch.isascii():
+        return ch in _ASCII_TOKEN_GAP_CHARS
+    return _compute_token_gap_character(ch)
 
 
 def _token_bridging_gap_spans(
@@ -1487,6 +1544,8 @@ def _token_bridging_gap_spans(
     check_runtime: Callable[[], None] | None = None,
 ) -> Iterator[tuple[int, int]]:
     """Yield contextual noise runs in one pass without crossing ASCII spaces."""
+    if _TOKEN_GAP_CANDIDATE.search(text) is None:
+        return
     offset = 0
     while offset < len(text):
         if check_runtime is not None and offset % 4096 == 0:
@@ -1784,7 +1843,11 @@ def prompt_injection_letter_spacing_view(
     index = 0
     while index < len(text):
         record_work()
-        if _is_letter_spacing_separator(text[index]):
+        # A line break is never a token: starting a run on it would treat the
+        # previous line's last character as the identifier-boundary neighbor.
+        if text[index] in _LOGICAL_LINE_BREAK_CHARACTERS or _is_letter_spacing_separator(
+            text[index]
+        ):
             index += 1
             continue
 
@@ -1915,6 +1978,7 @@ def prompt_injection_letter_spacing_view(
     )
 
 
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
 def _requires_normalized_security_view(text: str) -> bool:
     """Return whether normalization can produce a distinct security view."""
     if _IGNORED_ASCII_CONTROL.search(text) is not None:
@@ -1937,7 +2001,7 @@ def security_text_views(text: str) -> tuple[SecurityTextView, ...]:
     """Return distinct raw, normalized, and compact views deterministically."""
     raw = SecurityTextView("raw", text)
     has_letter_spacing = _has_letter_spacing_run(text)
-    has_obfuscated_instruction = next(_obfuscated_instruction_matches(text), None) is not None
+    has_obfuscated_instruction = _has_obfuscated_instruction(text)
     if (
         text.isascii()
         and _IGNORED_ASCII_CONTROL.search(text) is None

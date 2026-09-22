@@ -84,6 +84,7 @@ class LedgerReason(StrEnum):
     OPAQUE_CONTENT = "opaque_content"
     REFERENCED_UNINSPECTED = "referenced_uninspected"
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
+    REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
@@ -91,7 +92,9 @@ class LedgerReason(StrEnum):
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
+    EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
     OUTPUT_LIMIT = "output_limit"
+    TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
@@ -114,7 +117,9 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM returned a malformed structured response after bounded retries."
     ),
-    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
+    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
+        "Transient LLM provider failure persisted after bounded retries."
+    ),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
     LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE: (
@@ -168,8 +173,13 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
         "Reference extraction reached an explicit resource bound before completion."
     ),
+    LedgerReason.REFERENCE_MISSING: (
+        "A local path-like reference does not match any bundled artifact,"
+        " such as a file the skill writes at runtime."
+    ),
     LedgerReason.REFERENCE_UNRESOLVED: (
-        "A local path-like reference could not be resolved unambiguously."
+        "A local path-like reference matched more than one bundled artifact"
+        " and could not be resolved to a single target."
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
@@ -181,7 +191,13 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.TRAVERSAL_DEPTH_LIMIT: ("Bundle discovery reached its directory-depth limit."),
     LedgerReason.TOTAL_BYTES_LIMIT: "Bundle caching reached its aggregate byte limit.",
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
+    LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
+        "Executable content was inventoried but excluded from content analysis."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
+    LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
+        "A transitive child scan failed before complete inspection."
+    ),
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
     ),

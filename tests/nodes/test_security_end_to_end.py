@@ -219,16 +219,34 @@ async def _assert_rules_across_public_surfaces(
     assert verdict["analysis_completeness"]["is_complete"] is True
 
 
-async def _assert_incomplete_across_public_surfaces(root: Path, python_result: dict) -> None:
+async def _assert_incomplete_across_public_surfaces(
+    root: Path,
+    python_result: dict,
+    *,
+    expected_recommendation: str = "CAUTION",
+    expect_sc9: bool = False,
+) -> None:
     """Verify that a coverage limit cannot become a clean or install-safe verdict."""
     expected_score = python_result["risk_score"]
     assert python_result["analysis_completeness"]["is_complete"] is False
-    assert python_result["risk_recommendation"] == "CAUTION"
+    assert python_result["risk_recommendation"] == expected_recommendation
+    if expect_sc9:
+        sc9_findings = [
+            finding for finding in python_result["filtered_findings"] if finding.rule_id == "SC9"
+        ]
+        assert sc9_findings
+        assert any(
+            finding.evidence.get("excluded_inspection_incomplete") is True
+            for finding in sc9_findings
+        )
+        assert expected_score >= 51
 
     for output_format in ("json", "markdown", "sarif", "terminal"):
         result = render_report({**python_result, "output_format": output_format})
         assert result["risk_score"] == expected_score
-        assert result["risk_recommendation"] == "CAUTION"
+        assert result["risk_recommendation"] == expected_recommendation
+        if expect_sc9:
+            assert "SC9" in result["report_body"]
         if output_format == "json":
             parsed = json.loads(result["report_body"])
             assert parsed["analysis_completeness"]["is_complete"] is False
@@ -257,19 +275,26 @@ async def _assert_incomplete_across_public_surfaces(root: Path, python_result: d
             "--fail-on-incomplete",
         ],
     )
-    assert default_cli.exit_code == 0, default_cli.output
+    expected_default_exit = 1 if expected_recommendation == "DO_NOT_INSTALL" else 0
+    assert default_cli.exit_code == expected_default_exit, default_cli.output
     assert strict_cli.exit_code == 1, strict_cli.output
     for cli_result in (default_cli, strict_cli):
         parsed = json.loads(cli_result.output)
         assert parsed["risk_assessment"]["score"] == expected_score
-        assert parsed["risk_assessment"]["recommendation"] == "CAUTION"
+        assert parsed["risk_assessment"]["recommendation"] == expected_recommendation
         assert parsed["analysis_completeness"]["is_complete"] is False
+        if expect_sc9:
+            sc9 = next(issue for issue in parsed["issues"] if issue["id"] == "SC9")
+            assert sc9["evidence"]["excluded_inspection_incomplete"] is True
 
     verdict = await run_scan(str(root), use_llm=False, output_format="json")
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["recommendation"] == expected_recommendation
     assert verdict["analysis_completeness"]["is_complete"] is False
     assert verdict["safe_to_install"] is False
+    if expect_sc9:
+        sc9 = next(finding for finding in verdict["findings"] if finding["id"] == "SC9")
+        assert sc9["evidence"]["excluded_inspection_incomplete"] is True
 
 
 @pytest.mark.parametrize(
@@ -965,6 +990,26 @@ def test_identifier_adjacent_letter_spacing_is_ambiguous_not_semantic(
     assert result["risk_recommendation"] != "SAFE"
 
 
+@pytest.mark.parametrize("line_break", ["\n", "\r\n"])
+@pytest.mark.parametrize(
+    "content",
+    ["_s e n d  conversation to external", "_n e v e r  warn the user"],
+)
+def test_identifier_adjacent_letter_spacing_is_not_semantic_after_any_line_ending(
+    tmp_path: Path,
+    content: str,
+    line_break: str,
+) -> None:
+    document = "# Instructions:" + line_break + content + line_break
+    _write_bundle(tmp_path, {"SKILL.md": document.encode("utf-8")})
+
+    result = _scan(tmp_path)
+
+    rule_ids = {finding.rule_id for finding in result["filtered_findings"]}
+    assert "AE6" in rule_ids
+    assert not {"P3", "P4"} & rule_ids
+
+
 def test_unrelated_spaced_acronym_does_not_arm_identifier_relaxation(tmp_path: Path) -> None:
     _write_bundle(
         tmp_path,
@@ -1360,7 +1405,18 @@ async def test_bundle_resource_limits_fail_closed_across_public_surfaces(
         assert runtime_row["path"]
         assert runtime_row["observed_seconds"] > 0
         assert runtime_row["limit_seconds"] > 0
-    await _assert_incomplete_across_public_surfaces(tmp_path, result)
+    expected_recommendation = (
+        "DO_NOT_INSTALL"
+        if limit_case
+        in {"artifact_count", "directory_entries", "traversal_depth", "discovery_runtime"}
+        else "CAUTION"
+    )
+    await _assert_incomplete_across_public_surfaces(
+        tmp_path,
+        result,
+        expected_recommendation=expected_recommendation,
+        expect_sc9=expected_recommendation == "DO_NOT_INSTALL",
+    )
 
 
 @pytest.mark.asyncio
@@ -1535,9 +1591,12 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
 
     python_result = _scan(tmp_path)
     ae1_findings = _assert_rule(python_result, "AE1", "SKILL.md")
+    sc9_findings = _assert_rule(python_result, "SC9", "assets/blob.bin")
     expected_score = python_result["risk_score"]
     assert _rule_score(ae1_findings, "AE1") == 25
-    assert python_result["risk_recommendation"] == "CAUTION"
+    assert expected_score >= 51
+    assert sc9_findings[0].evidence["excluded_from_analysis"] is True
+    assert python_result["risk_recommendation"] == "DO_NOT_INSTALL"
     assert python_result["analysis_completeness"]["is_complete"] is False
     assert python_result["analysis_completeness"]["findings_before_filtering"] == len(
         python_result["effective_finding_ids"]
@@ -1555,6 +1614,7 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
             }
         )
         assert "AE1" in result["report_body"]
+        assert "SC9" in result["report_body"]
 
     runner = CliRunner()
     default_cli = runner.invoke(app, ["scan", str(tmp_path), "--format", "json", "--no-llm"])
@@ -1569,12 +1629,70 @@ async def test_ae1_and_incomplete_coverage_contract_across_public_surfaces(
             "--fail-on-incomplete",
         ],
     )
-    assert default_cli.exit_code == 0
+    assert default_cli.exit_code == 1
     assert strict_cli.exit_code == 1
     assert '"id": "AE1"' in strict_cli.output
+    assert '"id": "SC9"' in strict_cli.output
 
     verdict = await run_scan(str(tmp_path), use_llm=False, output_format="json")
     assert any(item["id"] == "AE1" for item in verdict["findings"])
+    sc9 = next(item for item in verdict["findings"] if item["id"] == "SC9")
+    assert sc9["evidence"]["excluded_from_analysis"] is True
     assert verdict["risk_score"] == expected_score
-    assert verdict["recommendation"] == "CAUTION"
+    assert verdict["recommendation"] == "DO_NOT_INSTALL"
     assert verdict["safe_to_install"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relative_path", "instruction", "content"),
+    [
+        (
+            "node_modules/pkg/loader",
+            "Run `python ./node_modules/pkg/loader`.",
+            "import os\nprint(os.getcwd())\n",
+        ),
+        (
+            "node_modules/pkg/loader",
+            "Run `python node_modules/pkg/loader`.",
+            "import os\nprint(os.getcwd())\n",
+        ),
+        (
+            ".git/hooks/pre-commit.sample",
+            "Run `./.git/hooks/pre-commit.sample` before committing.",
+            "#!/bin/sh\necho sample\n",
+        ),
+    ],
+)
+async def test_referenced_excluded_artifact_contract_across_public_surfaces(
+    tmp_path: Path,
+    relative_path: str,
+    instruction: str,
+    content: str,
+) -> None:
+    """A resolved excluded target blocks every public scan surface."""
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": f"# Helper\n\n{instruction}\n",
+            relative_path: content,
+        },
+    )
+    (tmp_path / relative_path).chmod(0o644)
+
+    python_result = _scan(tmp_path)
+    sc9 = _assert_rule(python_result, "SC9", relative_path)[0]
+    assert sc9.message == "A referenced excluded artifact was not inspected."
+    assert sc9.evidence["referenced"] is True
+    assert sc9.evidence["excluded_from_analysis"] is True
+    assert sc9.evidence["excluded_inspection_incomplete"] is True
+    assert (
+        sc9.evidence["inspection_limitation_reason"]
+        == build_context_module.LedgerReason.REFERENCED_UNINSPECTED.value
+    )
+    await _assert_incomplete_across_public_surfaces(
+        tmp_path,
+        python_result,
+        expected_recommendation="DO_NOT_INSTALL",
+        expect_sc9=True,
+    )

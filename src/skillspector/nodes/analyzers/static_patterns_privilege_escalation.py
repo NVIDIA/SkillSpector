@@ -32,6 +32,7 @@ from .common import (
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
     get_context,
+    get_context_from_lines,
     get_line_number,
 )
 from .pattern_defaults import PatternCategory
@@ -40,14 +41,16 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
 
-PE1_PATTERNS = [
+PE1_CODE_PATTERNS = [
     (r"permissions?\s*:\s*\[?\s*['\"]?\*['\"]?\s*\]?", 0.8),
-    (r"(?:request|require|need)s?\s+(?:full|all|complete)\s+(?:access|permissions?)", 0.7),
-    (r"(?:grant|give|allow)\s+(?:me\s+)?(?:full|all|complete)\s+(?:access|permissions?)", 0.75),
     (
         r"permissions?\s*:.*?(?:shell_execute|file_write|network).*?(?:shell_execute|file_write|network)",
         0.6,
     ),
+]
+PE1_PROSE_PATTERNS = [
+    (r"(?:request|require|need)s?\s+(?:full|all|complete)\s+(?:access|permissions?)", 0.7),
+    (r"(?:grant|give|allow)\s+(?:me\s+)?(?:full|all|complete)\s+(?:access|permissions?)", 0.75),
     (
         r"(?:also\s+)?(?:need|require)s?\s+(?:write|execute|admin)\s+(?:access|permissions?)\s+(?:for|to)\s+(?:read|view|display)",
         0.7,
@@ -55,17 +58,20 @@ PE1_PATTERNS = [
     (r"(?:escalate|elevate|upgrade)\s+(?:my\s+)?(?:permissions?|privileges?|access)", 0.8),
     (r"(?:bypass|skip|ignore)\s+(?:permission|access)\s+(?:check|validation|restriction)", 0.85),
 ]
-PE2_PATTERNS = [
+PE1_PATTERNS = PE1_CODE_PATTERNS + PE1_PROSE_PATTERNS
+PE2_CODE_PATTERNS = [
     (r"sudo\s+(?!-v|-l|--version|--list)", 0.7),
     (r"sudo\s+-[isSE]", 0.8),
     (r"sudo\s+su\b", 0.9),
-    (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
-    (r"(?:requires?|needs?)\s+root\s+(?:access|privileges?|permissions?)", 0.6),
     (r"su\s+-\s*$|su\s+root", 0.8),
     (r"doas\s+", 0.7),
     (r"pkexec\s+", 0.75),
     (r"chmod\s+[ugo]*[+-=]*s", 0.85),
     (r"chmod\s+[0-7]*[4567][0-7]{2}", 0.8),
+]
+PE2_PROSE_PATTERNS = [
+    (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
+    (r"(?:requires?|needs?)\s+root\s+(?:access|privileges?|permissions?)", 0.6),
     (r"(?:edit|modify|write|change)\s+(?:/etc/|system)\s+(?:files?|config)", 0.6),
     (
         r"(?:run|execute)\s+(?:this|the)\s+(?:script|command)\s+(?:as|with)\s+(?:sudo|root|admin)",
@@ -73,7 +79,8 @@ PE2_PATTERNS = [
     ),
     (r"(?:you\s+)?(?:will\s+)?need\s+(?:to\s+)?(?:use\s+)?sudo", 0.5),
 ]
-PE3_PATTERNS = [
+PE2_PATTERNS = PE2_CODE_PATTERNS + PE2_PROSE_PATTERNS
+PE3_CODE_PATTERNS = [
     (r"~?/?\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts)", 0.9),
     (r"(?:home|HOME)/\w+/\.ssh/", 0.9),
     (r"Path\s*\.\s*home\s*\(\s*\)\s*/\s*['\"]\.ssh['\"]", 0.9),
@@ -97,10 +104,13 @@ PE3_PATTERNS = [
     (r"(?<!\w)\.env(?:\.local|\.production|\.development)?(?:\s|$|['\"])", 0.6),
     (r"(?:keychain|keyring|gnome-keyring)", 0.7),
     (r"(?:Chrome|Firefox|Safari)/.*?(?:Cookies|Login Data|key4\.db)", 0.8),
+]
+PE3_PROSE_PATTERNS = [
     (r"read\s+(?:the\s+)?(?:ssh|private)\s+key", 0.8),
     (r"access\s+(?:the\s+)?(?:credentials?|secrets?|tokens?)", 0.7),
     (r"(?:extract|copy|get)\s+(?:api\s+)?keys?\s+from", 0.7),
 ]
+PE3_PATTERNS = PE3_CODE_PATTERNS + PE3_PROSE_PATTERNS
 PE4_PATTERNS = [
     (r"/var/run/docker\.sock", 0.9),
     (r"docker\.from_env\(\)", 0.85),
@@ -172,12 +182,41 @@ _PE3_TOKEN_ACTION_CONTEXT = re.compile(
     r"harvest(?:s|ed|ing)?|scrap(?:e|es|ed|ing)|upload(?:s|ed|ing)?|"
     r"transmit(?:s|ted|ting)?|send(?:s|ing)?|sent|cop(?:y|ies|ied|ying)|"
     r"extract(?:s|ed|ing|ion)?|forward(?:s|ed|ing)?|leak(?:s|ed|ing)?|"
-    r"share(?:s|d|ing)?|expose(?:s|d|ing)?)\b"
+    r"share(?:s|d|ing)?|expose(?:s|d|ing)?|log(?:s|ged|ging)?|"
+    r"print(?:s|ed|ing)?|write(?:s|written|writing)?|publish(?:es|ed|ing)?|"
+    r"display(?:s|ed|ing)?|giv(?:e|es|ing|en)|reveal(?:s|ed|ing)?|"
+    r"email(?:s|ed|ing)?|include(?:s|d|ing)?)\b"
     r"|\bpost(?:s|ed|ing)?\b[^\n]{0,80}"
     r"\b(?:it|them|(?:the\s+)?(?:access|refresh|bearer|api)[ _-]?tokens?)\b"
     r"[^\n]{0,40}\bto\b"
     r"|\b(?:read(?:s|ing)?|open(?:s|ed|ing)?|load(?:s|ed|ing)?)\b[^\n]{0,80}"
     r"\b(?:access|refresh|bearer|api)[ _-]?tokens?\b",
+    re.IGNORECASE,
+)
+_PE3_BOUND_TOKEN_OBJECT = (
+    r"[\s`'\"-]{0,24}"
+    r"(?:it|them|(?:(?:the|this|that|these|those|returned|resulting|oauth|oidc|"
+    r"access|refresh|bearer|api)\s+){0,5}tokens?|"
+    r"(?:(?:this|that|the\s+(?:returned|resulting))\s+value))\b"
+)
+_PE3_BOUND_TOKEN_TRANSFER = re.compile(
+    r"\b(?:past(?:e|es|ed|ing)|submit(?:s|ted|ting)?|attach(?:es|ed|ing)?|"
+    r"relay(?:s|ed|ing)?|deliver(?:s|ed|ing)?|put(?:s|ting)?|"
+    r"pass(?:es|ed|ing)?|enter(?:s|ed|ing)?|insert(?:s|ed|ing)?|"
+    r"post(?:s|ed|ing)?)\b"
+    + _PE3_BOUND_TOKEN_OBJECT
+    + r"[^.!?;\r\n\v\f\x1c-\x1e\x85\u2028\u2029]{0,96}?"
+    r"\b(?:to|into|onto|through|via|in|on|with|as|at|under|for)\b(?=\s+\S)",
+    re.IGNORECASE,
+)
+_PE3_BOUND_TOKEN_RETENTION = re.compile(
+    r"\b(?:stor(?:e|es|ed|ing)|sav(?:e|es|ed|ing)|export(?:s|ed|ing)?|"
+    r"persist(?:s|ed|ing)?|cach(?:e|es|ed|ing)|retain(?:s|ed|ing)?|"
+    r"keep(?:s|ing)?|kept)\b" + _PE3_BOUND_TOKEN_OBJECT + r"(?:"
+    r"(?=\s*(?:[.!?;]|$|\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]))"
+    r"|[^.!?;\r\n\v\f\x1c-\x1e\x85\u2028\u2029]{0,96}?"
+    r"\b(?:to|into|onto|through|via|in|on|with|as|at|under|for)\b(?=\s+\S)"
+    r")",
     re.IGNORECASE,
 )
 _PE3_TOKEN_SENSITIVE_SOURCE = re.compile(
@@ -203,6 +242,41 @@ _PE3_ACCESS_TOKEN_NOUN_SUFFIX = re.compile(
     r"issued|returned|accepted|rejected|revoked|stored|used|tied|associated)\b)",
     re.IGNORECASE,
 )
+_PE3_OAUTH_PROTOCOL_CONTEXT = re.compile(
+    r"\b(?:oauth(?:\s*2(?:\.\d+)?)?|openid\s+connect|oidc|authorization\s+code|"
+    r"refresh[ _-]?tokens?|bearer[ _-]?tokens?)\b",
+    re.IGNORECASE,
+)
+_PE3_COMPANION_CLI_CONTEXT = re.compile(
+    r"\b(?:companion\s+cli|command[- ]line\s+(?:client|tool)|cli(?:'s)?|"
+    r"[a-z][\w.-]*(?:ctl|-cli)(?:'s)?)\b",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_RESULT_CONTEXT = re.compile(
+    r"\b(?P<verb>return(?:s|ed)?|issu(?:e|es|ed)|provid(?:e|es|ed)|yield(?:s|ed)?)"
+    r"\s+(?:an?|the)\s+(?:(?:oauth|oidc|bearer|short-lived|"
+    r"temporary|new|provider-specific)\s+){0,3}$",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_OWNER_BRIDGE = re.compile(
+    r"^(?:['’]s)?(?:\s+(?:sign[- ]?in|login|flow|authentication|authorization|"
+    r"token|code|exchange|command|client|process|request|operation|helper)){0,4}\s*$",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_CAUSATIVE_PREFIX = re.compile(
+    r"\b(?:have|has|had|make|makes|made|let|lets|cause|causes|caused|"
+    r"force|forces|forced|ask|asks|asked|tell|tells|told|instruct|instructs|"
+    r"instructed|get|gets|got|request|requests|require|requires|command|commands|"
+    r"direct|directs|order|orders|prompt|prompts|ensure|confirm|verify|check|"
+    r"configure|use|please|must|should|shall|need|needs|can|could|may|will|would)\b",
+    re.IGNORECASE,
+)
+_PE3_OAUTH_BARE_RESULT_VERBS = frozenset({"return", "issue", "provide", "yield"})
+_PE3_OAUTH_RESULT_SUFFIX = re.compile(
+    r"\s*(?:and\s+(?:an?\s+|the\s+)?(?:short-lived\s+)?refresh[ _-]?token)?"
+    r"\s*[`'\".,;:)]*\s*$",
+    re.IGNORECASE,
+)
 _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
     {
         "docs",
@@ -219,6 +293,8 @@ _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
     }
 )
 _MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
+_MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS = 4_096
+_MAX_BOUND_TOKEN_CONTEXT_CHARS = 4_096
 
 
 def _source_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -243,15 +319,39 @@ def _source_line_bounds(
     return line_starts[index], line_ends[index]
 
 
-def _source_line(
+def _has_bound_token_transfer(
     content: str,
     match: re.Match[str],
     line_starts: tuple[int, ...] | None = None,
     line_ends: tuple[int, ...] | None = None,
-) -> str:
-    """Return only the source line containing *match*."""
-    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
-    return content[line_start:line_end]
+) -> bool:
+    """Return whether a transfer or retention instruction is bound to this token.
+
+    The generic PE3 action veto intentionally fails closed on established
+    credential verbs. The additional natural-language transfer verbs here are
+    common in unrelated documentation, so require a token/anaphoric recipient.
+    Transfer verbs additionally require a destination; persistence verbs are
+    already destination-like operations and may terminate after their object.
+    """
+    if line_starts is None or line_ends is None:
+        line_starts, line_ends = _source_line_metadata(content)
+    line_index = bisect_right(line_starts, match.start()) - 1
+    window_end = min(
+        line_ends[min(line_index + 3, len(line_ends) - 1)],
+        match.end() + _MAX_BOUND_TOKEN_CONTEXT_CHARS,
+    )
+    window_start = line_starts[line_index]
+    window = content[window_start:window_end]
+    match_start = match.start() - window_start
+    match_end = match.end() - window_start
+    for pattern in (_PE3_BOUND_TOKEN_TRANSFER, _PE3_BOUND_TOKEN_RETENTION):
+        for transfer in pattern.finditer(window):
+            # Direct instructions contain this exact token match. Anaphoric
+            # instructions ("Paste it ...") must follow it in the same bounded
+            # context window.
+            if transfer.start() <= match_start < transfer.end() or transfer.start() >= match_end:
+                return True
+    return False
 
 
 _PE3_CREDENTIAL_STORE_WORDS = frozenset({"keychain", "keyring", "gnome-keyring"})
@@ -423,6 +523,7 @@ def _is_access_token_documentation_noun(
     file_path: str,
     line_starts: tuple[int, ...] | None = None,
     line_ends: tuple[int, ...] | None = None,
+    context: str | None = None,
 ) -> bool:
     """Return True for a bounded ``access token`` compound noun in documentation.
 
@@ -430,28 +531,40 @@ def _is_access_token_documentation_noun(
     "access tokens" from the OAuth compound noun "access token". A bare
     singular match is necessarily noun-shaped: the verb form requires a
     determiner (for example, "access the token"). Plural matches remain
-    ambiguous, so suppress them only when they are not governed by an
-    imperative/modal prefix, or when a line-leading match has noun syntax.
+    ambiguous, so classify them as documentation only when they are not
+    governed by an imperative/modal prefix, or when a line-leading match has
+    noun syntax.
 
     Any credential action or sensitive source in the bounded context vetoes
-    suppression. This keeps malicious instructions actionable even when they
-    are placed in documentation or next to otherwise benign OAuth prose.
+    that classification. This keeps malicious instructions actionable even
+    when they are placed in documentation or next to otherwise benign OAuth
+    prose.
     """
     if file_type not in {"markdown", "text"}:
-        return False
-    normalized_parts = file_path.replace("\\", "/").lower().split("/")
-    if not any(part in _PE3_TOKEN_DOCUMENTATION_DIRS for part in normalized_parts):
         return False
     matched_text = match.group(0).lower()
     if matched_text not in {"access token", "access tokens"}:
         return False
 
-    context = get_context(content, match.start())
-    if _PE3_TOKEN_ACTION_CONTEXT.search(context) or _PE3_TOKEN_SENSITIVE_SOURCE.search(context):
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    if line_end - line_start > _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS:
+        return False
+    line = content[line_start:line_end]
+    normalized_parts = file_path.replace("\\", "/").lower().split("/")
+    in_documentation_directory = any(
+        part in _PE3_TOKEN_DOCUMENTATION_DIRS for part in normalized_parts
+    )
+    if not in_documentation_directory:
+        return False
+    if context is None:
+        context = get_context(content, match.start())
+    if (
+        _PE3_TOKEN_ACTION_CONTEXT.search(context)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(context)
+        or _has_bound_token_transfer(content, match, line_starts, line_ends)
+    ):
         return False
 
-    line = _source_line(content, match, line_starts, line_ends)
-    line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
     relative_start = match.start() - line_start
     relative_end = match.end() - line_start
     prefix = _MARKDOWN_LINE_PREFIX.sub("", line[:relative_start])
@@ -469,6 +582,49 @@ def _is_access_token_documentation_noun(
     if not clause_prefix.strip():
         return _PE3_ACCESS_TOKEN_NOUN_SUFFIX.match(suffix) is not None
     return True
+
+
+def _is_companion_cli_oauth_result_noun(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...] | None = None,
+    line_ends: tuple[int, ...] | None = None,
+    context: str | None = None,
+) -> bool:
+    """Recognize one directly owned singular OAuth result in CLI documentation."""
+    if file_type not in {"markdown", "text"} or match.group(0).lower() != "access token":
+        return False
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    if line_end - line_start > _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS:
+        return False
+    line = content[line_start:line_end]
+    prefix = line[: match.start() - line_start]
+    clause_prefix = prefix[max(prefix.rfind(mark) for mark in ".;:|") + 1 :]
+    cli_context = _PE3_COMPANION_CLI_CONTEXT.search(clause_prefix)
+    oauth_context = _PE3_OAUTH_PROTOCOL_CONTEXT.search(clause_prefix)
+    result_context = _PE3_OAUTH_RESULT_CONTEXT.search(clause_prefix)
+    if cli_context is None or oauth_context is None or result_context is None:
+        return False
+    owner_end = max(cli_context.end(), oauth_context.end())
+    owner_bridge = clause_prefix[owner_end : result_context.start()]
+    suffix = line[match.end() - line_start :]
+    cli_prefix = clause_prefix[: cli_context.start()]
+    if (
+        result_context.start() < owner_end
+        or _PE3_OAUTH_CAUSATIVE_PREFIX.search(cli_prefix) is not None
+        or result_context.group("verb").lower() in _PE3_OAUTH_BARE_RESULT_VERBS
+        or _PE3_OAUTH_OWNER_BRIDGE.fullmatch(owner_bridge) is None
+        or _PE3_OAUTH_RESULT_SUFFIX.fullmatch(suffix) is None
+    ):
+        return False
+    if context is None:
+        context = get_context(content, match.start())
+    return not (
+        _PE3_TOKEN_ACTION_CONTEXT.search(context)
+        or _PE3_TOKEN_SENSITIVE_SOURCE.search(context)
+        or _has_bound_token_transfer(content, match, line_starts, line_ends)
+    )
 
 
 def _is_qualified_benign_access_requirement(
@@ -507,17 +663,34 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
     line_starts, line_ends = _source_line_metadata(content)
+    content_lines = content.splitlines()
     fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
+    def line_number(offset: int) -> int:
+        return bisect_right(line_starts, offset)
+
+    def context_at(offset: int) -> str:
+        line_num = line_number(offset)
+        return get_context_from_lines(
+            content_lines,
+            line_num,
+            column=offset - line_starts[line_num - 1],
+        )
+
     tag = [PatternCategory.PRIVILEGE_ESCALATION.value]
 
     for pattern, confidence in PE1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
-            context = get_context(content, match.start())
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = line_number(match.start())
+            context = context_at(match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE1",
@@ -532,9 +705,14 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
-            context = get_context(content, match.start())
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = line_number(match.start())
+            context = context_at(match.start())
             finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
@@ -552,35 +730,78 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if _is_bare_credential_store_noun(
                 content, match, file_type, fence_ranges, line_starts, line_ends
             ):
                 continue
-            line_num = bisect_right(line_starts, match.start())
-            context = get_context(content, match.start())
-            contextual = any(
-                (
-                    _is_pe3_documentation_example(
-                        content, match, file_type, file_path, line_starts, line_ends
-                    ),
-                    _is_qualified_benign_access_requirement(
-                        content, match, file_type, line_starts, line_ends
-                    ),
-                    _is_read_only_passwd_volume_match(content, match),
-                    _is_negated_safety_constraint(content, match, line_starts, line_ends),
+            line_num = line_number(match.start())
+            context = context_at(match.start())
+            token_documentation = _is_pe3_documentation_example(
+                content,
+                match,
+                file_type,
+                file_path,
+                line_starts,
+                line_ends,
+                context,
+            )
+            companion_oauth_result = _is_companion_cli_oauth_result_noun(
+                content,
+                match,
+                file_type,
+                line_starts,
+                line_ends,
+                context,
+            )
+            contextual = (
+                token_documentation
+                or companion_oauth_result
+                or _is_qualified_benign_access_requirement(
+                    content, match, file_type, line_starts, line_ends
                 )
+                or _is_read_only_passwd_volume_match(content, match)
+                or _is_negated_safety_constraint(content, match, line_starts, line_ends)
             )
             finding_tags = list(tag)
             if contextual:
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
+            token_explanation = None
+            if companion_oauth_result:
+                if _PE3_OAUTH_PROTOCOL_CONTEXT.search(context):
+                    token_explanation = (
+                        "The matched phrase names an OAuth access-token value in documentation; "
+                        "no instruction to read, copy, or transmit stored credentials was matched."
+                    )
+                else:
+                    token_explanation = (
+                        "The matched phrase is an access-token label in documentation; no "
+                        "instruction to read, copy, or transmit stored credentials was matched."
+                    )
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE3",
-                    message="Credential Access",
-                    severity=Severity.HIGH,
+                    message=(
+                        "OAuth Token Documentation"
+                        if companion_oauth_result
+                        else "Credential Access"
+                    ),
+                    severity=Severity.LOW if companion_oauth_result else Severity.HIGH,
                     location=loc(line_num),
-                    confidence=confidence,
+                    confidence=min(confidence, 0.15) if companion_oauth_result else confidence,
+                    remediation=(
+                        "No credential-access change is indicated by this match. Keep the OAuth "
+                        "flow and token scope explicit, and review separately if the skill reads "
+                        "or transmits stored tokens."
+                        if companion_oauth_result
+                        else None
+                    ),
+                    explanation=token_explanation,
                     tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],
@@ -592,8 +813,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     pe4_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE4_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
-            context = get_context(content, match.start())
+            line_num = line_number(match.start())
+            context = context_at(match.start())
             finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
@@ -616,8 +837,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     pe5_best: dict[int, AnalyzerFinding] = {}
     for pattern, confidence in PE5_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
-            context = get_context(content, match.start())
+            line_num = line_number(match.start())
+            context = context_at(match.start())
             finding_tags = list(tag)
             if _is_documentation_example(context, file_type):
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
@@ -670,6 +891,7 @@ def _is_pe3_documentation_example(
     file_path: str,
     line_starts: tuple[int, ...] | None = None,
     line_ends: tuple[int, ...] | None = None,
+    context: str | None = None,
 ) -> bool:
     """Filter reviewed, position-bound access-token documentation forms.
 
@@ -685,16 +907,24 @@ def _is_pe3_documentation_example(
     if match.group(0).lower() not in {"access token", "access tokens"}:
         return False
 
-    line = _source_line(content, match, line_starts, line_ends)
+    line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    if line_end - line_start > _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS:
+        return False
+    line = content[line_start:line_end]
     navigation = _PE3_SAFE_ACCESS_TOKEN_NAVIGATION.search(line)
     if navigation is not None:
-        line_start, _ = _source_line_bounds(content, match, line_starts, line_ends)
         match_span = (match.start() - line_start, match.end() - line_start)
         if navigation.span("target") == match_span:
             return True
 
     return _is_access_token_documentation_noun(
-        content, match, file_type, file_path, line_starts, line_ends
+        content,
+        match,
+        file_type,
+        file_path,
+        line_starts,
+        line_ends,
+        context,
     )
 
 
@@ -706,6 +936,8 @@ def _is_negated_safety_constraint(
 ) -> bool:
     """Return True when a privilege-escalation phrase is forbidden in policy prose."""
     line_start, line_end = _source_line_bounds(content, match, line_starts, line_ends)
+    if line_end - line_start > _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS:
+        return False
     line = content[line_start:line_end]
     local_start = match.start() - line_start
     phrase = line[local_start : local_start + len(match.group(0))]

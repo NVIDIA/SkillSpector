@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Static patterns: supply chain (SC1–SC9) and trigger analysis (TR1–TR3).
+"""Static patterns: supply chain (SC1–SC10) and trigger analysis (TR1–TR3).
 
 SC1–SC3: regex-based pattern matching (original implementation).
 SC4: Known vulnerable dependencies — live OSV.dev lookup with static fallback.
@@ -22,6 +22,7 @@ SC6: Typosquatting — flags package names similar to popular packages.
 SC7: Untrusted container image — flags image signature / registry-verification bypass.
 SC8: Shipped Python bytecode — flags __pycache__/ and *.pyc/*.pyo that discovery skips.
 SC9: Concealed executable artifact — flags executables nested in document or hidden artifacts.
+SC10: Dependency source redirection — flags noncanonical package registries and indexes.
 TR1–TR3: Trigger analysis — flags overly broad, shadowing, or baiting triggers.
 
 Node and analyze() in one module.
@@ -36,6 +37,7 @@ import re
 import sys
 import time
 import tomllib
+from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +46,10 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
+from skillspector.dependency_sources import (
+    DependencySourceLimitation,
+    analyze_dependency_sources_detailed,
+)
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     LedgerOutcome,
@@ -62,7 +68,12 @@ from skillspector.state import (
 )
 
 from . import static_runner
-from .common import get_context, get_line_number
+from .common import (
+    LOGICAL_LINE_BREAK,
+    get_context_from_lines,
+    get_line_number,
+    logical_line_starts,
+)
 from .osv_client import (
     ECOSYSTEM_NPM,
     ECOSYSTEM_PYPI,
@@ -97,19 +108,22 @@ MAX_DEPENDENCY_SPEC_CHARS = 4_096
 # SC1–SC3: Original regex-based patterns
 # ---------------------------------------------------------------------------
 
-SC1_PATTERNS = [
+SC1_CODE_PATTERNS = [
     (r"^[a-zA-Z][a-zA-Z0-9_-]*\s*$", 0.6),
     (r"^[a-zA-Z][a-zA-Z0-9_-]*\s*>=\s*[\d.]+\s*$", 0.5),
     (r"^[a-zA-Z][a-zA-Z0-9_-]*\s*==\s*\*\s*$", 0.7),
     (r'"[^"]+"\s*:\s*"(?:\*|latest)"', 0.7),
     (r'"[^"]+"\s*:\s*"\^[\d.]+"', 0.4),
+]
+SC1_PROSE_PATTERNS = [
     (
         r"install\s+(?:the\s+)?latest\s+(?:version\s+)?(?:of\s+)?(?:all\s+)?(?:packages?|dependencies)",
         0.6,
     ),
     (r"(?:don't|do\s+not)\s+(?:pin|lock|specify)\s+(?:package\s+)?versions?", 0.7),
 ]
-SC2_PATTERNS = [
+SC1_PATTERNS = SC1_CODE_PATTERNS + SC1_PROSE_PATTERNS
+SC2_CODE_PATTERNS = [
     (r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
     (r"wget\s+[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh", 0.9),
     (r"curl\s+[^|]*\|\s*(?:sudo\s+)?(?:python|python3|node|ruby|perl)", 0.9),
@@ -121,10 +135,33 @@ SC2_PATTERNS = [
     (r"eval\s*\(\s*(?:await\s+)?fetch\s*\(", 0.9),
     (r"new\s+Function\s*\([^)]*fetch\s*\(", 0.9),
     (r"subprocess\.[^(]+\([^)]*(?:curl|wget)\s+https?://", 0.8),
+]
+SC2_PROSE_PATTERNS = [
     (r"download\s+and\s+(?:run|execute)\s+(?:the\s+)?script", 0.7),
     (r"run\s+(?:this|the)\s+(?:following\s+)?(?:curl|wget)\s+command", 0.6),
 ]
-SC3_PATTERNS = [
+SC2_PATTERNS = SC2_CODE_PATTERNS + SC2_PROSE_PATTERNS
+_INSTALLER_WARNING = re.compile(r"\b(?:warning|caution)\b", re.IGNORECASE)
+_INTERNAL_INSTALLER = re.compile(
+    r"\binternal\b[^\n]{0,80}\binstaller\b|\binstaller\b[^\n]{0,80}\binternal\b",
+    re.IGNORECASE,
+)
+_SOURCE_REVIEW_BEFORE_RUN = re.compile(
+    r"\b(?:review|inspect)\b[^\n]{0,80}\bsource\b[^\n]{0,80}"
+    r"\bbefore\b[^\n]{0,40}\b(?:run|execute|launch)(?:ning|d|s)?\b",
+    re.IGNORECASE,
+)
+_INSTALLER_WARNING_NEGATION = re.compile(
+    r"\b(?:not|no)\s+(?:an?\s+)?(?:warning|caution)\b|"
+    r"\b(?:never|do\s+not|don't)\s+(?:review|inspect)\b",
+    re.IGNORECASE,
+)
+_PIPE_TO_SHELL = re.compile(
+    r"\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba)?sh\b",
+    re.IGNORECASE,
+)
+_MAX_WARNED_INSTALLER_LINE_CHARS = 4_096
+SC3_CODE_PATTERNS = [
     (r"exec\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"eval\s*\(\s*(?:base64\.)?b64decode\s*\(", 0.95),
     (r"exec\s*\(\s*codecs\.decode\s*\([^)]*['\"]hex['\"]\s*\)", 0.95),
@@ -141,8 +178,11 @@ SC3_PATTERNS = [
     (r"['\"][A-Za-z0-9+/=]{200,}['\"]", 0.5),
     (r"\(lambda\s+_:\s*exec\s*\(", 0.9),
     (r"__import__\s*\(['\"]os['\"]\s*\)\.system", 0.85),
+]
+SC3_PROSE_PATTERNS = [
     (r"decode\s+(?:this|the)\s+(?:base64|hex)\s+(?:and\s+)?(?:run|execute)", 0.8),
 ]
+SC3_PATTERNS = SC3_CODE_PATTERNS + SC3_PROSE_PATTERNS
 
 # SC7: Untrusted Container Image — pulling images with signature/registry
 # verification turned off. These flags disable image trust regardless of the
@@ -940,7 +980,9 @@ def _extract_packages_from_npm_lock(
     """Extract exact package versions from an npm lockfile."""
     if limit is not None and limit <= 0:
         return []
-    found = [(name, version, line) for name, version, line, _depth in _npm_lock_entries(content)]
+    found: list[tuple[str, str | None, int]] = [
+        (name, version, line) for name, version, line, _depth in _npm_lock_entries(content)
+    ]
     return found if limit is None else found[:limit]
 
 
@@ -1163,12 +1205,22 @@ def _version_lt(v1: str, v2: str) -> bool:
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for supply chain patterns (SC1–SC3, SC7)."""
     findings: list[AnalyzerFinding] = []
+    line_starts = logical_line_starts(content)
+    content_lines = content.splitlines()
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
 
     def ctx(start: int) -> str:
-        return str(get_context(content, start))
+        line_num = bisect_right(line_starts, start)
+        return get_context_from_lines(
+            content_lines,
+            line_num,
+            column=start - line_starts[line_num - 1],
+        )
+
+    def line_number(start: int) -> int:
+        return bisect_right(line_starts, start)
 
     tag = [PatternCategory.SUPPLY_CHAIN.value]
 
@@ -1178,8 +1230,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     )
     if is_dep_file:
         for pattern, confidence in SC1_PATTERNS:
-            for match in re.finditer(pattern, content, re.MULTILINE):
-                line_num = get_line_number(content, match.start())
+            matches = (
+                static_runner.iter_paragraph_matches
+                if (pattern, confidence) in SC1_PROSE_PATTERNS
+                else re.finditer
+            )
+            for match in matches(pattern, content, re.MULTILINE):
+                line_num = line_number(match.start())
                 findings.append(
                     AnalyzerFinding(
                         rule_id="SC1",
@@ -1194,23 +1251,55 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
     for pattern, confidence in SC2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in SC2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = line_number(match.start())
             mt = match.group(0)
+            warned_internal_installer = _is_warned_internal_installer(
+                content,
+                match,
+                file_type,
+                line_starts,
+            )
             if _is_safe_supply_chain_pattern(mt):
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:
                 adj = confidence
                 sev = Severity.HIGH
+            finding_tags = list(tag)
+            if warned_internal_installer:
+                finding_tags.extend(["contextual-triage", "explicit-risk-warning"])
             findings.append(
                 AnalyzerFinding(
                     rule_id="SC2",
-                    message="External Script Fetching",
+                    message=(
+                        "Warned Pipe-to-Shell Installer"
+                        if warned_internal_installer
+                        else "External Script Fetching"
+                    ),
                     severity=sev,
                     location=loc(line_num),
                     confidence=adj,
-                    tags=tag,
+                    remediation=(
+                        "Keep the warning adjacent to this command. Prefer a checksum, signature, "
+                        "or inspect-before-execute flow instead of piping fetched content directly "
+                        "to a shell."
+                        if warned_internal_installer
+                        else None
+                    ),
+                    explanation=(
+                        "The matched documentation explicitly warns that an internal installer "
+                        "is fetched and piped directly to a shell. The warning provides context, "
+                        "but the command still executes remote code without an inspection step."
+                        if warned_internal_installer
+                        else None
+                    ),
+                    tags=finding_tags,
                     context=ctx(match.start()),
                     matched_text=mt[:200],
                     complete_match=mt,
@@ -1218,8 +1307,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     if file_type in ("python", "javascript", "shell", "other"):
         for pattern, confidence in SC3_PATTERNS:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                line_num = get_line_number(content, match.start())
+            matches = (
+                static_runner.iter_paragraph_matches
+                if (pattern, confidence) in SC3_PROSE_PATTERNS
+                else re.finditer
+            )
+            for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+                line_num = line_number(match.start())
                 findings.append(
                     AnalyzerFinding(
                         rule_id="SC3",
@@ -1236,7 +1330,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     # SC7: untrusted container image. Example filtering is delegated to the runner.
     for pattern, confidence in SC7_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-            line_num = get_line_number(content, match.start())
+            line_num = line_number(match.start())
             findings.append(
                 AnalyzerFinding(
                     rule_id="SC7",
@@ -1251,6 +1345,47 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     return findings
+
+
+def _is_warned_internal_installer(
+    content: str,
+    match: re.Match[str],
+    file_type: str,
+    line_starts: tuple[int, ...],
+) -> bool:
+    """Return whether a pipe-to-shell example carries an explicit local warning."""
+    if file_type not in {"markdown", "text"}:
+        return False
+    pipe_match = _PIPE_TO_SHELL.search(match.group(0))
+    if pipe_match is None:
+        return False
+    pipe_start = match.start() + pipe_match.start()
+    pipe_end = match.start() + pipe_match.end()
+    if LOGICAL_LINE_BREAK.search(content, pipe_start, pipe_end) is not None:
+        return False
+    line_index = max(0, bisect_right(line_starts, pipe_start) - 1)
+    line_start = line_starts[line_index]
+    separator = LOGICAL_LINE_BREAK.search(content, pipe_end)
+    line_end = separator.start() if separator is not None else len(content)
+    if line_end - line_start > _MAX_WARNED_INSTALLER_LINE_CHARS:
+        return False
+    line = content[line_start:line_end]
+    if len(tuple(_PIPE_TO_SHELL.finditer(line))) != 1:
+        return False
+    local_pipe_start = pipe_start - line_start
+    local_pipe_end = pipe_end - line_start
+    code_start = line.rfind("`", 0, local_pipe_start)
+    descriptor_end = code_start if code_start >= 0 else local_pipe_start
+    descriptor_prefix = re.split(r"(?:[.!?;]\s+|\n)", line[:descriptor_end])[-1]
+    trailing_context = line[local_pipe_end:]
+    relevant_context = f"{descriptor_prefix} {trailing_context}"
+    if _INSTALLER_WARNING_NEGATION.search(relevant_context):
+        return False
+    return (
+        _INSTALLER_WARNING.search(descriptor_prefix) is not None
+        and _INTERNAL_INSTALLER.search(descriptor_prefix) is not None
+        and _SOURCE_REVIEW_BEFORE_RUN.search(trailing_context) is not None
+    )
 
 
 _TRUSTED_DOMAINS: tuple[str, ...] = (
@@ -1806,8 +1941,9 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
 # SC8: Shipped Python bytecode (closes silent __pycache__ / .pyc skip)
 # ---------------------------------------------------------------------------
 
-# Still skip heavy/vendor trees for SC8, but *do* descend into __pycache__.
-_SC8_SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"})
+# Still skip non-runtime metadata and vendor trees for SC8, but descend into
+# Python environments: their bytecode is importable by the bundled runtime.
+_SC8_SKIP_DIRS = frozenset({".git", "node_modules", ".pytest_cache"})
 _SC8_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 MAX_SC8_DISCOVERED_ENTRIES = 10_000
 MAX_SC8_DIRECTORY_ENTRIES = 10_000
@@ -2051,10 +2187,9 @@ def _scan_shipped_bytecode(
 def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
     """Emit SC8 when a skill ships __pycache__ dirs or .pyc/.pyo files.
 
-    ``build_context`` excludes ``__pycache__`` from inventory and
-    ``static_runner`` treats ``.pyc`` as binary, so malicious bytecode can
-    otherwise score SAFE. Presence alone is a HIGH supply-chain signal;
-    full disassembly can come later.
+    ``build_context`` keeps bytecode out of content analysis and
+    ``static_runner`` treats ``.pyc`` as binary. Presence alone is a HIGH
+    supply-chain signal; full disassembly can come later.
     """
     return _scan_shipped_bytecode(skill_path).findings
 
@@ -2062,10 +2197,13 @@ def _analyze_shipped_bytecode(skill_path: str) -> list[Finding]:
 def _analyze_concealed_executables(
     component_metadata: list[dict[str, object]],
 ) -> list[Finding]:
-    """Emit SC9 for executable content concealed in a local-only artifact."""
+    """Emit SC9 for concealed executables or incomplete excluded-artifact inspection."""
     findings: list[Finding] = []
     for metadata in component_metadata:
-        if not metadata.get("concealed_executable"):
+        if metadata.get("allowed_exclusion") is True:
+            continue
+        inspection_incomplete = metadata.get("excluded_inspection_incomplete") is True
+        if not metadata.get("concealed_executable") and not inspection_incomplete:
             continue
         path = str(metadata.get("path", ""))
         if not path:
@@ -2087,11 +2225,22 @@ def _analyze_concealed_executables(
             else:
                 concealment_reasons.append("disguised_container")
         concealment = concealment_reasons[0]
+        excluded_from_analysis = metadata.get("excluded_from_analysis") is True
+        referenced_uninspected = (
+            metadata.get("inspection_limitation_reason")
+            == LedgerReason.REFERENCED_UNINSPECTED.value
+        )
         findings.append(
             Finding(
                 rule_id="SC9",
                 message=(
-                    "Executable content is concealed inside a document, hidden, "
+                    "A referenced excluded artifact was not inspected."
+                    if referenced_uninspected
+                    else "An excluded artifact could not be completely inspected."
+                    if inspection_incomplete
+                    else "Executable content is excluded from analysis."
+                    if excluded_from_analysis
+                    else "Executable content is concealed inside a document, hidden, "
                     "or disguised artifact."
                 ),
                 severity="HIGH",
@@ -2099,19 +2248,41 @@ def _analyze_concealed_executables(
                 file=path,
                 start_line=1,
                 category="Supply Chain",
-                pattern="Concealed Executable Artifact",
+                pattern=(
+                    "Referenced Excluded Artifact Uninspected"
+                    if referenced_uninspected
+                    else "Excluded Artifact Inspection Incomplete"
+                    if inspection_incomplete
+                    else "Concealed Executable Artifact"
+                ),
                 finding=nested_path,
                 explanation=(
-                    "An executable nested in a document or hidden/disguised artifact can "
+                    "SKILL.md references an artifact whose content remains outside "
+                    "deterministic analyzer coverage."
+                    if referenced_uninspected
+                    else "A resource, read, or archive-safety limit left excluded content "
+                    "outside deterministic inspection coverage."
+                    if inspection_incomplete
+                    else "An executable artifact remains available under the skill install path "
+                    "but its content is outside analyzer coverage."
+                    if excluded_from_analysis
+                    else "An executable nested in a document or hidden/disguised artifact can "
                     "evade ordinary extension-based review while still being available to "
                     "the skill at runtime."
                 ),
                 remediation=(
-                    "Review the artifact provenance and the reason executable content is "
+                    "Move directly referenced runtime artifacts into normal analyzer scope "
+                    "or remove the reference."
+                    if referenced_uninspected
+                    else "Review the artifact provenance and the reason executable content is "
                     "packaged in this location; keep executable files explicit and directly "
                     "reviewable."
                 ),
-                tags=["supply-chain", "concealed-executable", "local-only"],
+                tags=[
+                    "supply-chain",
+                    "referenced-artifact" if referenced_uninspected else "concealed-executable",
+                    "local-only",
+                ],
                 matched_text=path,
                 evidence={
                     "outer_path": outer_path,
@@ -2122,6 +2293,11 @@ def _analyze_concealed_executables(
                     "concealment": concealment,
                     "concealment_reasons": concealment_reasons,
                     "local_only": True,
+                    "referenced": metadata.get("referenced") is True,
+                    "excluded_from_analysis": excluded_from_analysis,
+                    "excluded_inspection_incomplete": inspection_incomplete,
+                    "inherited_exclusion_reason": metadata.get("inherited_exclusion_reason"),
+                    "inspection_limitation_reason": metadata.get("inspection_limitation_reason"),
                 },
             )
         )
@@ -2134,7 +2310,7 @@ def _analyze_concealed_executables(
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Run supply_chain patterns (SC1–SC9) and trigger analysis (TR1–TR3)."""
+    """Run supply_chain patterns (SC1–SC10) and trigger analysis (TR1–TR3)."""
     # SC1–SC3 via static_runner
     response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
     findings = response["findings"]
@@ -2170,7 +2346,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
 
     def record_limitation(
         path: str,
-        limitation: OsvQueryLimitation | _SupplementalLimitation,
+        limitation: OsvQueryLimitation | _SupplementalLimitation | DependencySourceLimitation,
         fallback_analyzer_id: str,
     ) -> None:
         """Project one supplemental omission into canonical partial accounting."""
@@ -2430,6 +2606,30 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 limit_records=concealed_limit,
             ),
             f"{ANALYZER_ID}_concealed_executable",
+        )
+
+    # SC10: deterministic dependency registry/source trust-boundary changes.
+    dependency_source_scan = analyze_dependency_sources_detailed(
+        components,
+        file_cache,
+        component_metadata,
+        timeout_seconds=transitive_remaining_seconds(state),
+        max_findings=max(0, MAX_FINDING_OUTPUT_RECORDS - len(findings)),
+    )
+    dependency_source_findings = dependency_source_scan.findings
+    findings.extend(dependency_source_findings)
+    for finding_path in sorted({finding.file for finding in dependency_source_findings}):
+        record_extra_findings(
+            finding_path,
+            [finding for finding in dependency_source_findings if finding.file == finding_path],
+            f"{ANALYZER_ID}_dependency_source",
+        )
+
+    for source_limitation in dependency_source_scan.limitations:
+        record_limitation(
+            source_limitation.path,
+            source_limitation,
+            f"{ANALYZER_ID}_dependency_source",
         )
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))

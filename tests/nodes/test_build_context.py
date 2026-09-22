@@ -21,8 +21,10 @@ Uses skill spec layout: SKILL.md, references/, scripts/, assets/
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
+import zipfile
 from pathlib import Path
 from time import monotonic
 from typing import BinaryIO
@@ -32,8 +34,12 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from skillspector.artifacts import ArtifactDisposition
 from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES, MODEL_CONFIG
-from skillspector.inspection_ledger import LedgerReason
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.nodes.analyzers.static_patterns_supply_chain import (
+    _analyze_concealed_executables,
+)
 from skillspector.nodes.build_context import build_context
+from skillspector.nodes.report import _compute_risk_score
 from skillspector.providers import reset_provider, use_provider
 from skillspector.providers.openai import OpenAIProvider
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
@@ -55,7 +61,7 @@ _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.
 def _write_real_oms_signature(root: Path, relative_path: str = "skill.oms.sig") -> Path:
     target = root / relative_path
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_OMS_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    target.write_bytes(_OMS_FIXTURE.read_bytes())
     return target
 
 
@@ -65,11 +71,14 @@ def _make_skill_spec_dir(root: Path, *, skill_md_name: str = "SKILL.md") -> None
         (root / "SKILL.md").write_text(
             "---\nname: test-skill\ndescription: For tests\ntriggers: [a, b]\npermissions: [read]\n---\n\n# Skill\n",
             encoding="utf-8",
+            newline="\n",
         )
     (root / "references").mkdir(exist_ok=True)
-    (root / "references" / "guide.md").write_text("# Reference guide\n", encoding="utf-8")
+    (root / "references" / "guide.md").write_text(
+        "# Reference guide\n", encoding="utf-8", newline="\n"
+    )
     (root / "scripts").mkdir(exist_ok=True)
-    (root / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8")
+    (root / "scripts" / "run.py").write_text("print(1)\n", encoding="utf-8", newline="\n")
     (root / "assets").mkdir(exist_ok=True)
     (root / "assets" / "icon.png").write_bytes(b"\x89PNG\r\n\x1a\n")
     if skill_md_name == "skill.md":
@@ -271,12 +280,14 @@ def test_scandir_checks_shared_deadline_for_each_directory_entry(
             self.reasons.append(reason)
 
     budget = FakeSharedBudget()
-    paths, events = build_context_module._walk_skill_files(
+    paths, events, excluded, gaps = build_context_module._walk_skill_files(
         tmp_path,
         {"workflow_resource_budget": budget},
     )
 
     assert paths == []
+    assert excluded == {}
+    assert gaps == {"SKILL.md": (None, LedgerReason.RUNTIME_LIMIT)}
     assert len(events) == 1
     assert events[0]["outcome"] == "partial"
     assert events[0]["reason_code"] == LedgerReason.RUNTIME_LIMIT
@@ -312,9 +323,11 @@ def test_discovery_marks_single_entry_partial_when_path_check_crosses_deadline(
     monkeypatch.setattr(build_context_module, "MAX_BUNDLE_DISCOVERY_SECONDS", 1.0)
     monkeypatch.setattr(build_context_module, "_resolves_outside", slow_path_check)
 
-    paths, events = build_context_module._walk_skill_files(tmp_path)
+    paths, events, excluded, gaps = build_context_module._walk_skill_files(tmp_path)
 
     assert paths == []
+    assert excluded == {}
+    assert gaps == {}
     assert len(events) == 1
     assert events[0]["phase"] == "discovery"
     assert events[0]["path"] == "SKILL.md"
@@ -329,8 +342,8 @@ def test_file_cache_stops_at_progressing_shared_deadline_with_affected_suffix(
     """A deadline reached between files marks the deterministic unread suffix partial."""
     import skillspector.nodes.build_context as build_context_module
 
-    (tmp_path / "first.txt").write_text("first\n", encoding="utf-8")
-    (tmp_path / "second.txt").write_text("second\n", encoding="utf-8")
+    (tmp_path / "first.txt").write_text("first\n", encoding="utf-8", newline="\n")
+    (tmp_path / "second.txt").write_text("second\n", encoding="utf-8", newline="\n")
     clock_values = iter((0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.6))
     monkeypatch.setattr(build_context_module, "monotonic", lambda: next(clock_values))
 
@@ -469,7 +482,7 @@ def test_dense_directory_discovery_and_cache_complete_with_modest_real_elapsed_t
         (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
 
     started = monotonic()
-    paths, discovery_events = build_context_module._walk_skill_files(tmp_path)
+    paths, discovery_events, excluded, gaps = build_context_module._walk_skill_files(tmp_path)
     _text, raw, _llm, inventory, cache_events = build_context_module._read_file_cache(
         tmp_path,
         paths,
@@ -477,6 +490,8 @@ def test_dense_directory_discovery_and_cache_complete_with_modest_real_elapsed_t
     elapsed = monotonic() - started
 
     assert len(paths) == len(raw) == len(inventory) == 256
+    assert excluded == {}
+    assert gaps == {}
     assert not discovery_events
     assert not cache_events
     assert elapsed < 5.0
@@ -592,6 +607,43 @@ def test_source_local_only_provenance_blocks_the_provider_cache(
     assert result["component_metadata"]
     assert all(item["local_only"] is True for item in result["component_metadata"])
     assert all(item["hidden_ancestor"] is True for item in result["component_metadata"])
+
+
+def test_source_local_only_preserves_excluded_executable_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hidden-source privacy must not erase fail-closed exclusion evidence."""
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "openai")
+    (tmp_path / "SKILL.md").write_text("# Private skill\n", encoding="utf-8")
+    payload = tmp_path / "node_modules" / "pkg" / "payload.js"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("require('child_process').exec('id')\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path), "source_local_only": True})
+
+    assert result["llm_file_cache"] == {}
+    assert result["file_cache"] == {}
+    assert result["llm_components"] == []
+    assert result["has_executable_scripts"] is True
+    metadata = next(
+        item
+        for item in result["component_metadata"]
+        if item["path"] == "node_modules/pkg/payload.js"
+    )
+    assert metadata["excluded_from_analysis"] is True
+    assert metadata["concealed_executable"] is True
+    assert metadata["local_only"] is True
+    assert metadata["hidden_ancestor"] is True
+    assert metadata["source_local_only"] is True
+    assert any(
+        event["path"] == "node_modules/pkg/payload.js"
+        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        for event in result["inspection_ledger"]
+    )
+    assert any(
+        finding.file == "node_modules/pkg/payload.js"
+        for finding in _analyze_concealed_executables(result["component_metadata"])
+    )
 
 
 def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
@@ -723,7 +775,7 @@ def test_build_context_scans_nested_oms_signature(tmp_path: Path) -> None:
 
     result = build_context({"skill_path": str(tmp_path)})
 
-    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_text(encoding="utf-8")
+    assert result["file_cache"]["nested/skill.oms.sig"] == nested.read_bytes().decode("utf-8")
     signature_meta = next(
         item for item in result["component_metadata"] if item["path"] == "nested/skill.oms.sig"
     )
@@ -966,26 +1018,436 @@ def test_build_context_parses_allowed_tools_single_space_string(tmp_path: Path) 
     assert result["manifest"]["allowed-tools"] == ["Bash"]
 
 
-def test_build_context_reports_exclusion_boundary_without_descendants(tmp_path: Path) -> None:
-    """Excluded directory trees produce one boundary record, not child records."""
+def test_build_context_inventories_excluded_executable_descendants(tmp_path: Path) -> None:
+    """Excluded trees retain bounded inventory and executable coverage evidence."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    excluded_files = {
+        "node_modules/pkg/index.js": b"alert(1)\n",
+        "node_modules/pkg/module.wasm": b"\x00asm\x01\x00\x00\x00",
+        "node_modules/pkg/payload.mjs": b"export default () => 1;\n",
+        "node_modules/pkg/vector.svg": b"<svg><script>alert(1)</script></svg>\n",
+        ".venv/bin/launcher": b"#!/bin/sh\necho launch\n",
+        ".tox/env/payload.pyc": b"\x00",
+        ".pytest_cache/README.md": b"ordinary cache metadata\n",
+    }
+    for relative_path, content in excluded_files.items():
+        target = tmp_path / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    result = build_context({"skill_path": str(tmp_path)})
+    excluded_executables = {
+        "node_modules/pkg/index.js",
+        "node_modules/pkg/module.wasm",
+        "node_modules/pkg/payload.mjs",
+        "node_modules/pkg/vector.svg",
+        ".venv/bin/launcher",
+        ".tox/env/payload.pyc",
+    }
+
+    assert not excluded_executables.intersection(result["components"])
+    assert not excluded_executables.intersection(result["local_file_cache"])
+    inventory = {item["path"]: item for item in result["artifact_inventory"]}
+    assert set(excluded_files).issubset(inventory)
+    assert all(
+        inventory[path]["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+        and inventory[path]["reason"] == LedgerReason.EXCLUDED_DIRECTORY.value
+        for path in excluded_files
+    )
+    metadata = {item["path"]: item for item in result["component_metadata"]}
+    assert excluded_executables.issubset(metadata)
+    assert ".pytest_cache/README.md" not in metadata
+    assert all(
+        metadata[path]["executable"] is True
+        and metadata[path]["excluded_from_analysis"] is True
+        and metadata[path]["concealment_reasons"] == ["excluded_directory"]
+        for path in excluded_executables
+    )
+    partial_paths = {
+        event["path"]
+        for event in result["inspection_ledger"]
+        if event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+    }
+    assert partial_paths == excluded_executables
+    scope_paths = {
+        event["path"] for event in result["inspection_ledger"] if event["outcome"] == "out_of_scope"
+    }
+    assert {
+        "node_modules/",
+        ".venv/",
+        ".tox/",
+        ".pytest_cache/",
+        *excluded_executables,
+    }.issubset(scope_paths)
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert {finding.file for finding in findings} == excluded_executables
+    score, _, recommendation = _compute_risk_score(findings, False)
+    assert score >= 51
+    assert recommendation == "DO_NOT_INSTALL"
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "instruction", "content"),
+    [
+        (
+            "node_modules/pkg/loader",
+            "Run `python ./node_modules/pkg/loader`.",
+            b"import os\nprint(os.getcwd())\n",
+        ),
+        (
+            "node_modules/pkg/loader",
+            "Run `python node_modules/pkg/loader`.",
+            b"import os\nprint(os.getcwd())\n",
+        ),
+        (
+            ".git/hooks/pre-commit.sample",
+            "Run `./.git/hooks/pre-commit.sample` before committing.",
+            b"#!/bin/sh\necho sample\n",
+        ),
+    ],
+)
+def test_referenced_excluded_artifact_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    instruction: str,
+    content: bytes,
+) -> None:
+    """Resolved excluded targets cannot remain silently outside analyzer coverage."""
+    (tmp_path / "SKILL.md").write_text(f"# Skill\n\n{instruction}\n", encoding="utf-8")
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    target.chmod(0o644)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    reference = next(
+        item for item in result["artifact_references"] if item["target_path"] == relative_path
+    )
+    assert reference["status"] == "resolved"
+    assert reference["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == relative_path)
+    assert artifact["referenced"] is True
+    assert artifact["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+    assert relative_path not in result["components"]
+    assert relative_path not in result["local_file_cache"]
+
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["referenced"] is True
+    assert metadata["excluded_from_analysis"] is True
+    assert metadata["excluded_inspection_incomplete"] is True
+    assert metadata["inspection_limitation_reason"] == LedgerReason.REFERENCED_UNINSPECTED.value
+    assert metadata.get("allowed_exclusion") is not True
+    assert any(
+        event["path"] == relative_path
+        and event["outcome"] == LedgerOutcome.PARTIAL
+        and event.get("reason_code") == LedgerReason.REFERENCED_UNINSPECTED
+        for event in result["inspection_ledger"]
+    )
+
+    finding = next(
+        item
+        for item in _analyze_concealed_executables(result["component_metadata"])
+        if item.file == relative_path
+    )
+    assert finding.message == "A referenced excluded artifact was not inspected."
+    assert finding.evidence["referenced"] is True
+    assert finding.evidence["excluded_from_analysis"] is True
+    score, _, recommendation = _compute_risk_score(
+        [finding],
+        bool(result["has_executable_scripts"]),
+        result["component_metadata"],
+    )
+    assert score >= 51
+    assert recommendation == "DO_NOT_INSTALL"
+
+
+def test_excluded_tree_inventory_obeys_global_artifact_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auditing an excluded tree fails closed instead of exceeding discovery bounds."""
+    import skillspector.nodes.build_context as build_context_module
+
     (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
     excluded = tmp_path / "node_modules" / "pkg"
     excluded.mkdir(parents=True)
-    (excluded / "index.js").write_text("alert(1)\n", encoding="utf-8")
+    (excluded / "first.js").write_text("alert(1)\n", encoding="utf-8")
+    (excluded / "second.js").write_text("alert(2)\n", encoding="utf-8")
+    # Root entries and the nested package directory consume this exact allowance.
+    monkeypatch.setattr(build_context_module, "MAX_DISCOVERED_ARTIFACTS", 3)
 
     result = build_context({"skill_path": str(tmp_path)})
-    exclusions = [
-        event for event in result["inspection_ledger"] if event["outcome"] == "out_of_scope"
-    ]
 
-    assert [event["path"] for event in exclusions] == ["node_modules/"]
-    assert "node_modules/pkg/index.js" not in result["components"]
+    assert result["components"] == ["SKILL.md"]
+    assert any(
+        event["outcome"] == "partial"
+        and event.get("reason_code") == LedgerReason.ARTIFACT_COUNT_LIMIT
+        and event["path"] == "node_modules/pkg/first.js"
+        for event in result["inspection_ledger"]
+    )
+    incomplete = next(
+        item for item in result["component_metadata"] if item["path"] == "node_modules/pkg/first.js"
+    )
+    assert incomplete["excluded_from_analysis"] is True
+    assert incomplete["excluded_inspection_incomplete"] is True
+    assert incomplete["inherited_exclusion_reason"] == "excluded_directory"
+    assert incomplete["inspection_limitation_reason"] == "artifact_count_limit"
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
+
+
+def test_excluded_tree_depth_limit_synthesizes_blocking_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A depth bound inside an excluded tree is a blocking coverage gap."""
+    import skillspector.nodes.build_context as build_context_module
+
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    payload = tmp_path / "node_modules" / "pkg" / "payload.sh"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("#!/bin/sh\necho hidden\n", encoding="utf-8")
+    monkeypatch.setattr(build_context_module, "MAX_BUNDLE_TRAVERSAL_DEPTH", 1)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    incomplete = next(
+        item for item in result["component_metadata"] if item["path"] == "node_modules/pkg"
+    )
+    assert incomplete["excluded_inspection_incomplete"] is True
+    assert incomplete["inspection_limitation_reason"] == "traversal_depth_limit"
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
+
+
+def test_pending_ordinary_tree_limit_cannot_hide_excluded_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unentered ordinary parent gets a blocking unknown-subtree sentinel."""
+    import skillspector.nodes.build_context as build_context_module
+
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    payload = tmp_path / "aaa" / "node_modules" / "pkg" / "payload.sh"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("#!/bin/sh\necho hidden\n", encoding="utf-8")
+    monkeypatch.setattr(build_context_module, "MAX_DISCOVERED_ARTIFACTS", 1)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    incomplete = next(item for item in result["component_metadata"] if item["path"] == "aaa")
+    assert incomplete["excluded_from_analysis"] is True
+    assert incomplete["excluded_inspection_incomplete"] is True
+    assert incomplete["inspection_limitation_reason"] == "artifact_count_limit"
+    assert "inherited_exclusion_reason" not in incomplete
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
+
+
+def test_excluded_tree_read_error_synthesizes_blocking_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory read failure inside an exclusion remains fail-closed."""
+    import skillspector.nodes.build_context as build_context_module
+
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    excluded = tmp_path / "node_modules" / "pkg"
+    excluded.mkdir(parents=True)
+    (excluded / "payload.sh").write_text("#!/bin/sh\necho hidden\n", encoding="utf-8")
+    real_scandir = build_context_module.os.scandir
+
+    def fail_excluded_scandir(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
+        if Path(path) == excluded:
+            raise PermissionError("test read boundary")
+        return real_scandir(path)
+
+    monkeypatch.setattr(build_context_module.os, "scandir", fail_excluded_scandir)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    incomplete = next(
+        item for item in result["component_metadata"] if item["path"] == "node_modules/pkg"
+    )
+    assert incomplete["inherited_exclusion_reason"] == "excluded_directory"
+    assert incomplete["excluded_inspection_incomplete"] is True
+    assert incomplete["inspection_limitation_reason"] == "read_error"
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
+
+
+def test_excluded_tree_discovery_time_limit_synthesizes_blocking_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deadline reached on an excluded root creates blocking coverage evidence."""
+    import skillspector.nodes.build_context as build_context_module
+
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    excluded = tmp_path / "node_modules" / "pkg"
+    excluded.mkdir(parents=True)
+    (excluded / "payload.sh").write_text("#!/bin/sh\necho hidden\n", encoding="utf-8")
+    expired = False
+    real_is_symlink = build_context_module._is_symlink
+
+    def expire_at_exclusion(path: Path) -> bool:
+        nonlocal expired
+        result = real_is_symlink(path)
+        if path == tmp_path / "node_modules":
+            expired = True
+        return result
+
+    monkeypatch.setattr(build_context_module, "_is_symlink", expire_at_exclusion)
+    monkeypatch.setattr(build_context_module, "monotonic", lambda: 31.0 if expired else 0.0)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    incomplete = next(
+        item for item in result["component_metadata"] if item["path"] == "node_modules"
+    )
+    assert incomplete["inherited_exclusion_reason"] == "excluded_directory"
+    assert incomplete["excluded_inspection_incomplete"] is True
+    assert incomplete["inspection_limitation_reason"] == "runtime_limit"
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "inherited_reason"),
+    [
+        ("payload.exe", LedgerReason.NOT_REGULAR_FILE.value),
+        ("node_modules/pkg/payload.exe", LedgerReason.EXCLUDED_DIRECTORY.value),
+    ],
+)
+def test_executable_symlink_is_not_dereferenced_and_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    inherited_reason: str,
+) -> None:
+    """Executable-looking links are audited no-follow and cannot remain SAFE."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    target = tmp_path / "ordinary.txt"
+    target.write_text("inert target\n", encoding="utf-8")
+    link = tmp_path / relative_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == relative_path)
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.NOT_REGULAR_FILE.value
+    assert artifact["inherited_exclusion_reason"] == inherited_reason
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["executable"] is True
+    assert metadata["excluded_inspection_incomplete"] is True
+    assert metadata["inspection_limitation_reason"] == LedgerReason.NOT_REGULAR_FILE.value
+    assert any(
+        event["path"] == relative_path
+        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        for event in result["inspection_ledger"]
+    )
+    assert _compute_risk_score([], False, result["component_metadata"])[0] == 51
+
+
+def test_excluded_artifact_probe_checks_deadline_after_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow excluded-file operation is accounted as partial even for the final file."""
+    import skillspector.nodes.build_context as build_context_module
+
+    payload = tmp_path / "node_modules" / "README"
+    payload.parent.mkdir()
+    payload.write_text("ordinary metadata\n", encoding="utf-8")
+    clock = iter((0.0, 2.0))
+    monkeypatch.setattr(build_context_module, "monotonic", lambda: next(clock))
+
+    inventory, metadata, events, archive_cache, input_bytes = (
+        build_context_module._inspect_excluded_artifacts(
+            tmp_path,
+            {"node_modules/README": LedgerReason.EXCLUDED_DIRECTORY},
+            state={},
+            started_at=0.0,
+            deadline=1.0,
+        )
+    )
+
+    assert len(metadata) == 1
+    assert metadata[0]["excluded_inspection_incomplete"] is True
+    assert metadata[0]["excluded_from_analysis"] is True
+    assert archive_cache == {}
+    assert input_bytes == len("ordi")
+    assert len(inventory) == 1
+    assert inventory[0]["path"] == "node_modules/README"
+    assert inventory[0]["disposition"] == ArtifactDisposition.PARTIAL
+    assert inventory[0]["reason"] == LedgerReason.RUNTIME_LIMIT.value
+    assert inventory[0]["size_bytes"] == len("ordinary metadata\n")
+    assert len(events) == 1
+    assert events[0]["reason_code"] == LedgerReason.RUNTIME_LIMIT
+    assert events[0]["observed_seconds"] == pytest.approx(2.0)
+    assert events[0]["limit_seconds"] == pytest.approx(1.0)
+
+
+def test_excluded_archive_bytes_are_charged_once_with_expanded_members(tmp_path: Path) -> None:
+    """Outer archive input and expanded member bytes each consume the shared budget once."""
+
+    class Traversal:
+        def __init__(self) -> None:
+            self.scanned_bytes = 0
+
+        def remaining_bytes(self) -> int:
+            return 1024 * 1024 - self.scanned_bytes
+
+        def remaining_seconds(self) -> float:
+            return 60.0
+
+        def record_bytes(self, count: int) -> None:
+            self.scanned_bytes += count
+
+        def note_truncation(self, _reason: str) -> None:
+            raise AssertionError("unexpected truncation")
+
+    skill_bytes = b"# Excluded archive accounting\n"
+    member_bytes = b"#!/bin/sh\necho nested\n"
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.sh", member_bytes)
+    archive_bytes = archive_buffer.getvalue()
+    (tmp_path / "SKILL.md").write_bytes(skill_bytes)
+    excluded_archive = tmp_path / "node_modules" / "cache.zip"
+    excluded_archive.parent.mkdir()
+    excluded_archive.write_bytes(archive_bytes)
+    traversal = Traversal()
+
+    context = build_context({"skill_path": str(tmp_path), "transitive_traversal_state": traversal})
+
+    assert "node_modules/cache.zip!/payload.sh" not in context["raw_file_cache"]
+    assert traversal.scanned_bytes == len(skill_bytes) + len(archive_bytes) + len(member_bytes)
+
+
+def test_build_context_audits_executable_selected_baseline(tmp_path: Path) -> None:
+    """A user-selected in-tree exclusion cannot silently hide executable content."""
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    baseline = tmp_path / "config" / "baseline.yaml"
+    baseline.parent.mkdir()
+    baseline.write_text("#!/bin/sh\nversion: 1\nrules: []\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path), "baseline_path": str(baseline)})
+
+    path = "config/baseline.yaml"
+    assert path not in result["components"]
+    inventory = next(item for item in result["artifact_inventory"] if item["path"] == path)
+    assert inventory["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+    assert inventory["reason"] == LedgerReason.BASELINE_FILE.value
+    metadata = next(item for item in result["component_metadata"] if item["path"] == path)
+    assert metadata["executable"] is True
+    assert metadata["excluded_from_analysis"] is True
+    assert metadata["concealment_reasons"] == ["baseline_file"]
+    assert any(
+        event["path"] == path
+        and event.get("reason_code") == LedgerReason.EXCLUDED_EXECUTABLE_CONTENT
+        for event in result["inspection_ledger"]
+    )
 
 
 def test_build_context_inventories_hidden_file_for_local_analysis(tmp_path: Path) -> None:
     """Hidden regular files stay local and never enter the LLM-visible cache."""
     (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
-    (tmp_path / ".env").write_text("TOKEN=not-reported\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=not-reported\n", encoding="utf-8", newline="\n")
 
     result = build_context({"skill_path": str(tmp_path)})
     assert ".env" in result["components"]
@@ -1009,7 +1471,13 @@ def test_build_context_reports_read_error_without_fake_empty_content(
     def deny_open(*args: object, **kwargs: object) -> int:
         raise PermissionError("sensitive operating-system detail")
 
+    # The secure open dispatches on the platform: POSIX goes through os.open,
+    # Windows through the handle-based helper. Deny both so the failure is
+    # injected wherever the test happens to run.
     monkeypatch.setattr("skillspector.input_handler.os.open", deny_open)
+    monkeypatch.setattr(
+        "skillspector.input_handler._open_regular_file_from_windows_handle", deny_open
+    )
     result = build_context({"skill_path": str(tmp_path)})
 
     assert "broken.py" in result["components"]
@@ -1076,6 +1544,8 @@ def test_build_context_records_stat_errors_in_the_ledger(
 
 def test_build_context_records_non_regular_entries_in_the_ledger(tmp_path: Path) -> None:
     """A discovered FIFO is retained as failed ledger evidence, never silently skipped."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes are unavailable on this platform")
     fifo = tmp_path / "inspection.pipe"
     os.mkfifo(fifo)
 
