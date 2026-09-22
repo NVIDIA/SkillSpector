@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from bisect import bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
@@ -1710,6 +1711,7 @@ def _has_shell_command_word_exhaustion(
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
     may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
+    json_openers = sorted(structural_quote_openers or ())
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
@@ -1759,7 +1761,13 @@ def _has_shell_command_word_exhaustion(
             # artifact. Once that unresolved span exceeds the command-word
             # budget, treating it as clean would turn malformed, deeply nested
             # runtime selection into a fail-open result.
-            if len(content) - start > _SHELL_COMMAND_WORD_CHARS:
+            # A validated JSON value owns its bytes and is checked separately.
+            # Do not charge that value to an earlier unmatched Markdown tick.
+            next_json = bisect_right(json_openers, start)
+            unresolved_end = (
+                json_openers[next_json] if next_json < len(json_openers) else len(content)
+            )
+            if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
                 return True
             continue
         # Only executable nested substitutions retain independent command
@@ -1775,6 +1783,7 @@ def _has_shell_command_word_exhaustion(
         )
         if (
             not parsed.dynamic
+            or "$" not in raw_word
             or not any(marker in raw_word for marker in ("$(", "`"))
             or simple_backtick_parameter
         ):
@@ -1921,8 +1930,12 @@ def _command_string_from_clause(
         if command in _SHELL_COMMAND_STRING_SHELLS:
             for _ in range(16):
                 option, limited = next_word()
-                if limited or option is None:
+                if limited:
                     return True, None
+                if option is None:
+                    # Without -c there is no command string to reconstruct.
+                    # This also keeps Markdown fence labels such as sh inert.
+                    return False, None
                 if option.startswith("-") and not option.startswith("--"):
                     if "c" in option[1:]:
                         command_string, limited = next_word()
@@ -3313,20 +3326,6 @@ def has_bounded_parse_exhaustion(
         structural_quote_closers=structural_quote_closers,
         structural_quote_openers=structural_quote_openers,
     ):
-        return True
-    if (
-        file_type == "markdown"
-        and raw_content != content
-        and _has_shell_command_word_exhaustion(
-            raw_content,
-            check_runtime,
-        )
-    ):
-        # Markdown normalization removes inline-code backticks. Scan the raw
-        # spelling as an additive completeness check so a runtime-selected
-        # backtick command cannot hide its destructive operands past the
-        # tokenizer lookahead. Documentary parameter notation is excluded by
-        # the bounded context predicate in ``_is_printf_substitution``.
         return True
     covered_until = 0
     for command_start, body_start in _destructive_command_words(content):
