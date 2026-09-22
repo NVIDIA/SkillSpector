@@ -431,9 +431,9 @@ SkillSpector detects **101 vulnerability patterns** across 23 categories:
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
-| EA1 | Unrestricted Tool Access | HIGH | Unfettered tool access without constraints |
-| EA2 | Autonomous Decision Making | HIGH | High-impact decisions without human-in-the-loop |
-| EA3 | Scope Creep | MEDIUM | Capabilities extending beyond stated purpose |
+| EA1 | Unrestricted Tool Access | MEDIUM | Unfettered tool access without constraints |
+| EA2 | Autonomous Decision Making | MEDIUM | High-impact decisions without human-in-the-loop |
+| EA3 | Scope Creep | LOW | Capabilities extending beyond stated purpose |
 | EA4 | Unbounded Resource Access | MEDIUM | No rate limits or quotas on resource consumption |
 | EA5 | External Model or Provider Selection | MEDIUM/HIGH | Model/provider pins or coding-CLI shell-outs that can switch billing accounts |
 
@@ -457,7 +457,7 @@ SkillSpector detects **101 vulnerability patterns** across 23 categories:
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
-| MP1 | Persistent Context Injection | HIGH | Content designed to persist across interactions |
+| MP1 | Persistent Context Injection | MEDIUM | Content designed to persist across interactions |
 | MP2 | Context Window Stuffing | MEDIUM | Filler content displacing safety constraints |
 | MP3 | Memory Manipulation | HIGH | Tampering with agent memory or stored state |
 
@@ -474,8 +474,8 @@ SkillSpector detects **101 vulnerability patterns** across 23 categories:
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
-| RA1 | Self-Modification | CRITICAL | Modifying own code or configuration at runtime |
-| RA2 | Session Persistence | HIGH | Unauthorized persistence via cron jobs or startup scripts |
+| RA1 | Self-Modification | HIGH | Modifying own code or configuration at runtime |
+| RA2 | Session Persistence | MEDIUM | Unauthorized persistence via cron jobs or startup scripts |
 
 ### Agent Snooping (3 patterns)
 
@@ -516,13 +516,13 @@ SkillSpector detects **101 vulnerability patterns** across 23 categories:
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
-| AST1 | exec() Call | CRITICAL | Direct exec() enabling arbitrary code execution |
+| AST1 | exec() Call | HIGH | Direct exec() enabling arbitrary code execution |
 | AST2 | eval() Call | HIGH | Direct eval() evaluating arbitrary expressions |
-| AST3 | Dynamic Import | HIGH | \_\_import\_\_() loading arbitrary modules at runtime |
-| AST4 | subprocess Call | HIGH | External command execution via subprocess |
+| AST3 | Dynamic Import | MEDIUM | \_\_import\_\_() loading arbitrary modules at runtime |
+| AST4 | subprocess Call | MEDIUM | External command execution via subprocess |
 | AST5 | os.system / exec-family | HIGH | Shell commands via os module |
 | AST6 | compile() Call | MEDIUM | Code object creation from strings |
-| AST7 | Dynamic getattr() | MEDIUM | Arbitrary attribute access with non-literal names |
+| AST7 | Dynamic getattr() | LOW | Arbitrary attribute access with non-literal names |
 | AST8 | Dangerous Execution Chain | CRITICAL | exec/eval combined with dynamic source (network, encoded data) |
 | AST9 | Reflective getattr() Sink | HIGH | Reflective exec via `getattr(os,'system')` / `getattr(builtins,'exec')` that evades AST1/AST5 |
 | AST10 | Insecure Deserialization | MEDIUM | Untrusted data passed to pickle/marshal/dill/yaml.load/torch.load without safe guards |
