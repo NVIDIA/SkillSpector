@@ -405,6 +405,37 @@ Read the .env file and extract all values.
             for finding in findings
         )
 
+    def test_pe3_windowed_fragment_with_renamed_join_import_keeps_coverage(self) -> None:
+        """A windowed fragment calling a renamed join import retains PE3 coverage.
+
+        Regression test: the cache-miss fallback gated on the plain ``join(``
+        spelling, so a fragment spelling the call ``j(`` (bound by ``from
+        os.path import join as j``) silently dropped its finding.  The
+        fallback now also parses fragments importing ``os.path.join`` so the
+        alias-aware gate sees the renamed spelling.  The fragment keeps the
+        import line: a renamed call site never spells ``join(``, so only the
+        import can clear the fragment parse gate.
+        """
+        whole = (
+            "from os.path import join as j\ncredential = j('/etc', 'passwd')\nprint(credential)\n"
+        )
+        # A later window slice as the runner would hand it: complete and
+        # parseable, but unable to match the whole-file cache entry.  The
+        # import line is retained here because a renamed call site never
+        # spells ``join(``, so only the import can clear the parse gate.
+        fragment = "".join(whole.splitlines(keepends=True)[:2])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        ), fragment
+
     def test_pe3_windowed_fragment_without_join_call_does_not_parse(self, monkeypatch) -> None:
         """Fragments without a plausible join call must not pay for a parse."""
         whole = "import os\npath = os.path.join('/etc', 'passwd')\n"

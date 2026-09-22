@@ -173,10 +173,13 @@ def test_graph_scan_reports_constructed_path_above_view_window_chars(tmp_path) -
     ``peek_python_ast`` dropped findings once the runner sliced content into
     window views (above ``SECURITY_VIEW_WINDOW_CHARS``), because a slice never
     matches the scan's whole-file cache entry.  The fragment fallback parses
-    the slice directly so large files keep their findings.
+    the slice directly so large files keep their findings.  The source spells
+    the call through a renamed import (``from os.path import join as j``) to
+    pin that the cache-miss fallback recognizes renamed join spellings: the
+    plain ``join(`` textual gate never fires on the ``j(`` call site.
     """
     filler_line = "# " + "x" * 118 + "\n"
-    body = "import os\ncredential = os.path.join('/etc', 'passwd')\n"
+    body = "from os.path import join as j\ncredential = j('/etc', 'passwd')\n"
     target_chars = static_runner.SECURITY_VIEW_WINDOW_CHARS + 120_000
     source = body + filler_line * ((target_chars - len(body)) // len(filler_line))
     assert len(source) > static_runner.SECURITY_VIEW_WINDOW_CHARS

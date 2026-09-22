@@ -683,6 +683,14 @@ def _is_qualified_benign_access_requirement(
 _JOIN_CALL_BASE_NAMES = {"join"}
 _JOIN_CALL_ALIAS_TARGETS = {"os.path", "os.path.join"}
 
+# Lexical pre-check for a windowed fragment that binds a renamed ``join``
+# without ever spelling ``join(`` (``from os.path import join as j`` calls
+# ``j(``).  On a whole-file cache miss the fragment is parsed to collect its
+# import aliases before the alias-aware join gate below runs, so such
+# fragments must also clear the parse gate; import-only fragments are
+# filtered out again by the alias-aware gate.
+_JOIN_IMPORT_HINT = re.compile(r"^\s*from\s+os\.path\s+import\b", re.MULTILINE)
+
 
 def _join_call_hint(aliases: dict[str, str]) -> re.Pattern[str]:
     """Return a pre-check pattern matching ``join(`` and imported join aliases.
@@ -716,8 +724,8 @@ def _constructed_sensitive_paths(
     runs inside the runner (the cache key published by node()); standalone
     callers get a single on-demand parse.  Windowed view fragments under a scan
     miss the whole-file cache entry and are parsed directly behind the same
-    textual join gate, so large files keep their findings instead of silently
-    dropping them.  Only fully-literal positional argument lists are resolved;
+    textual join-or-import gate, so large files keep their findings instead of
+    silently dropping them.  Only fully-literal positional argument lists are resolved;
     anything dynamic is left to the existing pattern loop.  Unparseable content
     simply yields no findings here.
     """
@@ -725,13 +733,17 @@ def _constructed_sensitive_paths(
         cache_key = _scan_python_ast_cache_key.get()
         if cache_key is not None:
             python_ast = peek_python_ast(cache_key, content, file_path)
-            if python_ast is None and _join_call_hint({}).search(content):
+            if python_ast is None and (
+                _join_call_hint({}).search(content) or _JOIN_IMPORT_HINT.search(content)
+            ):
                 # A windowed view fragment, not the scan's whole file: the
                 # shared tree does not cover this slice, so parse the
                 # fragment directly to avoid silently dropping large-file
-                # findings.  The plain textual gate keeps the runner's
-                # scan-count discipline for fragments without a plausible
-                # join call.
+                # findings.  The textual gate also fires on ``from os.path
+                # import`` spellings so renamed calls (``from os.path import
+                # join as j`` then ``j(``) survive; the alias-aware gate
+                # below filters import-only fragments.  Fragments without a
+                # plausible join call or join import never parse.
                 python_ast = parse_python_source(content, file_path)
         else:
             python_ast = parse_python_source(content, file_path)
