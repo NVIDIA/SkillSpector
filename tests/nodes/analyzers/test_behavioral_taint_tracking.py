@@ -18,6 +18,9 @@
 from __future__ import annotations
 
 import json
+import textwrap
+
+import pytest
 
 from skillspector.nodes.analyzers import behavioral_taint_tracking
 from skillspector.nodes.deduplicate import deduplicate
@@ -41,6 +44,37 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            "del opener",
+            "try:\n    pass\nexcept Exception as opener:\n    pass",
+            "match value:\n    case opener:\n        pass",
+            "match value:\n    case [*opener]:\n        pass",
+            "match value:\n    case {'key': _, **opener}:\n        pass",
+        ],
+        ids=["delete", "exception", "match-as", "match-star", "match-rest"],
+    )
+    @pytest.mark.parametrize("scope", ["local", "global", "nested"])
+    def test_later_binding_respects_whole_function_scope(self, binding, scope):
+        # A local binding applies even before that statement runs. A declaration
+        # or a binding inside a nested function must not hide the outer handle.
+        body = 'opener(os.environ.get("API_KEY"))\n'
+        if scope == "global":
+            body = "global opener\n" + body + binding + "\n"
+        elif scope == "nested":
+            body += "def inner():\n" + textwrap.indent(binding, "    ") + "\n"
+        else:
+            body += binding + "\n"
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send(value):\n" + textwrap.indent(body, "    ")
+        )
+        compile(code, "fixture.py", "exec")
+        assert ("TT3" in _rule_ids(_run(code))) is (scope != "local")
+
     def test_constructed_urllib_sink_tracks_environment_taint(self):
         code = (
             "import importlib, os\n"
