@@ -534,16 +534,31 @@ _DESCRIPTION_INVOCATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Command-interception signals for the TR2 shadow-command rule. Unlike the
+# broader extraction gate above, this requires an actual
+# invocation/interception/override claim (or a literal slash-command token):
+# merely discussing commands as a noun ("Show available build commands",
+# "documents the build and test commands") describes documentation or help
+# prose, not shadowing intent, so it must not establish TR2 on its own.
+_DESCRIPTION_COMMAND_INTERCEPTION_RE = re.compile(
+    r"\b(?:invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
+    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
+    re.IGNORECASE,
+)
+
 # Trigger-phrase extraction for the TR1 broad/short-trigger rule on
 # descriptions: the word or phrase the skill claims to activate on, as in
 # "whenever the user says hello". Filler words between the verb and the
 # phrase ("asks to create", "asks for a poster") are skipped so the rule
-# judges the real trigger word, never a preposition like "to".
+# judges the real trigger phrase, never a preposition like "to". The phrase
+# is the complete bounded wording the skill names ("code review", not just
+# "code"): only a literal single word can be an overly broad trigger, matching
+# the legacy trigger grammar where multiword triggers are never TR1.
 _DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
     r"\b(?:whenever|when|if)\s+(?:the\s+)?user\s+"
     r"(?:says?|asks?|types?|sends?|requests?)\s+"
     r"(?:(?:the\s+(?:word|phrase)|to|for|about|on|of|the|a|an|that)\s+)*"
-    r"['\"]?(?P<phrase>[A-Za-z][\w-]{0,31})['\"]?",
+    r"['\"]?(?P<phrase>[A-Za-z][\w-]*(?:\s+[A-Za-z][\w-]*){0,7})['\"]?",
     re.IGNORECASE,
 )
 
@@ -554,10 +569,29 @@ _DESCRIPTION_BARE_SCOPE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Boundaries that end an activation-condition span. A universal-scope word
+# after one belongs to a separate instruction, not to the activation
+# condition: in "whenever code changes and summarize all messages", the
+# "all messages" are compiler output in a new conjunct, not the trigger's
+# scope.
+_DESCRIPTION_CONDITION_BOUNDARY_RE = re.compile(
+    r"\b(?:and|but|or|while|then|plus)\b|[;,]",
+    re.IGNORECASE,
+)
+
 # Bounds for description clause extraction: keep the analysis cheap and the
-# extracted trigger phrases reviewable.
-_MAX_DESCRIPTION_CLAUSES = 8
+# extracted trigger phrases reviewable. The clause budget counts only
+# signal-bearing clauses (benign padding never consumes it); raising it
+# keeps realistic multi-sentence descriptions fully inspected, and any
+# signal-bearing clause dropped past the budget is reported as explicit
+# incomplete coverage instead of being silently discarded.
+_MAX_DESCRIPTION_CLAUSES = 32
 _MAX_DESCRIPTION_CLAUSE_CHARS = 120
+# Per-clause cap on signal-anchored windows: each window is bounded, so
+# per-clause work stays bounded however many signals a clause carries.
+_MAX_DESCRIPTION_SIGNAL_WINDOWS = 3
+# Backstop on the activation-condition span searched for a bound scope.
+_MAX_DESCRIPTION_CONDITION_SPAN = 160
 
 
 def _description_clause_has_signal(text: str) -> bool:
@@ -569,32 +603,88 @@ def _description_clause_has_signal(text: str) -> bool:
     )
 
 
-def _extract_description_trigger_clauses(description: str) -> list[str]:
+def _description_signal_windows(text: str) -> list[str]:
+    """Bounded text windows anchored at each intent-signal match.
+
+    Overlong clauses are analyzed through windows centered on the signal
+    matches themselves (activation condition, universal scope, or
+    invocation/shadowing intent), so a trigger sentence buried in the middle
+    of padding is still inspected while per-clause work stays bounded: each
+    window extends at most ``_MAX_DESCRIPTION_CLAUSE_CHARS`` past its match
+    and the window count per clause is capped.
+    """
+    spans: list[tuple[int, int]] = []
+    for pattern in (
+        _DESCRIPTION_ACTIVATION_CONDITION_RE,
+        _DESCRIPTION_UNIVERSAL_SCOPE_RE,
+        _DESCRIPTION_INVOCATION_RE,
+    ):
+        for match in pattern.finditer(text):
+            spans.append(
+                (
+                    max(0, match.start() - _MAX_DESCRIPTION_CLAUSE_CHARS),
+                    match.end() + _MAX_DESCRIPTION_CLAUSE_CHARS,
+                )
+            )
+    spans.sort()
+    merged: list[list[int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [text[start:end].strip() for start, end in merged[:_MAX_DESCRIPTION_SIGNAL_WINDOWS]]
+
+
+def _description_condition_has_universal_scope(clause: str) -> bool:
+    """Check the universal scope is bound to the activation condition.
+
+    The scope must sit inside the condition's own span: the text after the
+    activation-condition match, up to the next coordinating conjunction or
+    clause punctuation (and bounded in length). A scope word anywhere else
+    in the clause does not establish an unconditional user-input trigger:
+    in "Run tests whenever code changes and summarize all messages from
+    the compiler", activation is limited to code changes while "all
+    messages" are compiler output in a separate instruction.
+    """
+    condition = _DESCRIPTION_ACTIVATION_CONDITION_RE.search(clause)
+    if condition is None:
+        return False
+    rest = clause[condition.end() :]
+    boundary = _DESCRIPTION_CONDITION_BOUNDARY_RE.search(rest)
+    span = rest[: boundary.start()] if boundary else rest
+    span = span[:_MAX_DESCRIPTION_CONDITION_SPAN]
+    return _DESCRIPTION_UNIVERSAL_SCOPE_RE.search(span) is not None
+
+
+def _extract_description_trigger_clauses(description: str) -> tuple[list[str], int]:
     """Extract bounded trigger-like clauses from a skill description.
 
     Every clause is scanned for cheap intent signals, so benign padding
     sentences never consume the clause budget and cannot push a trigger
     clause out of the analysis. Overlong clauses are analyzed through
-    bounded head/tail windows (joined with an explicit " ..." marker) so
-    activation intent at the start or end of a padded clause is still
-    inspected while per-clause work stays bounded.
+    bounded windows anchored at each intent-signal match, so activation
+    intent in the middle of a padded clause is still inspected while
+    per-clause work stays bounded.
+
+    Returns the extracted clauses plus the number of signal-bearing clauses
+    omitted by the clause budget, so the caller can record explicit
+    incomplete coverage instead of silently dropping relevant text.
     """
     clauses = re.split(r"[.;:!?]\s*|\s+-\s+", description)
     extracted: list[str] = []
+    omitted = 0
     for clause in clauses:
         text = clause.strip().strip(",")
         if not text or not _description_clause_has_signal(text):
             continue
-        if len(text) > _MAX_DESCRIPTION_CLAUSE_CHARS:
-            text = (
-                text[:_MAX_DESCRIPTION_CLAUSE_CHARS]
-                + " ... "
-                + text[-_MAX_DESCRIPTION_CLAUSE_CHARS:]
-            )
-        extracted.append(text)
         if len(extracted) >= _MAX_DESCRIPTION_CLAUSES:
-            break
-    return extracted
+            omitted += 1
+            continue
+        if len(text) > _MAX_DESCRIPTION_CLAUSE_CHARS:
+            text = " ... ".join(_description_signal_windows(text))
+        extracted.append(text)
+    return extracted, omitted
 
 
 def _pinned_version(operator: str | None, version: str | None) -> str | None:
@@ -1934,19 +2024,31 @@ def _analyze_dependencies_detailed(
 # ---------------------------------------------------------------------------
 
 
-def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Finding]:
+def _analyze_triggers(
+    manifest: dict[str, object],
+    skill_path: str,
+    *,
+    on_description_truncated: Callable[[int, int], None] | None = None,
+) -> list[Finding]:
     """Analyze trigger-like manifest content for abuse patterns.
 
     Agent Skills exposes activation intent through ``description``; legacy
     ``triggers`` metadata remains supported when present. Descriptions are not
     passed to the legacy trigger grammar directly: every clause is scanned
     for cheap intent signals, and only clauses carrying one are analyzed.
-    TR1 extracts the trigger phrase from activation prose and applies the
-    broad/short-trigger rule to it; TR2 requires invocation or shadowing
-    intent (reachable without broad-activation wording); TR3 requires a
-    bounded activation condition plus an unconditional scope (or a bare
-    universal-scope statement). Realistic activation prose is detected while
-    ordinary capability prose is skipped.
+    TR1 extracts the complete trigger phrase from activation prose and applies
+    the broad/short-trigger rule to it (only a literal single word can be
+    overly broad, as in the legacy grammar); TR2 requires an actual
+    invocation, interception, or override claim (or a slash-command token),
+    so command documentation prose is not shadowing; TR3 requires the
+    universal scope to sit inside the activation condition's own span (or a
+    bare universal-scope statement). Realistic activation prose is detected
+    while ordinary capability prose is skipped.
+
+    When ``on_description_truncated`` is given, it is called with
+    ``(omitted, limit)`` if signal-bearing description clauses had to be
+    dropped past the clause budget, so the caller can record explicit
+    incomplete coverage.
     """
     triggers: list[str] = []
     raw = manifest.get("triggers", [])
@@ -1956,7 +2058,11 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
     if not triggers:
         description = manifest.get("description")
         if isinstance(description, str) and description.strip():
-            description_clauses = _extract_description_trigger_clauses(description.strip())
+            description_clauses, omitted_clauses = _extract_description_trigger_clauses(
+                description.strip()
+            )
+            if omitted_clauses and on_description_truncated is not None:
+                on_description_truncated(omitted_clauses, _MAX_DESCRIPTION_CLAUSES)
     if not triggers and not description_clauses:
         return []
 
@@ -2095,14 +2201,16 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
                 )
 
         # TR2 (description-calibrated): only flag a shadow command when the
-        # clause shows invocation or shadowing intent; ordinary capability
-        # prose such as "Build projects" stays out of the trigger path.
-        # Invocation clauses pass the extraction gate on their own, so no
-        # broad-activation wording is required.
+        # clause shows an actual invocation, interception, or override claim
+        # about the command (or names a slash-command token); ordinary
+        # capability or documentation prose such as "Show available build
+        # commands" merely discusses commands and stays out of the trigger
+        # path. Invocation clauses pass the extraction gate on their own, so
+        # no broad-activation wording is required.
         shadowed = sorted(
             {cmd for cmd in _BUILTIN_COMMANDS if cmd in {w.lstrip("/") for w in words}}
         )
-        if shadowed and _DESCRIPTION_INVOCATION_RE.search(clause):
+        if shadowed and _DESCRIPTION_COMMAND_INTERCEPTION_RE.search(clause):
             findings.append(
                 Finding(
                     rule_id="TR2",
@@ -2121,16 +2229,19 @@ def _analyze_triggers(manifest: dict[str, object], skill_path: str) -> list[Find
                 )
             )
 
-        # TR3 (description-calibrated): require a bounded activation condition
-        # *and* an unconditional scope in the same clause. Bare behavior
+        # TR3 (description-calibrated): require the universal scope to sit
+        # inside the activation condition's own span. A condition word and a
+        # scope word merely sharing a punctuation-delimited clause does not
+        # establish an unconditional user-input trigger ("whenever code
+        # changes and summarize all messages from the compiler" activates on
+        # code changes; the messages are compiler output). Bare behavior
         # prose ("Always preserves file permissions when copying files") and
         # subject-qualified scopes ("any questions about PostgreSQL") stay
         # negative; a bare universal-scope statement ("all messages") still
         # fires, as in the legacy trigger grammar.
-        has_condition = _DESCRIPTION_ACTIVATION_CONDITION_RE.search(clause) is not None
-        has_scope = _DESCRIPTION_UNIVERSAL_SCOPE_RE.search(clause) is not None
+        has_condition_scope = _description_condition_has_universal_scope(clause)
         is_bare_scope = _DESCRIPTION_BARE_SCOPE_RE.fullmatch(clause_lower) is not None
-        if (has_condition and has_scope) or is_bare_scope:
+        if has_condition_scope or is_bare_scope:
             findings.append(
                 Finding(
                     rule_id="TR3",
@@ -2749,7 +2860,23 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     manifest: dict[str, object] = state.get("manifest") or {}
     if manifest:
         skill_path = state.get("skill_path") or ""
-        trigger_findings = _analyze_triggers(manifest, skill_path)
+
+        def _record_trigger_clause_truncation(omitted: int, limit: int) -> None:
+            record_limitation(
+                "SKILL.md",
+                OsvQueryLimitation(
+                    reason=LedgerReason.STATIC_PARSE_LIMIT,
+                    observed_records=omitted + limit,
+                    limit_records=limit,
+                ),
+                f"{ANALYZER_ID}_triggers",
+            )
+
+        trigger_findings = _analyze_triggers(
+            manifest,
+            skill_path,
+            on_description_truncated=_record_trigger_clause_truncation,
+        )
         trigger_limit = max(0, MAX_FINDING_OUTPUT_RECORDS - len(findings))
         omitted_triggers = len(trigger_findings) > trigger_limit
         trigger_findings = trigger_findings[:trigger_limit]

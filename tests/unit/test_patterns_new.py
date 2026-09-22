@@ -2380,6 +2380,88 @@ class TestTriggerAnalysis:
         )
         assert findings == []
 
+    def test_description_middle_signal_window_analyzed(self) -> None:
+        """rng1995 #541 P1: a trigger sentence buried mid-clause is inspected."""
+        core = "Use this skill whenever the user sends any message"
+        description = f"{'x' * 130} {core} {'y' * 130}"
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_signal_clause_beyond_old_budget_analyzed(self) -> None:
+        """rng1995 #541 P1: signal-bearing clauses past the old budget are inspected."""
+        padding = ". ".join(["Run tests whenever code changes"] * 8)
+        description = f"{padding}. Use this skill whenever the user sends any message"
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_clause_budget_truncation_reported(self) -> None:
+        """rng1995 #541 P1: dropping signal clauses past the budget is reported."""
+        reported: list[tuple[int, int]] = []
+        padding = ". ".join(["Run tests whenever code changes"] * 40)
+        sc_mod._analyze_triggers(
+            {"description": padding},
+            "myskill",
+            on_description_truncated=lambda omitted, limit: reported.append((omitted, limit)),
+        )
+        assert reported == [(8, sc_mod._MAX_DESCRIPTION_CLAUSES)]
+
+    def test_description_clause_budget_not_exceeded_not_reported(self) -> None:
+        """rng1995 #541 P1: no truncation report when the budget is not exceeded."""
+        reported: list[tuple[int, int]] = []
+        padding = ". ".join(["Run tests whenever code changes"] * 8)
+        description = f"{padding}. Use this skill whenever the user sends any message"
+        sc_mod._analyze_triggers(
+            {"description": description},
+            "myskill",
+            on_description_truncated=lambda omitted, limit: reported.append((omitted, limit)),
+        )
+        assert reported == []
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param("Use when the user asks for code review", id="code_review"),
+            pytest.param("Use when the user asks to make a chart", id="make_chart"),
+        ],
+    )
+    def test_description_multiword_trigger_phrase_not_tr1(self, description: str) -> None:
+        """rng1995 #541 P2: specific multiword task descriptions are not TR1."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param("Show available build commands", id="help_lists_commands"),
+            pytest.param(
+                "Documents the build and test commands with examples",
+                id="command_docs",
+            ),
+        ],
+    )
+    def test_description_command_documentation_not_shadow_command(self, description: str) -> None:
+        """rng1995 #541 P1: describing command help is not command shadowing."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param(
+                "Run tests whenever code changes and summarize all messages from the compiler",
+                id="separate_instruction",
+            ),
+            pytest.param(
+                "Use this skill whenever the user asks any questions about PostgreSQL",
+                id="subject_qualified_activation",
+            ),
+        ],
+    )
+    def test_description_scope_bound_to_activation_condition(self, description: str) -> None:
+        """rng1995 #541 P1: the universal scope must sit inside the condition."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
 
 # ── Supply Chain Helpers ───────────────────────────────────────────────
 
