@@ -714,23 +714,29 @@ def _constructed_sensitive_paths(
     ``from os.path import join as j``, ``from os import path``) are recognized
     without reparsing tricks.  The scan's shared parse is reused whenever this
     runs inside the runner (the cache key published by node()); standalone
-    callers get a single on-demand parse, while windowed view fragments under
-    a scan are skipped because the shared tree only covers whole files.
-    Only fully-literal positional argument lists are resolved; anything
-    dynamic is left to the existing pattern loop.  Unparseable content simply
-    yields no findings here.
+    callers get a single on-demand parse.  Windowed view fragments under a scan
+    miss the whole-file cache entry and are parsed directly behind the same
+    textual join gate, so large files keep their findings instead of silently
+    dropping them.  Only fully-literal positional argument lists are resolved;
+    anything dynamic is left to the existing pattern loop.  Unparseable content
+    simply yields no findings here.
     """
     if python_ast is None:
         cache_key = _scan_python_ast_cache_key.get()
         if cache_key is not None:
             python_ast = peek_python_ast(cache_key, content, file_path)
-            if python_ast is None:
+            if python_ast is None and _join_call_hint({}).search(content):
                 # A windowed view fragment, not the scan's whole file: the
-                # shared tree does not cover it, and parsing fragments here
-                # would break the runner's parse-once invariant.
-                return []
+                # shared tree does not cover this slice, so parse the
+                # fragment directly to avoid silently dropping large-file
+                # findings.  The plain textual gate keeps the runner's
+                # scan-count discipline for fragments without a plausible
+                # join call.
+                python_ast = parse_python_source(content, file_path)
         else:
             python_ast = parse_python_source(content, file_path)
+    if python_ast is None:
+        return []
     tree = python_ast.tree
     if tree is None:
         return []

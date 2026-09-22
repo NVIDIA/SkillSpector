@@ -16,6 +16,7 @@ from skillspector.nodes.analyzers import (
     behavioral_taint_tracking,
     static_patterns_data_exfiltration,
     static_patterns_output_handling,
+    static_runner,
 )
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.deduplicate import deduplicate
@@ -163,3 +164,27 @@ def test_graph_scan_parses_python_once_before_parallel_analyzers(tmp_path, monke
     )
     assert parse_calls == 1
     assert JsonPlusSerializer().dumps_typed(result)
+
+
+def test_graph_scan_reports_constructed_path_above_view_window_chars(tmp_path) -> None:
+    """Windowed lexical scans keep constructed-path PE3 above the view window.
+
+    Regression test: routing the constructed-path analysis through
+    ``peek_python_ast`` dropped findings once the runner sliced content into
+    window views (above ``SECURITY_VIEW_WINDOW_CHARS``), because a slice never
+    matches the scan's whole-file cache entry.  The fragment fallback parses
+    the slice directly so large files keep their findings.
+    """
+    filler_line = "# " + "x" * 118 + "\n"
+    body = "import os\ncredential = os.path.join('/etc', 'passwd')\n"
+    target_chars = static_runner.SECURITY_VIEW_WINDOW_CHARS + 120_000
+    source = body + filler_line * ((target_chars - len(body)) // len(filler_line))
+    assert len(source) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+    (tmp_path / "large_script.py").write_text(source, encoding="utf-8")
+
+    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
+
+    assert any(
+        finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        for finding in result["findings"]
+    )
