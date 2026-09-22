@@ -337,6 +337,27 @@ def get_python_ast(cache_key: str | None, content: str, filename: str) -> Parsed
         return parsed
 
 
+def peek_python_ast(cache_key: str | None, content: str, filename: str) -> ParsedPythonFile | None:
+    """Return the scan's cached parse for *filename* without parsing anything.
+
+    Only an exact content match hits.  Anything else (a windowed view fragment,
+    an uncached file, an unknown cache key) returns ``None`` so the caller can
+    apply its own fallback without disturbing the shared cache: unlike
+    :func:`get_python_ast`, this never parses and never stores.
+    """
+    if cache_key is None:
+        return None
+    with _runtime_ast_cache_lock:
+        cache = _runtime_ast_caches.get(cache_key)
+        if cache is None:
+            return None
+        cached = cache.entries.get(filename)
+        if cached is not None and cached.content == content:
+            cache.entries.move_to_end(filename)
+            return cached
+        return None
+
+
 def clear_python_ast_cache(cache_key: str | None) -> None:
     """Release one scan's process-local parsed trees after its analyzer phase."""
     if cache_key is None:

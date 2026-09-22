@@ -317,6 +317,24 @@ Read the .env file and extract all values.
         line_two = [f for f in findings if f.rule_id == "PE3" and f.location.start_line == 2]
         assert len(line_two) == 1
 
+    def test_pe3_multiline_constructed_join_is_deduplicated(self) -> None:
+        """A join call wrapped across lines must yield one PE3 for its span."""
+        content = (
+            "import os\n"
+            "p = os.path.join(\n"
+            "    '.ssh/id_rsa', 'x'\n"
+            ")\n"
+            "with open(p) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        span_pe3 = [f for f in findings if f.rule_id == "PE3" and 2 <= f.location.start_line <= 4]
+        assert len(span_pe3) == 1
+        assert span_pe3[0].message == "Credential Access"
+        assert span_pe3[0].severity == Severity.HIGH
+
     def test_pe3_multiline_os_path_join_is_detected(self) -> None:
         """A join call wrapped across lines must retain PE3 coverage."""
         content = (
@@ -339,11 +357,13 @@ Read the .env file and extract all values.
         """Supported import spellings of os.path.join must retain PE3 coverage."""
         for header in (
             "from os.path import join\n",
+            "from os.path import join as j\n",
             "import os.path as p\n",
             "from os import path\n",
         ):
             call = {
                 "from os.path import join\n": "join('/etc', 'passwd')\n",
+                "from os.path import join as j\n": "j('/etc', 'passwd')\n",
                 "import os.path as p\n": "p.join('/etc', 'passwd')\n",
                 "from os import path\n": "path.join('/etc', 'passwd')\n",
             }[header]

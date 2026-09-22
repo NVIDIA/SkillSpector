@@ -128,12 +128,18 @@ def test_uppercase_python_path_reuses_preparsed_ast_for_static_analyzers(
 
 
 def test_graph_scan_parses_python_once_before_parallel_analyzers(tmp_path, monkeypatch) -> None:
-    """The runtime cache shares one parse across the graph's analyzer fan-out."""
+    """The runtime cache shares one parse across the graph's analyzer fan-out.
+
+    The fixture includes a literal ``os.path.join`` call so the test proves
+    the supplemental constructed-path analysis reuses the shared parse rather
+    than parsing again.
+    """
     (tmp_path / "script.py").write_text(
         "import os\n"
         "import subprocess\n"
         "payload = input()\n"
         "environment = os.environ.copy()\n"
+        "credential = os.path.join('/etc', 'passwd')\n"
         "subprocess.run(output)\n"
         "exec(payload)\n",
         encoding="utf-8",
@@ -151,5 +157,9 @@ def test_graph_scan_parses_python_once_before_parallel_analyzers(tmp_path, monke
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
 
     assert {"E2", "OH1", "AST1", "TT5"} <= {finding.rule_id for finding in result["findings"]}
+    assert any(
+        finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        for finding in result["findings"]
+    )
     assert parse_calls == 1
     assert JsonPlusSerializer().dumps_typed(result)
