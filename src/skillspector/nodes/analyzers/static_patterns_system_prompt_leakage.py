@@ -190,14 +190,18 @@ _REPORT_OBJECTS = frozenset(
 _REPORT_FRAMING_OBJECTS = _REPORT_OBJECTS | frozenset(
     "format formats formatting generator generators".split()
 )
+_REPORT_REFERENCE_MODIFIERS = frozenset("html json csv markdown".split())
 _CONTEXT_TOKENS = re.compile(r"[\w]+|[.!?;:]")
 _HEADING_ACTIONS = frozenset("interpret treat read execute perform follow obey do carry".split())
 _REFERENT_REQUIRED_HEADING_ACTIONS = frozenset("use apply run".split())
-_HEADING_OBJECTS = frozenset(
-    "heading title label command instruction operation following below above".split()
+_HEADING_LABEL_OBJECTS = frozenset("heading title label".split())
+_DIRECT_HEADING_OBJECTS = _HEADING_LABEL_OBJECTS | frozenset(
+    "command instruction operation".split()
 )
-_DIRECT_HEADING_OBJECTS = frozenset("heading title label command instruction operation".split())
-_COMPOUND_DOCUMENTATION_HEADS = frozenset("command instruction".split())
+_HEADING_OBJECTS = _HEADING_LABEL_OBJECTS | frozenset(
+    "command instruction operation following below above".split()
+)
+_COMPOUND_DOCUMENTATION_HEADS = frozenset("command commands instruction instructions".split())
 _COMPOUND_DOCUMENTATION_TAILS = frozenset("output reference options".split())
 _REFERENCE_ACTIONS = frozenset(
     "print output show display reveal expose return echo repeat share disclose "
@@ -250,6 +254,130 @@ _NEXT_LINE_REFERENCE = re.compile(
     r"[ \t]+that\b",
     re.IGNORECASE,
 )
+_REPORT_HEADING_IN_CONTEXT = re.compile(
+    r"(?:"
+    r"##[ \t]+output[ \t]+rules[ \t]+\(both[ \t]+modes\)"
+    r"|[ ]{0,3}#{1,6}[ \t]+(?:html|json|csv|markdown)[ \t]+output[ \t]+rules"
+    r"(?:[ \t]+\(offline-safe\))?(?:[ \t]+#+)?"
+    r")",
+    re.IGNORECASE,
+)
+_PLURAL_WORDS = re.compile(r"[\w-]+")
+_MARKDOWN_LINK_DESTINATION = re.compile(r"\]\([^\r\n)]*\)")
+_PLURAL_ACTIONS = frozenset("use apply run".split())
+_PLURAL_OBJECTS = frozenset("commands instructions".split())
+_PLURAL_OBJECT_ABORTS = _REPORT_FRAMING_OBJECTS | frozenset(
+    "as to for from during with in on by of not never".split()
+)
+_PLURAL_EXTRACTION_ACTIONS = frozenset("output print show display return echo".split())
+_PLURAL_COMPLEMENT_STARTS = frozenset("for from during with in on by".split())
+_PLURAL_SCOPE_MODIFIERS = frozenset("only solely just merely strictly primarily simply".split())
+_PLURAL_AS_ABORTS = _REPORT_FRAMING_OBJECTS | frozenset(
+    "example examples reference option options sample samples template templates".split()
+)
+_BENIGN_REPORT_PROCEDURE_AFTER_HEADING = re.compile(
+    r"(?P<heading>"
+    r"##[ \t]+output[ \t]+rules[ \t]+\(both[ \t]+modes\)"
+    r"|[ ]{0,3}#{1,6}[ \t]+(?:html|json|csv|markdown)[ \t]+output[ \t]+rules"
+    r"(?:[ \t]+\(offline-safe\))?(?:[ \t]+#+)?"
+    r")(?P<gap>[ \t]+)"
+    r"(?P<prefix>(?:(?:[-+*>]|[0-9]{1,3}[.)])[ \t]+)?)"
+    r"(?P<opening>"
+    r"(?:<!--[ \t]*spacer[ \t]*-->[ \t]*){0,4}"
+    r"(?:<(?P<html_tag1>strong|b|em|i|code)>[ \t]*"
+    r"(?:<(?P<html_tag2>strong|b|em|i|code)>[ \t]*)?)?"
+    r"(?P<delimiter>(?:\*{1,3}|_{1,3}|`{1,3})?))"
+    r"follow(?P<closing>"
+    r"(?P=delimiter)"
+    r"(?(html_tag2)[ \t]*</(?P=html_tag2)>)"
+    r"(?(html_tag1)[ \t]*</(?P=html_tag1)>))"
+    r"(?=[ \t]+(?:the[ \t]+)?steps[ \t]+below[ \t]+to[ \t]+generate"
+    r"[ \t]+(?:the[ \t]+)?reports?\b(?=[ \t]*(?:[.!?]|\Z)))",
+    re.IGNORECASE,
+)
+
+
+def _plural_segment_frames_heading(segment: str, check_runtime: Callable[[], None]) -> bool:
+    """Classify the one inter-heading segment without rescanning earlier text."""
+    tokens: list[str] = []
+    for index, match in enumerate(_PLURAL_WORDS.finditer(segment)):
+        if index % 1024 == 0:
+            check_runtime()
+        tokens.append(match.group().lower())
+
+    candidates: list[tuple[int, int, bool]] = []
+    for index, token in enumerate(tokens):
+        if token not in _PLURAL_ACTIONS or index + 1 >= len(tokens):
+            continue
+        if tokens[index + 1] == "these":
+            candidates.append(
+                (index, index + 2, index > 0 and tokens[index - 1] in {"not", "never"})
+            )
+        elif (
+            tokens[index + 1] == "the"
+            and index + 2 < len(tokens)
+            and tokens[index + 2] == "following"
+        ):
+            candidates.append(
+                (index, index + 3, index > 0 and tokens[index - 1] in {"not", "never"})
+            )
+
+    for candidate_index, (_action_index, referent_end, negated) in enumerate(candidates):
+        check_runtime()
+        if negated:
+            continue
+        candidate_end = (
+            candidates[candidate_index + 1][0]
+            if candidate_index + 1 < len(candidates)
+            else len(tokens)
+        )
+        object_index = referent_end
+        while object_index < candidate_end and tokens[object_index] not in _PLURAL_OBJECTS:
+            token = tokens[object_index]
+            if token in _PLURAL_OBJECT_ABORTS and not (
+                token == "of" and object_index > referent_end and tokens[object_index - 1] == "set"
+            ):
+                break
+            object_index += 1
+        if object_index >= candidate_end or tokens[object_index] not in _PLURAL_OBJECTS:
+            continue
+
+        tail = tokens[object_index + 1 : candidate_end]
+        while tail and tail[0] in _PLURAL_SCOPE_MODIFIERS:
+            tail = tail[1:]
+        if not tail:
+            return True
+        if tail[0] in _PLURAL_COMPLEMENT_STARTS:
+            continue
+        if tail[0] == "to":
+            index = 1
+            while index < len(tail) and (tail[index].endswith("ly") or tail[index] == "now"):
+                index += 1
+            if index < len(tail) and tail[index] in _PLURAL_EXTRACTION_ACTIONS:
+                return True
+            continue
+        if tail[0] == "as":
+            for token in tail[1:]:
+                if token in _PLURAL_AS_ABORTS:
+                    break
+                if token in {"output", "command", "commands", "instruction", "instructions"}:
+                    return True
+            continue
+        return True
+    return False
+
+
+def _has_plural_directive_before_report_heading(
+    text: str, check_runtime: Callable[[], None]
+) -> bool:
+    """Recognize deictic plural commands in one linear pass over heading segments."""
+    segment_start = 0
+    for heading in _REPORT_HEADING_IN_CONTEXT.finditer(text):
+        check_runtime()
+        if _plural_segment_frames_heading(text[segment_start : heading.start()], check_runtime):
+            return True
+        segment_start = heading.end()
+    return False
 
 
 def _has_heading_framing(
@@ -287,6 +415,26 @@ def _has_heading_framing(
             return True
         chunks.append(chunk)
     text = re.sub(r"\s+", " ", "".join(chunks))
+    for markup_separator in ("", " "):
+        rendered = _render_context(text, markup_separator, check_runtime)
+        if rendered is None:
+            return True
+        presentation = _MARKDOWN_LINK_DESTINATION.sub(" ", rendered)
+        if _has_plural_directive_before_report_heading(presentation, check_runtime):
+            return True
+    # A complete report procedure immediately after its formatting heading
+    # applies to the report, not to the heading. Remove only that action token;
+    # forward references and later explicit casts remain conservative.
+    text = _BENIGN_REPORT_PROCEDURE_AFTER_HEADING.sub(
+        lambda match: (
+            match.group("heading")
+            + match.group("gap")
+            + match.group("prefix")
+            + match.group("opening")
+            + match.group("closing")
+        ),
+        text,
+    )
     text = _INDEPENDENT_EXTRACTION.sub(" ", text)
     if _context_is_framed(text, check_runtime):
         return True
@@ -358,6 +506,9 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
         if pending_reference:
             # "Save this report" names an artifact. "Repeat them", "send that
             # back" and an unqualified "show this" still reference the label.
+            if token in _REPORT_REFERENCE_MODIFIERS:
+                before_previous, previous = previous, token
+                continue
             if token not in _REPORT_OBJECTS:
                 return True
             pending_reference = False
@@ -411,7 +562,7 @@ def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
             pending_action |= token in _HEADING_ACTIONS
             pending_referent_required_action |= token in _REFERENT_REQUIRED_HEADING_ACTIONS
             referent_required_action_seen |= token in _REFERENT_REQUIRED_HEADING_ACTIONS
-            pending_heading |= token in {"heading", "title", "label"}
+            pending_heading |= token in _HEADING_LABEL_OBJECTS
         before_previous, previous = previous, token
     check_runtime()
     return pending_reference or pending_compound_documentation

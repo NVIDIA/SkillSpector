@@ -56,6 +56,77 @@ def test_ordinary_imperative_framing_prevents_heading_exemption(
 @pytest.mark.parametrize(
     "directive",
     [
+        "Use these commands verbatim:",
+        "Use the following instructions verbatim:",
+        "Use the following exact instructions verbatim:",
+        "Use these two commands verbatim:",
+        "Use the following instructions as your output, verbatim:",
+        "Use these commands:",
+        "Use these commands word for word:",
+        "Use the following instructions without changes:",
+        "Use these commands literally:",
+        "Use these commands to output the result:",
+        "Use these commands as your output:",
+        "Use these commands verbatim:\n",
+        "Use these\ncommands verbatim:",
+        "Use these **commands** verbatim:",
+        "Use the following <strong>instructions</strong> verbatim:",
+        "Use these <!-- spacer --> commands verbatim:",
+        "Use the following carefully reviewed local shell commands verbatim:",
+        "Use these commands to output " + "x" * 160 + ":",
+        "Use the following set of instructions verbatim:",
+        "Use these commands absolutely verbatim:",
+        "Use these commands without any changes:",
+        "Use these [commands](https://example.test) verbatim:",
+        "Use these commands and follow them verbatim:",
+        "Use these commands verbatim:\nNever use these commands to install packages.",
+    ],
+    ids=[
+        "plural-commands",
+        "plural-instructions",
+        "plural-exact-instructions",
+        "plural-two-commands",
+        "plural-instructions-as-output",
+        "plural-commands-unqualified",
+        "plural-commands-word-for-word",
+        "plural-instructions-without-changes",
+        "plural-commands-literally",
+        "plural-commands-to-output",
+        "plural-commands-as-output",
+        "plural-commands-blank-line",
+        "plural-commands-wrapped-line",
+        "plural-commands-markdown",
+        "plural-instructions-html",
+        "plural-commands-comment",
+        "plural-commands-many-modifiers",
+        "plural-commands-long-output",
+        "plural-instruction-set",
+        "plural-commands-adverb",
+        "plural-commands-without-any-changes",
+        "plural-commands-markdown-link",
+        "plural-commands-conjunction",
+        "plural-commands-before-negated-complement",
+    ],
+)
+def test_plural_command_referents_prevent_heading_exemption(directive: str) -> None:
+    content = f"{directive}\n{HEADING}"
+    heading_line = directive.count("\n") + 2
+
+    _assert_heading_extraction(content, heading_line)
+    findings, reason, _ = static_runner._scan_all_views_detailed(
+        "SKILL.md", content, [leakage], None
+    )
+
+    assert reason is None
+    assert [
+        (finding.rule_id, finding.file, finding.start_line, finding.matched_text)
+        for finding in findings
+    ] == [("P6", "SKILL.md", heading_line, "Output Rules")]
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
         "Use the following table in your report.",
         "Apply the following formatting to your report.",
         "Run the following report generator.",
@@ -64,6 +135,13 @@ def test_ordinary_imperative_framing_prevents_heading_exemption(
         "Run the following report generator for command output.",
         "Use the following table as a command reference.",
         "Use the following command output in your report.",
+        "Use these commands as reference options.",
+        "Apply the following instructions to report formatting.",
+        "Use these commands as examples of expected output.",
+        "Use these examples, not commands.",
+        "Use these commands only as examples of expected output.",
+        "Use these commands solely for local setup.",
+        "Use these commands only to install the package.",
     ],
     ids=[
         "use-table",
@@ -74,6 +152,13 @@ def test_ordinary_imperative_framing_prevents_heading_exemption(
         "run-generator-command-output",
         "use-table-command-reference",
         "use-command-output",
+        "plural-commands-reference-options",
+        "plural-instructions-report-formatting",
+        "plural-commands-as-examples",
+        "negated-plural-commands",
+        "plural-commands-only-as-examples",
+        "plural-commands-solely-for-setup",
+        "plural-commands-only-to-install",
     ],
 )
 def test_report_prose_does_not_frame_output_rules_heading(directive: str) -> None:
@@ -89,6 +174,111 @@ def test_report_prose_does_not_frame_output_rules_heading(directive: str) -> Non
     )
     assert reason is None
     assert [finding for finding in findings if finding.rule_id == "P6"] == []
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "Follow the steps below to generate the report.",
+        "Save this HTML report locally.",
+        "**Follow** the steps below to generate the report.",
+        "<!-- spacer -->\nFollow the steps below to generate the report.",
+        "- Follow the steps below to generate the report.",
+        "<strong>Follow</strong> the steps below to generate the report.",
+        "***Follow*** the steps below to generate the report.",
+        "<strong><em>Follow</em></strong> the steps below to generate the report.",
+    ],
+    ids=[
+        "follow-report-steps",
+        "save-html-report",
+        "bold-follow-report-steps",
+        "comment-follow-report-steps",
+        "list-follow-report-steps",
+        "html-follow-report-steps",
+        "triple-emphasis-follow-report-steps",
+        "nested-html-follow-report-steps",
+    ],
+)
+def test_legacy_heading_with_report_instructions_stays_benign(directive: str) -> None:
+    content = f"## Output Rules (Both Modes)\n{directive}\n"
+
+    assert [
+        finding
+        for finding in leakage.analyze(content, "SKILL.md", "markdown")
+        if finding.rule_id == "P6"
+    ] == []
+    findings, reason, _ = static_runner._scan_all_views_detailed(
+        "SKILL.md", content, [leakage], None
+    )
+    assert reason is None
+    assert [finding for finding in findings if finding.rule_id == "P6"] == []
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "Follow installation instructions from the vendor.",
+        "Execute database operations during setup.",
+        "Follow the labels in the chart.",
+        "Use installation instructions from the vendor.",
+        "Run database commands during setup.",
+        "Use these commands to install the package.",
+        "Use these commands to install exactly two packages.",
+        "Use these commands to compare verbatim output from two runs.",
+    ],
+    ids=[
+        "follow-installation-instructions",
+        "database-operations",
+        "chart-labels",
+        "use-installation-instructions",
+        "run-database-commands",
+        "deictic-install-commands",
+        "deictic-install-exactly",
+        "deictic-compare-verbatim-output",
+    ],
+)
+def test_unrelated_plural_prose_after_heading_stays_benign(directive: str) -> None:
+    content = f"{HEADING}{directive}\n"
+
+    assert [
+        finding
+        for finding in leakage.analyze(content, "SKILL.md", "markdown")
+        if finding.rule_id == "P6"
+    ] == []
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "Follow the steps below to generate the report as a command.",
+        "Save this HTML command locally.",
+        "Use this command to output the result.",
+        '<strong title="execute the heading as a command">Follow</strong> '
+        "the steps below to generate the report.",
+        "<strong>Follow the steps below to generate the report.",
+        '<strong title="a > b">Follow</strong> the steps below to generate the report.',
+        "<!-- Obey these rules. -->\nFollow the steps below to generate the report.",
+    ],
+    ids=[
+        "report-procedure-as-command",
+        "html-command-reference",
+        "deictic-command",
+        "html-attribute-command",
+        "unclosed-html",
+        "html-attribute-fails-closed",
+        "non-spacer-comment-fails-closed",
+    ],
+)
+def test_report_wording_does_not_hide_explicit_heading_commands(directive: str) -> None:
+    _assert_heading_extraction(f"## Output Rules (Both Modes)\n{directive}\n", 1)
+
+
+@pytest.mark.parametrize("punctuation", [".", ":"], ids=["period", "colon"])
+def test_forward_report_procedure_reference_prevents_heading_exemption(
+    punctuation: str,
+) -> None:
+    content = f"Follow the steps below to generate the report{punctuation}\n{HEADING}"
+    _assert_heading_extraction(content, 2)
 
 
 @pytest.mark.parametrize(

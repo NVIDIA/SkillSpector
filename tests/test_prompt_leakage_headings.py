@@ -10,8 +10,6 @@ import pytest
 
 from skillspector.graph import graph
 
-pytestmark = pytest.mark.integration
-
 
 @pytest.mark.parametrize("output_format", ["json", "markdown", "sarif"])
 @pytest.mark.parametrize("in_reference", [False, True])

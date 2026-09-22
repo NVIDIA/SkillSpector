@@ -60,6 +60,42 @@ async def test_run_scan_returns_structured_verdict(
     assert result["report"]  # non-empty rendered report
 
 
+@pytest.mark.parametrize(
+    ("body", "expect_p6"),
+    [
+        ("Use these commands verbatim:\n## JSON Output Rules\n", True),
+        ("Use the following instructions verbatim:\n## JSON Output Rules\n", True),
+        (
+            "## Output Rules (Both Modes)\nFollow the steps below to generate the report.\n",
+            False,
+        ),
+        ("## Output Rules (Both Modes)\nSave this HTML report locally.\n", False),
+    ],
+    ids=[
+        "plural-commands",
+        "plural-instructions",
+        "follow-report-steps",
+        "save-html-report",
+    ],
+)
+async def test_run_scan_preserves_p6_heading_context_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    expect_p6: bool,
+) -> None:
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    _write_skill(tmp_path, body)
+
+    result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    p6 = [finding for finding in result["findings"] if finding["id"] == "P6"]
+    assert len(p6) == int(expect_p6)
+    assert result["risk_score"] == (21 if expect_p6 else 0)
+    assert result["recommendation"] == ("CAUTION" if expect_p6 else "SAFE")
+    assert result["analysis_completeness"]["is_complete"] is True
+
+
 async def test_run_scan_llm_accounting_is_honest_without_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

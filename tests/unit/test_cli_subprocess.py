@@ -92,6 +92,50 @@ def test_recursive_json_stdout_is_one_complete_report(tmp_path: Path, verbose: b
     assert "Multi-Skill Summary" in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("body", "expect_p6"),
+    [
+        ("Use these commands verbatim:\n## JSON Output Rules\n", True),
+        ("Use the following instructions verbatim:\n## JSON Output Rules\n", True),
+        (
+            "## Output Rules (Both Modes)\nFollow the steps below to generate the report.\n",
+            False,
+        ),
+        ("## Output Rules (Both Modes)\nSave this HTML report locally.\n", False),
+    ],
+    ids=[
+        "plural-commands",
+        "plural-instructions",
+        "follow-report-steps",
+        "save-html-report",
+    ],
+)
+def test_p6_heading_context_controls_fail_on_findings(
+    tmp_path: Path, body: str, expect_p6: bool
+) -> None:
+    skill = _write_skill(
+        tmp_path / "skill",
+        "---\nname: heading-context\ndescription: Format a local report.\n---\n" + body,
+    )
+
+    result = _run_cli(
+        "scan",
+        str(skill),
+        "--no-llm",
+        "--format",
+        "json",
+        "--fail-on-findings",
+    )
+
+    assert result.returncode == int(expect_p6), result.stderr
+    payload = json.loads(result.stdout)
+    p6 = [issue for issue in payload["issues"] if issue["id"] == "P6"]
+    assert len(p6) == int(expect_p6)
+    assert payload["risk_assessment"]["score"] == (21 if expect_p6 else 0)
+    assert payload["risk_assessment"]["recommendation"] == ("CAUTION" if expect_p6 else "SAFE")
+    assert payload["analysis_completeness"]["is_complete"] is True
+
+
 @pytest.mark.parametrize("recursive", [False, True])
 def test_no_llm_ignores_invalid_provider(tmp_path: Path, recursive: bool) -> None:
     skill_root = tmp_path / "skills"
