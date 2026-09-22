@@ -525,19 +525,25 @@ _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
 
 # Invocation/shadowing intent signals. A description only counts as a shadow
 # command when it shows the skill means to intercept or override a command.
+# The slash branch only matches a slash that starts a token (a slash-command
+# invocation such as "/build"), never a slash embedded in a larger token:
+# "CI/CD" must not read as invocation intent for "build".
 _DESCRIPTION_INVOCATION_RE = re.compile(
     r"\b(?:commands?|slash|invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|/[a-z]",
+    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
     re.IGNORECASE,
 )
 
 # Trigger-phrase extraction for the TR1 broad/short-trigger rule on
 # descriptions: the word or phrase the skill claims to activate on, as in
-# "whenever the user says hello".
+# "whenever the user says hello". Filler words between the verb and the
+# phrase ("asks to create", "asks for a poster") are skipped so the rule
+# judges the real trigger word, never a preposition like "to".
 _DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
     r"\b(?:whenever|when|if)\s+(?:the\s+)?user\s+"
     r"(?:says?|asks?|types?|sends?|requests?)\s+"
-    r"(?:the\s+(?:word|phrase)\s+)?['\"]?(?P<phrase>[A-Za-z][\w-]{0,31})['\"]?",
+    r"(?:(?:the\s+(?:word|phrase)|to|for|about|on|of|the|a|an|that)\s+)*"
+    r"['\"]?(?P<phrase>[A-Za-z][\w-]{0,31})['\"]?",
     re.IGNORECASE,
 )
 

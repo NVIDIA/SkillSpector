@@ -2302,6 +2302,28 @@ class TestTriggerAnalysis:
         )
         assert "TR2" in {finding.rule_id for finding in findings}
 
+    def test_description_embedded_slash_not_invocation_intent(self) -> None:
+        """MohammedAlkindi #541: a slash inside a larger token (CI/CD) is not
+        slash-command invocation intent, so 'build' prose stays negative."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Audit CI/CD pipelines and run the build"},
+            "myskill",
+        )
+        assert findings == []
+
+    def test_description_trigger_phrase_skips_filler_words(self) -> None:
+        """MohammedAlkindi #541: TR1 judges the real trigger word, not a
+        filler preposition after the verb."""
+        for description in (
+            "Use when the user asks to create a poster",
+            "Use when the user asks for a poster",
+        ):
+            findings = sc_mod._analyze_triggers(
+                {"description": description},
+                "myskill",
+            )
+            assert findings == [], description
+
     @pytest.mark.parametrize("target_len", [120, 121])
     def test_description_long_clause_window_still_analyzed(self, target_len: int) -> None:
         """rng1995 #541 P1: 120/121-char clauses keep start-of-clause intent."""
