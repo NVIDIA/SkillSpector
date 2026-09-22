@@ -79,6 +79,16 @@ _DANGEROUS_GETATTR_NAMES = frozenset({"exec", "eval", "system", "popen", "__impo
 _REFLECTIVE_DICT_READ_METHODS = frozenset({"get", "setdefault", "pop"})
 
 
+# Longest dangerous getattr name. The only consumer of `_constant_string`
+# compares the resolved value against `_DANGEROUS_GETATTR_NAMES`, so a resolved
+# value longer than this can never match. Capping the prospective join length
+# (computed before allocating) keeps an adversarial literal from expanding into
+# a memory-exhausting payload on untrusted skill source: the source-size gate
+# does not bound the expanded join value. Exceeding the cap returns unresolved
+# so the caller falls back to the existing AST7 dynamic-name treatment.
+_MAX_RESOLVED_GETATTR_NAME_LEN = max(len(name) for name in _DANGEROUS_GETATTR_NAMES)
+
+
 def _constant_string(node: ast.expr) -> str | None:
     """Resolve a deliberately small safe subset of constant string expressions."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -94,7 +104,13 @@ def _constant_string(node: ast.expr) -> str | None:
     ):
         parts = [_constant_string(item) for item in node.args[0].elts]
         if all(part is not None for part in parts):
-            return node.func.value.value.join(part for part in parts if part is not None)
+            separator = node.func.value.value
+            # Bound the prospective output before allocating it. Nested joins
+            # are already bounded because the recursive call above returns None
+            # for any over-cap operand, which fails the `all()` check here.
+            prospective = sum(len(part) for part in parts) + len(separator) * max(len(parts) - 1, 0)
+            if prospective <= _MAX_RESOLVED_GETATTR_NAME_LEN:
+                return separator.join(parts)
     return None
 
 
