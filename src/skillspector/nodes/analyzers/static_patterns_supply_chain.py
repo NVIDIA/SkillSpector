@@ -1355,8 +1355,6 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     if file_type == "python":
-        line_offsets = [0]
-        line_offsets.extend(index + 1 for index, char in enumerate(content) if char == "\n")
         for line_num, command in _decoded_literal_xor_calls(content):
             for pattern, confidence in SC2_PATTERNS:
                 if not re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
@@ -1369,7 +1367,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         location=loc(line_num),
                         confidence=confidence,
                         tags=list(tag),
-                        context=ctx(line_offsets[line_num - 1]),
+                        context=ctx(line_starts[line_num - 1]),
                         matched_text=command[:200],
                     )
                 )
