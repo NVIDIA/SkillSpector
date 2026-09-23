@@ -876,7 +876,7 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI invocation  (verified against copilot 1.0.86)
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.88)
 # ---------------------------------------------------------------------------
 
 
@@ -911,8 +911,14 @@ def _prepare_copilot_env(
     ambient shell config cannot re-enable tools; ``COPILOT_PROVIDER_*``
     cannot redirect inference to an arbitrary endpoint; and
     ``COPILOT_CUSTOM_INSTRUCTIONS_DIRS`` cannot inject instructions.
-    ``COPILOT_AUTO_UPDATE`` is forced off so the version gate cannot be
-    invalidated mid-scan.
+    Deliberately NOT forced: ``COPILOT_AUTO_UPDATE``. The CLI keeps
+    several cached runtime generations on disk and disabling updates
+    selects an older cached one (probed 2026-09-23: both the env flag
+    and ``--no-auto-update`` report and run an older generation than
+    the newest install), which would brick the version pin. Mid-scan
+    updates are covered instead by the per-completion version
+    preflight: an update landing mid-scan fails loud on the next
+    call, never drifts silent.
 
     User/plugin lifecycle hooks are handled NOT by home isolation (broken
     as above) but by the preflight audits: inference refuses to run
@@ -926,14 +932,17 @@ def _prepare_copilot_env(
         value = os.environ.get(name, "").strip()
         if value:
             env[name] = value
-    env["COPILOT_AUTO_UPDATE"] = "false"
+    # NOTE: COPILOT_AUTO_UPDATE is deliberately neither forwarded nor
+    # forced (see docstring): updates stay enabled so the CLI runs its
+    # newest cached generation, and the per-completion preflight
+    # fail-closes any mid-scan drift.
     return env
 
 
 def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build the argv list for a non-interactive ``copilot`` call.
 
-    Flags chosen (verified against Copilot CLI 1.0.86 ``--help``):
+    Flags chosen (verified against Copilot CLI 1.0.88 ``--help``):
 
     (no ``-p``)
         With no prompt flag, the prompt is piped to stdin by run_agent_cli —
@@ -957,9 +966,12 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
         Disable all built-in MCP servers as defense in depth alongside the
         tool allowlist below.
 
-    ``--no-auto-update``
-        Disable CLI auto-updates so the pinned-version gate cannot be
-        invalidated mid-scan.
+    Deliberately NOT included:
+    - ``--allow-all*`` / ``--yolo`` — auto-approve permissions (dangerous); never use them.
+    - ``--no-auto-update`` — disabling updates runs an older cached
+      generation instead of the newest install (probed 2026-09-23),
+      which would brick the version pin; mid-scan drift is covered
+      by the per-completion preflight instead.
 
     ``--available-tools skillspector-no-tools``
         Allowlist holding a fixed implausible name, so the model is offered
@@ -991,7 +1003,6 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
         "--no-ask-user",
         "--no-custom-instructions",
         "--disable-builtin-mcps",
-        "--no-auto-update",
         "--available-tools",
         "skillspector-no-tools",
         "--deny-tool",
@@ -1003,7 +1014,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 def _parse_copilot_output(raw: str) -> str:
     """Extract the assistant reply from ``copilot -s`` plain-text output.
 
-    Verified against Copilot CLI 1.0.86: ``-s`` emits only the response text.
+    Verified against Copilot CLI 1.0.88: ``-s`` emits only the response text.
     The whole stripped output is the reply; empty output raises fail-closed
     (an empty response must never be mistaken for a clean analysis).
     """
@@ -1020,7 +1031,7 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     shared scrubbed environment (token re-injection is inference-only and
     version output does not depend on it), performs no inference, and
     completes well under 15s. Fail-closed: probe error/timeout, non-zero
-    exit, or a version other than the verified 1.0.86 all return
+    exit, or a version other than the verified 1.0.88 all return
     ``(False, reason)``.
 
     There is no status subcommand, so a passing probe means the binary runs
@@ -1047,10 +1058,10 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
             f"(exit {result.returncode}); check the binary, then `copilot login`"
         )
     version = _parse_copilot_version(result.stdout or b"")
-    if version != "1.0.86":
+    if version != "1.0.88":
         version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         return False, (
-            "copilot_cli requires exactly GitHub Copilot CLI 1.0.86 "
+            "copilot_cli requires exactly GitHub Copilot CLI 1.0.88 "
             f"for its verified tool-deny policy; found {version_text[:80]!r}"
         )
     return True, None
@@ -1069,7 +1080,7 @@ def _preflight_copilot_policy(
        runtime. Re-verifies ``[binary, --version]`` under the isolated
        child env on EVERY completion. ``argv`` is unused (CliSpec
        signature uniformity). Fail-closed: probe error/timeout,
-       non-zero exit, or a version other than the verified 1.0.86 all
+       non-zero exit, or a version other than the verified 1.0.88 all
        raise before any prompt bytes move.
     2. Temp-dir tripwire: repo-level hook sources (``.github/hooks/``,
        repo settings) cannot exist in the fresh ``mkdtemp`` dir; any
@@ -1090,10 +1101,10 @@ def _preflight_copilot_policy(
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         raise AgentCLIError(f"copilot version preflight failed: {exc}") from exc
-    if result.returncode != 0 or _parse_copilot_version(result.stdout or b"") != "1.0.86":
+    if result.returncode != 0 or _parse_copilot_version(result.stdout or b"") != "1.0.88":
         version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         raise AgentCLIError(
-            "copilot_cli requires exactly GitHub Copilot CLI 1.0.86 "
+            "copilot_cli requires exactly GitHub Copilot CLI 1.0.88 "
             f"for its verified tool-deny policy; found {version_text[:80]!r}"
         )
     _audit_copilot_home(child_env)
@@ -1110,7 +1121,7 @@ def _copilot_home(child_env: dict[str, str]) -> str:
 def _audit_copilot_home(child_env: dict[str, str]) -> None:
     """Refuse inference when user or plugin hook material is present.
 
-    The 1.0.86 CLI loads hooks from policy, user, project, then plugin
+    The 1.0.88 CLI loads hooks from policy, user, project, then plugin
     sources with no argv off-switch (verified: no ``--disable*hook*``
     flag in ``copilot --help``), and — as probed 2026-09-19 — silently
     refuses inference under ANY redirected home, so home isolation is

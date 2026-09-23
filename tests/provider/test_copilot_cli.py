@@ -27,7 +27,7 @@ Security invariants verified:
     argv.
   - Ambient instruction files, built-in MCP servers, and mid-scan CLI
     updates stay off (``--no-custom-instructions``,
-    ``--disable-builtin-mcps``, ``--no-auto-update``); user and plugin
+    ``--disable-builtin-mcps``); user and plugin
     lifecycle hooks stay off via preflight refusal (audit rejects
     ``installed-plugins/``, ``hooks/*.json``, inline ``hooks`` in
     ``settings.json``, and any repo-level hook material in the temp
@@ -73,7 +73,7 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.86.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.88.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
@@ -98,7 +98,6 @@ class TestBuildCopilotArgv:
             "--no-ask-user",
             "--no-custom-instructions",
             "--disable-builtin-mcps",
-            "--no-auto-update",
             "--available-tools",
             "skillspector-no-tools",
             "--deny-tool",
@@ -135,14 +134,14 @@ class TestBuildCopilotArgv:
         denied = argv[argv.index("--deny-tool") + 1]
         assert "shell" in denied and "write" in denied
 
-    def test_argv_disables_custom_instructions_mcp_and_auto_update(self) -> None:
-        # Ambient instruction files, built-in MCP servers, and mid-scan CLI
-        # updates must stay off (hooks have no argv off-switch: the
-        # preflight audit refuses hook material instead).
+    def test_argv_disables_custom_instructions_and_mcp(self) -> None:
+        # Ambient instruction files and built-in MCP servers must stay off.
+        # (--no-auto-update is deliberately absent: disabling updates runs
+        # an older cached generation and would brick the version pin.)
         argv = _build_copilot_argv(COPILOT_BINARY, "", 0)
         assert "--no-custom-instructions" in argv
         assert "--disable-builtin-mcps" in argv
-        assert "--no-auto-update" in argv
+        assert "--no-auto-update" not in argv
 
     def test_argv_max_output_tokens_accepted_but_not_forwarded(self) -> None:
         # CliSpec uniformity: the parameter exists but copilot has no
@@ -189,7 +188,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.86"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.88"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -244,7 +243,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.86" in (reason or "")
+        assert "1.0.88" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -269,13 +268,13 @@ class TestPreflightCopilotPolicy:
     def test_synthetic_future_version_rejected_before_stdin(self, mock_run: MagicMock) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
-        with pytest.raises(AgentCLIError, match="1.0.86"):
+        with pytest.raises(AgentCLIError, match="1.0.88"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, "/tmp")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_nonzero_exit_rejected(self, mock_run: MagicMock) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
-        with pytest.raises(AgentCLIError, match="preflight|1.0.86"):
+        with pytest.raises(AgentCLIError, match="preflight|1.0.88"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -529,10 +528,14 @@ class TestPrepareCopilotEnv:
         assert "GH_TOKEN" not in env
         assert "GITHUB_TOKEN" not in env
 
-    def test_forces_auto_update_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_auto_update_not_forced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Updates stay enabled so the CLI runs its newest cached
+        # generation (disabling them selects an older cached one and
+        # would brick the pin); mid-scan drift fail-closes at the
+        # per-completion preflight instead.
         monkeypatch.setenv("COPILOT_AUTO_UPDATE", "1")
         env = _prepare_copilot_env({}, "/tmp", ["copilot"])
-        assert env["COPILOT_AUTO_UPDATE"] == "false"
+        assert "COPILOT_AUTO_UPDATE" not in env
 
     def test_preserves_copilot_home_for_login(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A path, not a policy control: the preflight audit (not argv
@@ -580,7 +583,7 @@ class TestHookHomeEndToEnd:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.86"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.88"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -642,7 +645,7 @@ class TestAdversarialTransport:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.86"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.88"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -669,7 +672,7 @@ class TestAdversarialTransport:
                     or "--yolo" in argv
                     or "--no-custom-instructions" not in argv
                     or "--disable-builtin-mcps" not in argv
-                    or "--no-auto-update" not in argv
+                    or "--no-auto-update" in argv
                     or not prompt
                     or os.environ.get("COPILOT_ALLOW_ALL", "") not in ("", "0", "false")
                 ):
