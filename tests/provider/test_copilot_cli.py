@@ -328,11 +328,42 @@ class TestAuditCopilotHome:
         (tmp_path / "installed-plugins").mkdir()
         _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
 
-    def test_missing_explicit_home_raises(self, tmp_path: Path) -> None:
-        # An explicitly set COPILOT_HOME that does not exist cannot be
-        # verified hook-free (the CLI may fall back to ~/.copilot): refuse.
-        with pytest.raises(AgentCLIError, match="COPILOT_HOME"):
+    def test_missing_explicit_home_audits_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A set-but-missing COPILOT_HOME holds nothing, but the CLI may
+        # fall back to ~/.copilot, so the default tree is still audited:
+        # dirty default refuses, clean default passes.
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path / "absent")})
+        (home / ".copilot" / "hooks").mkdir(parents=True)
+        (home / ".copilot" / "hooks" / "evil.json").write_text(
+            '{"version": 1, "hooks": {}}', encoding="utf-8"
+        )
+        with pytest.raises(AgentCLIError, match="hook"):
             _audit_copilot_home({"COPILOT_HOME": str(tmp_path / "absent")})
+
+    def test_default_home_audited_despite_clean_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A clean explicit home does not excuse a dirty default: the CLI
+        # may fall back to ~/.copilot.
+        override = tmp_path / "override"
+        override.mkdir()
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        (home / ".copilot" / "hooks").mkdir(parents=True)
+        (home / ".copilot" / "hooks" / "evil.json").write_text(
+            '{"version": 1, "hooks": {}}', encoding="utf-8"
+        )
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home({"COPILOT_HOME": str(override)})
 
     def test_missing_default_home_passes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -435,13 +466,43 @@ class TestAuditCopilotHome:
         with pytest.raises(AgentCLIError, match="hook"):
             _audit_copilot_home({})
 
-    def test_xdg_missing_explicit_source_raises(self, tmp_path: Path) -> None:
-        # An explicitly set but missing XDG_CONFIG_HOME cannot be verified.
+    def test_xdg_missing_explicit_source_audits_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A set-but-missing XDG_CONFIG_HOME holds nothing, but the CLI may
+        # fall back to ~/.config/.copilot, so the default source is still
+        # audited: dirty default refuses, clean default passes.
         home = tmp_path / "home"
         home.mkdir()
-        with pytest.raises(AgentCLIError, match="XDG_CONFIG_HOME"):
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        env = {
+            "COPILOT_HOME": str(home),
+            "XDG_CONFIG_HOME": str(tmp_path / "absent"),
+        }
+        _audit_copilot_home(env)
+        xdg = home / ".config" / ".copilot" / "hooks"
+        xdg.mkdir(parents=True)
+        (xdg / "evil.json").write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home(env)
+
+    def test_xdg_default_audited_despite_clean_explicit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A clean explicit XDG source does not excuse a dirty default.
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        explicit = tmp_path / "xdg" / ".copilot"
+        explicit.mkdir(parents=True)
+        xdg = home / ".config" / ".copilot" / "hooks"
+        xdg.mkdir(parents=True)
+        (xdg / "evil.json").write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
             _audit_copilot_home(
-                {"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "absent")}
+                {"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
             )
 
     def test_xdg_falsy_hooks_pass(self, tmp_path: Path) -> None:

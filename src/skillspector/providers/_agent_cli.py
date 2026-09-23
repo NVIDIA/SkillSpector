@@ -1129,7 +1129,7 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
     here for every user and plugin source under the resolved copilot home
     AND under the XDG migration source (startup moves
     ``$XDG_CONFIG_HOME/.copilot/hooks`` into the home, so a clean home
-    with a dirty XDG tree still loads hooks — see ``_xdg_copilot_home``):
+    with a dirty XDG tree still loads hooks):
 
     - ``installed-plugins/`` present-and-non-empty raises (plugin hooks);
     - ``hooks/*.json`` present raises (user hook files);
@@ -1137,10 +1137,10 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
       (inline user hooks); an unreadable ``settings.json`` also raises —
       it cannot be verified hook-free. Error messages name paths only,
       never file contents.
-    - An explicitly set but missing ``COPILOT_HOME`` raises: the tree
-      cannot be verified, and the CLI may fall back to ``~/.copilot``.
-      A missing default home passes (nothing exists to fall back to;
-      missing auth fails later, also fail-closed).
+    - An explicitly set but missing ``COPILOT_HOME`` is not itself a
+      refusal: it holds nothing, and the default tree below covers the
+      fallback. A missing default home passes (nothing exists to fall
+      back to; missing auth fails later, also fail-closed).
 
     Residual risk (documented, not auditable without administrator
     privileges): machine-wide
@@ -1150,34 +1150,28 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
     (``.github/hooks/``, repo settings) are covered by ``_audit_tmp_cwd``
     over the fresh temp working dir.
     """
+    seen: set[str] = set()
+
+    def consider(tree: str, kind: str) -> None:
+        key = os.path.normcase(os.path.normpath(tree))
+        if key in seen:
+            return
+        seen.add(key)
+        _audit_hook_tree(tree, kind)
+
     home = _copilot_home(child_env)
-    if (child_env.get("COPILOT_HOME") or "").strip() and not os.path.isdir(home):
-        raise AgentCLIError(
-            "COPILOT_HOME is set but missing, so hook material cannot be "
-            f"verified absent: {home}; point it at an existing hook-free tree"
-        )
-    _audit_hook_tree(home, "copilot home")
-    xdg = _xdg_copilot_home(child_env)
-    if (child_env.get("XDG_CONFIG_HOME") or "").strip() and not os.path.isdir(xdg):
-        raise AgentCLIError(
-            "XDG_CONFIG_HOME is set but missing, so migration hook material "
-            f"cannot be verified absent: {xdg}"
-        )
-    if os.path.normcase(os.path.normpath(xdg)) != os.path.normcase(os.path.normpath(home)):
-        _audit_hook_tree(xdg, "copilot XDG migration source")
-
-
-def _xdg_copilot_home(child_env: dict[str, str]) -> str:
-    """Resolve the XDG migration source dir as the CLI does.
-
-    Startup moves ``$XDG_CONFIG_HOME/.copilot/hooks`` into the copilot
-    home, so hook material there is loadable even when the home itself
-    is clean. Unset ``XDG_CONFIG_HOME`` falls back to ``~/.config``.
-    """
-    base = (child_env.get("XDG_CONFIG_HOME") or "").strip()
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, ".copilot")
+    consider(home, "copilot home")
+    # The CLI may fall back to the default home when the override is
+    # missing, so a clean override never excuses a dirty default.
+    consider(os.path.join(os.path.expanduser("~"), ".copilot"), "copilot default home")
+    xdg_explicit = (child_env.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg_explicit:
+        consider(os.path.join(xdg_explicit, ".copilot"), "copilot XDG migration source")
+    # Same fallback reasoning for the migration source itself.
+    consider(
+        os.path.join(os.path.expanduser("~"), ".config", ".copilot"),
+        "copilot default XDG migration source",
+    )
 
 
 def _audit_hook_tree(home: str, kind: str) -> None:
