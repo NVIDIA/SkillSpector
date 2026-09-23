@@ -1630,6 +1630,24 @@ def test_nested_printf_fake_closes_do_not_reparse_each_suffix(
     assert elapsed < _shell_stress_deadline()
 
 
+def test_shell_delimiter_plain_words_preserve_runtime_deadline() -> None:
+    # Each word crosses a 4096-character checkpoint without ending exactly on
+    # it. Bulk word scanning must still consult and propagate the deadline.
+    content = "$(" + ("x" * 4095 + " ") * 4 + ")"
+    runtime_checks = 0
+
+    def check_runtime() -> None:
+        nonlocal runtime_checks
+        runtime_checks += 1
+        if runtime_checks == 2:
+            raise TimeoutError("shell parse deadline")
+
+    with pytest.raises(TimeoutError, match="shell parse deadline"):
+        tm_module._skip_command_substitution(content, 0, len(content), check_runtime)
+
+    assert runtime_checks == 2
+
+
 def test_root_glob_documentation_does_not_mask_later_destructive_command() -> None:
     content = (
         "The rm command accepts -r and -f while * denotes a wildcard, "

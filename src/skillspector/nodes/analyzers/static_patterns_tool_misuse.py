@@ -65,6 +65,7 @@ _QUOTED_GLOB_SENTINEL = "\ue000"
 _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
 _RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
 _SIMPLE_BRACED_PARAMETER_RE = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}")
+_SHELL_DELIMITER_WORD_RE = re.compile(r"[^$'\"`\\(){}<>#;|&!\s]++")
 _PERL_LITERAL_PRINT_RE = re.compile(
     r"^[ \t]*+print\b(?:[ \t]++(?:STDOUT|STDERR)\b)?[ \t]*+(?P<paren>\()?[ \t]*+"
     r"(?P<literal>\"(?:\\[\\\"'nrt]|[^\\\"$@`\r\n])*+\""
@@ -512,6 +513,7 @@ def _skip_shell_delimited_expansion(
         )
     ]
     cursor = start + opener_width
+    next_runtime_check = ((cursor + 4095) // 4096) * 4096
 
     def cache_frame(frame: _ShellDelimiterFrame, end: int | None) -> None:
         if frame.start is None:
@@ -570,8 +572,9 @@ def _skip_shell_delimited_expansion(
         return before in delimiters and after in delimiters
 
     while cursor < limit:
-        if check_runtime is not None and cursor % 4096 == 0:
+        if check_runtime is not None and cursor >= next_runtime_check:
             check_runtime()
+            next_runtime_check = cursor + 4096
         frame = frames[-1]
         character = content[cursor]
 
@@ -608,6 +611,24 @@ def _skip_shell_delimited_expansion(
                 cursor += 2
                 continue
             cursor += 1
+            continue
+
+        # Ordinary words cannot change the delimiter stack. Consume them in
+        # one bounded match rather than testing each character for every shell
+        # opener, quote, and keyword. Nested static-evaluator windows otherwise
+        # repeat those Python-level checks hundreds of thousands of times.
+        word = _SHELL_DELIMITER_WORD_RE.match(content, cursor, min(limit, cursor + 4096))
+        if word is not None:
+            if frame.kind in {"command", "paren"}:
+                if at_shell_keyword("case"):
+                    frame.pending_case_clauses += 1
+                elif frame.pending_case_clauses and at_shell_keyword("in"):
+                    frame.pending_case_clauses -= 1
+                    frame.open_case_clauses += 1
+                elif frame.open_case_clauses and at_shell_keyword("esac"):
+                    frame.open_case_clauses -= 1
+                frame.word_started = True
+            cursor = word.end()
             continue
 
         if content.startswith("${", cursor):
@@ -691,14 +712,6 @@ def _skip_shell_delimited_expansion(
                 continue
             cursor += 1
             continue
-
-        if at_shell_keyword("case"):
-            frame.pending_case_clauses += 1
-        elif frame.pending_case_clauses and at_shell_keyword("in"):
-            frame.pending_case_clauses -= 1
-            frame.open_case_clauses += 1
-        elif frame.open_case_clauses and at_shell_keyword("esac"):
-            frame.open_case_clauses -= 1
 
         if character == "(":
             push("paren", None, 1)
