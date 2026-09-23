@@ -610,7 +610,21 @@ connect(SOCK, sockaddr_in(4444, inet_aton(\"127.0.0.1\")));
         ],
         ids=["python", "perl"],
     )
-    def test_builtin_malware_finding_covers_multiline_socket_shells(self, content):
+    def test_builtin_malware_does_not_flag_multiline_socket_clients(self, content):
+        findings = _run_builtin(content, "socket-client.txt")
+
+        assert not _has_rule(findings, "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded_content",
+        [
+            "aW1wb3J0IG9zLCBzb2NrZXQsIHN1YnByb2Nlc3MKc29jayA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKc29jay5jb25uZWN0KCgnMTI3LjAuMC4xJywgNDQ0NCkpCm9zLmR1cDIoc29jay5maWxlbm8oKSwgMCkKc3VicHJvY2Vzcy5jYWxsKFsnL2Jpbi9zaCcsICctaSddKQo=",
+            "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0ssIFBGX0lORVQsIFNPQ0tfU1RSRUFNLCBnZXRwcm90b2J5bmFtZSgidGNwIikpOwpjb25uZWN0KFNPQ0ssIHNvY2thZGRyX2luKDQ0NDQsIGluZXRfYXRvbigiMTI3LjAuMC4xIikpKTsKb3BlbihTVERJTiwgJzwmU09DSycpOyBvcGVuKFNURE9VVCwgJz4mU09DSycpOyBvcGVuKFNUREVSUiwgJz4mU09DSycpOyBleGVjKCcvYmluL3NoJyk7Cg==",
+        ],
+        ids=["python", "perl"],
+    )
+    def test_builtin_malware_finding_covers_multiline_socket_shells(self, encoded_content):
+        content = base64.b64decode(encoded_content).decode()
         findings = _run_builtin(content, "reverse-shell.txt")
 
         assert _has_rule(findings, "reverse_shell")
