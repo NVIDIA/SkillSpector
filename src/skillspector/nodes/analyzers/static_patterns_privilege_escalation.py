@@ -712,6 +712,21 @@ def _join_call_hint(aliases: dict[str, str]) -> re.Pattern[str]:
     return re.compile(r"\b(?:" + "|".join(sorted(re.escape(name) for name in names)) + r")\s*\(")
 
 
+def _fragment_whole_file_line_offset(fragment: str, whole_content: str) -> int | None:
+    """Return how many whole-file lines precede a windowed view fragment.
+
+    Windowed view fragments are contiguous slices of the scanned file, so a
+    whole-file AST line number maps onto a fragment-relative line by
+    subtracting this offset.  Return ``None`` when the fragment is not a
+    slice of the whole file (for example a normalized view), so callers keep
+    the standalone-parse fallback.
+    """
+    start = whole_content.find(fragment)
+    if start < 0:
+        return None
+    return whole_content.count("\n", 0, start)
+
+
 def _constructed_sensitive_paths(
     content: str,
     file_path: str,
@@ -728,17 +743,27 @@ def _constructed_sensitive_paths(
     without reparsing tricks.  The scan's shared parse is reused whenever this
     runs inside the runner (the cache key published by node()); standalone
     callers get a single on-demand parse.  Windowed view fragments under a scan
-    miss the whole-file cache entry and are parsed directly behind the same
-    textual join-or-import gate, so large files keep their findings instead of
-    silently dropping them.  On such a fragment the whole file's import-alias
+    miss the whole-file cache entry; behind the same textual join-or-import
+    gate they are evaluated against the whole file's cached tree instead of
+    being parsed standalone, so a fragment starting mid-block (for example
+    inside a function body, which is not a valid module on its own) keeps its
+    findings instead of silently dropping them.  The whole file's import-alias
     map is carried in from the scan cache for the join gate and call
     resolution, so a renamed ``os.path.join`` spelling (``from os.path import
     join as j``) is recognized even when the import lives in an earlier window
-    than the call.  Only fully-literal positional argument lists are resolved;
-    anything dynamic is left to the existing pattern loop.  Unparseable content
-    simply yields no findings here.
+    than the call.  Call spans map onto fragment-relative lines and only
+    calls starting inside the fragment are owned by it, preserving the
+    runner's source-coordinate and dedupe behavior.  When the whole-file tree
+    is unavailable, or the fragment is not a slice of the whole file
+    (normalized views), the fragment is parsed directly as before.  Only
+    fully-literal positional argument lists are resolved; anything dynamic is
+    left to the existing pattern loop.  Unparseable content simply yields no
+    findings here.
     """
     whole_file_aliases: dict[str, str] | None = None
+    whole_file_tree: ast.Module | None = None
+    whole_file_source: str | None = None
+    whole_file_line_offset: int | None = None
     if python_ast is None:
         cache_key = _scan_python_ast_cache_key.get()
         if cache_key is not None:
@@ -746,8 +771,8 @@ def _constructed_sensitive_paths(
             if python_ast is None:
                 # A windowed view fragment, not the scan's whole file: the
                 # shared tree does not cover this slice.  Carry the whole
-                # file's import-alias map from the scan cache first (a
-                # fragment is a slice of the same scanned file), so the
+                # file's import-alias map and tree from the scan cache first
+                # (a fragment is a slice of the same scanned file), so the
                 # textual gate below also fires on renamed call spellings
                 # like ``j(`` when the ``from os.path import join as j``
                 # import lives in an earlier window.  Fragments without a
@@ -755,18 +780,40 @@ def _constructed_sensitive_paths(
                 whole_file = peek_python_ast_any_content(cache_key, file_path)
                 if whole_file is not None and whole_file.tree is not None:
                     whole_file_aliases = whole_file.import_aliases
+                    whole_file_tree = whole_file.tree
+                    whole_file_source = whole_file.content
                 if _join_call_hint(whole_file_aliases or {}).search(
                     content
                 ) or _JOIN_IMPORT_HINT.search(content):
-                    python_ast = parse_python_source(content, file_path)
+                    if whole_file_tree is not None and whole_file_source is not None:
+                        # Evaluate the whole-file tree rather than parsing the
+                        # fragment standalone: a slice starting mid-block is
+                        # not a valid module, so its standalone parse fails
+                        # and the finding would be silently dropped.
+                        whole_file_line_offset = _fragment_whole_file_line_offset(
+                            content, whole_file_source
+                        )
+                    if whole_file_line_offset is None:
+                        python_ast = parse_python_source(content, file_path)
         else:
             python_ast = parse_python_source(content, file_path)
-    if python_ast is None:
-        return []
-    tree = python_ast.tree
-    if tree is None:
-        return []
-    aliases = whole_file_aliases if whole_file_aliases is not None else python_ast.import_aliases
+    if whole_file_tree is not None and whole_file_line_offset is not None:
+        tree = whole_file_tree
+        aliases = whole_file_aliases or {}
+        owned_span: tuple[int, int] | None = (
+            whole_file_line_offset,
+            whole_file_line_offset + len(content.splitlines()),
+        )
+    else:
+        if python_ast is None:
+            return []
+        tree = python_ast.tree
+        if tree is None:
+            return []
+        aliases = (
+            whole_file_aliases if whole_file_aliases is not None else python_ast.import_aliases
+        )
+        owned_span = None
     if not _join_call_hint(aliases).search(content):
         return []
     resolved: list[tuple[int, int, str, float]] = []
@@ -781,9 +828,19 @@ def _constructed_sensitive_paths(
         if len(parts) != len(node.args) or not all(isinstance(part, str) for part in parts):
             continue
         value = posixpath.join(*parts)
+        start_line = node.lineno
+        end_line = node.end_lineno or node.lineno
+        if owned_span is not None:
+            # Only calls starting inside this fragment are owned by it; the
+            # runner's own owned-range filter and cross-window dedupe keep
+            # exactly one finding per call at whole-file coordinates.
+            if not owned_span[0] < start_line <= owned_span[1]:
+                continue
+            start_line -= owned_span[0]
+            end_line -= owned_span[0]
         for pattern, confidence in PE3_PATTERNS:
             if re.search(pattern, value, re.IGNORECASE):
-                resolved.append((node.lineno, node.end_lineno or node.lineno, value, confidence))
+                resolved.append((start_line, end_line, value, confidence))
                 break
     return resolved
 
