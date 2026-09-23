@@ -44,6 +44,107 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    def test_starred_assignment_replaces_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "first, *opener = [1, 2]\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("name", ["importlib", "getattr"])
+    def test_relative_import_replaces_reflective_helper(self, name):
+        code = (
+            "import importlib, os\n"
+            f"from . import {name}\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("inline", [True, False])
+    def test_inline_reflective_callee(self, inline):
+        module = 'importlib.import_module("urllib.request")' if inline else "module"
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f'getattr({module}, "urlopen")(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_class_body_reflective_call_is_detected(self):
+        code = (
+            "import importlib, os\n"
+            "class Client:\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_match_capture_replaces_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "match (lambda value: value):\n"
+            "    case opener:\n"
+            "        pass\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("replacement", ["lambda value: value", 'getattr(module, "urlopen")'])
+    def test_walrus_respects_expression_order(self, replacement):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            f'(opener := {replacement}, opener(os.environ.get("API_KEY")))\n'
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is ("getattr" in replacement)
+
+    @pytest.mark.parametrize("replacement", ["lambda value: value", 'getattr(module, "urlopen")'])
+    def test_function_reads_global_at_call_site(self, replacement):
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "send()\n"
+            f"opener = {replacement}\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_call_before_reflective_binding_stays_safe(self):
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            "opener = lambda value: value\n"
+            "send()\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_multiple_function_calls_track_each_global_binding(self):
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            "opener = lambda value: value\n"
+            "send()\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "send()\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
     @pytest.mark.parametrize(
         "binding",
         [
