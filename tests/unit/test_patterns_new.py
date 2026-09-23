@@ -2353,6 +2353,50 @@ class TestTriggerAnalysis:
         assert len(tr1) == 1
         assert "hello" in tr1[0].message
 
+    @pytest.mark.parametrize(
+        "trailing",
+        [
+            pytest.param("there", id="there"),
+            pytest.param("here", id="here"),
+        ],
+    )
+    def test_description_broad_word_with_trailing_prose_reaches_tr1(self, trailing: str) -> None:
+        """MohammedAlkindi #541: a broad word followed by trailing discourse
+        prose still names the broad word ("says hello there"), so TR1 fires.
+        Fixtures must not all end on the trigger phrase."""
+        findings = sc_mod._analyze_triggers(
+            {"description": ("Use this skill whenever the user says hello " + trailing)},
+            "myskill",
+        )
+        tr1 = [finding for finding in findings if finding.rule_id == "TR1"]
+        assert len(tr1) == 1
+        assert "activates on 'hello'" in tr1[0].message
+
+    def test_description_article_not_skipped_as_filler(self) -> None:
+        """MohammedAlkindi #541: bare articles are not filler words, so the
+        broad word stays in the captured phrase ("says the zone" captures
+        "the zone", not "zone"). A multiword phrase is still not TR1."""
+        match = sc_mod._DESCRIPTION_TRIGGER_PHRASE_RE.search(
+            "Use this skill whenever the user says the zone"
+        )
+        assert match is not None
+        assert match.group("phrase") == "the zone"
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user says the zone"},
+            "myskill",
+        )
+        assert findings == []
+
+    def test_description_content_word_after_broad_word_not_tr1(self) -> None:
+        """rng1995 #541 P2 boundary: a content word after a broad word names
+        a multiword trigger phrase ("hello world"), which the legacy trigger
+        grammar never flags as TR1."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user says hello world"},
+            "myskill",
+        )
+        assert findings == []
+
     def test_description_tr1_from_skill_md_frontmatter(self, tmp_path) -> None:
         """rng1995 #541 P2: TR1 is reachable end to end from SKILL.md frontmatter."""
         from skillspector.nodes.build_context import _parse_manifest

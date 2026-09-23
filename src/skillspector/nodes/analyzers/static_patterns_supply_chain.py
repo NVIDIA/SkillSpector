@@ -550,17 +550,34 @@ _DESCRIPTION_COMMAND_INTERCEPTION_RE = re.compile(
 # descriptions: the word or phrase the skill claims to activate on, as in
 # "whenever the user says hello". Filler words between the verb and the
 # phrase ("asks to create", "asks for a poster") are skipped so the rule
-# judges the real trigger phrase, never a preposition like "to". The phrase
-# is the complete bounded wording the skill names ("code review", not just
-# "code"): only a literal single word can be an overly broad trigger, matching
-# the legacy trigger grammar where multiword triggers are never TR1.
+# judges the real trigger phrase, never a preposition like "to". The bare
+# articles "the"/"a"/"an" are deliberately NOT filler: they are also overly
+# broad single-word triggers, so skipping them would drop the broad word
+# from the analysis entirely ("says the zone" must capture "the zone", not
+# "zone"). The phrase is the complete bounded wording the skill names
+# ("code review", not just "code"): only a literal single word can be an
+# overly broad trigger, matching the legacy trigger grammar where multiword
+# triggers are never TR1.
 _DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
     r"\b(?:whenever|when|if)\s+(?:the\s+)?user\s+"
     r"(?:says?|asks?|types?|sends?|requests?)\s+"
-    r"(?:(?:the\s+(?:word|phrase)|to|for|about|on|of|the|a|an|that)\s+)*"
+    r"(?:(?:the\s+(?:word|phrase)|to|for|about|on|of|that)\s+)*"
     r"['\"]?(?P<phrase>[A-Za-z][\w-]*(?:\s+[A-Za-z][\w-]*){0,7})['\"]?",
     re.IGNORECASE,
 )
+
+# Trailing discourse words that modify the utterance rather than name trigger
+# content. When the captured phrase is a broad single word followed only by
+# these deictics ("says hello there"), the skill names the broad word and the
+# rest is trailing prose, so TR1 still fires; a content word after the broad
+# word ("code review", "the zone") names a multiword phrase and stays TR1
+# negative, matching the legacy trigger grammar.
+_DESCRIPTION_TRAILING_DISCOURSE_WORDS: set[str] = {
+    "there",
+    "here",
+    "now",
+    "then",
+}
 
 # Bare universal-scope statements: the whole clause is a catch-all scope
 # ("all messages"), which the legacy trigger grammar also flags as TR3.
@@ -2161,13 +2178,25 @@ def _analyze_triggers(
         if phrase_match:
             phrase = phrase_match.group("phrase")
             phrase_lower = phrase.lower()
-            if len(phrase_lower.split()) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS:
+            phrase_words = phrase_lower.split()
+            # A broad word followed only by trailing discourse words names
+            # the broad word ("says hello there"); anything else multiword
+            # names a phrase and is not an overly broad single-word trigger.
+            broad_head_with_prose_tail = (
+                len(phrase_words) > 1
+                and phrase_words[0] in _OVERLY_BROAD_SINGLE_WORDS
+                and all(word in _DESCRIPTION_TRAILING_DISCOURSE_WORDS for word in phrase_words[1:])
+            )
+            if (
+                len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS
+            ) or broad_head_with_prose_tail:
+                broad_word = phrase_words[0]
                 findings.append(
                     Finding(
                         rule_id="TR1",
                         message=(
                             f"Overly Broad Trigger: description clause '{clause}' "
-                            f"activates on '{phrase}', a common word that will "
+                            f"activates on '{broad_word}', a common word that will "
                             "activate in many unintended contexts"
                         ),
                         severity="LOW",
