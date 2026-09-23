@@ -218,6 +218,28 @@ _SETTINGS_COMMAND_OBJECT_KEYS: Final = frozenset({"fileSuggestion", "statusLine"
 _SETTINGS_COMMAND_KEYS: Final = _SETTINGS_COMMAND_STRING_KEYS | _SETTINGS_COMMAND_OBJECT_KEYS
 # Command keys that disableAllHooks turns off (per the settings reference).
 _DISABLE_SUPPRESSED_COMMAND_KEYS: Final = frozenset({"fileSuggestion", "statusLine"})
+# Settings `env` names that reroute model/API traffic when set in a bundled file.
+_ENV_TRAFFIC_REDIRECT_URL_NAMES: Final = frozenset(
+    {
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+    }
+)
+_ENV_PROXY_URL_NAMES: Final = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"})
+# Settings `env` names whose values make Claude Code or its subprocesses run code.
+_ENV_COMMAND_INJECTION_NAMES: Final = frozenset(
+    {
+        "CLAUDE_CODE_SHELL_PREFIX",
+        "DYLD_INSERT_LIBRARIES",
+        "GIT_SSH_COMMAND",
+        "LD_PRELOAD",
+    }
+)
+# NODE_OPTIONS flags that load attacker-chosen modules into the Node runtime.
+_NODE_OPTIONS_CODE_FLAGS: Final = frozenset(
+    {"--require", "--import", "--loader", "--experimental-loader"}
+)
 _ANTHROPIC_DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
 _HookIdentity = tuple[str, str, str]
 
@@ -1349,6 +1371,34 @@ def _settings_command_declarations(
     return declarations, partial, observed
 
 
+def _env_node_options_runs_code(value: str) -> bool:
+    return any(
+        token == flag or token.startswith(f"{flag}=")
+        for token in value.split()
+        for flag in _NODE_OPTIONS_CODE_FLAGS
+    )
+
+
+def _env_value_is_flagged(name: str, value: str) -> bool:
+    """Decide whether a settings `env` entry deserves a finding.
+
+    Only the documented names are classified, and only their clearly risky
+    values are flagged: a base URL other than the known default, a proxy URL
+    that points at a remote host, a loader-injection flag in NODE_OPTIONS, or
+    a nonempty shell-prefix/loader/SSH-command override.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if name in _ENV_TRAFFIC_REDIRECT_URL_NAMES:
+        return stripped.rstrip("/").lower() != _ANTHROPIC_DEFAULT_BASE_URL
+    if name in _ENV_PROXY_URL_NAMES:
+        return _is_external_http_url(stripped)
+    if name in _ENV_COMMAND_INJECTION_NAMES:
+        return True
+    return name == "NODE_OPTIONS" and _env_node_options_runs_code(stripped)
+
+
 def _settings_surface_declarations(
     document: dict[str, object], *, limit: int
 ) -> tuple[list[_PermissionDeclaration], bool, int]:
@@ -1364,13 +1414,15 @@ def _settings_surface_declarations(
         if not _is_bounded_string_map(env):
             partial = True
         else:
-            base_url = env.get("ANTHROPIC_BASE_URL")
-            if (
-                isinstance(base_url, str)
-                and base_url.strip()
-                and base_url.strip().rstrip("/").lower() != _ANTHROPIC_DEFAULT_BASE_URL
-            ):
-                declarations.append(_PermissionDeclaration(Severity.HIGH, "traffic_redirect"))
+            assert isinstance(env, dict)
+            for name in sorted(env):
+                if _env_value_is_flagged(name, env[name]):
+                    kind = (
+                        "env_code_execution"
+                        if name in _ENV_COMMAND_INJECTION_NAMES or name == "NODE_OPTIONS"
+                        else "traffic_redirect"
+                    )
+                    declarations.append(_PermissionDeclaration(Severity.HIGH, kind))
     if "enableAllProjectMcpServers" in document:
         observed += 1
         if observed > limit:
