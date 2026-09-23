@@ -27,9 +27,11 @@ Security invariants verified:
     argv.
   - Ambient instruction files, built-in MCP servers, and mid-scan CLI
     updates stay off (``--no-custom-instructions``,
-    ``--disable-builtin-mcps``, ``--no-auto-update``); user/plugin
-    lifecycle hooks stay off via home isolation (``HOME``/``COPILOT_HOME``
-    redirected to empty temp dirs, auth only via forwarded token vars).
+    ``--disable-builtin-mcps``, ``--no-auto-update``); user and plugin
+    lifecycle hooks stay off via preflight refusal (audit rejects
+    ``installed-plugins/``, ``hooks/*.json``, inline ``hooks`` in
+    ``settings.json``, and any repo-level hook material in the temp
+    working dir before stdin moves).
   - Only the exactly verified Copilot CLI version is accepted.
   - The auth probe (``copilot --version``) is cheap, non-inference, bounded,
     uses the scrubbed environment, and fail-closed.
@@ -56,6 +58,7 @@ from skillspector.providers import (
 from skillspector.providers._agent_cli import (
     AgentCLIError,
     _audit_copilot_home,
+    _audit_tmp_cwd,
     _build_copilot_argv,
     _copilot_auth_check,
     _parse_copilot_output,
@@ -134,7 +137,8 @@ class TestBuildCopilotArgv:
 
     def test_argv_disables_custom_instructions_mcp_and_auto_update(self) -> None:
         # Ambient instruction files, built-in MCP servers, and mid-scan CLI
-        # updates must stay off (hooks additionally die via home isolation).
+        # updates must stay off (hooks have no argv off-switch: the
+        # preflight audit refuses hook material instead).
         argv = _build_copilot_argv(COPILOT_BINARY, "", 0)
         assert "--no-custom-instructions" in argv
         assert "--disable-builtin-mcps" in argv
@@ -281,15 +285,33 @@ class TestPreflightCopilotPolicy:
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
-    def test_preflight_uses_child_env_shell_false_bounded(self, mock_run: MagicMock) -> None:
+    def test_preflight_uses_child_env_shell_false_bounded(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
         mock_run.return_value = _version_result()
-        child = {"PATH": "/bin", "COPILOT_HOME": "/tmp/iso/home"}
-        _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], child, "/tmp")
+        # The home must exist: an explicitly set but missing COPILOT_HOME
+        # is unverifiable and refused (see TestAuditCopilotHome).
+        home = tmp_path / "home"
+        home.mkdir()
+        child = {"PATH": "/bin", "COPILOT_HOME": str(home)}
+        _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], child, str(tmp_path))
         assert mock_run.call_args[0][0][:2] == [COPILOT_BINARY, "--version"]
         kwargs = mock_run.call_args[1]
         assert kwargs.get("env") == child
         assert kwargs.get("shell") is False
         assert kwargs["timeout"] <= 15
+
+    @patch("skillspector.providers._agent_cli.subprocess.run")
+    def test_preflight_rejects_tmp_cwd_hook_material(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        # Repo-level hook material in the working dir fails before the
+        # version probe even runs: no subprocess call must happen.
+        (tmp_path / ".github" / "hooks").mkdir(parents=True)
+        (tmp_path / ".github" / "hooks" / "evil.json").write_text("{}", encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, str(tmp_path))
+        mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -307,9 +329,62 @@ class TestAuditCopilotHome:
         (tmp_path / "installed-plugins").mkdir()
         _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
 
-    def test_missing_tree_passes(self, tmp_path: Path) -> None:
-        # No home tree at all: no hooks to load (missing auth fails later).
-        _audit_copilot_home({"COPILOT_HOME": str(tmp_path / "absent")})
+    def test_missing_explicit_home_raises(self, tmp_path: Path) -> None:
+        # An explicitly set COPILOT_HOME that does not exist cannot be
+        # verified hook-free (the CLI may fall back to ~/.copilot): refuse.
+        with pytest.raises(AgentCLIError, match="COPILOT_HOME"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path / "absent")})
+
+    def test_missing_default_home_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No override and no ~/.copilot tree: nothing exists to fall back
+        # to, so no hooks can load (missing auth fails later).
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("COPILOT_HOME", raising=False)
+        _audit_copilot_home({})
+
+    def test_user_hook_file_raises(self, tmp_path: Path) -> None:
+        (tmp_path / "hooks").mkdir()
+        (tmp_path / "hooks" / "evil.json").write_text(
+            '{"version": 1, "hooks": {"userPromptSubmitted": '
+            '[{"type": "prompt", "prompt": "hi"}]}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_empty_hooks_dir_passes(self, tmp_path: Path) -> None:
+        (tmp_path / "hooks").mkdir()
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_non_json_in_hooks_dir_passes(self, tmp_path: Path) -> None:
+        # The CLI loads only *.json hook files; stray files are ignored.
+        (tmp_path / "hooks").mkdir()
+        (tmp_path / "hooks" / "notes.txt").write_text("not a hook", encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_inline_settings_hooks_raise(self, tmp_path: Path) -> None:
+        (tmp_path / "settings.json").write_text(
+            '{"theme": "dark", "hooks": {"userPromptSubmitted": '
+            '[{"type": "prompt", "prompt": "hi"}]}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_settings_without_hooks_passes(self, tmp_path: Path) -> None:
+        (tmp_path / "settings.json").write_text('{"theme": "dark"}', encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
+
+    def test_malformed_settings_raises(self, tmp_path: Path) -> None:
+        # Unparseable settings cannot be verified hook-free: fail closed.
+        (tmp_path / "settings.json").write_text('{"theme": ', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="settings.json"):
+            _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
 
     def test_defaults_to_dot_copilot(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         home = tmp_path / "home"
@@ -319,6 +394,35 @@ class TestAuditCopilotHome:
         monkeypatch.delenv("COPILOT_HOME", raising=False)
         with pytest.raises(AgentCLIError, match="installed plugins"):
             _audit_copilot_home({})
+
+
+# ---------------------------------------------------------------------------
+# _audit_tmp_cwd: the fresh temp working dir must carry no repo-level hook
+# material (.github/hooks, repo settings). mkdtemp is always empty, so any
+# hit here is a tripwire for a future change in temp-dir handling.
+# ---------------------------------------------------------------------------
+
+
+class TestAuditTmpCwd:
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            ".github/hooks/evil.json",
+            ".github/copilot/settings.json",
+            ".github/copilot/settings.local.json",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+        ],
+    )
+    def test_repo_hook_material_raises(self, tmp_path: Path, rel: str) -> None:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("{}", encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_tmp_cwd(str(tmp_path))
+
+    def test_clean_tmp_cwd_passes(self, tmp_path: Path) -> None:
+        _audit_tmp_cwd(str(tmp_path))
 
 
 # ---------------------------------------------------------------------------
@@ -431,14 +535,90 @@ class TestPrepareCopilotEnv:
         assert env["COPILOT_AUTO_UPDATE"] == "false"
 
     def test_preserves_copilot_home_for_login(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # A path, not a policy control: argv denies hold regardless of config.
+        # A path, not a policy control: the preflight audit (not argv
+        # denies) holds the hook boundary regardless of config.
         # (Home isolation was probed and rejected 2026-09-19: the CLI
         # silently refuses inference under ANY redirected home, so hooks
-        # are handled by the preflight home audit instead.)
+        # are handled by preflight refusal instead.)
         monkeypatch.setenv("COPILOT_HOME", "/home/op")
         env = _prepare_copilot_env({}, "/tmp", ["copilot"])
         assert env["COPILOT_HOME"] == "/home/op"
         assert "HOME" not in env and "USERPROFILE" not in env
+
+
+# ---------------------------------------------------------------------------
+# Hook-home end to end: a plugin-free home carrying a user hook file and
+# an inline settings hooks block must be rejected before prompt delivery.
+# The fake records any invocation reaching Popen, so an empty marker dir
+# proves stdin never moved.
+# ---------------------------------------------------------------------------
+
+
+class TestHookHomeEndToEnd:
+    @staticmethod
+    def _write_hook_home(home: Path) -> None:
+        (home / "hooks").mkdir(parents=True)
+        (home / "hooks" / "evil.json").write_text(
+            '{"version": 1, "hooks": {"userPromptSubmitted": '
+            '[{"type": "prompt", "prompt": "hi"}]}}',
+            encoding="utf-8",
+        )
+        (home / "settings.json").write_text(
+            '{"theme": "dark", "hooks": {"sessionStart": [{"type": "prompt", "prompt": "hi"}]}}',
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_recording_copilot(binary: Path) -> None:
+        """Fake host: answers --version, otherwise records invocation."""
+        binary.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import os
+                import sys
+                from pathlib import Path
+
+                if sys.argv[1:] == ["--version"]:
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.86"))
+                    raise SystemExit(0)
+
+                markers = Path(os.environ["ATTACK_MARKERS"])
+                markers.mkdir(parents=True, exist_ok=True)
+                (markers / "invoked").write_text("invoked")
+                sys.stdin.read()
+                print("should never print")
+                """
+            ),
+            encoding="utf-8",
+        )
+        binary.chmod(0o700)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_hook_home_rejects_before_prompt_delivery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Public completion with hook material present must raise first.
+
+        A plugin-free COPILOT_HOME carrying both a user hook file and an
+        inline settings hooks block reaches run_agent_cli; the preflight
+        audit must reject before the prompt is delivered. The fake host
+        records any Popen invocation, so an empty marker dir proves the
+        prompt never moved.
+        """
+        home = tmp_path / "copilot-home"
+        self._write_hook_home(home)
+        binary = tmp_path / "copilot"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_recording_copilot(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("COPILOT_HOME", str(home))
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="hook"):
+            run_agent_cli("copilot", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------

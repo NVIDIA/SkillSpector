@@ -915,9 +915,11 @@ def _prepare_copilot_env(
     invalidated mid-scan.
 
     User/plugin lifecycle hooks are handled NOT by home isolation (broken
-    as above) but by the preflight home audit: inference refuses to run
-    when ``installed-plugins/`` under the resolved copilot home is
-    present and non-empty. No hook material on disk means no hooks load.
+    as above) but by the preflight audits: inference refuses to run
+    when hook material (``installed-plugins/``, ``hooks/*.json``,
+    inline ``hooks`` in ``settings.json``) is present under the resolved
+    copilot home, or when repo-level hook material appears in the fresh
+    temp working dir. No hook material on disk means no hooks load.
     """
     env = {key: value for key, value in base_env.items() if not key.upper().startswith("COPILOT_")}
     for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_HOME"):
@@ -946,10 +948,10 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
     ``--no-custom-instructions``
         Disable loading of custom instructions from AGENTS.md and related
         files, so ambient instruction files cannot steer the semantic
-        verdict. (Belt-and-braces alongside the preflight home audit:
-        user/plugin lifecycle hooks have no argv off-switch, so inference
-        refuses to run when ``installed-plugins/`` is present and
-        non-empty under the resolved copilot home.)
+        verdict. (Belt-and-braces alongside the preflight audits:
+        user and plugin lifecycle hooks have no argv off-switch, so inference
+        refuses to run when hook material is present under the resolved
+        copilot home or in the temp working dir.)
 
     ``--disable-builtin-mcps``
         Disable all built-in MCP servers as defense in depth alongside the
@@ -1059,20 +1061,25 @@ def _preflight_copilot_policy(
 ) -> None:
     """Reject an unverified Copilot runtime before stdin delivery.
 
-    Two checks, both before ``run_agent_cli`` writes the prompt:
+    Three checks, all before ``run_agent_cli`` writes the prompt:
 
     1. Version: the availability probe runs once per scan, so a swapped
        or updated binary (or a direct ``complete()`` call that never
        probes) would otherwise deliver scan content to an unsupported
        runtime. Re-verifies ``[binary, --version]`` under the isolated
-       child env on EVERY completion. ``argv``/``tmp_cwd`` are unused
-       (CliSpec signature uniformity). Fail-closed: probe error/timeout,
+       child env on EVERY completion. ``argv`` is unused (CliSpec
+       signature uniformity). Fail-closed: probe error/timeout,
        non-zero exit, or a version other than the verified 1.0.86 all
        raise before any prompt bytes move.
-    2. Home audit: user/plugin lifecycle hooks have no argv off-switch,
-       so ``installed-plugins/`` present-and-non-empty under the resolved
-       copilot home raises (see ``_audit_copilot_home``).
+    2. Temp-dir tripwire: repo-level hook sources (``.github/hooks/``,
+       repo settings) cannot exist in the fresh ``mkdtemp`` dir; any
+       hit raises (see ``_audit_tmp_cwd``).
+    3. Home audit: user and plugin hook sources have no argv off-switch, so
+       ``installed-plugins/``, ``hooks/*.json``, and an inline
+       ``hooks`` block in ``settings.json`` under the resolved copilot
+       home all raise (see ``_audit_copilot_home``).
     """
+    _audit_tmp_cwd(tmp_cwd)
     try:
         result = subprocess.run(
             [binary, "--version"],
@@ -1101,21 +1108,45 @@ def _copilot_home(child_env: dict[str, str]) -> str:
 
 
 def _audit_copilot_home(child_env: dict[str, str]) -> None:
-    """Refuse inference when plugin hook material is present.
+    """Refuse inference when user or plugin hook material is present.
 
-    Plugins extend the CLI with lifecycle hooks and no argv flag disables
-    them — and, as probed 2026-09-19, the CLI silently refuses inference
-    under ANY redirected home (even a byte-identical copy), so home
-    isolation is not a usable lever. The enforceable property is absence:
-    ``installed-plugins/`` present-and-non-empty raises fail-closed before
-    stdin. A missing tree passes (no hooks to load; missing auth fails
-    later, also fail-closed).
+    The 1.0.86 CLI loads hooks from policy, user, project, then plugin
+    sources with no argv off-switch (verified: no ``--disable*hook*``
+    flag in ``copilot --help``), and — as probed 2026-09-19 — silently
+    refuses inference under ANY redirected home, so home isolation is
+    not a usable lever. The enforceable property is absence, checked
+    here for every user and plugin source under the resolved copilot home:
+
+    - ``installed-plugins/`` present-and-non-empty raises (plugin hooks);
+    - ``hooks/*.json`` present raises (user hook files);
+    - ``settings.json`` with a truthy top-level ``hooks`` field raises
+      (inline user hooks); an unreadable ``settings.json`` also raises —
+      it cannot be verified hook-free. Error messages name paths only,
+      never file contents.
+    - An explicitly set but missing ``COPILOT_HOME`` raises: the tree
+      cannot be verified, and the CLI may fall back to ``~/.copilot``.
+      A missing default home passes (nothing exists to fall back to;
+      missing auth fails later, also fail-closed).
+
+    Residual risk (documented, not auditable without administrator
+    privileges): machine-wide
+    policy hooks (``/etc/github-copilot/policy.d/``, ``C:\\ProgramData\\...``,
+    HKLM registry) are admin-owned, immune to ``disableAllHooks``, and
+    cannot be removed or disabled by this provider. Project-level sources
+    (``.github/hooks/``, repo settings) are covered by ``_audit_tmp_cwd``
+    over the fresh temp working dir.
     """
-    plugins = os.path.join(_copilot_home(child_env), "installed-plugins")
+    home = _copilot_home(child_env)
+    if (child_env.get("COPILOT_HOME") or "").strip() and not os.path.isdir(home):
+        raise AgentCLIError(
+            "COPILOT_HOME is set but missing, so hook material cannot be "
+            f"verified absent: {home}; point it at an existing hook-free tree"
+        )
+    plugins = os.path.join(home, "installed-plugins")
     try:
         has_plugins = any(os.scandir(plugins))
     except FileNotFoundError:
-        return
+        has_plugins = False
     except OSError as exc:
         raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
     if has_plugins:
@@ -1124,6 +1155,64 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
             f"lifecycle hooks: {plugins}; remove them or point COPILOT_HOME "
             "at a plugin-free tree"
         )
+    hooks = os.path.join(home, "hooks")
+    try:
+        hook_files = [
+            entry.name
+            for entry in os.scandir(hooks)
+            if entry.is_file() and entry.name.endswith(".json")
+        ]
+    except FileNotFoundError:
+        hook_files = []
+    except OSError as exc:
+        raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
+    if hook_files:
+        raise AgentCLIError(
+            "copilot home contains user hook files, which load with no "
+            f"argv off-switch: {hooks}; remove them or point COPILOT_HOME "
+            "at a hook-free tree"
+        )
+    settings = os.path.join(home, "settings.json")
+    try:
+        with open(settings, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        raise AgentCLIError(
+            f"copilot settings.json cannot be verified hook-free: {settings}"
+        ) from exc
+    if isinstance(document, dict) and document.get("hooks"):
+        raise AgentCLIError(
+            "copilot settings.json carries an inline hooks block, which loads "
+            f"with no argv off-switch: {settings}; remove it or point "
+            "COPILOT_HOME at a hook-free tree"
+        )
+
+
+_REPO_HOOK_PATHS = (
+    ".github/hooks",
+    ".github/copilot/settings.json",
+    ".github/copilot/settings.local.json",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+)
+
+
+def _audit_tmp_cwd(tmp_cwd: str) -> None:
+    """Refuse inference when the temp working dir carries hook material.
+
+    ``run_agent_cli`` always starts from a fresh ``mkdtemp`` dir, so none
+    of the repo-level hook sources can exist there. Any hit is a tripwire
+    for a future change in temp-dir handling — fail closed, never assume
+    the directory is pristine.
+    """
+    for relative in _REPO_HOOK_PATHS:
+        candidate = os.path.join(tmp_cwd, relative)
+        if os.path.lexists(candidate):
+            raise AgentCLIError(
+                f"temp working dir carries repo-level hook material (isolation breach): {candidate}"
+            )
 
 
 # ---------------------------------------------------------------------------
