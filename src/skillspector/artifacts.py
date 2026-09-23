@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
 from io import StringIO
+from threading import Lock
 from typing import NotRequired
 
 from typing_extensions import TypedDict
@@ -1796,41 +1797,55 @@ _DERIVED_VIEW_CACHE_BUDGET_CHARS = 4_000_000
 
 
 class _SizeBoundedViewCache:
-    """A small insertion-ordered cache bounded by total stored characters."""
+    """A small insertion-ordered cache bounded by total stored characters.
+
+    Every operation is a multi-step read-modify-write over three fields, and
+    the analyzers reach this cache from a thread pool -- LangGraph fans the
+    nodes out through one under ``invoke`` and ``ainvoke`` alike -- while scan
+    teardown clears it. Each operation therefore takes the lock, in the manner
+    of the per-scan AST registry in ``python_ast``. Building a view is not done
+    under the lock: two threads racing the same uncached text both build, which
+    costs the work twice and never yields a different view.
+    """
 
     def __init__(self, budget: int) -> None:
         self._budget = budget
+        self._lock = Lock()
         self._entries: OrderedDict[str, SecurityTextView] = OrderedDict()
         self._sizes: dict[str, int] = {}
         self._total = 0
 
     def get(self, key: str) -> SecurityTextView | None:
-        view = self._entries.get(key)
-        if view is not None:
-            self._entries.move_to_end(key)
-        return view
+        with self._lock:
+            view = self._entries.get(key)
+            if view is not None:
+                self._entries.move_to_end(key)
+            return view
 
     def store(self, key: str, view: SecurityTextView, size: int) -> None:
         if size > self._budget:
             # A single view larger than the whole budget is never worth keeping.
             return
-        if key in self._entries:
-            return
-        self._entries[key] = view
-        self._sizes[key] = size
-        self._total += size
-        while self._total > self._budget and self._entries:
-            evicted, _ = self._entries.popitem(last=False)
-            self._total -= self._sizes.pop(evicted, 0)
+        with self._lock:
+            if key in self._entries:
+                return
+            self._entries[key] = view
+            self._sizes[key] = size
+            self._total += size
+            while self._total > self._budget and self._entries:
+                evicted, _ = self._entries.popitem(last=False)
+                self._total -= self._sizes.pop(evicted, 0)
 
     def clear(self) -> None:
-        self._entries.clear()
-        self._sizes.clear()
-        self._total = 0
+        with self._lock:
+            self._entries.clear()
+            self._sizes.clear()
+            self._total = 0
 
     @property
     def stored_chars(self) -> int:
-        return self._total
+        with self._lock:
+            return self._total
 
 
 _NORMALIZED_VIEW_CACHE = _SizeBoundedViewCache(_DERIVED_VIEW_CACHE_BUDGET_CHARS)
