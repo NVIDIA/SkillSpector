@@ -625,19 +625,6 @@ _DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Trailing discourse words that modify the utterance rather than name trigger
-# content. When the captured phrase is a broad single word followed only by
-# these deictics ("says hello there"), the skill names the broad word and the
-# rest is trailing prose, so TR1 still fires; a content word after the broad
-# word ("code review", "the zone") names a multiword phrase and stays TR1
-# negative, matching the legacy trigger grammar.
-_DESCRIPTION_TRAILING_DISCOURSE_WORDS: set[str] = {
-    "there",
-    "here",
-    "now",
-    "then",
-}
-
 # Bare universal-scope statements: the whole clause is a catch-all scope
 # ("all messages"), which the legacy trigger grammar also flags as TR3.
 _DESCRIPTION_BARE_SCOPE_RE = re.compile(
@@ -2256,17 +2243,11 @@ def _analyze_triggers(
             phrase = phrase_match.group("phrase")
             phrase_lower = phrase.lower()
             phrase_words = phrase_lower.split()
-            # A broad word followed only by trailing discourse words names
-            # the broad word ("says hello there"); anything else multiword
-            # names a phrase and is not an overly broad single-word trigger.
-            broad_head_with_prose_tail = (
-                len(phrase_words) > 1
-                and phrase_words[0] in _OVERLY_BROAD_SINGLE_WORDS
-                and all(word in _DESCRIPTION_TRAILING_DISCOURSE_WORDS for word in phrase_words[1:])
-            )
-            if (
-                len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS
-            ) or broad_head_with_prose_tail:
+            # A multiword phrase names the complete bounded wording, even
+            # when its final word could also be read as discourse prose. In
+            # particular, "go there" and "work now" are valid phrases and
+            # must not be reduced to the broad heads "go" and "work".
+            if len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS:
                 broad_word = phrase_words[0]
                 findings.append(
                     Finding(
