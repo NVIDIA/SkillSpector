@@ -86,6 +86,15 @@ Truncated extraction and missing or ambiguous local references are explicit part
 conditions. A referenced binary, opaque, or otherwise uninspected artifact is not treated as a
 successfully analyzed reference.
 
+AE1 is suppressed only for a positively identified rendered Markdown image whose complete
+bytes verify as a minimal, non-interlaced PNG and whose canonical inspection evidence has
+only unsupported-format limitations. Active, ambiguous, escaped, code, and missing-kind
+references retain AE1, as do non-PNG formats, executable or concealed content, other failures,
+unknown reasons, and mixed limitations. Suppression leaves the coverage exception, coverage
+metrics, incomplete-scan recommendation, and `--fail-on-incomplete` behavior unchanged. Such
+an image-only limitation may report LOW severity while still recommending `CAUTION` because
+the scan remains incomplete.
+
 ## Structured skill data
 
 AISOP/AISP structured extraction consumes the already-bounded cache and shares the enclosing

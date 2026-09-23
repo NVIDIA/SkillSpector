@@ -25,6 +25,7 @@ from skillspector.artifacts import (
     ArtifactRecord,
     ContentKind,
     classify_artifact,
+    has_dex_magic,
 )
 from skillspector.constants import MAX_FILE_BYTES
 from skillspector.input_handler import (
@@ -60,11 +61,13 @@ _EXECUTABLE_SUFFIXES = frozenset(
         ".class",
         ".cts",
         ".dll",
+        ".dex",
         ".dylib",
         ".exe",
         ".go",
         ".js",
         ".jsx",
+        ".luac",
         ".mjs",
         ".msi",
         ".mts",
@@ -373,6 +376,7 @@ _BINARY_EXECUTABLE_MAGICS = (
     b"MZ",
     b"\x7fELF",
     b"\x00asm",
+    b"\x1bLua",
     b"\xfe\xed\xfa",
     b"\xce\xfa\xed\xfe",
     b"\xcf\xfa\xed\xfe",
@@ -385,7 +389,7 @@ _BINARY_EXECUTABLE_MAGICS = (
 
 def has_binary_executable_magic(data: bytes) -> bool:
     """Return whether canonical bytes begin with supported executable magic."""
-    return data.startswith(_BINARY_EXECUTABLE_MAGICS)
+    return has_dex_magic(data) or data.startswith(_BINARY_EXECUTABLE_MAGICS)
 
 
 def is_executable_content(path: str, data: bytes, mode: int = 0) -> bool:

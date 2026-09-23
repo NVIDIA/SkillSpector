@@ -18,6 +18,7 @@
 from .provider import (
     BEDROCK_DEFAULT_MODEL,
     BEDROCK_DEFAULT_REGION,
+    BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
     REGISTRY_PATH,
     BedrockProvider,
 )
@@ -25,6 +26,7 @@ from .provider import (
 __all__ = [
     "BEDROCK_DEFAULT_MODEL",
     "BEDROCK_DEFAULT_REGION",
+    "BEDROCK_SDK_TOTAL_MAX_ATTEMPTS",
     "REGISTRY_PATH",
     "BedrockProvider",
 ]

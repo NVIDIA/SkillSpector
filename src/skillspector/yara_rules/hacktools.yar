@@ -80,7 +80,7 @@ rule exploit_framework
         $beef_hook     = /hook\.js.*BeEF/ nocase
         $set_toolkit   = /(setoolkit|Social-Engineer)/ nocase
         $pwntools      = /from\s+pwn\s+import/ nocase
-        $rop_chain     = /ROP\s*\(.*elf\)/ nocase
+        $rop_chain     = /\bROP\s*\(.*elf\)/ nocase
         $shellcode_gen = /shellcode.*\\x[0-9a-f]{2}\\x[0-9a-f]{2}\\x[0-9a-f]{2}/ nocase
     condition:
         any of them

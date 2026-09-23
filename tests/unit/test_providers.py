@@ -323,11 +323,38 @@ class TestOpenAIProvider:
 
     def test_metadata_known_model(self) -> None:
         provider = OpenAIProvider()
-        assert provider.get_context_length("gpt-5.4") == 1_000_000
+        assert provider.get_context_length("gpt-5.4") == 1_050_000
         assert provider.get_max_output_tokens("gpt-5.4") == 128_000
         assert provider.get_context_length("gemini-3.5-flash") == 1_048_576
         assert provider.get_max_output_tokens("gemini-3.5-flash") == 65_536
         for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            assert provider.get_context_length(model) == 1_050_000
+            assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_metadata_gpt5_generation(self) -> None:
+        provider = OpenAIProvider()
+        for model in (
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5.1",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.2",
+        ):
+            assert provider.get_context_length(model) == 400_000
+            assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_metadata_flagship_generation(self) -> None:
+        provider = OpenAIProvider()
+        for model in (
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6",
+            "gpt-6-astra",
+        ):
             assert provider.get_context_length(model) == 1_050_000
             assert provider.get_max_output_tokens(model) == 128_000
 
@@ -597,12 +624,37 @@ class TestOpenAICompatibleConstructor:
         assert captured["temperature"] == 0.25
         assert captured["seed"] == 42
 
+    @pytest.mark.parametrize("seed", [-(1 << 63), (1 << 63) - 1])
+    def test_signed_64_bit_seed_boundaries_are_forwarded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seed: int,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_chat_openai(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(chat_models, "ChatOpenAI", fake_chat_openai)
+        monkeypatch.setenv("SKILLSPECTOR_SEED", str(seed))
+
+        create_openai_compatible_chat_model(
+            model="gpt-5.4",
+            credentials=("sk-x", "http://localhost:1234/v1"),
+            max_tokens=123,
+        )
+
+        assert captured["seed"] == seed
+
     @pytest.mark.parametrize(
         ("name", "value", "message"),
         [
             ("SKILLSPECTOR_TEMPERATURE", "warm", "must be a number"),
             ("SKILLSPECTOR_TEMPERATURE", "1.1", "must be between 0 and 1"),
             ("SKILLSPECTOR_SEED", "4.2", "must be an integer"),
+            ("SKILLSPECTOR_SEED", str(1 << 63), "must be a signed 64-bit integer"),
+            ("SKILLSPECTOR_SEED", str(-(1 << 63) - 1), "must be a signed 64-bit integer"),
         ],
     )
     def test_invalid_sampling_control_fails_before_model_construction(

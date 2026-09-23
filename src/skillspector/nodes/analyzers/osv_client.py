@@ -299,6 +299,16 @@ def _estimate_cvss_severity(vector: str) -> str | None:
     return "LOW"
 
 
+# GHSA's four severity levels are LOW/MODERATE/HIGH/CRITICAL (GitHub's own
+# term is "moderate", not "medium" — see the Advisory Database UI and the
+# `severity` enum in https://docs.github.com/en/rest/security-advisories).
+# Every downstream table in static_patterns_supply_chain.py (_SEVERITY_ORDER,
+# _osv_severity_to_app, _SEVERITY_CONFIDENCE) only recognises the app's own
+# LOW/MEDIUM/HIGH/CRITICAL vocabulary, so an un-normalized "MODERATE" silently
+# fell through every one of them to the LOW default.
+_EXTERNAL_SEVERITY_ALIASES = {"MODERATE": "MEDIUM"}
+
+
 def _severity_from_vuln(vuln: dict) -> str:
     """Extract the highest severity string from an OSV vulnerability object.
 
@@ -311,7 +321,8 @@ def _severity_from_vuln(vuln: dict) -> str:
     db_specific = vuln.get("database_specific", {})
     ghsa_severity = db_specific.get("severity", "") if isinstance(db_specific, dict) else ""
     if isinstance(ghsa_severity, str) and ghsa_severity:
-        return ghsa_severity[:32].upper()
+        normalized = ghsa_severity[:32].upper()
+        return _EXTERNAL_SEVERITY_ALIASES.get(normalized, normalized)
     raw_affected = vuln.get("affected", [])
     for affected in raw_affected if isinstance(raw_affected, list) else []:
         if not isinstance(affected, dict):
@@ -319,7 +330,8 @@ def _severity_from_vuln(vuln: dict) -> str:
         eco_specific = affected.get("ecosystem_specific", {})
         sev = eco_specific.get("severity", "") if isinstance(eco_specific, dict) else ""
         if isinstance(sev, str) and sev:
-            return sev[:32].upper()
+            normalized = sev[:32].upper()
+            return _EXTERNAL_SEVERITY_ALIASES.get(normalized, normalized)
     raw_severity = vuln.get("severity", [])
     for severity_entry in raw_severity if isinstance(raw_severity, list) else []:
         if not isinstance(severity_entry, dict):
