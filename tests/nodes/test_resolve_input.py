@@ -83,6 +83,8 @@ def test_workflow_budget_starts_before_input_materialization(
     captured: list[object] = []
 
     class CapturingHandler:
+        primary_file_path = None
+
         def __init__(self, transitive_budget: object | None = None) -> None:
             assert transitive_budget is not None
             assert getattr(transitive_budget, "started_at", None) is not None
