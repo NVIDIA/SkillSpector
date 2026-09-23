@@ -344,6 +344,9 @@ def _build_sarif_properties(
     metadata: dict[str, object] = {
         "findingId": finding.finding_id,
         "severity": finding_dict["severity"],
+        # GitHub code scanning banding: emitted alongside level so generic
+        # SARIF consumers can distinguish CRITICAL from HIGH.
+        "security-severity": _severity_to_security_severity(str(finding.severity)),
         "category": finding_dict["category"],
         "pattern": finding_dict["pattern"],
         "confidence": finding_dict["confidence"],
@@ -394,6 +397,26 @@ def _severity_to_sarif_level(severity: str) -> Literal["error", "warning", "note
         "MEDIUM": "warning",
         "LOW": "note",
     }.get(severity.upper(), "note")  # type: ignore[return-value]
+
+
+# SARIF has no critical level, so CRITICAL and HIGH both map to "error" above.
+# GitHub code scanning and most SARIF gates band security-severity >= 9.0 as
+# critical, 7.0-8.9 as high, 4.0-6.9 as medium, and 0.1-3.9 as low; the values
+# below keep each SkillSpector severity inside its band.
+_SEVERITY_TO_SECURITY_SEVERITY: dict[str, str] = {
+    "CRITICAL": "9.5",
+    "HIGH": "8.0",
+    "MEDIUM": "5.5",
+    "LOW": "3.0",
+}
+
+
+def _severity_to_security_severity(severity: str) -> str | None:
+    """Map Finding.severity to a SARIF security-severity score string.
+
+    Returns None for unknown severities so no misleading score is emitted.
+    """
+    return _SEVERITY_TO_SECURITY_SEVERITY.get(severity.upper())
 
 
 def _summary_display_value(value: object) -> str | None:
@@ -603,10 +626,12 @@ def _build_sarif(
     """Build one SARIF invocation with canonical inspection notifications."""
     results: list[SarifResult] = []
     seen_rule_ids: dict[str, str] = {}
+    seen_rule_severities: dict[str, set[str]] = {}
 
     for finding in findings:
         if not finding.rule_id or not finding.message:
             continue
+        seen_rule_severities.setdefault(finding.rule_id, set()).add(str(finding.severity).upper())
         occurrences = finding.occurrences or [
             {
                 "file": finding.file,
@@ -652,6 +677,7 @@ def _build_sarif(
         finding = sf.finding
         if not finding.rule_id or not finding.message:
             continue
+        seen_rule_severities.setdefault(finding.rule_id, set()).add(str(finding.severity).upper())
         occurrences = finding.occurrences or [
             {
                 "file": finding.file,
@@ -692,13 +718,24 @@ def _build_sarif(
         if finding.rule_id not in seen_rule_ids:
             seen_rule_ids[finding.rule_id] = finding.message
 
-    rules = [
-        SarifReportingDescriptor(
-            id=rule_id,
-            shortDescription=SarifMessage(text=description),
+    rules = []
+    for rule_id, description in sorted(seen_rule_ids.items()):
+        # A rule carries security-severity only when every reported finding
+        # for it shares one severity; mixed-severity rules stay unannotated
+        # rather than mislabeling some of their results.
+        rule_properties: dict[str, object] | None = None
+        severities = seen_rule_severities.get(rule_id, set())
+        if len(severities) == 1:
+            score = _severity_to_security_severity(next(iter(severities)))
+            if score is not None:
+                rule_properties = {"security-severity": score}
+        rules.append(
+            SarifReportingDescriptor(
+                id=rule_id,
+                shortDescription=SarifMessage(text=description),
+                properties=rule_properties,
+            )
         )
-        for rule_id, description in sorted(seen_rule_ids.items())
-    ]
 
     completeness = analysis_completeness or {}
 
