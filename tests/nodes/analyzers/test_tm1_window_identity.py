@@ -129,7 +129,8 @@ def test_normalized_continuity_view_owns_its_bound_call_once() -> None:
     )
     findings = [finding for finding in result["findings"] if finding.rule_id == "TM1"]
 
-    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
     assert len(findings) == 1
 
 
