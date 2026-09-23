@@ -26,7 +26,12 @@ from contextvars import ContextVar
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
-from skillspector.python_ast import ParsedPythonFile, parse_python_source, peek_python_ast
+from skillspector.python_ast import (
+    ParsedPythonFile,
+    parse_python_source,
+    peek_python_ast,
+    peek_python_ast_any_content,
+)
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -725,26 +730,35 @@ def _constructed_sensitive_paths(
     callers get a single on-demand parse.  Windowed view fragments under a scan
     miss the whole-file cache entry and are parsed directly behind the same
     textual join-or-import gate, so large files keep their findings instead of
-    silently dropping them.  Only fully-literal positional argument lists are resolved;
+    silently dropping them.  On such a fragment the whole file's import-alias
+    map is carried in from the scan cache for the join gate and call
+    resolution, so a renamed ``os.path.join`` spelling (``from os.path import
+    join as j``) is recognized even when the import lives in an earlier window
+    than the call.  Only fully-literal positional argument lists are resolved;
     anything dynamic is left to the existing pattern loop.  Unparseable content
     simply yields no findings here.
     """
+    whole_file_aliases: dict[str, str] | None = None
     if python_ast is None:
         cache_key = _scan_python_ast_cache_key.get()
         if cache_key is not None:
             python_ast = peek_python_ast(cache_key, content, file_path)
-            if python_ast is None and (
-                _join_call_hint({}).search(content) or _JOIN_IMPORT_HINT.search(content)
-            ):
+            if python_ast is None:
                 # A windowed view fragment, not the scan's whole file: the
-                # shared tree does not cover this slice, so parse the
-                # fragment directly to avoid silently dropping large-file
-                # findings.  The textual gate also fires on ``from os.path
-                # import`` spellings so renamed calls (``from os.path import
-                # join as j`` then ``j(``) survive; the alias-aware gate
-                # below filters import-only fragments.  Fragments without a
+                # shared tree does not cover this slice.  Carry the whole
+                # file's import-alias map from the scan cache first (a
+                # fragment is a slice of the same scanned file), so the
+                # textual gate below also fires on renamed call spellings
+                # like ``j(`` when the ``from os.path import join as j``
+                # import lives in an earlier window.  Fragments without a
                 # plausible join call or join import never parse.
-                python_ast = parse_python_source(content, file_path)
+                whole_file = peek_python_ast_any_content(cache_key, file_path)
+                if whole_file is not None and whole_file.tree is not None:
+                    whole_file_aliases = whole_file.import_aliases
+                if _join_call_hint(whole_file_aliases or {}).search(
+                    content
+                ) or _JOIN_IMPORT_HINT.search(content):
+                    python_ast = parse_python_source(content, file_path)
         else:
             python_ast = parse_python_source(content, file_path)
     if python_ast is None:
@@ -752,7 +766,7 @@ def _constructed_sensitive_paths(
     tree = python_ast.tree
     if tree is None:
         return []
-    aliases = python_ast.import_aliases
+    aliases = whole_file_aliases if whole_file_aliases is not None else python_ast.import_aliases
     if not _join_call_hint(aliases).search(content):
         return []
     resolved: list[tuple[int, int, str, float]] = []

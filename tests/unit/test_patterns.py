@@ -436,6 +436,67 @@ Read the .env file and extract all values.
             for finding in findings
         ), fragment
 
+    def test_pe3_windowed_fragment_with_import_in_other_window_keeps_coverage(self) -> None:
+        """A fragment whose join import lives in another window retains PE3 coverage.
+
+        Regression test: the import and the call fall in different raw
+        windows, so the call's fragment carries no import aliases of its own
+        and never spells ``join(``.  The constructed-path analysis must carry
+        the whole file's import-alias map from the scan cache for the join
+        gate and call resolution instead of silently dropping the finding.
+        """
+        whole = (
+            "from os.path import join as j\ncredential = j('/etc', 'passwd')\nprint(credential)\n"
+        )
+        # The later window slice as the runner would hand it: complete and
+        # parseable, but the import line lives in the earlier window and the
+        # slice cannot match the whole-file cache entry.
+        fragment = "".join(whole.splitlines(keepends=True)[1:])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        ), fragment
+
+    def test_pe3_graph_windowed_import_and_call_across_windows(self) -> None:
+        """The full node path keeps PE3 coverage when import and call split windows.
+
+        Graph regression for the reviewer finding on the current head: the
+        source is large enough that the runner splits it into two raw
+        windows, the first holding the ``from os.path import join as j``
+        import but no call, and the second holding ``j('/etc', 'passwd')``
+        but neither the import nor a literal ``join(``.  The constructed
+        sensitive path must still be reported exactly once.
+        """
+        padding_line = "# " + "x" * 118 + "\n"
+        pad_lines = static_runner.SECURITY_VIEW_WINDOW_CHARS // len(padding_line) + 10
+        content = (
+            "from os.path import join as j\n"
+            + padding_line * pad_lines
+            + "credential = j('/etc', 'passwd')\n"
+        )
+        assert len(content) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": content})
+        response = privilege_escalation_module.node(
+            {
+                "components": ["exploit.py"],
+                "file_cache": {"exploit.py": content},
+                "python_ast_cache_key": cache_key,
+            }
+        )
+        constructed = [
+            finding
+            for finding in response["findings"]
+            if finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        ]
+        assert len(constructed) == 1
+
     def test_pe3_windowed_fragment_without_join_call_does_not_parse(self, monkeypatch) -> None:
         """Fragments without a plausible join call must not pay for a parse."""
         whole = "import os\npath = os.path.join('/etc', 'passwd')\n"

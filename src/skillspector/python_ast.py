@@ -358,6 +358,25 @@ def peek_python_ast(cache_key: str | None, content: str, filename: str) -> Parse
         return None
 
 
+def peek_python_ast_any_content(cache_key: str | None, filename: str) -> ParsedPythonFile | None:
+    """Return the scan's cached parse for *filename* regardless of content.
+
+    Windowed view fragments never content-match the whole-file entry, but a
+    fragment is a slice of the same scanned file, so its import-alias map is
+    still valid for resolving calls that the fragment's own imports cannot
+    explain (for example a renamed ``os.path.join`` import living in an
+    earlier window).  Like :func:`peek_python_ast`, this never parses and
+    never stores.
+    """
+    if cache_key is None:
+        return None
+    with _runtime_ast_cache_lock:
+        cache = _runtime_ast_caches.get(cache_key)
+        if cache is None:
+            return None
+        return cache.entries.get(filename)
+
+
 def clear_python_ast_cache(cache_key: str | None) -> None:
     """Release one scan's process-local parsed trees after its analyzer phase."""
     if cache_key is None:
