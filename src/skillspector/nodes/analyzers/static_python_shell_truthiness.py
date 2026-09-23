@@ -23,6 +23,17 @@ ANALYZER_ID = "static_patterns_tool_misuse"
 USES_PYTHON_AST = True
 BOUND_SHELL_EVIDENCE = "_tm1_bound_shell_value"
 _DIRECT_CALL_NAMES = frozenset({"subprocess", "Popen"})
+BoundShellCallKey = tuple[int, int, int, int]
+
+
+def _bound_shell_call_key(call: ast.Call) -> BoundShellCallKey:
+    """Return a stable source key for one call node."""
+    return (
+        getattr(call, "lineno", 1),
+        getattr(call, "col_offset", 0),
+        getattr(call, "end_lineno", getattr(call, "lineno", 1)),
+        getattr(call, "end_col_offset", getattr(call, "col_offset", 0)),
+    )
 
 
 def _truth_value(
@@ -393,16 +404,109 @@ def _class_body_changed_direct_names(
     return affected
 
 
-def _is_direct_subprocess_call(call: ast.Call, trusted_names: set[str]) -> bool:
+def _class_deferred_receiver_trust(
+    statement: ast.ClassDef,
+    trusted_names: set[str],
+) -> tuple[set[str], dict[int, set[str]]]:
+    """Return final and observed-call outer trust for deferred class methods."""
+    deferred = set(trusted_names)
+    trusted_at_call_by_definition: dict[int, set[str]] = {}
+    active_functions: dict[str, int] = {}
+    declarations = _DirectBindingCollector(_DIRECT_CALL_NAMES)
+    for child in statement.body:
+        declarations.visit(child)
+    global_names = declarations.nonlocal_names.intersection(_DIRECT_CALL_NAMES)
+
+    for child_index, child in enumerate(statement.body):
+        call = _passive_direct_call(child)
+        if call is not None:
+            assert isinstance(call.func, ast.Name)
+            owner = active_functions.get(call.func.id)
+            if owner is not None:
+                trusted_at_call_by_definition.setdefault(owner, set()).update(deferred)
+
+        pending = [child]
+        contains_call = False
+        while pending:
+            current = pending.pop()
+            if isinstance(current, ast.Call):
+                contains_call = True
+                break
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                pending.extend(_DirectBindingCollector._function_header_nodes(current))
+                continue
+            if isinstance(current, ast.Lambda):
+                pending.extend(current.args.defaults)
+                pending.extend(item for item in current.args.kw_defaults if item is not None)
+                continue
+            pending.extend(ast.iter_child_nodes(current))
+        if contains_call:
+            # Class-body expressions run before any method can be called and may
+            # mutate the surrounding module/function receiver binding.
+            deferred.clear()
+
+        collector = _DirectBindingCollector(_DIRECT_CALL_NAMES)
+        collector.visit(child)
+        deferred.difference_update(collector.mutated)
+        globally_bound = collector.bound.intersection(global_names)
+        if isinstance(child, ast.Import):
+            for imported in child.names:
+                bound = imported.asname or imported.name.partition(".")[0]
+                if bound not in globally_bound:
+                    continue
+                if imported.name == "subprocess" and bound == "subprocess":
+                    deferred.add(bound)
+                else:
+                    deferred.discard(bound)
+        elif isinstance(child, ast.ImportFrom):
+            if any(imported.name == "*" for imported in child.names) and global_names:
+                deferred.clear()
+            for imported in child.names:
+                bound = imported.asname or imported.name
+                if bound not in globally_bound:
+                    continue
+                if (
+                    child.level == 0
+                    and child.module == "subprocess"
+                    and imported.name == "Popen"
+                    and bound == "Popen"
+                ):
+                    deferred.add(bound)
+                else:
+                    deferred.discard(bound)
+        else:
+            deferred.difference_update(globally_bound)
+
+        changed_names = _direct_bound_names(child)
+        for name in changed_names:
+            active_functions.pop(name, None)
+        if (
+            isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and _function_header_is_passive(child)
+            and _is_immediate_function(child)
+        ):
+            active_functions[child.name] = child_index
+    return deferred, trusted_at_call_by_definition
+
+
+def _is_direct_subprocess_syntax(call: ast.Call) -> bool:
+    """Return whether a call uses one of the direct subprocess spellings."""
     function = call.func
     if isinstance(function, ast.Name):
-        return function.id == "Popen" and function.id in trusted_names
+        return function.id == "Popen"
     return (
         isinstance(function, ast.Attribute)
         and isinstance(function.value, ast.Name)
         and function.value.id == "subprocess"
-        and function.value.id in trusted_names
     )
+
+
+def _is_direct_subprocess_call(call: ast.Call, trusted_names: set[str]) -> bool:
+    if not _is_direct_subprocess_syntax(call):
+        return False
+    function = call.func
+    receiver = function.id if isinstance(function, ast.Name) else function.value.id
+    return receiver in trusted_names
 
 
 def _is_passive_argument(expression: ast.expr) -> bool:
@@ -548,6 +652,17 @@ def _function_header_is_passive(
     return all(_annotation_is_passive(annotation) for annotation in annotations)
 
 
+def _class_header_is_passive(statement: ast.ClassDef) -> bool:
+    """Return whether evaluating a class header cannot rebind a receiver."""
+    expressions = [
+        *statement.decorator_list,
+        *statement.bases,
+        *(keyword.value for keyword in statement.keywords),
+        *getattr(statement, "type_params", []),
+    ]
+    return all(_is_passive_argument(expression) for expression in expressions)
+
+
 def _is_immediate_function(statement: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """Return whether a direct call begins executing this function body."""
     if isinstance(statement, ast.AsyncFunctionDef):
@@ -625,6 +740,21 @@ class _Analyzer:
         self.python_ast = python_ast
         self.lines = python_ast.lines
         self.findings: list[AnalyzerFinding] = []
+        self.bound_shell_call_ownership: dict[BoundShellCallKey, bool] = {}
+
+    def _record_bound_shell_call(self, call: ast.Call, trusted_names: set[str]) -> None:
+        """Record whether the companion owns one supported bound-shell call."""
+        shell = next((item.value for item in call.keywords if item.arg == "shell"), None)
+        if (
+            not _is_direct_subprocess_syntax(call)
+            or not isinstance(shell, ast.Name)
+            or shell.id.casefold().startswith("true")
+        ):
+            return
+        self.bound_shell_call_ownership[_bound_shell_call_key(call)] = bool(
+            _is_direct_subprocess_call(call, trusted_names)
+            and _shell_argument_is_captured_before_effects(call)
+        )
 
     def _inspect_call(self, call: ast.Call, facts: dict[str, bool]) -> None:
         shell = next((item.value for item in call.keywords if item.arg == "shell"), None)
@@ -688,6 +818,8 @@ class _Analyzer:
         result_is_finalizer_safe = _is_finalizer_safe_value(value, finalizer_safe_names)
         call_has_protocol_effects = False
         effectful_call = isinstance(value, ast.Call)
+        if isinstance(value, ast.Call):
+            self._record_bound_shell_call(value, trusted_names)
         if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
             resolved = None
             safe_value = _call_arguments_are_passive(value)
@@ -747,6 +879,8 @@ class _Analyzer:
         *,
         trusted_names: set[str] | None = None,
         initial_bound_names: set[str] | None = None,
+        nested_function_trusted_names: set[str] | None = None,
+        nested_function_trusted_at_call: dict[int, set[str]] | None = None,
     ) -> None:
         trusted_names = set(_DIRECT_CALL_NAMES if trusted_names is None else trusted_names)
         facts: dict[str, bool] = {}
@@ -786,13 +920,19 @@ class _Analyzer:
         for index, statement in enumerate(statements):
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 passive_header = _function_header_is_passive(statement)
-                trusted_at_call = trusted_at_call_by_definition.get(index, set())
-                nested_trusted_names = set(trusted_names).union(trusted_at_call)
-                nested_trusted_names = {
-                    name
-                    for name in nested_trusted_names
-                    if last_invalidation_by_name.get(name, -1) <= index or name in trusted_at_call
-                }
+                if nested_function_trusted_names is None:
+                    trusted_at_call = trusted_at_call_by_definition.get(index, set())
+                    nested_trusted_names = set(trusted_names).union(trusted_at_call)
+                    nested_trusted_names = {
+                        name
+                        for name in nested_trusted_names
+                        if last_invalidation_by_name.get(name, -1) <= index
+                        or name in trusted_at_call
+                    }
+                else:
+                    nested_trusted_names = set(nested_function_trusted_names).union(
+                        (nested_function_trusted_at_call or {}).get(index, set())
+                    )
                 nested_trusted_names.difference_update(
                     _function_bound_direct_names(statement, nested_trusted_names)
                 )
@@ -833,6 +973,8 @@ class _Analyzer:
             elif isinstance(statement, ast.AnnAssign):
                 value = statement.value
                 effectful_call = isinstance(value, ast.Call)
+                if isinstance(value, ast.Call):
+                    self._record_bound_shell_call(value, trusted_names)
                 if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
                     if _shell_argument_is_captured_before_effects(value):
                         self._inspect_call(value, facts)
@@ -854,6 +996,7 @@ class _Analyzer:
                 trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
             elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
                 call = statement.value
+                self._record_bound_shell_call(call, trusted_names)
                 direct_call = _is_direct_subprocess_call(call, trusted_names)
                 if direct_call and _shell_argument_is_captured_before_effects(call):
                     self._inspect_call(call, facts)
@@ -872,6 +1015,33 @@ class _Analyzer:
             ):
                 continue
             elif isinstance(statement, ast.ClassDef):
+                class_trusted_names = set(trusted_names)
+                passive_class_header = _class_header_is_passive(statement)
+                if not passive_class_header:
+                    class_trusted_names.clear()
+                method_outer_trust = set(
+                    trusted_names
+                    if nested_function_trusted_names is None
+                    else nested_function_trusted_names
+                )
+                if nested_function_trusted_names is None:
+                    method_outer_trust = {
+                        name
+                        for name in method_outer_trust
+                        if last_invalidation_by_name.get(name, -1) <= index
+                    }
+                if not passive_class_header:
+                    method_outer_trust.clear()
+                method_trusted_names, method_trusted_at_call = _class_deferred_receiver_trust(
+                    statement,
+                    method_outer_trust,
+                )
+                self._scan_block(
+                    statement.body,
+                    trusted_names=class_trusted_names,
+                    nested_function_trusted_names=method_trusted_names,
+                    nested_function_trusted_at_call=method_trusted_at_call,
+                )
                 facts.clear()
                 finalizer_safe_names.clear()
                 bound_names.update(_direct_bound_names(statement))
@@ -904,3 +1074,15 @@ def analyze(
     if parsed.tree is None:
         return []
     return _Analyzer(file_path, parsed).run(parsed.tree)
+
+
+def bound_shell_call_ownership(
+    file_path: str,
+    python_ast: ParsedPythonFile,
+) -> dict[BoundShellCallKey, bool]:
+    """Return supported bound-shell calls and whether their receiver is trusted."""
+    if python_ast.tree is None:
+        return {}
+    analyzer = _Analyzer(file_path, python_ast)
+    analyzer.run(python_ast.tree)
+    return dict(analyzer.bound_shell_call_ownership)

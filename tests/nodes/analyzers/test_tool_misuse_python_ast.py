@@ -227,6 +227,173 @@ def test_calls_inside_compound_statements_are_out_of_scope() -> None:
     )
 
 
+def test_class_body_same_scope_binding_is_tracked() -> None:
+    findings = _tm1(
+        "class Runner:\n    enabled = True\n    subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [3]
+
+
+def test_generic_call_invalidates_receiver_trust_in_class_body() -> None:
+    assert not _tm1(
+        "class Runner:\n"
+        "    replace_subprocess()\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_class_method_does_not_close_over_class_binding() -> None:
+    assert not _tm1(
+        "class Runner:\n"
+        "    enabled = True\n"
+        "    def run(self):\n"
+        "        subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_class_body_lookup_precedes_later_class_binding() -> None:
+    findings = _tm1(
+        "enabled = True\n"
+        "class Runner:\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "    enabled = False\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [1]
+
+
+@pytest.mark.parametrize(
+    "class_body",
+    [
+        pytest.param(
+            "    enabled = subprocess.run(command, shell=enabled)\n",
+            id="assignment-rhs-before-store",
+        ),
+        pytest.param(
+            "    def enabled(value=subprocess.run(command, shell=enabled)):\n        pass\n",
+            id="function-default-before-name-binding",
+        ),
+        pytest.param(
+            "    with manager(subprocess.run(command, shell=enabled)) as enabled:\n        pass\n",
+            id="with-target-after-context",
+        ),
+        pytest.param(
+            "    try:\n"
+            "        raise Error\n"
+            "    except subprocess.run(command, shell=enabled) as enabled:\n"
+            "        pass\n",
+            id="except-target-after-type",
+        ),
+    ],
+)
+def test_class_binding_is_installed_after_value_evaluation(class_body: str) -> None:
+    findings = _tm1("enabled = True\nclass Runner:\n" + class_body)
+
+    assert [finding.start_line for finding in findings] == [1]
+
+
+def test_class_local_import_does_not_establish_method_receiver_trust() -> None:
+    assert not _tm1(
+        "subprocess = proxy\n"
+        "class Runner:\n"
+        "    import subprocess\n"
+        "    def run(self):\n"
+        "        enabled = True\n"
+        "        subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_class_local_shadow_does_not_hide_global_method_receiver() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "class Runner:\n"
+        "    subprocess = proxy\n"
+        "    def run(self):\n"
+        "        enabled = True\n"
+        "        subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [6]
+
+
+def test_class_body_generic_call_invalidates_deferred_method_receiver() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "class Runner:\n"
+        "    replace_subprocess()\n"
+        "    def run(self):\n"
+        "        enabled = True\n"
+        "        subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_called_class_method_preserves_receiver_before_later_invalidation() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "class Runner:\n"
+        "    def run():\n"
+        "        enabled = True\n"
+        "        subprocess.run(command, shell=enabled)\n"
+        "    run()\n"
+        "    replace_subprocess()\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [5]
+
+
+def test_class_method_call_after_invalidation_is_rejected() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "class Runner:\n"
+        "    def run():\n"
+        "        enabled = True\n"
+        "        subprocess.run(command, shell=enabled)\n"
+        "    replace_subprocess()\n"
+        "    run()\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "class_header",
+    [
+        pytest.param("@replace_subprocess()\nclass Runner:", id="decorator"),
+        pytest.param("class Runner(replace_subprocess()):", id="base"),
+    ],
+)
+def test_effectful_class_header_invalidates_deferred_method_receiver(class_header: str) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        f"{class_header}\n"
+        "    def run(self):\n"
+        "        enabled = True\n"
+        "        subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_class_for_target_is_bound_after_iterable_evaluation() -> None:
+    findings = _tm1(
+        "enabled = True\n"
+        "class Runner:\n"
+        "    for enabled in subprocess.run(command, shell=enabled):\n"
+        "        pass\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [1]
+
+
+def test_comprehension_target_shadows_outer_shell_flag() -> None:
+    assert not _tm1(
+        "enabled = True\n"
+        "class Runner:\n"
+        "    values = [\n"
+        "        subprocess.run(command, shell=enabled)\n"
+        "        for enabled in items\n"
+        "    ]\n"
+    )
+
+
 @pytest.mark.parametrize(
     "argument",
     [
@@ -399,6 +566,19 @@ def test_generic_call_invalidates_receiver_trust_for_called_function(statement: 
     assert not findings
 
 
+def test_generic_call_invalidates_receiver_trust_for_nested_closure() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def outer():\n"
+        "    enabled = True\n"
+        "    def inner():\n"
+        "        subprocess.run(command, shell=enabled)\n"
+        "    replace_subprocess()\n"
+        "    inner()\n"
+        "outer()\n"
+    )
+
+
 @pytest.mark.parametrize(
     "statement",
     [
@@ -428,6 +608,13 @@ def test_direct_subprocess_call_remains_detected(statement: str) -> None:
     )
 
     assert [finding.location.start_line for finding in findings] == [4, 6]
+
+
+def test_blank_line_before_assignment_has_one_tm1_owner() -> None:
+    findings = _tm1("import subprocess\n\nenabled = True\nsubprocess.run(command, shell=enabled)\n")
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 4
 
 
 def test_unsupported_assignment_clears_existing_facts() -> None:
@@ -502,6 +689,93 @@ def test_true_prefixed_identifier_has_one_lexical_owner() -> None:
     findings = _tm1("true_value = True\nsubprocess.run(command, shell=true_value)\n")
 
     assert len(findings) == 1
+
+
+def test_true_prefixed_closure_has_one_lexical_owner() -> None:
+    findings = _tm1(
+        "def outer():\n"
+        "    true_value = True\n"
+        "    def inner():\n"
+        "        subprocess.run(command, shell=true_value)\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 4
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            "enabled = True\ndef run(enabled):\n    subprocess.run(command, shell=enabled)\n",
+            id="parameter-shadow",
+        ),
+        pytest.param(
+            "enabled = True\ndef run():\n"
+            "    subprocess.run(command, shell=enabled)\n    enabled = False\n",
+            id="later-local-shadow",
+        ),
+        pytest.param(
+            "def outer():\n    enabled = True\n    def inner():\n"
+            "        global enabled\n        subprocess.run(command, shell=enabled)\n",
+            id="global-redirect",
+        ),
+    ],
+)
+def test_cross_scope_binding_must_resolve_to_literal_assignment(content: str) -> None:
+    assert not _tm1(content)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            "import subprocess\n"
+            "enabled = True\n"
+            "values = [(subprocess.run(command, shell=enabled), (enabled := False)) "
+            "for item in items]\n",
+            id="module",
+        ),
+        pytest.param(
+            "import subprocess\n"
+            "def execute():\n"
+            "    enabled = True\n"
+            "    return [(subprocess.run(command, shell=enabled), "
+            "(enabled := False)) for item in items]\n",
+            id="function",
+        ),
+        pytest.param(
+            "import subprocess\n"
+            "enabled = True\n"
+            "values = [[(subprocess.run(command, shell=enabled), (enabled := False)) "
+            "for inner in inners] for outer in outers]\n",
+            id="nested-comprehension",
+        ),
+    ],
+)
+def test_comprehension_walrus_binds_in_containing_scope(content: str) -> None:
+    findings = _tm1(content)
+
+    assert len(findings) == 1
+
+
+def test_malformed_python_keeps_bounded_lexical_fallback() -> None:
+    findings = _tm1("enabled = True\nsubprocess.run(command, shell=enabled)\nif:\n")
+
+    assert len(findings) == 1
+    assert "_tm1_variable_shell_flag" not in findings[0].evidence
+
+
+def test_oversized_python_keeps_bounded_lexical_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = "enabled = True\nsubprocess.run(command, shell=enabled)\n" + "# padding\n" * 20
+    monkeypatch.setattr(tm_module.static_runner, "MAX_FILE_CHARS", 80)
+
+    findings = _tm1(content)
+
+    assert len(findings) == 1
+    assert "_tm1_variable_shell_flag" not in findings[0].evidence
 
 
 def test_long_same_line_calls_keep_exact_coordinates_and_distinct_identity() -> None:

@@ -878,6 +878,8 @@ def _scan_path(
                     analyze_kwargs["python_ast"] = python_ast
                 if _uses_runtime_check(module):
                     analyze_kwargs["check_runtime"] = finding_budget.check_runtime
+                if _explicit_module_hook(module, "ANALYZE_USES_POSTPROCESS") is True:
+                    analyze_kwargs["defer_variable_reconciliation"] = True
                 raw = module.analyze(**analyze_kwargs)
                 finding_budget.check_runtime()
                 for af in raw:
