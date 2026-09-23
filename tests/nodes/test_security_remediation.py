@@ -433,14 +433,14 @@ def test_markdown_image_alt_text_is_not_a_second_plain_reference(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
-    "source_text",
+    ("source_text", "target"),
     [
-        r"![Chart\](assets/chart.png)",
-        "![[Chart](assets/chart.png)",
-        r"![Chart](assets/chart.png\))",
-        "![Chart](assets/chart.png Color chart)",
-        "![Chart](assets/chart.png (Color chart))",
-        r'![Chart](assets/chart.png "Color \"chart\"")',
+        (r"![Chart\](assets/chart.png)", "assets/chart.png"),
+        ("![[Chart](assets/chart.png)", "assets/chart.png"),
+        (r"![Chart](assets/chart.png\))", "assets/chart.png)"),
+        ("![Chart](assets/chart.png Color chart)", "assets/chart.png"),
+        ("![Chart](assets/chart.png (Color chart))", "assets/chart.png"),
+        (r'![Chart](assets/chart.png "Color \"chart\"")', "assets/chart.png"),
     ],
     ids=[
         "escaped-label-delimiter",
@@ -452,16 +452,16 @@ def test_markdown_image_alt_text_is_not_a_second_plain_reference(tmp_path: Path)
     ],
 )
 def test_ambiguous_image_syntax_does_not_prove_passive_use(
-    tmp_path: Path, source_text: str
+    tmp_path: Path, source_text: str, target: str
 ) -> None:
     records = resolve_bundle_references(
         tmp_path,
         source_path="SKILL.md",
         source_text=source_text,
-        known_paths=["SKILL.md", "assets/chart.png"],
+        known_paths=["SKILL.md", target],
     )
 
-    references = [record for record in records if record["target_path"] == "assets/chart.png"]
+    references = [record for record in records if record["target_path"] == target]
     assert references
     assert all(record["reference_kind"] != "markdown_image" for record in references)
 

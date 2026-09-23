@@ -23,8 +23,15 @@ MAX_ACCEPTED_REFERENCES = 256
 MAX_REFERENCE_RECORDS = 1024
 MAX_REFERENCE_RUNTIME_SECONDS = 2.0
 _MAX_EVIDENCE = 160
-_MARKDOWN_IMAGE_DESTINATION = re.compile(r"!\[[^\]\n]{0,200}\]\(([^)\n]{1,512})\)")
-_MARKDOWN_LINK_DESTINATION = re.compile(r"(?<!!)\[[^\]\n]{1,200}\]\(([^)\n]{1,512})\)")
+_MAX_MARKDOWN_DESTINATION_CHARS = 512
+_MARKDOWN_REFERENCE_START = re.compile(
+    r"(?:!\[[^\]\n]{0,200}\]|(?<!!)\[[^\]\n]{1,200}\])\("
+    r"|^[ \t]{0,3}\[[^\]\n]{1,200}\]:[ \t]*"
+)
+_MARKDOWN_TITLE = r"""(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\((?:\\.|[^)\\\r\n])*\))"""
+_MARKDOWN_INLINE_END = re.compile(r"[ \t]*(?:" + _MARKDOWN_TITLE + r")?[ \t]*\)")
+_MARKDOWN_DEFINITION_END = re.compile(r"[ \t]*(?:" + _MARKDOWN_TITLE + r")?[ \t]*(?:\r?\n)?\Z")
+_MARKDOWN_STRUCTURAL_ESCAPE = re.compile(r"\\([\\()<>])")
 _PASSIVE_IMAGE_DESTINATION = re.compile(
     r"[^\s\\()\[\]<>]+(?:[ \t]+(?:\"[^\"\\\r\n()]*\"|'[^'\\\r\n()]*'))?"
 )
@@ -75,6 +82,120 @@ def _evidence(cleaned_line: str, column: int) -> str:
         return cleaned_line
     start = max(0, min(column - 1, len(cleaned_line)) - _MAX_EVIDENCE // 2)
     return cleaned_line[start : start + _MAX_EVIDENCE]
+
+
+@dataclass(frozen=True)
+class _ReferenceCandidate:
+    raw: str
+    start: int
+    end: int
+    kind: ReferenceKind
+    syntax_start: int
+    passive_image: bool = False
+
+
+def _markdown_candidates(
+    line: str, *, deadline: float, clock: Callable[[], float], limitations: set[str]
+) -> Iterator[_ReferenceCandidate]:
+    """Read bounded destinations without splitting spaces or balanced parentheses.
+
+    Explicit reference definitions use the same destination grammar as inline
+    links. Recognizing them separately keeps slash-separated prose excluded.
+    """
+    consumed_until = 0
+    for opening in _MARKDOWN_REFERENCE_START.finditer(line):
+        # Malformed openings may never yield a candidate. Bound their work too.
+        if clock() >= deadline:
+            return
+        if opening.start() < consumed_until:
+            continue
+        start = opening.end()
+        while start < len(line) and line[start] in " \t":
+            start += 1
+        if start >= len(line):
+            continue
+        limit = min(len(line), start + _MAX_MARKDOWN_DESTINATION_CHARS + 2)
+        end = start
+        if line[start] == "<":
+            start += 1
+            end = start
+            while end < limit and line[end] not in "<>\r\n":
+                if line[end] == "\\" and end + 1 < limit:
+                    end += 1
+                end += 1
+            if end - start > _MAX_MARKDOWN_DESTINATION_CHARS:
+                limitations.add("markdown_destination")
+                continue
+            if end >= limit or line[end] != ">":
+                continue
+            raw = line[start:end]
+            destination_end = end + 1
+        else:
+            depth = 0
+            while end < limit and not line[end].isspace():
+                char = line[end]
+                if char == "\\" and end + 1 < limit:
+                    end += 2
+                    continue
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif char in "<>":
+                    break
+                end += 1
+            if end - start > _MAX_MARKDOWN_DESTINATION_CHARS:
+                limitations.add("markdown_destination")
+                continue
+            if depth or end == start:
+                continue
+            raw = line[start:end]
+            destination_end = end
+        if opening.group().endswith("("):
+            ending = _MARKDOWN_INLINE_END.match(
+                line, destination_end, min(len(line), destination_end + 512)
+            )
+            if ending is None:
+                if len(line) - destination_end > 512:
+                    limitations.add("markdown_title")
+                continue
+        else:
+            if len(line) - destination_end > 512:
+                limitations.add("markdown_title")
+                continue
+            ending = _MARKDOWN_DEFINITION_END.fullmatch(line, destination_end)
+            # A destination can only be followed by a title, not arbitrary prose.
+            if ending is None:
+                continue
+        consumed_until = ending.end()
+        is_image = opening.group().startswith("![")
+        label = line[opening.start() + 2 : opening.end() - 2] if is_image else ""
+        # Retain main's conservative passive-image grammar even when the
+        # destination parser can recover a more complex literal filename.
+        passive_image = (
+            is_image
+            and not any(char in label for char in "[]\\")
+            and bool(_PASSIVE_IMAGE_DESTINATION.fullmatch(line[opening.end() : consumed_until - 1]))
+        )
+        yield _ReferenceCandidate(
+            _MARKDOWN_STRUCTURAL_ESCAPE.sub(r"\1", raw),
+            start,
+            consumed_until,
+            ReferenceKind.MARKDOWN_IMAGE if is_image else ReferenceKind.MARKDOWN_LINK,
+            opening.start(),
+            passive_image,
+        )
+
+
+def _pattern_candidates(
+    pattern: re.Pattern[str], line: str, kind: ReferenceKind
+) -> Iterator[_ReferenceCandidate]:
+    for match in pattern.finditer(line):
+        yield _ReferenceCandidate(
+            match.group(1), match.start(1), match.end(1), kind, match.start(1)
+        )
 
 
 def _advance_inline_code_state(
@@ -156,20 +277,14 @@ def _candidate_strings(
 ) -> tuple[list[tuple[str, int, int, str, ReferenceKind]], tuple[str, ...]]:
     """Extract path-like strings without materializing all matches or lines.
 
-    Each regular expression contributes at most one pending match to a small
+    Each candidate iterator contributes at most one pending match to a small
     merge heap.  This preserves source ordering while ensuring a dense,
     attacker-controlled line cannot be fully enumerated and sorted before the
     candidate and time ceilings are enforced.
     """
     candidates: list[tuple[str, int, int, str, ReferenceKind]] = []
+    limitations: set[str] = set()
     seen: set[tuple[int, int, str]] = set()
-    patterns = (
-        (_MARKDOWN_IMAGE_DESTINATION, ReferenceKind.MARKDOWN_IMAGE, True),
-        (_MARKDOWN_LINK_DESTINATION, ReferenceKind.MARKDOWN_LINK, True),
-        (_INLINE_CODE_COMMAND_PATH, ReferenceKind.INLINE_COMMAND, False),
-        (_QUOTED_OR_CODE_PATH, ReferenceKind.QUOTED_OR_CODE, False),
-        (_PLAIN_RELATIVE_PATH, ReferenceKind.PLAIN_PATH, False),
-    )
     active_fence: tuple[str, int, int, int] | None = None
     in_html = False
     html_end: re.Pattern[str] | None = None
@@ -225,75 +340,71 @@ def _candidate_strings(
                 in_html = False
                 html_end = None
         cleaned_line = " ".join(line.strip().split())
-        iterators: list[Iterator[re.Match[str]]] = [
-            pattern.finditer(line) for pattern, _, _ in patterns
+        iterators = [
+            _markdown_candidates(line, deadline=deadline, clock=clock, limitations=limitations),
+            _pattern_candidates(_INLINE_CODE_COMMAND_PATH, line, ReferenceKind.INLINE_COMMAND),
+            _pattern_candidates(_QUOTED_OR_CODE_PATH, line, ReferenceKind.QUOTED_OR_CODE),
+            _pattern_candidates(_PLAIN_RELATIVE_PATH, line, ReferenceKind.PLAIN_PATH),
         ]
-        pending: list[tuple[int, int, int, int, re.Match[str]]] = []
+        pending: list[tuple[int, int, _ReferenceCandidate]] = []
         image_label_spans: list[tuple[int, int, str]] = []
+        markdown_destination_span: tuple[int, int] | None = None
         inline_code_cursor = 0
         for pattern_index, iterator in enumerate(iterators):
             match = next(iterator, None)
             if match is not None:
-                _, _, is_markdown = patterns[pattern_index]
-                heapq.heappush(
-                    pending,
-                    (
-                        match.start(0) if is_markdown else match.start(1),
-                        match.start(1),
-                        match.end(1),
-                        pattern_index,
-                        match,
-                    ),
-                )
+                heapq.heappush(pending, (match.syntax_start, pattern_index, match))
             if clock() >= deadline:
                 return candidates, ("runtime",)
         while pending:
             if clock() >= deadline:
                 return candidates, ("runtime",)
-            sort_start, _, _, pattern_index, match = heapq.heappop(pending)
-            _, reference_kind, is_markdown = patterns[pattern_index]
+            sort_start, pattern_index, match = heapq.heappop(pending)
+            reference_kind = match.kind
             if not line_in_fence and not line_is_indented_code and not line_in_html:
                 inline_code_cursor, inline_code_delimiter = _advance_inline_code_state(
-                    line,
-                    sort_start,
-                    inline_code_cursor,
-                    inline_code_delimiter,
+                    line, sort_start, inline_code_cursor, inline_code_delimiter
                 )
             if reference_kind is ReferenceKind.MARKDOWN_IMAGE:
-                label = line[match.start(0) + 2 : match.start(1) - 2]
-                unambiguous_image = not any(char in label for char in "[]\\") and bool(
-                    _PASSIVE_IMAGE_DESTINATION.fullmatch(match.group(1))
-                )
                 if (
                     line_in_fence
                     or line_is_indented_code
                     or line_in_html
                     or inline_code_delimiter is not None
-                    or not unambiguous_image
+                    or not match.passive_image
                 ):
                     reference_kind = ReferenceKind.QUOTED_OR_CODE
-                elif _is_escaped_marker(line, match.start(0)):
+                elif _is_escaped_marker(line, match.syntax_start):
                     reference_kind = ReferenceKind.PLAIN_PATH
-            raw = match.group(1).strip().split(maxsplit=1)[0]
+            raw = match.raw
             if reference_kind is ReferenceKind.MARKDOWN_IMAGE:
-                # Only the same literal target in passive image alt text is
-                # redundant. Visible link labels and command operands can name
-                # independent artifacts whose coverage must still be checked.
-                image_label_spans.append((match.start(0), match.start(1), raw))
+                # Same-target image alt text is redundant; different visible
+                # targets and command operands still require their own records.
+                image_label_spans.append((match.syntax_start, match.start, raw))
             redundant_image_label = reference_kind is ReferenceKind.PLAIN_PATH and any(
-                start <= match.start(1) < end and raw == destination
+                start <= match.start < end and raw == destination
                 for start, end, destination in image_label_spans
             )
-            if not redundant_image_label:
-                key = (line_number, match.start(1), raw)
+            # Markdown candidates sort at their opening marker so their labels
+            # can be classified. Suppress only destination/title text, not an
+            # independent artifact named in a visible link or image label.
+            inside_destination = (
+                pattern_index != 0
+                and markdown_destination_span is not None
+                and markdown_destination_span[0] <= match.start < markdown_destination_span[1]
+            )
+            if pattern_index == 0:
+                markdown_destination_span = (match.start, match.end)
+            if not inside_destination and not redundant_image_label:
+                key = (line_number, match.start, raw)
                 if key not in seen:
                     seen.add(key)
                     candidates.append(
                         (
                             raw,
                             line_number,
-                            match.start(1) + 1,
-                            _evidence(cleaned_line, match.start(1) + 1),
+                            match.start + 1,
+                            _evidence(cleaned_line, match.start + 1),
                             reference_kind,
                         )
                     )
@@ -301,17 +412,7 @@ def _candidate_strings(
                         return candidates, ("raw_candidates",)
             next_match = next(iterators[pattern_index], None)
             if next_match is not None:
-                _, _, next_is_markdown = patterns[pattern_index]
-                heapq.heappush(
-                    pending,
-                    (
-                        next_match.start(0) if next_is_markdown else next_match.start(1),
-                        next_match.start(1),
-                        next_match.end(1),
-                        pattern_index,
-                        next_match,
-                    ),
-                )
+                heapq.heappush(pending, (next_match.syntax_start, pattern_index, next_match))
         if not line_in_fence and not line_is_indented_code and not line_in_html:
             _, inline_code_delimiter = _advance_inline_code_state(
                 line,
@@ -321,17 +422,19 @@ def _candidate_strings(
             )
         if closes_fence:
             active_fence = None
-    return candidates, ()
+    return candidates, tuple(sorted(limitations))
 
 
 def _normalize_candidate(raw: str, source_path: str) -> str | None:
     """Return a contained relative POSIX candidate, or None when unsupported."""
-    raw = unquote(raw.strip().strip("<>"))
+    raw = raw.strip()
     split = urlsplit(raw)
     if split.scheme or split.netloc or raw.startswith(("/", "\\", "#")):
         return None
-    path_part = split.path.replace("\\", "/")
-    if not path_part:
+    # Split URI syntax before decoding so %23/%3F remain filename characters.
+    # Decode exactly once, then apply containment checks to the decoded path.
+    path_part = unquote(split.path).replace("\\", "/")
+    if not path_part or path_part.startswith("/"):
         return None
     if len(path_part) >= 2 and path_part[1] == ":":
         return None
@@ -410,7 +513,7 @@ def resolve_bundle_references_with_metadata(
                 resolved_target = target
                 status = "resolved"
                 disposition = ArtifactDisposition.ANALYZED
-            elif "/" not in raw.replace("\\", "/"):
+            elif "/" not in unquote(raw).replace("\\", "/"):
                 matches = basename_index.get(PurePosixPath(target).name, [])
                 if len(matches) == 1:
                     resolved_target = matches[0]
