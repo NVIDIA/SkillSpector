@@ -132,6 +132,81 @@ class TestCredentialExfiltration:
         )
         assert "TT3" not in _rule_ids(_run(code))
 
+    @pytest.mark.parametrize(
+        ("replacement", "call"),
+        [
+            ("send = lambda value: value", "send(None)"),
+            ("def send(value):\n    return value", "send(None)"),
+            ("from math import fabs as send", "send(1)"),
+            ("class send:\n    pass", "send()"),
+        ],
+        ids=["assignment", "redefinition", "import", "class"],
+    )
+    def test_rebound_function_name_does_not_call_stale_definition(self, replacement, call):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            f"{replacement}\n"
+            f"{call}\n"
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_function_rebound_in_both_branches_is_not_restored_at_join(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "if condition:\n"
+            "    send = lambda value: value\n"
+            "else:\n"
+            "    send = lambda value: value\n"
+            "send(None)\n"
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_function_may_survive_rebinding_in_one_branch(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "if condition:\n"
+            "    send = lambda: None\n"
+            "send()\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_alias_survives_original_name_rebinding(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "alias = send\n"
+            "send = lambda: None\n"
+            "alias()\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_call_before_rebinding_still_analyzes_definition(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "send()\n"
+            "send = lambda value: value\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
     def test_multiple_function_calls_track_each_global_binding(self):
         code = (
             "import importlib, os\n"

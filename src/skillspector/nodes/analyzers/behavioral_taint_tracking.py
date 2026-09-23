@@ -319,6 +319,7 @@ def _constant_string(node: ast.expr, *, depth: int = 0) -> str | None:
 class _ReflectiveScope:
     modules: dict[str, str] = field(default_factory=dict)
     callables: dict[str, str] = field(default_factory=dict)
+    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = field(default_factory=dict)
     shadowed: set[str] = field(default_factory=set)
     global_names: set[str] = field(default_factory=set)
     nonlocal_names: set[str] = field(default_factory=set)
@@ -327,6 +328,7 @@ class _ReflectiveScope:
         return _ReflectiveScope(
             modules=dict(self.modules),
             callables=dict(self.callables),
+            functions=dict(self.functions),
             shadowed=set(self.shadowed),
             global_names=set(self.global_names),
             nonlocal_names=set(self.nonlocal_names),
@@ -427,7 +429,6 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
     def __init__(self) -> None:
         self.scopes = [_ReflectiveScope()]
         self.call_sinks: dict[ast.Call, str] = {}
-        self.functions: list[dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
         self.active_functions: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
         self.called_functions: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
 
@@ -440,6 +441,14 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             values = scope.modules if kind == "module" else scope.callables
             if name in values:
                 return values[name]
+            if name in scope.shadowed:
+                return None
+        return None
+
+    def _lookup_function(self, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        for scope in reversed(self.scopes):
+            if name in scope.functions:
+                return scope.functions[name]
             if name in scope.shadowed:
                 return None
         return None
@@ -497,6 +506,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             scope.shadowed.add(name)
             scope.modules.pop(name, None)
             scope.callables.pop(name, None)
+            scope.functions.pop(name, None)
 
     def _set_binding(self, kind: str, name: str, value: str) -> None:
         scope = self._binding_scope(name)
@@ -508,6 +518,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         names = self._target_names(targets)
         module = self._dynamic_module_name(value)
         canonical = self._reflective_callable(value)
+        function = self._lookup_function(value.id) if isinstance(value, ast.Name) else None
 
         self._shadow_names(names)
         if module is not None:
@@ -517,6 +528,10 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         if canonical is not None:
             for name in names:
                 self._set_binding("callable", name, canonical)
+            return
+        if function is not None:
+            for name in names:
+                self._binding_scope(name).functions[name] = function
 
     def _reflective_callable(self, value: ast.expr) -> str | None:
         if (
@@ -578,17 +593,14 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             sink = self._lookup("callable", node.func.id)
             if sink is not None:
                 self.call_sinks[node] = sink
-            for functions in reversed(self.functions):
-                function = functions.get(node.func.id)
-                if function is not None:
-                    if function not in self.active_functions:
-                        self.called_functions.add(function)
-                        self.active_functions.add(function)
-                        snapshot = [scope.clone() for scope in self.scopes]
-                        self._analyze_function(function)
-                        self.scopes = snapshot
-                        self.active_functions.remove(function)
-                    break
+            function = self._lookup_function(node.func.id)
+            if function is not None and function not in self.active_functions:
+                self.called_functions.add(function)
+                self.active_functions.add(function)
+                snapshot = [scope.clone() for scope in self.scopes]
+                self._analyze_function(function)
+                self.scopes = snapshot
+                self.active_functions.remove(function)
         else:
             sink = self._reflective_callable(node.func)
             if sink is not None:
@@ -682,11 +694,13 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._prepare_function(node)
         self._shadow_names([node.name])
+        self._binding_scope(node.name).functions[node.name] = node
         self._analyze_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._prepare_function(node)
         self._shadow_names([node.name])
+        self._binding_scope(node.name).functions[node.name] = node
         self._analyze_function(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
@@ -753,6 +767,19 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         merged.shadowed.update(all_names)
         merged.shadowed.update(merged.modules)
         merged.shadowed.update(merged.callables)
+        for name in set(base.functions) | set(left.functions) | set(right.functions):
+            left_function = left.functions.get(name)
+            right_function = right.functions.get(name)
+            if left_function is not None and (
+                right_function is None or left_function is right_function
+            ):
+                merged.functions[name] = left_function
+            elif right_function is not None and left_function is None:
+                merged.functions[name] = right_function
+            else:
+                merged.functions.pop(name, None)
+                merged.shadowed.add(name)
+        merged.shadowed.update(merged.functions)
         return merged
 
     def visit_If(self, node: ast.If) -> None:
@@ -854,12 +881,11 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
 
     def _visit_statements(self, statements: list[ast.stmt]) -> None:
         deferred: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-        self.functions.append({})
         for statement in statements:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self._prepare_function(statement)
                 self._shadow_names([statement.name])
-                self.functions[-1][statement.name] = statement
+                self._binding_scope(statement.name).functions[statement.name] = statement
                 deferred.append(statement)
                 continue
             if isinstance(statement, ast.ClassDef):
@@ -867,12 +893,13 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
                 continue
             self.visit(statement)
         for function in deferred:
-            if function in self.called_functions:
+            if function in self.called_functions or not any(
+                function in scope.functions.values() for scope in self.scopes
+            ):
                 continue
             outer_scopes = [scope.clone() for scope in self.scopes]
             self._analyze_function(function)
             self.scopes = outer_scopes
-        self.functions.pop()
 
     def visit_Module(self, node: ast.Module) -> None:
         self._visit_statements(node.body)
