@@ -101,6 +101,7 @@ FILE_TYPES: dict[str, str] = {
     ".js": "javascript",
     ".ts": "typescript",
     ".rb": "ruby",
+    ".pl": "perl",
     ".go": "go",
     ".rs": "rust",
 }

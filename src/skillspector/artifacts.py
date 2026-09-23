@@ -331,6 +331,14 @@ _OBFUSCATED_ACTION_START_PATTERN = re.compile(
 _LOGICAL_LINE_BREAK_CHARACTERS = frozenset(
     {"\r", "\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"}
 )
+_MULTILINE_PROMPT_SPACING_PAIR = re.compile(
+    r"(?<!\w)[^\W\d_]"
+    r"(?:[^\S\r\n\v\f\x1c-\x1e\x85\u2028\u2029]*"
+    r"(?:\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029])"
+    r"[^\S\r\n\v\f\x1c-\x1e\x85\u2028\u2029]*"
+    r"|[^\S\r\n\v\f\x1c-\x1e\x85\u2028\u2029])"
+    r"[^\W\d_](?!\w)"
+)
 _REMOVE_ALLOWED_FORMAT_CHARACTERS = str.maketrans("", "", "".join(_ALLOWED_FORMAT_CHARS))
 
 
@@ -1994,6 +2002,66 @@ def prompt_injection_letter_spacing_view(
         output.getvalue(),
         offsets,
         tuple(reconstructions),
+    )
+
+
+def multiline_prompt_injection_view(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+) -> SecurityTextView:
+    """Project isolated letter lines for ambiguity detection, never classification.
+
+    One logical line break (optionally indented), or one horizontal space,
+    between alphabetic singleton tokens is removed. Paragraphs, list markers,
+    code punctuation, ordinary words and wider word gaps remain intact. Raw offsets and
+    removed-gap provenance let artifact-integrity attribute an unresolved
+    P3/P4-shaped instruction without treating this as semantic reconstruction.
+    """
+    if check_runtime is not None:
+        check_runtime()
+    match = _MULTILINE_PROMPT_SPACING_PAIR.search(text)
+    if match is None:
+        return SecurityTextView("multiline-prompt-spacing", text)
+
+    output = StringIO()
+    offsets = array("I")
+    reconstructions: list[SecurityTextReconstruction] = []
+    cursor = 0
+    checked_offset = 0
+
+    def record_work(source_offset: int) -> None:
+        nonlocal checked_offset
+        if check_runtime is not None and source_offset - checked_offset >= 4096:
+            check_runtime()
+            checked_offset = source_offset
+
+    def append_source(start: int, end: int) -> None:
+        for source_offset in range(start, end):
+            record_work(source_offset)
+            output.write(text[source_offset])
+            offsets.append(source_offset)
+
+    while match is not None:
+        run_start = match.start()
+        append_source(cursor, run_start)
+        derived_start = len(offsets)
+        output.write(text[run_start])
+        offsets.append(run_start)
+        while match is not None:
+            last_letter = match.end() - 1
+            record_work(last_letter)
+            output.write(text[last_letter])
+            offsets.append(last_letter)
+            match = _MULTILINE_PROMPT_SPACING_PAIR.match(text, last_letter)
+        cursor = last_letter + 1
+        reconstructions.append(
+            SecurityTextReconstruction(derived_start, len(offsets), run_start, cursor)
+        )
+        match = _MULTILINE_PROMPT_SPACING_PAIR.search(text, cursor)
+
+    append_source(cursor, len(text))
+    return SecurityTextView(
+        "multiline-prompt-spacing", output.getvalue(), offsets, tuple(reconstructions)
     )
 
 
