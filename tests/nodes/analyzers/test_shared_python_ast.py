@@ -60,9 +60,9 @@ def test_preparsed_python_is_reused_by_all_ast_analyzers(tmp_path, monkeypatch) 
     """One scan parses each eligible Python file once before analyzer fan-out."""
     (tmp_path / "script.py").write_text(
         "import os\n"
-        "import subprocess\n"
         "payload = input()\n"
         "environment = os.environ.copy()\n"
+        "import subprocess\n"
         "enabled = True\n"
         "subprocess.run(output, shell=enabled)\n"
         "exec(payload)\n",

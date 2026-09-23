@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from skillspector.nodes.analyzers import static_patterns_tool_misuse as tm_module
+from skillspector.nodes.analyzers import static_python_shell_truthiness as python_tm_module
 from skillspector.nodes.deduplicate import deduplicate
 
 
@@ -17,6 +18,10 @@ def _run(content: str, path: str = "run.py") -> dict:
 
 def _tm1(content: str, path: str = "run.py") -> list:
     return [finding for finding in _run(content, path)["findings"] if finding.rule_id == "TM1"]
+
+
+def _tm1_ast(content: str, path: str = "run.py") -> list:
+    return python_tm_module.analyze(content, path, "python")
 
 
 @pytest.mark.parametrize(
@@ -127,8 +132,8 @@ def test_explicit_import_reestablishes_direct_receivers() -> None:
         len(
             _tm1(
                 "subprocess = Proxy()\n"
-                "import subprocess\n"
                 "Popen = Proxy()\n"
+                "import subprocess\n"
                 "from subprocess import Popen\n"
                 "enabled = True\n"
                 "subprocess.run('/usr/bin/true', shell=enabled)\n"
@@ -352,6 +357,79 @@ def test_later_argument_effect_invalidates_receiver_for_called_function() -> Non
     assert [finding.start_line for finding in findings] == [4]
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("replace_subprocess()", id="expression"),
+        pytest.param("result = replace_subprocess()", id="assignment"),
+        pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),
+    ],
+)
+def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        f"{statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("replace_subprocess()", id="expression"),
+        pytest.param("result = replace_subprocess()", id="assignment"),
+        pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),
+    ],
+)
+def test_generic_call_invalidates_receiver_trust_for_called_function(statement: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{statement}\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(
+            "subprocess.run('/usr/bin/true', shell=enabled)",
+            id="expression",
+        ),
+        pytest.param(
+            "result = subprocess.run('/usr/bin/true', shell=enabled)",
+            id="assignment",
+        ),
+        pytest.param(
+            "result: object = subprocess.run('/usr/bin/true', shell=enabled)",
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_direct_subprocess_call_remains_detected(statement: str) -> None:
+    findings = _tm1_ast(
+        "import subprocess\n"
+        "def execute():\n"
+        "    later_enabled = True\n"
+        "    subprocess.run('/usr/bin/true', shell=later_enabled)\n"
+        "enabled = True\n"
+        f"{statement}\n"
+        "execute()\n"
+    )
+
+    assert [finding.location.start_line for finding in findings] == [4, 6]
+
+
 def test_unsupported_assignment_clears_existing_facts() -> None:
     assert not _tm1("enabled = True\nresult = factory()\nsubprocess.run(cmd, shell=enabled)\n")
 
@@ -394,13 +472,13 @@ def test_external_name_store_treats_prior_binding_as_finalizer_capable() -> None
 
 def test_protocol_consuming_direct_call_invalidates_later_truth_fact() -> None:
     findings = _tm1(
-        "import subprocess\n"
         "class MutatingArgs:\n"
         "    def __iter__(self):\n"
         "        global enabled\n"
         "        enabled = False\n"
         "        return iter(('/usr/bin/true',))\n"
         "mutator = MutatingArgs()\n"
+        "import subprocess\n"
         "enabled = True\n"
         "subprocess.run(mutator, shell=enabled)\n"
         "subprocess.run('/usr/bin/true', shell=enabled)\n"

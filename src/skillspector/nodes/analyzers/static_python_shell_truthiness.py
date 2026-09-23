@@ -584,13 +584,11 @@ def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None
     value = (
         statement.value if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign)) else None
     )
-    if (
-        isinstance(value, ast.Call)
-        and _is_direct_subprocess_call(value, trusted_names)
-        and not _call_arguments_are_passive(value)
-    ):
-        trusted_names.clear()
-        return
+    if isinstance(value, ast.Call):
+        direct_subprocess_call = _is_direct_subprocess_call(value, trusted_names)
+        if not direct_subprocess_call or not _call_arguments_are_passive(value):
+            trusted_names.clear()
+            return
     if isinstance(statement, (ast.Import, ast.ImportFrom)):
         _update_trusted_names_from_import(statement, trusted_names)
         return
@@ -689,11 +687,11 @@ class _Analyzer:
         )
         result_is_finalizer_safe = _is_finalizer_safe_value(value, finalizer_safe_names)
         call_has_protocol_effects = False
-        effectful_direct_call = False
+        effectful_call = isinstance(value, ast.Call)
         if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
             resolved = None
             safe_value = _call_arguments_are_passive(value)
-            effectful_direct_call = not safe_value
+            effectful_call = not safe_value
             if _shell_argument_is_captured_before_effects(value):
                 self._inspect_call(value, facts)
             if safe_value:
@@ -711,7 +709,7 @@ class _Analyzer:
             for target in targets:
                 if isinstance(target, ast.Name):
                     bound_names.add(target.id)
-            if effectful_direct_call:
+            if effectful_call:
                 trusted_names.clear()
             else:
                 trusted_names.difference_update(
@@ -834,16 +832,16 @@ class _Analyzer:
                 )
             elif isinstance(statement, ast.AnnAssign):
                 value = statement.value
-                effectful_direct_call = False
+                effectful_call = isinstance(value, ast.Call)
                 if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
                     if _shell_argument_is_captured_before_effects(value):
                         self._inspect_call(value, facts)
-                    effectful_direct_call = not _call_arguments_are_passive(value)
+                    effectful_call = not _call_arguments_are_passive(value)
                 facts.clear()
                 finalizer_safe_names.clear()
                 if value is not None:
                     bound_names.update(_direct_bound_names(statement))
-                if effectful_direct_call:
+                if effectful_call:
                     trusted_names.clear()
                 else:
                     trusted_names.difference_update(
@@ -868,12 +866,7 @@ class _Analyzer:
                 else:
                     facts.clear()
                     finalizer_safe_names.clear()
-                    if direct_call:
-                        trusted_names.clear()
-                    else:
-                        trusted_names.difference_update(
-                            _changed_direct_names([call], trusted_names)
-                        )
+                    trusted_names.clear()
             elif isinstance(statement, ast.Pass) or (
                 isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
             ):
