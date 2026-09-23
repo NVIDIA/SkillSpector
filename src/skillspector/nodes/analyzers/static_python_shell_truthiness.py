@@ -745,11 +745,7 @@ class _Analyzer:
     def _record_bound_shell_call(self, call: ast.Call, trusted_names: set[str]) -> None:
         """Record whether the companion owns one supported bound-shell call."""
         shell = next((item.value for item in call.keywords if item.arg == "shell"), None)
-        if (
-            not _is_direct_subprocess_syntax(call)
-            or not isinstance(shell, ast.Name)
-            or shell.id.casefold().startswith("true")
-        ):
+        if not _is_direct_subprocess_syntax(call) or not isinstance(shell, ast.Name):
             return
         self.bound_shell_call_ownership[_bound_shell_call_key(call)] = bool(
             _is_direct_subprocess_call(call, trusted_names)

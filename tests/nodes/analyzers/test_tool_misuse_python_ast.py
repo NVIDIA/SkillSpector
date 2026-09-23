@@ -691,16 +691,94 @@ def test_true_prefixed_identifier_has_one_lexical_owner() -> None:
     assert len(findings) == 1
 
 
+@pytest.mark.parametrize("name", ["true", "TRUE", "TrUe"])
+def test_case_variant_true_has_one_direct_owner(name: str) -> None:
+    findings = _tm1(f"{name} = True\nsubprocess.run(command, shell={name})\n")
+
+    assert len(findings) == 1
+    assert findings[0].start_line == 2
+    assert not findings[0].evidence
+
+
 def test_true_prefixed_closure_has_one_lexical_owner() -> None:
     findings = _tm1(
-        "def outer():\n"
-        "    true_value = True\n"
-        "    def inner():\n"
-        "        subprocess.run(command, shell=true_value)\n"
+        "true_value = True\n"
+        "def inner():\n"
+        "    # one\n"
+        "    # two\n"
+        "    # three\n"
+        "    subprocess.run(command, shell=true_value)\n"
     )
 
     assert len(findings) == 1
-    assert findings[0].start_line == 4
+    assert findings[0].start_line == 6
+    snippet = str(findings[0].to_dict()["code_snippet"])
+    assert "subprocess.run" in snippet
+    assert "true_value = True" not in snippet
+    assert findings[0].severity == "HIGH"
+    assert findings[0].confidence == pytest.approx(0.9)
+
+
+def test_normalized_prefix_does_not_restore_invalidated_true_prefixed_call() -> None:
+    assert not _tm1(
+        "true_value = True\n"
+        "def inner():\n"
+        "    ﬀ; subprocess.run(command, shell=true_value)\n"
+        "replace_subprocess()\n"
+        "inner()\n"
+    )
+
+
+def test_normalized_prefix_does_not_duplicate_true_direct_fallback() -> None:
+    findings = _tm1("true = True\nﬀ; subprocess.run(command, shell=true)\n")
+
+    assert len(findings) == 1
+    assert (findings[0].start_line, findings[0].start_column) == (2, 3)
+    assert not findings[0].evidence
+
+
+@pytest.mark.parametrize(
+    "call_line",
+    [
+        "subprocess.run(command, shell=true); "
+        "[subprocess.run(command, shell=true) for item in items]",
+        "[subprocess.run(command, shell=true) for item in items]; "
+        "subprocess.run(command, shell=true)",
+    ],
+)
+def test_true_direct_calls_on_one_line_keep_distinct_locations(call_line: str) -> None:
+    findings = _tm1(f"true = True\n{call_line}\n")
+    expected_columns = [
+        index for index in range(len(call_line)) if call_line.startswith("subprocess.run", index)
+    ]
+
+    assert len(findings) == 2
+    assert sorted(finding.start_column for finding in findings) == expected_columns
+
+
+def test_true_direct_ownership_invalidation_is_per_call() -> None:
+    findings = _tm1(
+        "true = True\n"
+        "subprocess.run(command, shell=true)\n"
+        "replace_subprocess()\n"
+        "subprocess.run(command, shell=true)\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [2]
+
+
+@pytest.mark.parametrize(
+    ("path", "suffix"),
+    [
+        pytest.param("run.py", "if:\n", id="malformed-python"),
+        pytest.param("run.js", "", id="non-python"),
+    ],
+)
+def test_true_direct_fallback_survives_without_ast_ownership(path: str, suffix: str) -> None:
+    findings = _tm1(f"true = True\nsubprocess.run(command, shell=true)\n{suffix}", path)
+
+    assert len(findings) == 1
+    assert not findings[0].evidence
 
 
 @pytest.mark.parametrize(
@@ -766,10 +844,12 @@ def test_malformed_python_keeps_bounded_lexical_fallback() -> None:
     assert "_tm1_variable_shell_flag" not in findings[0].evidence
 
 
+@pytest.mark.parametrize("name", ["enabled", "true"])
 def test_oversized_python_keeps_bounded_lexical_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    name: str,
 ) -> None:
-    content = "enabled = True\nsubprocess.run(command, shell=enabled)\n" + "# padding\n" * 20
+    content = f"{name} = True\nsubprocess.run(command, shell={name})\n" + "# padding\n" * 20
     monkeypatch.setattr(tm_module.static_runner, "MAX_FILE_CHARS", 80)
 
     findings = _tm1(content)

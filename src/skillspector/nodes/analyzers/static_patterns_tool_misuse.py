@@ -53,6 +53,8 @@ ANALYZER_ID = "static_patterns_tool_misuse"
 ANALYZE_USES_POSTPROCESS = True
 POSTPROCESS_USES_PYTHON_AST = True
 _VARIABLE_SHELL_FLAG_EVIDENCE = "_tm1_variable_shell_flag"
+_TRUE_SHELL_DIRECT_EVIDENCE = "_tm1_true_shell_direct"
+_TRUE_SHELL_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*true", re.IGNORECASE)
 
 _SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
 _SHELL_COMMAND_WORD_CHARS = 4096
@@ -2973,7 +2975,7 @@ def analyze(
         return get_context(content, start)
 
     tag = [PatternCategory.TOOL_MISUSE.value]
-    tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
+    tm1_findings_by_key: dict[tuple[int, str, int], AnalyzerFinding] = {}
 
     variable_matches = {
         (match.start(), match.end()): (match.group(1), match)
@@ -2992,6 +2994,10 @@ def analyze(
 
     for match_start, match_end, matched_text, confidence in _tm1_candidates(content):
         variable_match = variable_matches.get((match_start, match_end))
+        if variable_match is not None and variable_match[0].casefold().startswith("true"):
+            # The case-insensitive direct ``shell=True`` pattern already owns
+            # true-prefixed names at the exact call location.
+            continue
         if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
             continue
         line_num = get_line_number(content, match_start)
@@ -3006,7 +3012,7 @@ def analyze(
             confidence,
             file_type,
         )
-        candidate_key = (line_num, " ".join(matched.strip().split()))
+        candidate_key = (line_num, " ".join(matched.strip().split()), match_start)
         existing = tm1_findings_by_key.get(candidate_key)
         if existing is not None:
             if adj > existing.confidence:
@@ -3016,6 +3022,8 @@ def analyze(
         evidence: dict[str, object] = {static_runner._VIEW_START_EVIDENCE: match_start}
         if variable_match is not None and defer_variable_reconciliation:
             evidence[_VARIABLE_SHELL_FLAG_EVIDENCE] = variable_match[0]
+        elif defer_variable_reconciliation and _TRUE_SHELL_ARGUMENT_RE.search(matched_text):
+            evidence[_TRUE_SHELL_DIRECT_EVIDENCE] = True
         finding = AnalyzerFinding(
             rule_id="TM1",
             message="Tool Parameter Abuse",
@@ -3115,6 +3123,7 @@ def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
     """Remove private reconciliation evidence when postprocessing times out."""
     for finding in findings:
         finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+        finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
     return findings
 
 
@@ -3129,6 +3138,7 @@ def postprocess_path_findings(
         finding
         for finding in findings
         if isinstance(finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+        or finding.evidence.get(_TRUE_SHELL_DIRECT_EVIDENCE) is True
     ]
     if not marked:
         return findings
@@ -3136,10 +3146,13 @@ def postprocess_path_findings(
     file_path = marked[0].file
     file_type = static_runner._infer_file_type(file_path)
     if file_type != "python":
-        marked_ids = {id(finding) for finding in marked}
-        for finding in marked:
-            finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
-        return [finding for finding in findings if id(finding) not in marked_ids]
+        reconciled: list[Finding] = []
+        for finding in findings:
+            variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+            finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+            if not isinstance(variable_name, str):
+                reconciled.append(finding)
+        return reconciled
     if python_ast is None or python_ast.tree is None:
         return cleanup_path_findings(findings)
 
@@ -3161,10 +3174,22 @@ def postprocess_path_findings(
         file_path,
         python_ast,
     )
+    ownership_by_start = {
+        (line, column): trusted
+        for (line, byte_column, _, _), trusted in ownership.items()
+        if (column := python_ast.character_column(line, byte_column)) is not None
+    }
 
     reconciled: list[Finding] = []
     for finding in findings:
         variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+        direct_true = finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+        if direct_true is True:
+            location = (finding.start_line, finding.start_column)
+            if finding.start_column is not None and ownership_by_start.get(location) is False:
+                continue
+            reconciled.append(finding)
+            continue
         if not isinstance(variable_name, str):
             reconciled.append(finding)
             continue
