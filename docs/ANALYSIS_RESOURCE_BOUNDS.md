@@ -95,6 +95,60 @@ metrics, incomplete-scan recommendation, and `--fail-on-incomplete` behavior unc
 an image-only limitation may report LOW severity while still recommending `CAUTION` because
 the scan remains incomplete.
 
+### Diagnosing incomplete referenced artifacts
+
+AE1 uses the check name **Incomplete referenced artifact analysis**. Its location
+is the reference in the source document. The affected file appears separately in
+`evidence.target_path`, with its final `target_disposition` and up to 16 distinct
+reason records. Each reason identifies the canonical `reason_code`, message,
+phase, and analyzer; target line numbers and observed/limit values appear when
+the ledger provides them. `reasons_truncated: true` means this finding contains
+only a subset of the reasons. Review the target's entries in
+`analysis_completeness.ledger_exceptions`, including any output-limit records,
+before deciding how to resolve the failure.
+
+Two references to the same partially inspected helper can produce two AE1
+locations. They identify one affected artifact, rather than demonstrating two
+independent vulnerabilities. Incomplete analysis alone also does not establish
+malicious evasion. Keep required references and use the reason to choose the fix:
+
+| Reason | Next step |
+|---|---|
+| `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
+| `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
+| `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
+| `binary_content`, `opaque_content` | Provide inspectable source or analysis support for the referenced format. |
+
+The finding and incomplete-analysis gates remain active until the relevant
+limitations are resolved. Evidence fields are diagnostic facts, not suppression
+instructions.
+
+### Perl literal help text
+
+For `.pl` source, the tool-misuse analyzer recognizes a narrow form of standalone
+`print`: an ordinary, single-line, non-interpolated quoted literal, optionally
+with `STDOUT`/`STDERR` or parentheses. For example:
+
+```perl
+print "Use rm to remove a project\n";
+```
+
+LF and CRLF line endings, including a trailing comment, are supported while
+source offsets are preserved. Line breaks inside the quoted literal remain
+outside this recognized form.
+
+When complete surrounding source proves those quote boundaries, the analyzer
+keeps the literal's payload visible while distinguishing Perl delimiters from
+shell delimiters. This prevents ordinary help text from creating a false shell
+parse limit. Printed dangerous commands still receive security checks, and Perl
+retains the existing prompt-injection and supply-chain checks.
+
+This is bounded recognition, not a general Perl parser. Ambiguous quoting,
+interpolation, quote operators such as `qx`, quote-like special variables,
+legacy package separators, incomplete fragments, and real parser limits remain
+on the conservative analysis path. A complex helper may therefore still need
+its particular ledger reason and expression reviewed.
+
 ## Structured skill data
 
 AISOP/AISP structured extraction consumes the already-bounded cache and shares the enclosing
