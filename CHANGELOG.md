@@ -1,5 +1,9 @@
 ### 2.12.0 (Unreleased)
 ### Features/Bug Fixes
+* fix(security): retain incomplete coverage for runtime-selected commands and remeasure active Git clones strictly (#514)
+* fix(scan): preserve required-input failures and multiline prompt uncertainty (#563)
+* fix(analyzer): preserve Perl print literal ownership and explain referenced-artifact limitations (#615)
+* fix(references): preserve complete bounded Markdown destinations and URI semantics (#553)
 * fix(analyzer): distinguish narrowly verified passive PNG references from active opaque targets in AE1 (#597)
 * fix(yara): require a word boundary for ROP exploit-framework matches (#607)
 * fix(analyzers): report registry load failures as incomplete coverage (#591)

@@ -8,8 +8,12 @@ SkillSpector 2.12.0 adds an opt-in CLI gate for any active finding, a configurab
 
 The latest additions include sanitized LLM provenance, SC10 dependency-source analysis, GitHub tree-directory inputs, opt-in compact prompt numbering, expanded model-budget metadata, fail-closed recursive reporting, and occurrence-specific JSON/SARIF columns. Further detection and coverage fixes distinguish narrow passive-image cases from active or unknown opaque content without treating uninspected bytes as safe.
 
+The candidate also includes the previously pending Markdown-reference and runtime-command completeness fixes, required-input and multiline-prompt accounting, and conservative Perl literal handling with clearer referenced-artifact diagnostics.
+
 ## Highlights
 
+- Preserve fatal outcomes for recognized unsupported required input and incomplete coverage for bounded runtime-command and multiline-prompt reconstruction.
+- Resolve complete Markdown reference destinations without losing URI or source ownership, and distinguish proven Perl print literals from ambiguous source.
 - Record sanitized LLM configuration/execution provenance and preserve occurrence-specific locations in JSON and SARIF.
 - Detect dependency-source redirection with SC10 and retain recursive failure, risk, and completeness evidence even when reports are bounded.
 - Scan selected GitHub tree subdirectories, optionally compact prompt line labels, and use expanded OpenAI/Azure model-budget metadata.
@@ -62,6 +66,14 @@ The latest additions include sanitized LLM provenance, SC10 dependency-source an
 
 ## Fixed
 
+- Preserve incomplete coverage for runtime-selected `printf` and executable wrappers, bounded `eval`/shell `-c` strings, shell commands embedded in PowerShell, unsupported brace expansion, and commands crossing analysis windows. Parser and deadline uncertainty remains visible through `static_parse_limit` and CLI/MCP completeness gates even when semantic analysis succeeds. Literal/documentation controls remain distinct; this is bounded analysis, not general shell emulation ([#514](https://github.com/NVIDIA/SkillSpector/pull/514)).
+- Tolerate transiently missing `.git` metadata only while a clone is active, then strictly remeasure the completed checkout. Permission errors, checkout failures, and final ingestion limits still fail closed ([#514](https://github.com/NVIDIA/SkillSpector/pull/514)).
+- Record fatal `unsupported_primary_content` for recognized unsupported selected inputs and in-profile `SKILL.md`/`skill.md` instructions, including nested or renamed ZIP members. Preserve required-file identity, reject lossy required UTF-8 decoding, retain canonical bytes, and omit rejected primary text from provider input. Supported ZIP inspection and incidental-asset policy remain bounded and unchanged; a valid UTF-8 code point cut by a recorded byte limit remains partial rather than an unsupported-encoding failure ([#563](https://github.com/NVIDIA/SkillSpector/pull/563)).
+- Retain failed artifact outcomes and excluded-executable evidence even when detailed ledger output is truncated or manifest parsing also fails. Fatal required-content failures remain execution failures rather than being downgraded to partial coverage ([#563](https://github.com/NVIDIA/SkillSpector/pull/563)).
+- Account for covered pure or mixed singleton newline/horizontal spacing with source-preserving AE6 and `obfuscated_instruction_text` partial evidence. The projection preserves structural boundaries and uses interruptible, workflow-bounded matching; it does not manufacture a confirmed P3/P4 finding or claim universal deobfuscation ([#563](https://github.com/NVIDIA/SkillSpector/pull/563)).
+- Parse bounded inline and reference-definition Markdown destinations with angle-wrapped spaces, balanced/escaped parentheses, and quoted titles. Split URI components before one-time decoding, preserve decoded containment and reference ownership, retain genuine missing targets, and report destination/title limit exhaustion as incomplete analysis. Title text is not reinterpreted as an extra reference ([#553](https://github.com/NVIDIA/SkillSpector/pull/553)).
+- Classify `.pl` as Perl while retaining its existing security checks, and avoid false shell-parse-limit AE1 for narrowly proven standalone non-interpolated print literals. Printed content still receives security analysis; interpolation, quote-like syntax, heredocs, ambiguous fragments, and genuine limits remain conservative ([#615](https://github.com/NVIDIA/SkillSpector/pull/615)).
+- Explain AE1 referenced-artifact failures with bounded, sanitized target disposition and canonical reason evidence, including truncation metadata and reason-specific remediation. Guidance preserves required references rather than suggesting their removal ([#615](https://github.com/NVIDIA/SkillSpector/pull/615)).
 - Recursive and transitive scans retain failed-child, risk, completeness, and omission evidence when output or ledger budgets omit detailed bodies. Recursive Markdown stdout includes child report sections without requiring `--output`. Actual execution failures return exit 2; bounded static path postprocessing shares analysis budgets and preserves syntax/coverage limitations ([#576](https://github.com/NVIDIA/SkillSpector/pull/576)).
 - Analyzer import/registry-load failures produce SYSTEM/PARTIAL ledger evidence with reason `analyzer_load_error`, so a missing analyzer cannot silently yield complete coverage. This remains a coverage gap rather than an execution crash ([#591](https://github.com/NVIDIA/SkillSpector/pull/591)).
 - Suppress AE1 only for narrowly verified passive rendered Markdown-image references to structurally valid minimal non-interlaced PNG data when the only limitations are unsupported binary/opaque format. Incomplete coverage, `CAUTION`, strict incomplete gates, and MCP installation blocking remain. Other uses of resolved targets, malformed or non-PNG content, concealed payloads, and mixed/unknown limitations retain AE1. DEX and Lua bytecode signatures are also recognized as binary/executable content ([#597](https://github.com/NVIDIA/SkillSpector/pull/597)).
@@ -88,7 +100,7 @@ The latest additions include sanitized LLM provenance, SC10 dependency-source an
 - Bound JSON quote traversal without repeatedly scanning overlapping suffixes ([#521](https://github.com/NVIDIA/SkillSpector/pull/521)).
 - Emit a HIGH AE7 analysis-evasion finding for per-file size limits that leave an artifact partially inspected, unless AE1 already covers that path. Supply a bounded text prefix and an explicit unreviewed-region marker to enabled LLM analysis; the unread region remains incomplete ([#509](https://github.com/NVIDIA/SkillSpector/pull/509)).
 - Preserve full-evidence fingerprints, concrete YARA rule identity, and precise occurrence locations through projection, deduplication, and report compaction. Separate findings are retained while duplicate projections of the same occurrence are collapsed ([#409](https://github.com/NVIDIA/SkillSpector/pull/409)).
-- Add bounded reconstruction for letter-spaced P3/P4 prompt instructions, retain source evidence, and use AE6 as an incomplete-coverage fallback for some ambiguous reconstructions. Some alternating-width short runs can evade both P3/P4 and AE6 (see Known Limitations) ([#470](https://github.com/NVIDIA/SkillSpector/pull/470)).
+- Add bounded reconstruction for letter-spaced P3/P4 prompt instructions, retain source evidence, and use AE6 as an incomplete-coverage fallback for covered ambiguous reconstructions; the later multiline work extends this accounting without making it a universal decoder ([#470](https://github.com/NVIDIA/SkillSpector/pull/470), [#563](https://github.com/NVIDIA/SkillSpector/pull/563)).
 - Discover skills inside dot-prefixed directories, retain inherited local-only restrictions for child skills, and partition transitive scan caching by those privacy restrictions ([#410](https://github.com/NVIDIA/SkillSpector/pull/410)).
 - Preserve incomplete discovery and requested semantic-analysis failures, including unavailable providers and mixed success/failure telemetry, instead of allowing a complete scan result ([#410](https://github.com/NVIDIA/SkillSpector/pull/410)).
 - Emit recursive JSON reports to standard output when no output path is provided ([#467](https://github.com/NVIDIA/SkillSpector/pull/467)).
@@ -108,6 +120,7 @@ The latest additions include sanitized LLM provenance, SC10 dependency-source an
 
 ## Security
 
+- Recognized unsupported required bytes produce failed execution and CLI exit 2, while covered unresolved reconstruction produces partial coverage, an incomplete-report caveat, and MCP installation blocking. Successful semantic analysis or truncated ledger details do not erase those outcomes.
 - Dependency-source SC10 findings remain authoritative through optional LLM filtering; intentional private endpoints are still policy-visible and require review. Nested report evidence and provenance use credential sanitization.
 - Registry-load failures, recursive omissions/failures, and description-analysis budget exhaustion remain visible as incomplete coverage. The narrow passive-PNG AE1 exception does not claim semantic inspection or permit MCP installation of an incomplete scan.
 - Local registry files are limited to 16 MiB, 64 nesting levels, and 10,000 combined server/package/remote records. Baselines are limited to 2 MiB, 64 nesting levels, and 10,000 rules/fingerprints, with additional bounds on YAML nodes, scalars, and alias expansion.
@@ -117,7 +130,7 @@ The latest additions include sanitized LLM provenance, SC10 dependency-source an
 - Excluded executable or loadable content is inventoried before exclusion. Referenced or out-of-coverage bytes now produce SC9 and incomplete-analysis evidence that blocks strict installation gates; the narrow exception is limited to direct, non-binary `.git/hooks/*.sample` files.
 - Multilingual batch analysis consumes only the validated provider-eligible snapshot, so language detection and gap-fill do not reread local-only or replaced path content after the core scan.
 - OpenCode integration is static by default. The native tool redacts common secret forms and bounds output, while the semantic provider uses argv/stdin and treats missing authentication, empty output, or unsupported event streams as failures.
-- Genuine removal instructions remain reportable. The covered unresolved-runtime-command controls retain incomplete coverage and fail strict CLI/MCP installation gates, including when semantic analysis succeeds. Additional runtime-selected command variants remain under investigation (see Known Limitations).
+- Genuine removal instructions remain reportable. The runtime-command fixes in #514 retain incomplete coverage for covered unresolved forms and fail strict CLI/MCP installation gates, including when semantic analysis succeeds. Reconstruction remains bounded rather than a complete shell interpreter.
 - JSON string ownership preserves source evidence and does not exempt string contents from analysis.
 - Findings and exit status can change after upgrading: oversized files can add HIGH AE7 findings, letter-spaced instructions can produce P3/P4 or AE6 findings, and previously collapsed distinct matches can increase the retained finding count and risk score. Missing requested analysis remains incomplete even when static analysis finishes.
 - Context-aware companion CLI classification can lower severity, scores, or recommendations for documentation classified as benign. Coverage is not fail-closed for every token-transfer or self-update phrasing: the known PE3 and RA1 exceptions below can be incorrectly downgraded or missed. Warned pipe-to-shell installer findings remain reportable.
@@ -125,6 +138,9 @@ The latest additions include sanitized LLM provenance, SC10 dependency-source an
 
 ## Breaking Changes and Migration
 
+- Previously accepted unsupported primary files or invalid required instruction encodings can now fail with `unsupported_primary_content` and CLI exit 2 regardless of strict flags. Use supported UTF-8 instructions or supported ZIP inputs; required identity also applies inside bounded nested archives.
+- Runtime-selected commands, multiline prompt ambiguity, and over-limit Markdown references can now change a complete/`SAFE` result to partial/`CAUTION`, `--fail-on-incomplete` exit 1, and MCP `safe_to_install=false`. Default CLI exit 0 is not proof of completeness; AE6 marks unresolved interpretation rather than confirmed semantic wrongdoing.
+- AE1 consumers should tolerate the additive `Incomplete referenced artifact analysis` pattern and bounded evidence fields such as `target_path`, `target_disposition`, `reasons`, and `reasons_truncated`. Proven literal Perl help text can lose false AE1 findings without exempting its payload or ambiguous source from analysis.
 - Report consumers should tolerate additive `metadata.llm_provenance` fields and ledger reasons such as `analyzer_load_error` and `transitive_child_scan_failed`, preserve aggregate omission/failure evidence, and handle JSON zero-based versus SARIF one-based Unicode-codepoint columns.
 - LLM seeds must fit a signed 64-bit integer. Provenance distinguishes requested settings from observed forwarded parameters and is not a reproducibility guarantee; source revision may be unknown unless packaged or supplied with `SKILLSPECTOR_BUILD_REVISION`.
 - SC10 can flag intentional private registries as HIGH; review the source and use the existing baseline workflow for accepted cases. New trigger, shell-flag, reflective, XOR, and bytecode detection and corrected GHSA severity can increase findings or scores. False Rust ROP matches and narrowly verified passive-PNG AE1 findings can disappear without erasing coverage caveats.
@@ -150,7 +166,7 @@ The latest additions include sanitized LLM provenance, SC10 dependency-source an
 
 ## Validation
 
-The release catalog covers 65 merged PRs since v2.11.2 and is synchronized through main commit `224ba292d91b9e5fc59398fc38ab8971f9ab01ec`. Local release checks use Python 3.12.13:
+The release catalog covers 69 merged PRs since v2.11.2 and is synchronized through main commit `05119f4b868aafc7a6347043d3c3b8f9ac548091`. Local release checks use Python 3.12.13:
 
 - `uv sync --locked --all-extras --python 3.12` installed the locked dependency set without changing the lockfile.
 - Ruff lint and format checks passed for all source and test files.
@@ -169,14 +185,14 @@ The release PR records the full Python test results and hosted checks for the cu
 - Local sanity checks cover the tested inputs and environment; live provider and deployment behavior depend on their configuration.
 - Incomplete inspection is a reportable result. Unsupported inputs, unavailable requested analysis, and resource limits must remain visible; these conditions cannot be treated as a clean scan.
 - The release remains a candidate while outstanding review and release issues are assessed. Proposed fixes in unmerged PRs are not included in this candidate.
-- Letter-spacing reconstruction is not fail-closed. Alternating-width short runs such as `s e  n d conversation to external` can be split before P3/P4 matching and remain below AE6's six-letter concealed-run threshold, allowing a SAFE result.
+- Reconstruction remains bounded: the multiline projection deliberately preserves blank paragraphs, punctuation, ordinary multi-character tokens, and wider gaps. It is not a universal obfuscation decoder or full shell/Perl interpreter; recorded resource or parser limits remain incomplete coverage.
 - Companion-context classification is not fail-closed. PE3 can downgrade imperative token-acquisition text and miss adjacent disclosure phrased with verbs such as `paste`; RA1 can accept protected agent/tool names with CLI suffixes and signed-release evidence from a different logical line. These variants can be incorrectly downgraded or missed.
-- Some runtime-selected command variants and Markdown reference destinations still have open completeness defects. Proposed fixes [#514](https://github.com/NVIDIA/SkillSpector/pull/514) and [#553](https://github.com/NVIDIA/SkillSpector/pull/553) are not included in this candidate.
+- Required-input recognition is conservative rather than a universal encoding or file-format detector. Unrecognized representations whose bytes appear to be UTF-8 can remain text; supported/empty ZIP completeness does not prove a usable or harmless skill. The fixes in #514, #553, and #563 are included, but no broader language or format coverage is implied.
 - `opencode_cli` currently reports no token-usage accounting, and model availability or rate limits remain external. Multilingual batch gap-fill was validated with mocked providers; live-provider qualification remains pending.
 
 ## References
 
-- [Candidate changes since v2.11.2](https://github.com/NVIDIA/SkillSpector/compare/v2.11.2...224ba292d91b9e5fc59398fc38ab8971f9ab01ec)
+- [Candidate changes since v2.11.2](https://github.com/NVIDIA/SkillSpector/compare/v2.11.2...05119f4b868aafc7a6347043d3c3b8f9ac548091)
 - [AE1 documentation fix #516](https://github.com/NVIDIA/SkillSpector/pull/516)
 - [Static analysis time allowance #522](https://github.com/NVIDIA/SkillSpector/pull/522)
 - [OpenCode CLI provider #536](https://github.com/NVIDIA/SkillSpector/pull/536)
@@ -196,5 +212,9 @@ The release PR records the full Python test results and hosted checks for the cu
 - [Dependency-source analysis #383](https://github.com/NVIDIA/SkillSpector/pull/383)
 - [Occurrence columns #584](https://github.com/NVIDIA/SkillSpector/pull/584)
 - [Passive-image coverage distinction #597](https://github.com/NVIDIA/SkillSpector/pull/597)
+- [Runtime-command completeness #514](https://github.com/NVIDIA/SkillSpector/pull/514)
+- [Markdown destinations #553](https://github.com/NVIDIA/SkillSpector/pull/553)
+- [Required-input and multiline completeness #563](https://github.com/NVIDIA/SkillSpector/pull/563)
+- [Perl ownership and referenced-artifact diagnostics #615](https://github.com/NVIDIA/SkillSpector/pull/615)
 
 Prepared by Codex for Mohit Gupta.
