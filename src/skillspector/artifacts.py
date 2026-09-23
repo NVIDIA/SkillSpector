@@ -14,11 +14,13 @@ from __future__ import annotations
 import re
 import unicodedata
 from array import array
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
 from io import StringIO
+from threading import Lock
 from typing import NotRequired
 
 from typing_extensions import TypedDict
@@ -296,9 +298,13 @@ _DEFAULT_IGNORABLE_PATTERN = re.compile(
 )
 _DEFAULT_IGNORABLE_RUN_PATTERN = re.compile(_DEFAULT_IGNORABLE_PATTERN.pattern + "+")
 _REPEATED_CHARACTER_RUN_PATTERN = re.compile(r"(.)\1+")
-_ASCII_CONFUSABLE_PATTERN = re.compile(
-    "[" + "".join(re.escape(chr(codepoint)) for codepoint in ASCII_CONFUSABLE_SKELETON) + "]"
-)
+# Membership in a 1,515-code-point class, asked as "does this text contain any".
+# As a regex character class that costs a bounded scan per character against 528
+# disjoint ranges; as a set it is one C-level pass building the text's distinct
+# characters. On 180 KB of ASCII prose the set form is ~230x faster, and the
+# class contains no ASCII code point at all, so ordinary text answers with a
+# single disjointness check.
+_ASCII_CONFUSABLE_CHARS = frozenset(chr(codepoint) for codepoint in ASCII_CONFUSABLE_SKELETON)
 _OBFUSCATED_INSTRUCTION_ACTIONS = (
     "ignore",
     "override",
@@ -483,7 +489,36 @@ def _letter_spacing_gap_signature(gap: str) -> tuple[str, str] | None:
     return ("marked", marker[0])
 
 
+@lru_cache(maxsize=_TEXT_PREDICATE_CACHE_SIZE)
+def _letter_spacing_run_spans_cached(
+    text: str, require_consistent_separator_class: bool
+) -> tuple[tuple[int, int], ...]:
+    """Materialize the spans once per text so repeat callers reuse them."""
+    return tuple(
+        _letter_spacing_run_spans_uncached(
+            text, require_consistent_separator_class=require_consistent_separator_class
+        )
+    )
+
+
 def _letter_spacing_run_spans(
+    text: str,
+    check_runtime: Callable[[], None] | None = None,
+    *,
+    require_consistent_separator_class: bool = True,
+) -> Iterator[tuple[int, int]]:
+    """Yield maximal runs of six or more separator-delimited single letters."""
+    if check_runtime is None:
+        yield from _letter_spacing_run_spans_cached(text, require_consistent_separator_class)
+        return
+    yield from _letter_spacing_run_spans_uncached(
+        text,
+        check_runtime,
+        require_consistent_separator_class=require_consistent_separator_class,
+    )
+
+
+def _letter_spacing_run_spans_uncached(
     text: str,
     check_runtime: Callable[[], None] | None = None,
     *,
@@ -1543,6 +1578,13 @@ _ASCII_TOKEN_GAP_CHARS = frozenset(
 # ASCII character outside this class is settled by the table above, so a text
 # built only from them has no gap spans and the per-character walk below is
 # pure overhead.
+# Every token-gap character lies outside printable ASCII and the three ASCII
+# whitespace characters, so the next candidate position can be found in C rather
+# than by stepping through the text one character at a time in Python. The class
+# is a deliberate superset -- an accented letter matches it but is not a gap
+# character -- so each hit is still confirmed by the exact predicate below.
+_TOKEN_GAP_SEEK = re.compile(r"[^\t\n\r\x20-\x7e]")
+
 _TOKEN_GAP_CANDIDATE = re.compile(
     "[^"
     + "".join(re.escape(ch) for ch in map(chr, range(128)) if ch not in _ASCII_TOKEN_GAP_CHARS)
@@ -1556,6 +1598,21 @@ def _is_token_gap_character(ch: str) -> bool:
     return _compute_token_gap_character(ch)
 
 
+_RUNTIME_CHECKPOINT_STRIDE = 4096
+
+
+def _check_skipped_checkpoints(check_runtime: Callable[[], None], start: int, end: int) -> None:
+    """Run the cooperative checks a character-by-character walk would have run.
+
+    Seeking jumps straight to the next candidate, so the ``offset % 4096``
+    checkpoints between ``start`` and ``end`` would otherwise never fire and a
+    long scan could not be cancelled. Invoke one per checkpoint crossed, which
+    matches the cadence of the walk it replaces.
+    """
+    for _ in range(start // _RUNTIME_CHECKPOINT_STRIDE + 1, end // _RUNTIME_CHECKPOINT_STRIDE + 1):
+        check_runtime()
+
+
 def _token_bridging_gap_spans(
     text: str,
     *,
@@ -1564,11 +1621,21 @@ def _token_bridging_gap_spans(
 ) -> Iterator[tuple[int, int]]:
     """Yield contextual noise runs in one pass without crossing ASCII spaces."""
     if _TOKEN_GAP_CANDIDATE.search(text) is None:
+        if check_runtime is not None:
+            _check_skipped_checkpoints(check_runtime, 0, len(text))
         return
     offset = 0
     while offset < len(text):
         if check_runtime is not None and offset % 4096 == 0:
             check_runtime()
+        seek = _TOKEN_GAP_SEEK.search(text, offset)
+        if seek is None:
+            if check_runtime is not None:
+                _check_skipped_checkpoints(check_runtime, offset, len(text))
+            return
+        if check_runtime is not None:
+            _check_skipped_checkpoints(check_runtime, offset, seek.start())
+        offset = seek.start()
         if not _is_token_gap_character(text[offset]):
             offset += 1
             continue
@@ -1722,8 +1789,107 @@ def _next_offset(offsets: Iterator[int]) -> int | None:
     return next(offsets, None)
 
 
+# Derived views can be far larger than their input, so this cache is bounded by
+# stored characters rather than entries. The budget is a few files' worth of
+# expanded text -- enough for the analyzers that revisit one file, small enough
+# that a long-lived scanner process cannot accumulate.
+_DERIVED_VIEW_CACHE_BUDGET_CHARS = 4_000_000
+
+
+class _SizeBoundedViewCache:
+    """A small insertion-ordered cache bounded by total stored characters.
+
+    Every operation is a multi-step read-modify-write over three fields, and
+    the analyzers reach this cache from a thread pool -- LangGraph fans the
+    nodes out through one under ``invoke`` and ``ainvoke`` alike -- while scan
+    teardown clears it. Each operation therefore takes the lock, in the manner
+    of the per-scan AST registry in ``python_ast``. Building a view is not done
+    under the lock: two threads racing the same uncached text both build, which
+    costs the work twice and never yields a different view.
+    """
+
+    def __init__(self, budget: int) -> None:
+        self._budget = budget
+        self._lock = Lock()
+        self._entries: OrderedDict[str, SecurityTextView] = OrderedDict()
+        self._sizes: dict[str, int] = {}
+        self._total = 0
+
+    def get(self, key: str) -> SecurityTextView | None:
+        with self._lock:
+            view = self._entries.get(key)
+            if view is not None:
+                self._entries.move_to_end(key)
+            return view
+
+    def store(self, key: str, view: SecurityTextView, size: int) -> None:
+        if size > self._budget:
+            # A single view larger than the whole budget is never worth keeping.
+            return
+        with self._lock:
+            if key in self._entries:
+                return
+            self._entries[key] = view
+            self._sizes[key] = size
+            self._total += size
+            while self._total > self._budget and self._entries:
+                evicted, _ = self._entries.popitem(last=False)
+                self._total -= self._sizes.pop(evicted, 0)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._sizes.clear()
+            self._total = 0
+
+    @property
+    def stored_chars(self) -> int:
+        with self._lock:
+            return self._total
+
+
+_NORMALIZED_VIEW_CACHE = _SizeBoundedViewCache(_DERIVED_VIEW_CACHE_BUDGET_CHARS)
+
+
+def clear_security_text_caches() -> None:
+    """Release every memoized security-text derivation.
+
+    Called from scan teardown so a long-lived scanner process does not retain a
+    scanned file's content -- the derived views, and the text keys the predicate
+    caches hold -- after the scan that produced it has finished.
+    """
+    _NORMALIZED_VIEW_CACHE.clear()
+    for cached in (
+        _has_letter_spacing_run,
+        _has_obfuscated_instruction,
+        _requires_normalized_security_view,
+        _letter_spacing_run_spans_cached,
+    ):
+        cached.cache_clear()
+
+
 def normalized_security_view(text: str) -> SecurityTextView:
-    """Build an NFKC/UTS #39 ASCII-skeleton view with compact offsets."""
+    """Build an NFKC/UTS #39 ASCII-skeleton view with compact offsets.
+
+    Memoized, because every analyzer reaches this with the same file content.
+    The view is a frozen dataclass and its ``source_offsets`` array is only ever
+    read -- sliced, or copied into a fresh array -- so callers can share one
+    instance.
+
+    The cache is bounded by the *size* of what it stores rather than by entry
+    count. Normalization can expand its input several-fold -- NFKC turns a
+    single U+FDFA into 18 characters, each carrying a four-byte offset -- so a
+    count-based bound places no limit on retained memory.
+    """
+    cached = _NORMALIZED_VIEW_CACHE.get(text)
+    if cached is not None:
+        return cached
+    view = _build_normalized_security_view(text)
+    _NORMALIZED_VIEW_CACHE.store(text, view, len(view.text))
+    return view
+
+
+def _build_normalized_security_view(text: str) -> SecurityTextView:
     output = StringIO()
     offsets = array("I")
     contextual_spans = iter(_normalization_ignored_spans(text))
@@ -2006,7 +2172,7 @@ def _requires_normalized_security_view(text: str) -> bool:
         return True
     if not unicodedata.is_normalized("NFKC", text):
         return True
-    if _ASCII_CONFUSABLE_PATTERN.search(text) is not None:
+    if not _ASCII_CONFUSABLE_CHARS.isdisjoint(text):
         return True
     if text.isprintable():
         return False

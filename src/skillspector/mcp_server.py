@@ -219,8 +219,7 @@ async def run_scan(
             "version": __version__,
         }
     finally:
-        if result is not None:
-            cleanup_result(result)
+        cleanup_result(result)
 
 
 def build_server(name: str = "skillspector", *, allow_local_targets: bool = False) -> FastMCP:

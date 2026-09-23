@@ -760,8 +760,7 @@ def scan(
             err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     finally:
-        if result is not None:
-            cleanup_result(result)
+        cleanup_result(result)
 
 
 def _build_trace_config(input_path: str, format: FormatChoice, no_llm: bool) -> RunnableConfig:
@@ -3207,8 +3206,7 @@ def baseline(
             err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
     finally:
-        if result is not None:
-            cleanup_result(result)
+        cleanup_result(result)
 
 
 if __name__ == "__main__":
