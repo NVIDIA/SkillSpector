@@ -88,6 +88,7 @@ _POWERSHELL_REPLACE_EXPRESSION_RE = re.compile(
     re.IGNORECASE,
 )
 _SHELL_COMMAND_STRING_SHELLS = frozenset({"sh", "ash", "bash", "dash", "ksh", "yash", "zsh"})
+_SHELL_COMMAND_STRING_ARGUMENTS = 32
 _SHELL_CLAUSE_PREFIX_WORDS = frozenset({"do", "else", "elif", "then", "time", "!"})
 _SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
 _RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
@@ -1381,7 +1382,12 @@ def _is_printf_substitution(
         body_start,
         check_runtime=runtime_check,
     )
-    return exhausted or _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens)
+    return (
+        exhausted
+        or _has_unsupported_brace_expansion(tokens)
+        or _has_destructive_root_glob(tokens)
+        or _has_destructive_root_path(tokens)
+    )
 
 
 def _skip_backtick_substitution(
@@ -1812,6 +1818,7 @@ def _has_shell_command_word_exhaustion(
             )
             if (
                 exhausted
+                or _has_unsupported_brace_expansion(tokens)
                 or _has_destructive_root_glob(tokens)
                 or _has_destructive_root_path(tokens)
             ):
@@ -1888,6 +1895,61 @@ def _shell_clause_starts(
         cursor += 1
 
 
+def _eval_command_string(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+) -> str | None:
+    """Join bounded eval operands, excluding outer redirections and clauses."""
+    # Include one lookahead character so reaching the limit cannot masquerade
+    # as a complete final word. No individual word can scan beyond this slice.
+    source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
+    cursor = 0
+    operands: list[str] = []
+    for count in range(_SHELL_COMMAND_STRING_ARGUMENTS + 1):
+        check_runtime()
+        while cursor < len(source):
+            if source.startswith("\\\r\n", cursor):
+                cursor += 3
+            elif source.startswith("\\\n", cursor):
+                cursor += 2
+            elif source[cursor].isspace() and source[cursor] not in "\r\n":
+                cursor += 1
+            else:
+                break
+        if cursor > _ROOT_GLOB_COMMAND_CHARS:
+            return None
+        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(source, cursor)
+        if redirection is None and (cursor == len(source) or source[cursor] in "\r\n;|&()#"):
+            return " ".join(operands)
+        if count == _SHELL_COMMAND_STRING_ARGUMENTS:
+            return None
+        if redirection is not None:
+            # Here-documents/strings require a different grammar. Keep their
+            # coverage partial instead of treating their delimiter as code.
+            if "<<" in redirection.group():
+                return None
+            cursor = redirection.end()
+            while cursor < len(source) and source[cursor] in " \t":
+                cursor += 1
+            if cursor == len(source) or source[cursor] in "\r\n;|&()#":
+                return None
+        word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+        if limited or word is None or cursor > _ROOT_GLOB_COMMAND_CHARS:
+            return None
+        if redirection is not None:
+            continue
+        if any(
+            marker in word
+            for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+        ):
+            return None
+        if not operands and word == "--":
+            continue
+        operands.append(word)
+    return None
+
+
 def _command_string_from_clause(
     content: str,
     start: int,
@@ -1938,8 +2000,7 @@ def _command_string_from_clause(
         if command in _SHELL_CLAUSE_PREFIX_WORDS:
             continue
         if command == "eval":
-            command_string, limited = next_word()
-            return True, resolved_command_string(command_string, limited)
+            return True, _eval_command_string(content, cursor, check_runtime)
         if command in _SHELL_COMMAND_STRING_SHELLS:
             for _ in range(16):
                 option, limited = next_word()
@@ -3320,8 +3381,9 @@ def has_bounded_parse_exhaustion(
     complete_context: bool = True,
 ) -> bool:
     """Return whether a destructive rm command exceeded the parser's span contract."""
-    if file_type == "powershell":
-        return False
+    # PowerShell source can invoke another shell with an executable command
+    # string. Apply the same bounded checks to those strings; benign PowerShell
+    # -replace values have their own narrowly proven expression context.
     structural_quote_closers = None
     structural_quote_openers = None
     json_strings: list[tuple[int, int]] = []

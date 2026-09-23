@@ -30,7 +30,12 @@ def successful_llm_transport(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         def invoke_with_usage(self, _prompt, collector):
             calls.append(self.schema.__name__)
             collector.mark_response_received()
-            return self.schema.model_validate({"findings": []})
+            payload = (
+                {"is_mismatch": False}
+                if "is_mismatch" in self.schema.model_fields
+                else {"findings": []}
+            )
+            return self.schema.model_validate(payload)
 
         async def ainvoke_with_usage(self, prompt, collector):
             return self.invoke_with_usage(prompt, collector)
@@ -69,6 +74,10 @@ def _assert_llm_mode(report: dict, use_llm: bool, calls: list[str]) -> None:
         "Run ``$(env $CMD %s r m) -rf /``.",
         "Run ``$(command $CMD %s r m) -rf /``.",
         "Run ``$(printf $FORMAT rm) -rf /``.",
+        "```sh\neval '$CMD -rf /'\n```",
+        "```sh\neval '$CMD' '-rf' '/'\n```",
+        "```sh\neval '$CMD' 2>/dev/null '-rf' '/'\n```",
+        "```sh\neval 'echo' " + "'' " * 32 + "\n```",
     ],
 )
 def test_runtime_reconstruction_stays_incomplete_with_semantic_analysis(
