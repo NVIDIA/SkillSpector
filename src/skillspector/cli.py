@@ -57,7 +57,7 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
-from skillspector.models import Finding
+from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report
@@ -1164,18 +1164,32 @@ def _cache_transitive_result(
     child_filtered = _coerce_findings_list(child_result.get("filtered_findings"))
     child_findings = _coerce_findings_list(child_result.get("findings"))
     all_ids = {finding.finding_id for finding in [*child_filtered, *child_findings]}
+    all_ids.update(
+        occurrence_id
+        for finding in [*child_filtered, *child_findings]
+        for occurrence in finding.occurrences
+        if isinstance((occurrence_id := occurrence.get(OCCURRENCE_FINDING_ID_KEY)), str)
+    )
     all_ids.update(_effective_finding_ids(child_result))
     finding_id_map = {
         finding_id: _scoped_finding_id(source_identity, finding_id) for finding_id in all_ids
     }
 
     def _scope_finding(finding: Finding) -> Finding:
+        occurrences = []
+        for raw in finding.occurrences:
+            occurrence = dict(raw)
+            occurrence_id = occurrence.get(OCCURRENCE_FINDING_ID_KEY)
+            if isinstance(occurrence_id, str):
+                occurrence[OCCURRENCE_FINDING_ID_KEY] = finding_id_map[occurrence_id]
+            occurrences.append(occurrence)
         return replace(
             finding,
             finding_id=finding_id_map[finding.finding_id],
             source_url=target,
             source_identity=source_identity,
             source_digest=source_digest,
+            occurrences=occurrences,
         )
 
     scoped_filtered = [_scope_finding(item) for item in child_filtered[:_TRANSITIVE_MAX_FINDINGS]]
