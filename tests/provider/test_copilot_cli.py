@@ -385,6 +385,116 @@ class TestAuditCopilotHome:
         with pytest.raises(AgentCLIError, match="settings.json"):
             _audit_copilot_home({"COPILOT_HOME": str(tmp_path)})
 
+    def test_xdg_hook_source_raises(self, tmp_path: Path) -> None:
+        # Startup migrates $XDG_CONFIG_HOME/.copilot/hooks into the home:
+        # a hook-free COPILOT_HOME with hook material in the XDG source
+        # must still refuse.
+        home = tmp_path / "home"
+        home.mkdir()
+        xdg = tmp_path / "xdg" / ".copilot" / "hooks"
+        xdg.mkdir(parents=True)
+        (xdg / "evil.json").write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home(
+                {"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+            )
+
+    def test_xdg_settings_hooks_raise(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        xdg = tmp_path / "xdg" / ".copilot"
+        xdg.mkdir(parents=True)
+        (xdg / "settings.json").write_text('{"hooks": {"sessionStart": []}}', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home(
+                {"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+            )
+
+    def test_xdg_clean_source_passes(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        xdg = tmp_path / "xdg" / ".copilot"
+        xdg.mkdir(parents=True)
+        (xdg / "settings.json").write_text('{"theme": "dark"}', encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "xdg")})
+
+    def test_xdg_default_location_audited(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # XDG_CONFIG_HOME unset: the default ~/.config/.copilot source is
+        # still inspected.
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("COPILOT_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        xdg = home / ".config" / ".copilot" / "hooks"
+        xdg.mkdir(parents=True)
+        (xdg / "evil.json").write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home({})
+
+    def test_xdg_missing_explicit_source_raises(self, tmp_path: Path) -> None:
+        # An explicitly set but missing XDG_CONFIG_HOME cannot be verified.
+        home = tmp_path / "home"
+        home.mkdir()
+        with pytest.raises(AgentCLIError, match="XDG_CONFIG_HOME"):
+            _audit_copilot_home(
+                {"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "absent")}
+            )
+
+    def test_xdg_falsy_hooks_pass(self, tmp_path: Path) -> None:
+        # Present-but-empty hooks blocks are not loadable hooks.
+        home = tmp_path / "home"
+        home.mkdir()
+        xdg = tmp_path / "xdg" / ".copilot"
+        xdg.mkdir(parents=True)
+        (xdg / "settings.json").write_text('{"hooks": {}}', encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": str(tmp_path / "xdg")})
+
+    def test_xdg_empty_string_falls_back_to_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Empty XDG_CONFIG_HOME is unset, not a relative path.
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        xdg = home / ".config" / ".copilot" / "hooks"
+        xdg.mkdir(parents=True)
+        (xdg / "evil.json").write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home({"COPILOT_HOME": str(home), "XDG_CONFIG_HOME": "   "})
+
+    def test_xdg_same_tree_dirty_raises_once(self, tmp_path: Path) -> None:
+        # XDG source resolving onto the home itself: still refused via the
+        # single home audit (no double counting, no skip).
+        base = tmp_path / "x"
+        (base / ".copilot" / "hooks").mkdir(parents=True)
+        (base / ".copilot" / "hooks" / "evil.json").write_text(
+            '{"version": 1, "hooks": {}}', encoding="utf-8"
+        )
+        with pytest.raises(AgentCLIError, match="hook"):
+            _audit_copilot_home(
+                {
+                    "COPILOT_HOME": str(base / ".copilot"),
+                    "XDG_CONFIG_HOME": str(base),
+                }
+            )
+
+    def test_xdg_default_missing_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No XDG tree anywhere: nothing to migrate, nothing to refuse.
+        home = tmp_path / "home"
+        (home / ".copilot").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("COPILOT_HOME", raising=False)
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        _audit_copilot_home({})
+
     def test_defaults_to_dot_copilot(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         home = tmp_path / "home"
         (home / ".copilot" / "installed-plugins" / "evil").mkdir(parents=True)
@@ -617,6 +727,37 @@ class TestHookHomeEndToEnd:
         self._write_recording_copilot(binary)
         monkeypatch.setenv("ATTACK_MARKERS", str(markers))
         monkeypatch.setenv("COPILOT_HOME", str(home))
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="hook"):
+            run_agent_cli("copilot", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_xdg_hook_source_rejects_before_prompt_delivery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Migration source hooks reject even with a hook-free home.
+
+        COPILOT_HOME is clean; the hook lives only in the inherited
+        XDG source tree that startup would migrate into the home.
+        """
+        home = tmp_path / "copilot-home"
+        home.mkdir()
+        xdg = tmp_path / "xdg" / ".copilot" / "hooks"
+        xdg.mkdir(parents=True)
+        (xdg / "evil.json").write_text(
+            '{"version": 1, "hooks": {"userPromptSubmitted": '
+            '[{"type": "prompt", "prompt": "hi"}]}}',
+            encoding="utf-8",
+        )
+        binary = tmp_path / "copilot"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_recording_copilot(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("COPILOT_HOME", str(home))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match="hook"):

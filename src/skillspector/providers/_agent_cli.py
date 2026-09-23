@@ -1126,7 +1126,10 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
     flag in ``copilot --help``), and — as probed 2026-09-19 — silently
     refuses inference under ANY redirected home, so home isolation is
     not a usable lever. The enforceable property is absence, checked
-    here for every user and plugin source under the resolved copilot home:
+    here for every user and plugin source under the resolved copilot home
+    AND under the XDG migration source (startup moves
+    ``$XDG_CONFIG_HOME/.copilot/hooks`` into the home, so a clean home
+    with a dirty XDG tree still loads hooks — see ``_xdg_copilot_home``):
 
     - ``installed-plugins/`` present-and-non-empty raises (plugin hooks);
     - ``hooks/*.json`` present raises (user hook files);
@@ -1153,6 +1156,38 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
             "COPILOT_HOME is set but missing, so hook material cannot be "
             f"verified absent: {home}; point it at an existing hook-free tree"
         )
+    _audit_hook_tree(home, "copilot home")
+    xdg = _xdg_copilot_home(child_env)
+    if (child_env.get("XDG_CONFIG_HOME") or "").strip() and not os.path.isdir(xdg):
+        raise AgentCLIError(
+            "XDG_CONFIG_HOME is set but missing, so migration hook material "
+            f"cannot be verified absent: {xdg}"
+        )
+    if os.path.normcase(os.path.normpath(xdg)) != os.path.normcase(os.path.normpath(home)):
+        _audit_hook_tree(xdg, "copilot XDG migration source")
+
+
+def _xdg_copilot_home(child_env: dict[str, str]) -> str:
+    """Resolve the XDG migration source dir as the CLI does.
+
+    Startup moves ``$XDG_CONFIG_HOME/.copilot/hooks`` into the copilot
+    home, so hook material there is loadable even when the home itself
+    is clean. Unset ``XDG_CONFIG_HOME`` falls back to ``~/.config``.
+    """
+    base = (child_env.get("XDG_CONFIG_HOME") or "").strip()
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, ".copilot")
+
+
+def _audit_hook_tree(home: str, kind: str) -> None:
+    """Refuse inference when one hook tree carries hook material.
+
+    ``kind`` names the tree in error messages (``copilot home`` or the
+    XDG migration source). Checks ``installed-plugins/``,
+    ``hooks/*.json``, and an inline ``hooks`` block in
+    ``settings.json``; messages name paths only, never contents.
+    """
     plugins = os.path.join(home, "installed-plugins")
     try:
         has_plugins = any(os.scandir(plugins))
@@ -1162,9 +1197,7 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
         raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
     if has_plugins:
         raise AgentCLIError(
-            "copilot home contains installed plugins, which may carry "
-            f"lifecycle hooks: {plugins}; remove them or point COPILOT_HOME "
-            "at a plugin-free tree"
+            f"{kind} contains installed plugins, which may carry lifecycle hooks: {plugins}"
         )
     hooks = os.path.join(home, "hooks")
     try:
@@ -1179,9 +1212,7 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
         raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
     if hook_files:
         raise AgentCLIError(
-            "copilot home contains user hook files, which load with no "
-            f"argv off-switch: {hooks}; remove them or point COPILOT_HOME "
-            "at a hook-free tree"
+            f"{kind} contains user hook files, which load with no argv off-switch: {hooks}"
         )
     settings = os.path.join(home, "settings.json")
     try:
@@ -1191,13 +1222,12 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
         return
     except (OSError, ValueError) as exc:
         raise AgentCLIError(
-            f"copilot settings.json cannot be verified hook-free: {settings}"
+            f"{kind} settings.json cannot be verified hook-free: {settings}"
         ) from exc
     if isinstance(document, dict) and document.get("hooks"):
         raise AgentCLIError(
-            "copilot settings.json carries an inline hooks block, which loads "
-            f"with no argv off-switch: {settings}; remove it or point "
-            "COPILOT_HOME at a hook-free tree"
+            f"{kind} settings.json carries an inline hooks block, which loads "
+            f"with no argv off-switch: {settings}"
         )
 
 
