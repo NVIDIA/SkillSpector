@@ -715,6 +715,12 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
 - `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
+- AE1 findings use **Incomplete referenced artifact analysis**. Their source
+  location identifies the reference; `evidence` identifies the affected target,
+  analyzer reasons, and available bounds. Review the target's completeness
+  ledger when `reasons_truncated` is true. See
+  [referenced-artifact diagnostics and Perl help text](docs/ANALYSIS_RESOURCE_BOUNDS.md#diagnosing-incomplete-referenced-artifacts)
+  for interpretation and corrective actions.
 - `metadata.inference_usage` contains one sanitized record per LLM response when the
   provider exposes token counters. It is an empty list when usage is unavailable;
   SkillSpector never estimates missing tokens. Prompt totals are inclusive of cache

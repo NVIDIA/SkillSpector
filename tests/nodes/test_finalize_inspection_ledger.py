@@ -694,6 +694,114 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["is_complete"] is False
 
 
+def test_ae1_reports_target_specific_parser_diagnostics_for_each_reference() -> None:
+    target = "scripts/helper.pl"
+    event = ledger_event(
+        outcome=LedgerOutcome.PARTIAL,
+        phase="static",
+        analyzer_id="static_patterns_tool_misuse",
+        path=target,
+        reason=LedgerReason.STATIC_PARSE_LIMIT,
+        start_line=4,
+        end_line=4,
+    )
+    findings = finalizer_module._reference_coverage_findings(
+        {
+            "artifact_inventory": [{"path": target, "disposition": "analyzed"}],
+            "artifact_references": [
+                {
+                    "status": "resolved",
+                    "target_path": target,
+                    "source_path": "SKILL.md",
+                    "line": line,
+                }
+                for line in (52, 351)
+            ],
+            "inspection_ledger": [
+                event,
+                {**event, "path": "unrelated.pl", "reason_code": "read_error"},
+            ],
+        }
+    )
+
+    assert len(findings) == 2
+    assert [finding.start_line for finding in findings] == [52, 351]
+    for finding in findings:
+        serialized = finding.to_dict()
+        assert serialized["pattern"] == "Incomplete referenced artifact analysis"
+        assert finding.severity == "HIGH"
+        assert serialized["evidence"] == {
+            "target_path": target,
+            "target_disposition": "partial",
+            "reasons": [
+                {
+                    "reason_code": "static_parse_limit",
+                    "message": inspection_ledger_module.REASON_MESSAGES[
+                        LedgerReason.STATIC_PARSE_LIMIT
+                    ],
+                    "phase": "static",
+                    "analyzers": ["static_patterns_tool_misuse"],
+                    "start_line": 4,
+                    "end_line": 4,
+                }
+            ],
+        }
+        assert "parsing limitation" in finding.remediation
+        assert "remove the reference" not in finding.remediation
+        assert "locally available" not in finding.remediation
+
+
+def test_ae1_diagnostics_use_bounded_canonical_ledger_fields() -> None:
+    events = [
+        {
+            "outcome": "partial",
+            "reason_code": "runtime_limit",
+            "phase": "static",
+            "analyzer_id": "static_patterns_tool_misuse",
+            "message": "arbitrary private payload",
+            "observed_seconds": 30.5,
+            "limit_seconds": 30,
+            "limit_bytes": True,
+            "observed_bytes": "private payload",
+            "limit_characters": float("inf"),
+            "observed_characters": 2**100,
+            "error_class": "private payload",
+            "start_line": line,
+        }
+        for line in range(1, 30)
+    ]
+    evidence = finalizer_module._reference_analysis_evidence("helper.pl", "partial", events)
+
+    assert evidence["reasons_truncated"] is True
+    assert len(evidence["reasons"]) == 16
+    assert evidence["reasons"][0]["limits"] == {
+        "observed_seconds": 30.5,
+        "limit_seconds": 30,
+    }
+    assert "private payload" not in json.dumps(evidence, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_advice"),
+    [
+        ("read_error", "remains readable"),
+        ("runtime_limit", "analysis bounds"),
+        ("size_limit", "analysis bounds"),
+        ("opaque_content", "referenced format"),
+        ("llm_batch_failed", "analysis-completeness ledger"),
+    ],
+)
+def test_ae1_remediation_addresses_the_inspection_reason(reason: str, expected_advice: str) -> None:
+    evidence = finalizer_module._reference_analysis_evidence(
+        "helper.pl", "partial", [{"outcome": "partial", "reason_code": reason}]
+    )
+
+    remediation = finalizer_module._reference_analysis_remediation(evidence)
+
+    assert expected_advice in remediation
+    assert "remove the reference" not in remediation
+
+
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize(
     "locations",
