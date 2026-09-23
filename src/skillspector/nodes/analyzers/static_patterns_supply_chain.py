@@ -1581,7 +1581,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     )
                 )
                 break
-    if file_type in ("python", "javascript", "shell", "other"):
+    if file_type in ("python", "javascript", "shell", "perl", "other"):
         for pattern, confidence in SC3_PATTERNS:
             matches = (
                 static_runner.iter_paragraph_matches
