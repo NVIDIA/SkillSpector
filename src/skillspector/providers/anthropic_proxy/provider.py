@@ -52,6 +52,10 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import SecretStr
 
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_reasoning_effort, resolve_sampling_parameters
 
@@ -244,8 +248,21 @@ class AnthropicProxyProvider:
         effort = resolve_reasoning_effort()
         if effort is not None:
             kwargs["effort"] = effort
-        kwargs.update(resolve_sampling_parameters())
-        return _ChatAnthropicProxy(**kwargs)
+        sampling_parameters = resolve_sampling_parameters()
+        kwargs.update(sampling_parameters)
+        chat_model = _ChatAnthropicProxy(**kwargs)
+        register_chat_model_controls(
+            chat_model,
+            retained_chat_model_controls(
+                chat_model,
+                ("temperature", "reasoning_effort"),
+            ),
+            requested_controls={
+                "temperature": sampling_parameters.get("temperature"),
+                "reasoning_effort": effort,
+            },
+        )
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)

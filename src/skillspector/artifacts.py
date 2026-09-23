@@ -43,6 +43,16 @@ class ArtifactDisposition(StrEnum):
     OUT_OF_SCOPE = "out_of_scope"
 
 
+class ReferenceKind(StrEnum):
+    """Syntactic use that produced one intra-bundle reference."""
+
+    MARKDOWN_IMAGE = "markdown_image"
+    MARKDOWN_LINK = "markdown_link"
+    INLINE_COMMAND = "inline_command"
+    QUOTED_OR_CODE = "quoted_or_code"
+    PLAIN_PATH = "plain_path"
+
+
 class ArtifactRecord(TypedDict):
     """Serializable inventory row for one discovered bundle artifact."""
 
@@ -68,6 +78,7 @@ class BundleReference(TypedDict):
     target_path: str | None
     status: str
     disposition: ArtifactDisposition
+    reference_kind: ReferenceKind
 
 
 @dataclass(frozen=True)
@@ -184,6 +195,7 @@ _BINARY_MAGIC = (
     b"\x7fELF",
     b"MZ",
     b"\x00asm",
+    b"\x1bLua",
     b"%PDF-",
 )
 
@@ -198,9 +210,11 @@ _BINARY_EXTENSIONS = frozenset(
         ".gz",
         ".exe",
         ".dll",
+        ".dex",
         ".so",
         ".dylib",
         ".wasm",
+        ".luac",
         ".pyc",
         ".class",
         ".mp3",
@@ -326,10 +340,15 @@ def _suffix(path: str) -> str:
     return name[index:].lower() if index >= 0 else ""
 
 
+def has_dex_magic(data: bytes) -> bool:
+    """Return whether bytes start with the versioned eight-byte DEX signature."""
+    return len(data) >= 8 and data.startswith(b"dex\n") and data[4:7].isdigit() and data[7] == 0
+
+
 def classify_artifact(path: str, data: bytes, *, referenced: bool = False) -> ArtifactRecord:
     """Classify from bytes and decodability; an extension is never authoritative."""
     contains_nul = b"\x00" in data
-    has_binary_magic = any(data.startswith(magic) for magic in _BINARY_MAGIC)
+    has_binary_magic = has_dex_magic(data) or any(data.startswith(magic) for magic in _BINARY_MAGIC)
     try:
         decoded = data.decode("utf-8")
         decodable = True

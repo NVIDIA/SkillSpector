@@ -9,8 +9,54 @@
 #       max_output_tokens: <int>       # model's max output cap (optional)
 
 models:
+  # GPT-5 generation (verified 2026-09-14: openai.com/gpt-5 for 5/mini/nano;
+  # developers.openai.com/api/docs/models/gpt-5.2, gpt-5.1-codex,
+  # gpt-5.1-codex-max): 400K context, 128K output. The -codex entries are
+  # Responses-API-only upstream; budgets listed for completeness.
+  "gpt-5":
+    context_length: 400000
+    max_output_tokens: 128000
+  "gpt-5-mini":
+    context_length: 400000
+    max_output_tokens: 128000
+  "gpt-5-nano":
+    context_length: 400000
+    max_output_tokens: 128000
+  "gpt-5.1":
+    context_length: 400000
+    max_output_tokens: 128000
+  "gpt-5.1-codex":
+    context_length: 400000
+    max_output_tokens: 128000
+  "gpt-5.1-codex-max":
+    context_length: 400000
+    max_output_tokens: 128000
+  "gpt-5.2":
+    context_length: 400000
+    max_output_tokens: 128000
+  # 1.05M generation (verified 2026-09-14 against
+  # developers.openai.com/api/docs/models/gpt-5.4, gpt-5.5, and
+  # https://platform.openai.com/docs/models): 1.05M context, 128K output.
   "gpt-5.4":
-    context_length: 1000000
+    context_length: 1050000
+    max_output_tokens: 128000
+  "gpt-5.5":
+    context_length: 1050000
+    max_output_tokens: 128000
+  "gpt-5.6-luna":
+    context_length: 1050000
+    max_output_tokens: 128000
+  "gpt-5.6-terra":
+    context_length: 1050000
+    max_output_tokens: 128000
+  "gpt-5.6-sol":
+    context_length: 1050000
+    max_output_tokens: 128000
+  "gpt-5.6":  # Alias routing to gpt-5.6-sol per official docs.
+    context_length: 1050000
+    max_output_tokens: 128000
+  "gpt-6-astra":
+    context_length: 1050000
     max_output_tokens: 128000
 
   "gemini-3.5-flash":

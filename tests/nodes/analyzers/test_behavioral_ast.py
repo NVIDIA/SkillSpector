@@ -202,6 +202,14 @@ class TestDynamicGetattr:
         findings = _run(code)
         assert not any(f.rule_id == "AST7" for f in findings)
 
+    def test_getattr_with_direct_non_string_literal_is_silent(self):
+        findings = _run("getattr(obj, 42)")
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    def test_getattr_with_constructed_benign_name_remains_dynamic(self):
+        findings = _run("getattr(subprocess, ''.join(['P', 'o', 'p', 'e', 'n']))(cmd)")
+        assert any(f.rule_id == "AST7" for f in findings)
+
 
 class TestReflectiveGetattrExec:
     """getattr(obj, "<sink>")(...) is a reflective handle on an exec/os sink.
@@ -219,6 +227,12 @@ class TestReflectiveGetattrExec:
 
     def test_getattr_builtins_exec_produces_ast9(self):
         findings = _run("import builtins\ngetattr(builtins, 'exec')(payload)")
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_getattr_joined_exec_name_produces_ast9(self):
+        findings = _run(
+            "import builtins\ngetattr(builtins, ''.join(['e', 'x', 'e', 'c']))(payload)"
+        )
         assert any(f.rule_id == "AST9" for f in findings)
 
     def test_getattr_eval_double_quotes_produces_ast9(self):
@@ -239,6 +253,53 @@ class TestReflectiveGetattrExec:
         for name in ("name", "timeout", "value", "data", "run", "compile"):
             findings = _run(f"v = getattr(config, '{name}')")
             assert not any(f.rule_id == "AST9" for f in findings), name
+
+
+class TestJoinedGetattrNameBounds:
+    """Joined getattr names must be length-bounded before the join allocates.
+
+    A parseable source can carry a separator/element combination whose expanded
+    join dwarfs the source-size gate; resolving it would allocate the full
+    payload from untrusted skill source. Over-cap joins must return unresolved
+    so the caller keeps the existing AST7 dynamic-name fallback (never AST9),
+    while bounded joins keep their AST7/AST9 classification.
+    """
+
+    @staticmethod
+    def _resolve(join_code: str):
+        node = behavioral_ast.ast.parse(join_code, mode="eval").body
+        return behavioral_ast._constant_string(node)
+
+    def test_huge_separator_and_list_return_unresolved_without_allocating(self):
+        # Reviewer P1 example shape: a 100,000-character separator joined over
+        # 10,000 empty literals fits in ~130,024 source characters but expands
+        # to ~999,900,000. The test builds the source, never the payload.
+        separator = "x" * 100_000
+        elements = ", ".join(["''"] * 10_000)
+        assert self._resolve(f"{separator!r}.join([{elements}])") is None
+
+    def test_nested_join_returns_unresolved(self):
+        # The inner join is already over the cap, so the whole expression
+        # must stay unresolved.
+        assert self._resolve("'-'.join(['p', 'ab'.join(['xy'] * 30)])") is None
+
+    def test_bounded_join_still_resolves(self):
+        assert self._resolve("''.join(['e', 'x', 'e', 'c'])") == "exec"
+
+    def test_over_cap_join_falls_back_to_ast7_not_ast9(self):
+        separator = "x" * 64
+        elements = ", ".join(["''"] * 300)
+        findings = _run(f"import os\ngetattr(os, {separator!r}.join([{elements}]))(cmd)")
+        assert any(f.rule_id == "AST7" for f in findings)
+        assert not any(f.rule_id == "AST9" for f in findings)
+
+    def test_over_cap_join_spelling_dangerous_name_stays_ast7(self):
+        # Even when the bounded parts would spell a dangerous name, an
+        # over-cap join must not resolve to it.
+        elements = ", ".join(["'e'", "'x'", "'e'", "'c'"] + ["''"] * 300)
+        findings = _run(f"import os\ngetattr(os, {('x' * 64)!r}.join([{elements}]))(cmd)")
+        assert not any(f.rule_id == "AST9" for f in findings)
+        assert any(f.rule_id == "AST7" for f in findings)
 
 
 class TestModuleDictSubscript:
