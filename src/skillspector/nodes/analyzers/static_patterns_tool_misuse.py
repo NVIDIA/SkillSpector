@@ -190,6 +190,39 @@ TM1_PROSE_PATTERNS = [
 ]
 TM1_PATTERNS = TM1_CODE_PATTERNS + TM1_PROSE_PATTERNS
 
+# Agent instructions can name the deletion target in prose rather than as a
+# shell path. Keep this separate from shell token reconstruction: interpreting
+# "entire repo" as two literal filenames misses what an agent is told to do.
+# Bounded separators accept Markdown/quote wrappers and soft line breaks;
+# iter_paragraph_matches keeps unrelated paragraphs from supplying the target.
+_DELETION_PROSE_GAP = r"[\s*_`\"'\u2018\u2019\u201c\u201d]{1,64}"
+# A closing emphasis delimiter is allowed; a filename suffix is not.
+_DELETION_PROSE_WORD_END = r"(?![^\W_]|[/-]|\.\w|_+(?:[^\W_]|[/-]|\.\w))"
+_DELETION_PROSE_REPOSITORY = rf"(?:repo(?:sitory)?|project|workspace){_DELETION_PROSE_WORD_END}"
+_DELETION_PROSE_ARTICLE = rf"(?:(?:the|this|your|our){_DELETION_PROSE_GAP})?"
+_REPOSITORY_DELETION_PROSE_RE = re.compile(
+    rf"(?<![\w./-])_{{0,2}}rm{_DELETION_PROSE_GAP}"
+    rf"(?P<options>(?:(?:-[A-Za-z]{{1,16}}|--recursive|--force)"
+    rf"{_DELETION_PROSE_GAP}){{1,8}})"
+    rf"(?:--{_DELETION_PROSE_GAP})?"
+    rf"(?:{_DELETION_PROSE_ARTICLE}(?:entire|whole|full|current){_DELETION_PROSE_GAP}"
+    rf"{_DELETION_PROSE_REPOSITORY}"
+    rf"|all{_DELETION_PROSE_GAP}{_DELETION_PROSE_ARTICLE}"
+    rf"(?:files|contents|data){_DELETION_PROSE_GAP}(?:in|of|from){_DELETION_PROSE_GAP}"
+    rf"{_DELETION_PROSE_ARTICLE}{_DELETION_PROSE_REPOSITORY}"
+    rf"|all{_DELETION_PROSE_GAP}{_DELETION_PROSE_ARTICLE}{_DELETION_PROSE_REPOSITORY}"
+    rf"{_DELETION_PROSE_GAP}(?:files|contents|data){_DELETION_PROSE_WORD_END})",
+    re.IGNORECASE,
+)
+_DELETION_PROSE_WARNING_RE = re.compile(
+    r"\b(?:(?:do\s+not|don't|never|must\s+not|should\s+not)\s+"
+    r"(?:ever\s+)?(?:do|run|execute|invoke|use)"
+    r"|avoid\s+(?:doing|running|executing|invoking|using)"
+    r"|refrain\s+from\s+(?:doing|running|executing|invoking|using))"
+    r"(?:\s+(?:the|this|following|command)){0,3}\s*:?\s*$",
+    re.IGNORECASE,
+)
+
 # TM2: Chaining Abuse — chained commands to bypass safety
 TM2_CODE_PATTERNS = [
     # Shell command chaining with dangerous commands (\b prevents substring matches)
@@ -2328,6 +2361,30 @@ def _tm1_candidates(
             yield command_start, command_end, command, 0.9
 
 
+def _repository_deletion_prose_matches(content: str) -> Iterator[re.Match[str]]:
+    """Find recursive, forced deletions with an explicit repository-wide target."""
+    for match in static_runner.iter_paragraph_matches(_REPOSITORY_DELETION_PROSE_RE, content):
+        options = re.findall(r"--(?:recursive|force)|-[A-Za-z]+", match["options"], re.I)
+        short_options = [option[1:] for option in options if not option.startswith("--")]
+        recursive = "--recursive" in options or any(
+            "r" in option or "R" in option for option in short_options
+        )
+        force = "--force" in options or any("f" in option for option in short_options)
+        if recursive and force:
+            yield match
+
+
+def _repository_deletion_prose_is_warning(content: str, start: int) -> bool:
+    """Recognize an immediate prohibition without erasing deterministic evidence."""
+    prefix = content[max(0, start - 256) : start]
+    prefix = re.split(r"\n[ \t\r]*\n", prefix)[-1].replace("\u2019", "'")
+    # Keep apostrophes inside words (don't), but ignore quotation/Markdown
+    # delimiters around the instruction. A later affirmative verb or clause
+    # cannot inherit an earlier warning through this anchored local grammar.
+    prefix = re.sub(r"[*_`\"\u2018\u2019\u201c\u201d]|(?<!\w)'|'(?!\w)", " ", prefix)
+    return _DELETION_PROSE_WARNING_RE.search(prefix) is not None
+
+
 def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
     """Recognize Setext underlines/thematic breaks with bounded, linear work."""
     line = line.strip(" \t")
@@ -2811,6 +2868,26 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         )
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
+    for match in _repository_deletion_prose_matches(content):
+        finding_tags = list(tag)
+        if _repository_deletion_prose_is_warning(content, match.start()):
+            finding_tags.extend(["contextual-triage", "likely-benign-context"])
+        # An explicit repository-wide instruction is not a safe container or
+        # cache cleanup, even when ordinary setup commands appear nearby.
+        findings.append(
+            AnalyzerFinding(
+                rule_id="TM1",
+                message="Destructive Repository Instruction",
+                severity=Severity.HIGH,
+                location=loc(get_line_number(content, match.start())),
+                confidence=0.9,
+                tags=finding_tags,
+                context=ctx(match.start()),
+                matched_text=match[0][:200],
+                complete_match=match[0],
+                evidence={static_runner._VIEW_START_EVIDENCE: match.start()},
+            )
+        )
     for pattern, confidence in TM2_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
