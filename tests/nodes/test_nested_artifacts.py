@@ -80,6 +80,18 @@ def test_runtime_code_in_typescript_declaration_named_file_stays_executable() ->
     assert is_executable_content("evil.d.cts", runtime)
 
 
+def test_typescript_side_effect_import_in_declaration_named_file_stays_executable() -> None:
+    runtime = b"import './payload.js';\nexport type Result = string;\n"
+
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+def test_mixed_typescript_declaration_and_runtime_stays_executable() -> None:
+    runtime = b"export type Result = string;\nconsole.log('runtime');\n"
+
+    assert is_executable_content("evil.d.ts", runtime)
+
+
 def _with_unsupported_compression(data: bytes, method: int = 99) -> bytes:
     encoded = bytearray(data)
     local_header = encoded.find(b"PK\x03\x04")

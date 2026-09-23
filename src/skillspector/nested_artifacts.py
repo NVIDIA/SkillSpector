@@ -384,15 +384,15 @@ _BINARY_EXECUTABLE_MAGICS = (
 )
 
 _TYPESCRIPT_DECLARATION_SUFFIXES = (".d.ts", ".d.cts", ".d.mts")
-_TYPESCRIPT_DECLARATION_MARKERS = re.compile(
-    r"\b(?:declare|interface|type|import\s+type|export\s+"
-    r"(?:declare|interface|type|namespace))\b"
-)
-_TYPESCRIPT_RUNTIME_MARKERS = re.compile(
-    r"\b(?:require|eval|Function|module\.exports|process\.|console\."
-    r"|fetch|new|setTimeout|setInterval|exec(?:Sync)?|spawn(?:Sync)?|"
-    r"child_process)\b|\b(?:const|let|var)\s+[A-Za-z_$]"
-    r"[\w$]*\s*=|(?:^|[;{}])\s*[A-Za-z_$][\w$]*\s*\([^)]*\)"
+_TYPESCRIPT_DECLARATION_FILE = re.compile(
+    r"\A\s*(?:"
+    r"(?:declare\s+(?:const|let|var|function|class|namespace|module)\b[^;{}]*;)|"
+    r"(?:(?:export\s+)?(?:interface|namespace)\b[^{}]*\{[^{}]*\}\s*;?)|"
+    r"(?:(?:export\s+)?type\b[^;{}]+;)|"
+    r"(?:import\s+type\b[^;{}]+;)|"
+    r"(?:export\s*\{[^{}]*\}\s*;?)"
+    r")+(?:\s|/\*.*?\*/|//[^\r\n]*)*\Z",
+    re.DOTALL,
 )
 
 
@@ -411,9 +411,8 @@ def _looks_like_typescript_declaration(path: str, data: bytes) -> bool:
     except UnicodeDecodeError:
         return False
     text = re.sub(r"/\*.*?\*/|//[^\r\n]*", "", text, flags=re.DOTALL)
-    if not text.strip() or _TYPESCRIPT_RUNTIME_MARKERS.search(text):
-        return False
-    return bool(_TYPESCRIPT_DECLARATION_MARKERS.search(text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return bool(text.strip() and _TYPESCRIPT_DECLARATION_FILE.fullmatch(text))
 
 
 def has_binary_executable_magic(data: bytes) -> bool:
