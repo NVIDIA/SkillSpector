@@ -2542,8 +2542,23 @@ class TestLLMAnalysisResult:
         assert finding.start_line == 10
         assert finding.end_line == 12
         assert finding.confidence == 0.95
+        assert finding.category == "Security"
+        assert finding.pattern == "Hardcoded secret"
+        assert finding.finding == "Hardcoded secret"
         assert finding.explanation == "Contains API key"
         assert finding.remediation == "Use env vars"
+
+    def test_to_finding_populates_report_metadata_for_semantic_rules(self) -> None:
+        finding = LLMFinding(
+            rule_id="SSD-3",
+            message="Natural-language credential exfiltration",
+            severity="CRITICAL",
+            start_line=3,
+        ).to_finding("SKILL.md")
+
+        assert finding.category == "Security"
+        assert finding.pattern == "Natural-language credential exfiltration"
+        assert finding.finding == "Natural-language credential exfiltration"
 
     def test_model_dump(self) -> None:
         f = LLMFinding(
