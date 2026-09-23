@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 import zlib
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
@@ -14,6 +16,7 @@ from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
 from skillspector.inspection_ledger import (
     MAX_FINDING_OUTPUT_RECORDS,
     MAX_INSPECTION_LEDGER_EVENTS,
+    REASON_MESSAGES,
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
@@ -43,6 +46,113 @@ _PNG_BIT_DEPTHS = {
     6: frozenset({8, 16}),
 }
 _MAX_PASSIVE_PNG_CHUNKS = 4_096
+_MAX_REFERENCE_REASONS = 16
+_REFERENCE_LIMIT_FIELDS = frozenset(
+    f"{prefix}_{unit}"
+    for prefix in ("observed", "limit")
+    for unit in ("characters", "bytes", "findings", "artifacts", "depth", "records", "seconds")
+)
+
+
+def _reference_analysis_evidence(
+    target_path: str,
+    disposition: str,
+    events: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Project bounded diagnostic facts without copying arbitrary ledger payloads."""
+    evidence: dict[str, object] = {
+        "target_path": target_path,
+        "target_disposition": disposition,
+    }
+    reasons: list[dict[str, object]] = []
+    for event in events:
+        if str(event.get("outcome")) not in {"partial", "failed", "skipped", "out_of_scope"}:
+            continue
+        try:
+            reason = LedgerReason(str(event.get("reason_code")))
+        except ValueError:
+            continue
+        phase = event.get("phase")
+        analyzer = event.get("analyzer_id")
+        row: dict[str, object] = {
+            "reason_code": reason.value,
+            "message": REASON_MESSAGES[reason],
+            "phase": (
+                phase
+                if isinstance(phase, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", phase)
+                else "unknown"
+            ),
+            "analyzers": (
+                [analyzer]
+                if isinstance(analyzer, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", analyzer)
+                else []
+            ),
+        }
+        for field in ("start_line", "end_line"):
+            value = event.get(field)
+            if type(value) is int and 0 < value < 2**63:
+                row[field] = value
+        limits: dict[str, int | float] = {}
+        for field in sorted(_REFERENCE_LIMIT_FIELDS):
+            value = event.get(field)
+            if type(value) is int and 0 <= value < 2**63:
+                limits[field] = value
+            elif (
+                field.endswith("_seconds")
+                and type(value) is float
+                and math.isfinite(value)
+                and value >= 0
+            ):
+                limits[field] = value
+        if limits:
+            row["limits"] = limits
+        if row in reasons:
+            continue
+        if len(reasons) == _MAX_REFERENCE_REASONS:
+            evidence["reasons_truncated"] = True
+            break
+        reasons.append(row)
+    evidence["reasons"] = reasons
+    return evidence
+
+
+def _reference_analysis_remediation(evidence: Mapping[str, object]) -> str:
+    """Give resolved references advice appropriate to their inspection limitation."""
+    reasons = {
+        str(row.get("reason_code"))
+        for row in evidence.get("reasons", [])
+        if isinstance(row, Mapping)
+    }
+    actions: list[str] = []
+    if LedgerReason.STATIC_PARSE_LIMIT in reasons:
+        actions.append(
+            "Review the reported expression and analyzer's parsing limitation; "
+            "correct the scanner if it misinterprets valid source, then rerun the scan."
+        )
+    if reasons & {LedgerReason.RUNTIME_LIMIT, LedgerReason.SIZE_LIMIT}:
+        actions.append(
+            "Review the reported analysis bounds and input size; "
+            "resolve the scanner limit or provide fully inspectable source, then rerun the scan."
+        )
+    if reasons & {
+        LedgerReason.READ_ERROR,
+        LedgerReason.STAT_ERROR,
+        LedgerReason.FILE_DISAPPEARED,
+        LedgerReason.MISSING_FILE_CACHE,
+    }:
+        actions.append(
+            "Ensure the resolved target remains readable throughout the scan, then rerun."
+        )
+    if reasons & {LedgerReason.BINARY_CONTENT, LedgerReason.OPAQUE_CONTENT}:
+        actions.append("Provide inspectable source or analysis support for the referenced format.")
+    if not actions or len(reasons) > 1 or evidence.get("reasons_truncated"):
+        actions.append(
+            "Review the target's analysis-completeness ledger and resolve all limitations."
+        )
+    actions.append(
+        "Keep required references; incomplete analysis is not proof of malicious evasion."
+    )
+    return " ".join(actions)
 
 
 def _png_scanlines_are_valid(compressed: bytes, expected_size: int, row_size: int) -> bool:
@@ -450,6 +560,7 @@ def _reference_coverage_findings(
     )
     findings: list[Finding] = []
     seen_locations: set[tuple[str, int, str]] = set()
+    diagnostics_by_target: dict[tuple[str, str], tuple[dict[str, object], str]] = {}
     for reference in raw_references:
         if not isinstance(reference, dict):
             continue
@@ -504,10 +615,21 @@ def _reference_coverage_findings(
             continue
         seen_locations.add(location)
         evidence = str(reference.get("evidence", ""))[:160]
+        diagnostic_key = (target_path, final_disposition)
+        if diagnostic_key not in diagnostics_by_target:
+            analysis_evidence = _reference_analysis_evidence(
+                target_path, final_disposition, target_events
+            )
+            diagnostics_by_target[diagnostic_key] = (
+                analysis_evidence,
+                _reference_analysis_remediation(analysis_evidence),
+            )
+        analysis_evidence, remediation = diagnostics_by_target[diagnostic_key]
         findings.append(
             Finding(
                 rule_id="AE1",
                 message="Referenced artifact was not completely inspected",
+                pattern="Incomplete referenced artifact analysis",
                 severity="HIGH",
                 confidence=1.0,
                 file=source_path,
@@ -517,10 +639,8 @@ def _reference_coverage_findings(
                 finding=f"{target_path} ({final_disposition})"[:200],
                 code_snippet=evidence,
                 matched_text=target_path,
-                remediation=(
-                    "Make the referenced artifact locally available and fully analyzable, "
-                    "or remove the reference."
-                ),
+                evidence=analysis_evidence,
+                remediation=remediation,
             )
         )
     return findings

@@ -70,6 +70,15 @@ _QUOTED_GLOB_SENTINEL = "\ue000"
 _DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
 _RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
 _SIMPLE_BRACED_PARAMETER_RE = re.compile(r"\$\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?$!-])\}")
+_PERL_LITERAL_PRINT_RE = re.compile(
+    r"^[ \t]*+print\b(?:[ \t]++(?:STDOUT|STDERR)\b)?[ \t]*+(?P<paren>\()?[ \t]*+"
+    r"(?P<literal>\"(?:\\[\\\"'nrt]|[^\\\"$@`\r\n])*+\""
+    r"|'(?:\\[\\\"'nrt]|[^\\'$@`\r\n])*+')"
+    r"[ \t]*+(?(paren)\))[ \t]*+;[ \t]*+(?:\#[^\r\n]*+)?\r?$",
+    re.MULTILINE,
+)
+_PERL_QUOTE_OPERATOR_RE = re.compile(r"\b(?:q[qwxr]?|m|s|tr|y)(?:\s+\S|[^\w\s])")
+_PERL_AMBIGUOUS_SIGIL_RE = re.compile(r"[$@%&*]\s*+[{#'\"`]")
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -1557,6 +1566,98 @@ def _command_wrapper_quote(content: str, command_start: int) -> str | None:
     return content[command_start - 1] if backslashes % 2 == 0 else None
 
 
+def _perl_literal_print_shell_text(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> str:
+    """Project only proven ordinary Perl print delimiters, retaining the payload.
+
+    This deliberately recognizes a small source subset, not general Perl: a
+    standalone print of one non-interpolated, single-line quoted literal, with
+    an optional standard output handle or parentheses. Ordinary surrounding
+    quotes and comments must also balance. Quote operators, heredocs, regexes,
+    and interpolation make host ownership uncertain, so leave that source on
+    the conservative path. Never use this to grant ownership to a fragment.
+
+    Only the two host delimiters change, with offsets preserved. In particular,
+    commands, prompt instructions and parser-limit payloads remain available to
+    the security scanners; printed text is not an analysis exemption.
+    """
+    literals: set[tuple[int, int]] = set()
+    check_runtime()
+    for match in _PERL_LITERAL_PRINT_RE.finditer(content):
+        check_runtime()
+        literals.add(match.span("literal"))
+    check_runtime()
+    if not literals:
+        return content
+    owned: list[tuple[int, int]] = []
+    cursor = 0
+    next_runtime_check = 0
+    while cursor < len(content):
+        if cursor >= next_runtime_check:
+            check_runtime()
+            next_runtime_check = cursor + 256
+        character = content[cursor]
+        if character == "#" and (cursor == 0 or content[cursor - 1] != "$"):
+            newline = content.find("\n", cursor)
+            cursor = len(content) if newline < 0 else newline + 1
+            continue
+        if character in "$@%&*" and _PERL_AMBIGUOUS_SIGIL_RE.match(content, cursor) is not None:
+            # Perl sigils can own quote punctuation (for example $' and *"),
+            # with whitespace/comments or braces inside the variable spelling.
+            # Leave those ambiguous forms outside this bounded source subset.
+            return content
+        if (
+            character == "/"
+            or content.startswith("<<", cursor)
+            or character in "qmsty"
+            and (cursor == 0 or content[cursor - 1] not in "$@%&")
+            and _PERL_QUOTE_OPERATOR_RE.match(content, cursor) is not None
+        ):
+            return content
+        if character not in "'\"`":
+            cursor += 1
+            continue
+        if cursor > 0:
+            previous = content[cursor - 1]
+            if character == "'" and (
+                previous.isalnum() or previous in "_:@%&*" or ord(previous) > 127
+            ):
+                # Apostrophes can separate legacy package names. Treat ambiguous adjacency
+                # (including print'...') conservatively instead of inventing
+                # a string that could hide an executable quote operator.
+                return content
+        start = cursor
+        quote = character
+        cursor += 1
+        while cursor < len(content):
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 256
+            character = content[cursor]
+            if character == "\\":
+                cursor += 2
+                continue
+            if character == quote:
+                cursor += 1
+                if (start, cursor) in literals:
+                    owned.append((start, cursor))
+                break
+            if quote != "'" and character in "$@":
+                # Interpolation can itself contain Perl expressions/quotes.
+                return content
+            cursor += 1
+        else:
+            return content
+    if not owned:
+        return content
+    output = list(content)
+    for start, end in owned:
+        output[start] = output[end - 1] = " "
+    return "".join(output)
+
+
 def _skip_command_substitution(
     content: str,
     start: int,
@@ -2485,6 +2586,8 @@ def _resolve_variable_shell_candidate(
 
 def _tm1_candidates(
     content: str,
+    *,
+    shell_content: str | None = None,
 ) -> Iterator[tuple[int, int, str, float]]:
     for pattern, confidence in TM1_PATTERNS:
         matches = (
@@ -2495,6 +2598,12 @@ def _tm1_candidates(
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             yield match.start(), match.end(), match.group(0), confidence
 
+    yield from _tm1_shell_candidates(content)
+    if shell_content is not None and shell_content != content:
+        yield from _tm1_shell_candidates(shell_content)
+
+
+def _tm1_shell_candidates(content: str) -> Iterator[tuple[int, int, str, float]]:
     seen_commands: set[tuple[int, int]] = set()
     covered_until = 0
     for command_start, body_start in _destructive_command_words(content):
@@ -2876,6 +2985,8 @@ def has_bounded_parse_exhaustion(
     structural_quote_closers = None
     structural_quote_openers = None
     json_strings: list[tuple[int, int]] = []
+    if file_type == "perl" and complete_context:
+        content = _perl_literal_print_shell_text(content, check_runtime)
     if file_type == "markdown":
         if complete_context:
             json_strings = validated_json_string_spans(content, check_runtime)
@@ -2992,7 +3103,12 @@ def analyze(
                 if candidate is not None and not candidate.visible:
                     invisible_variable_matches.add(span)
 
-    for match_start, match_end, matched_text, confidence in _tm1_candidates(content):
+    shell_content = (
+        _perl_literal_print_shell_text(content, lambda: None) if file_type == "perl" else None
+    )
+    for match_start, match_end, matched_text, confidence in _tm1_candidates(
+        content, shell_content=shell_content
+    ):
         variable_match = variable_matches.get((match_start, match_end))
         if variable_match is not None and variable_match[0].casefold().startswith("true"):
             # The case-insensitive direct ``shell=True`` pattern already owns
