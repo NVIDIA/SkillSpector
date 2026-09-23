@@ -116,6 +116,9 @@ class NestedInspectionResult:
     artifact_inventory: list[ArtifactRecord] = field(default_factory=list)
     metadata: list[dict[str, object]] = field(default_factory=list)
     outer_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
+    # Byte-recognized ZIPs at every depth, including ones stopped by a limit.
+    # Expected extensions and format mismatches are not content recognition.
+    recognized_zip_paths: set[str] = field(default_factory=set)
     ledger_events: list[InspectionLedgerEvent] = field(default_factory=list)
     uncompressed_bytes: int = 0
     # Exceptions can target a top-level container before a virtual artifact row
@@ -1024,6 +1027,7 @@ def _inspect_zip_bytes(
 
             if not nested_zip:
                 continue
+            result.recognized_zip_paths.add(virtual_path)
             if depth >= budget.max_depth:
                 _exception(
                     result,
@@ -1131,6 +1135,7 @@ def inspect_nested_artifacts(
             except (OSError, _FileOpenError, _UnsafeFileError):
                 continue
             if _is_zip_signature(signature):
+                result.recognized_zip_paths.add(path)
                 _record_outer_metadata(
                     result,
                     path=path,
@@ -1182,6 +1187,7 @@ def inspect_nested_artifacts(
             continue
         # Record a conservative local-only identity before parsing the central
         # directory. The bounded inspector refines this after its early checks.
+        result.recognized_zip_paths.add(path)
         _record_outer_metadata(
             result,
             path=path,
