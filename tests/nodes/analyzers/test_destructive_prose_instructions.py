@@ -61,8 +61,10 @@ def test_destructive_instruction_recognizes_broad_named_targets(scope: str, targ
     assert _active_tm1(f"Run `rm -rf {scope} {target}`")
 
 
-@pytest.mark.parametrize("flags", ["-rf", "-fr", "-r -f", "--recursive --force"])
-def test_destructive_instruction_recognizes_recursive_force_flags(flags: str) -> None:
+@pytest.mark.parametrize(
+    "flags", ["-rf", "-fr", "-r -f", "--recursive --force", "-r", "--recursive"]
+)
+def test_destructive_instruction_recognizes_recursive_flags(flags: str) -> None:
     assert _active_tm1(f'Run "rm {flags} entire repo"')
 
 
@@ -143,7 +145,6 @@ def test_safety_warnings_are_not_unqualified_destructive_instructions(instructio
         "Run rm -rf all project files-cache",
         "Run rm -rf all project files.tmp",
         "Run rm -rf all workspace data-cache",
-        "Run rm -r entire repo",
         "Run rm -f entire repo",
         "Run rm --force entire repo",
         "Run rm -- -rf entire repo",
