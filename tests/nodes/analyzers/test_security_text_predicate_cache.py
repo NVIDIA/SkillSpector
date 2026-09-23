@@ -99,3 +99,30 @@ def test_cache_is_bounded() -> None:
         _requires_normalized_security_view,
     ):
         assert predicate.cache_info().maxsize is not None
+
+
+@pytest.mark.parametrize("text", _TEXTS)
+def test_deadline_aware_views_match_cached_views(text: str) -> None:
+    expected = security_text_views(text)
+    actual = security_text_views(text, lambda: None)
+    assert [(view.name, view.text) for view in actual] == [
+        (view.name, view.text) for view in expected
+    ]
+
+
+@pytest.mark.parametrize("text", _TEXTS)
+def test_warm_cache_does_not_bypass_predicate_deadline(text: str) -> None:
+    security_text_views(text)
+
+    class Deadline:
+        # A per-scan callback is not a cache key and need not be hashable.
+        __hash__ = None
+        calls = 0
+
+        def __call__(self) -> None:
+            self.calls += 1
+            if self.calls == 2:
+                raise TimeoutError("deadline reached during predicate evaluation")
+
+    with pytest.raises(TimeoutError, match="during predicate evaluation"):
+        security_text_views(text, Deadline())

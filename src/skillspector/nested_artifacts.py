@@ -25,6 +25,7 @@ from skillspector.artifacts import (
     ArtifactRecord,
     ContentKind,
     classify_artifact,
+    has_dex_magic,
 )
 from skillspector.constants import MAX_FILE_BYTES
 from skillspector.input_handler import (
@@ -60,11 +61,13 @@ _EXECUTABLE_SUFFIXES = frozenset(
         ".class",
         ".cts",
         ".dll",
+        ".dex",
         ".dylib",
         ".exe",
         ".go",
         ".js",
         ".jsx",
+        ".luac",
         ".mjs",
         ".msi",
         ".mts",
@@ -113,6 +116,9 @@ class NestedInspectionResult:
     artifact_inventory: list[ArtifactRecord] = field(default_factory=list)
     metadata: list[dict[str, object]] = field(default_factory=list)
     outer_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
+    # Byte-recognized ZIPs at every depth, including ones stopped by a limit.
+    # Expected extensions and format mismatches are not content recognition.
+    recognized_zip_paths: set[str] = field(default_factory=set)
     ledger_events: list[InspectionLedgerEvent] = field(default_factory=list)
     uncompressed_bytes: int = 0
     # Exceptions can target a top-level container before a virtual artifact row
@@ -373,6 +379,7 @@ _BINARY_EXECUTABLE_MAGICS = (
     b"MZ",
     b"\x7fELF",
     b"\x00asm",
+    b"\x1bLua",
     b"\xfe\xed\xfa",
     b"\xce\xfa\xed\xfe",
     b"\xcf\xfa\xed\xfe",
@@ -385,7 +392,7 @@ _BINARY_EXECUTABLE_MAGICS = (
 
 def has_binary_executable_magic(data: bytes) -> bool:
     """Return whether canonical bytes begin with supported executable magic."""
-    return data.startswith(_BINARY_EXECUTABLE_MAGICS)
+    return has_dex_magic(data) or data.startswith(_BINARY_EXECUTABLE_MAGICS)
 
 
 def is_executable_content(path: str, data: bytes, mode: int = 0) -> bool:
@@ -1020,6 +1027,7 @@ def _inspect_zip_bytes(
 
             if not nested_zip:
                 continue
+            result.recognized_zip_paths.add(virtual_path)
             if depth >= budget.max_depth:
                 _exception(
                     result,
@@ -1127,6 +1135,7 @@ def inspect_nested_artifacts(
             except (OSError, _FileOpenError, _UnsafeFileError):
                 continue
             if _is_zip_signature(signature):
+                result.recognized_zip_paths.add(path)
                 _record_outer_metadata(
                     result,
                     path=path,
@@ -1178,6 +1187,7 @@ def inspect_nested_artifacts(
             continue
         # Record a conservative local-only identity before parsing the central
         # directory. The bounded inspector refines this after its early checks.
+        result.recognized_zip_paths.add(path)
         _record_outer_metadata(
             result,
             path=path,

@@ -29,6 +29,7 @@ import struct
 import subprocess
 import zipfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from stat import S_IFIFO, S_IFLNK
 
@@ -719,6 +720,130 @@ def _stub_private_ip_check(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestGitCloneBound:
     """``_clone_git`` rejects clones whose on-disk size exceeds the cap."""
+
+    @pytest.mark.parametrize("kind", ["file", "directory"])
+    @pytest.mark.parametrize("max_bytes", [100, 10])
+    def test_running_clone_remeasures_after_git_metadata_disappears(
+        self, monkeypatch: pytest.MonkeyPatch, kind: str, max_bytes: int
+    ) -> None:
+        import skillspector.input_handler as ih
+
+        _stub_private_ip_check(monkeypatch)
+        real_scandir = ih.os.scandir
+        vanished: list[Path] = []
+        processes = []
+        budget = _RecordingBudget(max_bytes=max_bytes, max_artifacts=20)
+
+        class RenamingProcess(_CompletedGitProcess):
+            def __init__(self, command: list[str]) -> None:
+                self.root = Path(command[-1])
+                self.metadata = self.root / ".git" / "temporary"
+                self.metadata.parent.mkdir(parents=True)
+                if kind == "file":
+                    self.metadata.write_bytes(b"temporary")
+                else:
+                    self.metadata.mkdir()
+                self.completed = False
+
+            def poll(self) -> int | None:
+                return 0 if self.completed else None
+
+            def wait(self, timeout: float | None = None) -> int:
+                (self.root / "SKILL.md").write_bytes(b"# small")
+                (self.root / ".git" / "pack").write_bytes(b"final pack")
+                self.completed = True
+                return 0
+
+        def fake_popen(command: list[str], **kwargs: object) -> RenamingProcess:
+            process = RenamingProcess(command)
+            processes.append(process)
+            return process
+
+        @contextmanager
+        def racing_scandir(path):
+            if isinstance(path, int):
+                with real_scandir(path) as entries:
+                    yield entries
+                return
+            process = processes[0]
+            if not process.completed and not vanished and kind == "directory":
+                if Path(path) == process.metadata:
+                    process.metadata.rmdir()
+                    vanished.append(process.metadata)
+            with real_scandir(path) as entries:
+                yield entries
+            if not process.completed and not vanished and kind == "file":
+                if Path(path) == process.metadata.parent:
+                    process.metadata.unlink()
+                    vanished.append(process.metadata)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(ih.os, "scandir", racing_scandir)
+        handler = InputHandler(transitive_budget=budget)
+        try:
+            if max_bytes < len(b"# smallfinal pack"):
+                with pytest.raises(TransitiveIngestTruncatedError, match="byte_budget_exhausted"):
+                    handler.resolve("https://github.com/foo/renaming")
+                assert vanished == [processes[0].metadata]
+                assert not processes[0].root.exists()
+                assert budget.scanned_bytes == 0
+                return
+            resolved, source_type = handler.resolve("https://github.com/foo/renaming")
+            assert source_type == "git"
+            assert vanished == [processes[0].metadata]
+            assert (resolved / "SKILL.md").read_bytes() == b"# small"
+            assert budget.scanned_bytes == len(b"# smallfinal pack")
+            assert budget.scanned_artifacts == 3
+        finally:
+            monkeypatch.setattr(ih.os, "scandir", real_scandir)
+            handler.cleanup()
+
+    @pytest.mark.parametrize(
+        ("running", "directory", "error"),
+        [
+            (False, ".git", FileNotFoundError),
+            (True, "content", FileNotFoundError),
+            (True, ".git", PermissionError),
+        ],
+    )
+    def test_clone_inspection_errors_still_fail_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        running: bool,
+        directory: str,
+        error: type[OSError],
+    ) -> None:
+        import skillspector.input_handler as ih
+
+        _stub_private_ip_check(monkeypatch)
+        real_scandir = ih.os.scandir
+        roots: list[Path] = []
+
+        class Process(_CompletedGitProcess):
+            def poll(self) -> int | None:
+                return None if running else 0
+
+        def fake_popen(command: list[str], **kwargs: object) -> Process:
+            root = Path(command[-1])
+            (root / directory).mkdir(parents=True)
+            roots.append(root)
+            return Process()
+
+        def failing_scandir(path):
+            if not isinstance(path, int) and roots and Path(path) == roots[0] / directory:
+                raise error("simulated inspection error")
+            return real_scandir(path)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(ih.os, "scandir", failing_scandir)
+        handler = InputHandler()
+        try:
+            with pytest.raises(ValueError, match="Could not safely inspect") as raised:
+                handler.resolve("https://github.com/foo/inspection-error")
+            assert isinstance(raised.value.__cause__, error)
+            assert not roots[0].exists()
+        finally:
+            handler.cleanup()
 
     def test_under_cap_clone_succeeds(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

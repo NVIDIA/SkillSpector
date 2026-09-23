@@ -201,6 +201,34 @@ class TestAzureOpenAIProvider:
         assert provider.get_context_length("gpt-4o") == 128000
         assert provider.get_max_output_tokens("gpt-4o") == 16384
 
+    def test_metadata_flagship_generation(self) -> None:
+        provider = AzureOpenAIProvider()
+        for model in (
+            "gpt-5.4",
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-5.6-sol",
+            "gpt-5.6",
+            "gpt-6-astra",
+        ):
+            assert provider.get_context_length(model) == 1050000
+            assert provider.get_max_output_tokens(model) == 128000
+
+    def test_metadata_gpt5_generation(self) -> None:
+        provider = AzureOpenAIProvider()
+        for model in (
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5.1",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.2",
+        ):
+            assert provider.get_context_length(model) == 400000
+            assert provider.get_max_output_tokens(model) == 128000
+
     def test_create_returns_none_without_credentials(self) -> None:
         assert AzureOpenAIProvider().create_chat_model("gpt-4o", max_tokens=1024) is None
 
