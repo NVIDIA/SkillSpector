@@ -74,6 +74,9 @@ def test_exact_filename_wins_over_sentence_period(
         "Read [guide](<./guide.>).",
         "[guide]: ./guide.",
         "[guide]: <./guide.>",
+        r"\![guide](./guide.)",
+        r"\![guide](<./guide.>)",
+        r'\![guide](./guide. "title")',
     ],
 )
 @pytest.mark.parametrize("present", [False, True])
@@ -192,3 +195,24 @@ def test_sentence_reference_preserves_threat_detection(tmp_path: Path, period: s
     assert report["analysis_completeness"]["references"][0]["target_path"] == "guide"
     assert any(issue["id"] == "P1" for issue in report["issues"])
     assert report["risk_assessment"]["recommendation"] != "SAFE"
+
+
+def test_cli_escaped_image_keeps_literal_missing_reference(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: reference-control\ndescription: Summarize the supplied guide.\n---\n\n"
+        r"Read \![guide](./guide.)."
+        "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "guide").write_text("Explain the supplied example.\n", encoding="utf-8")
+    result = CliRunner().invoke(
+        app, ["scan", str(tmp_path), "--no-llm", "--format", "json", "--fail-on-incomplete"]
+    )
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.stdout)
+    assert report["execution_successful"] is True
+    assert report["analysis_completeness"]["is_complete"] is False
+    assert report["risk_assessment"]["recommendation"] == "CAUTION"
+    reference = report["analysis_completeness"]["references"][0]
+    assert reference["status"] == "missing"
+    assert reference["target_path"] is None

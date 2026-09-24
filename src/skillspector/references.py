@@ -403,7 +403,7 @@ def _candidate_strings(
                     # contexts retain every filename character; resolution
                     # below also prefers an exact inventory match.
                     sentence_period = (
-                        reference_kind is ReferenceKind.PLAIN_PATH
+                        match.kind is ReferenceKind.PLAIN_PATH
                         and raw.endswith(".")
                         and not raw.endswith("..")
                         and not line_in_fence
