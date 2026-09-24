@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -429,7 +430,11 @@ def test_public_projection_drops_unknown_fields_and_redacts_unsafe_labels() -> N
         "hf_fake-value",
         "AIza-fake-value",
         "Bearer synthetic-secret-token-123456",
-        "Basic c3ludGhldGljOnNlY3JldA==",
+        # Build a realistic Basic header from explicit dummy credentials.
+        pytest.param(
+            "Basic " + base64.b64encode(b"synthetic-user:synthetic-password").decode("ascii"),
+            id="synthetic-basic-auth",
+        ),
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.fake_signature",
         "ewogICJhbGciOiAibm9uZSIKfQ.eyJzdWIiOiJzeW50aGV0aWMifQ.",
         "0123456789abcdef" * 2,

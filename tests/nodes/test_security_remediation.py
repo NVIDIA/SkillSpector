@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import time
 import tracemalloc
 import zipfile
@@ -57,6 +58,27 @@ def test_content_classification_uses_bytes_not_extension() -> None:
     assert binary["misleading_extension"] is True
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("classes.dex", b"dex\n035\0" + b"\0" * 104),
+        ("chunk.luac", b"\x1bLua" + b"\0" * 108),
+    ],
+)
+def test_utf8_decodable_bytecode_magic_is_still_binary(path: str, payload: bytes) -> None:
+    artifact = classify_artifact(path, payload, referenced=True)
+
+    assert artifact["content_kind"] is ContentKind.BINARY
+    assert artifact["disposition"] is ArtifactDisposition.PARTIAL
+
+
+def test_dex_word_prefix_remains_text_content() -> None:
+    artifact = classify_artifact("glossary.txt", b"dex\nA short term for dexterity.\n")
+
+    assert artifact["content_kind"] is ContentKind.TEXT
+    assert artifact["disposition"] is ArtifactDisposition.ANALYZED
+
+
 def test_referenced_opaque_artifact_is_partial() -> None:
     artifact = classify_artifact("assets/blob.bin", b"\x89PNG\r\n\x1a\n\x00data", referenced=True)
     assert artifact["disposition"] == ArtifactDisposition.PARTIAL
@@ -83,7 +105,9 @@ description: A skill that ships one small PNG as reference material.
 
 # Binary repro
 
-Describe the diagram in assets/diagram.png to the user.
+Describe this diagram to the user:
+
+![Diagram](assets/diagram.png)
 """,
         encoding="utf-8",
     )
@@ -102,9 +126,10 @@ Describe the diagram in assets/diagram.png to the user.
     findings = [finding for finding in result["findings"] if finding.file == "assets/diagram.png"]
     assert artifact["content_kind"] in {ContentKind.BINARY, ContentKind.OPAQUE}
     assert not {finding.rule_id for finding in findings} & {"AE3", "AE4"}
-    assert any(
+    assert not any(
         finding.rule_id == "AE1" and finding.file == "SKILL.md" for finding in result["findings"]
     )
+    assert result["analysis_completeness"]["is_complete"] is False
     assert any(
         event.get("analyzer_id") == "artifact_integrity"
         and event.get("path") == "assets/diagram.png"
@@ -351,6 +376,203 @@ def test_full_body_reference_resolver_handles_markdown_and_unique_basename(
 
     assert records
     assert {record["target_path"] for record in records} == {"references/guide.md"}
+    assert all(record["status"] == "resolved" for record in records)
+
+
+@pytest.mark.parametrize(
+    ("source_text", "expected_kind"),
+    [
+        ("![Chart](assets/chart.png)", "markdown_image"),
+        ("![](assets/chart.png)", "markdown_image"),
+        ('![Chart](assets/chart.png "Color chart")', "markdown_image"),
+        ("![Chart](assets/chart.png 'Color chart')", "markdown_image"),
+        ('![Chart](assets/chart.png\t"Color chart")', "markdown_image"),
+        ("- ![Chart](assets/chart.png)", "markdown_image"),
+        ("1. ![Chart](assets/chart.png)", "markdown_image"),
+        ("> ![Chart](assets/chart.png)", "markdown_image"),
+        ("> - ![Chart](assets/chart.png)", "markdown_image"),
+        ("[Chart](assets/chart.png)", "markdown_link"),
+        ("Run `bash assets/chart.png`.", "inline_command"),
+        ("Inspect `assets/chart.png`.", "quoted_or_code"),
+        ("Inspect assets/chart.png before continuing.", "plain_path"),
+        (r"\![Chart](assets/chart.png)", "plain_path"),
+        ("Show `![Chart](assets/chart.png)` then run it.", "quoted_or_code"),
+        ("`example\n![Chart](assets/chart.png)\nend`", "quoted_or_code"),
+        ("```markdown\n![Chart](assets/chart.png)\n```", "quoted_or_code"),
+        ("    ![Chart](assets/chart.png)", "quoted_or_code"),
+    ],
+)
+def test_reference_resolver_classifies_the_specific_reference_use(
+    tmp_path: Path,
+    source_text: str,
+    expected_kind: str,
+) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source_text,
+        known_paths=["SKILL.md", "assets/chart.png"],
+    )
+
+    assert len(records) == 1
+    assert records[0]["target_path"] == "assets/chart.png"
+    assert records[0]["reference_kind"] == expected_kind
+    assert json.loads(json.dumps(records))[0]["reference_kind"] == expected_kind
+
+
+def test_markdown_image_alt_text_is_not_a_second_plain_reference(tmp_path: Path) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text="![assets/chart.png](assets/chart.png)",
+        known_paths=["SKILL.md", "assets/chart.png"],
+    )
+
+    assert len(records) == 1
+    assert records[0]["reference_kind"] == "markdown_image"
+
+
+@pytest.mark.parametrize(
+    ("source_text", "target"),
+    [
+        (r"![Chart\](assets/chart.png)", "assets/chart.png"),
+        ("![[Chart](assets/chart.png)", "assets/chart.png"),
+        (r"![Chart](assets/chart.png\))", "assets/chart.png)"),
+        ("![Chart](assets/chart.png Color chart)", "assets/chart.png"),
+        ("![Chart](assets/chart.png (Color chart))", "assets/chart.png"),
+        (r'![Chart](assets/chart.png "Color \"chart\"")', "assets/chart.png"),
+    ],
+    ids=[
+        "escaped-label-delimiter",
+        "unmatched-label-bracket",
+        "escaped-destination-delimiter",
+        "unquoted-title",
+        "unsupported-parenthesized-title",
+        "escaped-title-delimiter",
+    ],
+)
+def test_ambiguous_image_syntax_does_not_prove_passive_use(
+    tmp_path: Path, source_text: str, target: str
+) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source_text,
+        known_paths=["SKILL.md", target],
+    )
+
+    references = [record for record in records if record["target_path"] == target]
+    assert references
+    assert all(record["reference_kind"] != "markdown_image" for record in references)
+
+
+@pytest.mark.parametrize(
+    "literal_block",
+    [
+        "> ~~~text\n> ![Chart](assets/chart.png)\n> ~~~",
+        "> ```text\n> ![Chart](assets/chart.png)\n> ```",
+        "- ~~~text\n  ![Chart](assets/chart.png)\n  ~~~",
+        "- ```text\n  ![Chart](assets/chart.png)\n  ```",
+        "1. ~~~text\n   ![Chart](assets/chart.png)\n   ~~~",
+        " \t![Chart](assets/chart.png)",
+        "  \t![Chart](assets/chart.png)",
+        "   \t![Chart](assets/chart.png)",
+        "<!-- ![Chart](assets/chart.png) -->",
+        "<!--\n![Chart](assets/chart.png)\n-->",
+        "<pre>\n![Chart](assets/chart.png)\n</pre>",
+        "<textarea>\n![Chart](assets/chart.png)\n</textarea>",
+        "<script>\n![Chart](assets/chart.png)\n</script>",
+        "<style>\n![Chart](assets/chart.png)\n</style>",
+        "<div>\n![Chart](assets/chart.png)\n</div>",
+        "<!-- First --> <!-- Second\n![Chart](assets/chart.png)\n-->",
+        "<pre>First</pre><textarea>\n![Chart](assets/chart.png)\n</textarea>",
+        "<!-- `\n![Chart](assets/chart.png)\n-->",
+        "<pre>`\n![Chart](assets/chart.png)\n</pre>",
+        "> <pre>\n> ![Chart](assets/chart.png)\n> </pre>",
+        "- <pre>\n  ![Chart](assets/chart.png)\n  </pre>",
+        "1. <!--\n   ![Chart](assets/chart.png)\n   -->",
+        "> `![Chart](assets/chart.png)`",
+        "- `![Chart](assets/chart.png)`",
+        "1. `![Chart](assets/chart.png)`",
+        ">     ![Chart](assets/chart.png)",
+        "-     ![Chart](assets/chart.png)",
+        "1.     ![Chart](assets/chart.png)",
+    ],
+    ids=[
+        "quoted-tilde-fence",
+        "quoted-backtick-fence",
+        "list-tilde-fence",
+        "list-backtick-fence",
+        "ordered-list-tilde-fence",
+        "space-tab-indent",
+        "two-spaces-tab-indent",
+        "three-spaces-tab-indent",
+        "inline-html-comment",
+        "html-comment-block",
+        "pre-block",
+        "textarea-block",
+        "script-block",
+        "style-block",
+        "html-block",
+        "multiple-html-comments",
+        "multiple-html-literal-blocks",
+        "html-comment-backtick",
+        "html-literal-backtick",
+        "quoted-html-literal-block",
+        "list-html-literal-block",
+        "ordered-list-html-comment",
+        "quoted-inline-code",
+        "list-inline-code",
+        "ordered-list-inline-code",
+        "quoted-indented-code",
+        "list-indented-code",
+        "ordered-list-indented-code",
+    ],
+)
+def test_literal_markdown_context_does_not_prove_a_passive_image(
+    tmp_path: Path, literal_block: str
+) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=literal_block + "\n\n![Rendered chart](assets/rendered.png)\n",
+        known_paths=["SKILL.md", "assets/chart.png", "assets/rendered.png"],
+    )
+
+    literal_references = [
+        record for record in records if record["target_path"] == "assets/chart.png"
+    ]
+    assert literal_references
+    assert all(record["reference_kind"] != "markdown_image" for record in literal_references)
+    rendered_references = [
+        record for record in records if record["target_path"] == "assets/rendered.png"
+    ]
+    assert len(rendered_references) == 1
+    assert rendered_references[0]["reference_kind"] == "markdown_image"
+
+
+@pytest.mark.parametrize(
+    ("label", "target", "expected_kind"),
+    [
+        ("Inspect references/extra.txt", "references/extra.txt", "plain_path"),
+        ("Use `python scripts/helper.py`", "scripts/helper.py", "inline_command"),
+    ],
+    ids=["distinct-path", "inline-command"],
+)
+def test_visible_link_labels_preserve_distinct_artifact_references(
+    tmp_path: Path, label: str, target: str, expected_kind: str
+) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=f"[{label}](references/guide.md)",
+        known_paths=["SKILL.md", "references/guide.md", target],
+    )
+
+    assert {(record["target_path"], record["reference_kind"]) for record in records} == {
+        ("references/guide.md", "markdown_link"),
+        (target, expected_kind),
+    }
     assert all(record["status"] == "resolved" for record in records)
 
 
