@@ -1816,24 +1816,23 @@ def _has_shell_command_word_exhaustion(
         if parsed.limited:
             return True
         if parsed.dynamic and may_have_destructive_outer_operands:
-            tokens, _, exhausted = _bounded_shell_tokens(
+            tokens, command_end, exhausted = _bounded_shell_tokens(
                 content,
                 start,
                 parsed.end,
                 check_runtime=check_runtime,
             )
-            if exhausted:
+            if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
                 # Earlier prose (for example "row-first") cannot supply this
-                # command's operands. Keep the entire remaining suffix in the
-                # prefilter: real operands beyond the tokenizer's bound must
-                # still fail closed. A negative result also applies to every
-                # later candidate, so this extra suffix scan occurs only once.
+                # command's operands. Refine only this candidate's exhausted
+                # span, including nested commands inside the executable word.
+                # Hitting the span bound always remains partial, including when
+                # real operands occur beyond that bound. This rescan is bounded
+                # by the same constant as the tokenizer.
                 check_runtime()
-                may_have_destructive_outer_operands = _may_have_destructive_outer_operands(
-                    content[parsed.end :]
-                )
+                exhausted = _may_have_destructive_outer_operands(content[start:command_end])
             if (
-                (exhausted and may_have_destructive_outer_operands)
+                exhausted
                 or _has_unsupported_brace_expansion(tokens)
                 or _has_destructive_root_glob(tokens)
                 or _has_destructive_root_path(tokens)
@@ -3408,13 +3407,15 @@ def _markdown_shell_text(
         # ownership before masking any apostrophe. Unresolved words retain all
         # remaining bytes; this pass never grants ownership past a parse limit.
         cursor = 0
+        next_runtime_check = 0
         last_apostrophe = max(prose_apostrophes)
         parameter_ends: dict[int, _ParameterExpansionEnd] = {}
         substitution_ends: dict[int, int | None] = {}
         backtick_ends: dict[int, int | None] = {}
         while cursor <= last_apostrophe:
-            if cursor % 4096 == 0:
+            if cursor >= next_runtime_check:
                 check_runtime()
+                next_runtime_check = cursor + 4096
             if cursor in prose_apostrophes:
                 output[cursor] = " "
             elif projected[cursor] in "'\"`$\\":

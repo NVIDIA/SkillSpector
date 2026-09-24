@@ -153,6 +153,19 @@ def test_runtime_operands_beyond_tokenizer_bound_stay_partial(arguments: str) ->
     assert tm.has_bounded_parse_exhaustion("$CMD " + arguments, lambda: None)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$(echo; $CMD -rf /)",
+        "`echo; $CMD -rf /`",
+        '$(echo; $WRAP -c "rm -rf /")',
+    ],
+)
+@pytest.mark.parametrize("tail", ["'", " " * 8200 + "safe", "x" * 8200])
+def test_outer_context_does_not_discard_nested_command_operands(command: str, tail: str) -> None:
+    assert tm.has_bounded_parse_exhaustion(command + " " + tail, lambda: None)
+
+
 def test_prose_ownership_requires_complete_context() -> None:
     assert tm.has_bounded_parse_exhaustion(
         _APOSTROPHE, lambda: None, file_type="markdown", complete_context=False
@@ -171,3 +184,26 @@ def test_prose_ownership_preserves_cancellation() -> None:
 
     with pytest.raises(TimeoutError, match="cancelled"):
         tm.has_bounded_parse_exhaustion(_APOSTROPHE * 100, cancel, file_type="markdown")
+
+
+def test_prose_ownership_checks_cancellation_after_word_jumps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parsed_words = 0
+    original = tm._parse_shell_command_word
+
+    def counted(*args, **kwargs):
+        nonlocal parsed_words
+        parsed_words += 1
+        return original(*args, **kwargs)
+
+    def cancel() -> None:
+        if parsed_words >= 10:
+            raise TimeoutError("cancelled")
+
+    monkeypatch.setattr(tm, "_parse_shell_command_word", counted)
+    # Each short parameter jumps over an exact multiple of the callback stride.
+    content = "a" * 4095 + "$X " + ("a" * 4093 + "$X ") * 100
+    content += "\n\nThe interface doesn't match the spec.\n"
+    with pytest.raises(TimeoutError, match="cancelled"):
+        tm._markdown_shell_text(content, cancel)
