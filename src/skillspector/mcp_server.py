@@ -42,6 +42,7 @@ from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
 
+
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
