@@ -72,7 +72,7 @@ class ReferenceResolutionResult:
 
 _PLAIN_RELATIVE_PATH = re.compile(
     r"(?<![\w:/.-])((?:\./(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+|"
-    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}))(?![\w/.-])"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}\.?))(?![\w/.-])"
 )
 
 
@@ -274,7 +274,7 @@ def _candidate_strings(
     *,
     deadline: float,
     clock: Callable[[], float],
-) -> tuple[list[tuple[str, int, int, str, ReferenceKind]], tuple[str, ...]]:
+) -> tuple[list[tuple[str, int, int, str, ReferenceKind, bool]], tuple[str, ...]]:
     """Extract path-like strings without materializing all matches or lines.
 
     Each candidate iterator contributes at most one pending match to a small
@@ -282,7 +282,7 @@ def _candidate_strings(
     attacker-controlled line cannot be fully enumerated and sorted before the
     candidate and time ceilings are enforced.
     """
-    candidates: list[tuple[str, int, int, str, ReferenceKind]] = []
+    candidates: list[tuple[str, int, int, str, ReferenceKind, bool]] = []
     limitations: set[str] = set()
     seen: set[tuple[int, int, str]] = set()
     active_fence: tuple[str, int, int, int] | None = None
@@ -399,6 +399,20 @@ def _candidate_strings(
                 key = (line_number, match.start, raw)
                 if key not in seen:
                     seen.add(key)
+                    # A single prose period may delimit a path. Literal/code
+                    # contexts retain every filename character; resolution
+                    # below also prefers an exact inventory match.
+                    sentence_period = (
+                        reference_kind is ReferenceKind.PLAIN_PATH
+                        and raw.endswith(".")
+                        and not raw.endswith("..")
+                        and not line_in_fence
+                        and not line_is_indented_code
+                        and not line_in_html
+                        and inline_code_delimiter is None
+                        and (match.start == 0 or line[match.start - 1] not in "`'\"")
+                        and (match.end == len(line) or line[match.end].isspace())
+                    )
                     candidates.append(
                         (
                             raw,
@@ -406,6 +420,7 @@ def _candidate_strings(
                             match.start + 1,
                             _evidence(cleaned_line, match.start + 1),
                             reference_kind,
+                            sentence_period,
                         )
                     )
                     if len(candidates) >= MAX_RAW_REFERENCE_CANDIDATES:
@@ -496,11 +511,18 @@ def resolve_bundle_references_with_metadata(
     limitations.extend(candidate_limitations)
     records: list[BundleReference] = []
     accepted_keys: set[tuple[str, str]] = set()
-    for raw, line, column, evidence, reference_kind in candidates:
+    for raw, line, column, evidence, reference_kind, sentence_period in candidates:
         if clock() > effective_deadline:
             limitations.append("runtime")
             break
         target = _normalize_candidate(raw, source_path)
+        if target is not None and target not in known and sentence_period:
+            # Never probe the filesystem or use basename fallback for this
+            # alternative: it must name an already-discovered artifact at the
+            # same relative location. Missing references remain missing.
+            sentence_target = _normalize_candidate(raw[:-1], source_path)
+            if sentence_target in known:
+                target = sentence_target
         status = "rejected"
         disposition = ArtifactDisposition.OUT_OF_SCOPE
         resolved_target: str | None = None
