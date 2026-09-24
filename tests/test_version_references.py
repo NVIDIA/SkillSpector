@@ -13,6 +13,27 @@ from skillspector.cli import app
 from skillspector.references import resolve_bundle_references_with_metadata
 
 
+@pytest.mark.parametrize("present", [False, True])
+def test_frontmatter_without_version_skips_yaml_reference_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, present: bool
+) -> None:
+    def unexpected_parse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("A header without version metadata needs no YAML event pass")
+
+    monkeypatch.setattr("skillspector.references.yaml.parse", unexpected_parse)
+    result = resolve_bundle_references_with_metadata(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text='---\nname: greeting\n---\nRead "docs/tool.1".\nversion: "1.2"\n',
+        known_paths=["SKILL.md", "docs/tool.1"] if present else ["SKILL.md"],
+    )
+    assert result.complete
+    assert len(result.records) == 2
+    assert result.records[0]["status"] == ("resolved" if present else "missing")
+    assert result.records[1]["status"] == "missing"
+    assert result.accepted_references == 2
+
+
 @pytest.mark.parametrize("field", ["version", "metadata:\n  version"])
 @pytest.mark.parametrize("value", ['"1.2.3"', "'1.0.0'", "1.2.3", '"v1.2.0-beta.1"'])
 def test_pinned_version_is_complete_through_strict_cli(

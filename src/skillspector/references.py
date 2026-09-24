@@ -293,6 +293,10 @@ def _quoted_frontmatter_scalars(
     if closing is None:
         return set()
     frontmatter = prefix[: closing.start() + 4]
+    # Every eligible version field contains this literal; other headers cannot
+    # produce an exemption and need no additional YAML parsing.
+    if "version" not in frontmatter:
+        return set()
     spans: set[tuple[int, int]] = set()
     events = yaml.parse(frontmatter)
     try:
