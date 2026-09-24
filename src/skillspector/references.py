@@ -279,7 +279,7 @@ def _html_context_end(match: re.Match[str]) -> re.Pattern[str] | None:
 
 def _quoted_frontmatter_scalars(
     text: str, *, deadline: float, clock: Callable[[], float]
-) -> set[tuple[int, int, int]]:
+) -> set[tuple[int, int]]:
     """Locate real quoted YAML scalars, conservatively retaining refs on failure.
 
     Parse events rather than constructing YAML objects or expanding aliases.
@@ -293,7 +293,7 @@ def _quoted_frontmatter_scalars(
     if closing is None:
         return set()
     frontmatter = prefix[: closing.start() + 4]
-    spans: set[tuple[int, int, int]] = set()
+    spans: set[tuple[int, int]] = set()
     events = yaml.parse(frontmatter)
     try:
         for count, event in enumerate(events, 1):
@@ -304,13 +304,9 @@ def _quoted_frontmatter_scalars(
                 and event.style in {"'", '"'}
                 and event.start_mark.line == event.end_mark.line
             ):
-                spans.add(
-                    (
-                        event.start_mark.line + 1,
-                        event.start_mark.column + 1,
-                        event.end_mark.column - 1,
-                    )
-                )
+                # YAML recognizes more line separators than StringIO. Absolute
+                # offsets bind the exemption to the same source characters.
+                spans.add((event.start_mark.index + 1, event.end_mark.index - 1))
     except yaml.YAMLError:
         return set()
     finally:
@@ -339,6 +335,7 @@ def _candidate_strings(
     html_end: re.Pattern[str] | None = None
     inline_code_delimiter: int | None = None
     quoted_scalars = _quoted_frontmatter_scalars(text, deadline=deadline, clock=clock)
+    line_offset = 0
     for line_number, line in enumerate(StringIO(text), 1):
         if clock() >= deadline:
             return candidates, ("runtime",)
@@ -453,7 +450,7 @@ def _candidate_strings(
                 reference_kind is ReferenceKind.QUOTED_OR_CODE
                 and version_match is not None
                 and (match.start, match.end) == version_match.span("version")
-                and (line_number, match.start, match.end) in quoted_scalars
+                and (line_offset + match.start, line_offset + match.end) in quoted_scalars
             )
             if not inside_destination and not redundant_image_label and not is_version_metadata:
                 key = (line_number, match.start, raw)
@@ -482,6 +479,7 @@ def _candidate_strings(
             )
         if closes_fence:
             active_fence = None
+        line_offset += len(line)
     return candidates, tuple(sorted(limitations))
 
 

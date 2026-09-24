@@ -170,3 +170,18 @@ def test_unparsed_frontmatter_retains_reference_accounting(tmp_path: Path, heade
     assert result.complete
     assert len(result.records) == 2
     assert all(record["status"] == "missing" for record in result.records)
+
+
+@pytest.mark.parametrize("separator", ["\r", "\x85", "\u2028", "\u2029"])
+def test_yaml_line_separators_cannot_exempt_a_body_reference(
+    tmp_path: Path, separator: str
+) -> None:
+    # YAML's logical line/column for "abc" collides with the later body token.
+    text = f'---\ndescription: text{separator}{separator}version: "abc"\n---\nversion: "1.2"\n'
+    result = resolve_bundle_references_with_metadata(
+        tmp_path, source_path="SKILL.md", source_text=text, known_paths=["SKILL.md"]
+    )
+    assert result.complete
+    assert len(result.records) == 1
+    assert result.records[0]["line"] == 4
+    assert result.records[0]["status"] == "missing"
