@@ -60,7 +60,7 @@ from skillspector.mcp_registry import scan_registry
 from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
-from skillspector.nodes.report import report
+from skillspector.nodes.report import _expand_occurrences, report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
@@ -3181,7 +3181,13 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
-        findings = effective_findings(result)
+        # Fingerprints bind to a finding's location, but effective_findings()
+        # returns the deduplicated list where repeats are folded into one
+        # finding with occurrences. The report node applies baseline
+        # suppression to the per-line list it partitions, so expand here to
+        # fingerprint every occurrence: each repeated line is then suppressed
+        # instead of only the representative line.
+        findings = _expand_occurrences(effective_findings(result))
         data = build_baseline_dict(
             findings,
             reason=reason,

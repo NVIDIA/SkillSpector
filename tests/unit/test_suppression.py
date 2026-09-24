@@ -1051,3 +1051,56 @@ def test_effective_findings_skips_a_suppressed_entry_with_no_finding() -> None:
     }
 
     assert effective_findings(result) == [kept]
+
+
+def test_baseline_expands_occurrences_before_fingerprinting() -> None:
+    """A baseline must suppress every repeated line, not only the folded
+    finding's representative occurrence (issue #630).
+
+    The `baseline` command fingerprints `effective_findings()`, which is the
+    deduplicated list where repeats are folded into one finding carrying
+    `occurrences`. The report node partitions the per-line list, so the
+    command expands occurrences first; otherwise only the first line of a
+    repeated finding is suppressed on the next scan.
+    """
+    from skillspector.nodes.report import _expand_occurrences
+
+    content = (
+        "---\nname: demo\ndescription: demo\n---\n\n"
+        "Start it with `npx @modelcontextprotocol/server-filesystem ./docs`.\n\n"
+        "If it stops, run `npx @modelcontextprotocol/server-filesystem ./docs` again.\n\n"
+        "On a fresh machine, `npx @modelcontextprotocol/server-filesystem ./docs` also installs it.\n"
+    )
+    folded = replace(
+        _finding(
+            rule_id="RP1",
+            file="demo/SKILL.md",
+            message="remote package execution",
+            matched_text="npx @modelcontextprotocol/server-filesystem ./docs",
+            start_line=6,
+        ),
+        occurrences=[
+            {"file": "demo/SKILL.md", "start_line": 6, "end_line": 6},
+            {"file": "demo/SKILL.md", "start_line": 8, "end_line": 8},
+            {"file": "demo/SKILL.md", "start_line": 10, "end_line": 10},
+        ],
+    )
+    file_cache = {"demo/SKILL.md": content}
+    # Mirror the `baseline` command: expand before fingerprinting.
+    data = build_baseline_dict(
+        _expand_occurrences([folded]),
+        file_cache=file_cache,
+        scanner_version=SCANNER_VERSION,
+    )
+    assert len(data["fingerprints"]) == 3
+    baseline = baseline_from_dict(data)
+    # Mirror the report node: partition the per-line findings.
+    per_line = _expand_occurrences([folded])
+    kept, suppressed = partition_findings(
+        per_line,
+        baseline,
+        file_cache=file_cache,
+        scanner_version=SCANNER_VERSION,
+    )
+    assert kept == []
+    assert len(suppressed) == 3
