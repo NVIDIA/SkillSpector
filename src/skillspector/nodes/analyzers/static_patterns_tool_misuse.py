@@ -3373,12 +3373,12 @@ def _markdown_shell_text(
                     if (
                         complete_context
                         and not runs
-                        and not has_list_marker
                         and not heading
                         and len(leading) <= 512
                         and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(leading))
                     ):
-                        # A whole plain-language sentence owns its contraction;
+                        # A whole plain-language sentence, including a parsed
+                        # list-item body, owns its contraction;
                         # it is not an unclosed shell quote spanning later prose.
                         # The restrictive grammar excludes code delimiters and
                         # shell syntax. Fences, indented code, HTML, tables, and

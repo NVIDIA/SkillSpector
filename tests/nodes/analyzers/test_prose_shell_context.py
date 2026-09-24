@@ -34,6 +34,9 @@ _LAYOUT = (
 )
 _CASES = [
     pytest.param(_APOSTROPHE, id="apostrophe-long"),
+    pytest.param("- " + _APOSTROPHE, id="list-apostrophe-long"),
+    pytest.param(("- " + _APOSTROPHE).replace("\n", "\r\n"), id="list-apostrophe-crlf"),
+    pytest.param("- " + _APOSTROPHE.replace("doesn't", "does not"), id="list-control"),
     pytest.param(_APOSTROPHE.replace("doesn't", "does not"), id="apostrophe-control"),
     pytest.param(_LAYOUT, id="overview-minimal"),
     pytest.param(
@@ -69,6 +72,117 @@ def test_benign_referenced_guide_passes_strict_cli(tmp_path: Path, content: str)
     assert report["risk_assessment"]["score"] == 0
     assert report["risk_assessment"]["recommendation"] == "SAFE"
     assert report["issues"] == []
+    assert coverage["total_components"] == coverage["fully_inspected_files"] == 2
+    assert len(coverage["references"]) == 1
+    reference = coverage["references"][0]
+    assert reference["target_path"] == "guide.md"
+    assert reference["status"] == "resolved"
+    assert reference["disposition"] == "analyzed"
+    assert (reference["source_path"], reference["line"], reference["column"]) == ("SKILL.md", 6, 28)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "- ",
+        "+ ",
+        "* ",
+        "1. ",
+        "2) ",
+        "-\t",
+        "-    ",
+        "- - ",
+        "- Details\n  - ",
+        "1. Details\n   1. ",
+        "- Details\n  ",
+    ],
+)
+@pytest.mark.parametrize("long", [False, True], ids=["short", "long"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_list_prose_has_complete_analyzer_coverage(prefix: str, long: bool, newline: str) -> None:
+    content = prefix + (_APOSTROPHE if long else _APOSTROPHE.split("\n\n")[0] + "\n")
+    content = content.replace("\n", newline)
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["findings"] == []
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_list_prose_preserves_unicode_offsets_and_later_findings(
+    tmp_path: Path, newline: str
+) -> None:
+    content = "# Résumé — インターフェース\n\n- " + _APOSTROPHE
+    command = "- rm -rf /\n"
+    content += command + command
+    # Reference the same file twice to exercise canonical artifact accounting.
+    manifest = _MANIFEST + "Read [the same guide](guide.md) again.\n"
+    reports = []
+    for guide in (content, content.replace("doesn't", "does not")):
+        (tmp_path / "SKILL.md").write_bytes(manifest.encode())
+        (tmp_path / "guide.md").write_bytes(guide.replace("\n", newline).encode())
+        cli = CliRunner().invoke(
+            app,
+            ["scan", str(tmp_path), "--no-llm", "--format", "json", "--fail-on-incomplete"],
+        )
+        assert cli.exit_code in (0, 1), cli.output
+        report = json.loads(cli.output)
+        coverage = report["analysis_completeness"]
+        assert coverage["is_complete"] is True
+        assert coverage["coverage_percent"] == 100.0
+        assert coverage["total_components"] == coverage["fully_inspected_files"] == 2
+        assert coverage["ledger_exceptions"] == []
+        assert report["risk_assessment"]["recommendation"] != "SAFE"
+        assert not any(issue["id"] == "AE1" for issue in report["issues"])
+        assert len({issue["finding_id"] for issue in report["issues"] if issue["id"] == "TM1"}) == 1
+        locations = {
+            (location["file"], location["start_line"])
+            for issue in report["issues"]
+            if issue["id"] == "TM1"
+            for location in [issue["location"], *issue.get("occurrences", [])]
+        }
+        first_line = content[: content.index(command)].count("\n") + 1
+        assert locations == {("guide.md", first_line), ("guide.md", first_line + 1)}
+        reports.append(report)
+    # Prose punctuation cannot change finding deduplication or threat scoring.
+    assert reports[0]["risk_assessment"] == reports[1]["risk_assessment"]
+    assert len(reports[0]["issues"]) == len(reports[1]["issues"])
+
+
+@pytest.mark.parametrize("prefix", ["- ", "1. ", "- Details\n  - ", "> - "])
+@pytest.mark.parametrize("command", ["$($CMD) -rf /", "$($(resolve_tool)/printf %s rm) -rf /"])
+@pytest.mark.parametrize("before", [False, True], ids=["after-prose", "before-prose"])
+def test_list_prose_cannot_hide_runtime_commands(prefix: str, command: str, before: bool) -> None:
+    prose = "- " + _APOSTROPHE
+    shell = prefix + command + "\n\n"
+    content = shell + prose if before else prose + shell
+    result = static_runner.run_static_patterns_with_ledger(
+        {"components": ["guide.md"], "file_cache": {"guide.md": content}}, [tm]
+    )
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- ```sh\n  " + _APOSTROPHE.replace("\n", "\n  ") + "\n  ```\n",
+        "1. ~~~sh\n   " + _APOSTROPHE.replace("\n", "\n   ") + "\n   ~~~\n",
+        "-     " + _APOSTROPHE.replace("\n", "\n      "),
+        "- Details\n\n      " + _APOSTROPHE.replace("\n", "\n      "),
+        "> - " + _APOSTROPHE.replace("\n", "\n>   "),
+        '- bash -c "\n- ' + _APOSTROPHE + '"\n',
+        "- $(\n- " + _APOSTROPHE + "') -rf /\n",
+        "- r'\n- " + _APOSTROPHE + "'m -rf /\n",
+        "- `\n- " + _APOSTROPHE + "`\n",
+    ],
+)
+def test_list_context_does_not_rewrite_code_or_shell_owners(content: str) -> None:
+    projected = tm._markdown_shell_text(content, lambda: None)
+    assert len(projected) == len(content)
+    apostrophe = content.index("doesn't") + len("doesn")
+    assert projected[apostrophe] == "'"
 
 
 @pytest.mark.parametrize(
@@ -107,7 +221,7 @@ def test_prose_inside_unresolved_shell_content_remains_partial(content: str) -> 
     assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
-@pytest.mark.parametrize("content", [_APOSTROPHE, _LAYOUT])
+@pytest.mark.parametrize("content", [_APOSTROPHE, _LAYOUT, "- " + _APOSTROPHE])
 @pytest.mark.parametrize(
     "command,partial",
     [
@@ -166,11 +280,12 @@ def test_outer_context_does_not_discard_nested_command_operands(command: str, ta
     assert tm.has_bounded_parse_exhaustion(command + " " + tail, lambda: None)
 
 
-def test_prose_ownership_requires_complete_context() -> None:
+@pytest.mark.parametrize("content", [_APOSTROPHE, "- " + _APOSTROPHE])
+def test_prose_ownership_requires_complete_context(content: str) -> None:
     assert tm.has_bounded_parse_exhaustion(
-        _APOSTROPHE, lambda: None, file_type="markdown", complete_context=False
+        content, lambda: None, file_type="markdown", complete_context=False
     )
-    assert tm.has_bounded_parse_exhaustion(_APOSTROPHE, lambda: None, file_type="shell")
+    assert tm.has_bounded_parse_exhaustion(content, lambda: None, file_type="shell")
 
 
 def test_prose_ownership_preserves_cancellation() -> None:
@@ -186,8 +301,10 @@ def test_prose_ownership_preserves_cancellation() -> None:
         tm.has_bounded_parse_exhaustion(_APOSTROPHE * 100, cancel, file_type="markdown")
 
 
+@pytest.mark.parametrize("prefix", ["", "- "])
 def test_prose_ownership_checks_cancellation_after_word_jumps(
     monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
 ) -> None:
     parsed_words = 0
     original = tm._parse_shell_command_word
@@ -204,6 +321,6 @@ def test_prose_ownership_checks_cancellation_after_word_jumps(
     monkeypatch.setattr(tm, "_parse_shell_command_word", counted)
     # Each short parameter jumps over an exact multiple of the callback stride.
     content = "a" * 4095 + "$X " + ("a" * 4093 + "$X ") * 100
-    content += "\n\nThe interface doesn't match the spec.\n"
+    content += "\n\n" + prefix + "The interface doesn't match the spec.\n"
     with pytest.raises(TimeoutError, match="cancelled"):
         tm._markdown_shell_text(content, cancel)
