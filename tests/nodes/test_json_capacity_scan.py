@@ -27,21 +27,33 @@ from tests.nodes.analyzers.test_documentation_reconstruction import (
 
 
 @pytest.mark.parametrize("use_llm", [False, True], ids=["static", "semantic"])
-@pytest.mark.parametrize("size", [65535, 65536, 65537])
+@pytest.mark.parametrize("size", [65535, 65536, 65537, 74978, 131071, 131072, 131073])
 def test_capacity_preserves_cli_mcp_gates(
     tmp_path: Path, use_llm: bool, size: int, successful_llm_transport: list[str]
 ) -> None:
     # A compact synthetic object with unique records avoids context-stuffing
     # findings while exercising the JSON closing quote after a placeholder.
-    body = json.dumps(
-        {
-            "batch": "<omit on first request; reuse the returned identifier later>",
-            "records": [
-                {"index": i, "label": f"Example record {i:05d} for review."} for i in range(1073)
-            ],
-        }
-    )
-    assert 0 < size - len(body) < 64
+    def encode(records: int) -> str:
+        return json.dumps(
+            {
+                "batch": "<omit on first request; reuse the returned identifier later>",
+                "records": [
+                    {"index": i, "label": f"Example record {i:05d} for review."}
+                    for i in range(records)
+                ],
+            }
+        )
+
+    # Size the distinct short records, then use less than one record of padding.
+    records = size // 64
+    body = encode(records)
+    while len(body) > size:
+        records -= 1
+        body = encode(records)
+    while len(candidate := encode(records + 1)) <= size:
+        records += 1
+        body = candidate
+    assert 0 <= size - len(body) < 80
     body += " " * (size - len(body))
     prefix = "---\nname: json-capacity\ndescription: Review a JSON example.\n---\n"
     (tmp_path / "SKILL.md").write_text(prefix + body, encoding="utf-8")
@@ -52,7 +64,7 @@ def test_capacity_preserves_cli_mcp_gates(
     cli_calls = list(successful_llm_transport)
     successful_llm_transport.clear()
     mcp = asyncio.run(run_scan(str(tmp_path), use_llm=use_llm, output_format="json"))
-    complete = size <= 65536
+    complete = size <= 131072
     assert cli.exit_code == (0 if complete else 1), cli.output
     assert mcp["safe_to_install"] is complete
     for report, calls in [
@@ -76,7 +88,7 @@ def test_capacity_preserves_cli_mcp_gates(
             assert event["source_start_offset"] == len(prefix)
             assert event["source_end_offset"] == len(prefix) + size
             assert event["observed_characters"] == size
-            assert event["limit_characters"] == 65536
+            assert event["limit_characters"] == 131072
             assert f"[{len(prefix)}, {len(prefix) + size})" in event["message"]
             assert "Split" in event["message"]
             assert "validity remains unverified" in event["message"]
