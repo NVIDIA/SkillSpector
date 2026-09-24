@@ -10,10 +10,16 @@ the synthetic Python inputs are scan data and are never executed.
 from __future__ import annotations
 
 import ast
+import json
+from dataclasses import replace
 
 import pytest
 
+from skillspector.models import compute_match_fingerprint
 from skillspector.nodes.analyzers import behavioral_ast, behavioral_taint_tracking
+from skillspector.nodes.deduplicate import deduplicate
+from skillspector.nodes.report import _expand_occurrences, report
+from skillspector.suppression import finding_fingerprint
 
 _COLUMN_STATES = ("normal", "null", "absent")
 
@@ -135,3 +141,92 @@ def test_taint_sinks_without_columns_remain_distinct(monkeypatch, column_state):
     assert len(findings) == 2
     assert all(finding.start_line == 3 and finding.end_line == 3 for finding in findings)
     assert all(finding.start_column is None and finding.end_column is None for finding in findings)
+
+
+@pytest.mark.parametrize("start_state", _COLUMN_STATES)
+@pytest.mark.parametrize("end_state", _COLUMN_STATES)
+@pytest.mark.parametrize("same_payload", [False, True], ids=["different-matches", "same-match"])
+@pytest.mark.parametrize(
+    "analyzer,rule",
+    [(behavioral_ast, "AST1"), (behavioral_taint_tracking, "TT5")],
+    ids=["ast", "taint"],
+)
+def test_same_line_occurrences_survive_compaction_and_reports(
+    monkeypatch, start_state, end_state, same_payload, analyzer, rule
+):
+    right = "left" if same_payload else "right"
+    source = f"exec(input('left')); exec(input('{right}'))\n"
+    state = {"components": ["script.py"], "file_cache": {"script.py": source}}
+    normal = analyzer.node(state)["findings"]
+    normal_report = report({"findings": normal, "output_format": "json", "use_llm": False})
+    _instrument_columns(monkeypatch, source, start_state, end_state)
+    findings = analyzer.node(state)["findings"]
+    reparsed = analyzer.node(state)["findings"]
+    incomplete = start_state != "normal" or end_state != "normal"
+
+    assert len(findings) == 2
+    assert all(finding.rule_id == rule for finding in findings)
+    if incomplete:
+        indices = [finding.evidence["python_ast_node_index"] for finding in findings]
+        assert all(isinstance(index, int) for index in indices)
+        assert len(set(indices)) == 2
+        assert indices == [finding.evidence["python_ast_node_index"] for finding in reparsed]
+        # Occurrence metadata must not salt semantic or baseline fingerprints.
+        assert {finding.match_fingerprint for finding in findings} == {
+            compute_match_fingerprint(rule, source)
+        }
+        for finding in findings:
+            assert finding_fingerprint(
+                finding, file_content=source, scanner_version="test"
+            ) == finding_fingerprint(
+                replace(finding, evidence={}), file_content=source, scanner_version="test"
+            )
+    else:
+        assert all(finding.evidence == {} for finding in findings)
+
+    def public_occurrences(rows):
+        result = []
+        for finding in _expand_occurrences(rows):
+            row = finding.to_dict()
+            row.pop("finding_id")
+            result.append(row)
+        return sorted(result, key=lambda row: json.dumps(row, sort_keys=True))
+
+    compacted = deduplicate(findings)
+    expected = public_occurrences(compacted)
+    assert len(expected) == 2
+    variants = [
+        deduplicate(compacted),
+        deduplicate(list(reversed(findings))),
+        deduplicate(compacted + reparsed),
+        deduplicate(_expand_occurrences(compacted)),
+    ]
+    for variant in variants:
+        assert public_occurrences(variant) == expected
+
+    # Ordinary report input remains raw findings. Incomplete-column findings
+    # also retain their separate identities if a caller compacts them first.
+    for rows in [findings, *([compacted, *variants] if incomplete else [])]:
+        result = report({"findings": rows, "output_format": "json", "use_llm": False})
+        assert result["risk_score"] == normal_report["risk_score"]
+        issues = json.loads(result["report_body"])["issues"]
+        sarif = result["sarif_report"]["runs"][0]["results"]
+        assert len(issues) == len(sarif) == 2
+        assert {issue["id"] for issue in issues} == {rule}
+        assert {issue["ruleId"] for issue in sarif} == {rule}
+        for issue, sarif_issue in zip(issues, sarif, strict=True):
+            assert issue["evidence"] == sarif_issue["properties"]["evidence"]
+            location = issue["location"]
+            region = sarif_issue["locations"][0]["physicalLocation"]["region"]
+            assert location["start_line"] == location["end_line"] == 1
+            assert region["startLine"] == region["endLine"] == 1
+            for column, sarif_column, column_state in (
+                ("start_column", "startColumn", start_state),
+                ("end_column", "endColumn", end_state),
+            ):
+                if column_state == "normal":
+                    assert location[column] in {getattr(finding, column) for finding in normal}
+                    assert region[sarif_column] == location[column] + 1
+                else:
+                    assert column not in location
+                    assert sarif_column not in region

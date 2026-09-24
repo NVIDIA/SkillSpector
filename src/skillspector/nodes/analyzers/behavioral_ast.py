@@ -437,6 +437,7 @@ def _analyze_python(
         return context
 
     def _emit(
+        node_index: int,
         rule_id: str,
         ast_node: ast.Call,
         msg_override: str | None = None,
@@ -466,13 +467,20 @@ def _analyze_python(
             context=context_for(lineno, start_column if start_column is not None else 0),
             matched_text=complete_match[:200],
             complete_match=complete_match,
+            # Evidence participates in report compaction. Keep distinct syntax
+            # nodes distinguishable when their source spans are incomplete.
+            evidence=(
+                {"python_ast_node_index": node_index}
+                if start_column is None or end_column is None
+                else {}
+            ),
         )
         if budget is None:
             findings.append(finding)
         else:
             budget.emit(finding)
 
-    for ast_node in ast.walk(tree):
+    for node_index, ast_node in enumerate(ast.walk(tree)):
         if budget is not None:
             budget.check_runtime()
         if isinstance(ast_node, ast.Subscript):
@@ -482,6 +490,7 @@ def _analyze_python(
                 if isinstance(key, ast.Constant):
                     if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
                         _emit(
+                            node_index,
                             "AST9",
                             ast_node,
                             f"Reflective dangerous access via {module}.__dict__ subscript "
@@ -489,6 +498,7 @@ def _analyze_python(
                         )
                 else:
                     _emit(
+                        node_index,
                         "AST7",
                         ast_node,
                         f"Dynamic attribute access via {module}.__dict__ subscript",
@@ -513,6 +523,7 @@ def _analyze_python(
                 if isinstance(key, ast.Constant):
                     if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
                         _emit(
+                            node_index,
                             "AST9",
                             ast_node,
                             f"Reflective dangerous access via {module}.__dict__.{method}() "
@@ -520,6 +531,7 @@ def _analyze_python(
                         )
                 else:
                     _emit(
+                        node_index,
                         "AST7",
                         ast_node,
                         f"Dynamic attribute access via {module}.__dict__.{method}()",
@@ -542,8 +554,10 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", ast_node, f"Dangerous chain: exec() wrapping {source}")
-            _emit("AST1", ast_node)
+                    _emit(
+                        node_index, "AST8", ast_node, f"Dangerous chain: exec() wrapping {source}"
+                    )
+            _emit(node_index, "AST1", ast_node)
 
         elif call_name == "eval":
             if _is_chain_sink(ast_node, aliases) and ast_node.args:
@@ -553,27 +567,29 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", ast_node, f"Dangerous chain: eval() wrapping {source}")
-            _emit("AST2", ast_node)
+                    _emit(
+                        node_index, "AST8", ast_node, f"Dangerous chain: eval() wrapping {source}"
+                    )
+            _emit(node_index, "AST2", ast_node)
 
         elif call_name == "__import__":
-            _emit("AST3", ast_node)
+            _emit(node_index, "AST3", ast_node)
 
         elif call_name == "compile":
-            _emit("AST6", ast_node)
+            _emit(node_index, "AST6", ast_node)
 
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                _emit("AST4", ast_node)
+                _emit(node_index, "AST4", ast_node)
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
             if attr in _OS_EXEC_CALLS:
-                _emit("AST5", ast_node)
+                _emit(node_index, "AST5", ast_node)
 
         elif (deser_msg := _deserialization_message(call_name, ast_node)) is not None:
-            _emit("AST10", ast_node, deser_msg)
+            _emit(node_index, "AST10", ast_node, deser_msg)
 
         elif call_name == "getattr" and len(ast_node.args) >= 2:
             second_arg = ast_node.args[1]
@@ -584,9 +600,9 @@ def _analyze_python(
             if isinstance(second_arg, ast.Constant) and not isinstance(second_arg.value, str):
                 continue
             if resolved_name in _DANGEROUS_GETATTR_NAMES:
-                _emit("AST9", ast_node)
+                _emit(node_index, "AST9", ast_node)
             elif resolved_name is None or not isinstance(second_arg, ast.Constant):
-                _emit("AST7", ast_node)
+                _emit(node_index, "AST7", ast_node)
 
     return findings if budget is None else list(budget.current_findings)
 

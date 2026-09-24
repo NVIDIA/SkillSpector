@@ -476,6 +476,7 @@ def _analyze_python(
         return context
 
     def _emit(
+        node_index: int,
         rule_id: str,
         ast_node: ast.Call,
         msg: str,
@@ -511,13 +512,20 @@ def _analyze_python(
             context=context_for(lineno),
             matched_text=complete_match[:200],
             complete_match=complete_match,
+            # Evidence participates in report compaction. Keep distinct syntax
+            # nodes distinguishable when their source spans are incomplete.
+            evidence=(
+                {"python_ast_node_index": node_index}
+                if start_column is None or end_column is None
+                else {}
+            ),
         )
         if budget is None:
             findings.append(finding)
         else:
             budget.emit(finding)
 
-    for ast_node in ast.walk(tree):
+    for node_index, ast_node in enumerate(ast.walk(tree)):
         if budget is not None:
             budget.check_runtime()
         # Record tainted assignments.
@@ -575,6 +583,7 @@ def _analyze_python(
             src_cat = _classify(src_name, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
+                node_index,
                 rule,
                 ast_node,
                 f"Direct flow: {src_name} ({src_cat}) \u2192 {sink_name} ({sink_cat})",
@@ -589,6 +598,7 @@ def _analyze_python(
             src_cat = _classify(tv.source_call, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
+                node_index,
                 rule,
                 ast_node,
                 f"Tainted flow: '{tv.name}' from {tv.source_call} (line {tv.lineno}, "
