@@ -200,7 +200,7 @@ def test_sentence_reference_preserves_threat_detection(tmp_path: Path, period: s
 def test_cli_escaped_image_keeps_literal_missing_reference(tmp_path: Path) -> None:
     (tmp_path / "SKILL.md").write_text(
         "---\nname: reference-control\ndescription: Summarize the supplied guide.\n---\n\n"
-        r"Read \![guide](./guide.)."
+        r"Read \![guide](./guide.)"
         "\n",
         encoding="utf-8",
     )
