@@ -331,6 +331,7 @@ class DeclaredMarkerViewResult:
 
     views: tuple[SecurityTextView, ...]
     limited: bool
+    first_limited_source_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -577,7 +578,10 @@ def _json_body_after_frontmatter(text: str, check_runtime: Callable[[], None] | 
 
 
 def _validated_json_ranges(
-    text: str, check_runtime: Callable[[], None] | None
+    text: str,
+    check_runtime: Callable[[], None] | None,
+    *,
+    on_capacity_limit: Callable[[int, int], None] | None = None,
 ) -> list[tuple[int, int]]:
     """Return raw source ranges whose complete JSON syntax has been validated.
 
@@ -597,6 +601,16 @@ def _validated_json_ranges(
     def valid(start: int, end: int, body: str | None = None) -> bool:
         check()
         if end - start > _MAX_JSON_QUOTE_CONTAINER_CHARS:
+            # Oversized candidates are NOT parsed. A fence explicitly claims
+            # JSON; standalone candidates need a plausible first token in the
+            # bounded prefix. Neither test establishes validity or ownership.
+            if on_capacity_limit is not None and (
+                body is not None
+                or text[start : start + _MAX_JSON_QUOTE_CONTAINER_CHARS]
+                .lstrip(" \t\r\n")
+                .startswith(("{", "[", '"'))
+            ):
+                on_capacity_limit(start, end)
             return False
         try:
             json.loads(text[start:end] if body is None else body, parse_constant=reject_constant)
@@ -664,6 +678,28 @@ def _validated_json_ranges(
                 body_lines = []
         offset += len(line)
     return ranges
+
+
+def json_quote_capacity_limit(
+    text: str, check_runtime: Callable[[], None] | None, *, containing_offset: int
+) -> tuple[int, int] | None:
+    """Describe the first oversized candidate without granting quote ownership.
+
+    Offsets are zero-based, end-exclusive source characters, including body
+    whitespace and Markdown container prefixes. Closed fences exclude their
+    delimiters. Only one diagnostic is retained regardless of candidate count.
+    Callers use this to explain already-incomplete reconstruction, not to infer
+    either maliciousness or completeness from a JSON-looking prefix.
+    """
+    first: tuple[int, int] | None = None
+
+    def record(start: int, end: int) -> None:
+        nonlocal first
+        if first is None and start <= containing_offset < end:
+            first = (start, end)
+
+    _validated_json_ranges(text, check_runtime, on_capacity_limit=record)
+    return first
 
 
 def _json_string_spans(
@@ -1789,6 +1825,7 @@ def build_declared_marker_views(
 
     active_directives = 0
     limited = False
+    first_limited_source_offset: int | None = None
     projection_blocked = False
     candidates: list[_ProjectionCandidate] = []
     for directive in _directives(
@@ -1818,6 +1855,8 @@ def build_declared_marker_views(
             end_is_truncated=source_end_is_truncated,
         )
         limited = limited or classification.limited
+        if classification.limited and first_limited_source_offset is None:
+            first_limited_source_offset = directive_source_start
         if classification.active and classification.limited:
             projection_blocked = True
             candidates.clear()
@@ -1832,4 +1871,4 @@ def build_declared_marker_views(
             candidates.append(classification.candidate)
 
     views, conflict_limited = _resolve_candidates(view, candidates)
-    return DeclaredMarkerViewResult(views, limited or conflict_limited)
+    return DeclaredMarkerViewResult(views, limited or conflict_limited, first_limited_source_offset)

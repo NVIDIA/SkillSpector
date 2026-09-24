@@ -70,6 +70,44 @@ charged for each projected occurrence, so a compact alias graph cannot amplify t
 manifest past these limits. A malformed or incomplete claimed frontmatter leaves the manifest
 empty, marks the primary artifact `partial`, and records an allowlisted parse error or limit reason.
 
+## JSON quote ownership
+
+The deterministic instruction parser can distinguish structural JSON quotes from instruction
+delimiters only after validating a complete JSON value within **65,536 source characters**.
+This is a structural capacity limit, independent of file-size and scan-time allowances. It is
+unchanged by this diagnostic update; larger JSON values are not newly supported.
+
+The inclusive ceiling counts characters, not UTF-8 bytes or decoded JSON string lengths:
+
+- Standalone JSON includes surrounding whitespace. After bounded frontmatter, only the body
+  following the closing delimiter is counted.
+- An explicitly labeled, closed JSON fence counts its body, including newlines and raw list or
+  blockquote prefixes. Opening and closing fence lines are excluded.
+- Unicode characters count once; each source character of an escape such as `\u0061` counts.
+  The frontmatter boundary search has its own 65,536-character prefix bound.
+
+When marker reconstruction is already incomplete and its first unresolved directive lies in an
+oversized JSON candidate, the ledger reports `json_quote_ownership_limit`. Its message identifies
+the zero-based, end-exclusive source character span `[start, end)`, observed character count,
+limit, and next step; the ledger also retains `observed_characters` and `limit_characters`.
+The exception's `path` identifies the source artifact. It does not assert that the candidate is
+valid JSON or that capacity is the only unresolved instruction issue. Invalid, truncated, and
+oversized candidates never acquire quote ownership. Unrelated parser failures retain their
+existing reason codes; an unclosed fence cannot establish a complete JSON body boundary.
+
+To resolve a capacity limitation, split the input into smaller **complete** JSON values or
+documents, preserve all required content and references, and rescan. Do not truncate the input
+or remove a required reference. Raising the timeout cannot raise this structural ceiling.
+Findings remain visible, and unresolved coverage remains incomplete: CLI `--fail-on-incomplete`
+returns nonzero and the MCP installation gate rejects it, even after successful semantic analysis.
+JSON with no unresolved instruction parsing may still complete without needing quote ownership.
+
+A future increase requires an explicit supported-input decision and validation of dense strings,
+deep nesting, escaped/Unicode text, malformed input, cancellation, and the interaction with analysis
+windows. JSON decoding allocates synchronously between deadline checks; a larger benign example
+passing in isolation does not validate that larger resource allowance. This patch retains the
+existing bound and does not change expected-complete dataset contracts for oversized examples.
+
 ## Intra-bundle references
 
 Reference extraction from the primary instructions is independently bounded:
@@ -115,6 +153,7 @@ malicious evasion. Keep required references and use the reason to choose the fix
 | Reason | Next step |
 |---|---|
 | `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
+| `json_quote_ownership_limit` | Use the reported source span and 65,536-character bound to split complete JSON values while retaining required content, then rescan. |
 | `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
 | `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
 | `binary_content`, `opaque_content` | Provide inspectable source or analysis support for the referenced format. |
