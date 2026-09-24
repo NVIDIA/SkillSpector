@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import inspect
+import json
 import math
 import os
 import re
@@ -25,6 +27,7 @@ import unicodedata
 from array import array
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -44,7 +47,13 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Finding, observe_analyzer_findings
+from skillspector.models import (
+    AnalyzerFinding,
+    Finding,
+    Severity,
+    compute_match_fingerprint,
+    observe_analyzer_findings,
+)
 from skillspector.nodes.deduplicate import classification_metadata_key
 from skillspector.python_ast import (
     MAX_PYTHON_AST_SOURCE_CHARS,
@@ -63,10 +72,18 @@ from .common import (
     LOGICAL_LINE_BREAK,
     MARKDOWN_FENCE_CLOSE,
     MARKDOWN_FENCE_OPEN,
+    logical_line_starts,
 )
 from .pattern_defaults import get_category, get_explanation, get_pattern_name, get_remediation
 
 logger = get_logger(__name__)
+
+_ANALYZER_SEVERITY_ORDER = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+}
 
 # Extension -> file type (match v1 InventoryBuilder.FILE_TYPES)
 FILE_TYPES: dict[str, str] = {
@@ -76,6 +93,7 @@ FILE_TYPES: dict[str, str] = {
     ".sh": "shell",
     ".bash": "shell",
     ".zsh": "shell",
+    ".ps1": "powershell",
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",
@@ -84,6 +102,7 @@ FILE_TYPES: dict[str, str] = {
     ".js": "javascript",
     ".ts": "typescript",
     ".rb": "ruby",
+    ".pl": "perl",
     ".go": "go",
     ".rs": "rust",
 }
@@ -94,10 +113,24 @@ _WINDOW_OVERLAP_CHARS = 8192
 _RAW_WINDOW_OWNED_CHARS = SECURITY_VIEW_WINDOW_CHARS - 2 * _WINDOW_OVERLAP_CHARS
 _VIEW_START_EVIDENCE = "_security_view_start"
 _SOURCE_START_EVIDENCE = "_security_source_start"
+_SOURCE_END_EVIDENCE = "_security_source_end"
 _VIEW_ORIGIN_TAGS = frozenset({"normalized-view", "declared-marker-view"})
-_BENIGN_CONTEXT_TAGS = frozenset({"contextual-triage", "likely-benign-context"})
-_ViewFindingKey = tuple[str, str, int, str | None, tuple[object, ...]]
-_ViewScopeKey = tuple[str, str, int, str | None]
+_CONTEXTUAL_TRIAGE_TAG = "contextual-triage"
+_ActiveSecurityView = tuple[SecurityTextView, str]
+_ACTIVE_SECURITY_VIEW: ContextVar[_ActiveSecurityView | None] = ContextVar(
+    "static_runner_active_security_view", default=None
+)
+_ViewFindingKey = tuple[
+    str,
+    str,
+    int,
+    int | None,
+    int | None,
+    int | None,
+    str | None,
+    tuple[object, ...],
+]
+_ViewScopeKey = tuple[str, str, int, int | None, int | None, int | None, str | None]
 assert _RAW_WINDOW_OWNED_CHARS > 0
 DECLARED_MARKER_LEFT_CONTEXT_CHARS = MAX_MARKER_LOOKAHEAD_CHARS
 DECLARED_MARKER_RIGHT_CONTEXT_CHARS = MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS
@@ -145,9 +178,152 @@ MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = _static_max_seconds_from_environment(
 
 _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
 _LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+
+
+def _analyzer_representative_key(finding: AnalyzerFinding) -> tuple[object, ...]:
+    """Rank exact analyzer duplicates by severity, confidence, and stable semantics."""
+    return (
+        _ANALYZER_SEVERITY_ORDER.get(finding.severity, 4),
+        -finding.confidence,
+        finding.location.file,
+        finding.location.start_line,
+        finding.location.end_line is not None,
+        finding.location.end_line or 0,
+        finding.location.start_column is not None,
+        finding.location.start_column or 0,
+        finding.location.end_column is not None,
+        finding.location.end_column or 0,
+        finding.rule_id,
+        finding.message,
+        finding.remediation or "",
+        tuple(finding.tags),
+        finding.context or "",
+        finding.matched_text or "",
+        json.dumps(
+            finding.evidence,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+
+def deduplicate_analyzer_findings(
+    findings: list[AnalyzerFinding],
+) -> list[AnalyzerFinding]:
+    """Compact only exact same-location matches before graph-state conversion."""
+    groups: dict[
+        tuple[str, int, int | None, int | None, int | None, str, str],
+        list[AnalyzerFinding],
+    ] = {}
+    identities: list[tuple[str, int, int | None, int | None, int | None, str, str] | None] = []
+    for finding in findings:
+        fingerprint = finding.match_fingerprint
+        if fingerprint is None and finding.matched_text:
+            fingerprint = compute_match_fingerprint(finding.rule_id, finding.matched_text)
+        identity = (
+            (
+                finding.location.file,
+                finding.location.start_line,
+                finding.location.end_line,
+                finding.location.start_column,
+                finding.location.end_column,
+                finding.rule_id,
+                fingerprint,
+            )
+            if fingerprint is not None
+            else None
+        )
+        identities.append(identity)
+        if identity is not None:
+            groups.setdefault(identity, []).append(finding)
+
+    compacted: list[AnalyzerFinding] = []
+    emitted: set[tuple[str, int, int | None, int | None, int | None, str, str]] = set()
+    for finding, identity in zip(findings, identities, strict=True):
+        if identity is None:
+            compacted.append(finding)
+        elif identity not in emitted:
+            compacted.append(min(groups[identity], key=_analyzer_representative_key))
+            emitted.add(identity)
+    return compacted
+
+
 _LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
 _ASCII_CONTINUITY_SEPARATOR_RUN = re.compile(r"[\s\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 _ASCII_NON_NEWLINE_WHITESPACE = re.compile(r"[ \t\r\f\v]")
+_PARAGRAPH_BOUNDARY = re.compile(
+    rf"(?>{LOGICAL_LINE_BREAK.pattern})[ \t]*(?>{LOGICAL_LINE_BREAK.pattern})"
+)
+_PARAGRAPH_RANGE_CACHE: dict[int, tuple[str, tuple[tuple[int, int], ...]]] = {}
+_PARAGRAPH_RANGE_CACHE_SIZE = 2
+_PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS = 1_000_000
+_PARAGRAPH_RANGE_CACHE_MAX_RANGES = 4_096
+
+
+def _paragraph_ranges(content: str) -> tuple[tuple[int, int], ...]:
+    cache_key = id(content)
+    cached = _PARAGRAPH_RANGE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is content:
+        return cached[1]
+
+    start = 0
+    ranges: list[tuple[int, int]] = []
+    for boundary in _PARAGRAPH_BOUNDARY.finditer(content):
+        ranges.append((start, boundary.start()))
+        start = boundary.end()
+    if not ranges:
+        result = ()
+    else:
+        ranges.append((start, len(content)))
+        result = tuple(ranges)
+
+    if (
+        len(content) <= _PARAGRAPH_RANGE_CACHE_MAX_CONTENT_CHARS
+        and len(result) <= _PARAGRAPH_RANGE_CACHE_MAX_RANGES
+    ):
+        if len(_PARAGRAPH_RANGE_CACHE) >= _PARAGRAPH_RANGE_CACHE_SIZE:
+            _PARAGRAPH_RANGE_CACHE.clear()
+        _PARAGRAPH_RANGE_CACHE[cache_key] = (content, result)
+    return result
+
+
+def iter_paragraph_matches(
+    pattern: str | re.Pattern[str], content: str, flags: int = 0
+) -> Iterator[re.Match[str]]:
+    """Match prose within paragraphs; executable and structured rules use finditer."""
+    regex = re.compile(pattern, flags)
+    ranges = _paragraph_ranges(content)
+    if not ranges:
+        yield from regex.finditer(content)
+        return
+    for start, end in ranges:
+        yield from regex.finditer(content, start, end)
+
+
+def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
+    """Return whether an active-view span is unchanged from its source text."""
+    active_view = _ACTIVE_SECURITY_VIEW.get()
+    if active_view is None or not 0 <= start < end <= len(content):
+        return False
+    view, source_text = active_view
+    if view.text is not content:
+        return False
+    if view.source_offsets is None:
+        return view.text is source_text
+    if end > len(view.source_offsets):
+        return False
+
+    source_start = view.source_offsets[start]
+    match_length = end - start
+    source_end = source_start + match_length
+    if source_end > len(source_text):
+        return False
+    if any(
+        view.source_offsets[index] != source_start + index - start for index in range(start, end)
+    ):
+        return False
+    return source_text[source_start:source_end] == content[start:end]
 
 
 def _advance_markdown_fence(active: tuple[str, int] | None, line: str) -> tuple[str, int] | None:
@@ -435,6 +611,8 @@ def analyzer_finding_to_finding(
         file=af.location.file,
         start_line=af.location.start_line,
         end_line=af.location.end_line,
+        start_column=af.location.start_column,
+        end_column=af.location.end_column,
         remediation=remediation,
         tags=list(af.tags),
         context=af.context,
@@ -442,16 +620,51 @@ def analyzer_finding_to_finding(
         category=category,
         pattern=pattern,
         finding=finding_snippet,
-        explanation=get_explanation(af.rule_id),
+        explanation=af.explanation or get_explanation(af.rule_id),
         code_snippet=af.context,
         intent=None,
         evidence=dict(af.evidence),
+        match_fingerprint=af.match_fingerprint,
     )
 
 
 def _uses_python_ast(module: object) -> bool:
     """Return whether a pattern module explicitly opts into the shared AST hook."""
     return getattr(module, "USES_PYTHON_AST", False) is True
+
+
+def _requires_python_ast(pattern_modules: list) -> bool:
+    """Return whether an analyzer or its postprocessor consumes the shared AST."""
+    return any(_uses_python_ast(module) for module in pattern_modules) or bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_PYTHON_AST") is True
+    )
+
+
+def _python_ast_for_path(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    python_ast_cache_key: str | None,
+) -> ParsedPythonFile | None:
+    """Return the shared parse needed by analyzer or postprocessor hooks."""
+    if len(content) > MAX_FILE_CHARS or not _requires_python_ast(pattern_modules):
+        return None
+    if _infer_file_type(path) != "python":
+        return None
+    return get_python_ast(python_ast_cache_key, content, path)
+
+
+def _explicit_module_hook(module: object, name: str) -> object | None:
+    """Return a hook only when the module or its class actually declares it."""
+    if inspect.getattr_static(module, name, None) is None:
+        return None
+    return getattr(module, name, None)
+
+
+def _uses_runtime_check(module: object) -> bool:
+    """Return whether a pattern module accepts the runner-owned deadline hook."""
+    return getattr(module, "USES_RUNTIME_CHECK", False) is True
 
 
 class _StaticResourceLimitError(RuntimeError):
@@ -545,16 +758,49 @@ class _WindowSourceContext:
     fence_transitions: dict[int, tuple[str, int, str, int, int]]
 
 
+@dataclass
+class _OccurrenceColumnResolver:
+    """Fill missing static-match columns once at the runner boundary.
+
+    Most regex analyzers expose a bounded preview rather than raw offsets. The
+    resolver walks identical previews monotonically within their reported line,
+    preserving repeated same-line occurrences without retaining full payloads.
+    Producers that compact locally must publish exact columns themselves.
+    """
+
+    content: str
+    line_starts: tuple[int, ...]
+    next_offsets: dict[tuple[int, str, str], int] = field(default_factory=dict)
+
+    def assign(self, finding: AnalyzerFinding) -> None:
+        if finding.location.start_column is not None or not finding.matched_text:
+            return
+        line_index = finding.location.start_line - 1
+        if line_index < 0 or line_index >= len(self.line_starts):
+            return
+        line_start = self.line_starts[line_index]
+        line_end = (
+            self.line_starts[line_index + 1]
+            if line_index + 1 < len(self.line_starts)
+            else len(self.content)
+        )
+        key = (finding.location.start_line, finding.rule_id, finding.matched_text)
+        search_start = self.next_offsets.get(key, line_start)
+        search_limit = min(len(self.content), line_end + len(finding.matched_text))
+        match_start = self.content.find(finding.matched_text, search_start, search_limit)
+        if match_start < line_start or match_start >= line_end:
+            return
+        finding.location.start_column = match_start - line_start
+        self.next_offsets[key] = match_start + max(1, len(finding.matched_text))
+
+
 def _build_window_source_context(
     path: str,
     content: str,
     raw_starts: tuple[int, ...],
 ) -> _WindowSourceContext:
     """Build line and Markdown state once for every scanner window origin."""
-    line_starts = (
-        0,
-        *(separator.end() for separator in LOGICAL_LINE_BREAK.finditer(content)),
-    )
+    line_starts = logical_line_starts(content)
     fence_states, fence_transitions = (
         _markdown_fence_states(content, raw_starts)
         if _infer_file_type(path) in {"markdown", "text"}
@@ -602,6 +848,7 @@ def _scan_path(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Run pattern modules with construction, emission, and runtime guards."""
     findings: list[Finding] = []
@@ -612,29 +859,32 @@ def _scan_path(
         if _is_license_basename(path, file_type)
         else None
     )
-    python_ast: ParsedPythonFile | None = None
     if file_type == "python" and any(_uses_python_ast(module) for module in pattern_modules):
         finding_budget.check_runtime()
-        python_ast = get_python_ast(python_ast_cache_key, content, path)
+        python_ast = python_ast or get_python_ast(python_ast_cache_key, content, path)
         finding_budget.check_runtime()
 
+    line_starts = logical_line_starts(content)
     for module in pattern_modules:
         module_finding_start = len(findings)
+        occurrence_columns = _OccurrenceColumnResolver(content, line_starts)
         finding_budget.begin_module()
         try:
             with observe_analyzer_findings(finding_budget.observe_creation):
+                analyze_kwargs: dict[str, object] = {
+                    "content": content,
+                    "file_path": path,
+                    "file_type": file_type,
+                }
                 if file_type == "python" and _uses_python_ast(module):
-                    raw = module.analyze(
-                        content=content,
-                        file_path=path,
-                        file_type=file_type,
-                        python_ast=python_ast,
-                    )
-                else:
-                    raw = module.analyze(content=content, file_path=path, file_type=file_type)
+                    analyze_kwargs["python_ast"] = python_ast
+                if _uses_runtime_check(module):
+                    analyze_kwargs["check_runtime"] = finding_budget.check_runtime
+                raw = module.analyze(**analyze_kwargs)
                 finding_budget.check_runtime()
                 for af in raw:
                     finding_budget.observe_emission()
+                    occurrence_columns.assign(af)
                     converted = _convert_analyzer_finding(
                         af,
                         path=path,
@@ -654,6 +904,7 @@ def _scan_path(
                     if finding_budget.emitted_findings >= finding_budget.max_findings:
                         break
                     finding_budget.emitted_findings += 1
+                    occurrence_columns.assign(af)
                     converted = _convert_analyzer_finding(
                         af,
                         path=path,
@@ -673,17 +924,57 @@ def _view_finding_key(finding: Finding) -> _ViewFindingKey:
         finding.rule_id,
         finding.file,
         finding.start_line,
+        finding.end_line,
+        finding.start_column,
+        finding.end_column,
         finding.fingerprint(),
         classification_metadata_key(finding, ignored_tags=_VIEW_ORIGIN_TAGS),
     )
 
 
 def _view_scope_key(finding: Finding) -> _ViewScopeKey:
+    # A mapped start column identifies the exact raw occurrence (and the end
+    # column scopes it further when available). Alternate security views may
+    # normalize characters inside that span and therefore produce a different
+    # content fingerprint; keep the fingerprint only as a fallback for legacy
+    # producers that lack precise columns.
+    occurrence_fingerprint = None if finding.start_column is not None else finding.fingerprint()
     return (
         finding.rule_id,
         finding.file,
         finding.start_line,
+        finding.end_line,
+        finding.start_column,
+        finding.end_column,
+        occurrence_fingerprint,
+    )
+
+
+def _view_finding_strength(finding: Finding) -> tuple[int, float]:
+    """Rank classification without assuming public severity strings are valid."""
+    try:
+        severity = Severity(finding.severity)
+    except ValueError:
+        severity_rank = len(_ANALYZER_SEVERITY_ORDER)
+    else:
+        severity_rank = _ANALYZER_SEVERITY_ORDER[severity]
+    return severity_rank, -finding.confidence
+
+
+def _projection_finding_key(finding: Finding) -> tuple[object, ...]:
+    """Identify one semantic signal across alternate marker projections.
+
+    Declared-marker reconstruction can expose the same canonical match through
+    multiple removal candidates. Those alternatives are not independent raw
+    occurrences, so their projected columns must not consume output budget.
+    """
+    return (
+        finding.rule_id,
+        finding.file,
+        finding.start_line,
+        finding.end_line,
         finding.fingerprint(),
+        classification_metadata_key(finding, ignored_tags=_VIEW_ORIGIN_TAGS),
     )
 
 
@@ -719,23 +1010,30 @@ def _deduplicate_view_findings(findings: list[Finding]) -> list[Finding]:
     raw_keys = {
         _view_finding_key(finding) for finding in findings if "normalized-view" not in finding.tags
     }
-    raw_non_benign_scopes = {
-        _view_scope_key(finding)
-        for finding in findings
-        if "normalized-view" not in finding.tags and not _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
-    }
+    raw_non_contextual_strength: dict[_ViewScopeKey, tuple[int, float]] = {}
+    for finding in findings:
+        if "normalized-view" in finding.tags or _CONTEXTUAL_TRIAGE_TAG in finding.tags:
+            continue
+        scope = _view_scope_key(finding)
+        strength = _view_finding_strength(finding)
+        previous = raw_non_contextual_strength.get(scope)
+        if previous is None or strength < previous:
+            raw_non_contextual_strength[scope] = strength
     for finding in findings:
         key = _view_finding_key(finding)
         if "normalized-view" in finding.tags and key in raw_keys:
             continue
         if (
             "normalized-view" in finding.tags
-            and _BENIGN_CONTEXT_TAGS.issubset(finding.tags)
-            and _view_scope_key(finding) in raw_non_benign_scopes
+            and _CONTEXTUAL_TRIAGE_TAG in finding.tags
+            and (raw_strength := raw_non_contextual_strength.get(_view_scope_key(finding)))
+            is not None
+            and raw_strength <= _view_finding_strength(finding)
         ):
-            # Normalization may make an ambiguous raw occurrence look benign.
-            # Prefer the raw non-benign signal, but never suppress a derived
-            # unsafe classification that exposes obfuscated content.
+            # Normalization may erase a raw separator and make the same exact
+            # occurrence appear contextually qualified. Prefer an equally or
+            # more severe raw classification; retain a stronger derived signal
+            # that actually exposes obfuscated content.
             continue
         if key in seen:
             continue
@@ -750,19 +1048,32 @@ def _scan_view_windows(
     pattern_modules: list,
     finding_budget: _FindingBudget,
     python_ast_cache_key: str | None,
+    *,
+    source_text: str,
 ) -> tuple[list[Finding], _StaticResourceLimitError | None]:
     """Scan one already-bounded view."""
-    findings, resource_limit = _scan_path(
-        path,
-        view.text,
-        pattern_modules,
-        finding_budget,
-        python_ast_cache_key,
-    )
+    view_token = _ACTIVE_SECURITY_VIEW.set((view, source_text))
+    try:
+        findings, resource_limit = _scan_path(
+            path,
+            view.text,
+            pattern_modules,
+            finding_budget,
+            python_ast_cache_key,
+        )
+    finally:
+        _ACTIVE_SECURITY_VIEW.reset(view_token)
     for finding in findings:
+        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
+        if not isinstance(local_start, int) and finding.start_column is not None:
+            local_start = _line_start_offset(view.text, finding.start_line) + finding.start_column
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
             finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
+        if finding.end_line is not None and finding.end_column is not None:
+            local_end = _line_start_offset(view.text, finding.end_line) + finding.end_column
+            if 0 < local_end <= len(view.text):
+                finding.evidence[_SOURCE_END_EVIDENCE] = view.source_offset(local_end - 1) + 1
     if view.name != "raw":
         for finding in findings:
             if "normalized-view" not in finding.tags:
@@ -975,6 +1286,10 @@ def _restore_continuity_lines(
         if finding.end_line is not None:
             end_index = min(max(finding.end_line - 1, 0), len(source_lines) - 1)
             finding.end_line = source_lines[end_index]
+        # Continuity projections retain exact raw lines but may remove columns'
+        # worth of separators. Do not publish a projected column as a raw one.
+        finding.start_column = None
+        finding.end_column = None
 
 
 def _continuity_finding_key(finding: Finding) -> tuple[object, ...]:
@@ -1013,22 +1328,55 @@ def _restore_source_lines(
     window_start: int = 0,
     source_line_starts: tuple[int, ...] | None = None,
 ) -> None:
-    """Map normalized/window-relative locations to raw whole-file lines."""
+    """Map normalized/window-relative locations to raw whole-file coordinates."""
 
-    def source_line(raw_offset: int) -> int:
+    def source_position(raw_offset: int) -> tuple[int, int]:
         if source_line_starts is not None:
-            return bisect_right(source_line_starts, window_start + raw_offset)
-        return window_line + sum(1 for _ in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_offset))
+            absolute = window_start + raw_offset
+            line_index = max(0, bisect_right(source_line_starts, absolute) - 1)
+            return line_index + 1, absolute - source_line_starts[line_index]
+        line = window_line
+        line_start = 0
+        for separator in LOGICAL_LINE_BREAK.finditer(raw_window, 0, raw_offset):
+            line += 1
+            line_start = separator.end()
+        return line, raw_offset - line_start
+
+    def derived_offset(line: int, column: int | None) -> int:
+        offset = _line_start_offset(view.text, line)
+        if column is not None:
+            offset += column
+        return min(max(offset, 0), len(view.text))
+
+    def source_end_offset(offset: int) -> int:
+        if offset <= 0:
+            return view.source_offset(0)
+        return view.source_offset(offset - 1) + 1
 
     for finding in findings:
-        derived_start = _line_start_offset(view.text, finding.start_line)
-        raw_start = view.source_offset(derived_start)
-        finding.start_line = source_line(raw_start)
+        source_start = finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+        source_end = finding.evidence.pop(_SOURCE_END_EVIDENCE, None)
+        has_exact_start = isinstance(source_start, int) or finding.start_column is not None
+        if isinstance(source_start, int):
+            raw_start = source_start
+        else:
+            raw_start = view.source_offset(derived_offset(finding.start_line, finding.start_column))
+        finding.start_line, raw_start_column = source_position(raw_start)
+        finding.start_column = raw_start_column if has_exact_start else None
         if finding.end_line is not None:
-            derived_end = _line_start_offset(view.text, finding.end_line)
-            raw_end = view.source_offset(derived_end)
-            finding.end_line = source_line(raw_end)
-        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+            has_exact_end = finding.end_column is not None
+            end_offset = derived_offset(finding.end_line, finding.end_column)
+            raw_end = (
+                source_end
+                if isinstance(source_end, int)
+                else (
+                    source_end_offset(end_offset)
+                    if has_exact_end
+                    else view.source_offset(end_offset)
+                )
+            )
+            finding.end_line, raw_end_column = source_position(raw_end)
+            finding.end_column = raw_end_column if has_exact_end else None
 
 
 def _scan_declared_marker_views(
@@ -1040,7 +1388,8 @@ def _scan_declared_marker_views(
     owned_starts: tuple[int, ...],
     raw_starts: tuple[int, ...],
     source_context: _WindowSourceContext,
-) -> tuple[list[Finding], bool, _StaticResourceLimitError | None]:
+    complete_context: bool,
+) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
 
@@ -1056,8 +1405,9 @@ def _scan_declared_marker_views(
 
     check_runtime()
     projection_limited = False
+    bounded_parse_limited = False
     seen_views: set[tuple[str, int, int]] = set()
-    seen_findings: set[_ViewFindingKey] = set()
+    seen_finding_counts: dict[tuple[object, ...], int] = {}
 
     for owned_start, raw_start in zip(owned_starts, raw_starts, strict=True):
         check_runtime()
@@ -1077,7 +1427,10 @@ def _scan_declared_marker_views(
         check_runtime()
         full_views = tuple(
             _window_view_with_markdown_context(full_view, len(context_prefix))
-            for full_view in security_text_views(context_prefix + raw_window)
+            for full_view in security_text_views(
+                context_prefix + raw_window,
+                check_runtime=check_runtime,
+            )
         )
         check_runtime()
         for full_view in full_views:
@@ -1100,6 +1453,8 @@ def _scan_declared_marker_views(
                 if marker_key in seen_views:
                     continue
                 seen_views.add(marker_key)
+                projection_finding_counts: dict[tuple[object, ...], int] = {}
+                projection_seen_occurrences: set[_ViewFindingKey] = set()
                 for view in _bounded_view_slices(marker_view):
                     check_runtime()
                     view_budget = _FindingBudget(
@@ -1114,6 +1469,7 @@ def _scan_declared_marker_views(
                         pattern_modules,
                         view_budget,
                         None,
+                        source_text=raw_window,
                     )
                     _restore_source_lines(
                         view_findings,
@@ -1124,15 +1480,22 @@ def _scan_declared_marker_views(
                         source_line_starts=source_context.line_starts,
                     )
                     for finding in view_findings:
-                        key = _view_finding_key(finding)
-                        if key in seen_findings:
+                        occurrence_key = _view_finding_key(finding)
+                        if occurrence_key in projection_seen_occurrences:
                             continue
-                        seen_findings.add(key)
+                        projection_seen_occurrences.add(occurrence_key)
+                        key = _projection_finding_key(finding)
+                        projection_count = projection_finding_counts.get(key, 0) + 1
+                        projection_finding_counts[key] = projection_count
+                        if projection_count <= seen_finding_counts.get(key, 0):
+                            continue
+                        seen_finding_counts[key] = projection_count
                         findings.append(finding)
                         if len(findings) > finding_budget.max_findings:
                             return (
                                 findings,
                                 projection_limited,
+                                bounded_parse_limited,
                                 _StaticResourceLimitError(
                                     LedgerReason.OUTPUT_LIMIT,
                                     {
@@ -1142,12 +1505,34 @@ def _scan_declared_marker_views(
                                 ),
                             )
                     if resource_limit is not None:
-                        return findings, projection_limited, resource_limit
+                        return (
+                            findings,
+                            projection_limited,
+                            bounded_parse_limited,
+                            resource_limit,
+                        )
+                # Preserve any concrete marker-view evidence before asking
+                # module-specific completeness hooks whether the reconstructed
+                # payload exceeded a bounded parser contract. If that hook
+                # reaches the shared deadline, ``check_runtime`` carries the
+                # findings accumulated above into the partial result.
+                for module in pattern_modules:
+                    exhaustion_hook = getattr(module, "has_bounded_parse_exhaustion", None)
+                    if callable(exhaustion_hook):
+                        check_runtime()
+                        bounded_parse_limited = bounded_parse_limited or bool(
+                            exhaustion_hook(
+                                marker_view.text,
+                                check_runtime,
+                                file_type=_infer_file_type(path),
+                                complete_context=complete_context,
+                            )
+                        )
 
         if owned_end == len(content):
             break
 
-    return findings, projection_limited, None
+    return findings, projection_limited, bounded_parse_limited, None
 
 
 def _scan_all_views_detailed(
@@ -1158,13 +1543,29 @@ def _scan_all_views_detailed(
     *,
     max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
     timeout_seconds: float | None = None,
+    started_at: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> tuple[list[Finding], LedgerReason | None, dict[str, int | float]]:
     """Scan bounded raw windows and return any limit with observed/limit metrics."""
+    started_at = time.monotonic() if started_at is None else started_at
     ast_modules = [module for module in pattern_modules if _uses_python_ast(module)]
     lexical_modules = [module for module in pattern_modules if not _uses_python_ast(module)]
+    if python_ast is None:
+        python_ast = _python_ast_for_path(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+        )
+    python_syntax_error = bool(
+        _infer_file_type(path) == "python"
+        and len(content) <= MAX_FILE_CHARS
+        and _requires_python_ast(pattern_modules)
+        and python_ast is not None
+        and python_ast.tree is None
+    )
     findings: list[Finding] = []
     seen_findings: set[_ViewFindingKey] = set()
-    started_at = time.monotonic()
     runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
     if timeout_seconds is not None:
         runtime_limit = min(runtime_limit, max(0.0, timeout_seconds))
@@ -1215,17 +1616,22 @@ def _scan_all_views_detailed(
                 tuple(sorted(set(marker_raw_starts).union(raw_starts))),
             )
             finding_budget.check_runtime()
-            marker_findings, marker_projection_limited, resource_limit = (
-                _scan_declared_marker_views(
-                    path,
-                    content,
-                    modules_for_windows,
-                    marker_budget,
-                    owned_starts=marker_owned_starts,
-                    raw_starts=marker_raw_starts,
-                    source_context=source_context,
-                )
+            (
+                marker_findings,
+                marker_projection_limited,
+                marker_bounded_parse_limited,
+                resource_limit,
+            ) = _scan_declared_marker_views(
+                path,
+                content,
+                modules_for_windows,
+                marker_budget,
+                owned_starts=marker_owned_starts,
+                raw_starts=marker_raw_starts,
+                source_context=source_context,
+                complete_context=whole_artifact_window,
             )
+            bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
             _extend_unique_findings(
                 findings,
@@ -1253,6 +1659,31 @@ def _scan_all_views_detailed(
                 resource_limit.metrics,
             )
 
+        # Window overlap cannot prove completeness for one shell command that
+        # spans several otherwise ordinary windows. Run each module's bounded,
+        # deadline-aware completeness hook once on the full artifact; ordinary
+        # finding production remains windowed below. Marker-view hooks run
+        # first so any concrete reconstructed evidence survives a deadline.
+        try:
+            for module in modules_for_windows:
+                exhaustion_hook = getattr(module, "has_bounded_parse_exhaustion", None)
+                if callable(exhaustion_hook):
+                    finding_budget.check_runtime()
+                    bounded_parse_limited = bounded_parse_limited or bool(
+                        exhaustion_hook(
+                            content,
+                            finding_budget.check_runtime,
+                            file_type=_infer_file_type(path),
+                            complete_context=True,
+                        )
+                    )
+        except _StaticResourceLimitError as exc:
+            return (
+                _deduplicate_view_findings(findings)[:max_findings],
+                exc.reason,
+                exc.metrics,
+            )
+
     if ast_modules and len(content) <= MAX_FILE_CHARS:
         try:
             ast_findings, resource_limit = _scan_path(
@@ -1261,6 +1692,7 @@ def _scan_all_views_detailed(
                 ast_modules,
                 finding_budget,
                 python_ast_cache_key,
+                python_ast,
             )
         except _StaticResourceLimitError as exc:
             return _deduplicate_view_findings(findings), exc.reason, exc.metrics
@@ -1313,7 +1745,18 @@ def _scan_all_views_detailed(
                 source_context.fence_states,
                 source_context.fence_transitions,
             )
-            for full_view in security_text_views(context_prefix + raw_window):
+            try:
+                full_views = security_text_views(
+                    context_prefix + raw_window,
+                    check_runtime=finding_budget.check_runtime,
+                )
+            except _StaticResourceLimitError as exc:
+                return (
+                    _deduplicate_view_findings(findings)[:max_findings],
+                    exc.reason,
+                    exc.metrics,
+                )
+            for full_view in full_views:
                 full_view = _window_view_with_markdown_context(full_view, len(context_prefix))
                 try:
                     for module in modules_for_windows:
@@ -1322,7 +1765,7 @@ def _scan_all_views_detailed(
                             "has_bounded_parse_exhaustion",
                             None,
                         )
-                        if callable(exhaustion_hook):
+                        if callable(exhaustion_hook) and full_view.name != "raw":
                             finding_budget.check_runtime()
                             bounded_parse_limited = bounded_parse_limited or bool(
                                 exhaustion_hook(
@@ -1355,6 +1798,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            source_text=raw_window,
                         )
                     except _StaticResourceLimitError as exc:
                         return (
@@ -1365,10 +1809,22 @@ def _scan_all_views_detailed(
                     owned_findings: list[Finding] = []
                     for finding in view_findings:
                         source_start = finding.evidence.get(_SOURCE_START_EVIDENCE)
-                        if isinstance(source_start, int) and not (
-                            owned_source_start <= source_start < owned_source_end
-                        ):
-                            continue
+                        if isinstance(source_start, int):
+                            starts_in_owned_range = (
+                                owned_source_start <= source_start < owned_source_end
+                            )
+                            source_end = finding.evidence.get(_SOURCE_END_EVIDENCE)
+                            # A match starting in the left overlap normally belongs
+                            # to the preceding window. If its exact end lies past
+                            # that window's right edge, however, this is the first
+                            # window capable of observing the complete occurrence.
+                            first_discoverable_in_this_window = (
+                                source_start < owned_source_start
+                                and isinstance(source_end, int)
+                                and source_end > owned_source_start + _WINDOW_OVERLAP_CHARS
+                            )
+                            if not starts_in_owned_range and not first_discoverable_in_this_window:
+                                continue
                         owned_findings.append(finding)
                     view_findings = owned_findings
                     _restore_source_lines(
@@ -1405,7 +1861,10 @@ def _scan_all_views_detailed(
         continuity_seen = {_continuity_finding_key(finding) for finding in findings}
         try:
             for continuity in _continuity_views(content, finding_budget):
-                for full_view in security_text_views(continuity.view.text):
+                for full_view in security_text_views(
+                    continuity.view.text,
+                    check_runtime=finding_budget.check_runtime,
+                ):
                     named_view = SecurityTextView(
                         name=f"continuity-{full_view.name}",
                         text=full_view.text,
@@ -1425,6 +1884,7 @@ def _scan_all_views_detailed(
                             modules_for_windows,
                             view_budget,
                             None,
+                            source_text=continuity.view.text,
                         )
                         _restore_source_lines(
                             view_findings,
@@ -1479,7 +1939,9 @@ def _scan_all_views_detailed(
     return (
         deduplicated,
         (
-            LedgerReason.STATIC_PARSE_LIMIT
+            LedgerReason.SYNTAX_ERROR
+            if python_syntax_error
+            else LedgerReason.STATIC_PARSE_LIMIT
             if bounded_parse_limited
             else LedgerReason.OBFUSCATED_INSTRUCTION_TEXT
             if marker_projection_limited
@@ -1497,6 +1959,8 @@ def _scan_all_views(
     *,
     max_findings: int = MAX_FINDINGS_PER_ARTIFACT,
     timeout_seconds: float | None = None,
+    started_at: float | None = None,
+    python_ast: ParsedPythonFile | None = None,
 ) -> list[Finding]:
     findings, _, _ = _scan_all_views_detailed(
         path,
@@ -1505,8 +1969,72 @@ def _scan_all_views(
         python_ast_cache_key,
         max_findings=max_findings,
         timeout_seconds=timeout_seconds,
+        started_at=started_at,
+        python_ast=python_ast,
     )
     return findings
+
+
+def _postprocess_path_findings(
+    content: str,
+    pattern_modules: list,
+    findings: list[Finding],
+    *,
+    python_ast: ParsedPythonFile | None = None,
+    started_at: float | None = None,
+    timeout_seconds: float | None = None,
+) -> list[Finding]:
+    """Let one analyzer family reconcile findings after every view has run."""
+    hook = (
+        _explicit_module_hook(pattern_modules[0], "postprocess_path_findings")
+        if pattern_modules
+        else None
+    )
+    if not callable(hook):
+        return findings
+    uses_python_ast = bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_PYTHON_AST") is True
+    )
+    uses_runtime_budget = bool(
+        pattern_modules
+        and _explicit_module_hook(pattern_modules[0], "POSTPROCESS_USES_RUNTIME_BUDGET") is True
+    )
+    if uses_python_ast or uses_runtime_budget:
+        kwargs: dict[str, object] = {}
+        if uses_python_ast:
+            kwargs["python_ast"] = python_ast
+        if uses_runtime_budget:
+            kwargs.update(
+                {
+                    "started_at": started_at,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+        return cast(list[Finding], hook(content, findings, **kwargs))
+    return cast(list[Finding], hook(content, findings))
+
+
+def _cleanup_expired_path_findings(
+    pattern_modules: list,
+    findings: list[Finding],
+) -> list[Finding]:
+    """Run only a module's bounded private-evidence cleanup after a deadline."""
+    hook = (
+        _explicit_module_hook(pattern_modules[0], "cleanup_path_findings")
+        if pattern_modules
+        else None
+    )
+    if callable(hook):
+        return cast(list[Finding], hook(findings))
+    has_postprocessor = bool(
+        pattern_modules
+        and callable(_explicit_module_hook(pattern_modules[0], "postprocess_path_findings"))
+    )
+    # A module requiring postprocessing owns the contract that turns its private
+    # intermediate findings into public objects. Without an explicit bounded
+    # cleanup hook, dropping that partial prefix is safer than leaking it.
+    return [] if has_postprocessor else findings
 
 
 def run_static_patterns(
@@ -1555,19 +2083,51 @@ def run_static_patterns(
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
         if remaining <= 0:
             break
+        path_started_at = time.monotonic()
         shared_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
         if shared_remaining is not None and shared_remaining <= 0:
             break
-        findings.extend(
-            _scan_all_views(
-                path,
+        python_ast = _python_ast_for_path(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+        )
+        path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
+        path_findings, resource_limit, _ = _scan_all_views_detailed(
+            path,
+            content,
+            pattern_modules,
+            python_ast_cache_key,
+            max_findings=path_limit,
+            timeout_seconds=shared_remaining,
+            started_at=path_started_at,
+            python_ast=python_ast,
+        )
+        runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+        if shared_remaining is not None:
+            runtime_limit = min(runtime_limit, max(0.0, shared_remaining))
+        expired = (
+            resource_limit is LedgerReason.RUNTIME_LIMIT
+            or time.monotonic() - path_started_at >= runtime_limit
+        )
+        if expired:
+            path_findings = _cleanup_expired_path_findings(pattern_modules, path_findings)
+        else:
+            path_findings = _postprocess_path_findings(
                 content,
                 pattern_modules,
-                python_ast_cache_key,
-                max_findings=min(MAX_FINDINGS_PER_ARTIFACT, remaining),
-                timeout_seconds=shared_remaining,
+                path_findings,
+                python_ast=python_ast,
+                started_at=path_started_at,
+                timeout_seconds=runtime_limit,
             )
-        )
+            if time.monotonic() - path_started_at >= runtime_limit:
+                path_findings = _cleanup_expired_path_findings(
+                    pattern_modules,
+                    path_findings,
+                )
+        findings.extend(path_findings[:path_limit])
 
     return findings
 
@@ -1654,6 +2214,7 @@ def run_static_patterns_with_ledger(
                 )
             else:
                 remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
+                path_started_at = time.monotonic()
                 shared_remaining = transitive_remaining_seconds(cast(SkillspectorState, state))
                 path_findings: list[Finding]
                 resource_limit: LedgerReason | None
@@ -1667,14 +2228,98 @@ def run_static_patterns_with_ledger(
                     }
                 else:
                     try:
+                        python_ast = _python_ast_for_path(
+                            path,
+                            content,
+                            pattern_modules,
+                            python_ast_cache_key,
+                        )
+                        path_limit = min(MAX_FINDINGS_PER_ARTIFACT, remaining)
                         path_findings, resource_limit, resource_metrics = _scan_all_views_detailed(
                             path,
                             content,
                             pattern_modules,
                             python_ast_cache_key,
-                            max_findings=min(MAX_FINDINGS_PER_ARTIFACT, remaining),
+                            max_findings=path_limit,
                             timeout_seconds=shared_remaining,
+                            started_at=path_started_at,
+                            python_ast=python_ast,
                         )
+                        has_postprocessor = bool(
+                            pattern_modules
+                            and callable(
+                                _explicit_module_hook(
+                                    pattern_modules[0],
+                                    "postprocess_path_findings",
+                                )
+                            )
+                        )
+                        runtime_limit = MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT
+                        if shared_remaining is not None:
+                            runtime_limit = min(runtime_limit, max(0.0, shared_remaining))
+                        observed_seconds = (
+                            float(resource_metrics.get("observed_seconds", 0.0))
+                            if resource_limit is LedgerReason.RUNTIME_LIMIT
+                            else max(0.0, time.monotonic() - path_started_at)
+                        )
+                        expired = (
+                            resource_limit is LedgerReason.RUNTIME_LIMIT
+                            or observed_seconds >= runtime_limit
+                        )
+                        if expired:
+                            resource_limit = LedgerReason.RUNTIME_LIMIT
+                            resource_metrics = {
+                                "observed_seconds": observed_seconds,
+                                "limit_seconds": runtime_limit,
+                            }
+                            path_findings = _cleanup_expired_path_findings(
+                                pattern_modules,
+                                path_findings,
+                            )
+                        elif has_postprocessor:
+                            path_findings = _postprocess_path_findings(
+                                content,
+                                pattern_modules,
+                                path_findings,
+                                python_ast=python_ast,
+                                started_at=path_started_at,
+                                timeout_seconds=runtime_limit,
+                            )
+                            observed_seconds = max(0.0, time.monotonic() - path_started_at)
+                            if observed_seconds >= runtime_limit:
+                                resource_limit = LedgerReason.RUNTIME_LIMIT
+                                resource_metrics = {
+                                    "observed_seconds": observed_seconds,
+                                    "limit_seconds": runtime_limit,
+                                }
+                                path_findings = _cleanup_expired_path_findings(
+                                    pattern_modules,
+                                    path_findings,
+                                )
+                        if len(path_findings) > path_limit:
+                            postprocessed_count = len(path_findings)
+                            path_findings = path_findings[:path_limit]
+                            if resource_limit is not LedgerReason.RUNTIME_LIMIT:
+                                if remaining < MAX_FINDINGS_PER_ARTIFACT:
+                                    observed_findings = len(findings) + postprocessed_count
+                                    limit_findings = MAX_FINDINGS_PER_ANALYZER
+                                else:
+                                    observed_findings = postprocessed_count
+                                    limit_findings = MAX_FINDINGS_PER_ARTIFACT
+                                if resource_limit is LedgerReason.OUTPUT_LIMIT:
+                                    observed_findings = max(
+                                        observed_findings,
+                                        int(resource_metrics.get("observed_findings", 0)),
+                                    )
+                                resource_limit = LedgerReason.OUTPUT_LIMIT
+                                resource_metrics = {
+                                    "observed_findings": observed_findings,
+                                    "limit_findings": limit_findings,
+                                }
+                    except _StaticResourceLimitError as exc:
+                        path_findings = []
+                        resource_limit = exc.reason
+                        resource_metrics = exc.metrics
                     except Exception as exc:
                         logger.warning("%s: scan error on %s: %s", analyzer_id, path, exc)
                         event = ledger_event(
@@ -1698,7 +2343,7 @@ def run_static_patterns_with_ledger(
                 partial = resource_limit is not None or (
                     _infer_file_type(path) == "python"
                     and len(content) > MAX_FILE_CHARS
-                    and any(_uses_python_ast(module) for module in pattern_modules)
+                    and _requires_python_ast(pattern_modules)
                 )
                 partial_reason = resource_limit or LedgerReason.SIZE_LIMIT
                 event = ledger_event(

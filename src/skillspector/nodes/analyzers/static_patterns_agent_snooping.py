@@ -28,8 +28,10 @@ Framework: OWASP LLMT09 (Misinformation), ASI-SR-003 (Least Knowledge).
 
 from __future__ import annotations
 
+import os
 import re
-import sys
+from collections.abc import Mapping
+from contextvars import ContextVar
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -43,22 +45,30 @@ logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_agent_snooping"
 
+_AS3_SKILL_PATH_PATTERN = r"skills?/(?P<skill_name>(?!CURRENT)[A-Z][A-Za-z0-9_-]+)/SKILL\.md"
+_AS3_SKILL_PATH_FULLMATCH = re.compile(_AS3_SKILL_PATH_PATTERN, re.IGNORECASE)
+_CURRENT_SKILL_IDENTIFIERS: ContextVar[frozenset[str]] = ContextVar(
+    "agent_snooping_current_skill_identifiers", default=frozenset()
+)
+
 # AS1: Agent Config Directory Access
 # Matches code/instructions that read from well-known agent config directories.
-AS1_PATTERNS = [
+AS1_CODE_PATTERNS = [
     # Direct filesystem access to .claude/, .codex/, .gemini/ directories
     (r"open\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)/", 0.9),
     (r"(?:Path|pathlib\.Path)\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)/", 0.9),
     (r"os\.path\.(?:join|exists|isfile)\s*\(\s*['\"]?\.(?:claude|codex|gemini|continue)", 0.85),
-    (
-        r"(?:read|load|open|access|fetch)\s+(?:the\s+)?(?:agent|claude|codex|gemini)\s+(?:config|configuration|settings?)\s+(?:from|at|in)\s+~?/?\.(?:claude|codex|gemini)",
-        0.9,
-    ),
     # Shell commands targeting config dirs
     (r"(?:cat|less|head|tail|grep|find)\s+[^|&;\n]*~?/?\.(claude|codex|gemini)/", 0.85),
     # Home-directory config paths
     (
         r"~?/\.(?:claude|codex|gemini|continue)/(?:config|settings?|preferences?|credentials?)(?:\.(?:json|yaml|yml|toml))?",
+        0.9,
+    ),
+]
+AS1_PROSE_PATTERNS = [
+    (
+        r"(?:read|load|open|access|fetch)\s+(?:the\s+)?(?:agent|claude|codex|gemini)\s+(?:config|configuration|settings?)\s+(?:from|at|in)\s+~?/?\.(?:claude|codex|gemini)",
         0.9,
     ),
     # Generic "agent config" snooping instructions
@@ -67,32 +77,36 @@ AS1_PATTERNS = [
         0.8,
     ),
 ]
+AS1_PATTERNS = AS1_CODE_PATTERNS + AS1_PROSE_PATTERNS
 
 # AS2: MCP Config Access
 # Matches code/instructions specifically targeting MCP server configuration.
-AS2_PATTERNS = [
+AS2_CODE_PATTERNS = [
     # Direct access to mcp.json files
     (r"open\s*\(\s*['\"][^'\"]*mcp(?:_config)?\.json['\"]", 0.95),
     (r"(?:Path|pathlib\.Path)\s*\(\s*['\"][^'\"]*mcp(?:_config)?\.json['\"]", 0.9),
     (r"(?:cat|less|head|grep)\s+[^|&;\n]*mcp(?:_config)?\.json", 0.9),
+    (r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json", 0.95),
+    # Accessing MCP server URLs or API keys from config
+    (r"mcp(?:_config)?\.json.*?(?:api_?key|token|secret|url|endpoint)", 0.9),
+]
+AS2_PROSE_PATTERNS = [
     # Instructions referencing MCP config
     (
         r"(?:read|access|load|inspect)\s+(?:the\s+)?mcp(?:\.json|_config)?\s+(?:file|config(?:uration)?|settings?)",
         0.9,
     ),
-    (r"\.(?:claude|codex|gemini)/mcp(?:_config)?\.json", 0.95),
     # Listing MCP servers
     (
         r"(?:list|enumerate|discover)\s+(?:all\s+)?(?:available\s+)?mcp\s+(?:servers?|tools?|services?)",
         0.8,
     ),
-    # Accessing MCP server URLs or API keys from config
-    (r"mcp(?:_config)?\.json.*?(?:api_?key|token|secret|url|endpoint)", 0.9),
 ]
+AS2_PATTERNS = AS2_CODE_PATTERNS + AS2_PROSE_PATTERNS
 
 # AS3: Skill Enumeration / Snooping
 # Matches code/instructions that enumerate or read other installed skills.
-AS3_PATTERNS = [
+AS3_CODE_PATTERNS = [
     # Listing skill directories
     (
         r"(?:os\.listdir|os\.scandir|glob\.glob|Path\.iterdir)\s*\([^)]*\.(?:claude|codex|gemini)/skills?",
@@ -101,6 +115,10 @@ AS3_PATTERNS = [
     (r"(?:ls|find|dir)\s+[^|&;\n]*\.(?:claude|codex|gemini)/skills?", 0.85),
     # Reading other skills' SKILL.md files
     (r"open\s*\(\s*['\"][^'\"]*SKILL\.md['\"].*?\bother\b", 0.85),
+    # Accessing skills/CURRENT or adjacent skill directories
+    (_AS3_SKILL_PATH_PATTERN, 0.8),
+]
+AS3_PROSE_PATTERNS = [
     (
         r"(?:read|access|inspect|enumerate)\s+(?:all\s+)?(?:installed|available|other)\s+skills?(?:\s+in\s+(?:the\s+)?(?:skills?|agent)\s+(?:directory|folder))?",
         0.85,
@@ -110,14 +128,13 @@ AS3_PATTERNS = [
         r"(?:list|discover|find|enumerate|identify)\s+(?:all\s+)?(?:other|installed|available)\s+(?:skills?|agents?|tools?)\s+(?:in\s+)?(?:the\s+)?(?:\.(?:claude|codex|gemini)|\$HOME)",
         0.85,
     ),
-    # Accessing skills/CURRENT or adjacent skill directories
-    (r"skills?/(?:(?!CURRENT)[A-Z][A-Za-z0-9_-]+)/SKILL\.md", 0.8),
     # Reading tool manifests of other agents
     (
         r"(?:read|access|load)\s+(?:the\s+)?(?:SKILL|skill)\.md\s+(?:file\s+)?(?:of|from|for)\s+(?:another|other|different|all)\s+(?:skill|agent|tool)",
         0.9,
     ),
 ]
+AS3_PATTERNS = AS3_CODE_PATTERNS + AS3_PROSE_PATTERNS
 
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
@@ -133,7 +150,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.AGENT_SNOOPING.value]
 
     for pattern, confidence in AS1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in AS1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -145,11 +167,17 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
 
     for pattern, confidence in AS2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in AS2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -161,11 +189,23 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
 
     for pattern, confidence in AS3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in AS3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            full_match = match.group(0)
+            if _is_current_skill_path_reference(
+                full_match, _CURRENT_SKILL_IDENTIFIERS.get()
+            ) and static_runner.security_view_match_is_literal(content, match.start(), match.end()):
+                continue
+            matched_text = full_match[:200]
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -176,15 +216,97 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     confidence=confidence,
                     tags=tag,
                     context=ctx(match.start()),
-                    matched_text=match.group(0)[:200],
+                    matched_text=matched_text,
+                    complete_match=full_match,
                 )
             )
 
     return findings
 
 
+def _normalize_skill_identifier(value: object) -> str | None:
+    """Return a usable identifier without aliasing filesystem names."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _current_skill_identifiers(state: SkillspectorState) -> frozenset[str]:
+    """Derive a trusted, internally consistent current-skill identity."""
+
+    # Normal graph scans carry one resolver-owned source identity, including
+    # an explicit None when the input layout is ambiguous. Direct analyzer
+    # callers retain the scan-root fallback used before provenance existed.
+    if "selected_source_identity" in state:
+        path_identifier = _normalize_skill_identifier(state.get("selected_source_identity"))
+    else:
+        path_identifier = _scan_root_identifier(state.get("skill_path"))
+
+    manifest = state.get("manifest")
+    manifest_identifier: str | None = None
+    if isinstance(manifest, Mapping):
+        manifest_identifier = _normalize_skill_identifier(manifest.get("name"))
+
+    # Manifest data can corroborate the selected source but cannot override a
+    # disagreement or add an alias that could conceal access to a peer skill.
+    if path_identifier is None:
+        return frozenset()
+    if manifest_identifier is not None and manifest_identifier != path_identifier:
+        return frozenset()
+    return frozenset({path_identifier})
+
+
+def _scan_root_identifier(skill_path: object) -> str | None:
+    """Return the root basename for callers without resolved input provenance."""
+    path_text: str | bytes | None = None
+    if isinstance(skill_path, str):
+        path_text = skill_path
+    elif isinstance(skill_path, os.PathLike):
+        try:
+            path_text = os.fspath(skill_path)
+        except Exception:
+            path_text = None
+    path_identifier: str | None = None
+    if isinstance(path_text, str):
+        normalized_path = path_text.replace("\\", "/").rstrip("/")
+        path_identifier = _normalize_skill_identifier(normalized_path.rsplit("/", 1)[-1])
+
+    return path_identifier
+
+
+def _is_current_skill_path_reference(
+    matched_text: object, current_skill_identifiers: frozenset[str]
+) -> bool:
+    """Return whether an exact AS3 path match names the current skill."""
+    if not current_skill_identifiers or not isinstance(matched_text, str):
+        return False
+    match = _AS3_SKILL_PATH_FULLMATCH.fullmatch(matched_text)
+    if match is None:
+        return False
+    matched_identifier = _normalize_skill_identifier(match.group("skill_name"))
+    return matched_identifier in current_skill_identifiers
+
+
+class _CurrentSkillScopedAnalyzer:
+    """Delegate AS checks while excluding exact current-skill path references."""
+
+    ANALYZER_ID = ANALYZER_ID
+
+    def __init__(self, current_skill_identifiers: frozenset[str]) -> None:
+        self._current_skill_identifiers = current_skill_identifiers
+
+    def analyze(self, content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+        token = _CURRENT_SKILL_IDENTIFIERS.set(self._current_skill_identifiers)
+        try:
+            return analyze(content, file_path, file_type)
+        finally:
+            _CURRENT_SKILL_IDENTIFIERS.reset(token)
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run agent_snooping patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    analyzer = _CurrentSkillScopedAnalyzer(_current_skill_identifiers(state))
+    response = static_runner.run_static_patterns_with_ledger(state, [analyzer])
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response

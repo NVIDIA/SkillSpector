@@ -80,8 +80,10 @@ MP1_PATTERNS = [
 ]
 
 # MP2: Context Window Stuffing — filling context to displace content
-MP2_PATTERNS = [
+MP2_CONTENT_PATTERNS = [
     (r"(.{2,20}?)\1{20,}", 0.8),
+]
+MP2_PROSE_PATTERNS = [
     (
         r"(?:repeat|duplicate|echo)\s+(?:this|the\s+following)\s+(?:\d{3,}|many|hundreds?|thousands?)\s+times?",
         0.85,
@@ -107,6 +109,7 @@ MP2_PATTERNS = [
         0.8,
     ),
 ]
+MP2_PATTERNS = MP2_CONTENT_PATTERNS + MP2_PROSE_PATTERNS
 
 # MP3: Memory Manipulation — direct modification of agent memory/state
 MP3_PATTERNS = [
@@ -292,7 +295,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.MEMORY_POISONING.value]
 
     for pattern, confidence in MP1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             line_num = get_line_number(content, match.start())
             findings.append(
                 AnalyzerFinding(
@@ -304,10 +309,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in MP2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in MP2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             span = match.group(0)
             if _is_layout_only_span(span):
                 continue
@@ -325,10 +336,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=ctx(match.start()),
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     for pattern, confidence in MP3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        for match in static_runner.iter_paragraph_matches(
+            pattern, content, re.IGNORECASE | re.MULTILINE
+        ):
             if _is_benign_reset_state_coverage(content, match):
                 continue
             line_num = get_line_number(content, match.start())
@@ -343,6 +357,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     tags=tag,
                     context=context_text,
                     matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
                 )
             )
     return findings

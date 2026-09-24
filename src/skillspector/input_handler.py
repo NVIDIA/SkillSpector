@@ -50,7 +50,7 @@ from pathlib import Path, PurePosixPath
 from stat import S_IFMT, S_ISDIR, S_ISLNK, S_ISREG
 from time import monotonic
 from typing import BinaryIO, NoReturn, cast
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
@@ -209,6 +209,28 @@ def _is_private_ip(host: str) -> bool:
     except (socket.gaierror, OSError):
         return True
     return False
+
+
+def _raw_file_url(url: str) -> str:
+    """Point a GitHub or GitLab ``/blob/`` file page at the file's raw bytes.
+
+    Those pages are HTML viewers, so downloading one scans the forge's page
+    markup instead of the file. Every other URL is returned unchanged.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    segments = parsed.path.split("/")
+    # /<owner>/<repo>/blob/<ref>/<path> -> raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>
+    if host == "github.com" and len(segments) > 5 and segments[3] == "blob":
+        raw_path = "/".join(segments[:3] + segments[4:])
+        return parsed._replace(netloc="raw.githubusercontent.com", path=raw_path).geturl()
+    # /<namespace>/<project>/-/blob/<ref>/<path> -> /<namespace>/<project>/-/raw/<ref>/<path>
+    if host == "gitlab.com" and "-" in segments[3:]:
+        marker = segments.index("-", 3)
+        if marker + 3 < len(segments) and segments[marker + 1] == "blob":
+            segments[marker + 1] = "raw"
+            return parsed._replace(path="/".join(segments)).geturl()
+    return url
 
 
 def _root_owned_root_alias(path: Path) -> Path | None:
@@ -443,6 +465,41 @@ def _windows_last_error() -> OSError:
     return cast(OSError, ctypes.WinError(ctypes.get_last_error()))  # type: ignore[attr-defined]
 
 
+def _windows_long_path_name(path: str) -> str:
+    """Expand any 8.3 short components of a Windows path to their long form.
+
+    ``GetFinalPathNameByHandleW`` always answers with long components, while the
+    requested path may carry short ones: Windows keeps an 8.3 alias for a
+    directory whose name holds a space, so a profile directory such as
+    ``C:\\Users\\Hoang Pham`` reaches the scanner as ``C:\\Users\\HOANGP~1`` by way
+    of ``%TEMP%``. Comparing the two spellings without expanding them first
+    rejects every file below such a path.
+
+    The short name is an alias the filesystem keeps for one directory entry, so
+    expanding it names that same entry and does not resolve symlinks or
+    junctions; the reparse-point checks around the caller keep their meaning. A
+    path that no longer resolves comes back unchanged, which leaves that caller
+    fail-closed.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    get_long_path_name = kernel32.GetLongPathNameW
+    get_long_path_name.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_long_path_name.restype = wintypes.DWORD
+
+    buffer_size = 260
+    while True:
+        buffer = ctypes.create_unicode_buffer(buffer_size)
+        result = cast(int, get_long_path_name(path, buffer, buffer_size))
+        if result == 0:
+            return path
+        if result < buffer_size:
+            return buffer.value
+        buffer_size = result + 1
+
+
 def _windows_normalized_path(path: str) -> str:
     """Normalize a Windows DOS path for an exact opened-handle comparison."""
     long_path_prefix = "\\\\?\\"
@@ -451,7 +508,8 @@ def _windows_normalized_path(path: str) -> str:
         path = "\\\\" + path[len(long_unc_prefix) :]
     elif path.startswith(long_path_prefix):
         path = path[len(long_path_prefix) :]
-    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    absolute = os.path.normpath(os.path.abspath(path))
+    return os.path.normcase(_windows_long_path_name(absolute))
 
 
 def _close_fd_safely(fd: int) -> None:
@@ -651,6 +709,56 @@ def _validate_zip_member_type(info: zipfile.ZipInfo) -> None:
         raise ValueError("Zip directory entry contains file data")
 
 
+def selected_source_identity_for_input(
+    input_path: str,
+    *,
+    source_type: str,
+    resolved_path: Path,
+    temp_dir: Path | None,
+) -> str | None:
+    """Identify the selected skill without treating materialization names as aliases.
+
+    Call only after successful input resolution, using the source type and
+    temporary directory returned by that handler. A preserved archive root is
+    stronger evidence than the archive filename; neither introduces a second
+    identity. Unknown source layouts deliberately have no suppression identity.
+    """
+    if source_type == "directory":
+        return resolved_path.name or None
+
+    if source_type == "git":
+        text = input_path.strip()
+        if text.startswith("git@"):
+            match = re.fullmatch(r"git@[^:]+:(.+)", text)
+            if match is None:
+                return None
+            source_path = match.group(1)
+        else:
+            source_path = urlparse(text).path
+        return source_path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or None
+
+    if temp_dir is None:
+        return None
+
+    extraction_root = temp_dir / "extracted"
+    if source_type in {"zip", "url"} and resolved_path.parent == extraction_root:
+        # InputHandler preserves a unique outer directory from an archive.
+        return resolved_path.name or None
+    if source_type == "zip" and resolved_path == extraction_root:
+        return Path(input_path.strip()).stem or None
+
+    if source_type == "file":
+        original = Path(input_path.strip())
+        if original.name not in {"SKILL.md", "skill.md"}:
+            return None
+        return Path(os.path.abspath(original)).parent.name or None
+
+    # Direct-download URLs cannot reliably distinguish repository, slash-
+    # containing ref, and skill-directory segments. Keep those identities
+    # unknown rather than allowing a ref or repository name to hide a peer.
+    return None
+
+
 class InputHandler:
     """
     Handles input resolution for different source types.
@@ -661,6 +769,7 @@ class InputHandler:
     def __init__(self, transitive_budget: object | None = None) -> None:
         self._temp_dir: Path | None = None
         self._transitive_budget = transitive_budget
+        self.primary_file_path: str | None = None
 
     def resolve(self, input_path: str) -> tuple[Path, str]:
         """
@@ -680,7 +789,24 @@ class InputHandler:
             FileNotFoundError: If local path doesn't exist.
         """
         input_path = input_path.strip()
+        self.primary_file_path = None
 
+        git_target = self._github_tree_target(input_path)
+        if git_target is not None:
+            repository_url, branch, subdirectory = git_target
+            clone_dir = self._clone_git(repository_url, branch=branch)
+            try:
+                clone_root = clone_dir.resolve()
+                target = (clone_root / subdirectory).resolve()
+                target.relative_to(clone_root)
+                if not target.is_dir() or target.is_symlink():
+                    raise ValueError("Git URL subdirectory does not exist or is not a directory")
+                return target, "git"
+            except (OSError, ValueError):
+                # No caller receives the resolver after a failed selection, so it
+                # cannot clean an owned clone on our behalf.
+                self.cleanup()
+                raise
         if self._is_git_url(input_path):
             return self._clone_git(input_path), "git"
         if self._is_file_url(input_path):
@@ -778,7 +904,9 @@ class InputHandler:
             self._truncate("time_budget_exhausted", source_type)
         raise IngestLimitExceededError(f"{source_type.title()} ingest exceeded its time limit")
 
-    def _bounded_tree_measurement(self, root: Path, deadline: float) -> _TreeMeasurement:
+    def _bounded_tree_measurement(
+        self, root: Path, deadline: float, *, allow_missing_git_entries: bool = False
+    ) -> _TreeMeasurement:
         """Measure a clone using iterative, deterministic, bounded ``scandir``.
 
         Directory entries are retained only up to ``INGEST_MAX_TREE_ENTRIES``.
@@ -812,6 +940,8 @@ class InputHandler:
                         directory_entries.append(entry)
                         self._check_deadline(deadline, "git")
             except OSError as exc:
+                if allow_missing_git_entries and inside_git and isinstance(exc, FileNotFoundError):
+                    continue
                 raise ValueError("Could not safely inspect cloned repository") from exc
 
             child_directories: list[tuple[Path, bool]] = []
@@ -819,12 +949,18 @@ class InputHandler:
                 directory_entries, key=lambda item: (item.name.casefold(), item.name)
             ):
                 self._check_deadline(deadline, "git")
+                entry_inside_git = inside_git or (directory == root and entry.name == ".git")
                 try:
                     entry_stat = entry.stat(follow_symlinks=False)
                 except OSError as exc:
+                    if (
+                        allow_missing_git_entries
+                        and entry_inside_git
+                        and isinstance(exc, FileNotFoundError)
+                    ):
+                        continue
                     raise ValueError("Could not safely inspect cloned repository") from exc
                 entry_path = Path(entry.path)
-                entry_inside_git = inside_git or (directory == root and entry.name == ".git")
                 if S_ISLNK(entry_stat.st_mode):
                     continue
                 if S_ISDIR(entry_stat.st_mode):
@@ -951,6 +1087,78 @@ class InputHandler:
             return True
         return False
 
+    def _github_tree_target(self, path: str) -> tuple[str, str, PurePosixPath] | None:
+        """Return a canonical clone target for a GitHub ``/tree/<ref>/<dir>`` URL.
+
+        The ref itself may contain ``/`` (for example ``feature/foo``), so the
+        split between ref and subdirectory is resolved against the remote's
+        advertised refs: the longest ``refs/heads/`` or ``refs/tags/`` name
+        that prefixes the ``/tree/`` segments wins.  Without this, a URL for
+        branch ``feature/foo`` would clone branch ``feature`` and treat
+        ``foo`` as part of the subdirectory.
+        """
+        parsed = urlparse(path)
+        if parsed.scheme != "https" or parsed.hostname != "github.com":
+            return None
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(parts) < 4 or parts[2] != "tree":
+            return None
+        owner, repository = parts[0], parts[1]
+        segments = parts[3:]
+        if any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in segments):
+            raise ValueError("Git URL subdirectory must stay within the repository")
+        repository_url = f"https://github.com/{owner}/{repository}.git"
+        ref, subdirectory = self._resolve_tree_ref(repository_url, segments)
+        return (repository_url, ref, PurePosixPath(*subdirectory))
+
+    def _resolve_tree_ref(self, repository_url: str, segments: list[str]) -> tuple[str, list[str]]:
+        """Split ``/tree/`` *segments* into ``(ref, subdirectory)``.
+
+        Uses the longest remote branch/tag name that prefixes the segments, so
+        refs containing ``/`` resolve to the intended tree.  Raises ValueError
+        when no advertised ref matches the URL.
+        """
+        remote_refs = self._list_remote_refs(repository_url)
+        for end in range(len(segments), 0, -1):
+            candidate = "/".join(segments[:end])
+            if candidate in remote_refs:
+                return candidate, segments[end:]
+        raise ValueError(
+            "GitHub tree URL does not name a known branch or tag: "
+            f"{repository_url} ({'/'.join(segments)})"
+        )
+
+    def _list_remote_refs(self, repository_url: str) -> set[str]:
+        """Return the branch/tag names advertised by the remote repository.
+
+        Bounded by the ingest deadline; the host allowlist and private-IP
+        checks from URL validation apply.
+        """
+        self._validate_url_host(repository_url, ALLOWED_GIT_HOSTS)
+        deadline = self._deadline()
+        self._check_deadline(deadline, "git")
+        timeout = max(1.0, deadline - monotonic())
+        try:
+            process = subprocess.run(
+                ["git", "ls-remote", repository_url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise IngestLimitExceededError("Git ref listing exceeded its time limit") from exc
+        if process.returncode != 0:
+            raise ValueError(f"Could not list refs for GitHub tree URL: {repository_url}")
+        refs: set[str] = set()
+        for line in process.stdout.decode("utf-8", errors="replace").splitlines():
+            _, _, ref = line.partition("\t")
+            for prefix in ("refs/heads/", "refs/tags/"):
+                if ref.startswith(prefix):
+                    refs.add(ref[len(prefix) :])
+                    break
+        return refs
+
     def _is_file_url(self, path: str) -> bool:
         """Check if path is a direct file URL."""
         if not path.startswith("https://"):
@@ -986,7 +1194,7 @@ class InputHandler:
             )
         return host
 
-    def _clone_git(self, url: str) -> Path:
+    def _clone_git(self, url: str, *, branch: str | None = None) -> Path:
         """Clone a Git repository to a temporary directory, bounded by ``INGEST_MAX_BYTES``."""
         remaining_seconds = self._remaining_seconds()
         remaining_bytes = self._remaining_bytes()
@@ -1012,6 +1220,8 @@ class InputHandler:
             url,
             str(clone_dir),
         ]
+        if branch is not None:
+            clone_command[6:6] = ["--branch", branch]
         if remaining_bytes is not None:
             clone_command.insert(6, f"--filter=blob:limit={remaining_bytes}")
         process: subprocess.Popen[bytes] | None = None
@@ -1031,7 +1241,12 @@ class InputHandler:
                     # Measure the materializing tree while Git is still running
                     # so an oversized pack/worktree is terminated, not merely
                     # rejected after the subprocess has filled the disk.
-                    final_measurement = self._bounded_tree_measurement(clone_dir, deadline)
+                    # Git can rename temporary metadata during this walk. Only
+                    # tolerate missing .git entries while the process is live;
+                    # the iteration after exit always performs a strict walk.
+                    final_measurement = self._bounded_tree_measurement(
+                        clone_dir, deadline, allow_missing_git_entries=return_code is None
+                    )
                 if return_code is not None:
                     if return_code != 0:
                         raise ValueError("Failed to clone repository")
@@ -1087,6 +1302,7 @@ class InputHandler:
         partial file produced by a mid-stream breach is removed before
         the exception propagates.
         """
+        url = _raw_file_url(url)
         if self._transitive_budget is not None:
             return self._download_transitive_file(url)
         self._validate_url_host(url, ALLOWED_DOWNLOAD_HOSTS)
@@ -1150,6 +1366,7 @@ class InputHandler:
             return self._extract_zip(zip_path)
         file_path = temp_dir / filename
         download_path.replace(file_path)
+        self.primary_file_path = filename
         return temp_dir
 
     def _download_transitive_file(self, url: str) -> Path:
@@ -1172,6 +1389,7 @@ class InputHandler:
             zip_path.write_bytes(content)
             return self._extract_zip(zip_path)
         (temp_dir / filename).write_bytes(content)
+        self.primary_file_path = filename
         return temp_dir
 
     def _download_with_redirect_validation(self, url: str) -> tuple[dict[str, str], str, bytes]:
@@ -1400,4 +1618,5 @@ class InputHandler:
             except BaseException:
                 dest.unlink(missing_ok=True)
                 raise
+        self.primary_file_path = file_path.name
         return temp_dir

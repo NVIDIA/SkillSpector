@@ -33,11 +33,11 @@ import re
 import sys
 
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.models import AnalyzerFinding, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number, is_code_example
+from .common import SourceLocationIndex, get_context, get_line_number, is_code_example
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -396,11 +396,14 @@ def _is_benign_ar_context(
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for anti-refusal statements (AR1-AR3)."""
     findings: list[AnalyzerFinding] = []
+    locations = SourceLocationIndex(content, file_path)
     tag = [PatternCategory.ANTI_REFUSAL.value]
 
     for rule_id, patterns in _RULES:
         for pattern, base_confidence in patterns:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            for match in static_runner.iter_paragraph_matches(
+                pattern, content, re.IGNORECASE | re.MULTILINE
+            ):
                 lines = content.splitlines()
                 line_num = get_line_number(content, match.start())
                 match_line = lines[line_num - 1] if lines else content
@@ -432,10 +435,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         rule_id=rule_id,
                         message="Anti-Refusal Statement",
                         severity=Severity.HIGH,
-                        location=Location(
-                            file=file_path,
-                            start_line=line_num,
-                        ),
+                        location=locations.location(match.start(), match.end()),
                         confidence=base_confidence,
                         tags=finding_tags,
                         context=_emitted_context(
@@ -445,20 +445,15 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                             previous_line=previous_line,
                         ),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
     return _deduplicate_findings(findings)
 
 
 def _deduplicate_findings(findings: list[AnalyzerFinding]) -> list[AnalyzerFinding]:
-    """Keep the highest-confidence finding per (file, line, rule_id)."""
-    best: dict[tuple[str, int, str], AnalyzerFinding] = {}
-    for f in findings:
-        key = (f.location.file, f.location.start_line, f.rule_id)
-        existing = best.get(key)
-        if existing is None or f.confidence > existing.confidence:
-            best[key] = f
-    return list(best.values())
+    """Compact only exact same-location matches."""
+    return static_runner.deduplicate_analyzer_findings(findings)
 
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:

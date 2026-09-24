@@ -36,16 +36,19 @@ ANALYZER_ID = "static_patterns_ssrf"
 _REQ = r"(?:requests|httpx|aiohttp|urllib(?:\.request)?|urllib3|session)\s*\.\s*(?:get|post|put|patch|delete|head|request|urlopen)|fetch|axios(?:\.\w+)?|XMLHttpRequest|\bcurl\b|\bwget\b"
 
 # SSRF1: Cloud instance metadata endpoints (credential theft).
-SSRF1_PATTERNS = [
+SSRF1_ENDPOINT_PATTERNS = [
     (r"169\.254\.169\.254", 0.9),  # AWS / GCP / Azure / OpenStack IMDS
     (r"metadata\.google\.internal", 0.9),
     (r"100\.100\.100\.200", 0.85),  # Alibaba Cloud
     (r"fd00:ec2::254", 0.85),  # AWS IMDS over IPv6
+]
+SSRF1_PROSE_PATTERNS = [
     (
         r"(?:read|fetch|get|query)\s+(?:the\s+)?(?:instance\s+)?metadata\s+(?:service|endpoint|server)",
         0.6,
     ),
 ]
+SSRF1_PATTERNS = SSRF1_ENDPOINT_PATTERNS + SSRF1_PROSE_PATTERNS
 
 # SSRF2: Requests to loopback / link-local / private (internal) hosts.
 SSRF2_PATTERNS = [
@@ -113,7 +116,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         rule_id: str, message: str, severity: Severity, patterns: list[tuple[str, float]]
     ) -> None:
         for pattern, confidence in patterns:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            matches = (
+                static_runner.iter_paragraph_matches
+                if (pattern, confidence) in SSRF1_PROSE_PATTERNS
+                else re.finditer
+            )
+            for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
                 if rule_id == "SSRF1" and _is_defensive_reference(content, match):
                     continue
                 line_num = get_line_number(content, match.start())
@@ -127,6 +135,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         tags=tag,
                         context=get_context(content, match.start()),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
 

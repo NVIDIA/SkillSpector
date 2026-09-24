@@ -34,7 +34,7 @@ make install-dev
 
 - **Python**: 3.12+ (see [pyproject.toml](../pyproject.toml)). `make install` and `make install-dev` use **uv** if available (`uv sync` / `uv sync --all-extras`), otherwise **pip** (`pip install -e .` / `pip install -e ".[dev]"`). You must create and activate the virtual environment yourself before running any make target.
 - **Environment**: Optional `.env` in the project root. The LangGraph dev server loads it (see [langgraph.json](../langgraph.json) `"env": ".env"`). Key variables:
-  - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `codex_cli`, or `gemini_cli`. Defaults to `nv_build` when unset.
+  - **`SKILLSPECTOR_PROVIDER`**: Selects the active LLM provider — `openai`, `anthropic`, `anthropic_proxy`, `bedrock`, `nv_build`, `ollama`, `azure_openai`, `openai_compatible`, `claude_cli`, `codex_cli`, `gemini_cli`, or `opencode_cli`. Defaults to `nv_build` when unset.
   - **Provider credential**: depends on the active provider. Hosted providers use the matching variables in [.env.example](../.env.example); Ollama and CLI providers do not require an API key. See [providers/](../src/skillspector/providers/).
   - **`OPENAI_BASE_URL`**: Override the OpenAI endpoint (e.g. point at Ollama).
   - **`SKILLSPECTOR_MODEL`**: Override default model; see [constants.py](../src/skillspector/constants.py).
@@ -296,7 +296,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai` \| `anthropic` \| `anthropic_proxy` \| `bedrock` \| `nv_build` \| `ollama` \| `azure_openai` \| `openai_compatible` \| `claude_cli` \| `codex_cli` \| `gemini_cli`. Defaults to `nv_build`. | `claude_cli` |
+| `SKILLSPECTOR_PROVIDER` | Active LLM provider: `openai` \| `anthropic` \| `anthropic_proxy` \| `bedrock` \| `nv_build` \| `ollama` \| `azure_openai` \| `openai_compatible` \| `claude_cli` \| `codex_cli` \| `gemini_cli` \| `opencode_cli`. Defaults to `nv_build`. | `claude_cli` |
 | `NVIDIA_INFERENCE_KEY` | Credential for `nv_build`. | `nvapi-...` |
 | `OPENAI_API_KEY` | Credential for `SKILLSPECTOR_PROVIDER=openai`. Also tier-2 fallback for non-OpenAI providers. | `sk-...` |
 | `OPENAI_BASE_URL` | Override the OpenAI endpoint (e.g. point at Ollama). | `http://localhost:11434/v1` |
@@ -312,7 +312,7 @@ Copy [.env.example](../.env.example) to `.env` in the project root and set value
 | `SKILLSPECTOR_COMPAT_BASE_URL` | OpenAI-compatible endpoint base URL. | `https://api.groq.com/openai/v1` |
 | `SKILLSPECTOR_MODEL` | Override the active provider's bundled default model (see [README.md](../README.md) for per-provider defaults). CLI providers forward it as `--model`. | `gpt-5.2` |
 
-> **CLI providers** (`claude_cli`, `codex_cli`, `gemini_cli`): no credential env var is needed. Authentication is managed by the agent CLI's own session. The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).
+> **CLI providers** (`claude_cli`, `codex_cli`, `gemini_cli`, `opencode_cli`): no credential env var is needed. Authentication is managed by the agent CLI's own session. The subprocess is heavily sandboxed — see [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py).
 
 ### Live provider tests
 
@@ -345,8 +345,9 @@ Base URL env vars are not needed for live provider tests; the tests intentionall
   - `claude_cli/` — **local `claude` binary; no API key**. Uses the CLI's own auth session (`claude auth login`). Set `SKILLSPECTOR_PROVIDER=claude_cli`.
   - `codex_cli/` — **local `codex` binary; no API key**. Uses the CLI's own auth session (`codex login`). Set `SKILLSPECTOR_PROVIDER=codex_cli`.
   - `gemini_cli/` — **local `gemini` binary; no API key**. Uses the CLI's own auth session. Set `SKILLSPECTOR_PROVIDER=gemini_cli`.
+  - `opencode_cli/` — **local `opencode` 1.18.31 binary; no API key**. Uses the CLI's own auth session (`opencode auth login`) and fails closed on every other runtime version because the deny-all policy is verified against that exact release. Set `SKILLSPECTOR_PROVIDER=opencode_cli`.
 
-  CLI providers (`claude_cli`, `codex_cli`, `gemini_cli`) implement the optional `AgentCLICapable` interface (`is_available()` + `complete()`) defined in [providers/base.py](../src/skillspector/providers/base.py). `has_cli_capability(provider)` detects this at runtime. All subprocess calls go through the hardened helper [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py) which enforces: no shell (`shell=False`), untrusted content via stdin only, capability stripping (tools disabled / sandboxed), environment scrubbing (no API keys forwarded), per-call timeout, and fail-closed error handling.
+  CLI providers (`claude_cli`, `codex_cli`, `gemini_cli`, `opencode_cli`) implement the optional `AgentCLICapable` interface (`is_available()` + `complete()`) defined in [providers/base.py](../src/skillspector/providers/base.py). `has_cli_capability(provider)` detects this at runtime. All subprocess calls go through the hardened helper [providers/_agent_cli.py](../src/skillspector/providers/_agent_cli.py) which enforces: no shell (`shell=False`), untrusted content via stdin only, capability stripping (tools disabled / sandboxed), environment scrubbing (no API keys forwarded), per-call timeout, and fail-closed error handling.
 
 - **LLM calls** ([llm_utils.py](../src/skillspector/llm_utils.py)): **`get_chat_model()`** and **`chat_completion()`** dispatch based on the active provider:
   - **HTTP providers**: resolve credentials in two tiers — active provider (`NVIDIA_INFERENCE_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` → endpoint) — against any OpenAI-compatible endpoint. `max_tokens` is auto-bound to `get_max_output_tokens(model)` from `model_info`.

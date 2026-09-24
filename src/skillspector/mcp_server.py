@@ -27,6 +27,7 @@ installed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,8 +35,11 @@ from skillspector import __version__
 from skillspector.cleanup import cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.inspection_ledger import LedgerReason
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
+from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
 
 if TYPE_CHECKING:
@@ -44,6 +48,23 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 VALID_FORMATS = ("json", "markdown", "sarif", "terminal")
+
+
+def _llm_runtime_accounting(*, enabled: bool, result: Mapping[str, object]) -> tuple[bool, bool]:
+    """Apply shared semantic runtime accounting to the discovered registry."""
+    return semantic_runtime_accounting(
+        enabled=enabled,
+        result=result,
+        discovered_modules=ANALYZER_MODULES,
+    )
+
+
+def _llm_runtime_available(*, preflight_available: bool, result: Mapping[str, object]) -> bool:
+    """Apply shared provider and meta-analysis runtime availability."""
+    return llm_runtime_available(
+        preflight_available=preflight_available,
+        result=result,
+    )
 
 
 def _is_local_target(target: str) -> bool:
@@ -105,22 +126,23 @@ async def run_scan(
         if local_target or local_yara_rules:
             raise ValueError("local targets are disabled for this MCP transport")
 
-    llm_available, _ = is_llm_available()
-    llm_used = use_llm and llm_available
+    llm_preflight_available, _ = is_llm_available()
+    llm_enabled = use_llm and llm_preflight_available
 
     state: dict[str, Any] = {
         "input_path": target,
         "output_format": output_format,
-        "use_llm": llm_used,
+        "use_llm": llm_enabled,
+        "llm_requested": use_llm,
     }
     if yara_rules_dir:
         state["yara_rules_dir"] = yara_rules_dir
 
     logger.debug(
-        "MCP scan started: target=%s, format=%s, llm_used=%s",
+        "MCP scan started: target=%s, format=%s, llm_enabled=%s",
         target,
         output_format,
-        llm_used,
+        llm_enabled,
     )
 
     result: dict[str, Any] | None = None
@@ -132,7 +154,8 @@ async def run_scan(
                 "tags": ["skillspector", "mcp"],
                 "metadata": {
                     "input_path": target,
-                    "use_llm": llm_used,
+                    "use_llm": llm_enabled,
+                    "llm_requested": use_llm,
                     "output_format": output_format,
                     "version": __version__,
                 },
@@ -140,20 +163,49 @@ async def run_scan(
         )
         findings = effective_findings(result)
         risk_score = int(result.get("risk_score") or 0)
+        llm_used, llm_runtime_complete = _llm_runtime_accounting(enabled=llm_enabled, result=result)
+        llm_available = _llm_runtime_available(
+            preflight_available=llm_preflight_available,
+            result=result,
+        )
         execution_successful = bool(result.get("execution_successful", True))
         analysis_completeness = result.get("analysis_completeness") or {}
         entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
+        partially_inspected = int(analysis_completeness.get("partially_inspected_files", 0))
+        # A missing reference names a path the bundle does not carry, such as a
+        # file the skill writes at runtime. Every discovered file is still
+        # inspected, so on its own it hides no bytes and must not fail this
+        # gate. An *ambiguous* reference (REFERENCE_UNRESOLVED) is different:
+        # it matches more than one bundled artifact, so the scanner has not
+        # established which bytes the instruction actually reaches, and it
+        # must keep blocking safe_to_install like any other exceptional
+        # reason.
+        ledger_exceptions = analysis_completeness.get("ledger_exceptions") or []
+        reference_caveat_only = (
+            bool(ledger_exceptions)
+            and not analysis_completeness.get("limitations")
+            and all(
+                exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
+                for exception in ledger_exceptions
+            )
+        )
+        analysis_requirement_met = not use_llm or llm_runtime_complete
         safe_to_install = (
             risk_score <= RISK_THRESHOLD
             and execution_successful
             and entirely_uninspected == 0
-            and bool(analysis_completeness.get("is_complete", True))
+            and partially_inspected == 0
+            and (bool(analysis_completeness.get("is_complete", True)) or reference_caveat_only)
+            and analysis_requirement_met
         )
+        recommendation = result.get("risk_recommendation")
+        if not analysis_requirement_met and recommendation == "SAFE":
+            recommendation = "CAUTION"
         return {
             "target": target,
             "risk_score": risk_score,
             "severity": result.get("risk_severity"),
-            "recommendation": result.get("risk_recommendation"),
+            "recommendation": recommendation,
             "safe_to_install": safe_to_install,
             "execution_successful": execution_successful,
             "analysis_completeness": analysis_completeness,

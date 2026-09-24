@@ -30,6 +30,7 @@ def test_resolve_input_with_input_path_directory(tmp_path: Path) -> None:
     update = resolve_input(state)
     assert update["skill_path"] == str(tmp_path.resolve())
     assert update.get("temp_dir_for_cleanup") is None
+    assert update.get("selected_source_identity") == tmp_path.name
 
 
 def test_resolve_input_with_skill_path_only(tmp_path: Path) -> None:
@@ -39,6 +40,7 @@ def test_resolve_input_with_skill_path_only(tmp_path: Path) -> None:
     update = resolve_input(state)
     assert update["skill_path"] == str(tmp_path.resolve())
     assert update.get("temp_dir_for_cleanup") is None
+    assert update.get("selected_source_identity") == tmp_path.name
 
 
 def test_resolve_input_rejects_skill_path_with_symlinked_parent(tmp_path: Path) -> None:
@@ -81,6 +83,8 @@ def test_workflow_budget_starts_before_input_materialization(
     captured: list[object] = []
 
     class CapturingHandler:
+        primary_file_path = None
+
         def __init__(self, transitive_budget: object | None = None) -> None:
             assert transitive_budget is not None
             assert getattr(transitive_budget, "started_at", None) is not None
@@ -131,3 +135,56 @@ def test_transitive_truncation_is_typed_sanitized_and_cleaned(
     }
     assert cleaned == [True]
     assert "private/source" not in str(raised.value)
+
+
+def test_selected_source_identity_from_resolved_git_and_archive_inputs() -> None:
+    """Identity follows successful materialization, including preserved archive roots."""
+    from skillspector.input_handler import selected_source_identity_for_input
+
+    temp_dir = Path("/tmp/skillspector_abc")
+    clone_root = temp_dir / "repo"
+    assert (
+        selected_source_identity_for_input(
+            "https://github.com/acme/example-skill.git",
+            source_type="git",
+            resolved_path=clone_root,
+            temp_dir=temp_dir,
+        )
+        == "example-skill"
+    )
+    assert (
+        selected_source_identity_for_input(
+            "git@github.com:acme/example-skill.git",
+            source_type="git",
+            resolved_path=clone_root,
+            temp_dir=temp_dir,
+        )
+        == "example-skill"
+    )
+    assert (
+        selected_source_identity_for_input(
+            "/tmp/packs/example-skill.zip",
+            source_type="zip",
+            resolved_path=temp_dir / "extracted",
+            temp_dir=temp_dir,
+        )
+        == "example-skill"
+    )
+    assert (
+        selected_source_identity_for_input(
+            "/tmp/packs/peer-skill.zip",
+            source_type="zip",
+            resolved_path=temp_dir / "extracted" / "example-skill",
+            temp_dir=temp_dir,
+        )
+        == "example-skill"
+    )
+    assert (
+        selected_source_identity_for_input(
+            "/tmp/skillspector_abc/repo",
+            source_type="directory",
+            resolved_path=clone_root,
+            temp_dir=None,
+        )
+        == "repo"
+    )

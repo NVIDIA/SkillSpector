@@ -40,6 +40,10 @@ from botocore.config import Config as BotocoreConfig
 from langchain_aws import ChatBedrockConverse
 from langchain_core.language_models.chat_models import BaseChatModel
 
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
 from skillspector.providers.chat_models import resolve_sampling_parameters
 
@@ -52,6 +56,7 @@ BEDROCK_DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6-20250915-v1:0"
 # Connect timeout for the Bedrock Runtime client. The per-call
 # ``timeout`` from ``create_chat_model`` is applied as the read timeout.
 _BEDROCK_CONNECT_TIMEOUT = 10
+BEDROCK_SDK_TOTAL_MAX_ATTEMPTS = 1
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -119,6 +124,12 @@ class BedrockProvider:
             config=BotocoreConfig(
                 read_timeout=timeout,
                 connect_timeout=_BEDROCK_CONNECT_TIMEOUT,
+                retries={
+                    "mode": "standard",
+                    # The analyzer coordinator owns the shared retry budget so
+                    # it can honor Retry-After and the workflow deadline.
+                    "total_max_attempts": BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
+                },
             ),
         )
 
@@ -130,9 +141,16 @@ class BedrockProvider:
         }
         if model.startswith("arn:"):
             kwargs["provider"] = "anthropic"
-        kwargs.update(resolve_sampling_parameters())
+        sampling_parameters = resolve_sampling_parameters()
+        kwargs.update(sampling_parameters)
 
-        return ChatBedrockConverse(**kwargs)
+        chat_model = ChatBedrockConverse(**kwargs)
+        register_chat_model_controls(
+            chat_model,
+            retained_chat_model_controls(chat_model, ("temperature",)),
+            requested_controls={"temperature": sampling_parameters.get("temperature")},
+        )
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)

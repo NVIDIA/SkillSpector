@@ -309,6 +309,38 @@ class TestScrubEnv:
         assert "PATH" in env
         assert "HOME" in env
 
+    @pytest.mark.parametrize("binary_name", ["claude", "codex", "gemini"])
+    @pytest.mark.parametrize("lowercase", [False, True])
+    def test_project_credentials_never_reach_child(
+        self, monkeypatch: pytest.MonkeyPatch, binary_name: str, lowercase: bool
+    ) -> None:
+        secrets = [
+            "SKILLSPECTOR_API_KEYS",
+            "ANTHROPIC_PROXY_API_KEY",
+            "SKILLSPECTOR_COMPAT_API_KEY",
+        ]
+        if lowercase:
+            secrets = [key.lower() for key in secrets]
+        for key in secrets:
+            monkeypatch.setenv(key, "synthetic-credential")
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "test-model")
+        monkeypatch.setenv("SKILLSPECTOR_COMPAT_BASE_URL", "https://example.invalid")
+        output = _GOOD_CODEX_JSONL if binary_name == "codex" else _GOOD_CLAUDE_OUTPUT
+        with (
+            patch(
+                "skillspector.providers._agent_cli.find_binary", return_value="/usr/bin/mock-cli"
+            ),
+            patch("skillspector.providers._agent_cli.subprocess.Popen") as popen,
+        ):
+            popen.return_value = _make_ok_process(output.encode())
+            run_agent_cli(binary_name, PROMPT, model="")
+        child_env = popen.call_args.kwargs["env"]
+        assert not set(secrets).intersection(child_env)
+        assert child_env["SKILLSPECTOR_MODEL"] == "test-model"
+        assert child_env["SKILLSPECTOR_COMPAT_BASE_URL"] == "https://example.invalid"
+        for key in secrets:
+            assert _agent_cli.os.environ[key] == "synthetic-credential"
+
 
 # ---------------------------------------------------------------------------
 # _parse_claude_output
@@ -651,10 +683,10 @@ class TestRunBounded:
 
 class TestCliRegistry:
     def test_registry_covers_known_clis(self) -> None:
-        assert set(_agent_cli._REGISTRY) == {"claude", "codex", "gemini", "agy"}
+        assert set(_agent_cli._REGISTRY) == {"claude", "codex", "gemini", "opencode", "agy"}
 
     def test_get_spec_returns_matching_binary(self) -> None:
-        for name in ("claude", "codex", "gemini", "agy"):
+        for name in ("claude", "codex", "gemini", "opencode", "agy"):
             assert _agent_cli.get_spec(name).binary == name
 
     def test_get_spec_unknown_raises(self) -> None:
