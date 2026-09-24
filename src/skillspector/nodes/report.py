@@ -771,6 +771,10 @@ def _build_sarif(
         "notificationsTruncated": False,
     }
 
+    if completeness.get("exclude_patterns"):
+        completeness_projection["excludePatterns"] = completeness["exclude_patterns"]
+        completeness_projection["excludedFileCount"] = nonnegative_count("excluded_file_count")
+
     notifications: list[SarifNotification] = []
     observed_notifications = 0
     notifications_truncated = False
@@ -937,6 +941,11 @@ def _render_terminal_completeness(
     table.add_row("Fully inspected", str(completeness.get("fully_inspected_files", 0)))
     table.add_row("Partially inspected", str(completeness.get("partially_inspected_files", 0)))
     table.add_row("Entirely uninspected", str(completeness.get("entirely_uninspected_files", 0)))
+    if completeness.get("exclude_patterns"):
+        table.add_row("Explicit exclusion patterns", str(completeness["exclude_patterns"]))
+        table.add_row(
+            "Excluded files (not inspected)", str(completeness.get("excluded_file_count", 0))
+        )
     console.print(table)
 
     def render_rows(title: str, rows: object) -> None:
@@ -1380,6 +1389,13 @@ def _render_markdown_completeness(
         f"| Entirely uninspected | {_markdown_cell(completeness.get('entirely_uninspected_files', 0))} |"
     )
     lines.append("")
+
+    patterns = completeness.get("exclude_patterns", [])
+    if patterns:
+        lines.append(f"Explicit exclusion patterns: {_markdown_cell(patterns)}\n")
+        lines.append(
+            f"Excluded files (not inspected): {completeness.get('excluded_file_count', 0)}\n"
+        )
 
     def render_rows(title: str, rows: object) -> None:
         if not isinstance(rows, list) or not rows:

@@ -28,6 +28,7 @@ import os
 import re
 import tarfile
 from collections.abc import Callable, Mapping
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from time import monotonic
@@ -2576,6 +2577,42 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         excluded_artifacts,
         excluded_inspection_gaps,
     ) = _walk_skill_files(skill_dir, state)
+    patterns = state.get("exclude_patterns", [])
+    if len(patterns) > 128 or any(
+        not isinstance(pattern, str)
+        or not pattern
+        or len(pattern) > 1024
+        or pattern.startswith("/")
+        or "\\" in pattern
+        or ".." in pattern.split("/")
+        or any(ord(char) < 32 for char in pattern)
+        for pattern in patterns
+    ):
+        raise ValueError("Exclusions require at most 128 relative POSIX globs (1-1024 characters)")
+    if any(fnmatchcase("SKILL.md", pattern) for pattern in patterns):
+        raise ValueError("--exclude must not match the required SKILL.md manifest")
+    user_excluded = sorted(
+        path
+        for path in set(inventoried_components) | set(excluded_artifacts)
+        if any(fnmatchcase(path, pattern) for pattern in patterns)
+    )
+    user_excluded_set = set(user_excluded)
+    inventoried_components = [
+        path for path in inventoried_components if path not in user_excluded_set
+    ]
+    excluded_artifacts = {
+        path: reason for path, reason in excluded_artifacts.items() if path not in user_excluded_set
+    }
+    user_exclusion_events = [
+        ledger_event(
+            outcome=LedgerOutcome.SKIPPED,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="explicit_exclusion",
+            path=path,
+            reason=LedgerReason.USER_EXCLUSION,
+        )
+        for path in user_excluded
+    ]
     selected_baseline = _selected_baseline_component(state, skill_dir, inventoried_components)
     selected_baselines = frozenset({selected_baseline} if selected_baseline else set())
     for path in selected_baselines:
@@ -2619,6 +2656,20 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             MAX_TOTAL_CACHED_BYTES - sum(len(data) for data in raw_file_cache.values()),
         ),
         incomplete_exclusions=excluded_inspection_gaps,
+    )
+    artifact_inventory.extend(
+        {
+            "path": path,
+            "content_kind": ContentKind.OPAQUE,
+            "disposition": ArtifactDisposition.PARTIAL,
+            "size_bytes": 0,
+            "decodable": False,
+            "contains_nul": False,
+            "misleading_extension": False,
+            "referenced": False,
+            "reason": LedgerReason.USER_EXCLUSION.value,
+        }
+        for path in user_excluded
     )
     artifact_inventory = sorted(
         [*artifact_inventory, *excluded_inventory], key=lambda item: item["path"]
@@ -2736,12 +2787,17 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                     source_path=primary_path,
                     source_text=primary_text,
                     known_paths=sorted(
-                        dict.fromkeys([*inventoried_components, *excluded_artifacts])
+                        dict.fromkeys(
+                            [*inventoried_components, *excluded_artifacts, *user_excluded]
+                        )
                     ),
                     clock=monotonic,
                     deadline=processing_deadline,
                 )
         references = resolution.records
+        for reference in references:
+            if reference.get("target_path") in user_excluded_set:
+                reference["disposition"] = ArtifactDisposition.PARTIAL
         primary_artifact = inventory_by_path.get(primary_path)
         primary_partial = (
             primary_artifact is not None
@@ -3383,6 +3439,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "inspection_ledger": _bounded_ledger_output(
             [
                 *discovery_events,
+                *user_exclusion_events,
                 *prework_events,
                 *signature_events,
                 *baseline_events,
