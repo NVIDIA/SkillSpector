@@ -446,8 +446,8 @@ def _analyze_python(
         complete_match = python_ast.source_segment(ast_node)
         if complete_match is None:
             complete_match = get_complete_source_segment(lines, lineno, end_lineno)
-        start_byte_column = getattr(ast_node, "col_offset", 0)
-        end_byte_column = getattr(ast_node, "end_col_offset", start_byte_column)
+        start_byte_column = getattr(ast_node, "col_offset", None)
+        end_byte_column = getattr(ast_node, "end_col_offset", None)
         start_column = python_ast.character_column(lineno, start_byte_column)
         end_column = python_ast.character_column(end_lineno or lineno, end_byte_column)
         finding = AnalyzerFinding(
