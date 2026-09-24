@@ -441,7 +441,12 @@ def _compact_spaced_security_word_view(view: SecurityTextView) -> SecurityTextVi
 # Only bounded, complete JSON values establish quote ownership. Arbitrary
 # key/value-looking prose is not a JSON representation. Keep fence syntax
 # aligned with analyzers.common without importing its auto-discovered registry.
-_MAX_JSON_QUOTE_CONTAINER_CHARS: Final = 65_536
+_MAX_JSON_QUOTE_DECODE_CHARS: Final = 65_536
+_MAX_JSON_FRONTMATTER_CHARS: Final = 65_536
+_MAX_JSON_QUOTE_CONTAINER_CHARS: Final = 131_072
+# A tab in a Markdown container can expand to at most four validation columns.
+# This bounds the validation copy separately from the raw source-size ceiling.
+_MAX_JSON_QUOTE_VALIDATION_CHARS: Final = 4 * _MAX_JSON_QUOTE_CONTAINER_CHARS
 _JSON_FENCE_OPEN_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)$")
 _JSON_FENCE_CLOSE_RE: Final = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
 _JSON_LIST_MARKER_RE: Final = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])")
@@ -561,7 +566,7 @@ def _json_body_after_frontmatter(text: str, check_runtime: Callable[[], None] | 
     This only identifies the JSON body's boundary. Manifest parsing continues
     to validate metadata independently; none of its quotes acquires ownership.
     """
-    prefix = text[:_MAX_JSON_QUOTE_CONTAINER_CHARS]
+    prefix = text[:_MAX_JSON_FRONTMATTER_CHARS]
     opening = re.match(r"\A---[ \t]*\r?\n", prefix)
     if opening is None:
         return None
@@ -577,6 +582,169 @@ def _json_body_after_frontmatter(text: str, check_runtime: Callable[[], None] | 
     return None
 
 
+def _validate_json_without_decoding(body: str, check_runtime: Callable[[], None] | None) -> bool:
+    """Validate one bounded JSON value without recursion or decoded allocations.
+
+    Every grammar transition consumes source; only a byte per open container
+    is retained. The caller also bounds raw source, which bounds the number of
+    tokens and later quote spans. No ownership escapes a partially read value.
+    """
+    length = len(body)
+    if length > _MAX_JSON_QUOTE_VALIDATION_CHARS:
+        return False
+    next_check = 0
+
+    def checkpoint(offset: int) -> None:
+        nonlocal next_check
+        if offset >= next_check:
+            if check_runtime is not None:
+                check_runtime()
+            # A Unicode escape advances at most six positions in one step.
+            # Checking every 128 keeps even that overshoot below 256 chars.
+            next_check = offset + 128
+
+    def string_end(start: int) -> int:
+        offset = start + 1
+        while offset < length:
+            checkpoint(offset)
+            character = body[offset]
+            if character == '"':
+                return offset + 1
+            if ord(character) < 0x20:
+                return -1
+            if character == "\\":
+                offset += 1
+                if offset >= length:
+                    return -1
+                escape = body[offset]
+                if escape == "u":
+                    for _ in range(4):
+                        offset += 1
+                        if offset >= length or body[offset] not in "0123456789abcdefABCDEF":
+                            return -1
+                elif escape not in '\\"/bfnrt':
+                    return -1
+            offset += 1
+        return -1
+
+    def number_end(start: int) -> int:
+        offset = start
+        if body[offset] == "-":
+            offset += 1
+        if offset >= length:
+            return -1
+        if body[offset] == "0":
+            offset += 1
+        elif "1" <= body[offset] <= "9":
+            while offset < length and "0" <= body[offset] <= "9":
+                checkpoint(offset)
+                offset += 1
+        else:
+            return -1
+        if offset < length and body[offset] == ".":
+            offset += 1
+            digits = offset
+            while offset < length and "0" <= body[offset] <= "9":
+                checkpoint(offset)
+                offset += 1
+            if offset == digits:
+                return -1
+        if offset < length and body[offset] in "eE":
+            offset += 1
+            if offset < length and body[offset] in "+-":
+                offset += 1
+            digits = offset
+            while offset < length and "0" <= body[offset] <= "9":
+                checkpoint(offset)
+                offset += 1
+            if offset == digits:
+                return -1
+        return offset
+
+    (
+        root_value,
+        root_done,
+        array_first,
+        array_value,
+        array_end,
+        object_first,
+        object_key,
+        object_colon,
+        object_value,
+        object_end,
+    ) = range(10)
+    stack = bytearray([root_value])
+    cursor = 0
+    while True:
+        checkpoint(cursor)
+        while cursor < length and body[cursor] in " \t\r\n":
+            checkpoint(cursor)
+            cursor += 1
+        if cursor == length:
+            if check_runtime is not None:
+                check_runtime()
+            return len(stack) == 1 and stack[0] == root_done
+        state = stack[-1]
+        character = body[cursor]
+        if state == root_done:
+            return False
+        if state in (object_first, object_key):
+            if character == "}" and state == object_first:
+                stack.pop()
+                cursor += 1
+                continue
+            if character != '"':
+                return False
+            cursor = string_end(cursor)
+            if cursor < 0:
+                return False
+            stack[-1] = object_colon
+            continue
+        if state == object_colon:
+            if character != ":":
+                return False
+            stack[-1] = object_value
+            cursor += 1
+            continue
+        if state in (array_end, object_end):
+            if character == ",":
+                stack[-1] = array_value if state == array_end else object_key
+            elif character == ("]" if state == array_end else "}"):
+                stack.pop()
+            else:
+                return False
+            cursor += 1
+            continue
+        if state == array_first and character == "]":
+            stack.pop()
+            cursor += 1
+            continue
+        # Advance the parent before pushing a child. A close is legal only
+        # in the explicit empty-container or after-value states above.
+        stack[-1] = (
+            root_done if state == root_value else object_end if state == object_value else array_end
+        )
+        if character in "[{":
+            stack.append(array_first if character == "[" else object_first)
+            cursor += 1
+        elif character == '"':
+            cursor = string_end(cursor)
+            if cursor < 0:
+                return False
+        elif character == "-" or "0" <= character <= "9":
+            cursor = number_end(cursor)
+            if cursor < 0:
+                return False
+        elif body.startswith("true", cursor):
+            cursor += 4
+        elif body.startswith("false", cursor):
+            cursor += 5
+        elif body.startswith("null", cursor):
+            cursor += 4
+        else:
+            return False
+
+
 def _validated_json_ranges(
     text: str,
     check_runtime: Callable[[], None] | None,
@@ -587,8 +755,8 @@ def _validated_json_ranges(
 
     List and blockquote prefixes are removed only in a bounded validation copy.
     They contain no string delimiters, so quote offsets in the original ranges
-    remain exact. Invalid, incomplete, oversized and deeply nested containers
-    grant no ownership. Non-JSON fences also establish block boundaries.
+    remain exact. Invalid, incomplete or oversized containers grant no
+    ownership. Non-JSON fences also establish block boundaries.
     """
 
     def check() -> None:
@@ -612,12 +780,19 @@ def _validated_json_ranges(
             ):
                 on_capacity_limit(start, end)
             return False
-        try:
-            json.loads(text[start:end] if body is None else body, parse_constant=reject_constant)
-        except (ValueError, RecursionError):
-            result = False
+        candidate = text[start:end] if body is None else body
+        if end - start > _MAX_JSON_QUOTE_DECODE_CHARS:
+            result = _validate_json_without_decoding(candidate, check_runtime)
         else:
-            result = True
+            # Preserve the established small-input acceptance contract,
+            # including decoder depth/numeric limits. Never retry a rejected
+            # small value through the larger-input path.
+            try:
+                json.loads(candidate, parse_constant=reject_constant)
+            except (ValueError, RecursionError):
+                result = False
+            else:
+                result = True
         check()
         return result
 

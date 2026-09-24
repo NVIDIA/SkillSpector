@@ -73,9 +73,11 @@ empty, marks the primary artifact `partial`, and records an allowlisted parse er
 ## JSON quote ownership
 
 The deterministic instruction parser can distinguish structural JSON quotes from instruction
-delimiters only after validating a complete JSON value within **65,536 source characters**.
-This is a structural capacity limit, independent of file-size and scan-time allowances. It is
-unchanged by this diagnostic update; larger JSON values are not newly supported.
+delimiters only after validating a complete JSON value within **131,072 source characters**.
+This is a structural capacity limit, independent of file-size and scan-time allowances.
+Candidates through 65,536 characters keep the established bounded JSON decoder path. Larger
+candidates use an iterative syntax validator that does not allocate decoded strings, numbers,
+arrays, or objects. A failed small-input decode is never retried through the larger-input path.
 
 The inclusive ceiling counts characters, not UTF-8 bytes or decoded JSON string lengths:
 
@@ -85,6 +87,25 @@ The inclusive ceiling counts characters, not UTF-8 bytes or decoded JSON string 
   blockquote prefixes. Opening and closing fence lines are excluded.
 - Unicode characters count once; each source character of an escape such as `\u0061` counts.
   The frontmatter boundary search has its own 65,536-character prefix bound.
+
+The iterative validator reads one complete value and trailing JSON whitespace. It rejects
+invalid escapes, raw controls inside strings, malformed numbers, unmatched delimiters, missing
+separators, trailing commas, and additional values. No quotes acquire ownership before validation
+reaches the end. Validation retains a byte per open container in a non-recursive grammar stack;
+the source ceiling therefore bounds nesting storage, token count, and the number of quote spans.
+There is no separate decoded-value allocation or integer-conversion cost. Deadline/cancellation
+checks occur within whitespace, string, number, and container processing, with fewer than 256
+validation characters between checks. The normalized fence-validation copy has a separate
+524,288-character ceiling to account for tabs expanding into at most four columns. Quote offsets
+continue to refer to the original source. The later quote-span collection is also bounded by
+the source characters and retains its existing runtime checks.
+
+This validates structural quote ownership; it does not exempt string contents from security
+analysis. Real commands and reconstructed instructions still pass through the existing analyzers.
+The unchanged 256,000-character analysis windows and their bounded context remain separate limits.
+A JSON value that straddles a window or exceeds another parser/runtime allowance may remain
+incomplete, even when its total size is below the JSON ownership ceiling. No unvalidated window
+fragment is treated as a complete value.
 
 When marker reconstruction is already incomplete and its first unresolved directive lies in an
 oversized JSON candidate, the ledger reports `json_quote_ownership_limit`. Its message identifies
@@ -102,11 +123,21 @@ Findings remain visible, and unresolved coverage remains incomplete: CLI `--fail
 returns nonzero and the MCP installation gate rejects it, even after successful semantic analysis.
 JSON with no unresolved instruction parsing may still complete without needing quote ownership.
 
-A future increase requires an explicit supported-input decision and validation of dense strings,
-deep nesting, escaped/Unicode text, malformed input, cancellation, and the interaction with analysis
-windows. JSON decoding allocates synchronously between deadline checks; a larger benign example
-passing in isolation does not validate that larger resource allowance. This patch retains the
-existing bound and does not change expected-complete dataset contracts for oversized examples.
+This extends the supported candidate size from 65,536 to 131,072 characters with a different,
+bounded validation algorithm. Previously incomplete valid examples can now complete when the
+remaining analysis also succeeds. Consumers that enumerate ledger reasons must recognize
+`json_quote_ownership_limit` for unresolved candidates exceeding the current ceiling, while
+continuing to reject incomplete reports regardless of reason. Do not add the old generic
+`obfuscated_instruction_text` as a second exception merely to preserve an exact-string predicate.
+That generic reason remains available for separate unresolved instruction parsing.
+
+Historical expectations tied to the 65,536-character ceiling must be retained as versioned
+compatibility evidence. A proposed successor contract may require complete analysis for an
+otherwise supported 65,537-character benign value and move the size-boundary rejection control to
+131,073 characters. Such a dataset migration needs explicit acceptance; it does not retroactively
+turn an old failed contract into a pass or weaken an existing expected-complete requirement.
+Further increases require new resource measurements and review, including dense strings, deep
+nesting, malformed input, cancellation, and analysis-window interactions.
 
 ## Intra-bundle references
 
@@ -153,7 +184,7 @@ malicious evasion. Keep required references and use the reason to choose the fix
 | Reason | Next step |
 |---|---|
 | `static_parse_limit` | Inspect the expression and analyzer. If valid source is misinterpreted, correct or update the scanner and rerun. |
-| `json_quote_ownership_limit` | Use the reported source span and 65,536-character bound to split complete JSON values while retaining required content, then rescan. |
+| `json_quote_ownership_limit` | Use the reported source span and 131,072-character bound to split complete JSON values while retaining required content, then rescan. |
 | `read_error`, `stat_error`, `file_disappeared`, `missing_file_cache` | Ensure the resolved target remains readable throughout the scan. |
 | `size_limit`, `runtime_limit` | Review the reported bounds and input size; distinguish a scanner performance problem from a legitimate resource ceiling. |
 | `binary_content`, `opaque_content` | Provide inspectable source or analysis support for the referenced format. |
