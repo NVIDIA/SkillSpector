@@ -174,14 +174,35 @@ def _enforce_rule_load_deadline() -> None:
         _check_rule_load_budget(budget)
 
 
-# Module-level cache keyed by a content hash of all rule directories.
-#
-# These three are one logical value: the compiled rules, the hash they were
-# compiled from, and how many files were dropped producing them. They must only
-# ever be written or read as a set, under ``_RULES_LOCK`` -- see
-# :func:`load_rules_with_skips` for why reading them separately is unsafe.
-_compiled_rules: yara.Rules | None = None
-_rules_hash: str | None = None
+@dataclass(frozen=True, slots=True)
+class _RuleCacheEntry:
+    """One compiled rule set, the hash it came from, and its own dropped-file count.
+
+    Frozen, and only ever published by replacing :data:`_rule_cache` wholesale,
+    so the three halves cannot drift apart. They used to be three independent
+    globals, and the non-populating paths of :func:`_load_rules` wrote the skip
+    count while leaving the compiled rules and their hash in place. A later
+    request for that stale hash then hit the cache and returned those rules
+    paired with the intervening load's count -- zero, when the intervening load
+    found no rule files at all -- so a rule set that had silently dropped a
+    detector reported a complete scan, which is the false-clean result #554 is
+    about.
+    """
+
+    rules: yara.Rules
+    rules_hash: str
+    skipped_count: int
+
+
+# Module-level cache keyed by a content hash of all rule directories. ``None``
+# means nothing usable is cached; there is deliberately no way to represent a
+# half-populated cache, so every non-populating load path simply clears it.
+_rule_cache: _RuleCacheEntry | None = None
+
+# Not cache state: the skip count of whichever load most recently ran, published
+# under ``_RULES_LOCK`` so :func:`load_rules_with_skips` can read it inside the
+# same transaction that produced it. On a cache hit it is assigned *from the
+# cache entry*, so it always describes the rules actually returned.
 _rules_skipped_count: int = 0
 
 # Reentrant so the load-and-read transaction in :func:`load_rules_with_skips`
@@ -465,13 +486,27 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
     or a scan can report ``completed``/SAFE while some of its own detections
     never ran (#554).
 
+    A successful load publishes rules, hash and count together as one
+    :class:`_RuleCacheEntry`, and every path that does not produce usable rules
+    clears that entry outright. Both halves matter: without the first a cache
+    hit could answer with another load's count, and without the second the
+    stale rules would stay reachable under their old hash.
+
     Callers should prefer :func:`load_rules_with_skips`, which returns both
     halves as one value; reading the count separately after this returns is
     racy across concurrent scans.
     """
-    global _compiled_rules, _rules_hash, _rules_skipped_count  # noqa: PLW0603
+    global _rule_cache, _rules_skipped_count  # noqa: PLW0603
 
     with _RULES_LOCK:
+        # Cleared up front so that a load which raises part way through cannot
+        # leave a previous load's total readable through
+        # :func:`rules_skipped_count`. Every return path below assigns its own.
+        # ``_rule_cache`` is deliberately *not* cleared here: an entry is
+        # self-consistent, so on an exception it stays a valid answer for its
+        # own hash rather than forcing a needless recompile.
+        _rules_skipped_count = 0
+
         dirs = [_BUILTIN_RULES_DIR]
         if extra_dir and extra_dir.is_dir():
             dirs.append(extra_dir)
@@ -481,15 +516,20 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
         rule_files = _collect_rule_files(*dirs)
         if not rule_files:
             logger.info("%s: no YARA rule files found", ANALYZER_ID)
-            _rules_skipped_count = 0
+            # Non-populating: discard the entry instead of leaving the previous
+            # rules cached under their old hash. Keeping them would let the next
+            # request for that hash return them alongside this load's zero.
+            _rule_cache = None
             return None
 
         raw_cache = _read_rule_bytes_cache(rule_files)
         current_hash = _content_hash(rule_files, raw_cache)
-        if _compiled_rules is not None and _rules_hash == current_hash:
-            # Cache hit: _rules_skipped_count already describes this exact file
-            # set, because it is only ever written together with _rules_hash.
-            return _compiled_rules
+        cached = _rule_cache
+        if cached is not None and cached.rules_hash == current_hash:
+            # The count is taken from the entry, so it describes these rules and
+            # not whichever load happened to run in between.
+            _rules_skipped_count = cached.skipped_count
+            return cached.rules
 
         namespace_files: dict[str, str] = {}
         sources, materialize_skipped = _build_namespace_map(
@@ -501,10 +541,15 @@ def _load_rules(extra_dir: Path | None = None) -> yara.Rules | None:
 
         if compiled is None:
             logger.warning("%s: failed to compile any YARA rules", ANALYZER_ID)
+            # Non-populating for the same reason as the no-rule-files path above.
+            _rule_cache = None
             return None
 
-        _compiled_rules = compiled
-        _rules_hash = current_hash
+        _rule_cache = _RuleCacheEntry(
+            rules=compiled,
+            rules_hash=current_hash,
+            skipped_count=skipped,
+        )
         loaded = len(sources) - compile_skipped
         logger.info("%s: compiled %d YARA rule file(s) (%d skipped)", ANALYZER_ID, loaded, skipped)
         return compiled
@@ -530,11 +575,11 @@ def load_rules_with_skips(extra_dir: Path | None = None) -> tuple[yara.Rules | N
 
 
 def rules_skipped_count() -> int:
-    """Return how many rule files the most recent :func:`_load_rules` call dropped.
+    """Return how many rule files the rules from the most recent load dropped.
 
-    Zero both when nothing was skipped and when a cache hit meant no reload
-    ran; a cache hit implies the same file set was already validated by the
-    load that populated the cache, so nothing new could have been skipped.
+    On a cache hit this is the cached entry's own count, not zero: the whole
+    point is that the number travels with the rules it describes, so a rule set
+    that dropped a detector keeps reporting it on every later cache hit.
 
     Retained for callers that already hold :data:`_RULES_LOCK` or run
     single-threaded. Anything reading this straight after :func:`_load_rules`
