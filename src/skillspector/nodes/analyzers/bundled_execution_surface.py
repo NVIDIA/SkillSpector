@@ -11,7 +11,7 @@ import math
 import posixpath
 import re
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Final
 from urllib.parse import urlsplit
@@ -42,6 +42,10 @@ _APPLICABLE_PATHS: Final = frozenset(
         ".claude/settings.local.json",
     }
 )
+# Claude Code also loads plugin hooks from the `hooks` field of
+# `.claude-plugin/plugin.json` (a path, a list of paths, or an inline object).
+_PLUGIN_MANIFEST_PATH: Final = ".claude-plugin/plugin.json"
+_MAX_PLUGIN_HOOK_PATHS: Final = 16
 _MAX_DECLARATIONS: Final = 2_048
 _MAX_DECLARATION_CHARS: Final = 16_384
 _VALID_DEFAULT_MODES: Final = frozenset(
@@ -1678,6 +1682,59 @@ def _analyze_document(
     )
 
 
+def _plugin_hook_documents(
+    file_cache: Mapping[str, str],
+) -> dict[str, str]:
+    """Resolve hook declarations from `.claude-plugin/plugin.json`.
+
+    Returns a mapping of analyzed path to document content: hook files the
+    manifest's `hooks` field points at, plus an inline `hooks` object wrapped
+    the way a hooks document looks and attributed to the manifest itself.
+    Referenced paths resolve relative to the plugin root and must stay
+    inside it; absolute paths, parent escapes, and files missing from the
+    cache are skipped so a hostile or sloppy manifest cannot pull arbitrary
+    content into the analysis.
+    """
+    content = file_cache.get(_PLUGIN_MANIFEST_PATH)
+    if content is None or len(content) > MAX_FILE_CHARS:
+        return {}
+    try:
+        manifest = _parse_document(content)
+    except (RecursionError, ValueError):
+        return {}
+    if not isinstance(manifest, dict):
+        return {}
+    raw_hooks = manifest.get("hooks")
+    if raw_hooks is None:
+        return {}
+    documents: dict[str, str] = {}
+    candidates: list[str]
+    if isinstance(raw_hooks, str):
+        candidates = [raw_hooks]
+    elif isinstance(raw_hooks, list):
+        candidates = [entry for entry in raw_hooks if isinstance(entry, str)]
+    elif isinstance(raw_hooks, dict):
+        documents[_PLUGIN_MANIFEST_PATH] = json.dumps({"hooks": raw_hooks}, ensure_ascii=False)
+        candidates = []
+    else:
+        return {}
+    for candidate in candidates[:_MAX_PLUGIN_HOOK_PATHS]:
+        resolved = posixpath.normpath(candidate)
+        if (
+            not resolved
+            or resolved == "."
+            or resolved == ".."
+            or resolved.startswith("../")
+            or posixpath.isabs(candidate)
+        ):
+            continue
+        hook_content = file_cache.get(resolved)
+        if hook_content is None:
+            continue
+        documents[resolved] = hook_content
+    return documents
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Inspect exact bundled hook/settings paths using bounded literal classifiers."""
     components = state.get("components") or []
@@ -1690,10 +1747,12 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     ledger_events: list[InspectionLedgerEvent] = []
     previous_settings_hook_ids: set[_HookIdentity] = set()
     applicable_paths = set(components).intersection(_APPLICABLE_PATHS)
+    plugin_documents = _plugin_hook_documents(file_cache)
+    applicable_paths |= set(plugin_documents)
     hooks_disabled = _bundled_hooks_are_disabled(applicable_paths, file_cache, decodable)
 
     for path in sorted(applicable_paths):
-        if decodable.get(path) is False:
+        if decodable.get(path) is False and path not in plugin_documents:
             ledger_events.append(
                 ledger_event(
                     outcome=LedgerOutcome.PARTIAL,
@@ -1704,7 +1763,7 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 )
             )
             continue
-        content = file_cache.get(path)
+        content = plugin_documents.get(path, file_cache.get(path))
         if content is None:
             ledger_events.append(
                 ledger_event(
