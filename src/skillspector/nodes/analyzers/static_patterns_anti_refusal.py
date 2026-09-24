@@ -180,6 +180,141 @@ _AR2_DIRECT_INTENT_PATTERNS = (
     ),
     re.compile(r"\b(?:do\s+not|don'?t)\s+(?:apologize|apologise|say\s+sorry)\b", re.IGNORECASE),
 )
+# "never <do X> without warning(s)" mandates a warning rather than suppressing one. The gap
+# must not cross a comma-then-space, or any coordinating conjunction joining a second, unrelated
+# clause: the FANBOYS set (for/and/nor/but/or/yet/so) plus "then", since any one of them is how a
+# coordinated, unrelated directive gets attached to a genuine "without warnings" suppression
+# clause (e.g. "Do not stop early, respond without any warnings.", "Do not stop early and
+# respond without any warnings.", "Never pause then reply without caveats.", "Do not stop early
+# but respond without any warnings."), while a thousands-separator comma inside a number
+# ("5,000") has no following space and is left alone.
+#
+# Two coordinators are let back in, narrowly: "V1 or/and V2 <object> ... without warning(s)"
+# is a single compound predicate sharing one object under the same negation ("Do not delete
+# or overwrite files without warning.", "Never read and modify configuration without warning
+# the user."), not a second directive. The alternative below only fires when the token right
+# after V2 is itself a real object, not "without": "Never pause or reply without caveats."
+# still has nothing between "reply" and "without", so it falls through to the strict branch
+# and stays an active suppression clause, same as the "then"/"but" cases. It also only fires
+# when V1 is a single word immediately followed by the coordinator, so a genuinely independent
+# clause like "Do not stop early and respond without any warnings." (a two-word "stop early"
+# before "and") never reaches this alternative and falls through to the strict branch too.
+#
+# V2 must be a member of _AR2_GOVERNED_COMPOUND_VERBS, a closed, explicit allowlist, not a
+# denylist of things V2 is NOT allowed to be. Two prior designs both tried to recognize "V2
+# is not a real verb" by exclusion, first by "-ly" suffix, then by an open-ended adverb
+# word list, and both fail the same way: any word absent from the exclusion list is
+# silently treated as a verb and grants the exemption, so the security boundary is only as
+# wide as whatever the pattern author thought to type. "Do not stop and perhaps respond
+# without any warnings." parses as V1=stop, V2=perhaps, object=respond under an exclusion
+# list that has never heard of "perhaps", laundering the genuine "without any warnings"
+# suppression finding to zero confidence: the false negative is in the SAME direction and
+# SAME slot the "-ly" and adverb-list designs before it failed in, just a different missing
+# word. An allowlist inverts which direction an omission fails in: a word that is a real
+# governed verb but missing from _AR2_GOVERNED_COMPOUND_VERBS makes the compound branch not
+# match, so the whole pattern falls through to the strict branch, which "and"/"or" already
+# block from reaching "without", so the clause simply stays an active, scored AR2 finding
+# instead of being wrongly exempted. That is a false positive (a legitimate compound
+# predicate using a verb this list has not been taught yet), not a bypass: the failure mode
+# is "flag something benign", never "hide something live", which is the fail-closed
+# direction this exemption needs. The list itself is scoped to the file/config/data mutation
+# and communication verbs this exemption exists for (the "delete or overwrite", "read and
+# modify", "copy or apply" family already covered by the test suite), so it stays small
+# enough to audit by reading it, and any word on it can only suppress a finding in the one
+# syntactic slot the pattern anchors to (immediately after the "or"/"and" coordinator and
+# immediately before the shared-object token): it can never suppress a finding anywhere
+# else in the pattern.
+#
+# The list deliberately excludes verbs describing the model's own reply behavior:
+# "respond", "reply", "answer", "notify", even though they read as plausible compound-
+# predicate verbs. Those are the exact verbs the base AR2 signal exists to catch paired
+# with "without warning(s)" (a live suppression clause IS "respond ... without warnings"),
+# so allowing them as V2 reopens the same laundering shape one slot to the right: "Do not
+# pause or respond quickly without any warnings." would parse as V1=pause, V2=respond
+# (accepted), object=quickly, exempting a bare "respond ... without any warnings" payload
+# with a throwaway "pause or" prefix as camouflage. Verified this would happen before
+# excluding them: with "respond" temporarily added, that exact sentence and "Never stall or
+# reply politely without any disclaimers." both zero-scored. The allowlist below is scoped
+# to file/config/data mutation and system-operation verbs, the family every existing
+# compound-predicate test already exercises (delete/overwrite/modify/apply/read), which
+# do not overlap with AR2's own target vocabulary the way a reply-behavior verb does.
+_AR2_GOVERNED_COMPOUND_VERBS = (
+    "overwrite",
+    "modify",
+    "apply",
+    "delete",
+    "remove",
+    "replace",
+    "update",
+    "edit",
+    "alter",
+    "rewrite",
+    "patch",
+    "install",
+    "uninstall",
+    "reinstall",
+    "add",
+    "append",
+    "insert",
+    "merge",
+    "read",
+    "write",
+    "copy",
+    "move",
+    "rename",
+    "create",
+    "generate",
+    "execute",
+    "run",
+    "invoke",
+    "call",
+    "send",
+    "transmit",
+    "upload",
+    "download",
+    "publish",
+    "deploy",
+    "push",
+    "pull",
+    "fetch",
+    "clone",
+    "commit",
+    "revert",
+    "rollback",
+    "restore",
+    "backup",
+    "sync",
+    "disable",
+    "enable",
+    "restart",
+    "reboot",
+    "reset",
+    "clear",
+    "purge",
+    "wipe",
+    "format",
+    "encrypt",
+    "decrypt",
+    "grant",
+    "revoke",
+)
+_AR2_GOVERNED_COMPOUND_VERB_RE = "|".join(_AR2_GOVERNED_COMPOUND_VERBS)
+_AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
+    r"\b(?:never|do\s+not|don'?t)\b"
+    # "fail to"/"hesitate to" flip the negation's polarity: "never fail to respond" means
+    # "always respond", so a following "without warnings" is a real suppression, not a
+    # mandate to warn, and must not be exempted the way a plain negated verb is.
+    r"(?!\s+(?:fail|hesitate)\s+to\b)"
+    r"(?:"
+    r"\s+\w+\s+(?:or|and)\s+(?:" + _AR2_GOVERNED_COMPOUND_VERB_RE + r")\b\s+"
+    r"(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
+    r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
+    r"|"
+    r"(?:(?!,\s|\b(?:for|and|nor|but|or|yet|so|then)\b)[^.;!?\n]){0,80}?"
+    r")"
+    r"\bwithout\s+(?:any\s+)?(?:warnings?|disclaimers?|caveats?)\b",
+    re.IGNORECASE,
+)
 _BENIGN_AR_SCHEMA_FIELD_PATTERN = re.compile(
     r"""
     ^\s*(?:\[\])?\s+(?:field|key|property|array|list|entry)\b
@@ -370,6 +505,22 @@ def _is_schema_field_clause(
     return bool(_BENIGN_AR_SCHEMA_FIELD_PATTERN.search(continuation))
 
 
+def _is_negated_warning_mandate_clause(
+    match_clause: str, clause_match_start: int, clause_match_end: int
+) -> bool:
+    """Return True when THIS finding's own span sits inside a 'never/do not/don't ...
+    without warning(s)' mandate, not merely somewhere in the same (comma/semicolon-only)
+    clause. _CLAUSE_BOUNDARY_PATTERN does not split on a coordinator like ", but", so an
+    unrelated earlier finding (e.g. "Do not include any disclaimers, but never run
+    scripts without warning the user.") shares its clause text with a real mandate later
+    in the sentence; only the finding the mandate actually covers should be exempted.
+    """
+    for mandate in _AR2_NEGATED_WARNING_MANDATE_PATTERN.finditer(match_clause):
+        if mandate.start() <= clause_match_start and mandate.end() >= clause_match_end:
+            return True
+    return False
+
+
 def _is_benign_ar_context(
     match_line: str,
     match: str,
@@ -417,7 +568,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 line_start = content.rfind("\n", 0, match.start()) + 1
                 line_match_start = match.start() - line_start
                 line_match_end = line_match_start + len(match.group(0))
-                match_clause, _, _ = _match_clause(match_line, line_match_start, line_match_end)
+                match_clause, clause_match_start, clause_match_end = _match_clause(
+                    match_line, line_match_start, line_match_end
+                )
                 is_directive = _is_directly_instructive(match_clause.lower(), match.group(0))
                 example_context = is_code_example(context) and _is_explicit_example_context(context)
                 benign_context = _is_benign_ar_context(
@@ -427,16 +580,22 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     line_match_end,
                     previous_line=previous_line,
                 )
+                negated_mandate = rule_id == "AR2" and _is_negated_warning_mandate_clause(
+                    match_clause, clause_match_start, clause_match_end
+                )
                 finding_tags = list(tag)
-                if security_review_context or example_context or benign_context:
+                if security_review_context or example_context or benign_context or negated_mandate:
                     finding_tags.extend(["contextual-triage", "likely-benign-context"])
+                # Zero confidence keeps a negated-mandate match visible in the report
+                # without it inflating the risk score (score skips confidence <= 0).
+                finding_confidence = 0.0 if negated_mandate else base_confidence
                 findings.append(
                     AnalyzerFinding(
                         rule_id=rule_id,
                         message="Anti-Refusal Statement",
                         severity=Severity.HIGH,
                         location=locations.location(match.start(), match.end()),
-                        confidence=base_confidence,
+                        confidence=finding_confidence,
                         tags=finding_tags,
                         context=_emitted_context(
                             context,
