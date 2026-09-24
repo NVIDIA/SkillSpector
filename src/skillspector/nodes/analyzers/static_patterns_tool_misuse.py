@@ -1421,6 +1421,7 @@ def _parse_shell_command_word(
     backtick_end_cache: dict[int, int | None] | None = None,
     *,
     check_runtime: Callable[[], None] | None = None,
+    owned_word_positions: set[int] | None = None,
 ) -> _ShellCommandWord | None:
     runtime_check = check_runtime or (lambda: None)
     output: list[str] = []
@@ -1437,6 +1438,8 @@ def _parse_shell_command_word(
         character = content[cursor]
         if quote is not None:
             if character == quote:
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
                 quote = None
                 ansi_c_quote = False
             elif character == "\\" and ansi_c_quote:
@@ -1450,6 +1453,8 @@ def _parse_shell_command_word(
                 output.append(decoded)
                 continue
             elif quote == '"' and character == "$" and cursor + 1 < limit:
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
                 inherited_quote_closed = [False]
                 if content[cursor + 1] == "(":
                     substitution_end = _skip_command_substitution(
@@ -1726,6 +1731,9 @@ def _has_shell_command_word_exhaustion(
 ) -> bool:
     """Find candidate command words whose deterministic parse hit a safety bound."""
     parsed_through = 0
+    # Completed words own their closing quotes and quoted expansion starts.
+    # Inner commands remain independent candidates; never suppress their bodies.
+    owned_word_positions: set[int] = set()
     parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
     substitution_end_cache: dict[int, int | None] = {}
     backtick_end_cache: dict[int, int | None] = {}
@@ -1734,17 +1742,23 @@ def _has_shell_command_word_exhaustion(
     for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
         check_runtime()
         start = candidate.start()
+        if start in owned_word_positions:
+            continue
         if structural_quote_closers is not None and start in structural_quote_closers:
             continue
         json_string_start = structural_quote_openers is not None and (
             start in structural_quote_openers or start - 1 in structural_quote_openers
         )
+        assignment_quote = start > 0 and content[start - 1] == "=" and content[start] in "'\""
         if start < parsed_through or (
-            not json_string_start and not _is_shell_command_word_start(content, start)
+            not json_string_start
+            and not assignment_quote
+            and not _is_shell_command_word_start(content, start)
         ):
             continue
         if _has_quoted_assignment_prefix(content, start):
             continue
+        candidate_word_positions: set[int] = set()
         parsed = _parse_shell_command_word(
             content,
             start,
@@ -1752,6 +1766,7 @@ def _has_shell_command_word_exhaustion(
             substitution_end_cache,
             backtick_end_cache,
             check_runtime=check_runtime,
+            owned_word_positions=candidate_word_positions,
         )
         if parsed is None:
             substitution_start = (
@@ -1789,6 +1804,7 @@ def _has_shell_command_word_exhaustion(
             if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
                 return True
             continue
+        owned_word_positions.update(candidate_word_positions)
         # Only executable nested substitutions retain independent command
         # positions. A plain dynamic data argument still owns its inner bytes;
         # revisiting those as commands would turn quoted printf data into code.
