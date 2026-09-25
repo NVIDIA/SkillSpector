@@ -3181,7 +3181,9 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
-        findings = effective_findings(result)
+        # Fingerprint every occurrence the next scan checks. The reported
+        # findings are deduplicated and keep only one occurrence's evidence.
+        findings = result["active_findings"]
         data = build_baseline_dict(
             findings,
             reason=reason,
