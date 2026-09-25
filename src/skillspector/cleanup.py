@@ -12,16 +12,25 @@ from pathlib import Path
 from skillspector.python_ast import clear_python_ast_cache
 
 
-def _retry_writable(function: Callable[[str], object], path: str, _error: BaseException) -> None:
-    """Clear a read-only bit and retry once; Windows refuses to delete read-only files."""
+def _retry_writable(function: Callable[..., object], path: str, error: BaseException) -> None:
+    """Clear a read-only bit and retry a refused removal once; Windows refuses to delete read-only files.
+
+    Only a permission error from the removal calls is retried. Any other failure,
+    such as a directory that is not empty yet, and any other callback ``rmtree``
+    reports, such as ``os.open``, are left to its best-effort pass, and nothing
+    raised here may reach the caller.
+    """
+    if function not in (os.unlink, os.rmdir) or not isinstance(error, PermissionError):
+        return
     try:
         # chmod follows links, so never touch whatever a link points at.
-        if not (os.path.islink(path) or os.path.isjunction(path)):
-            # Add the owner-write bit only; replacing the mode would strip read and
-            # search permission on POSIX and leave the entry harder to remove.
-            os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_IWRITE)
-            function(path)
-    except OSError:
+        if os.path.islink(path) or os.path.isjunction(path):
+            return
+        # Add the owner-write bit only; replacing the mode would strip read and
+        # search permission on POSIX and leave the entry harder to remove.
+        os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_IWRITE)
+        function(path)
+    except Exception:
         pass
 
 
