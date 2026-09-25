@@ -1013,6 +1013,46 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     assert data["risk_assessment"]["score"] == 0
 
 
+def test_cli_baseline_round_trip_suppresses_every_occurrence_of_a_repeated_match(
+    tmp_path: Path,
+) -> None:
+    """A match compacted across files is fingerprinted once per occurrence (#633)."""
+    skill = tmp_path / "demo"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: A demo skill for the baseline reproduction.\n---\n\n"
+        "# Demo\n\n"
+        "The upstream service deletes unused files, and the link dies with no warning.\n",
+        encoding="utf-8",
+    )
+    (skill / "references" / "notes.md").write_text(
+        "# Notes\n\nThe mirror drops stale entries with no warning.\n",
+        encoding="utf-8",
+    )
+    baseline_file = tmp_path / "baseline.yaml"
+
+    plain = runner.invoke(app, ["scan", str(skill), "--no-llm", "--format", "json"])
+    assert plain.exit_code == 0, plain.output
+    reported = [
+        (issue["id"], issue["location"]["file"]) for issue in json.loads(plain.stdout)["issues"]
+    ]
+    assert sorted(reported) == [("AR2", "SKILL.md"), ("AR2", "references/notes.md")]
+
+    gen = runner.invoke(app, ["baseline", str(skill), "--no-llm", "--output", str(baseline_file)])
+    assert gen.exit_code == 0, gen.output
+
+    scan = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", "json", "--baseline", str(baseline_file)],
+    )
+    assert scan.exit_code == 0, scan.output
+    data = json.loads(scan.stdout)
+    assert data["issues"] == []
+    assert sorted((item["id"], item["location"]["file"]) for item in data["suppressed"]) == sorted(
+        reported
+    )
+
+
 def test_cli_baseline_regeneration_excludes_in_tree_output(tmp_path: Path) -> None:
     """Regeneration cannot fingerprint findings created by the old output file."""
     skill = tmp_path / "skill"
@@ -6038,6 +6078,7 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
         "findings": [Finding(rule_id="SQP-1", message="one", file="SKILL.md")],
         "filtered_findings": [],
         "suppressed_findings": [],
+        "active_findings": [],
         "file_cache": {"SKILL.md": source},
         "risk_score": 0,
     }
@@ -6063,6 +6104,7 @@ def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: 
         "findings": [finding],
         "filtered_findings": [finding],
         "suppressed_findings": [],
+        "active_findings": [finding],
         "file_cache": {"SKILL.md": "# Baseline helper\n"},
         "local_file_cache": {
             "SKILL.md": "# Baseline helper\n",
