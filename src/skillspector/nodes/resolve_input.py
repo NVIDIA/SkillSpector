@@ -87,9 +87,11 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
                 exc.truncation.code,
             )
             raise
-        except Exception:
+        except BaseException:
             # The graph fails before returning temp_dir_for_cleanup, so no caller
             # can remove a partial download or extraction directory afterwards.
+            # BaseException, not Exception: an interrupt or a cancellation that
+            # lands after the temp directory was allocated must clean up too.
             handler.cleanup()
             raise
 
