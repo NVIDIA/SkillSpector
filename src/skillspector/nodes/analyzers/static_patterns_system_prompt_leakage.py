@@ -26,13 +26,29 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 
+from skillspector.artifacts import (
+    SecurityTextView,
+    _contains_default_ignorable,
+    is_default_ignorable,
+    normalized_security_view,
+    security_text_views,
+)
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.security_reconstruction import build_declared_marker_views
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import LOGICAL_LINE_BREAK, get_context, get_line_number
+from .common import (
+    LINE_BREAK_CHARS,
+    LOGICAL_LINE_BREAK,
+    get_context,
+    get_line_number,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -151,7 +167,56 @@ P8_PATTERNS = [
     ),
 ]
 
-_BENIGN_OUTPUT_RULES_HEADING = "## Output Rules (Both Modes)"
+_LEGACY_OUTPUT_RULES_HEADING = "## Output Rules (Both Modes)"
+_BENIGN_OUTPUT_RULES_HEADING = re.compile(
+    r"[ ]{0,3}#{1,6}[ \t]+"
+    r"(?:HTML|JSON|CSV|Markdown)[ \t]+"
+    r"(?P<target>output[ \t]+rules)"
+    r"(?:[ \t]+\(offline-safe\))?"
+    r"(?:[ \t]+#+)?[ \t]*",
+    re.IGNORECASE,
+)
+# Formatting is transparent when deciding whether a label is being used as a
+# command. These token states persist across whitespace, comments and scan
+# windows, but stop at sentence boundaries. The decision is made once for the
+# complete artifact, never from an arbitrarily truncated neighbouring excerpt.
+# Exemption analysis is optional: beyond this bound retain ordinary detections.
+_MAX_HEADING_CONTEXT_CHARS = 1024 * 1024
+_MARKUP_START = re.compile(r"<!--|</?[A-Za-z]")
+_MARKDOWN_DELIMITERS = str.maketrans("", "", "*_`")
+_REPORT_OBJECTS = frozenset(
+    "report reports document documents chart charts figure figures file files table tables".split()
+)
+_REPORT_FRAMING_OBJECTS = _REPORT_OBJECTS | frozenset(
+    "format formats formatting generator generators".split()
+)
+_REPORT_REFERENCE_MODIFIERS = frozenset("html json csv markdown".split())
+_CONTEXT_TOKENS = re.compile(r"[\w]+|[.!?;:]")
+_HEADING_ACTIONS = frozenset("interpret treat read execute perform follow obey do carry".split())
+_REFERENT_REQUIRED_HEADING_ACTIONS = frozenset("use apply run".split())
+_HEADING_LABEL_OBJECTS = frozenset("heading title label".split())
+_DIRECT_HEADING_OBJECTS = _HEADING_LABEL_OBJECTS | frozenset(
+    "command instruction operation".split()
+)
+_HEADING_OBJECTS = _HEADING_LABEL_OBJECTS | frozenset(
+    "command instruction operation following below above".split()
+)
+_COMPOUND_DOCUMENTATION_HEADS = frozenset("command commands instruction instructions".split())
+_COMPOUND_DOCUMENTATION_TAILS = frozenset("output reference options".split())
+_REFERENCE_ACTIONS = frozenset(
+    "print output show display reveal expose return echo repeat share disclose "
+    "publish provide send copy extract dump recite summarize translate encode "
+    "forward pipe write save store log do".split()
+)
+_REFERENCE_OBJECTS = frozenset(
+    "it them so this that these those above below previous preceding foregoing former latter".split()
+)
+_SENSITIVE_QUALIFIERS = frozenset("system developer hidden internal secret governing".split())
+_SENSITIVE_OBJECTS = frozenset("prompt prompts instruction instructions rule rules".split())
+_INDEPENDENT_EXTRACTION = re.compile(
+    "|".join(f"(?:{pattern})" for pattern, _ in (*P6_PATTERNS, *P7_PATTERNS, *P8_PATTERNS)), re.I
+)
+
 _LOGICAL_BREAK = rf"(?:{LOGICAL_LINE_BREAK.pattern})"
 _BENIGN_PRINT_RULES_TAXONOMY = re.compile(
     rf"(?:\A|{_LOGICAL_BREAK})[ \t]*[\"'`]{{0,3}}[ \t]*"
@@ -189,17 +254,419 @@ _NEXT_LINE_REFERENCE = re.compile(
     r"[ \t]+that\b",
     re.IGNORECASE,
 )
+_REPORT_HEADING_IN_CONTEXT = re.compile(
+    r"(?:"
+    r"##[ \t]+output[ \t]+rules[ \t]+\(both[ \t]+modes\)"
+    r"|[ ]{0,3}#{1,6}[ \t]+(?:html|json|csv|markdown)[ \t]+output[ \t]+rules"
+    r"(?:[ \t]+\(offline-safe\))?(?:[ \t]+#+)?"
+    r")",
+    re.IGNORECASE,
+)
+_PLURAL_WORDS = re.compile(r"[\w-]+")
+_MARKDOWN_LINK_DESTINATION = re.compile(r"\]\([^\r\n)]*\)")
+_PLURAL_ACTIONS = frozenset("use apply run".split())
+_PLURAL_OBJECTS = frozenset("commands instructions".split())
+_PLURAL_OBJECT_ABORTS = _REPORT_FRAMING_OBJECTS | frozenset(
+    "as to for from during with in on by of not never".split()
+)
+_PLURAL_EXTRACTION_ACTIONS = frozenset("output print show display return echo".split())
+_PLURAL_COMPLEMENT_STARTS = frozenset("for from during with in on by".split())
+_PLURAL_SCOPE_MODIFIERS = frozenset("only solely just merely strictly primarily simply".split())
+_PLURAL_AS_ABORTS = _REPORT_FRAMING_OBJECTS | frozenset(
+    "example examples reference option options sample samples template templates".split()
+)
+_BENIGN_REPORT_PROCEDURE_AFTER_HEADING = re.compile(
+    r"(?P<heading>"
+    r"##[ \t]+output[ \t]+rules[ \t]+\(both[ \t]+modes\)"
+    r"|[ ]{0,3}#{1,6}[ \t]+(?:html|json|csv|markdown)[ \t]+output[ \t]+rules"
+    r"(?:[ \t]+\(offline-safe\))?(?:[ \t]+#+)?"
+    r")(?P<gap>[ \t]+)"
+    r"(?P<prefix>(?:(?:[-+*>]|[0-9]{1,3}[.)])[ \t]+)?)"
+    r"(?P<opening>"
+    r"(?:<!--[ \t]*spacer[ \t]*-->[ \t]*){0,4}"
+    r"(?:<(?P<html_tag1>strong|b|em|i|code)>[ \t]*"
+    r"(?:<(?P<html_tag2>strong|b|em|i|code)>[ \t]*)?)?"
+    r"(?P<delimiter>(?:\*{1,3}|_{1,3}|`{1,3})?))"
+    r"follow(?P<closing>"
+    r"(?P=delimiter)"
+    r"(?(html_tag2)[ \t]*</(?P=html_tag2)>)"
+    r"(?(html_tag1)[ \t]*</(?P=html_tag1)>))"
+    r"(?=[ \t]+(?:the[ \t]+)?steps[ \t]+below[ \t]+to[ \t]+generate"
+    r"[ \t]+(?:the[ \t]+)?reports?\b(?=[ \t]*(?:[.!?]|\Z)))",
+    re.IGNORECASE,
+)
 
 
-def _is_benign_output_rules_heading(content: str, match: re.Match[str], file_type: str) -> bool:
-    """Return True only for the reported benign Markdown heading."""
-    if file_type != "markdown" or match.group(0) != "Output Rules":
-        return False
-    line_start = content.rfind("\n", 0, match.start()) + 1
-    line_end = content.find("\n", match.end())
-    if line_end < 0:
-        line_end = len(content)
-    return content[line_start:line_end].strip() == _BENIGN_OUTPUT_RULES_HEADING
+def _plural_segment_frames_heading(segment: str, check_runtime: Callable[[], None]) -> bool:
+    """Classify the one inter-heading segment without rescanning earlier text."""
+    tokens: list[str] = []
+    for index, match in enumerate(_PLURAL_WORDS.finditer(segment)):
+        if index % 1024 == 0:
+            check_runtime()
+        tokens.append(match.group().lower())
+
+    candidates: list[tuple[int, int, bool]] = []
+    for index, token in enumerate(tokens):
+        if token not in _PLURAL_ACTIONS or index + 1 >= len(tokens):
+            continue
+        if tokens[index + 1] == "these":
+            candidates.append(
+                (index, index + 2, index > 0 and tokens[index - 1] in {"not", "never"})
+            )
+        elif (
+            tokens[index + 1] == "the"
+            and index + 2 < len(tokens)
+            and tokens[index + 2] == "following"
+        ):
+            candidates.append(
+                (index, index + 3, index > 0 and tokens[index - 1] in {"not", "never"})
+            )
+
+    for candidate_index, (_action_index, referent_end, negated) in enumerate(candidates):
+        check_runtime()
+        if negated:
+            continue
+        candidate_end = (
+            candidates[candidate_index + 1][0]
+            if candidate_index + 1 < len(candidates)
+            else len(tokens)
+        )
+        object_index = referent_end
+        while object_index < candidate_end and tokens[object_index] not in _PLURAL_OBJECTS:
+            token = tokens[object_index]
+            if token in _PLURAL_OBJECT_ABORTS and not (
+                token == "of" and object_index > referent_end and tokens[object_index - 1] == "set"
+            ):
+                break
+            object_index += 1
+        if object_index >= candidate_end or tokens[object_index] not in _PLURAL_OBJECTS:
+            continue
+
+        tail = tokens[object_index + 1 : candidate_end]
+        while tail and tail[0] in _PLURAL_SCOPE_MODIFIERS:
+            tail = tail[1:]
+        if not tail:
+            return True
+        if tail[0] in _PLURAL_COMPLEMENT_STARTS:
+            continue
+        if tail[0] == "to":
+            index = 1
+            while index < len(tail) and (tail[index].endswith("ly") or tail[index] == "now"):
+                index += 1
+            if index < len(tail) and tail[index] in _PLURAL_EXTRACTION_ACTIONS:
+                return True
+            continue
+        if tail[0] == "as":
+            for token in tail[1:]:
+                if token in _PLURAL_AS_ABORTS:
+                    break
+                if token in {"output", "command", "commands", "instruction", "instructions"}:
+                    return True
+            continue
+        return True
+    return False
+
+
+def _has_plural_directive_before_report_heading(
+    text: str, check_runtime: Callable[[], None]
+) -> bool:
+    """Recognize deictic plural commands in one linear pass over heading segments."""
+    segment_start = 0
+    for heading in _REPORT_HEADING_IN_CONTEXT.finditer(text):
+        check_runtime()
+        if _plural_segment_frames_heading(text[segment_start : heading.start()], check_runtime):
+            return True
+        segment_start = heading.end()
+    return False
+
+
+def _has_heading_framing(
+    content: str, check_runtime: Callable[[], None], *, separator_reading: bool = True
+) -> bool:
+    """Conservatively retain labels when the artifact assigns them instructions.
+
+    Recognized independent extraction spans are removed only from this context
+    check: they are still scanned and reported normally. Thus a real extraction
+    following a report label does not also turn that label into a second finding.
+    """
+    if len(content) > _MAX_HEADING_CONTEXT_CHARS:
+        check_runtime()
+        return True
+    if separator_reading and _contains_default_ignorable(content):
+        separated: list[str] = []
+        for start in range(0, len(content), 65536):
+            check_runtime()
+            separated.append(
+                "".join(
+                    " " if is_default_ignorable(character) else character
+                    for character in content[start : start + 65536]
+                )
+            )
+        if _has_heading_framing("".join(separated), check_runtime, separator_reading=False):
+            return True
+    chunks: list[str] = []
+    normalized_size = 0
+    for start in range(0, len(content), 65536):
+        check_runtime()
+        chunk = normalized_security_view(content[start : start + 65536]).text
+        normalized_size += len(chunk)
+        if normalized_size > _MAX_HEADING_CONTEXT_CHARS:
+            check_runtime()
+            return True
+        chunks.append(chunk)
+    text = re.sub(r"\s+", " ", "".join(chunks))
+    for markup_separator in ("", " "):
+        rendered = _render_context(text, markup_separator, check_runtime)
+        if rendered is None:
+            return True
+        presentation = _MARKDOWN_LINK_DESTINATION.sub(" ", rendered)
+        if _has_plural_directive_before_report_heading(presentation, check_runtime):
+            return True
+    # A complete report procedure immediately after its formatting heading
+    # applies to the report, not to the heading. Remove only that action token;
+    # forward references and later explicit casts remain conservative.
+    text = _BENIGN_REPORT_PROCEDURE_AFTER_HEADING.sub(
+        lambda match: (
+            match.group("heading")
+            + match.group("gap")
+            + match.group("prefix")
+            + match.group("opening")
+            + match.group("closing")
+        ),
+        text,
+    )
+    text = _INDEPENDENT_EXTRACTION.sub(" ", text)
+    if _context_is_framed(text, check_runtime):
+        return True
+    # Inspect the source plus rendered readings. Only extraction spans visible
+    # in the source were removed above: rendering must not silently bless a
+    # hidden instruction that the ordinary detector has not independently seen.
+    for markup_separator in ("", " "):
+        rendered = _render_context(text, markup_separator, check_runtime)
+        if rendered is None:
+            return True
+        if rendered != text and _context_is_framed(rendered, check_runtime):
+            return True
+    return False
+
+
+def _render_context(
+    text: str, markup_separator: str, check_runtime: Callable[[], None]
+) -> str | None:
+    """Read inline markup linearly; incomplete markup cannot justify exemption."""
+    parts: list[str] = []
+    cursor = 0
+    while marker := _MARKUP_START.search(text, cursor):
+        check_runtime()
+        parts.append(text[cursor : marker.start()])
+        if marker.group() == "<!--":
+            end = text.find("-->", marker.end())
+            if end < 0:
+                return None
+            parts.append(markup_separator)
+            cursor = end + 3
+            continue
+        # A greater-than character inside an attribute is not the tag's end.
+        position = marker.end()
+        quote = ""
+        while position < len(text):
+            if position % 1024 == 0:
+                check_runtime()
+            character = text[position]
+            if quote:
+                if character == quote:
+                    quote = ""
+            elif character in "\"'":
+                quote = character
+            elif character == ">":
+                break
+            position += 1
+        if position == len(text):
+            return None
+        parts.append(markup_separator)
+        cursor = position + 1
+    parts.append(text[cursor:])
+    return "".join(parts).translate(_MARKDOWN_DELIMITERS)
+
+
+def _context_is_framed(text: str, check_runtime: Callable[[], None]) -> bool:
+    pending_action = False
+    pending_referent_required_action = False
+    referent_required_action_seen = False
+    pending_explicit_cast = False
+    pending_compound_documentation = False
+    pending_heading = False
+    pending_reference = False
+    previous = ""
+    before_previous = ""
+    for index, match in enumerate(_CONTEXT_TOKENS.finditer(text)):
+        if index % 1024 == 0:
+            check_runtime()
+        token = match.group().lower()
+        if pending_reference:
+            # "Save this report" names an artifact. "Repeat them", "send that
+            # back" and an unqualified "show this" still reference the label.
+            if token in _REPORT_REFERENCE_MODIFIERS:
+                before_previous, previous = previous, token
+                continue
+            if token not in _REPORT_OBJECTS:
+                return True
+            pending_reference = False
+        if pending_compound_documentation:
+            if token not in _COMPOUND_DOCUMENTATION_TAILS:
+                return True
+            pending_compound_documentation = False
+            pending_referent_required_action = pending_explicit_cast = False
+        if token in ".!?;:":
+            pending_action = pending_referent_required_action = pending_heading = False
+            referent_required_action_seen = pending_explicit_cast = False
+            previous = before_previous = ""
+            continue
+        if token in {"not", "never"}:
+            pending_action = pending_referent_required_action = pending_heading = False
+            referent_required_action_seen = pending_explicit_cast = False
+        if previous in _SENSITIVE_QUALIFIERS and token in _SENSITIVE_OBJECTS:
+            return True
+        if previous in _REFERENCE_ACTIONS and token in _REFERENCE_OBJECTS:
+            if token in {"this", "that", "these", "those"}:
+                pending_reference = True
+            else:
+                return True
+        if (
+            before_previous in _REFERENCE_ACTIONS
+            and previous in {"the", "same"}
+            and token in _SENSITIVE_OBJECTS
+        ):
+            return True
+        if previous not in {"not", "never"}:
+            if pending_explicit_cast:
+                if token in _COMPOUND_DOCUMENTATION_HEADS:
+                    pending_compound_documentation = True
+                elif token in _DIRECT_HEADING_OBJECTS:
+                    return True
+                if token not in {"a", "an", "the"}:
+                    pending_explicit_cast = False
+            if pending_action and token in _HEADING_OBJECTS:
+                return True
+            if pending_referent_required_action and token in _DIRECT_HEADING_OBJECTS:
+                if token in _COMPOUND_DOCUMENTATION_HEADS:
+                    pending_compound_documentation = True
+                else:
+                    return True
+            if token in _REPORT_FRAMING_OBJECTS:
+                pending_referent_required_action = False
+            if referent_required_action_seen and token == "as":
+                pending_explicit_cast = True
+            if pending_heading and token in {"command", "instruction", "commands", "instructions"}:
+                return True
+            pending_action |= token in _HEADING_ACTIONS
+            pending_referent_required_action |= token in _REFERENT_REQUIRED_HEADING_ACTIONS
+            referent_required_action_seen |= token in _REFERENT_REQUIRED_HEADING_ACTIONS
+            pending_heading |= token in _HEADING_LABEL_OBJECTS
+        before_previous, previous = previous, token
+    check_runtime()
+    return pending_reference or pending_compound_documentation
+
+
+def _has_reconstructed_framing(content: str, check_runtime: Callable[[], None]) -> bool:
+    """Do not approve labels before inspecting recoverable instructions elsewhere.
+
+    Overlapping bounded neighborhoods include the marker decoder's full scope.
+    Reconstructed context can only revoke an exemption; it cannot create one.
+    Ambiguous active decoding also keeps the original conservative detection.
+    """
+    for start in range(0, len(content), 32768):
+        check_runtime()
+        for view in security_text_views(content[start : start + 65536]):
+            check_runtime()
+            if view.name not in {"raw", "normalized"} and _has_heading_framing(
+                view.text, check_runtime
+            ):
+                return True
+            decoded = build_declared_marker_views(view, check_runtime=check_runtime)
+            if decoded.limited:
+                return True
+            if any(_has_heading_framing(item.text, check_runtime) for item in decoded.views):
+                return True
+        if start + 65536 >= len(content):
+            break
+    return False
+
+
+@dataclass(frozen=True)
+class _PreparedAnalysis:
+    # Absolute source start -> exclusive source end for complete, approved labels.
+    heading_spans: Mapping[int, int]
+
+    def analyze(
+        self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> list[AnalyzerFinding]:
+        return _analyze(content, file_path, self, source_view)
+
+    def analyze_whitespace_continuity(
+        self, content: str, file_path: str, file_type: str, source_view: SecurityTextView
+    ) -> list[AnalyzerFinding]:
+        # Only P6 opts into whitespace compaction. Other rules may intentionally
+        # bound their gaps; changing their input would change that security policy.
+        return _analyze(content, file_path, self, source_view, p6_only=True)
+
+    def is_report_label(self, match: re.Match[str], view: SecurityTextView) -> bool:
+        start = view.source_offset(match.start())
+        end = view.source_offset(match.end() - 1) + 1
+        approved_end = self.heading_spans.get(start)
+        # An overlapping view may end at singular "Rule". It is safe only if the
+        # entire detected noun phrase lies inside the same complete source label.
+        return approved_end is not None and start < end <= approved_end
+
+
+def prepare_analysis(
+    content: str, file_type: str, check_runtime: Callable[[], None]
+) -> _PreparedAnalysis:
+    """Prepare immutable, complete-source heading decisions under the runner budget."""
+    spans: dict[int, int] = {}
+    check_runtime()
+    if file_type != "markdown" or len(content) > _MAX_HEADING_CONTEXT_CHARS:
+        return _PreparedAnalysis(MappingProxyType(spans))
+    offset = 0
+    for index, raw_line in enumerate(content.splitlines(keepends=True)):
+        if index % 128 == 0:
+            check_runtime()
+        line = raw_line.rstrip(LINE_BREAK_CHARS)
+        # Very long lines cannot be approved from a bounded fragment. Leave them
+        # detectable; normal report headings fit comfortably within this bound.
+        if len(line) <= 4096:
+            normalized = normalized_security_view(line)
+            target = _report_heading_target(normalized.text)
+            candidates: tuple[tuple[SecurityTextView, tuple[int, int]], ...]
+            if target is not None:
+                candidates = ((normalized, target),)
+            elif normalized.text.lstrip().startswith("#"):
+                candidates = tuple(
+                    (view, target)
+                    for view in security_text_views(line)
+                    if (target := _report_heading_target(view.text)) is not None
+                )
+            else:
+                candidates = ()
+            for view, (start, end) in candidates:
+                spans[offset + view.source_offset(start)] = offset + view.source_offset(end - 1) + 1
+        offset += len(raw_line)
+    if spans and (
+        _has_heading_framing(content, check_runtime)
+        or _has_reconstructed_framing(content, check_runtime)
+    ):
+        spans.clear()
+    check_runtime()
+    return _PreparedAnalysis(MappingProxyType(spans))
+
+
+def _report_heading_target(line: str) -> tuple[int, int] | None:
+    if line.strip() == _LEGACY_OUTPUT_RULES_HEADING:
+        start = line.index("Output Rules")
+        return start, start + len("Output Rules")
+    if heading := _BENIGN_OUTPUT_RULES_HEADING.fullmatch(line):
+        return heading.span("target")
+    return None
 
 
 def _bounded_previous_nonblank_line(content: str, offset: int) -> tuple[str, bool]:
@@ -264,6 +731,18 @@ def _is_benign_print_rules_taxonomy(content: str, match: re.Match[str]) -> bool:
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for system prompt leakage patterns (P6–P8)."""
+    prepared = prepare_analysis(content, file_type, lambda: None)
+    return _analyze(content, file_path, prepared, SecurityTextView("raw", content))
+
+
+def _analyze(
+    content: str,
+    file_path: str,
+    prepared: _PreparedAnalysis,
+    source_view: SecurityTextView,
+    *,
+    p6_only: bool = False,
+) -> list[AnalyzerFinding]:
     findings: list[AnalyzerFinding] = []
 
     def loc(ln: int) -> Location:
@@ -278,7 +757,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         for match in static_runner.iter_paragraph_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
-            if _is_benign_output_rules_heading(content, match, file_type):
+            if prepared.is_report_label(match, source_view):
                 continue
             if _is_benign_print_rules_taxonomy(content, match):
                 continue
@@ -296,6 +775,8 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
+    if p6_only:
+        return findings
     for pattern, confidence in P7_PATTERNS:
         for match in static_runner.iter_paragraph_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
