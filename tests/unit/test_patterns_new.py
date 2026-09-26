@@ -2469,24 +2469,16 @@ class TestTriggerAnalysis:
         assert len(tr1) == 1
         assert "hello" in tr1[0].message
 
-    @pytest.mark.parametrize(
-        "trailing",
-        [
-            pytest.param("there", id="there"),
-            pytest.param("here", id="here"),
-        ],
-    )
-    def test_description_broad_word_with_trailing_prose_reaches_tr1(self, trailing: str) -> None:
-        """MohammedAlkindi #541: a broad word followed by trailing discourse
-        prose still names the broad word ("says hello there"), so TR1 fires.
-        Fixtures must not all end on the trigger phrase."""
+    @pytest.mark.parametrize("phrase", ["go there", "work now", "hello there", "hello here"])
+    def test_description_bounded_phrase_with_discourse_word_stays_negative(
+        self, phrase: str
+    ) -> None:
+        """#609: a discourse-looking tail must not shrink a phrase to its head."""
         findings = sc_mod._analyze_triggers(
-            {"description": ("Use this skill whenever the user says hello " + trailing)},
+            {"description": f"Use this skill whenever the user says {phrase}"},
             "myskill",
         )
-        tr1 = [finding for finding in findings if finding.rule_id == "TR1"]
-        assert len(tr1) == 1
-        assert "activates on 'hello'" in tr1[0].message
+        assert not any(finding.rule_id == "TR1" for finding in findings), phrase
 
     def test_description_article_not_skipped_as_filler(self) -> None:
         """MohammedAlkindi #541: bare articles are not filler words, so the
