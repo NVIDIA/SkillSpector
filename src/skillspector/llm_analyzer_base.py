@@ -70,6 +70,7 @@ from skillspector.llm_utils import (
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
+from skillspector.nodes.analyzers.pattern_defaults import get_category, get_pattern_name
 
 logger = get_logger(__name__)
 
@@ -622,6 +623,9 @@ class LLMFinding(BaseModel):
             file=file,
             start_line=self.start_line,
             end_line=self.end_line,
+            category=get_category(self.rule_id),
+            pattern=self.message or get_pattern_name(self.rule_id),
+            finding=self.message,
             explanation=self.explanation,
             remediation=self.remediation,
         )
