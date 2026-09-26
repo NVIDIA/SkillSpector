@@ -219,6 +219,84 @@ TM1_PROSE_PATTERNS = [
 ]
 TM1_PATTERNS = TM1_CODE_PATTERNS + TM1_PROSE_PATTERNS
 
+# Agent instructions can name any filesystem target in prose rather than as a
+# shell path, or express deletion without a shell command at all.
+# Bounded separators accept Markdown/quote wrappers and soft line breaks;
+# iter_paragraph_matches keeps unrelated paragraphs from supplying the target.
+_DELETION_PROSE_GAP = r"[\s*_`\"'\u2018\u2019\u201c\u201d]{1,64}"
+# A closing emphasis delimiter is allowed; a filename suffix is not.
+_DELETION_PROSE_WORD_END = r"(?![^\W_]|[/-]|\.\w|_+(?:[^\W_]|[/-]|\.\w))"
+_DELETION_PROSE_CONTAINER = (
+    rf"(?:repo(?:sitory)?|project|workspace|folder|directory|tree){_DELETION_PROSE_WORD_END}"
+    rf"(?!{_DELETION_PROSE_GAP}(?:names?|labels?|references?|mentions?|entry|entries)\b)"
+)
+_DELETION_PROSE_ARTICLE = rf"(?:(?:the|this|that|your|our|my){_DELETION_PROSE_GAP})?"
+_DELETION_PROSE_NAME = (
+    r"(?!(?:from|in|of|under|inside|to|and|or|but|then|with|without)\b)"
+    # A name must start outside the delimiter alphabet. Otherwise runs of
+    # underscores can be split between repeated names and gaps exponentially.
+    r"(?:[^\W_]|[./~$])[\w./~$-]{0,63}+"
+)
+_DELETION_PROSE_NAMED_CONTAINER = (
+    rf"(?:{_DELETION_PROSE_NAME}{_DELETION_PROSE_GAP}){{0,4}}"
+    rf"{_DELETION_PROSE_CONTAINER}"
+)
+_DELETION_PROSE_CONTENTS = rf"(?:files?|contents?|data){_DELETION_PROSE_WORD_END}"
+_DELETION_PROSE_QUANTIFIER = rf"(?:all(?:{_DELETION_PROSE_GAP}of)?|every){_DELETION_PROSE_GAP}"
+_DELETION_PROSE_BROAD_TARGET = (
+    rf"(?:{_DELETION_PROSE_ARTICLE}(?:entire|whole|full|current){_DELETION_PROSE_GAP}"
+    rf"{_DELETION_PROSE_NAMED_CONTAINER}"
+    rf"|(?:{_DELETION_PROSE_QUANTIFIER}{_DELETION_PROSE_ARTICLE}{_DELETION_PROSE_CONTENTS}"
+    rf"|everything){_DELETION_PROSE_GAP}(?:in|of|from|under|inside){_DELETION_PROSE_GAP}"
+    rf"{_DELETION_PROSE_ARTICLE}{_DELETION_PROSE_NAMED_CONTAINER}"
+    rf"|all{_DELETION_PROSE_GAP}{_DELETION_PROSE_ARTICLE}{_DELETION_PROSE_CONTAINER}"
+    rf"{_DELETION_PROSE_GAP}{_DELETION_PROSE_CONTENTS})"
+)
+_DELETION_PROSE_RM_PREFIX = (
+    rf"(?<![\w./-])_{{0,2}}(?P<action>rm){_DELETION_PROSE_GAP}?"
+    rf"(?P<options>(?:(?:-[A-Za-z]{{1,16}}|--recursive|--force)"
+    rf"{_DELETION_PROSE_GAP}?){{1,8}})"
+    rf"(?:--{_DELETION_PROSE_GAP})?"
+)
+_BROAD_DELETION_PROSE_RE = re.compile(
+    rf"{_DELETION_PROSE_RM_PREFIX}(?P<target>{_DELETION_PROSE_BROAD_TARGET})",
+    re.IGNORECASE,
+)
+_NAMED_DELETION_PROSE_RE = re.compile(
+    rf"{_DELETION_PROSE_RM_PREFIX}"
+    r"(?P<target>\"[^\"\n]{1,256}\"|'[^'\n]{1,256}'|`[^`\n]{1,256}`|"
+    r"(?![-#])[^\s;|&<>\"'`]{1,256}(?![^\s;|&<>\"'`]))",
+    re.IGNORECASE,
+)
+_NATURAL_DELETION_PROSE_RE = re.compile(
+    rf"(?<![\w./-])_{{0,2}}"
+    rf"(?:(?:recursively|permanently){_DELETION_PROSE_GAP})?"
+    rf"(?P<action>delet(?:e|ing)|remov(?:e|ing)|eras(?:e|ing)|wip(?:e|ing)|"
+    rf"destroy(?:ing)?|purg(?:e|ing)|empty(?:ing)?)"
+    rf"{_DELETION_PROSE_GAP}(?:out{_DELETION_PROSE_GAP})?"
+    rf"(?P<target>{_DELETION_PROSE_BROAD_TARGET}"
+    rf"|{_DELETION_PROSE_ARTICLE}(?:{_DELETION_PROSE_QUANTIFIER}{_DELETION_PROSE_ARTICLE}"
+    rf"|(?:entire|whole|full){_DELETION_PROSE_GAP})?"
+    rf"{_DELETION_PROSE_CONTENTS}"
+    rf"(?:{_DELETION_PROSE_GAP}(?:in|of|from|under|inside){_DELETION_PROSE_GAP}"
+    rf"{_DELETION_PROSE_ARTICLE}{_DELETION_PROSE_NAMED_CONTAINER})?"
+    rf"|{_DELETION_PROSE_ARTICLE}{_DELETION_PROSE_NAMED_CONTAINER})",
+    re.IGNORECASE,
+)
+_DELETION_PROSE_WARNING_RE = re.compile(
+    r"\b(?:(?:do\s+not|don't|never|must\s+not|should\s+not)\s+"
+    r"(?:ever\s+)?(?:do|run|execute|invoke|use)"
+    r"|avoid\s+(?:doing|running|executing|invoking|using)"
+    r"|refrain\s+from\s+(?:doing|running|executing|invoking|using))"
+    r"(?:\s+(?:the|this|following|command)){0,3}\s*:?\s*$",
+    re.IGNORECASE,
+)
+_DELETION_PROSE_DIRECT_WARNING_RE = re.compile(
+    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|avoid|refrain\s+from)"
+    r"\s+(?:ever\s+)?$",
+    re.IGNORECASE,
+)
+
 # TM2: Chaining Abuse — chained commands to bypass safety
 TM2_CODE_PATTERNS = [
     # Shell command chaining with dangerous commands (\b prevents substring matches)
@@ -3028,6 +3106,66 @@ def _tm1_shell_candidates(content: str) -> Iterator[tuple[int, int, str, float]]
             yield command_start, command_end, command, 0.9
 
 
+def _destructive_instruction_matches(
+    content: str, file_type: str
+) -> Iterator[tuple[re.Match[str], str, str]]:
+    """Find explicit destructive operations for optional contextual LLM review."""
+    seen_shell_starts: set[int] = set()
+    patterns = [(_BROAD_DELETION_PROSE_RE, "broad")]
+    # The general target/prose matcher interprets agent instructions. Executable
+    # source keeps its existing shell-token and AST policies (including scoped
+    # glob controls); it must not be reinterpreted as free-form English.
+    instruction_text = file_type in {"markdown", "text", "other"}
+    if instruction_text:
+        patterns.append((_NAMED_DELETION_PROSE_RE, "specified"))
+    for pattern, scope in patterns:
+        for match in static_runner.iter_paragraph_matches(pattern, content):
+            if match.start() in seen_shell_starts:
+                continue
+            if not _prose_has_recursive_options(match):
+                continue
+            wrapper = _command_wrapper_quote(content, match.start())
+            if wrapper is not None:
+                closer = content.find(wrapper, match.end("action"), match.start("target"))
+                if closer > match.end("action"):
+                    # A closed quoted/inline command cannot borrow an operand
+                    # from subsequent prose: `rm -rf` to see the help.
+                    continue
+            seen_shell_starts.add(match.start())
+            yield match, "shell", scope
+    if instruction_text:
+        for match in static_runner.iter_paragraph_matches(_NATURAL_DELETION_PROSE_RE, content):
+            broad = re.search(
+                r"\b(?:all|every|everything|entire|whole|full|recursively|empty(?:ing)?)\b",
+                match[0],
+                re.IGNORECASE,
+            )
+            yield match, "natural-language", "broad" if broad else "specified"
+
+
+def _prose_has_recursive_options(match: re.Match[str]) -> bool:
+    """Recursive deletion can remove a folder even without the force flag."""
+    options = re.findall(r"--(?:recursive|force)|-[A-Za-z]+", match["options"], re.I)
+    short_options = [option[1:] for option in options if not option.startswith("--")]
+    return "--recursive" in options or any(
+        "r" in option or "R" in option for option in short_options
+    )
+
+
+def _destructive_instruction_is_warning(content: str, start: int) -> bool:
+    """Recognize an immediate prohibition without erasing deterministic evidence."""
+    prefix = content[max(0, start - 256) : start]
+    prefix = re.split(r"\n[ \t\r]*\n", prefix)[-1].replace("\u2019", "'")
+    # Keep apostrophes inside words (don't), but ignore quotation/Markdown
+    # delimiters around the instruction. A later affirmative verb or clause
+    # cannot inherit an earlier warning through this anchored local grammar.
+    prefix = re.sub(r"[*_`\"\u2018\u2019\u201c\u201d]|(?<!\w)'|'(?!\w)", " ", prefix)
+    return (
+        _DELETION_PROSE_WARNING_RE.search(prefix) is not None
+        or _DELETION_PROSE_DIRECT_WARNING_RE.search(prefix) is not None
+    )
+
+
 def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
     """Recognize Setext underlines/thematic breaks with bounded, linear work."""
     line = line.strip(" \t")
@@ -3464,6 +3602,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
     tag = [PatternCategory.TOOL_MISUSE.value]
     tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
+    tm1_findings_by_start: dict[int, list[AnalyzerFinding]] = {}
 
     # The variable-shell-flag regex cannot see Python scopes, so an assignment
     # in one function and a shell= use in another still match.  Drop those
@@ -3521,7 +3660,51 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             evidence={static_runner._VIEW_START_EVIDENCE: match_start},
         )
         tm1_findings_by_key[candidate_key] = finding
+        tm1_findings_by_start.setdefault(match_start, []).append(finding)
         findings.append(finding)
+    for match, form, scope in _destructive_instruction_matches(content, file_type):
+        finding_tags = [*tag, "destructive-operation"]
+        warning = _destructive_instruction_is_warning(content, match.start())
+        if warning:
+            finding_tags.extend(["contextual-triage", "likely-benign-context"])
+        operation = {
+            "action": match["action"].lower(),
+            "target": match["target"],
+            "form": form,
+            "scope": scope,
+            "context": "warning" if warning else "instruction",
+        }
+        # Keep existing path-specific severity and confidence. Add operation
+        # evidence to its finding rather than emitting a duplicate candidate.
+        existing_operations = tm1_findings_by_start.get(match.start(), [])
+        if existing_operations:
+            for finding in existing_operations:
+                finding.evidence["destructive_operation"] = operation
+                finding.tags = list(dict.fromkeys([*finding.tags, *finding_tags]))
+            continue
+        # Broad destruction cannot be made safe by nearby setup commands.
+        # A named/scoped target is a review candidate, not proof of malice.
+        severity = Severity.HIGH if scope == "broad" else Severity.MEDIUM
+        confidence = 0.9 if scope == "broad" else 0.75
+        if form == "shell" and scope == "specified" and _is_safe_cache_cleanup(match[0]):
+            severity, confidence = Severity.LOW, 0.15
+        findings.append(
+            AnalyzerFinding(
+                rule_id="TM1",
+                message="Destructive Filesystem Operation",
+                severity=severity,
+                location=loc(get_line_number(content, match.start())),
+                confidence=confidence,
+                tags=finding_tags,
+                context=ctx(match.start()),
+                matched_text=match[0][:200],
+                complete_match=match[0],
+                evidence={
+                    static_runner._VIEW_START_EVIDENCE: match.start(),
+                    "destructive_operation": operation,
+                },
+            )
+        )
     for pattern, confidence in TM2_PATTERNS:
         matches = (
             static_runner.iter_paragraph_matches
