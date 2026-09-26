@@ -17,12 +17,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 import yaml
 
 from skillspector.nodes.analyzers import mcp_least_privilege
+from skillspector.nodes.report import report
 
 # ---------------------------------------------------------------------------
 # Fixture directory path
@@ -259,6 +261,11 @@ class TestLP3NoPermissions:
         assert lp3.severity == "MEDIUM"
         assert lp3.confidence >= 0.70
         assert lp3.file == "SKILL.md"
+        issue = json.loads(
+            report({"filtered_findings": [lp3], "output_format": "json"})["report_body"]
+        )["issues"][0]
+        assert issue["pattern"] == lp3.message
+        assert issue["finding"] == lp3.message
 
 
 class TestLP3AllowedTools:
