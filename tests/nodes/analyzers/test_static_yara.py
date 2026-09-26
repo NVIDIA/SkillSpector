@@ -22,7 +22,10 @@ antivirus/Defender on test files containing real malware signatures.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
+import logging
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -37,12 +40,17 @@ from skillspector.nodes.report import _compute_risk_score
 
 @pytest.fixture(autouse=True)
 def _clear_rule_cache():
-    """Reset the module-level compiled rules cache between tests."""
-    static_yara._compiled_rules = None
-    static_yara._rules_hash = None
+    """Reset the module-level compiled rules cache between tests.
+
+    The skip count is part of that cache entry: it is only meaningful alongside
+    the hash it was produced from, so leaving it set would leak a previous
+    test's dropped-rule total into the next one.
+    """
+    static_yara._rule_cache = None
+    static_yara._rules_skipped_count = 0
     yield
-    static_yara._compiled_rules = None
-    static_yara._rules_hash = None
+    static_yara._rule_cache = None
+    static_yara._rules_skipped_count = 0
 
 
 def _write_rule(
@@ -788,22 +796,22 @@ class TestRuleCaching:
             tmp_path, "rule_cache", category="malware", severity="HIGH", strings={"a": "CACHETEST"}
         )
         _run("CACHETEST", "f.txt", str(tmp_path))
-        first_rules = static_yara._compiled_rules
+        first_rules = static_yara._rule_cache.rules
         _run("CACHETEST", "f.txt", str(tmp_path))
-        assert static_yara._compiled_rules is first_rules
+        assert static_yara._rule_cache.rules is first_rules
 
     def test_cache_invalidated_on_new_rule(self, tmp_path):
         _write_rule(
             tmp_path, "rule_v1", category="malware", severity="HIGH", strings={"a": "V1MARKER"}
         )
         _run("V1MARKER", "f.txt", str(tmp_path))
-        first_hash = static_yara._rules_hash
+        first_hash = static_yara._rule_cache.rules_hash
 
         _write_rule(
             tmp_path, "rule_v2", category="malware", severity="HIGH", strings={"a": "V2MARKER"}
         )
         _run("V2MARKER", "f.txt", str(tmp_path))
-        assert static_yara._rules_hash != first_hash
+        assert static_yara._rule_cache.rules_hash != first_hash
 
 
 # ── Internal helpers ──────────────────────────────────────────────────
@@ -952,6 +960,48 @@ class TestHelpers:
         assert "valid" in ns_map
         assert "invalid" not in ns_map
         assert skipped == 1
+
+    def test_malformed_rule_is_reported_not_silently_dropped(self, tmp_path, monkeypatch):
+        """A custom rule that can't compile must not report a clean, SAFE scan (#554).
+
+        Reproduces the issue's own scenario: a valid rule plus a rule with a
+        YARA syntax error in the same --yara-rules-dir. The good rule must
+        still fire, but the analyzer status must not be "completed" -- that
+        claim would be false, since the broken rule never ran against
+        anything.
+        """
+        static_yara._rule_cache = None
+        static_yara._rules_skipped_count = 0
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", tmp_path / "empty_builtin")
+        (tmp_path / "empty_builtin").mkdir()
+
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "good.yar").write_text(
+            'rule good_rule { meta: category = "malware" '
+            'strings: $a = "ACME_CANARY" condition: $a }'
+        )
+        # Missing closing brace: a real YARA syntax error, not a decode failure.
+        (rules_dir / "bad.yar").write_text('rule bad_rule { strings: $a = "x" condition: $a')
+
+        result = static_yara.node(
+            {
+                "components": ["skill.md"],
+                "file_cache": {"skill.md": "contains ACME_CANARY"},
+                "yara_rules_dir": str(rules_dir),
+            }
+        )
+
+        assert any("good_rule" in f.message for f in result["findings"]), (
+            "the valid rule must still fire"
+        )
+        status = result["analyzer_status_events"][0]
+        assert status["status"] != "completed", "a dropped custom rule must not report a clean scan"
+        assert any(
+            event.get("reason_code") == LedgerReason.READ_ERROR
+            and event.get("observed_artifacts") == 1
+            for event in result["inspection_ledger"]
+        )
 
     @pytest.mark.parametrize("payload", ["not base64", "not base64 é"])
     def test_malformed_extra_encoded_rule_does_not_block_builtin_rules(self, tmp_path, payload):
@@ -1322,3 +1372,380 @@ class TestInspectionLedgerResponse:
         match.assert_not_called()
         assert matched.reason == "runtime_limit"
         assert matched.metrics == {"observed_seconds": 0.0, "limit_seconds": 0.5}
+
+
+class TestRuleSkipAccounting:
+    """Regressions for the three review findings on the #554 skip-count surface.
+
+    All three share one root shape: the dropped-rule total was reported through
+    channels not tied to the scan that produced it -- a module global read after
+    the fact, a ledger work ID shared with component work, and a DEBUG log the
+    operator never sees at default verbosity.
+    """
+
+    @staticmethod
+    def _isolated_builtin(tmp_path: Path, monkeypatch) -> None:
+        """Point the built-in rule dir at an empty dir so counts are only ours."""
+        builtin = tmp_path / "empty_builtin"
+        builtin.mkdir(exist_ok=True)
+        monkeypatch.setattr(static_yara, "_BUILTIN_RULES_DIR", builtin)
+
+    @staticmethod
+    def _rule_dir(tmp_path: Path, name: str, *, broken: int, good: bool = True) -> Path:
+        """Build a rule dir with ``broken`` uncompilable rules, optionally one valid one.
+
+        ``good=False`` with ``broken=0`` yields an existing but empty directory,
+        which is how the "no rule files at all" load path is reached.
+        """
+        rules_dir = tmp_path / name
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        marker = f"MARKER_{name.upper()}"
+        if good:
+            (rules_dir / "good.yar").write_text(
+                f'rule good_{name} {{ strings: $a = "{marker}" condition: $a }}'
+            )
+        for index in range(broken):
+            # Missing closing brace: a real YARA syntax error, not a decode failure.
+            (rules_dir / f"bad{index}.yar").write_text(
+                f'rule bad_{name}_{index} {{ strings: $a = "x" condition: $a'
+            )
+        return rules_dir
+
+    def test_skip_count_travels_with_the_rules_it_describes(self, tmp_path, monkeypatch):
+        """Two loads in sequence must each report their own skip total.
+
+        Deterministic form of the concurrency finding: reading the count as a
+        separate step after the load is what lets a later load answer for an
+        earlier one. ``load_rules_with_skips`` returns both halves together, so
+        the pairing cannot be broken by anything that happens afterwards.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, "a", broken=1)
+        dir_b = self._rule_dir(tmp_path, "b", broken=0)
+
+        rules_a, skipped_a = static_yara.load_rules_with_skips(dir_a)
+        rules_b, skipped_b = static_yara.load_rules_with_skips(dir_b)
+
+        assert rules_a is not None
+        assert rules_b is not None
+        assert skipped_a == 1, "rule set A dropped one rule and must say so"
+        assert skipped_b == 0, "rule set B dropped nothing and must not inherit A's count"
+
+        # The separate-read path is what made this unsafe: after B's load the
+        # module global describes B, so anyone still holding A's rules and
+        # reading the global now would report a clean scan for A.
+        assert static_yara.rules_skipped_count() == 0
+
+    @pytest.mark.parametrize(
+        ("label", "b_broken", "a_broken"),
+        [
+            # B finds no rule files at all. This path forced the count to zero,
+            # so A's cache hit reported zero dropped rules: a false-complete scan.
+            ("no_rule_files", 0, 1),
+            # B compiles nothing because every one of its rules is rejected.
+            # Counts are deliberately asymmetric (A drops 2, B drops 1) so an
+            # inherited count is visible rather than coincidentally equal.
+            ("all_rejected", 1, 2),
+        ],
+    )
+    def test_cached_rules_never_report_a_later_loads_skip_count(
+        self, tmp_path, monkeypatch, label, b_broken, a_broken
+    ):
+        """load A -> load a non-populating B -> load A again must still report A's count.
+
+        ``_load_rules`` used to set the skip count and return on both
+        non-populating paths without replacing *or* clearing the cached rules
+        and hash. The entry left behind still matched A's hash, so the third
+        load hit the cache and paired A's rules with B's count -- zero for the
+        empty/no-files case -- and a rule set that had dropped a detector went
+        back to reporting a complete scan.
+
+        Deterministic and single-threaded: this is a cache-integrity defect, not
+        a race, so it reproduces purely from the order of the three loads.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, f"a_{label}", broken=a_broken)
+        dir_b = self._rule_dir(tmp_path, f"b_{label}", broken=b_broken, good=False)
+
+        rules_a, skipped_a = static_yara.load_rules_with_skips(dir_a)
+        assert rules_a is not None
+        assert skipped_a == a_broken
+
+        rules_b, skipped_b = static_yara.load_rules_with_skips(dir_b)
+        assert rules_b is None, "B must not produce usable rules in this scenario"
+
+        rules_a_again, skipped_a_again = static_yara.load_rules_with_skips(dir_a)
+
+        assert rules_a_again is not None, "A's rules must still be available"
+        assert skipped_a_again == a_broken, (
+            f"rule set A dropped {a_broken} rule(s) but the reload reported "
+            f"{skipped_a_again}, which is B's count ({skipped_b})"
+        )
+
+    @pytest.mark.parametrize(
+        ("label", "broken", "good"),
+        [
+            ("no_rule_files", 0, False),
+            ("all_rejected", 1, False),
+        ],
+    )
+    def test_non_populating_load_leaves_no_cache_entry(
+        self, tmp_path, monkeypatch, label, broken, good
+    ):
+        """A load that yields no usable rules must not leave a populated cache entry.
+
+        Covers the invalidation half directly, so a future change that starts
+        writing one part of the entry on these paths fails here rather than
+        only showing up as a wrong skip count three loads later.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, f"seed_{label}", broken=1)
+        assert static_yara._load_rules(dir_a) is not None
+        assert static_yara._rule_cache is not None, "the seed load must populate the cache"
+
+        dir_b = self._rule_dir(tmp_path, f"empty_{label}", broken=broken, good=good)
+
+        assert static_yara._load_rules(dir_b) is None
+        assert static_yara._rule_cache is None, (
+            "the previous rules and hash are still cached after a load that "
+            "produced nothing, so a later request for that hash can be served "
+            "rules paired with this load's count"
+        )
+
+    def test_cache_entry_cannot_be_mutated_in_place(self, tmp_path, monkeypatch):
+        """The three halves are one immutable value, not three fields to edit.
+
+        Reassigning ``_rule_cache`` wholesale is the only supported way to
+        publish a change, which is what makes a cache hit unable to mix one
+        load's rules with another's count.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        static_yara._load_rules(self._rule_dir(tmp_path, "frozen", broken=1))
+        entry = static_yara._rule_cache
+        assert entry is not None
+        assert entry.skipped_count == 1
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            entry.skipped_count = 0
+
+    def test_rescan_after_a_non_populating_load_still_reports_the_dropped_rule(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: the A -> B -> A sequence must not resurrect a clean scan.
+
+        The load-level assertions above pin the count; this pins the user-visible
+        consequence the issue is actually about. Before the fix the second scan
+        of A reported ``completed`` with no rule-skip event at all, even though
+        one of A's own rules had never run.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = self._rule_dir(tmp_path, "scan", broken=1)
+        empty_dir = self._rule_dir(tmp_path, "empty_scan", broken=0, good=False)
+        state = {
+            "components": ["skill.md"],
+            "file_cache": {"skill.md": "contains MARKER_SCAN"},
+            "yara_rules_dir": str(rules_dir),
+        }
+
+        first = static_yara.node(state)
+        assert first["analyzer_status_events"][0]["status"] != "completed"
+
+        static_yara.node(
+            {
+                "components": ["skill.md"],
+                "file_cache": {"skill.md": "nothing to match"},
+                "yara_rules_dir": str(empty_dir),
+            }
+        )
+
+        second = static_yara.node(state)
+
+        assert any("good_scan" in finding.message for finding in second["findings"]), (
+            "the valid rule must still fire on the rescan"
+        )
+        assert second["analyzer_status_events"][0]["status"] != "completed", (
+            "a rescan served from cache must not claim a complete scan while one "
+            "of its own rules is still dropped"
+        )
+        assert any(
+            event.get("reason_code") is LedgerReason.READ_ERROR
+            and event.get("observed_artifacts") == 1
+            for event in second["inspection_ledger"]
+        ), "the dropped rule must still be surfaced in the ledger on the rescan"
+
+    def test_load_and_read_is_serialized_against_other_scans(self, tmp_path, monkeypatch):
+        """The load-and-read pair must be atomic, not merely adjacent.
+
+        Proves the lock is genuinely held across the whole transaction rather
+        than racing threads and hoping, so the test cannot pass by luck of
+        timing: mid-transaction, another thread must not be able to acquire the
+        rules lock at all.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, "a", broken=2)
+
+        lock_was_held: list[bool] = []
+        real_load = static_yara._load_rules
+
+        def probing_load(extra_dir=None):
+            rules = real_load(extra_dir)
+            acquired_elsewhere: list[bool] = []
+
+            def try_acquire() -> None:
+                got = static_yara._RULES_LOCK.acquire(blocking=False)
+                acquired_elsewhere.append(got)
+                if got:
+                    static_yara._RULES_LOCK.release()
+
+            probe = threading.Thread(target=try_acquire)
+            probe.start()
+            probe.join()
+            lock_was_held.append(not acquired_elsewhere[0])
+            return rules
+
+        monkeypatch.setattr(static_yara, "_load_rules", probing_load)
+        _, skipped = static_yara.load_rules_with_skips(dir_a)
+
+        assert skipped == 2
+        assert lock_was_held == [True], (
+            "another scan could enter the load-and-read transaction, so the rules "
+            "and their skip count are not obtained atomically"
+        )
+
+    def test_concurrent_scans_never_report_another_rule_sets_count(self, tmp_path, monkeypatch):
+        """Under real contention every scan must still see its own total."""
+        self._isolated_builtin(tmp_path, monkeypatch)
+        dir_a = self._rule_dir(tmp_path, "a", broken=1)
+        dir_b = self._rule_dir(tmp_path, "b", broken=0)
+
+        mismatches: list[tuple[str, int, int]] = []
+        failures: list[BaseException] = []
+        observations = 0
+
+        def scan(label: str, rules_dir: Path, expected: int) -> None:
+            nonlocal observations
+            try:
+                for _ in range(25):
+                    _, skipped = static_yara.load_rules_with_skips(rules_dir)
+                    observations += 1
+                    if skipped != expected:
+                        mismatches.append((label, expected, skipped))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the main thread
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=scan, args=("A", dir_a, 1)),
+            threading.Thread(target=scan, args=("B", dir_b, 0)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # An exception inside a worker thread does not fail the test on its own,
+        # so it is surfaced explicitly -- otherwise this test passes vacuously
+        # when the scans never actually ran.
+        assert failures == [], f"a scan thread raised: {failures!r}"
+        assert observations == 50, f"expected 50 observations, made {observations}"
+        assert mismatches == [], f"scans observed another rule set's skip count: {mismatches}"
+
+    def test_rule_load_event_does_not_collide_with_a_component_of_the_same_name(
+        self, tmp_path, monkeypatch
+    ):
+        """A skill file named ``yara_rules`` must not collide with the rule-load event.
+
+        The ledger derives a work ID from ``analyzer_id`` plus the normalized
+        path. The synthetic rule-set scope normalizes to ``yara_rules``, so
+        attributing the event to ``static_yara`` gave it the same work ID as a
+        scanned component of that name: both planned targets then resolved to two
+        matching events and reconciliation raised a fatal ``unaccounted_work``
+        instead of recording a nonfatal partial scan. Renaming the synthetic path
+        alone would only move the collision to the next unlucky filename.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = self._rule_dir(tmp_path, "r", broken=1)
+
+        result = static_yara.node(
+            {
+                "components": ["yara_rules"],
+                "file_cache": {"yara_rules": "contains MARKER_R"},
+                "yara_rules_dir": str(rules_dir),
+            }
+        )
+
+        events = result["inspection_ledger"]
+        work_ids = [event["work_id"] for event in events]
+        assert len(work_ids) == len(set(work_ids)), (
+            "the rule-load event shares a work ID with the scanned component"
+        )
+
+        # The planned work the status advertises must be equally distinct, since
+        # reconciliation requires exactly one event per planned target.
+        planned = result["analyzer_status_events"][0]["planned_work"]
+        planned_ids = [target["work_id"] for target in planned]
+        assert len(planned_ids) == len(set(planned_ids))
+
+        # The dropped rule is still surfaced, and the scan is partial not clean.
+        assert result["analyzer_status_events"][0]["status"] != "completed"
+        assert any(
+            event.get("reason_code") == LedgerReason.READ_ERROR
+            and event.get("observed_artifacts") == 1
+            for event in events
+        )
+
+    @pytest.mark.parametrize(
+        ("filename", "content", "expected_fragment"),
+        [
+            ("acme.yar", b'rule broken { strings: $a = "x" condition: $a', "could not compile"),
+            (
+                "bom.yar",
+                b'\xef\xbb\xbfrule bomrule { strings: $a = "y" condition: $a }',
+                "could not compile",
+            ),
+            (
+                "bad_utf8.yar",
+                b'rule u { strings: $a = "\xff\xfe" condition: $a }',
+                "could not decode",
+            ),
+        ],
+    )
+    def test_rejected_rule_is_named_at_default_log_level(
+        self, tmp_path, monkeypatch, caplog, filename, content, expected_fragment
+    ):
+        """Each rejected rule must be reported at WARNING, naming the file (#554).
+
+        A dropped rule removes a detector. At DEBUG the operator gets no signal
+        at default verbosity, and the ledger event is scoped to the rule set
+        rather than to one file, so without this the specific file that needs
+        repairing cannot be identified.
+        """
+        self._isolated_builtin(tmp_path, monkeypatch)
+        rules_dir = tmp_path / "rejected"
+        rules_dir.mkdir()
+        (rules_dir / filename).write_bytes(content)
+
+        with caplog.at_level(logging.WARNING, logger=static_yara.logger.name):
+            static_yara._load_rules(rules_dir)
+
+        rejections = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "rejected rule file" in record.getMessage()
+        ]
+        assert len(rejections) == 1, f"expected one rejection warning, got {rejections}"
+        assert filename in rejections[0], f"the warning must name {filename}: {rejections[0]}"
+        assert expected_fragment in rejections[0]
+
+    def test_rejection_reason_is_length_bounded(self):
+        """Rule sources can be untrusted, so the echoed reason must be capped."""
+        reason = static_yara._bounded_rejection_reason(ValueError("x" * 5_000))
+
+        assert len(reason) <= static_yara.MAX_RULE_REJECTION_REASON_CHARS + 3
+        assert reason.endswith("...")
+
+    def test_rejection_reason_collapses_newlines(self):
+        """A multi-line YARA error must stay one log line."""
+        reason = static_yara._bounded_rejection_reason(ValueError("line one\nline two\r\nthree"))
+
+        assert "\n" not in reason
+        assert reason == "line one line two three"
