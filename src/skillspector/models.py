@@ -120,6 +120,11 @@ def _new_finding_id() -> str:
     return f"finding-{uuid4().hex}"
 
 
+OCCURRENCE_FINDING_ID_KEY = "_skillspector_report_finding_id"
+OCCURRENCE_CODE_SNIPPET_KEY = "_skillspector_report_code_snippet"
+_PRIVATE_OCCURRENCE_KEYS = frozenset({OCCURRENCE_FINDING_ID_KEY, OCCURRENCE_CODE_SNIPPET_KEY})
+
+
 @dataclass
 class Finding:
     """Finding model for graph state and report output (shape aligned with to_dict)."""
@@ -218,7 +223,9 @@ class Finding:
         ]
         serialized: list[dict[str, object]] = []
         for raw in occurrences:
-            occurrence = dict(raw)
+            occurrence = {
+                key: value for key, value in raw.items() if key not in _PRIVATE_OCCURRENCE_KEYS
+            }
             if self.source_identity:
                 occurrence.setdefault("source_identity", self.source_identity)
             if self.source_digest:

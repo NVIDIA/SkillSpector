@@ -556,6 +556,20 @@ def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
     assert handler._is_file_url("http://raw.githubusercontent.com/org/repo/SKILL.md") is False
 
 
+def test_resolve_routes_github_python_window_asset_as_direct_file(tmp_path: Path) -> None:
+    """A GitHub-hosted ``.pyw`` asset is downloaded instead of cloned as a repository."""
+    handler = InputHandler()
+    url = "https://github.com/NVIDIA/SkillSpector/releases/download/v1/tool.pyw"
+    with (
+        patch.object(handler, "_download_file", return_value=tmp_path) as download,
+        patch.object(handler, "_clone_git", side_effect=AssertionError("unexpected clone")),
+    ):
+        resolved, source_type = handler.resolve(url)
+
+    assert (resolved, source_type) == (tmp_path, "url")
+    download.assert_called_once_with(url)
+
+
 @pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "workflow-budget"])
 @pytest.mark.parametrize(
     ("page_url", "raw_url"),

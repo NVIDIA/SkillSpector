@@ -46,7 +46,11 @@ from skillspector.inspection_ledger import (
 from skillspector.llm_provenance import sanitize_llm_provenance
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
-from skillspector.models import Finding
+from skillspector.models import (
+    OCCURRENCE_CODE_SNIPPET_KEY,
+    OCCURRENCE_FINDING_ID_KEY,
+    Finding,
+)
 from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.nodes.deduplicate import deduplicate
 from skillspector.python_ast import clear_python_ast_cache
@@ -141,6 +145,13 @@ def _sanitize_finding(finding: Finding) -> Finding:
     evidence = {
         clean(str(key)) or "": clean_evidence(value) for key, value in finding.evidence.items()
     }
+    occurrences = []
+    for raw in finding.occurrences:
+        occurrence = dict(raw)
+        report_snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
+        if isinstance(report_snippet, str):
+            occurrence[OCCURRENCE_CODE_SNIPPET_KEY] = clean(report_snippet)
+        occurrences.append(occurrence)
     return replace(
         finding,
         message=clean(finding.message) or "",
@@ -151,6 +162,23 @@ def _sanitize_finding(finding: Finding) -> Finding:
         matched_text=clean(finding.matched_text),
         code_snippet=clean(finding.code_snippet),
         evidence=evidence,
+        occurrences=occurrences,
+    )
+
+
+def _finding_for_occurrence(finding: Finding, occurrence: Mapping[str, object]) -> Finding:
+    """Return report-only metadata bound to one compacted occurrence."""
+    finding_id = occurrence.get(OCCURRENCE_FINDING_ID_KEY)
+    snippet = occurrence.get(OCCURRENCE_CODE_SNIPPET_KEY)
+    if not isinstance(finding_id, str) or not finding_id:
+        finding_id = finding.finding_id
+    if OCCURRENCE_CODE_SNIPPET_KEY not in occurrence:
+        return replace(finding, finding_id=finding_id)
+    return replace(
+        finding,
+        finding_id=finding_id,
+        code_snippet=snippet if isinstance(snippet, str) else None,
+        context=None,
     )
 
 
@@ -244,6 +272,7 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
             }
         ]
         for occurrence in occurrences:
+            occurrence_finding = _finding_for_occurrence(finding, occurrence)
             start_value = occurrence.get("start_line", finding.start_line)
             start_line = start_value if isinstance(start_value, int) else finding.start_line
             end_value = occurrence.get("end_line")
@@ -253,7 +282,7 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
             depth_value = provenance.get("transitive_depth")
             expanded.append(
                 replace(
-                    finding,
+                    occurrence_finding,
                     file=str(occurrence.get("file", finding.file)),
                     start_line=start_line,
                     end_line=end_line,
@@ -340,9 +369,10 @@ def _build_sarif_properties(
     finding: Finding, occurrence: Mapping[str, object] | None = None
 ) -> dict[str, object] | None:
     """Project selected finding metadata into a SARIF properties dictionary."""
-    finding_dict = finding.to_dict()
+    occurrence_finding = _finding_for_occurrence(finding, occurrence or {})
+    finding_dict = occurrence_finding.to_dict()
     metadata: dict[str, object] = {
-        "findingId": finding.finding_id,
+        "findingId": occurrence_finding.finding_id,
         "severity": finding_dict["severity"],
         "category": finding_dict["category"],
         "pattern": finding_dict["pattern"],
