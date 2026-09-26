@@ -661,6 +661,34 @@ def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -
     assert all(record["target_path"] is None for record in records)
 
 
+def test_root_level_numeric_suffix_known_path_resolves(tmp_path: Path) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text='See "tool.1" for the manual page.',
+        known_paths=["SKILL.md", "tool.1"],
+    )
+
+    assert any(
+        record["status"] == "resolved" and record["target_path"] == "tool.1" for record in records
+    )
+
+
+def test_numeric_suffix_path_with_directory_signal_still_resolves(tmp_path: Path) -> None:
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text="See `docs/tool.1` for the manual page.",
+        known_paths=["SKILL.md", "docs/tool.1"],
+    )
+
+    assert records
+    assert any(
+        record["status"] == "resolved" and record["target_path"] == "docs/tool.1"
+        for record in records
+    )
+
+
 def test_rejected_candidates_do_not_consume_accepted_reference_budget(tmp_path: Path) -> None:
     (tmp_path / ".hidden.md").write_text("hidden", encoding="utf-8")
     rejected = "\n".join(

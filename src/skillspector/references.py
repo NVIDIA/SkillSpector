@@ -15,6 +15,8 @@ from io import StringIO
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
+import yaml
+
 from skillspector.artifacts import ArtifactDisposition, BundleReference, ReferenceKind
 
 MAX_REFERENCE_SOURCE_BYTES = 1_000_000
@@ -22,6 +24,7 @@ MAX_RAW_REFERENCE_CANDIDATES = 4096
 MAX_ACCEPTED_REFERENCES = 256
 MAX_REFERENCE_RECORDS = 1024
 MAX_REFERENCE_RUNTIME_SECONDS = 2.0
+_MAX_VERSION_FRONTMATTER_CHARS = 64 * 1024
 _MAX_EVIDENCE = 160
 _MAX_MARKDOWN_DESTINATION_CHARS = 512
 _MARKDOWN_REFERENCE_START = re.compile(
@@ -42,6 +45,11 @@ _MARKDOWN_CONTAINER_PREFIX = re.compile(
 _HTML_CONTEXT_START = re.compile(
     r"<!--|<\?|<!\[CDATA\[|<![A-Z]|</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>])",
     re.IGNORECASE,
+)
+_FRONTMATTER_VERSION = re.compile(
+    r"""^[ \t]*(?:version|'version'|"version"):[ \t]*(['"])"""
+    r"(?P<version>v?[0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"
+    r"\1(?=[ \t]*(?:#|\r?$))"
 )
 _QUOTED_OR_CODE_PATH = re.compile(
     r"(?:`|'|\")((?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?:`|'|\")"
@@ -269,6 +277,47 @@ def _html_context_end(match: re.Match[str]) -> re.Pattern[str] | None:
     return None
 
 
+def _quoted_frontmatter_scalars(
+    text: str, *, deadline: float, clock: Callable[[], float]
+) -> set[tuple[int, int]]:
+    """Locate real quoted YAML scalars, conservatively retaining refs on failure.
+
+    Parse events rather than constructing YAML objects or expanding aliases.
+    The optional metadata exemption has bounded input, events, and runtime;
+    unsupported/oversized frontmatter keeps normal reference accounting.
+    """
+    if not text.startswith("---\n") and not text.startswith("---\r\n"):
+        return set()
+    prefix = text[:_MAX_VERSION_FRONTMATTER_CHARS]
+    closing = re.search(r"^---[ \t]*\r?$", prefix[4:], re.MULTILINE)
+    if closing is None:
+        return set()
+    frontmatter = prefix[: closing.start() + 4]
+    # Every eligible version field contains this literal; other headers cannot
+    # produce an exemption and need no additional YAML parsing.
+    if "version" not in frontmatter:
+        return set()
+    spans: set[tuple[int, int]] = set()
+    events = yaml.parse(frontmatter)
+    try:
+        for count, event in enumerate(events, 1):
+            if count >= MAX_RAW_REFERENCE_CANDIDATES or clock() >= deadline:
+                return set()
+            if (
+                isinstance(event, yaml.ScalarEvent)
+                and event.style in {"'", '"'}
+                and event.start_mark.line == event.end_mark.line
+            ):
+                # YAML recognizes more line separators than StringIO. Absolute
+                # offsets bind the exemption to the same source characters.
+                spans.add((event.start_mark.index + 1, event.end_mark.index - 1))
+    except yaml.YAMLError:
+        return set()
+    finally:
+        events.close()
+    return spans
+
+
 def _candidate_strings(
     text: str,
     *,
@@ -289,10 +338,13 @@ def _candidate_strings(
     in_html = False
     html_end: re.Pattern[str] | None = None
     inline_code_delimiter: int | None = None
+    quoted_scalars = _quoted_frontmatter_scalars(text, deadline=deadline, clock=clock)
+    line_offset = 0
     for line_number, line in enumerate(StringIO(text), 1):
         if clock() >= deadline:
             return candidates, ("runtime",)
         stripped_line = line.rstrip("\r\n")
+        version_match = _FRONTMATTER_VERSION.match(stripped_line) if quoted_scalars else None
         block_line, quote_depth, has_list, prefix_width = _markdown_block_view(stripped_line)
         fence_match = _MARKDOWN_FENCE.fullmatch(block_line)
         line_in_fence = active_fence is not None
@@ -395,7 +447,16 @@ def _candidate_strings(
             )
             if pattern_index == 0:
                 markdown_destination_span = (match.start, match.end)
-            if not inside_destination and not redundant_image_label:
+            # Only the quoted scalar of a frontmatter version field is metadata.
+            # Numeric filenames elsewhere (including explicit Markdown links)
+            # must retain normal missing/resolved reference accounting.
+            is_version_metadata = (
+                reference_kind is ReferenceKind.QUOTED_OR_CODE
+                and version_match is not None
+                and (match.start, match.end) == version_match.span("version")
+                and (line_offset + match.start, line_offset + match.end) in quoted_scalars
+            )
+            if not inside_destination and not redundant_image_label and not is_version_metadata:
                 key = (line_number, match.start, raw)
                 if key not in seen:
                     seen.add(key)
@@ -422,6 +483,7 @@ def _candidate_strings(
             )
         if closes_fence:
             active_fence = None
+        line_offset += len(line)
     return candidates, tuple(sorted(limitations))
 
 
