@@ -217,6 +217,220 @@ _EMOJI_MODIFIERS = range(0x1F3FB, 0x1F400)
 _VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
 
 
+# P2 structural-benign carve-out. Only structurally proven benign constructs
+# (license-header-shaped HTML comments, frontmatter-adjacent metadata blocks)
+# may suppress a P2 comment match — and never when the match retains an
+# exfiltration or override signal.
+_P2_LICENSE_SHAPE = re.compile(
+    r"copyright|\(c\)|spdx(?:-license-identifier)?|licensed under"
+    r"|all rights reserved|permission is hereby granted",
+    re.IGNORECASE,
+)
+_P2_OVERRIDE_EXTRA = re.compile(
+    r"system\s+prompt|respond\s+as|override\s+instructions?|you\s+must",
+    re.IGNORECASE,
+)
+_P2_EXFIL_KEYWORD = re.compile(
+    r"\b(send|transmit|post|upload|forward|exfiltrat\w*)\b", re.IGNORECASE
+)
+_P2_EXTERNAL_DEST = re.compile(
+    r"https?://|\bexternal\b|\bwebhook\b|\bendpoint\b"
+    r"|\battacker\b|\bevil\b|\bcollect\b|data:text/plain;base64",
+    re.IGNORECASE,
+)
+_P2_EXFIL_STANDALONE = re.compile(r"\bexfiltrat\w*\b", re.IGNORECASE)
+# Metadata keys observed in benign skill headers plus obvious header keys.
+# Matching is exact (case-insensitive): bare instruction words such as
+# system, instructions, or ignore are never here.
+_P2_BENIGN_METADATA_KEYS = frozenset(
+    {
+        "author",
+        "version",
+        "date",
+        "reviewed",
+        "updated",
+        "status",
+        "tags",
+        "description",
+        "title",
+        "license",
+        "copyright",
+        "requires",
+        "contact",
+        "get started",
+        "system dependencies",
+        "system requirements",
+        "spdx-license-identifier",
+    }
+)
+_P2_METADATA_LINE = re.compile(r"\A([A-Za-z][\w\- ]{0,40}):\s+(\S.*)\Z")
+_P2_NUMERIC_MASK = re.compile(r"\d+")
+# Clause separators: a pure license line has none of these. A semicolon
+# splits fragments instead (each clause is validated on its own), and
+# spaced hyphens join clauses the same way a separator does.
+_P2_LICENSE_SEPARATOR = re.compile(r"[:!?—,–]|\s-\s")
+_P2_METADATA_VALUE = re.compile(r"\A[\w .+/\-@]{1,40}\Z")
+_P2_FRONTMATTER_ADJACENT_LIMIT = 1500
+_P2_BENIGN_COMMENT_MAX_LEN = 300
+
+
+def _p2_comment_inner(matched_text: str) -> str:
+    """Return the inner body of an HTML or reference-style comment match."""
+    text = matched_text.strip()
+    if text.startswith("<!--"):
+        inner = text[4:]
+        if inner.endswith("-->"):
+            inner = inner[:-3]
+        return inner
+    if text.startswith("[//]:"):
+        start = text.find("(")
+        end = text.rfind(")")
+        if 0 <= start < end:
+            return text[start + 1 : end]
+        return text
+    return text
+
+
+def _p2_has_danger_signal(inner: str) -> bool:
+    """Return True when a comment body carries override or exfiltration intent."""
+    for pattern_source, _confidence in P1_PATTERNS:
+        if re.search(pattern_source, inner, re.IGNORECASE):
+            return True
+    if _P2_OVERRIDE_EXTRA.search(inner):
+        return True
+    if _P2_EXFIL_STANDALONE.search(inner):
+        return True
+    if _P2_EXFIL_KEYWORD.search(inner) and _P2_EXTERNAL_DEST.search(inner):
+        return True
+    return False
+
+
+_P2_FRONTMATTER_OPEN = re.compile(r"\A---[ \t]*\r?\n")
+_P2_FRONTMATTER_CLOSE = re.compile(r"(?m)^---\s*$")
+
+
+def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
+    """Return True when a match sits before any substantive file content."""
+    if match_start > _P2_FRONTMATTER_ADJACENT_LIMIT:
+        return False
+    stripped = content[:match_start].strip()
+    if not stripped:
+        return True
+    open_match = _P2_FRONTMATTER_OPEN.match(stripped)
+    if open_match is None:
+        return False
+    closing = _P2_FRONTMATTER_CLOSE.search(stripped, open_match.end())
+    if closing is None:
+        return False
+    return not stripped[closing.end() :].strip()
+
+
+def _is_license_only_fragment(fragment: str) -> bool:
+    """Return True for a license line with no joined payload clause."""
+    return (
+        _P2_LICENSE_SHAPE.search(fragment) is not None
+        and _P2_LICENSE_SEPARATOR.search(fragment) is None
+    )
+
+
+def _is_allowlisted_metadata_fragment(fragment: str) -> bool:
+    """Return True for one key:value line with an allowlisted key.
+
+    The value must be a short token run (version, path, date, name):
+    bounded length, few tokens, no clause separators, no inner
+    sentence boundary, and at least one machine token (digit, path,
+    dot, @, hyphen) so a plain instruction sentence cannot ride an
+    allowlisted key.
+    """
+    match = _P2_METADATA_LINE.match(fragment.strip())
+    if match is None or match.group(1).lower() not in _P2_BENIGN_METADATA_KEYS:
+        return False
+    value = match.group(2)
+    return (
+        _P2_METADATA_VALUE.match(value) is not None
+        and len(value.split()) <= 5
+        and re.search(r"[\d/.@-]", value) is not None
+        and re.search(r"[.!?]+\s|\s-\s", value) is None
+    )
+
+
+def _is_benign_license_or_metadata_body(inner: str) -> bool:
+    """Return True only when every fragment is license- or metadata-shaped.
+
+    Numbers are masked before sentence splitting so ``3.10`` does not
+    split into fragments. Only digits are masked (dots stay), so a
+    ``2.0.`` boundary still splits. Masking maps digits to ``0`` and
+    cannot create an allowlist hit.
+    """
+    body = inner.strip()
+    if not body:
+        return False
+    masked = _P2_NUMERIC_MASK.sub("0", body)
+    for fragment in re.split(r"[.!?]+\s+|\n|;", masked):
+        fragment = fragment.strip()
+        if not fragment:
+            continue
+        if _is_license_only_fragment(fragment):
+            continue
+        if _is_allowlisted_metadata_fragment(fragment):
+            continue
+        return False
+    return True
+
+
+def _p2_match_is_complete_comment(content: str, match_start: int, match_end: int) -> bool:
+    """Return True only when the match covers exactly one complete comment.
+
+    The P2 patterns can match a prefix of a reference comment (an
+    escaped ``\\)``, an inner paren, or a ``(c)`` ends the match early)
+    or span two HTML comments to reach a keyword. Either way the
+    exemption must not inspect a fragment, so incomplete matches fail
+    closed. A match that stops mid-line while comment text follows is
+    partial; anything after the match on its line must be whitespace.
+    """
+    if content[match_end:].split("\n", 1)[0].strip():
+        return False
+    stripped = content[match_start:match_end]
+    if stripped.startswith("<!--"):
+        return stripped.endswith("-->") and "-->" not in stripped[4:-3]
+    if stripped.startswith("[//]:"):
+        open_paren = stripped.find("(")
+        if open_paren == -1:
+            return False
+        depth = 0
+        i = open_paren
+        while i < len(stripped):
+            if stripped[i] == "\\":
+                i += 2
+                continue
+            if stripped[i] == "(":
+                depth += 1
+            elif stripped[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i == len(stripped) - 1
+            i += 1
+        return False
+    return False
+
+
+def _is_structurally_benign_p2_comment(content: str, match_start: int, matched_text: str) -> bool:
+    """Return True only for structurally proven benign P2 comment matches."""
+    stripped = matched_text.strip()
+    if not (stripped.startswith("<!--") or stripped.startswith("[//]:")):
+        return False
+    if not _p2_match_is_complete_comment(content, match_start, match_start + len(matched_text)):
+        return False
+    inner = _p2_comment_inner(stripped)
+    if _p2_has_danger_signal(inner):
+        return False
+    if not _is_frontmatter_adjacent(content, match_start):
+        return False
+    if len(inner.strip()) > _P2_BENIGN_COMMENT_MAX_LEN:
+        return False
+    return _is_benign_license_or_metadata_body(inner)
+
+
 def _previous_emoji_base(content: str, offset: int) -> bool:
     i = offset - 1
     while i >= 0 and (
@@ -358,6 +572,9 @@ def analyze(
         for pattern_source, confidence in P2_PATTERNS:
             for match in _p2_pattern_matches(content, pattern_source, check_runtime):
                 runtime_check()
+                matched_text = match.group(0)
+                if _is_structurally_benign_p2_comment(content, match.start(), matched_text):
+                    continue
                 findings.append(
                     AnalyzerFinding(
                         rule_id="P2",
