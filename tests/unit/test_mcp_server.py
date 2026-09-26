@@ -16,7 +16,6 @@
 """Tests for the MCP server wrapper (run_scan core + scan_skill tool)."""
 
 import asyncio
-import importlib
 import json
 import os
 import sys
@@ -306,14 +305,9 @@ async def test_late_provider_binding_cannot_claim_a_complete_semantic_scan(
 ) -> None:
     """A graph built without credentials keeps semantic nodes for a later provider."""
     _write_skill(tmp_path)
-    graph_module = importlib.import_module("skillspector.graph")
-    monkeypatch.setattr(
-        graph_module,
-        "is_llm_available",
-        lambda: (False, "not configured"),
-        raising=False,
-    )
-    late_bound_graph = graph_module.create_graph()
+    # The public graph is now credential-independent: semantic analyzers are
+    # always wired and report their disabled state at execution time.
+    late_bound_graph = workflow_graph
 
     def transport_failure(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated late-bound provider failure")
