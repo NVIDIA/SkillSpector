@@ -22,7 +22,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.models import (
+    AnalyzerFinding,
+    Location,
+    Severity,
+    compute_match_fingerprint,
+    observe_analyzer_findings,
+)
 from skillspector.nodes.analyzers import (
     static_patterns_agent_snooping as agent_snooping_module,
 )
@@ -112,6 +118,117 @@ class TestRunStaticPatternsPromptInjection:
             findings = static_runner.run_static_patterns(state, [prompt_injection_module])
             p2 = [f for f in findings if f.rule_id == "P2"]
             assert len(p2) >= 1, f"Expected P2 for bidi char U+{ord(ch):04X}"
+
+    def test_p2_bidi_control_chars_detected_in_python_script(self):
+        """Bidi control chars (Trojan Source, CVE-2021-42574) must be caught in a
+        bundled .py file too, not just markdown -- see issue #39, where the
+        payload sat unnoticed in scripts/helper.py because the bidi pattern was
+        gated to file_type in ("markdown", "other")."""
+        rlo = chr(0x202E)
+        pdf = chr(0x202C)
+        state = {
+            "components": ["scripts/helper.py"],
+            "file_cache": {
+                "scripts/helper.py": f'access_level = "user"  # {rlo}nimda si resu tnerruc eht{pdf}',
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert any(f.rule_id == "P2" for f in findings)
+
+    def test_p2_bidi_control_chars_still_detected_in_markdown(self):
+        """Regression guard for the bidi-ungating fix: bidi control chars in
+        markdown must still fire P2 after the pattern moves out of the
+        markdown-gated loop and into its own unconditional check."""
+        rlo = chr(0x202E)
+        pdf = chr(0x202C)
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {
+                "SKILL.md": f"Normal text{rlo} evil hidden content{pdf}",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert any(f.rule_id == "P2" for f in findings)
+
+    def test_p2_bidi_control_chars_in_markdown_produce_exactly_one_finding(self):
+        """A single bidi payload in markdown must be reported exactly once, not
+        twice by both the markdown-gated loop and the unconditional check."""
+        rlo = chr(0x202E)
+        pdf = chr(0x202C)
+        findings = prompt_injection_module.analyze(
+            content=f"Normal text{rlo} evil hidden content{pdf}",
+            file_path="SKILL.md",
+            file_type="markdown",
+        )
+        p2 = [f for f in findings if f.rule_id == "P2"]
+        assert len(p2) == 1
+
+    def test_p2_zero_width_char_in_python_file_no_finding(self):
+        """Zero-width chars stay markdown-gated -- ZERO_WIDTH_CHARS includes
+        U+FEFF (BOM), so ungating it would flag every BOM-prefixed source file.
+        Must NOT fire P2 in a .py file, unaffected by the bidi ungating fix."""
+        state = {
+            "components": ["scripts/helper.py"],
+            "file_cache": {
+                "scripts/helper.py": "x = 1  # normal​comment\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert not any(f.rule_id == "P2" for f in findings)
+
+    def test_p2_bidi_scan_observes_runtime_deadline_per_match(self):
+        """The file-type-independent bidi scan must check the runtime callback per
+        emitted match, as the markdown P2 loop does, so a script with a bidi
+        control on every line cannot be enumerated to completion after the
+        deadline has already expired."""
+        rlo = chr(0x202E)
+        pdf = chr(0x202C)
+        content = "".join(f"x{i} = 1  # {rlo}evil{pdf}\n" for i in range(2_000))
+        built = 0
+
+        def count_p2_findings(finding: AnalyzerFinding) -> None:
+            nonlocal built
+            if finding.rule_id == "P2":
+                built += 1
+
+        def expire_after_three_p2_findings() -> None:
+            if built >= 3:
+                raise TimeoutError("inert bidi deadline")
+
+        with (
+            observe_analyzer_findings(count_p2_findings),
+            pytest.raises(TimeoutError, match="inert bidi deadline"),
+        ):
+            prompt_injection_module.analyze(
+                content=content,
+                file_path="scripts/helper.py",
+                file_type="python",
+                check_runtime=expire_after_three_p2_findings,
+            )
+        assert built == 3
+
+    def test_p2_bidi_finding_in_python_file_has_exact_location(self):
+        """The moved bidi scan keeps the exact occurrence location and the
+        complete-match identity that the markdown P2 path records."""
+        rlo = chr(0x202E)
+        pdf = chr(0x202C)
+        findings = prompt_injection_module.analyze(
+            content=f'import os\naccess_level = "user"  # {rlo}nimda si resu{pdf}\n',
+            file_path="scripts/helper.py",
+            file_type="python",
+        )
+        p2 = [f for f in findings if f.rule_id == "P2"]
+        assert [f.location for f in p2] == [
+            Location(
+                file="scripts/helper.py",
+                start_line=2,
+                end_line=2,
+                start_column=25,
+                end_column=26,
+            )
+        ]
+        assert [f.matched_text for f in p2] == [rlo]
+        assert [f.match_fingerprint for f in p2] == [compute_match_fingerprint("P2", rlo)]
 
     def test_p2_unicode_tag_smuggling_produces_finding(self):
         """Unicode Tag-block 'ASCII smuggling' (U+E0000-E007F) yields P2."""
