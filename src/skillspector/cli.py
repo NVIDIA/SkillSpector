@@ -3180,8 +3180,9 @@ def baseline(
         # output_format is irrelevant here; we consume findings, not report_body.
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
+        from skillspector.nodes.report import _expand_occurrences
         result = graph.invoke(state)
-        findings = effective_findings(result)
+        findings = _expand_occurrences(effective_findings(result))
         data = build_baseline_dict(
             findings,
             reason=reason,
