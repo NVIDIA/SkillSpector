@@ -338,10 +338,16 @@ class _ReflectiveScope:
 class _LocalBindingCollector(ast.NodeVisitor):
     """Collect names local to one function without entering nested scopes."""
 
-    def __init__(self) -> None:
+    def __init__(self, check_runtime: Callable[[], None] | None = None) -> None:
         self.names: set[str] = set()
         self.global_names: set[str] = set()
         self.nonlocal_names: set[str] = set()
+        self.check_runtime = check_runtime
+
+    def visit(self, node: ast.AST) -> object:
+        if self.check_runtime is not None:
+            self.check_runtime()
+        return super().visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -426,11 +432,23 @@ class _LocalBindingCollector(ast.NodeVisitor):
 class _ReflectiveSinkResolver(ast.NodeVisitor):
     """Resolve reflective sink handles at each call site with lexical scoping."""
 
-    def __init__(self) -> None:
+    def __init__(self, check_runtime: Callable[[], None] | None = None) -> None:
         self.scopes = [_ReflectiveScope()]
         self.call_sinks: dict[ast.Call, str] = {}
         self.active_functions: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
         self.called_functions: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
+        self.function_closures: dict[
+            ast.FunctionDef | ast.AsyncFunctionDef, list[_ReflectiveScope]
+        ] = {}
+        self.check_runtime = check_runtime
+
+    def _check_runtime(self) -> None:
+        if self.check_runtime is not None:
+            self.check_runtime()
+
+    def visit(self, node: ast.AST) -> object:
+        self._check_runtime()
+        return super().visit(node)
 
     @property
     def scope(self) -> _ReflectiveScope:
@@ -588,23 +606,49 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             if node.level == 0 and node.module is not None:
                 self._set_binding("module", local_name, f"{node.module}.{imported.name}")
 
-    def _record_call(self, node: ast.Call) -> None:
+    def _record_call(self, node: ast.Call) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        """Record the callee selected before argument evaluation, without invoking it."""
         if isinstance(node.func, ast.Name):
             sink = self._lookup("callable", node.func.id)
             if sink is not None:
                 self.call_sinks[node] = sink
-            function = self._lookup_function(node.func.id)
-            if function is not None and function not in self.active_functions:
-                self.called_functions.add(function)
-                self.active_functions.add(function)
-                snapshot = [scope.clone() for scope in self.scopes]
-                self._analyze_function(function)
-                self.scopes = snapshot
-                self.active_functions.remove(function)
+            return self._lookup_function(node.func.id)
         else:
             sink = self._reflective_callable(node.func)
             if sink is not None:
                 self.call_sinks[node] = sink
+        return None
+
+    def _register_function(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        closure: list[_ReflectiveScope] | None = None,
+    ) -> None:
+        self._shadow_names([node.name])
+        self._binding_scope(node.name).functions[node.name] = node
+        self.function_closures[node] = (
+            [scope.clone() for scope in closure]
+            if closure is not None
+            else [scope.clone() for scope in self.scopes[1:]]
+        )
+
+    def _invoke_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        if node in self.active_functions:
+            return
+        self._check_runtime()
+        self.called_functions.add(node)
+        self.active_functions.add(node)
+        caller_scopes = self.scopes
+        closure = self.function_closures.get(node, [])
+        # Globals remain live at the call site; caller locals do not leak into a
+        # separately-defined function's lexical environment.
+        self.scopes = [caller_scopes[0].clone(), *[scope.clone() for scope in closure]]
+        try:
+            self._analyze_function(node)
+        finally:
+            self.scopes = caller_scopes
+            self.active_functions.remove(node)
 
     def _visit_comprehension(
         self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp
@@ -629,9 +673,28 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
         self.scopes.pop()
 
     def _visit_expression(self, expression: ast.expr) -> None:
-        pending: list[ast.expr] = [expression]
+        pending: list[tuple[str, ast.AST]] = [("visit", expression)]
         while pending:
-            node = pending.pop()
+            self._check_runtime()
+            action, item = pending.pop()
+            if action == "bind_named":
+                assert isinstance(item, ast.NamedExpr)
+                self._bind([item.target], item.value)
+                continue
+            if action == "finish_call_callee":
+                assert isinstance(item, ast.Call)
+                function = self._record_call(item)
+                if function is not None:
+                    pending.append(("invoke", function))
+                arguments = [*item.args, *(keyword.value for keyword in item.keywords)]
+                pending.extend(("visit", argument) for argument in reversed(arguments))
+                continue
+            if action == "invoke":
+                assert isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                self._invoke_function(item)
+                continue
+            assert action == "visit"
+            node = item
             if isinstance(node, ast.Lambda):
                 self.visit_Lambda(node)
                 continue
@@ -639,13 +702,16 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
                 self._visit_comprehension(node)
                 continue
             if isinstance(node, ast.NamedExpr):
-                self.visit(node.value)
-                self._bind([node.target], node.value)
+                pending.append(("bind_named", node))
+                pending.append(("visit", node.value))
                 continue
             if isinstance(node, ast.Call):
-                self._record_call(node)
+                pending.append(("finish_call_callee", node))
+                pending.append(("visit", node.func))
+                continue
             pending.extend(
-                reversed(
+                ("visit", child)
+                for child in reversed(
                     [child for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr)]
                 )
             )
@@ -675,7 +741,7 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
                 self.visit(expression)
 
     def _analyze_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        collector = _LocalBindingCollector()
+        collector = _LocalBindingCollector(self.check_runtime)
         for statement in node.body:
             collector.visit(statement)
         local_names = (collector.names | self._argument_names(node.args)) - (
@@ -693,15 +759,13 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._prepare_function(node)
-        self._shadow_names([node.name])
-        self._binding_scope(node.name).functions[node.name] = node
-        self._analyze_function(node)
+        self._register_function(node)
+        self._invoke_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._prepare_function(node)
-        self._shadow_names([node.name])
-        self._binding_scope(node.name).functions[node.name] = node
-        self._analyze_function(node)
+        self._register_function(node)
+        self._invoke_function(node)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for expression in [*node.args.defaults, *node.args.kw_defaults]:
@@ -725,20 +789,19 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             for child in node.body
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
+        outer_scopes = [scope.clone() for scope in self.scopes[1:]]
         self.scopes.append(_ReflectiveScope())
-        self._visit_statements(
-            [
-                child
-                for child in node.body
-                if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-            ]
-        )
+        for child in node.body:
+            self._check_runtime()
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._prepare_function(child)
+                self._register_function(child, closure=outer_scopes)
+            else:
+                self._visit_statements([child])
         self.scopes.pop()
         for method in methods:
-            self._prepare_function(method)
-            snapshot = [scope.clone() for scope in self.scopes]
-            self._analyze_function(method)
-            self.scopes = snapshot
+            if method not in self.called_functions:
+                self._invoke_function(method)
 
     @staticmethod
     def _merge_scope(
@@ -882,10 +945,10 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
     def _visit_statements(self, statements: list[ast.stmt]) -> None:
         deferred: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         for statement in statements:
+            self._check_runtime()
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self._prepare_function(statement)
-                self._shadow_names([statement.name])
-                self._binding_scope(statement.name).functions[statement.name] = statement
+                self._register_function(statement)
                 deferred.append(statement)
                 continue
             if isinstance(statement, ast.ClassDef):
@@ -898,15 +961,17 @@ class _ReflectiveSinkResolver(ast.NodeVisitor):
             ):
                 continue
             outer_scopes = [scope.clone() for scope in self.scopes]
-            self._analyze_function(function)
+            self._invoke_function(function)
             self.scopes = outer_scopes
 
     def visit_Module(self, node: ast.Module) -> None:
         self._visit_statements(node.body)
 
 
-def _build_reflective_sink_aliases(tree: ast.Module) -> dict[ast.Call, str]:
-    resolver = _ReflectiveSinkResolver()
+def _build_reflective_sink_aliases(
+    tree: ast.Module, check_runtime: Callable[[], None] | None = None
+) -> dict[ast.Call, str]:
+    resolver = _ReflectiveSinkResolver(check_runtime=check_runtime)
     resolver.visit(tree)
     return resolver.call_sinks
 
@@ -1091,7 +1156,9 @@ def _analyze_python(
 
     aliases = python_ast.import_aliases
     type_map = build_type_map(tree, aliases)
-    reflective_sinks = _build_reflective_sink_aliases(tree)
+    reflective_sinks = _build_reflective_sink_aliases(
+        tree, budget.check_runtime if budget is not None else None
+    )
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}

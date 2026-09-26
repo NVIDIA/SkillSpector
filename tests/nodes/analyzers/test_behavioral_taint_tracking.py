@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import textwrap
 
@@ -131,6 +132,88 @@ class TestCredentialExfiltration:
             'opener = getattr(module, "urlopen")\n'
         )
         assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize(
+        ("initial_binding", "argument_binding", "expected"),
+        [
+            ("opener = lambda value: value", 'getattr(module, "urlopen")', True),
+            ('opener = getattr(module, "urlopen")', "lambda value: value", False),
+        ],
+    )
+    def test_function_call_uses_callee_before_arguments_and_globals_after_arguments(
+        self, initial_binding, argument_binding, expected
+    ):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f"{initial_binding}\n"
+            "def send(unused):\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            f"send(opener := {argument_binding})\n"
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize(
+        ("global_binding", "caller_binding", "expected"),
+        [
+            ('getattr(module, "urlopen")', "lambda value: value", True),
+            ("lambda value: value", 'getattr(module, "urlopen")', False),
+        ],
+    )
+    def test_function_call_uses_lexical_scope_not_caller_locals(
+        self, global_binding, caller_binding, expected
+    ):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f"opener = {global_binding}\n"
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "def wrapper():\n"
+            f"    opener = {caller_binding}\n"
+            "    send()\n"
+            "wrapper()\n"
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    def test_class_method_definition_replaces_reflective_class_binding(self):
+        code = (
+            "import importlib, os\n"
+            "class Client:\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            "    def opener(value):\n"
+            "        return value\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_reflective_prepass_checks_shared_runtime_budget_during_expansion(self):
+        source = (
+            "def f0():\n    pass\n"
+            + "".join(
+                f"def f{index}():\n    f{index - 1}()\n    f{index - 1}()\n"
+                for index in range(1, 21)
+            )
+            + "f20()\n"
+        )
+        tree = ast.parse(source)
+        checks = 0
+
+        class BudgetExpiredError(RuntimeError):
+            pass
+
+        def check_runtime():
+            nonlocal checks
+            checks += 1
+            if checks == 500:
+                raise BudgetExpiredError
+
+        with pytest.raises(BudgetExpiredError):
+            behavioral_taint_tracking._build_reflective_sink_aliases(
+                tree, check_runtime=check_runtime
+            )
+        assert checks == 500
 
     @pytest.mark.parametrize(
         ("replacement", "call"),
