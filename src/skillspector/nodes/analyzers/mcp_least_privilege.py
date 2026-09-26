@@ -216,6 +216,8 @@ class _LeastPrivilegeBudget:
                 },
                 path=finding.file,
             )
+        finding.pattern = finding.pattern or finding.message
+        finding.finding = finding.finding or finding.matched_text or finding.message
         self.findings.append(finding)
         self.artifact_findings[finding.file] = artifact_observed
 
