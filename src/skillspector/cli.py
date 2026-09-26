@@ -2577,6 +2577,11 @@ def _multi_skill_text_summary(
     return f"{risk}\n\n{_multi_skill_text_completeness(completeness)}"
 
 
+# uriBaseId key used to scope recursive child-run result URIs to their own
+# skill directory (SARIF 2.1.0 section 3.14.14).
+_RECURSIVE_SARIF_URI_BASE_ID = "SKILLROOT"
+
+
 def _multi_skill_sarif_report(
     processed_skills: list[SkillDirectory],
     results: list[dict[str, object]],
@@ -2606,6 +2611,26 @@ def _multi_skill_sarif_report(
                 "path": skill.relative_path,
             }
             run["properties"] = run_properties
+            # SARIF 2.1.0 sections 3.4.4 and 3.14.14: scope each child run's
+            # skill-relative URIs to its own skill directory so results from
+            # different skills stop collapsing onto one repo-root-relative
+            # path. Single-skill output is untouched: only recursive merges
+            # set uriBaseId.
+            relative = skill.relative_path.strip("/")
+            if relative:
+                for result in run.get("results", []):
+                    if not isinstance(result, dict):
+                        continue
+                    for location in result.get("locations", []):
+                        physical = (
+                            location.get("physicalLocation") if isinstance(location, dict) else None
+                        )
+                        artifact = (
+                            physical.get("artifactLocation") if isinstance(physical, dict) else None
+                        )
+                        if isinstance(artifact, dict):
+                            artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+                run["originalUriBaseIds"] = {_RECURSIVE_SARIF_URI_BASE_ID: {"uri": f"{relative}/"}}
             runs.append(run)
 
     invocation_properties: dict[str, object] = {"analysisCompleteness": completeness}

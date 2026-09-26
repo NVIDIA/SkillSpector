@@ -1993,6 +1993,88 @@ def test_recursive_sarif_preserves_intrinsic_child_state_without_output_limit(
     assert "aggregate safety limit" not in json.dumps(aggregate_notifications)
 
 
+def _recursive_child_with_results(label: str) -> dict[str, object]:
+    """Build a child recursive result whose SARIF run has two located results."""
+    child = _bounded_recursive_result(label)
+    sarif = cast(dict[str, object], child["sarif_report"])
+    run = cast(list[dict[str, object]], sarif["runs"])[0]
+    run["results"] = [
+        {
+            "ruleId": "P5",
+            "message": {"text": "Malicious instruction"},
+            "level": "error",
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": "SKILL.md"},
+                        "region": {"startLine": 1},
+                    }
+                },
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": "scripts/helper.py"},
+                        "region": {"startLine": 3},
+                    }
+                },
+            ],
+        }
+    ]
+    return child
+
+
+def test_recursive_sarif_scopes_result_uris_to_skill_directory(tmp_path: Path) -> None:
+    """Recursive child results carry uriBaseId and the run maps it to the skill path."""
+    skill = SkillDirectory(tmp_path / "malicious_skill", "malicious_skill", "malicious_skill")
+    child = _recursive_child_with_results("one")
+    completeness = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=1,
+        partial_skills=0,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [child], completeness)
+
+    validate_sarif_report(payload)
+    run = payload["runs"][0]
+    assert run["properties"]["recursiveSkill"] == {
+        "name": "malicious_skill",
+        "path": "malicious_skill",
+    }
+    assert run["originalUriBaseIds"] == {"SKILLROOT": {"uri": "malicious_skill/"}}
+    locations = run["results"][0]["locations"]
+    assert [loc["physicalLocation"]["artifactLocation"]["uri"] for loc in locations] == [
+        "SKILL.md",
+        "scripts/helper.py",
+    ]
+    assert {loc["physicalLocation"]["artifactLocation"]["uriBaseId"] for loc in locations} == {
+        "SKILLROOT"
+    }
+
+
+def test_recursive_sarif_child_without_results_still_maps_base_id(tmp_path: Path) -> None:
+    """A child run with no results still publishes the skill base URI mapping."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    child = _bounded_recursive_result("one")
+    completeness = cli._multi_skill_analysis_completeness(
+        total_skills=1,
+        complete_skills=1,
+        partial_skills=0,
+        failed_skills=0,
+        omitted_skills=0,
+        limitations=[],
+    )
+
+    payload = cli._multi_skill_sarif_report([skill], [child], completeness)
+
+    validate_sarif_report(payload)
+    run = payload["runs"][0]
+    assert run["originalUriBaseIds"] == {"SKILLROOT": {"uri": "one/"}}
+    assert run["results"] == []
+
+
 def test_recursive_sarif_labels_actual_serialized_output_cap() -> None:
     """Only a real recursive output bound uses the output-limit reason code."""
     reason = "recursive serialized report character budget 1800 reached"
