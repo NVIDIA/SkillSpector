@@ -177,7 +177,11 @@ MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT = _static_max_seconds_from_environment(
 )
 
 _LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
-_LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+# SIL Open Font License files are conventionally named ``OFL.txt`` or
+# ``<FontName>-OFL.txt``.
+_LICENSE_BASENAME = re.compile(
+    r"^(?:license|licenses|copying|notice|notices|(?:[^/]*[._-])?ofl)(?:[._-].*)?$"
+)
 
 
 def _analyzer_representative_key(finding: AnalyzerFinding) -> tuple[object, ...]:
@@ -473,6 +477,14 @@ _LICENSE_CANONICAL_RANGES: tuple[tuple[tuple[str, ...], int], ...] = (
             'this software is provided by the copyright holders and contributors "as is"',
             "and any express or implied warranties, including, but not limited to, the",
             "implied warranties of merchantability and fitness for a particular purpose are",
+        ),
+        1,
+    ),
+    (
+        (
+            'the font software is provided "as is", without warranty of any kind,',
+            "express or implied, including but not limited to any warranties of",
+            "merchantability, fitness for a particular purpose and noninfringement",
         ),
         1,
     ),

@@ -234,6 +234,30 @@ class TestRunStaticPatternsPromptInjection:
         findings = static_runner.run_static_patterns(state, [prompt_injection_module])
         assert any(f.rule_id == "P2" for f in findings)
 
+    @pytest.mark.parametrize("path", ["SKILL.md", "schemas/types.xsd"])
+    def test_p2_leading_byte_order_mark_no_false_positive(self, path: str):
+        """A U+FEFF byte-order mark at offset 0 is an encoding marker, not hidden text."""
+        state = {
+            "components": [path],
+            "file_cache": {path: '\ufeff<?xml version="1.0"?>\n<schema/>\n'},
+        }
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert not any(f.rule_id == "P2" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "# Title\n\nhidden\ufefftext\n",
+            "\ufeff# Title\n\nhidden\u200btext\n",
+            "\ufeff\u200bhidden text\n",
+        ],
+        ids=["mid_file_feff", "bom_then_zero_width_later", "bom_then_zero_width_same_line"],
+    )
+    def test_p2_zero_width_after_byte_order_mark_still_produces_finding(self, content: str):
+        state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+        findings = static_runner.run_static_patterns(state, [prompt_injection_module])
+        assert any(f.rule_id == "P2" for f in findings)
+
     def test_safe_content_no_p1_p2(self):
         """Safe content does not produce P1/P2."""
         state = {
@@ -1664,6 +1688,32 @@ class TestLicenseFiles:
 
         assert any(f.rule_id == "EA3" and f.start_line == 3 for f in findings)
 
+    @pytest.mark.parametrize("path", ["OFL.txt", "assets/SomeFont-OFL.txt"])
+    def test_ofl_font_license_disclaimer_suppresses_ea3(self, path: str) -> None:
+        content = (
+            "DISCLAIMER\n"
+            'THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,\n'
+            "EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF\n"
+            "MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT\n"
+            "OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT.\n"
+        )
+        findings = static_runner.run_static_patterns(
+            {"components": [path], "file_cache": {path: content}},
+            [excessive_agency_module],
+        )
+
+        assert not any(f.rule_id == "EA3" for f in findings)
+
+    def test_ofl_named_file_with_non_boilerplate_content_reports_ea3(self) -> None:
+        path = "assets/SomeFont-OFL.txt"
+        content = "You may take actions including but not limited to deleting user files.\n"
+        findings = static_runner.run_static_patterns(
+            {"components": [path], "file_cache": {path: content}},
+            [excessive_agency_module],
+        )
+
+        assert any(f.rule_id == "EA3" and f.start_line == 1 for f in findings)
+
     @pytest.mark.parametrize(
         "mutation,expected_line",
         [
@@ -1788,6 +1838,10 @@ class TestLicenseFiles:
             ("license_terms.py", False),
             ("license.php", False),
             ("notice.c", False),
+            ("OFL.txt", True),
+            ("fonts/SomeFont-OFL.txt", True),
+            ("profl.txt", False),
+            ("ofl.py", False),
         ],
     )
     def test_helper_boundaries(self, path: str, expected: bool) -> None:

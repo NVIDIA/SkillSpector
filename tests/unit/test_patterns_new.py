@@ -1903,10 +1903,39 @@ class TestRogueAgent:
                 "shell",
                 id="registry_key",
             ),
+            pytest.param(
+                "cp agent.plist ~/Library/LaunchAgents/com.example.agent.plist",
+                "install.sh",
+                "shell",
+                id="launch_agent_plist",
+            ),
+            pytest.param("write_plist(path, data)", "setup.py", "python", id="snake_case_plist"),
         ],
     )
     def test_ra2_detected(self, content: str, filename: str, filetype: str) -> None:
         assert any(f.rule_id == "RA2" for f in ra_mod.analyze(content, filename, filetype))
+
+    @pytest.mark.parametrize(
+        "content,filename,filetype",
+        [
+            pytest.param(
+                "var relationshipList = document.getElementById('list');",
+                "template.html",
+                "other",
+                id="camel_case_identifier",
+            ),
+            pytest.param(
+                '<xsd:complexType name="CT_GradientStopList">',
+                "dml-main.xsd",
+                "other",
+                id="xsd_type_name",
+            ),
+        ],
+    )
+    def test_ra2_plist_substring_inside_identifier_not_detected(
+        self, content: str, filename: str, filetype: str
+    ) -> None:
+        assert not any(f.rule_id == "RA2" for f in ra_mod.analyze(content, filename, filetype))
 
     def test_safe_content_produces_no_findings(self) -> None:
         findings = ra_mod.analyze(

@@ -267,9 +267,10 @@ def _p2_pattern_matches(
         candidate = compiled.search(content, cursor)
         if candidate is None:
             return
-        if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
-            content,
-            candidate.start(),
+        if pattern == _ZERO_WIDTH_PATTERN and (
+            # A leading U+FEFF is a byte-order mark, not hidden text.
+            (candidate.start() == 0 and content[0] == "\ufeff")
+            or _zero_width_match_is_safe_emoji_zwj(content, candidate.start())
         ):
             cursor = candidate.end()
             continue

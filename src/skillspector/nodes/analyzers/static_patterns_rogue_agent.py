@@ -169,7 +169,9 @@ RA2_CODE_PATTERNS = [
     (r"(?:nohup|disown|setsid)\s+", 0.65),
     # Registry / plist for Windows/macOS persistence
     (r"(?:HKEY_|RegOpenKey|RegSetValue|reg\s+add)\s+", 0.8),
-    (r"(?:defaults\s+write|plist|launchctl\s+load)", 0.75),
+    # ``plist`` must not follow a letter, so identifiers such as
+    # ``relationshipList`` or ``CT_GradientStopList`` do not match.
+    (r"(?:defaults\s+write|(?<![a-z])plist|launchctl\s+load)", 0.75),
 ]
 RA2_PROSE_PATTERNS = [
     (
