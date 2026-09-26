@@ -171,10 +171,43 @@ class PaddingRun:
     followed_by_content: bool
     summary: str  # visible-ized snippet, e.g. "U+00A0 x82" or "\\n x82"
     end_offset: int = -1  # char offset just past the run (-1 → unset, == start)
+    whole_lines: bool = False  # vertical/line-repetition signals own complete source lines
 
     def __post_init__(self) -> None:
         if self.end_offset < 0:
             self.end_offset = self.start_offset
+
+
+def padding_source_span(content: str, run: PaddingRun, start: int, end: int) -> tuple[int, int]:
+    """Include source padding or line edges removed by a security projection.
+
+    Character repetition remains exact. Padding runs own adjacent padding,
+    vertical/line-repetition signals own complete lines, and ratio signals own
+    the bounded source window. Unrelated overlapping signals remain distinct.
+    """
+    separators = "\r\n\u2028\u2029\x85"
+    if run.whole_lines:
+        start = max(content.rfind(char, 0, start) for char in separators) + 1
+        if end and content[end - 1] not in separators:
+            ends = [content.find(char, end) for char in separators]
+            end = min((offset + 1 for offset in ends if offset >= 0), default=len(content))
+        if 0 < end < len(content) and content[end - 1 : end + 1] == "\r\n":
+            end += 1
+    elif run.kind in {"horizontal", "block"}:
+        boundaries = separators if run.kind == "horizontal" else ""
+        while (
+            start > 0
+            and content[start - 1] not in boundaries
+            and is_padding_char(content[start - 1])
+        ):
+            start -= 1
+        while (
+            end < len(content) and content[end] not in boundaries and is_padding_char(content[end])
+        ):
+            end += 1
+    elif run.kind == "ratio":
+        start, end = 0, len(content)
+    return start, end
 
 
 def padding_run_match_fingerprint(content: str, run: PaddingRun) -> str:
@@ -275,6 +308,7 @@ def _detect_vertical(content: str, lines: list[str], line_offsets: list[int]) ->
                     followed_by_content=followed_by_content,
                     summary=summary,
                     end_offset=end_offset,
+                    whole_lines=True,
                 )
             )
         i = j
@@ -423,6 +457,7 @@ def _detect_repetition(content: str) -> list[PaddingRun]:
                     followed_by_content=end < len(lines),
                     summary=f"repeated line x{end - index}",
                     end_offset=offsets[end],
+                    whole_lines=True,
                 )
             )
         index = end

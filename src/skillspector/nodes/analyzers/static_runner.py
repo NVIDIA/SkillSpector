@@ -301,6 +301,16 @@ def iter_paragraph_matches(
         yield from regex.finditer(content, start, end)
 
 
+def security_view_source_span(content: str, start: int, end: int) -> tuple[str, int, int]:
+    """Resolve a bounded view span to its original text and character offsets."""
+    active_view = _ACTIVE_SECURITY_VIEW.get()
+    if active_view is not None and 0 <= start < end <= len(content):
+        view, source_text = active_view
+        if view.text is content:
+            return source_text, view.source_offset(start), view.source_offset(end - 1) + 1
+    return content, start, end
+
+
 def security_view_match_is_literal(content: str, start: int, end: int) -> bool:
     """Return whether an active-view span is unchanged from its source text."""
     active_view = _ACTIVE_SECURITY_VIEW.get()
@@ -1064,16 +1074,19 @@ def _scan_view_windows(
     finally:
         _ACTIVE_SECURITY_VIEW.reset(view_token)
     for finding in findings:
-        finding.evidence.pop(_SOURCE_START_EVIDENCE, None)
+        # Producers may already own exact source bounds, including characters
+        # removed at the edges of a projected padding run.
         local_start = finding.evidence.pop(_VIEW_START_EVIDENCE, None)
         if not isinstance(local_start, int) and finding.start_column is not None:
             local_start = _line_start_offset(view.text, finding.start_line) + finding.start_column
         if isinstance(local_start, int) and 0 <= local_start < len(view.text):
-            finding.evidence[_SOURCE_START_EVIDENCE] = view.source_offset(local_start)
+            finding.evidence.setdefault(_SOURCE_START_EVIDENCE, view.source_offset(local_start))
         if finding.end_line is not None and finding.end_column is not None:
             local_end = _line_start_offset(view.text, finding.end_line) + finding.end_column
             if 0 < local_end <= len(view.text):
-                finding.evidence[_SOURCE_END_EVIDENCE] = view.source_offset(local_end - 1) + 1
+                finding.evidence.setdefault(
+                    _SOURCE_END_EVIDENCE, view.source_offset(local_end - 1) + 1
+                )
     if view.name != "raw":
         for finding in findings:
             if "normalized-view" not in finding.tags:
