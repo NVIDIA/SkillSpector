@@ -592,6 +592,81 @@ class TestBuiltInMalwarePackaging:
         assert _has_rule(findings, "reverse_shell")
         assert any(f.rule_id == "YR1" for f in findings)
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            """
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect((\"127.0.0.1\", 4444))
+""",
+            """
+use Socket;
+
+socket(SOCK, PF_INET, SOCK_STREAM, getprotobyname(\"tcp\"));
+connect(SOCK, sockaddr_in(4444, inet_aton(\"127.0.0.1\")));
+""",
+        ],
+        ids=["python", "perl"],
+    )
+    def test_builtin_malware_does_not_flag_multiline_socket_clients(self, content):
+        findings = _run_builtin(content, "socket-client.txt")
+
+        assert not _has_rule(findings, "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded_content",
+        [
+            "aW1wb3J0IG9zLCBzb2NrZXQsIHN1YnByb2Nlc3MKc29jayA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKc29jay5jb25uZWN0KCgiMTI3LjAuMC4xIiwgNDQ0NCkpCmxvZyA9IG9wZW4oImxvY2FsLmxvZyIsICJ3IikKb3MuZHVwMihsb2cuZmlsZW5vKCksIDEpCnN1YnByb2Nlc3MucnVuKFsicHJpbnRmIiwgImRvbmUiXSkKZGVmYXVsdF9zaGVsbCA9ICIvYmluL3NoIgo=",
+            "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0ssIFBGX0lORVQsIFNPQ0tfU1RSRUFNLCBnZXRwcm90b2J5bmFtZSgidGNwIikpOwpjb25uZWN0KFNPQ0ssIHNvY2thZGRyX2luKDQ0NDQsIGluZXRfYXRvbigiMTI3LjAuMC4xIikpKTsKb3BlbihteSAkbG9nLCAiPiIsICJsb2NhbC5sb2ciKTsKcHJpbnQgJGxvZyAiZG9uZSI7CnN5c3RlbSgiL2Jpbi9zaCIsICItYyIsICJwcmludGYgZG9uZSIpOwo=",
+        ],
+        ids=["python-unrelated-shell-evidence", "perl-unrelated-shell-evidence"],
+    )
+    def test_builtin_malware_does_not_combine_unrelated_socket_evidence(self, encoded_content):
+        content = base64.b64decode(encoded_content).decode()
+        findings = _run_builtin(content, "benign-network-client.txt")
+
+        assert not _has_rule(findings, "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded_content",
+        [
+            "aW1wb3J0IHNvY2tldApzb2NrID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzb2NrLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA0NDQ0KSkKbG9nID0gb3BlbigibG9jYWwubG9nIiwgInciKQpvcy5kdXAyKGxvZy5maWxlbm8oKSwgMSkKc3VicHJvY2Vzcy5ydW4oWyJwcmludGYiLCAiZG9uZSJdKQpkZWZhdWx0X3NoZWxsID0gIi9iaW4vc2giCg==",
+            "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0ssIFBGX0lORVQsIFNPQ0tfU1RSRUFNLCBnZXRwcm90b2J5bmFtZSgidGNwIikpOwpjb25uZWN0KFNPQ0ssIHNvY2thZGRyX2luKDQ0NDQsIGluZXRfYXRvbigiMTI3LjAuMC4xIikpKTsKb3BlbihteSAkbG9nLCAiPiIsICJsb2NhbC5sb2ciKTsKcHJpbnQgJGxvZyAiZG9uZSI7CnN5c3RlbSgicHJpbnRmIGRvbmUiKTsK",
+        ],
+        ids=["python-local-redirection", "perl-local-logging"],
+    )
+    def test_builtin_malware_does_not_combine_unrelated_redirection_and_shell_text(
+        self, encoded_content
+    ):
+        content = base64.b64decode(encoded_content).decode()
+        findings = _run_builtin(content, "benign-redirection.txt")
+
+        assert not _has_rule(findings, "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded_content",
+        [
+            "aW1wb3J0IG9zLCBzb2NrZXQsIHN1YnByb2Nlc3MKc29jayA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKc29jay5jb25uZWN0KCgnMTI3LjAuMC4xJywgNDQ0NCkpCm9zLmR1cDIoc29jay5maWxlbm8oKSwgMCkKc3VicHJvY2Vzcy5jYWxsKFsnL2Jpbi9zaCcsICctaSddKQo=",
+            "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0ssIFBGX0lORVQsIFNPQ0tfU1RSRUFNLCBnZXRwcm90b2J5bmFtZSgidGNwIikpOwpjb25uZWN0KFNPQ0ssIHNvY2thZGRyX2luKDQ0NDQsIGluZXRfYXRvbigiMTI3LjAuMC4xIikpKTsKb3BlbihTVERJTiwgJzwmU09DSycpOyBvcGVuKFNURE9VVCwgJz4mU09DSycpOyBvcGVuKFNUREVSUiwgJz4mU09DSycpOyBleGVjKCcvYmluL3NoJyk7Cg==",
+        ],
+        ids=["python", "perl"],
+    )
+    def test_builtin_malware_finding_covers_multiline_socket_shells(self, encoded_content):
+        content = base64.b64decode(encoded_content).decode()
+        findings = _run_builtin(content, "reverse-shell.txt")
+
+        assert _has_rule(findings, "reverse_shell")
+
+    def test_builtin_malware_finding_covers_python_os_exec_shell(self):
+        content = base64.b64decode(
+            "aW1wb3J0IG9zLCBzb2NrZXQKc29jayA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKc29jay5jb25uZWN0KCgiMTI3LjAuMC4xIiwgNDQ0NCkpCm9zLmR1cDIoc29jay5maWxlbm8oKSwgMCkKb3MuZHVwMihzb2NrLmZpbGVubygpLCAxKQpvcy5kdXAyKHNvY2suZmlsZW5vKCksIDIpCm9zLmV4ZWNsKCcvYmluL3NoJywgJ3NoJywgJy1pJykK"
+        ).decode()
+        findings = _run_builtin(content, "python-exec-shell.txt")
+
+        assert _has_rule(findings, "reverse_shell")
+
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
             tmp_path,
