@@ -624,6 +624,18 @@ class TestBuiltInMalwarePackaging:
         "content, filename",
         [
             (_python_socket_shell_fixture(), "shell.py"),
+            (
+                _python_socket_shell_fixture()
+                .replace("import socket,subprocess,os", "import socket,subprocess,os,pty")
+                .replace("subprocess.call", "pty.spawn"),
+                "pty_shell.py",
+            ),
+            (
+                _python_socket_shell_fixture().replace(
+                    'p=subprocess.call(["/bin/sh","-i"])', 'os.execl("/bin/sh", "sh", "-i")'
+                ),
+                "exec_shell.py",
+            ),
             (_perl_socket_shell_fixture(), "shell.pl"),
         ],
     )
@@ -646,6 +658,38 @@ class TestBuiltInMalwarePackaging:
     def test_builtin_reverse_shell_ignores_plain_socket_clients(
         self, content: str, filename: str
     ) -> None:
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded, filename",
+        [
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwg"
+                "c29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA4MDgwKSkKc3VicHJvY2Vz"
+                "cy5ydW4oWyJkYXRlIl0sIGNoZWNrPVRydWUpCnMuc2VuZGFsbChiImhlYWx0aGNoZWNrXG4iKQpzLmNs"
+                "b3NlKCkK",
+                "client.py",
+            ),
+            (
+                "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnlu"
+                "YW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbig4MDgwLCBpbmV0X2F0b24oIjEy"
+                "Ny4wLjAuMSIpKSk7Cm9wZW4oU1RET1VULCAiPiIsICJjbGllbnQubG9nIikgb3IgZGllICQhOwpwcmlu"
+                "dCBTT0NLRVQgImhlYWx0aGNoZWNrXG4iOwpjbG9zZShTT0NLRVQpOwo=",
+                "client.pl",
+            ),
+            (
+                "aW1wb3J0IHNvY2tldCwgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5T"
+                "T0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTI3LjAuMC4xIiwgODA4MCkpCndpdGggb3BlbigiY2xpZW50"
+                "LmxvZyIsICJ3IikgYXMgbG9nZmlsZToKICAgIG9zLmR1cDIobG9nZmlsZS5maWxlbm8oKSwgMSkKcHJp"
+                "bnQoImhlYWx0aGNoZWNrIikK",
+                "redirect.py",
+            ),
+        ],
+    )
+    def test_builtin_reverse_shell_ignores_client_subprocess_and_file_logging(
+        self, encoded: str, filename: str
+    ) -> None:
+        content = base64.b64decode(encoded).decode()
         assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
 
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
