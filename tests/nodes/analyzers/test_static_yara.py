@@ -632,6 +632,22 @@ connect(SOCK, sockaddr_in(4444, inet_aton(\"127.0.0.1\")));
     @pytest.mark.parametrize(
         "encoded_content",
         [
+            "aW1wb3J0IHNvY2tldApzb2NrID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzb2NrLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA0NDQ0KSkKbG9nID0gb3BlbigibG9jYWwubG9nIiwgInciKQpvcy5kdXAyKGxvZy5maWxlbm8oKSwgMSkKc3VicHJvY2Vzcy5ydW4oWyJwcmludGYiLCAiZG9uZSJdKQpkZWZhdWx0X3NoZWxsID0gIi9iaW4vc2giCg==",
+            "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0ssIFBGX0lORVQsIFNPQ0tfU1RSRUFNLCBnZXRwcm90b2J5bmFtZSgidGNwIikpOwpjb25uZWN0KFNPQ0ssIHNvY2thZGRyX2luKDQ0NDQsIGluZXRfYXRvbigiMTI3LjAuMC4xIikpKTsKb3BlbihteSAkbG9nLCAiPiIsICJsb2NhbC5sb2ciKTsKcHJpbnQgJGxvZyAiZG9uZSI7CnN5c3RlbSgicHJpbnRmIGRvbmUiKTsK",
+        ],
+        ids=["python-local-redirection", "perl-local-logging"],
+    )
+    def test_builtin_malware_does_not_combine_unrelated_redirection_and_shell_text(
+        self, encoded_content
+    ):
+        content = base64.b64decode(encoded_content).decode()
+        findings = _run_builtin(content, "benign-redirection.txt")
+
+        assert not _has_rule(findings, "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded_content",
+        [
             "aW1wb3J0IG9zLCBzb2NrZXQsIHN1YnByb2Nlc3MKc29jayA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKc29jay5jb25uZWN0KCgnMTI3LjAuMC4xJywgNDQ0NCkpCm9zLmR1cDIoc29jay5maWxlbm8oKSwgMCkKc3VicHJvY2Vzcy5jYWxsKFsnL2Jpbi9zaCcsICctaSddKQo=",
             "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0ssIFBGX0lORVQsIFNPQ0tfU1RSRUFNLCBnZXRwcm90b2J5bmFtZSgidGNwIikpOwpjb25uZWN0KFNPQ0ssIHNvY2thZGRyX2luKDQ0NDQsIGluZXRfYXRvbigiMTI3LjAuMC4xIikpKTsKb3BlbihTVERJTiwgJzwmU09DSycpOyBvcGVuKFNURE9VVCwgJz4mU09DSycpOyBvcGVuKFNUREVSUiwgJz4mU09DSycpOyBleGVjKCcvYmluL3NoJyk7Cg==",
         ],
