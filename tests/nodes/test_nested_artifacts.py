@@ -94,6 +94,41 @@ def test_mixed_typescript_declaration_and_runtime_stays_executable() -> None:
 
 
 @pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_stay_executable(runtime: bytes) -> None:
+    """Assignments and labels must not be mistaken for declarations."""
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_in_hidden_documents_raise_sc9(
+    tmp_path: Path, runtime: bytes
+) -> None:
+    archive_path = tmp_path / ".types.docx.txt"
+    _write_archive(archive_path, _document_members(**{"word/payload.d.mts": runtime}))
+    (tmp_path / "SKILL.md").write_text("# Declaration container\n", encoding="utf-8")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = ".types.docx.txt!/word/payload.d.mts"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    assert metadata["executable"] is True
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(context["component_metadata"])
+    assert any(finding.rule_id == "SC9" and finding.file == virtual_path for finding in findings)
+
+
+@pytest.mark.parametrize(
     ("path", "payload"),
     [
         ("classes.dex", b"dex\n035\0"),
