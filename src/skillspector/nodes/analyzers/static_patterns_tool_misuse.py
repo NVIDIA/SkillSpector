@@ -27,13 +27,13 @@ from __future__ import annotations
 import ast
 import re
 import sys
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Location, Severity
-from skillspector.python_ast import parse_python_source
+from skillspector.models import AnalyzerFinding, Finding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.security_reconstruction import validated_json_string_spans
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
@@ -50,6 +50,11 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_tool_misuse"
+ANALYZE_USES_POSTPROCESS = True
+POSTPROCESS_USES_PYTHON_AST = True
+_VARIABLE_SHELL_FLAG_EVIDENCE = "_tm1_variable_shell_flag"
+_TRUE_SHELL_DIRECT_EVIDENCE = "_tm1_true_shell_direct"
+_TRUE_SHELL_ARGUMENT_RE = re.compile(r"\bshell\s*=\s*true", re.IGNORECASE)
 
 _SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
 _SHELL_COMMAND_WORD_CHARS = 4096
@@ -2819,168 +2824,354 @@ def _has_unsupported_brace_expansion(tokens: tuple[_ShellToken, ...]) -> bool:
 
 
 _SCOPE_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+_COMPREHENSION_SCOPE_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
-def _scope_chain(tree: ast.Module, target: ast.AST) -> tuple[ast.AST, ...] | None:
-    """Return the chain of enclosing scopes for *target*, outermost first.
+@dataclass(frozen=True)
+class _ScopedShellNode:
+    """One relevant AST node plus its source and lexical-scope identity."""
 
-    The module itself is the outermost scope.  Returns None when *target* is
-    not part of *tree*.
-    """
-    parents: dict[ast.AST, ast.AST] = {}
-    stack: list[ast.AST] = [tree]
-    found = False
-    while stack:
-        node = stack.pop()
-        if node is target:
-            found = True
-            break
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-            stack.append(child)
-    if not found:
-        return None
-    chain: list[ast.AST] = []
-    current: ast.AST | None = target
-    while current is not None:
-        if isinstance(current, _SCOPE_NODE_TYPES) or current is tree:
-            chain.append(current)
-        current = parents.get(current)
-    chain.reverse()
-    return tuple(chain)
+    node: ast.Assign | ast.Call
+    scope_chain: tuple[ast.AST, ...]
+    start: int
 
 
-def _scope_binds_name(scope_node: ast.AST, name: str) -> bool:
-    """Return whether *name* is bound directly in *scope_node*.
+@dataclass(frozen=True)
+class _VariableShellAstIndex:
+    """Linear-time index used to reconcile every bounded regex candidate."""
 
-    Nested function/class/lambda bodies are not descended into: their bindings
-    belong to those scopes, not this one.
-    """
-    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-        args = scope_node.args
-        named = [arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
-        if args.vararg is not None:
-            named.append(args.vararg.arg)
-        if args.kwarg is not None:
-            named.append(args.kwarg.arg)
-        if name in named:
-            return True
-        bodies: list[ast.AST] = (
-            [scope_node.body] if isinstance(scope_node, ast.Lambda) else list(scope_node.body)
-        )
-    elif isinstance(scope_node, (ast.ClassDef, ast.Module)):
-        bodies = list(scope_node.body)
-    else:
-        return False
-    stack = list(bodies)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, _SCOPE_NODE_TYPES):
+    tree: ast.Module
+    line_character_starts: tuple[int, ...]
+    assignments: dict[tuple[int, str], tuple[_ScopedShellNode, ...]]
+    calls: dict[str, tuple[_ScopedShellNode, ...]]
+    call_starts: dict[str, tuple[int, ...]]
+    bindings: dict[ast.AST, frozenset[str]]
+    class_binding_starts: dict[ast.ClassDef, dict[str, tuple[int, ...]]]
+    declarations: dict[ast.AST, dict[str, str]]
+
+
+@dataclass(frozen=True)
+class _VariableShellCandidate:
+    """One raw variable-shell regex candidate resolved against the shared AST."""
+
+    name: str
+    call: ast.Call
+    same_scope: bool
+    visible: bool
+
+
+def _resolved_name_scope(
+    index: _VariableShellAstIndex,
+    use_chain: tuple[ast.AST, ...],
+    name: str,
+    use_start: int,
+) -> ast.AST:
+    """Return the Python scope that resolves *name* at one use site."""
+    crossed_function = False
+    nonlocal_lookup = False
+    seen_class_scope = False
+    for scope in reversed(use_chain):
+        if scope is index.tree:
+            return index.tree
+        declaration = index.declarations.get(scope, {}).get(name)
+        if declaration == "global":
+            return index.tree
+        if declaration == "nonlocal":
+            nonlocal_lookup = True
+            crossed_function = True
             continue
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name:
-            return True
-        stack.extend(ast.iter_child_nodes(node))
-    return False
-
-
-def _direct_global_nonlocal(scope_node: ast.AST, name: str) -> str | None:
-    """Return 'global'/'nonlocal' when *scope_node* declares *name* as such.
-
-    Only declarations directly in the scope are considered; nested scopes are
-    not descended into.
-    """
-    if isinstance(scope_node, ast.Lambda):
-        return None
-    bodies: list[ast.stmt] | None = None
-    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
-        bodies = scope_node.body
-    if bodies is None:
-        return None
-    stack: list[ast.AST] = list(bodies)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, _SCOPE_NODE_TYPES):
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if name in index.bindings.get(scope, frozenset()):
+                return scope
+            crossed_function = True
             continue
-        if isinstance(node, ast.Global) and name in node.names:
-            return "global"
-        if isinstance(node, ast.Nonlocal) and name in node.names:
-            return "nonlocal"
-        stack.extend(ast.iter_child_nodes(node))
+        if isinstance(scope, _COMPREHENSION_SCOPE_TYPES):
+            if name in index.bindings.get(scope, frozenset()):
+                return scope
+            # Comprehensions use an implicit function scope.  Free names skip a
+            # surrounding class namespace just like names in a method body.
+            crossed_function = True
+            continue
+        if isinstance(scope, ast.ClassDef):
+            # A method does not close over its class namespace.  A call evaluated
+            # directly in the class body sees assignments already executed, but
+            # a later class assignment does not create a compile-time local.
+            starts = index.class_binding_starts.get(scope, {}).get(name, ())
+            if (
+                not crossed_function
+                and not nonlocal_lookup
+                and not seen_class_scope
+                and bisect_left(starts, use_start)
+            ):
+                return scope
+            seen_class_scope = True
+    return index.tree
+
+
+def _node_character_span(parsed: ParsedPythonFile, node: ast.AST) -> tuple[int, int] | None:
+    """Return one AST node's absolute character span."""
+    line = getattr(node, "lineno", None)
+    end_line = getattr(node, "end_lineno", None)
+    byte_column = getattr(node, "col_offset", None)
+    end_byte_column = getattr(node, "end_col_offset", None)
+    if not all(isinstance(value, int) for value in (line, end_line, byte_column, end_byte_column)):
+        return None
+    assert isinstance(line, int)
+    assert isinstance(end_line, int)
+    assert isinstance(byte_column, int)
+    assert isinstance(end_byte_column, int)
+    start_column = parsed.character_column(line, byte_column)
+    end_column = parsed.character_column(end_line, end_byte_column)
+    if start_column is None or end_column is None:
+        return None
+    start = parsed.line_character_starts[line - 1] + start_column
+    end = parsed.line_character_starts[end_line - 1] + end_column
+    return start, end
+
+
+def _parameter_names(arguments: ast.arguments) -> tuple[str, ...]:
+    names = [
+        argument.arg
+        for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+    ]
+    if arguments.vararg is not None:
+        names.append(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.append(arguments.kwarg.arg)
+    return tuple(names)
+
+
+def _direct_shell_name(call: ast.Call) -> str | None:
+    function = call.func
+    direct = isinstance(function, ast.Name) and function.id == "Popen"
+    direct = direct or (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.value.id == "subprocess"
+    )
+    if not direct:
+        return None
+    for keyword in call.keywords:
+        if keyword.arg == "shell" and isinstance(keyword.value, ast.Name):
+            return keyword.value.id
     return None
 
 
-def _variable_shell_flag_same_scope(content: str, file_path: str, match: re.Match[str]) -> bool:
-    """Return whether a variable-shell-flag match is a same-scope data flow.
-
-    The regex cannot see Python scopes, so ``use_shell = True`` in one
-    function followed by ``shell=use_shell`` in another still matches.  Resolve
-    the matched assignment and the ``shell=`` use through the Python AST and
-    require the assignment to be visible from the use: identical scope chains,
-    a closure read from an enclosing scope, or a matching global/nonlocal
-    declaration.  Unparseable content keeps the candidate so a syntax error
-    cannot silence the signal.
-    """
-    var_name = match.group(1)
-    assign_line = content.count("\n", 0, match.start()) + 1
-    use_line = content.count("\n", 0, match.end()) + 1
-    tree = parse_python_source(content, file_path).tree
+def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellAstIndex | None:
+    """Index relevant nodes, bindings, and declarations in one AST traversal."""
+    tree = parsed.tree
     if tree is None:
-        return True
-    assign_node: ast.Assign | None = None
-    call_node: ast.Call | None = None
-    for node in ast.walk(tree):
+        return None
+    assignments: dict[tuple[int, str], list[_ScopedShellNode]] = {}
+    calls: dict[str, list[_ScopedShellNode]] = {}
+    bindings: dict[ast.AST, set[str]] = {tree: set()}
+    class_binding_starts: dict[ast.ClassDef, dict[str, list[int]]] = {}
+    declarations: dict[ast.AST, dict[str, str]] = {}
+
+    def bind(scope: ast.AST, name: str, start: int) -> None:
+        bindings.setdefault(scope, set()).add(name)
+        if isinstance(scope, ast.ClassDef):
+            class_binding_starts.setdefault(scope, {}).setdefault(name, []).append(start)
+
+    stack: list[tuple[ast.AST, tuple[ast.AST, ...], int | None]] = [(tree, (tree,), None)]
+    while stack:
+        node, scope_chain, binding_start = stack.pop()
+        scope = scope_chain[-1]
+        span = _node_character_span(parsed, node)
+        start = span[0] if span is not None else 0
+        end = span[1] if span is not None else start
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind(scope, node.name, end)
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set()).update(_parameter_names(node.args))
+            header_nodes: list[ast.AST] = [*node.decorator_list, node.args]
+            if node.returns is not None:
+                header_nodes.append(node.returns)
+            header_nodes.extend(getattr(node, "type_params", []))
+            stack.extend((child, scope_chain, None) for child in header_nodes)
+            stack.extend((child, nested_chain, None) for child in node.body)
+            continue
+        if isinstance(node, ast.Lambda):
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set()).update(_parameter_names(node.args))
+            stack.append((node.args, scope_chain, None))
+            stack.append((node.body, nested_chain, None))
+            continue
+        if isinstance(node, ast.ClassDef):
+            bind(scope, node.name, end)
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set())
+            header_nodes = [*node.decorator_list, *node.bases]
+            header_nodes.extend(keyword.value for keyword in node.keywords)
+            header_nodes.extend(getattr(node, "type_params", []))
+            stack.extend((child, scope_chain, None) for child in header_nodes)
+            stack.extend((child, nested_chain, None) for child in node.body)
+            continue
+        if isinstance(node, _COMPREHENSION_SCOPE_TYPES):
+            nested_chain = (*scope_chain, node)
+            bindings.setdefault(node, set())
+            generators = node.generators
+            if generators:
+                first, *remaining = generators
+                # The leftmost iterable is the only comprehension expression
+                # evaluated in the enclosing scope.
+                stack.append((first.iter, scope_chain, None))
+                stack.append((first.target, nested_chain, None))
+                stack.extend((condition, nested_chain, None) for condition in first.ifs)
+                for generator in remaining:
+                    stack.append((generator.iter, nested_chain, None))
+                    stack.append((generator.target, nested_chain, None))
+                    stack.extend((condition, nested_chain, None) for condition in generator.ifs)
+            if isinstance(node, ast.DictComp):
+                stack.append((node.key, nested_chain, None))
+                stack.append((node.value, nested_chain, None))
+            else:
+                stack.append((node.elt, nested_chain, None))
+            continue
+
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                declarations.setdefault(scope, {})[name] = "global"
+        elif isinstance(node, ast.Nonlocal):
+            for name in node.names:
+                declarations.setdefault(scope, {})[name] = "nonlocal"
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bind(scope, node.id, binding_start if binding_start is not None else start)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    bind(scope, alias.asname or alias.name.split(".", 1)[0], end)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            type_span = _node_character_span(parsed, node.type) if node.type is not None else None
+            bind(scope, node.name, type_span[1] if type_span is not None else start)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bind(scope, node.name, start)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bind(scope, node.rest, start)
+
         if (
-            assign_node is None
-            and isinstance(node, ast.Assign)
-            and node.lineno == assign_line
+            isinstance(node, ast.Assign)
+            and span is not None
             and isinstance(node.value, ast.Constant)
             and node.value.value is True
-            and any(
-                isinstance(target, ast.Name) and target.id == var_name for target in node.targets
-            )
         ):
-            assign_node = node
-        if (
-            call_node is None
-            and isinstance(node, ast.Call)
-            and any(
-                keyword.arg == "shell"
-                and isinstance(keyword.value, ast.Name)
-                and keyword.value.id == var_name
-                and assign_line <= keyword.value.lineno <= use_line
-                for keyword in node.keywords
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    scoped = _ScopedShellNode(node=node, scope_chain=scope_chain, start=start)
+                    assignments.setdefault((node.lineno, target.id), []).append(scoped)
+        elif isinstance(node, ast.Call) and span is not None:
+            shell_name = _direct_shell_name(node)
+            if shell_name is not None:
+                scoped = _ScopedShellNode(node=node, scope_chain=scope_chain, start=start)
+                calls.setdefault(shell_name, []).append(scoped)
+
+        if isinstance(node, ast.Assign):
+            stack.append((node.value, scope_chain, None))
+            stack.extend((target, scope_chain, end) for target in node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if node.value is not None:
+                stack.append((node.value, scope_chain, None))
+            stack.append((node.target, scope_chain, end))
+            if isinstance(node, ast.AnnAssign):
+                stack.append((node.annotation, scope_chain, None))
+        elif isinstance(node, ast.NamedExpr):
+            stack.append((node.value, scope_chain, None))
+            # PEP 572 makes a walrus target inside one or more
+            # comprehensions local to the nearest containing real scope.
+            # Comprehension ``for`` targets remain local to their implicit
+            # scope, but the named-expression target skips those scopes.
+            target_chain = scope_chain
+            while len(target_chain) > 1 and isinstance(
+                target_chain[-1], _COMPREHENSION_SCOPE_TYPES
+            ):
+                target_chain = target_chain[:-1]
+            stack.append((node.target, target_chain, end))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            iteration_span = _node_character_span(parsed, node.iter)
+            iteration_end = iteration_span[1] if iteration_span is not None else end
+            stack.append((node.iter, scope_chain, None))
+            stack.append((node.target, scope_chain, iteration_end))
+            stack.extend((child, scope_chain, None) for child in (*node.body, *node.orelse))
+        elif isinstance(node, ast.withitem):
+            context_span = _node_character_span(parsed, node.context_expr)
+            context_end = context_span[1] if context_span is not None else end
+            stack.append((node.context_expr, scope_chain, None))
+            if node.optional_vars is not None:
+                stack.append((node.optional_vars, scope_chain, context_end))
+        else:
+            stack.extend(
+                (child, scope_chain, binding_start) for child in ast.iter_child_nodes(node)
             )
-        ):
-            call_node = node
-    if assign_node is None or call_node is None:
-        return True
-    assign_chain = _scope_chain(tree, assign_node)
-    use_chain = _scope_chain(tree, call_node)
-    if assign_chain is None or use_chain is None:
-        return True
-    if assign_chain == use_chain:
-        return True
-    if len(assign_chain) < len(use_chain) and use_chain[: len(assign_chain)] == assign_chain:
-        # Closure read: the use sits in a scope nested inside the assignment's
-        # scope, so the name resolves to the assigned value.
-        return True
-    use_scope = use_chain[-1]
-    if use_scope is not tree:
-        declaration = _direct_global_nonlocal(use_scope, var_name)
-        if declaration == "global":
-            return assign_chain == (tree,)
-        if declaration == "nonlocal":
-            binding = next(
-                (
-                    scope
-                    for scope in use_chain[-2::-1]
-                    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-                    and _scope_binds_name(scope, var_name)
-                ),
-                None,
-            )
-            return binding is not None and assign_chain == _scope_chain(tree, binding)
-    return False
+
+    frozen_calls = {
+        name: tuple(sorted(nodes, key=lambda item: item.start)) for name, nodes in calls.items()
+    }
+    return _VariableShellAstIndex(
+        tree=tree,
+        line_character_starts=parsed.line_character_starts,
+        assignments={key: tuple(nodes) for key, nodes in assignments.items()},
+        calls=frozen_calls,
+        call_starts={
+            name: tuple(item.start for item in nodes) for name, nodes in frozen_calls.items()
+        },
+        bindings={scope: frozenset(names) for scope, names in bindings.items()},
+        class_binding_starts={
+            scope: {name: tuple(sorted(starts)) for name, starts in names.items()}
+            for scope, names in class_binding_starts.items()
+        },
+        declarations=declarations,
+    )
+
+
+def _assignment_name_scope(
+    index: _VariableShellAstIndex,
+    scope_chain: tuple[ast.AST, ...],
+    name: str,
+) -> ast.AST:
+    """Return the scope mutated by a simple-name assignment."""
+    scope = scope_chain[-1]
+    declaration = index.declarations.get(scope, {}).get(name)
+    if declaration == "global":
+        return index.tree
+    if declaration == "nonlocal":
+        for outer in reversed(scope_chain[:-1]):
+            if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and name in (
+                index.bindings.get(outer, frozenset())
+            ):
+                return outer
+    return scope
+
+
+def _resolve_variable_shell_candidate(
+    index: _VariableShellAstIndex,
+    match: re.Match[str],
+    assignment_line: int,
+) -> _VariableShellCandidate | None:
+    """Resolve a bounded regex match to its exact assignment, call, and binding."""
+    name = match.group(1)
+    assignment_nodes = [
+        item
+        for item in index.assignments.get((assignment_line, name), ())
+        if match.start() <= item.start < match.end()
+    ]
+    call_nodes = index.calls.get(name, ())
+    starts = index.call_starts.get(name, ())
+    call_index = bisect_left(starts, match.start())
+    if len(assignment_nodes) != 1 or call_index >= len(call_nodes):
+        return None
+    assignment = assignment_nodes[0]
+    call = call_nodes[call_index]
+    if call.start >= match.end():
+        return None
+    assignment_scope = _assignment_name_scope(index, assignment.scope_chain, name)
+    resolved_scope = _resolved_name_scope(index, call.scope_chain, name, call.start)
+    return _VariableShellCandidate(
+        name=name,
+        call=call.node,
+        same_scope=assignment.scope_chain == call.scope_chain,
+        visible=resolved_scope is assignment_scope,
+    )
 
 
 def _tm1_candidates(
@@ -3452,7 +3643,33 @@ def _line_containing(content: str, start: int, end: int) -> str:
     return content[line_start:line_end]
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+def _classify_tm1(
+    context: str,
+    matched_text: str,
+    matched_line: str,
+    confidence: float,
+    file_type: str,
+) -> tuple[Severity, float]:
+    """Apply the existing TM1 contextual classification to one candidate."""
+    if (
+        _is_safe_container_command(context)
+        or _is_safe_dockerfile_idiom(context, matched_text)
+        or _is_safe_cache_cleanup(matched_line)
+    ):
+        return Severity.LOW, min(confidence, 0.15)
+    adjusted = (
+        min(1.0, confidence + 0.1) if file_type in ("python", "shell", "javascript") else confidence
+    )
+    return Severity.HIGH, adjusted
+
+
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    *,
+    defer_variable_reconciliation: bool = False,
+) -> list[AnalyzerFinding]:
     """Analyze content for tool misuse patterns (TM1–TM3)."""
     findings: list[AnalyzerFinding] = []
 
@@ -3463,16 +3680,22 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         return get_context(content, start)
 
     tag = [PatternCategory.TOOL_MISUSE.value]
-    tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
+    tm1_findings_by_key: dict[tuple[int, str, int], AnalyzerFinding] = {}
 
-    # The variable-shell-flag regex cannot see Python scopes, so an assignment
-    # in one function and a shell= use in another still match.  Drop those
-    # cross-scope candidates for Python files.
-    cross_scope_starts: set[int] = set()
-    if file_type == "python":
-        for variable_match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
-            if not _variable_shell_flag_same_scope(content, file_path, variable_match):
-                cross_scope_starts.add(variable_match.start())
+    variable_matches = {
+        (match.start(), match.end()): (match.group(1), match)
+        for match in _VARIABLE_SHELL_FLAG_RE.finditer(content)
+    }
+    invisible_variable_matches: set[tuple[int, int]] = set()
+    if file_type == "python" and variable_matches and not defer_variable_reconciliation:
+        parsed = parse_python_source(content, file_path)
+        ast_index = _build_variable_shell_ast_index(parsed)
+        if ast_index is not None:
+            for span, (_, match) in variable_matches.items():
+                assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
+                candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
+                if candidate is not None and not candidate.visible:
+                    invisible_variable_matches.add(span)
 
     shell_content = (
         _perl_literal_print_shell_text(content, lambda: None) if file_type == "perl" else None
@@ -3480,34 +3703,37 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     for match_start, match_end, matched_text, confidence in _tm1_candidates(
         content, shell_content=shell_content
     ):
-        if match_start in cross_scope_starts:
+        variable_match = variable_matches.get((match_start, match_end))
+        if variable_match is not None and variable_match[0].casefold().startswith("true"):
+            # The case-insensitive direct ``shell=True`` pattern already owns
+            # true-prefixed names at the exact call location.
+            continue
+        if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
             continue
         line_num = get_line_number(content, match_start)
         context_text = ctx(match_start)
         matched = matched_text[:200]
         matched_line = _line_containing(content, match_start, match_end)
 
-        if (
-            _is_safe_container_command(context_text)
-            or _is_safe_dockerfile_idiom(context_text, matched)
-            or _is_safe_cache_cleanup(matched_line)
-        ):
-            adj = min(confidence, 0.15)
-            sev = Severity.LOW
-        else:
-            adj = (
-                min(1.0, confidence + 0.1)
-                if file_type in ("python", "shell", "javascript")
-                else confidence
-            )
-            sev = Severity.HIGH
-        candidate_key = (line_num, " ".join(matched.strip().split()))
+        sev, adj = _classify_tm1(
+            context_text,
+            matched,
+            matched_line,
+            confidence,
+            file_type,
+        )
+        candidate_key = (line_num, " ".join(matched.strip().split()), match_start)
         existing = tm1_findings_by_key.get(candidate_key)
         if existing is not None:
             if adj > existing.confidence:
                 existing.confidence = adj
                 existing.severity = sev
             continue
+        evidence: dict[str, object] = {static_runner._VIEW_START_EVIDENCE: match_start}
+        if variable_match is not None and defer_variable_reconciliation:
+            evidence[_VARIABLE_SHELL_FLAG_EVIDENCE] = variable_match[0]
+        elif defer_variable_reconciliation and _TRUE_SHELL_ARGUMENT_RE.search(matched_text):
+            evidence[_TRUE_SHELL_DIRECT_EVIDENCE] = True
         finding = AnalyzerFinding(
             rule_id="TM1",
             message="Tool Parameter Abuse",
@@ -3518,7 +3744,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             context=context_text,
             matched_text=matched,
             complete_match=matched_text,
-            evidence={static_runner._VIEW_START_EVIDENCE: match_start},
+            evidence=evidence,
         )
         tm1_findings_by_key[candidate_key] = finding
         findings.append(finding)
@@ -3593,8 +3819,141 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     return findings
 
 
+def _bound_shell_call_key(call: ast.Call) -> tuple[int, int, int, int]:
+    """Return the call key shared with the flow-sensitive companion."""
+    return (
+        getattr(call, "lineno", 1),
+        getattr(call, "col_offset", 0),
+        getattr(call, "end_lineno", getattr(call, "lineno", 1)),
+        getattr(call, "end_col_offset", getattr(call, "col_offset", 0)),
+    )
+
+
+def cleanup_path_findings(findings: list[Finding]) -> list[Finding]:
+    """Remove private reconciliation evidence when postprocessing times out."""
+    for finding in findings:
+        finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+        finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+    return findings
+
+
+def postprocess_path_findings(
+    content: str,
+    findings: list[Finding],
+    *,
+    python_ast: ParsedPythonFile | None,
+) -> list[Finding]:
+    """Reconcile the legacy variable regex with the Python AST companion."""
+    marked = [
+        finding
+        for finding in findings
+        if isinstance(finding.evidence.get(_VARIABLE_SHELL_FLAG_EVIDENCE), str)
+        or finding.evidence.get(_TRUE_SHELL_DIRECT_EVIDENCE) is True
+    ]
+    if not marked:
+        return findings
+
+    file_path = marked[0].file
+    file_type = static_runner._infer_file_type(file_path)
+    if file_type != "python":
+        reconciled: list[Finding] = []
+        for finding in findings:
+            variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+            finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+            if not isinstance(variable_name, str):
+                reconciled.append(finding)
+        return reconciled
+    if python_ast is None or python_ast.tree is None:
+        return cleanup_path_findings(findings)
+
+    from . import static_python_shell_truthiness
+
+    ast_index = _build_variable_shell_ast_index(python_ast)
+    if ast_index is None:
+        return cleanup_path_findings(findings)
+    resolved: dict[tuple[int, str], list[_VariableShellCandidate]] = {}
+    for match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+        finding_line = bisect_right(ast_index.line_character_starts, match.start())
+        assignment_line = bisect_right(ast_index.line_character_starts, match.start(1))
+        candidate = _resolve_variable_shell_candidate(ast_index, match, assignment_line)
+        if candidate is None:
+            continue
+        key = (finding_line, candidate.name)
+        resolved.setdefault(key, []).append(candidate)
+    ownership = static_python_shell_truthiness.bound_shell_call_ownership(
+        file_path,
+        python_ast,
+    )
+    ownership_by_start = {
+        (line, column): trusted
+        for (line, byte_column, _, _), trusted in ownership.items()
+        if (column := python_ast.character_column(line, byte_column)) is not None
+    }
+
+    reconciled: list[Finding] = []
+    for finding in findings:
+        variable_name = finding.evidence.pop(_VARIABLE_SHELL_FLAG_EVIDENCE, None)
+        direct_true = finding.evidence.pop(_TRUE_SHELL_DIRECT_EVIDENCE, None)
+        if direct_true is True:
+            location = (finding.start_line, finding.start_column)
+            if finding.start_column is not None and ownership_by_start.get(location) is False:
+                continue
+            reconciled.append(finding)
+            continue
+        if not isinstance(variable_name, str):
+            reconciled.append(finding)
+            continue
+        candidates = resolved.get((finding.start_line, variable_name), [])
+        if len(candidates) != 1:
+            # Derived views and ambiguous recovery candidates retain the
+            # conservative lexical signal.
+            reconciled.append(finding)
+            continue
+        candidate = candidates[0]
+        if variable_name.casefold().startswith("true") or not candidate.visible:
+            continue
+        call_key = _bound_shell_call_key(candidate.call)
+        if candidate.same_scope:
+            # Parsed same-scope data flow belongs exclusively to the companion,
+            # including constructs it rejects as outside its straight-line
+            # contract.
+            continue
+        elif call_key in ownership and ownership[call_key] is False:
+            continue
+        reconciled.append(finding)
+    return reconciled
+
+
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run tool_misuse patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    from . import static_python_shell_truthiness
+
+    response = static_runner.run_static_patterns_with_ledger(
+        state,
+        [sys.modules[__name__], static_python_shell_truthiness],
+    )
+    file_cache = state.get("file_cache", {})
+    for finding in response["findings"]:
+        if (
+            finding.evidence.pop(
+                static_python_shell_truthiness.BOUND_SHELL_EVIDENCE,
+                None,
+            )
+            is not True
+        ):
+            continue
+        content = file_cache.get(finding.file, "")
+        content_lines = content.splitlines()
+        line_index = max(0, finding.start_line - 1)
+        matched = (finding.matched_text or "")[:200]
+        matched_line = content_lines[line_index] if line_index < len(content_lines) else matched
+        severity, finding.confidence = _classify_tm1(
+            finding.context or "",
+            matched,
+            matched_line,
+            finding.confidence,
+            "python",
+        )
+        finding.severity = severity.value
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
