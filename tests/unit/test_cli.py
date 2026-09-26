@@ -1857,6 +1857,41 @@ def test_recursive_markdown_report_character_limit_is_explicit(
     assert len(body) <= 1_024
 
 
+def test_recursive_symlinked_skills_are_reported_as_omitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Symlinked skill directories surface as omitted, not complete coverage."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True,
+        skills=[skill],
+        omitted_symlink_entries=1,
+    )
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(
+        cli.graph,
+        "invoke",
+        lambda *_args, **_kwargs: _bounded_recursive_result("one", finding_count=0),
+    )
+
+    _scan_multi_skill(detection, FormatChoice.json, output, no_llm=True)
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["skills_scanned"] == 1
+    assert payload["skills_omitted"] == 1
+    assert payload["analysis_completeness"]["is_complete"] is False
+    assert payload["risk_recommendation"] == "CAUTION"
+    assert any(
+        "symlinked recursive skill(s) omitted" in limitation
+        for limitation in payload["analysis_completeness"]["limitations"]
+    )
+    assert payload["skills"][-1] == {
+        "omitted": True,
+        "omitted_count": 1,
+        "reason": "symlink_not_followed",
+    }
+
+
 def test_recursive_json_bounds_the_final_serialized_document(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
