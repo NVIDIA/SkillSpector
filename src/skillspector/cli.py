@@ -61,6 +61,7 @@ from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report
+from skillspector.runway_projects import get_template, render_project, template_names
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
@@ -142,6 +143,13 @@ class TransportChoice(StrEnum):
 
     stdio = "stdio"
     http = "http"
+
+
+class RunwayFormat(StrEnum):
+    """Output formats for offline Runway project exports."""
+
+    markdown = "markdown"
+    json = "json"
 
 
 @dataclass(slots=True)
@@ -3079,6 +3087,41 @@ def _scan_multi_skill(
         raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
+
+
+@app.command("runway-project")
+def runway_project(
+    template: Annotated[
+        str,
+        typer.Option("--template", "-t", help="Built-in project template to export."),
+    ] = "automation-legends",
+    format: Annotated[
+        RunwayFormat,
+        typer.Option("--format", "-f", help="Export format.", case_sensitive=False),
+    ] = RunwayFormat.markdown,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Output file; otherwise print to stdout."),
+    ] = None,
+    list_templates: Annotated[
+        bool,
+        typer.Option("--list-templates", help="List available templates and exit."),
+    ] = False,
+) -> None:
+    """Export an offline Runway prompt project from a built-in template."""
+    if list_templates:
+        print("\n".join(template_names()))
+        return
+    try:
+        rendered = render_project(get_template(template), format.value)
+        if output is not None:
+            output.write_text(rendered, encoding="utf-8")
+            console.print(f"Report saved to: {output}")
+        else:
+            print(rendered, end="")
+    except (OSError, ValueError) as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
 
 
 @app.command()

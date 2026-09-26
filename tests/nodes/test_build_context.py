@@ -1375,7 +1375,7 @@ def test_excluded_artifact_probe_checks_deadline_after_open(
     assert inventory[0]["path"] == "node_modules/README"
     assert inventory[0]["disposition"] == ArtifactDisposition.PARTIAL
     assert inventory[0]["reason"] == LedgerReason.RUNTIME_LIMIT.value
-    assert inventory[0]["size_bytes"] == len("ordinary metadata\n")
+    assert inventory[0]["size_bytes"] == len(("ordinary metadata" + os.linesep).encode("utf-8"))
     assert len(events) == 1
     assert events[0]["reason_code"] == LedgerReason.RUNTIME_LIMIT
     assert events[0]["observed_seconds"] == pytest.approx(2.0)
