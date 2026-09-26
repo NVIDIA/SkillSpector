@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
@@ -354,6 +355,70 @@ class TestOpenAIProvider:
         ):
             assert provider.get_context_length(model) == 1_050_000
             assert provider.get_max_output_tokens(model) == 128_000
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ROOT_MODEL_REGISTRY = REPO_ROOT / "model_registry.yaml"
+MODEL_REGISTRIES = sorted(
+    [ROOT_MODEL_REGISTRY]
+    + list((REPO_ROOT / "src" / "skillspector" / "providers").glob("*/model_registry.yaml"))
+)
+
+
+def _model_keys_as_written(registry_path: Path) -> list[str]:
+    """Return the ``models`` keys in document order, duplicates included.
+
+    ``yaml.safe_load`` keeps only the last of a repeated key, so asserting on
+    resolved budgets cannot see a model that was mapped twice. Composing the
+    node tree preserves every key exactly as the file spells it.
+    """
+    document = yaml.compose(registry_path.read_text(encoding="utf-8"))
+    for key_node, value_node in document.value:
+        if key_node.value == "models":
+            return [key.value for key, _ in value_node.value]
+    raise AssertionError(f"{registry_path} has no top-level 'models' mapping")
+
+
+class TestModelRegistryFiles:
+    """Integrity of the shipped YAML registries themselves."""
+
+    def test_registries_are_discovered(self) -> None:
+        # Guards the glob: an empty list would make the checks below vacuous.
+        assert ROOT_MODEL_REGISTRY in MODEL_REGISTRIES
+        assert len(MODEL_REGISTRIES) > 1
+
+    @pytest.mark.parametrize(
+        "registry_path",
+        MODEL_REGISTRIES,
+        ids=lambda path: path.relative_to(REPO_ROOT).as_posix(),
+    )
+    def test_each_model_is_mapped_once(self, registry_path: Path) -> None:
+        # Loaders disagree on duplicate keys — most keep the last mapping,
+        # strict ones reject the document — so mapping one model twice makes
+        # the resolved budget loader-dependent and lets the copies drift apart
+        # while value-only assertions stay green.
+        keys = _model_keys_as_written(registry_path)
+        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        assert not duplicates, f"{registry_path} maps these models more than once: {duplicates}"
+
+    def test_root_registry_replaces_bundled_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The repo-root file is the documented SKILLSPECTOR_MODEL_REGISTRY sample."""
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(ROOT_MODEL_REGISTRY))
+        provider = OpenAIProvider()
+
+        # Gateway-prefixed ids that only the root registry carries.
+        assert provider.get_context_length("openai/openai/gpt-5.3-chat") == 128_000
+        assert provider.get_max_output_tokens("openai/openai/gpt-5.3-chat") == 16_384
+        assert provider.get_context_length("azure/anthropic/claude-sonnet-4-6") == 1_000_000
+
+        # Budgets the root registry must keep in step with the bundled YAML,
+        # since an override replaces that file instead of merging with it.
+        assert provider.get_context_length("gpt-5.6-sol") == 1_050_000
+        assert provider.get_max_output_tokens("gpt-5.6-sol") == 128_000
+
+        # Same replacement rule from the other side: a bundled-only model has
+        # no budget at all while the override is in force.
+        assert provider.get_context_length("gpt-6-astra") is None
 
 
 class TestAnthropicProvider:
