@@ -24,6 +24,13 @@ def _write_release_notes(root: Path, version: str = "2.4.3") -> Path:
     return release_notes
 
 
+def _add_windows_cli_shim(bin_dir: Path) -> None:
+    (bin_dir / "gh.cmd").write_text(
+        '@python "%~dp0gh" %*\n',
+        encoding="utf-8",
+    )
+
+
 def _write_existing_release_gh(root: Path) -> tuple[dict[str, str], Path]:
     """Create a fake gh CLI that records mutations for an existing release."""
     bin_dir = root / "bin"
@@ -50,6 +57,7 @@ def _write_existing_release_gh(root: Path) -> tuple[dict[str, str], Path]:
         encoding="utf-8",
     )
     gh.chmod(0o755)
+    _add_windows_cli_shim(bin_dir)
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env["GH_CALLS_FILE"] = str(calls_file)
@@ -132,6 +140,7 @@ def test_creates_github_release_with_supported_distribution_artifacts(tmp_path: 
         encoding="utf-8",
     )
     gh.chmod(0o755)
+    _add_windows_cli_shim(bin_dir)
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env["GH_ARGUMENTS_FILE"] = str(arguments_file)
@@ -237,7 +246,7 @@ def test_reconciles_and_publishes_when_rerunning_an_existing_release(
             "--repo",
             "NVIDIA/SkillSpector",
             "--notes-file",
-            "docs/release/skillspector-2.4.3.md",
+            str(Path("docs") / "release" / "skillspector-2.4.3.md"),
             "--draft=false",
         ]
     )
@@ -263,6 +272,7 @@ def test_rejects_an_existing_version_tag_at_another_commit(tmp_path: Path) -> No
         encoding="utf-8",
     )
     gh.chmod(0o755)
+    _add_windows_cli_shim(bin_dir)
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
 
@@ -312,4 +322,4 @@ def test_rejects_a_release_when_its_versioned_notes_are_missing(tmp_path: Path) 
     )
 
     assert result.returncode != 0
-    assert "docs/release/skillspector-2.4.3.md" in result.stderr
+    assert "docs/release/skillspector-2.4.3.md" in result.stderr.replace("\\", "/")
