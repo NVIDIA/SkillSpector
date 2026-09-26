@@ -17,12 +17,21 @@
 
 from __future__ import annotations
 
+import ast
+import posixpath
 import re
 import sys
 from bisect import bisect_right
+from contextvars import ContextVar
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import (
+    ParsedPythonFile,
+    parse_python_source,
+    peek_python_ast,
+    peek_python_ast_any_content,
+)
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -34,12 +43,22 @@ from .common import (
     get_context,
     get_context_from_lines,
     get_line_number,
+    resolve_call_name,
 )
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
+
+# Scan-scoped handle on the runner's shared Python AST cache, published by
+# node() for the analyze() calls the runner makes on its behalf.  This module
+# stays lexical (no USES_PYTHON_AST opt-in) so its windowed and normalized
+# views keep running; the constructed-path analysis below consults the shared
+# cache through this key instead of reparsing.
+_scan_python_ast_cache_key: ContextVar[str | None] = ContextVar(
+    "privilege_escalation_python_ast_cache_key", default=None
+)
 
 PE1_CODE_PATTERNS = [
     (r"permissions?\s*:\s*\[?\s*['\"]?\*['\"]?\s*\]?", 0.8),
@@ -659,7 +678,179 @@ def _is_qualified_benign_access_requirement(
     return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+# Cheap pre-check before walking for constructed join calls: the AST walk
+# below is only worthwhile when the text plausibly contains a join() call.
+# The gate covers spelling aliases collected from the imports (``from
+# os.path import join as j`` binds ``j`` to ``os.path.join``, so the call
+# site reads ``j(`` with no literal ``join`` in sight).  Keeping the module
+# lexical plus this alias-aware gate preserves the runner's parse-once
+# invariant for files without any join call.
+_JOIN_CALL_BASE_NAMES = {"join"}
+_JOIN_CALL_ALIAS_TARGETS = {"os.path", "os.path.join"}
+
+# Lexical pre-check for a windowed fragment that binds a renamed ``join``
+# without ever spelling ``join(`` (``from os.path import join as j`` calls
+# ``j(``).  On a whole-file cache miss the fragment is parsed to collect its
+# import aliases before the alias-aware join gate below runs, so such
+# fragments must also clear the parse gate; import-only fragments are
+# filtered out again by the alias-aware gate.
+_JOIN_IMPORT_HINT = re.compile(r"^\s*from\s+os\.path\s+import\b", re.MULTILINE)
+
+
+def _join_call_hint(aliases: dict[str, str]) -> re.Pattern[str]:
+    """Return a pre-check pattern matching ``join(`` and imported join aliases.
+
+    Every local name the file binds to ``os.path`` or ``os.path.join`` is a
+    possible call spelling (``j(`` for ``from os.path import join as j``),
+    alongside the plain ``join(`` used by ``os.path.join(``, ``p.join(``,
+    and direct ``join(`` imports.
+    """
+    names = set(_JOIN_CALL_BASE_NAMES)
+    for local, qualified in aliases.items():
+        if qualified in _JOIN_CALL_ALIAS_TARGETS:
+            names.add(local)
+    return re.compile(r"\b(?:" + "|".join(sorted(re.escape(name) for name in names)) + r")\s*\(")
+
+
+def _fragment_whole_file_line_offset(fragment: str, whole_content: str) -> int | None:
+    """Return how many whole-file lines precede a windowed view fragment.
+
+    Windowed view fragments are contiguous slices of the scanned file, so a
+    whole-file AST line number maps onto a fragment-relative line by
+    subtracting this offset.  Return ``None`` when the fragment is not a
+    slice of the whole file (for example a normalized view), so callers keep
+    the standalone-parse fallback.
+    """
+    start = whole_content.find(fragment)
+    if start < 0:
+        return None
+    return whole_content.count("\n", 0, start)
+
+
+def _constructed_sensitive_paths(
+    content: str,
+    file_path: str,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[tuple[int, int, str, float]]:
+    """Return literal sensitive paths assembled with ``os.path.join`` in Python.
+
+    Each hit is a ``(start_line, end_line, path, confidence)`` tuple anchored
+    to the call's source span so callers can deduplicate raw findings across
+    the whole occurrence, including calls wrapped over several lines.
+    Resolved from the Python AST so calls split across lines and supported
+    import spellings (``import os.path as p``, ``from os.path import join``,
+    ``from os.path import join as j``, ``from os import path``) are recognized
+    without reparsing tricks.  The scan's shared parse is reused whenever this
+    runs inside the runner (the cache key published by node()); standalone
+    callers get a single on-demand parse.  Windowed view fragments under a scan
+    miss the whole-file cache entry; behind the same textual join-or-import
+    gate they are evaluated against the whole file's cached tree instead of
+    being parsed standalone, so a fragment starting mid-block (for example
+    inside a function body, which is not a valid module on its own) keeps its
+    findings instead of silently dropping them.  The whole file's import-alias
+    map is carried in from the scan cache for the join gate and call
+    resolution, so a renamed ``os.path.join`` spelling (``from os.path import
+    join as j``) is recognized even when the import lives in an earlier window
+    than the call.  Call spans map onto fragment-relative lines and only
+    calls starting inside the fragment are owned by it, preserving the
+    runner's source-coordinate and dedupe behavior.  When the whole-file tree
+    is unavailable, or the fragment is not a slice of the whole file
+    (normalized views), the fragment is parsed directly as before.  Only
+    fully-literal positional argument lists are resolved; anything dynamic is
+    left to the existing pattern loop.  Unparseable content simply yields no
+    findings here.
+    """
+    whole_file_aliases: dict[str, str] | None = None
+    whole_file_tree: ast.Module | None = None
+    whole_file_source: str | None = None
+    whole_file_line_offset: int | None = None
+    if python_ast is None:
+        cache_key = _scan_python_ast_cache_key.get()
+        if cache_key is not None:
+            python_ast = peek_python_ast(cache_key, content, file_path)
+            if python_ast is None:
+                # A windowed view fragment, not the scan's whole file: the
+                # shared tree does not cover this slice.  Carry the whole
+                # file's import-alias map and tree from the scan cache first
+                # (a fragment is a slice of the same scanned file), so the
+                # textual gate below also fires on renamed call spellings
+                # like ``j(`` when the ``from os.path import join as j``
+                # import lives in an earlier window.  Fragments without a
+                # plausible join call or join import never parse.
+                whole_file = peek_python_ast_any_content(cache_key, file_path)
+                if whole_file is not None and whole_file.tree is not None:
+                    whole_file_aliases = whole_file.import_aliases
+                    whole_file_tree = whole_file.tree
+                    whole_file_source = whole_file.content
+                if _join_call_hint(whole_file_aliases or {}).search(
+                    content
+                ) or _JOIN_IMPORT_HINT.search(content):
+                    if whole_file_tree is not None and whole_file_source is not None:
+                        # Evaluate the whole-file tree rather than parsing the
+                        # fragment standalone: a slice starting mid-block is
+                        # not a valid module, so its standalone parse fails
+                        # and the finding would be silently dropped.
+                        whole_file_line_offset = _fragment_whole_file_line_offset(
+                            content, whole_file_source
+                        )
+                    if whole_file_line_offset is None:
+                        python_ast = parse_python_source(content, file_path)
+        else:
+            python_ast = parse_python_source(content, file_path)
+    if whole_file_tree is not None and whole_file_line_offset is not None:
+        tree = whole_file_tree
+        aliases = whole_file_aliases or {}
+        owned_span: tuple[int, int] | None = (
+            whole_file_line_offset,
+            whole_file_line_offset + len(content.splitlines()),
+        )
+    else:
+        if python_ast is None:
+            return []
+        tree = python_ast.tree
+        if tree is None:
+            return []
+        aliases = (
+            whole_file_aliases if whole_file_aliases is not None else python_ast.import_aliases
+        )
+        owned_span = None
+    if not _join_call_hint(aliases).search(content):
+        return []
+    resolved: list[tuple[int, int, str, float]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if resolve_call_name(node, aliases) != "os.path.join":
+            continue
+        if node.keywords or len(node.args) < 2:
+            continue
+        parts = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+        if len(parts) != len(node.args) or not all(isinstance(part, str) for part in parts):
+            continue
+        value = posixpath.join(*parts)
+        start_line = node.lineno
+        end_line = node.end_lineno or node.lineno
+        if owned_span is not None:
+            # Only calls starting inside this fragment are owned by it; the
+            # runner's own owned-range filter and cross-window dedupe keep
+            # exactly one finding per call at whole-file coordinates.
+            if not owned_span[0] < start_line <= owned_span[1]:
+                continue
+            start_line -= owned_span[0]
+            end_line -= owned_span[0]
+        for pattern, confidence in PE3_PATTERNS:
+            if re.search(pattern, value, re.IGNORECASE):
+                resolved.append((start_line, end_line, value, confidence))
+                break
+    return resolved
+
+
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
     line_starts, line_ends = _source_line_metadata(content)
@@ -808,6 +999,40 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
+    if file_type == "python":
+        for start_line, end_line, path, confidence in _constructed_sensitive_paths(
+            content, file_path, python_ast
+        ):
+            constructed = AnalyzerFinding(
+                rule_id="PE3",
+                message="Credential Access",
+                severity=Severity.HIGH,
+                location=loc(start_line),
+                confidence=confidence,
+                tags=list(tag),
+                context=get_context(content, line_starts[start_line - 1]),
+                matched_text=path,
+            )
+            # One PE3 per source occurrence: the pattern loop above may already
+            # have fired inside the join call's line span (for example the
+            # literal '.ssh/id_rsa' on a wrapped argument line, while this
+            # finding anchors to the call's first line).  Keep the
+            # best-confidence finding per call span, mirroring the PE4/PE5
+            # per-line aggregation below; unrelated occurrences on other
+            # lines are preserved.
+            duplicate = next(
+                (
+                    existing
+                    for existing in findings
+                    if existing.rule_id == "PE3"
+                    and start_line <= existing.location.start_line <= end_line
+                ),
+                None,
+            )
+            if duplicate is None:
+                findings.append(constructed)
+            elif confidence > duplicate.confidence:
+                findings[findings.index(duplicate)] = constructed
     # Collect best-confidence PE4 finding per line to avoid double-counting lines
     # that match multiple patterns (e.g. DockerClient(base_url=".../docker.sock")).
     pe4_best: dict[int, AnalyzerFinding] = {}
@@ -955,6 +1180,10 @@ def _is_negated_safety_constraint(
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run privilege_escalation patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    token = _scan_python_ast_cache_key.set(state.get("python_ast_cache_key"))
+    try:
+        response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    finally:
+        _scan_python_ast_cache_key.reset(token)
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
