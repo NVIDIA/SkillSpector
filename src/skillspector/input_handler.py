@@ -1276,6 +1276,12 @@ class InputHandler:
             self._terminate_git_process(process)
             shutil.rmtree(clone_dir, ignore_errors=True)
             raise ValueError("Failed to clone repository") from exc
+        except BaseException:
+            # An interrupt or a cancellation while Git is still writing: stop
+            # the child before the tree it writes into is removed.
+            self._terminate_git_process(process)
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            raise
         return clone_dir
 
     @staticmethod
