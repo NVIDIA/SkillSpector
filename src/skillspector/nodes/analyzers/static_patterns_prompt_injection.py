@@ -305,6 +305,10 @@ def _p2_has_danger_signal(inner: str) -> bool:
     return False
 
 
+_P2_FRONTMATTER_OPEN = re.compile(r"\A---[ \t]*\r?\n")
+_P2_FRONTMATTER_CLOSE = re.compile(r"(?m)^---\s*$")
+
+
 def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
     """Return True when a match sits before any substantive file content."""
     if match_start > _P2_FRONTMATTER_ADJACENT_LIMIT:
@@ -312,12 +316,13 @@ def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
     stripped = content[:match_start].strip()
     if not stripped:
         return True
-    if stripped.startswith("---"):
-        rest = stripped[3:]
-        closing = re.search(r"(?m)^---\s*$", rest)
-        if closing is None:
-            return True
-        return not rest[closing.end() :].strip()
+    open_match = _P2_FRONTMATTER_OPEN.match(stripped)
+    if open_match is None:
+        return False
+    closing = _P2_FRONTMATTER_CLOSE.search(stripped, open_match.end())
+    if closing is None:
+        return False
+    return not stripped[closing.end() :].strip()
 
 
 def _is_license_only_fragment(fragment: str) -> bool:
