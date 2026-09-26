@@ -465,7 +465,7 @@ def _analyze_python(
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     tainted: dict[str, _TaintedVar] = {}
-    seen: set[tuple[str, int, int, int | None, int | None]] = set()
+    seen: set[tuple[str, ast.Call]] = set()
     contexts: dict[int, str] = {}
 
     def context_for(lineno: int) -> str:
@@ -476,15 +476,18 @@ def _analyze_python(
         return context
 
     def _emit(
+        node_index: int,
         rule_id: str,
         ast_node: ast.Call,
         msg: str,
     ) -> None:
         lineno = getattr(ast_node, "lineno", 1)
         end_lineno = getattr(ast_node, "end_lineno", None)
-        start_byte_column = getattr(ast_node, "col_offset", 0)
+        start_byte_column = getattr(ast_node, "col_offset", None)
         end_byte_column = getattr(ast_node, "end_col_offset", None)
-        key = (rule_id, lineno, start_byte_column, end_lineno, end_byte_column)
+        # Deduplicate flows into the same sink without merging distinct nodes
+        # whose optional source columns are unavailable.
+        key = (rule_id, ast_node)
         if key in seen:
             return
         seen.add(key)
@@ -492,11 +495,7 @@ def _analyze_python(
         if complete_match is None:
             complete_match = get_complete_source_segment(lines, lineno, end_lineno)
         start_column = python_ast.character_column(lineno, start_byte_column)
-        end_column = (
-            python_ast.character_column(end_lineno or lineno, end_byte_column)
-            if end_byte_column is not None
-            else None
-        )
+        end_column = python_ast.character_column(end_lineno or lineno, end_byte_column)
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg,
@@ -513,13 +512,20 @@ def _analyze_python(
             context=context_for(lineno),
             matched_text=complete_match[:200],
             complete_match=complete_match,
+            # Evidence participates in report compaction. Keep distinct syntax
+            # nodes distinguishable when their source spans are incomplete.
+            evidence=(
+                {"python_ast_node_index": node_index}
+                if start_column is None or end_column is None
+                else {}
+            ),
         )
         if budget is None:
             findings.append(finding)
         else:
             budget.emit(finding)
 
-    for ast_node in ast.walk(tree):
+    for node_index, ast_node in enumerate(ast.walk(tree)):
         if budget is not None:
             budget.check_runtime()
         # Record tainted assignments.
@@ -577,6 +583,7 @@ def _analyze_python(
             src_cat = _classify(src_name, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
+                node_index,
                 rule,
                 ast_node,
                 f"Direct flow: {src_name} ({src_cat}) \u2192 {sink_name} ({sink_cat})",
@@ -591,6 +598,7 @@ def _analyze_python(
             src_cat = _classify(tv.source_call, _SOURCE_CATEGORIES, "data source")
             sink_cat = _classify(sink_name, _SINK_CATEGORIES, "data sink")
             _emit(
+                node_index,
                 rule,
                 ast_node,
                 f"Tainted flow: '{tv.name}' from {tv.source_call} (line {tv.lineno}, "

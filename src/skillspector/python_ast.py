@@ -125,8 +125,10 @@ class ParsedPythonFile:
         except UnicodeDecodeError:
             return None
 
-    def character_column(self, lineno: int, byte_column: int) -> int | None:
-        """Convert one CPython UTF-8 byte column to a public character column."""
+    def character_column(self, lineno: int, byte_column: int | None) -> int | None:
+        """Convert a UTF-8 byte column, retaining unavailable columns as None."""
+        if byte_column is None:
+            return None
         line_index = lineno - 1
         if line_index < 0 or line_index >= len(self.line_byte_starts):
             return None
