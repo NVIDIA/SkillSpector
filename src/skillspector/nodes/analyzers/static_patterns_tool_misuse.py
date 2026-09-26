@@ -93,6 +93,12 @@ _SHELL_CLAUSE_PREFIX_WORDS = frozenset({"do", "else", "elif", "then", "time", "!
 _SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
 _RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
 _FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
+_MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
+    r"(?:The|This|That|These|Those|It|They|We|You|I|A|An)[ \t]+[A-Za-z \t,]*\b"
+    r"(?:doesn|isn|aren|wasn|weren|don|didn|hasn|haven|hadn|can|couldn|shouldn|wouldn|won|mustn)"
+    r"(?P<apostrophe>')t\b[A-Za-z \t,]*[.!?]",
+    re.IGNORECASE,
+)
 _ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
     r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
     r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
@@ -1810,12 +1816,21 @@ def _has_shell_command_word_exhaustion(
         if parsed.limited:
             return True
         if parsed.dynamic and may_have_destructive_outer_operands:
-            tokens, _, exhausted = _bounded_shell_tokens(
+            tokens, command_end, exhausted = _bounded_shell_tokens(
                 content,
                 start,
                 parsed.end,
                 check_runtime=check_runtime,
             )
+            if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
+                # Earlier prose (for example "row-first") cannot supply this
+                # command's operands. Refine only this candidate's exhausted
+                # span, including nested commands inside the executable word.
+                # Hitting the span bound always remains partial, including when
+                # real operands occur beyond that bound. This rescan is bounded
+                # by the same constant as the tokenizer.
+                check_runtime()
+                exhausted = _may_have_destructive_outer_operands(content[start:command_end])
             if (
                 exhausted
                 or _has_unsupported_brace_expansion(tokens)
@@ -3144,6 +3159,7 @@ def _markdown_shell_text(
     inside their bodies. Pair equal-length runs in linear time.
     """
     output = list(content)
+    prose_apostrophes: set[int] = set()
     runs: list[tuple[int, int]] = []
     list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
     backtick_runs = re.compile(r"`+")
@@ -3354,6 +3370,20 @@ def _markdown_shell_text(
                         if not cells:
                             table_columns = None
                 elif not separator and not empty_list_item:
+                    if (
+                        complete_context
+                        and not runs
+                        and not heading
+                        and len(leading) <= 512
+                        and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(leading))
+                    ):
+                        # A whole plain-language sentence, including a parsed
+                        # list-item body, owns its contraction;
+                        # it is not an unclosed shell quote spanning later prose.
+                        # The restrictive grammar excludes code delimiters and
+                        # shell syntax. Fences, indented code, HTML, tables, and
+                        # pending multiline inline spans never reach this rule.
+                        prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
                     for match in backtick_runs.finditer(line):
                         check_runtime()
                         runs.append((offset + match.start(), offset + match.end()))
@@ -3370,7 +3400,40 @@ def _markdown_shell_text(
             paragraph_list_indent = 0
         offset += len(line)
     mask_inline_delimiters()
-    return "".join(output)
+    projected = "".join(output)
+    if prose_apostrophes:
+        # A prose-looking line can still be inside an earlier shell word, such
+        # as a multiline bash -c string. Reuse the shell parser to preserve that
+        # ownership before masking any apostrophe. Unresolved words retain all
+        # remaining bytes; this pass never grants ownership past a parse limit.
+        cursor = 0
+        next_runtime_check = 0
+        last_apostrophe = max(prose_apostrophes)
+        parameter_ends: dict[int, _ParameterExpansionEnd] = {}
+        substitution_ends: dict[int, int | None] = {}
+        backtick_ends: dict[int, int | None] = {}
+        while cursor <= last_apostrophe:
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 4096
+            if cursor in prose_apostrophes:
+                output[cursor] = " "
+            elif projected[cursor] in "'\"`$\\":
+                parsed = _parse_shell_command_word(
+                    projected,
+                    cursor,
+                    parameter_ends,
+                    substitution_ends,
+                    backtick_ends,
+                    check_runtime=check_runtime,
+                )
+                if parsed is None or parsed.limited:
+                    break
+                cursor = max(cursor + 1, parsed.end)
+                continue
+            cursor += 1
+        return "".join(output)
+    return projected
 
 
 def has_bounded_parse_exhaustion(
