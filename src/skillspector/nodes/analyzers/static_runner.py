@@ -61,9 +61,11 @@ from skillspector.python_ast import (
     get_python_ast,
 )
 from skillspector.security_reconstruction import (
+    _MAX_JSON_QUOTE_CONTAINER_CHARS,
     MAX_DECLARED_MARKER_RIGHT_CONTEXT_CHARS,
     MAX_MARKER_LOOKAHEAD_CHARS,
     build_declared_marker_views,
+    json_quote_capacity_limit,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
 
@@ -1389,6 +1391,7 @@ def _scan_declared_marker_views(
     raw_starts: tuple[int, ...],
     source_context: _WindowSourceContext,
     complete_context: bool,
+    limited_source_offsets: list[int],
 ) -> tuple[list[Finding], bool, bool, _StaticResourceLimitError | None]:
     """Reconstruct marker payloads with directive-relative context windows."""
     findings: list[Finding] = []
@@ -1442,6 +1445,13 @@ def _scan_declared_marker_views(
                 source_end_is_truncated=raw_end < len(content),
             )
             projection_limited = projection_limited or reconstruction.limited
+            if (
+                reconstruction.first_limited_source_offset is not None
+                and not limited_source_offsets
+            ):
+                limited_source_offsets.append(
+                    raw_start + reconstruction.first_limited_source_offset
+                )
             for marker_view in reconstruction.views:
                 if not marker_view.source_offsets:
                     continue
@@ -1577,6 +1587,7 @@ def _scan_all_views_detailed(
         clock=time.monotonic,
     )
     marker_projection_limited = False
+    limited_source_offsets: list[int] = []
     modules_for_windows = lexical_modules or ([] if ast_modules else pattern_modules)
     bounded_parse_limited = False
     marker_owned_starts: tuple[int, ...] = ()
@@ -1630,6 +1641,7 @@ def _scan_all_views_detailed(
                 raw_starts=marker_raw_starts,
                 source_context=source_context,
                 complete_context=whole_artifact_window,
+                limited_source_offsets=limited_source_offsets,
             )
             bounded_parse_limited = bounded_parse_limited or marker_bounded_parse_limited
         except _StaticResourceLimitError as exc:
@@ -1936,6 +1948,27 @@ def _scan_all_views_detailed(
                 "limit_findings": max_findings,
             },
         )
+    if limited_source_offsets and not (python_syntax_error or bounded_parse_limited):
+        try:
+            capacity_span = json_quote_capacity_limit(
+                content,
+                finding_budget.check_runtime,
+                containing_offset=limited_source_offsets[0],
+            )
+        except _StaticResourceLimitError as exc:
+            return deduplicated, exc.reason, exc.metrics
+        if capacity_span is not None:
+            start, end = capacity_span
+            return (
+                deduplicated,
+                LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT,
+                {
+                    "observed_characters": end - start,
+                    "limit_characters": _MAX_JSON_QUOTE_CONTAINER_CHARS,
+                    "source_start_offset": start,
+                    "source_end_offset": end,
+                },
+            )
     return (
         deduplicated,
         (
@@ -2354,10 +2387,18 @@ def run_static_patterns_with_ledger(
                     reason=partial_reason if partial else None,
                     emitted_finding_ids=[finding.finding_id for finding in path_findings],
                     observed_characters=(
-                        len(content) if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["observed_characters"])
+                        if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT
+                        else len(content)
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     limit_characters=(
-                        MAX_FILE_CHARS if partial_reason is LedgerReason.SIZE_LIMIT else None
+                        int(resource_metrics["limit_characters"])
+                        if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT
+                        else MAX_FILE_CHARS
+                        if partial_reason is LedgerReason.SIZE_LIMIT
+                        else None
                     ),
                     observed_findings=(
                         int(resource_metrics.get("observed_findings", len(path_findings)))
@@ -2384,6 +2425,12 @@ def run_static_patterns_with_ledger(
                         else None
                     ),
                 )
+                if partial_reason is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+                    # Keep the file-level work identity; the diagnostic span is
+                    # not a separately planned inspection range. Finalization
+                    # projects these numeric facts into a safe public message.
+                    event["source_start_offset"] = int(resource_metrics["source_start_offset"])
+                    event["source_end_offset"] = int(resource_metrics["source_end_offset"])
         events.append(event)
 
     return {
