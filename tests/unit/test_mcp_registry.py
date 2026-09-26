@@ -568,3 +568,238 @@ def test_registry_record_budget_is_aggregate_and_accepts_exact_limit(
     monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_RECORDS", 5)
     with pytest.raises(ValueError, match="exceeds 5 records"):
         scan_registry(str(capture))
+
+
+def test_registry_comparison_reports_changes_without_changing_risk(tmp_path: Path) -> None:
+    original = tmp_path / "registry.json"
+    original.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "server": pinned_server(
+                            name="example/changed", version="1", description="old"
+                        )
+                    },
+                    {"server": pinned_server(name="example/removed", version="1")},
+                    {"server": pinned_server(name="example/stable", version="1")},
+                ]
+            }
+        )
+    )
+    previous = scan_registry(str(original))
+    saved = tmp_path / "report.json"
+    saved.write_text(json.dumps(previous))
+    original.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "server": pinned_server(
+                            name="example/changed", version="1", description="new"
+                        )
+                    },
+                    {"server": pinned_server(name="example/added", version="2")},
+                    {"server": pinned_server(name="example/stable", version="1")},
+                ]
+            }
+        )
+    )
+    plain = scan_registry(str(original))
+    compared = scan_registry(str(original), compare_path=saved)
+    comparison = compared.pop("comparison")
+    assert comparison == {
+        "added": [{"name": "example/added", "version": "2"}],
+        "removed": [{"name": "example/removed", "version": "1"}],
+        "changed": [
+            {
+                "name": "example/changed",
+                "version": "1",
+                "fields": {"description": {"before": "old", "after": "new"}},
+            }
+        ],
+        "unchanged_count": 1,
+    }
+    for key in ["findings", "risk_score", "max_risk_score", "server_count"]:
+        assert compared[key] == plain[key]
+
+
+def test_comparison_ignores_provenance_and_collection_order() -> None:
+    from copy import deepcopy
+
+    report = {
+        "mcp_registry": True,
+        "snapshots": [
+            normalize_payload(
+                one_server(
+                    pinned_server(packages=[pinned_package(), pinned_package(identifier="other")])
+                ),
+                source="first.json",
+            )[0].to_dict()
+        ],
+    }
+    current = deepcopy(report)
+    current["snapshots"][0].update(
+        source="second.json", scanned_at="later", record_hash="different"
+    )
+    current["snapshots"][0]["packages"].reverse()
+    assert mcp_registry.compare_registry_reports(report, current) == {
+        "added": [],
+        "removed": [],
+        "changed": [],
+        "unchanged_count": 1,
+    }
+
+
+def test_comparison_version_change_is_added_and_removed() -> None:
+    before = {
+        "mcp_registry": True,
+        "snapshots": [
+            normalize_payload(one_server(pinned_server(version="1")), source="fixture")[0].to_dict()
+        ],
+    }
+    after = {
+        "mcp_registry": True,
+        "snapshots": [
+            normalize_payload(one_server(pinned_server(version="2")), source="fixture")[0].to_dict()
+        ],
+    }
+    result = mcp_registry.compare_registry_reports(before, after)
+    assert result["added"] == [{"name": "safe/example", "version": "2"}]
+    assert result["removed"] == [{"name": "safe/example", "version": "1"}]
+    assert result["changed"] == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "not_report",
+        "missing_field",
+        "duplicate",
+        "bad_name",
+        "bad_repository",
+        "bad_packages",
+        "bad_latest",
+    ],
+)
+def test_registry_comparison_rejects_ambiguous_baseline_before_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    snapshot = normalize_payload(one_server(pinned_server()), source="fixture")[0].to_dict()
+    report = {"mcp_registry": True, "snapshots": [snapshot]}
+    if mutation == "not_report":
+        report["mcp_registry"] = False
+    elif mutation == "missing_field":
+        snapshot.pop("name")
+    elif mutation == "duplicate":
+        report["snapshots"].append(snapshot.copy())
+    elif mutation == "bad_name":
+        snapshot["name"] = 42
+    elif mutation == "bad_repository":
+        snapshot["repository"] = {"url": ["invalid"]}
+    elif mutation == "bad_packages":
+        snapshot["packages"] = None
+    else:
+        snapshot["is_latest"] = "yes"
+    saved = tmp_path / "report.json"
+    saved.write_text(json.dumps(report))
+    monkeypatch.setattr(
+        mcp_registry, "_load_payload", lambda _: pytest.fail("must reject before fetch")
+    )
+    with pytest.raises(ValueError, match="comparison"):
+        scan_registry(compare_path=saved)
+
+
+def test_registry_comparison_rejects_duplicate_current_identity(tmp_path: Path) -> None:
+    snapshot = normalize_payload(one_server(pinned_server()), source="fixture")[0].to_dict()
+    report = {"mcp_registry": True, "snapshots": [snapshot]}
+    with pytest.raises(ValueError, match="duplicate"):
+        mcp_registry.compare_registry_reports(
+            report, {"mcp_registry": True, "snapshots": [snapshot, snapshot]}
+        )
+
+
+@pytest.mark.parametrize("limit", ["bytes", "depth", "records"])
+def test_registry_comparison_input_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str
+) -> None:
+    saved = tmp_path / "report.json"
+    snapshot = normalize_payload(one_server(pinned_server()), source="fixture")[0].to_dict()
+    saved.write_text(json.dumps({"mcp_registry": True, "snapshots": [snapshot]}))
+    monkeypatch.setattr(
+        mcp_registry,
+        {
+            "bytes": "MAX_REGISTRY_BYTES",
+            "depth": "MAX_REGISTRY_DEPTH",
+            "records": "MAX_REGISTRY_RECORDS",
+        }[limit],
+        1,
+    )
+    monkeypatch.setattr(
+        mcp_registry, "_load_payload", lambda _: pytest.fail("must reject before fetch")
+    )
+    with pytest.raises(ValueError, match="exceeds"):
+        scan_registry(compare_path=saved)
+
+
+def test_cli_registry_comparison_and_mode_guard(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from skillspector.cli import app
+
+    source = tmp_path / "registry.json"
+    source.write_text(json.dumps(one_server(pinned_server())))
+    baseline = tmp_path / "previous.json"
+    baseline.write_text(json.dumps(scan_registry(str(source))))
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(source),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--mcp-registry-compare",
+            str(baseline),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["comparison"]["unchanged_count"] == 1
+    result = runner.invoke(app, ["scan", str(source), "--mcp-registry-compare", str(baseline)])
+    assert result.exit_code == 2
+    assert "requires --mcp-registry" in result.output
+    baseline.write_text('{"mcp_registry": true, "snapshots": [null]}')
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(source),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--mcp-registry-compare",
+            str(baseline),
+        ],
+    )
+    assert result.exit_code == 2
+
+
+def test_comparison_record_budget_counts_nested_collections_across_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = normalize_payload(
+        {
+            "servers": [
+                {"server": pinned_server(name="one")},
+                {"server": pinned_server(name="two")},
+            ]
+        },
+        source="fixture",
+    )
+    report = {"mcp_registry": True, "snapshots": [item.to_dict() for item in snapshots]}
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_RECORDS", 6)
+    assert mcp_registry.compare_registry_reports(report, report)["unchanged_count"] == 2
+    monkeypatch.setattr(mcp_registry, "MAX_REGISTRY_RECORDS", 5)
+    with pytest.raises(ValueError, match="exceeds 5 records"):
+        mcp_registry.compare_registry_reports(report, report)

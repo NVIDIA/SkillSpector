@@ -9,7 +9,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from itertools import chain
 from pathlib import Path
@@ -463,8 +463,104 @@ def _load_paginated_registry(url: str) -> dict[str, Any]:
     }
 
 
-def scan_registry(input_path: str = REGISTRY_URL) -> dict[str, Any]:
+def _comparison_index(report: dict[str, Any]) -> dict[tuple[str, str | None], dict[str, Any]]:
+    """Validate normalized report snapshots before comparing untrusted input."""
+    snapshots = report.get("snapshots")
+    if report.get("mcp_registry") is not True or not isinstance(snapshots, list):
+        raise ValueError("comparison input must be an MCP Registry JSON report")
+    record_count = len(snapshots)
+    if record_count > MAX_REGISTRY_RECORDS:
+        raise ValueError(f"comparison input exceeds {MAX_REGISTRY_RECORDS} records")
+    expected = {field.name for field in fields(RegistryServerSnapshot)}
+    structured = {"repository", "packages", "remotes", "is_latest"}
+    index: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict) or set(snapshot) != expected:
+            raise ValueError("comparison snapshot has invalid fields")
+        if (
+            any(
+                value is not None and not isinstance(value, str)
+                for key, value in snapshot.items()
+                if key not in structured
+            )
+            or not isinstance(snapshot["name"], str)
+            or not snapshot["name"]
+        ):
+            raise ValueError("comparison snapshot has invalid text fields")
+        if snapshot["is_latest"] is not None and not isinstance(snapshot["is_latest"], bool):
+            raise ValueError("comparison snapshot has invalid is_latest")
+        for key, model in (
+            ("repository", RepositoryReference),
+            ("packages", PackageReference),
+            ("remotes", RemoteReference),
+        ):
+            value = snapshot[key]
+            records = [] if value is None and key == "repository" else [value]
+            if key != "repository":
+                if not isinstance(value, list):
+                    raise ValueError(f"comparison snapshot has invalid {key}")
+                record_count += len(value)
+                if record_count > MAX_REGISTRY_RECORDS:
+                    raise ValueError(f"comparison input exceeds {MAX_REGISTRY_RECORDS} records")
+                records = value
+            nested_fields = {field.name for field in fields(model)}
+            if any(
+                not isinstance(record, dict)
+                or set(record) != nested_fields
+                or any(item is not None and not isinstance(item, str) for item in record.values())
+                for record in records
+            ):
+                raise ValueError(f"comparison snapshot has invalid {key}")
+        identity = (snapshot["name"], snapshot["version"])
+        if identity in index:
+            raise ValueError(f"comparison has duplicate server identity: {identity!r}")
+        # Acquisition provenance and raw-record hashes are not normalized field changes.
+        normalized = {
+            key: value
+            for key, value in snapshot.items()
+            if key not in {"source", "scanned_at", "record_hash"}
+        }
+        for key in ("packages", "remotes"):
+            normalized[key] = sorted(normalized[key], key=_canonical_json)
+        index[identity] = normalized
+    return index
+
+
+def compare_registry_reports(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Describe snapshot changes without changing findings or risk assessment."""
+    before = _comparison_index(previous)
+    after = _comparison_index(current)
+
+    def ordered(keys: set[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+        return sorted(keys, key=lambda key: (key[0], key[1] is not None, key[1] or ""))
+
+    def identity(key: tuple[str, str | None]) -> dict[str, Any]:
+        return {"name": key[0], "version": key[1]}
+
+    changed = []
+    for key in ordered(before.keys() & after.keys()):
+        differences = {
+            field: {"before": before[key][field], "after": value}
+            for field, value in after[key].items()
+            if before[key][field] != value
+        }
+        if differences:
+            changed.append({**identity(key), "fields": differences})
+    return {
+        "added": [identity(key) for key in ordered(after.keys() - before.keys())],
+        "removed": [identity(key) for key in ordered(before.keys() - after.keys())],
+        "changed": changed,
+        "unchanged_count": len(before.keys() & after.keys()) - len(changed),
+    }
+
+
+def scan_registry(
+    input_path: str = REGISTRY_URL, *, compare_path: Path | None = None
+) -> dict[str, Any]:
     """Acquire, normalize, and assess one MCP Registry payload."""
+    previous = _load_local_registry(compare_path) if compare_path is not None else None
+    if previous is not None:
+        _comparison_index(previous)
     snapshots = normalize_payload(_load_payload(input_path), source=input_path)
     per_server: list[RegistryServerReport] = [
         {"snapshot": snapshot.to_dict(), "findings": posture_findings(snapshot)}
@@ -473,7 +569,7 @@ def scan_registry(input_path: str = REGISTRY_URL) -> dict[str, Any]:
     findings = [finding for server in per_server for finding in server["findings"]]
     risk_score = min(sum(finding["risk_score"] for finding in findings), 100)
     max_risk_score = max((finding["risk_score"] for finding in findings), default=0)
-    return {
+    report = {
         "mcp_registry": True,
         "source": input_path,
         "server_count": len(snapshots),
@@ -483,3 +579,6 @@ def scan_registry(input_path: str = REGISTRY_URL) -> dict[str, Any]:
         "snapshots": [snapshot.to_dict() for snapshot in snapshots],
         "servers": per_server,
     }
+    if previous is not None:
+        report["comparison"] = compare_registry_reports(previous, report)
+    return report

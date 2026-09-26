@@ -196,6 +196,33 @@ See the [contrib guide](contrib/batch_scan/docs/) for details.
 > contribute a more universal backend (Ollama, vLLM, or a different provider),
 > PRs are very welcome.
 
+### Comparing MCP Registry snapshots
+
+Start with raw registry payload captures (`registry-before.json` and
+`registry-after.json`). Save a scan report as `previous.json`, then compare a
+later scan against that generated local report:
+
+```bash
+skillspector scan registry-before.json --mcp-registry --format json --output previous.json
+skillspector scan registry-after.json --mcp-registry --format json \
+  --mcp-registry-compare previous.json --output compared.json
+```
+
+The optional `comparison` object lists added and removed server identities,
+changed normalized fields with their previous and current values, and an
+`unchanged_count`. Identity is the server name and version, so a new version
+appears as an addition and the old version as a removal if it is absent from the
+new scan. Acquisition source, scan timestamp and raw-record hash are excluded
+from comparison; package and remote ordering alone does not count as a change.
+Compare reports with the same selection scope: a server absent from the current
+input is reported as removed, which does not prove it was removed from a registry.
+
+The comparison file must be a local report produced by this registry mode with
+valid normalized snapshots. Malformed, oversized or duplicate server identities
+are rejected. This option requires `--mcp-registry` and is separate from the
+finding-suppression `--baseline`: it never suppresses findings or changes risk
+scores, and it does not fetch or execute listed server endpoints.
+
 ### Suppressing False Positives (baseline)
 
 Suppress known/accepted findings so the risk score reflects only un-triaged
