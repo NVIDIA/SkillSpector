@@ -49,6 +49,32 @@ def test_rp1_npx_unpinned():
     assert "npx @scope/mcp-server" in rp1[0].matched_text
 
 
+def test_rp1_npx_match_does_not_cross_lines():
+    """A trailing ``npx`` must not combine with the next line as a command."""
+    for content in (
+        "---\nname: npx\ndescription: repro\n---\n",
+        "Install it with npx\nthe package manager.\n",
+    ):
+        result = node(_state(file_cache={"SKILL.md": content}))
+        assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+def test_rp1_npx_requires_a_word_boundary():
+    """An identifier ending in ``npx`` is not an npx command."""
+    result = node(_state(file_cache={"setup.sh": "pnpx @scope/mcp-server\n"}))
+
+    assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+def test_rp1_npx_still_matches_flags_on_the_same_line():
+    """Common npx flags remain supported after restricting whitespace."""
+    result = node(_state(file_cache={"setup.sh": "npx -y @scope/mcp-server\n"}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+    assert len(rp1) == 1
+    assert rp1[0].matched_text == "npx -y @scope/mcp-server"
+
+
 def test_rp1_scans_cached_files_without_a_manifest():
     """Cache-based RP1 checks remain applicable when manifest parsing failed."""
     result = node(_state(file_cache={"setup.sh": "npx @scope/mcp-server\n"}))

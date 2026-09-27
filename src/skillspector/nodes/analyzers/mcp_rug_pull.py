@@ -122,7 +122,7 @@ class _RugPullBudget:
 
 # RP1: Unpinned MCP server references in code or manifest
 _RP1_NPX_CMD = re.compile(
-    r"npx\s+(?:-+\w+\s+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
+    r"\bnpx[ \t]+(?:-+\w+[ \t]+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
     re.IGNORECASE,
 )
 _RP1_UVX_CMD = re.compile(
