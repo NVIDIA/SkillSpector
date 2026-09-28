@@ -131,8 +131,8 @@ def test_explicit_import_reestablishes_direct_receivers() -> None:
     assert (
         len(
             _tm1(
-                "subprocess = Proxy()\n"
-                "Popen = Proxy()\n"
+                "subprocess = None\n"
+                "Popen = None\n"
                 "import subprocess\n"
                 "from subprocess import Popen\n"
                 "enabled = True\n"
@@ -157,7 +157,7 @@ def test_function_local_binding_and_outer_fact_are_independent() -> None:
         "def execute(command):\n"
         "    enabled = 'True'\n"
         "    subprocess.run(command, shell=enabled)\n"
-        "subprocess.run(command, shell=outer)\n"
+        "subprocess.run('/usr/bin/true', shell=outer)\n"
     )
 
     assert [finding.start_line for finding in findings] == [4, 5]
@@ -603,6 +603,46 @@ def test_generic_call_invalidates_receiver_trust_for_called_function(statement: 
     assert not findings
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("assert (replace_subprocess(),)", id="assert"),
+        pytest.param("(replace_subprocess(),)", id="tuple-expression"),
+        pytest.param("[replace_subprocess()]", id="list-expression"),
+    ],
+)
+def test_unsupported_eager_statement_invalidates_receiver_trust(statement: str) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        f"{statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("assert (replace_subprocess(),)", id="assert"),
+        pytest.param("(replace_subprocess(),)", id="tuple-expression"),
+        pytest.param("[replace_subprocess()]", id="list-expression"),
+    ],
+)
+def test_unsupported_eager_statement_invalidates_receiver_for_called_function(
+    statement: str,
+) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{statement}\n"
+        "execute()\n"
+    )
+
+
 def test_generic_call_invalidates_receiver_trust_for_nested_closure() -> None:
     assert not _tm1(
         "import subprocess\n"
@@ -660,6 +700,47 @@ def test_direct_subprocess_call_remains_detected(statement: str) -> None:
     assert [finding.location.start_line for finding in findings] == [4, 6]
 
 
+@pytest.mark.parametrize(
+    "call_line",
+    [
+        "subprocess.run(command, shell=true); "
+        "[subprocess.run(command, shell=true) for item in items]",
+        "[subprocess.run(command, shell=true) for item in items]; "
+        "subprocess.run(command, shell=true)",
+    ],
+)
+def test_true_direct_calls_around_safe_comprehension_keep_distinct_locations(
+    call_line: str,
+) -> None:
+    findings = _tm1(f"items = [1]\ncommand = '/bin/true'\ntrue = True\n{call_line}\n")
+    expected_columns = [
+        index for index in range(len(call_line)) if call_line.startswith("subprocess.run", index)
+    ]
+
+    assert len(findings) == 2
+    assert sorted(finding.start_column for finding in findings) == expected_columns
+
+
+def test_unknown_comprehension_protocol_invalidates_receiver_trust() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_unknown_comprehension_protocol_invalidates_called_function_trust() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "execute()\n"
+    )
+
+
 def test_blank_line_before_assignment_has_one_tm1_owner() -> None:
     findings = _tm1("import subprocess\n\nenabled = True\nsubprocess.run(command, shell=enabled)\n")
 
@@ -709,19 +790,14 @@ def test_external_name_store_treats_prior_binding_as_finalizer_capable() -> None
 
 def test_protocol_consuming_direct_call_invalidates_later_truth_fact() -> None:
     findings = _tm1(
-        "class MutatingArgs:\n"
-        "    def __iter__(self):\n"
-        "        global enabled\n"
-        "        enabled = False\n"
-        "        return iter(('/usr/bin/true',))\n"
-        "mutator = MutatingArgs()\n"
+        "from helpers import mutator\n"
         "import subprocess\n"
         "enabled = True\n"
         "subprocess.run(mutator, shell=enabled)\n"
         "subprocess.run('/usr/bin/true', shell=enabled)\n"
     )
 
-    assert [finding.start_line for finding in findings] == [9]
+    assert [finding.start_line for finding in findings] == [4]
 
 
 def test_annotated_assignment_is_outside_side_effect_free_contract() -> None:
