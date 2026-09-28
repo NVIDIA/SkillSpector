@@ -530,6 +530,21 @@ def test_later_argument_effect_invalidates_receiver_for_called_function() -> Non
         pytest.param("replace_subprocess()", id="expression"),
         pytest.param("result = replace_subprocess()", id="assignment"),
         pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),
+        pytest.param("result = (replace_subprocess(),)", id="tuple-rhs"),
+        pytest.param("result = [replace_subprocess()]", id="list-rhs"),
+        pytest.param(
+            "result: object = (replace_subprocess(),)",
+            id="annotated-tuple-rhs",
+        ),
+        pytest.param(
+            "result: object = [replace_subprocess()]",
+            id="annotated-list-rhs",
+        ),
+        pytest.param("result = (mutator.value,)", id="tuple-protocol-rhs"),
+        pytest.param(
+            "result: object = [mutator[0]]",
+            id="annotated-list-protocol-rhs",
+        ),
     ],
 )
 def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
@@ -550,6 +565,21 @@ def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
         pytest.param("replace_subprocess()", id="expression"),
         pytest.param("result = replace_subprocess()", id="assignment"),
         pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),
+        pytest.param("result = (replace_subprocess(),)", id="tuple-rhs"),
+        pytest.param("result = [replace_subprocess()]", id="list-rhs"),
+        pytest.param(
+            "result: object = (replace_subprocess(),)",
+            id="annotated-tuple-rhs",
+        ),
+        pytest.param(
+            "result: object = [replace_subprocess()]",
+            id="annotated-list-rhs",
+        ),
+        pytest.param("result = (mutator.value,)", id="tuple-protocol-rhs"),
+        pytest.param(
+            "result: object = [mutator[0]]",
+            id="annotated-list-protocol-rhs",
+        ),
     ],
 )
 def test_generic_call_invalidates_receiver_trust_for_called_function(statement: str) -> None:
