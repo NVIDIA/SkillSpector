@@ -132,6 +132,7 @@ class MultiSkillDetectionResult:
     entries_examined: int = 0
     structured_candidates_examined: int = 0
     structured_input_bytes_examined: int = 0
+    omitted_symlink_entries: int = 0
 
     @property
     def complete(self) -> bool:
@@ -277,32 +278,32 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
 
         skills: list[SkillDirectory] = []
         limitations: list[MultiSkillDetectionLimitation] = []
+        omitted_symlink_entries = 0
         for entry in _bounded_scandir(directory, budget=budget):
             budget.check_runtime()
             child = Path(entry.path)
+            if entry.name in _SKIP_DIRS:
+                # Intentionally ignored names (e.g. `.git`, `.venv`,
+                # `node_modules`) are not a discovery gap even when they are
+                # symlinks; skip them before recording any limitation. Any
+                # other symlinked name is recorded below, so an eligible
+                # dot-prefixed skill such as `.review-helper` is never
+                # silently excluded.
+                continue
             try:
                 if entry.is_symlink() or _is_link_or_junction(child):
-                    if entry.name in _SKIP_DIRS:
-                        # Intentionally ignored names (e.g. `.git`, `.venv`,
-                        # `node_modules`) are not a discovery gap even when
-                        # they are symlinks; skip them before recording the
-                        # symlink limitation. Any other symlinked name is
-                        # recorded below, so an eligible dot-prefixed skill
-                        # such as `.review-helper` is never silently excluded.
-                        continue
                     limitations.append(
                         MultiSkillDetectionLimitation(
                             reason_code="read_error",
                             resource="multi_skill_symlinked_entry",
                         )
                     )
+                    omitted_symlink_entries += 1
                     continue
                 if not entry.is_dir(follow_symlinks=False):
                     continue
             except OSError as exc:
                 raise _read_error("multi_skill_directory_entry") from exc
-            if entry.name in _SKIP_DIRS:
-                continue
 
             has_manifest = _has_skill_md(child, budget=budget)
             is_structured = False
@@ -333,6 +334,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
         entries_examined=budget.entries,
         structured_candidates_examined=budget.structured_candidates,
         structured_input_bytes_examined=budget.structured_bytes,
+        omitted_symlink_entries=omitted_symlink_entries,
     )
 
 
