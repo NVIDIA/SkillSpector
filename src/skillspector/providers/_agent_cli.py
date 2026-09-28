@@ -876,7 +876,7 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI invocation  (verified against copilot 1.0.88)
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.89)
 # ---------------------------------------------------------------------------
 
 
@@ -942,7 +942,7 @@ def _prepare_copilot_env(
 def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build the argv list for a non-interactive ``copilot`` call.
 
-    Flags chosen (verified against Copilot CLI 1.0.88 ``--help``):
+    Flags chosen (verified against Copilot CLI 1.0.89 ``--help``):
 
     (no ``-p``)
         With no prompt flag, the prompt is piped to stdin by run_agent_cli —
@@ -1014,7 +1014,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 def _parse_copilot_output(raw: str) -> str:
     """Extract the assistant reply from ``copilot -s`` plain-text output.
 
-    Verified against Copilot CLI 1.0.88: ``-s`` emits only the response text.
+    Verified against Copilot CLI 1.0.89: ``-s`` emits only the response text.
     The whole stripped output is the reply; empty output raises fail-closed
     (an empty response must never be mistaken for a clean analysis).
     """
@@ -1031,7 +1031,7 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     shared scrubbed environment (token re-injection is inference-only and
     version output does not depend on it), performs no inference, and
     completes well under 15s. Fail-closed: probe error/timeout, non-zero
-    exit, or a version other than the verified 1.0.88 all return
+    exit, or a version other than the verified 1.0.89 all return
     ``(False, reason)``.
 
     There is no status subcommand, so a passing probe means the binary runs
@@ -1058,10 +1058,10 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
             f"(exit {result.returncode}); check the binary, then `copilot login`"
         )
     version = _parse_copilot_version(result.stdout or b"")
-    if version != "1.0.88":
+    if version != "1.0.89":
         version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         return False, (
-            "copilot_cli requires exactly GitHub Copilot CLI 1.0.88 "
+            "copilot_cli requires exactly GitHub Copilot CLI 1.0.89 "
             f"for its verified tool-deny policy; found {version_text[:80]!r}"
         )
     return True, None
@@ -1080,7 +1080,7 @@ def _preflight_copilot_policy(
        runtime. Re-verifies ``[binary, --version]`` under the isolated
        child env on EVERY completion. ``argv`` is unused (CliSpec
        signature uniformity). Fail-closed: probe error/timeout,
-       non-zero exit, or a version other than the verified 1.0.88 all
+       non-zero exit, or a version other than the verified 1.0.89 all
        raise before any prompt bytes move.
     2. Temp-dir tripwire: repo-level hook sources (``.github/hooks/``,
        repo settings) cannot exist in the fresh ``mkdtemp`` dir; any
@@ -1101,10 +1101,10 @@ def _preflight_copilot_policy(
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         raise AgentCLIError(f"copilot version preflight failed: {exc}") from exc
-    if result.returncode != 0 or _parse_copilot_version(result.stdout or b"") != "1.0.88":
+    if result.returncode != 0 or _parse_copilot_version(result.stdout or b"") != "1.0.89":
         version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         raise AgentCLIError(
-            "copilot_cli requires exactly GitHub Copilot CLI 1.0.88 "
+            "copilot_cli requires exactly GitHub Copilot CLI 1.0.89 "
             f"for its verified tool-deny policy; found {version_text[:80]!r}"
         )
     _audit_copilot_home(child_env)
@@ -1121,15 +1121,16 @@ def _copilot_home(child_env: dict[str, str]) -> str:
 def _audit_copilot_home(child_env: dict[str, str]) -> None:
     """Refuse inference when user or plugin hook material is present.
 
-    The 1.0.88 CLI loads hooks from policy, user, project, then plugin
+    The 1.0.89 CLI loads hooks from policy, user, project, then plugin
     sources with no argv off-switch (verified: no ``--disable*hook*``
     flag in ``copilot --help``), and — as probed 2026-09-19 — silently
     refuses inference under ANY redirected home, so home isolation is
     not a usable lever. The enforceable property is absence, checked
     here for every user and plugin source under the resolved copilot home
-    AND under the XDG migration source (startup moves
-    ``$XDG_CONFIG_HOME/.copilot/hooks`` into the home, so a clean home
-    with a dirty XDG tree still loads hooks):
+    AND under the XDG migration sources (startup moves
+    ``$XDG_CONFIG_HOME/.copilot/hooks`` and
+    ``$XDG_STATE_HOME/.copilot/installed-plugins`` into the home, so a
+    clean home with a dirty XDG tree still loads hooks):
 
     - ``installed-plugins/`` present-and-non-empty raises (plugin hooks);
     - ``hooks/*.json`` present raises (user hook files);
@@ -1171,6 +1172,23 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
     consider(
         os.path.join(os.path.expanduser("~"), ".config", ".copilot"),
         "copilot default XDG migration source",
+    )
+    # Since 1.0.88, the CLI also migrates installed-plugins (and session
+    # state) from $XDG_STATE_HOME/.copilot at startup, loading plugin
+    # hooks after this audit. Redirecting the variable is not a lever
+    # (inference refuses under any redirected home, probed
+    # 2026-09-19; deleting it falls back to an unaudited default), so
+    # both the explicit and default STATE sources are audited in place
+    # with the same fallback reasoning as the CONFIG source.
+    xdg_state_explicit = (child_env.get("XDG_STATE_HOME") or "").strip()
+    if xdg_state_explicit:
+        consider(
+            os.path.join(xdg_state_explicit, ".copilot"),
+            "copilot XDG state migration source",
+        )
+    consider(
+        os.path.join(os.path.expanduser("~"), ".local", "state", ".copilot"),
+        "copilot default XDG state migration source",
     )
 
 

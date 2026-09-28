@@ -73,7 +73,7 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.88.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.89.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
@@ -188,7 +188,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.88"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.89"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -243,7 +243,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.88" in (reason or "")
+        assert "1.0.89" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -268,13 +268,13 @@ class TestPreflightCopilotPolicy:
     def test_synthetic_future_version_rejected_before_stdin(self, mock_run: MagicMock) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
-        with pytest.raises(AgentCLIError, match="1.0.88"):
+        with pytest.raises(AgentCLIError, match="1.0.89"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, "/tmp")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_nonzero_exit_rejected(self, mock_run: MagicMock) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
-        with pytest.raises(AgentCLIError, match="preflight|1.0.88"):
+        with pytest.raises(AgentCLIError, match="preflight|1.0.89"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -556,6 +556,66 @@ class TestAuditCopilotHome:
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         _audit_copilot_home({})
 
+    def test_xdg_state_plugins_raise(self, tmp_path: Path) -> None:
+        # Startup migrates $XDG_STATE_HOME/.copilot/installed-plugins
+        # into the home (1.0.89: hvn/mvn over juo, which still lists
+        # installed-plugins): a plugin-free COPILOT_HOME with plugin
+        # material in the STATE source must still refuse.
+        home = tmp_path / "home"
+        home.mkdir()
+        plugins = tmp_path / "xdg-state" / ".copilot" / "installed-plugins" / "evil"
+        plugins.mkdir(parents=True)
+        with pytest.raises(AgentCLIError, match="installed plugins"):
+            _audit_copilot_home(
+                {"COPILOT_HOME": str(home), "XDG_STATE_HOME": str(tmp_path / "xdg-state")}
+            )
+
+    def test_xdg_state_default_location_audited(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # XDG_STATE_HOME unset: the default ~/.local/state/.copilot
+        # source is still inspected (same fallback reasoning as CONFIG).
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("COPILOT_HOME", raising=False)
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+        plugins = home / ".local" / "state" / ".copilot" / "installed-plugins" / "evil"
+        plugins.mkdir(parents=True)
+        with pytest.raises(AgentCLIError, match="installed plugins"):
+            _audit_copilot_home({})
+
+    def test_xdg_state_missing_explicit_audits_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A set-but-missing XDG_STATE_HOME holds nothing, but the CLI
+        # may fall back to ~/.local/state/.copilot, so the default
+        # source is still audited.
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        env = {
+            "COPILOT_HOME": str(home),
+            "XDG_STATE_HOME": str(tmp_path / "absent"),
+        }
+        _audit_copilot_home(env)
+        plugins = home / ".local" / "state" / ".copilot" / "installed-plugins" / "evil"
+        plugins.mkdir(parents=True)
+        with pytest.raises(AgentCLIError, match="installed plugins"):
+            _audit_copilot_home(env)
+
+    def test_xdg_state_clean_passes(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        xdg = tmp_path / "xdg-state" / ".copilot"
+        xdg.mkdir(parents=True)
+        (xdg / "settings.json").write_text('{"theme": "dark"}', encoding="utf-8")
+        _audit_copilot_home(
+            {"COPILOT_HOME": str(home), "XDG_STATE_HOME": str(tmp_path / "xdg-state")}
+        )
+
     def test_defaults_to_dot_copilot(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         home = tmp_path / "home"
         (home / ".copilot" / "installed-plugins" / "evil").mkdir(parents=True)
@@ -754,7 +814,7 @@ class TestHookHomeEndToEnd:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.88"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.89"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -825,6 +885,34 @@ class TestHookHomeEndToEnd:
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_xdg_state_source_rejects_before_prompt_delivery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STATE migration source plugins reject even with a clean home.
+
+        COPILOT_HOME and the CONFIG source are clean; plugin material
+        lives only in the inherited STATE tree that startup would
+        migrate into the home (1.0.89 confirms installed-plugins is
+        still migrated). Rejection must precede prompt delivery.
+        """
+        home = tmp_path / "copilot-home"
+        home.mkdir()
+        plugins = tmp_path / "xdg-state" / ".copilot" / "installed-plugins" / "evil"
+        plugins.mkdir(parents=True)
+        binary = tmp_path / "copilot"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_recording_copilot(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("COPILOT_HOME", str(home))
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="installed plugins"):
+            run_agent_cli("copilot", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
 
 # ---------------------------------------------------------------------------
 # Adversarial transport: a fake copilot host asserts the deny posture on
@@ -847,7 +935,7 @@ class TestAdversarialTransport:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.88"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.89"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -923,4 +1011,28 @@ class TestAdversarialTransport:
 
         response = run_agent_cli("copilot", "use every host tool", model="")
         assert response == "policy held"
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_public_completion_rejects_unsupported_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """9.9.99 through the public path must raise before delivery.
+
+        The direct-preflight version test cannot catch removal of the
+        registered preflight: only a public completion reaching the
+        gate proves removal cannot silently bypass it. The fake answers
+        9.9.99 to --version, so the run must fail with no Popen beyond
+        the version probe reaching prompt delivery.
+        """
+        binary = tmp_path / "copilot"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_fake_copilot(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("FAKE_COPILOT_VERSION", "9.9.99")
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="1.0.89"):
+            run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
