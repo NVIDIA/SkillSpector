@@ -36,6 +36,7 @@ from skillspector.providers import (
 from skillspector.providers.bedrock import (
     BEDROCK_DEFAULT_MODEL,
     BEDROCK_DEFAULT_REGION,
+    BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
     BedrockProvider,
 )
 from skillspector.providers.structured_output import claude_model_from_bedrock_id
@@ -209,6 +210,10 @@ class TestBedrockProviderCreateChatModel:
         # botocore.config.Config exposes timeouts as attributes.
         assert config.read_timeout == 90
         assert config.connect_timeout == 10
+        assert config.retries == {
+            "mode": "standard",
+            "total_max_attempts": BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
+        }
 
     @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
     @patch("skillspector.providers.bedrock.provider.boto3.Session")
@@ -352,14 +357,19 @@ class TestBedrockProviderToolChoice:
     @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
     @patch("skillspector.providers.bedrock.provider.boto3.Session")
     def test_create_chat_model_restricts_rejecting_models_to_auto(
-        self, mock_session: MagicMock, mock_chat: MagicMock
+        self,
+        mock_session: MagicMock,
+        mock_chat: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
         mock_session.return_value.get_credentials.return_value = MagicMock()
         mock_session.return_value.client.return_value = MagicMock()
         provider = BedrockProvider()
 
         provider.create_chat_model("us.anthropic.claude-fable-5-1", max_tokens=1024)
         assert mock_chat.call_args.kwargs["supports_tool_choice_values"] == ("auto",)
+        assert mock_chat.call_args.kwargs["temperature"] == 0.2
 
         provider.create_chat_model(BEDROCK_DEFAULT_MODEL, max_tokens=1024)
         assert "supports_tool_choice_values" not in mock_chat.call_args.kwargs

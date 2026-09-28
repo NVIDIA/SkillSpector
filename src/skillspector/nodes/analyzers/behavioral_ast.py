@@ -40,8 +40,8 @@ from skillspector.state import (
 )
 
 from .common import (
+    get_complete_source_segment,
     get_context_from_lines,
-    get_source_segment,
     resolve_call_name,
     resolve_dynamic_import_call,
 )
@@ -66,6 +66,53 @@ _DANGEROUS_BUILTINS = frozenset({"exec", "eval", "compile", "__import__"})
 # deliberately small — only names with essentially no legitimate ``getattr`` use — so
 # benign reflection such as ``getattr(obj, "name")`` stays unflagged.
 _DANGEROUS_GETATTR_NAMES = frozenset({"exec", "eval", "system", "popen", "__import__"})
+
+# dict methods that can retrieve an existing key's value exactly like a subscript
+# does. All three take the key as their first positional argument and, for any
+# key that already exists (every name in _DANGEROUS_GETATTR_NAMES always does,
+# on the module that defines it), return that same object: ``.get(key)`` reads
+# without mutating; ``.setdefault(key)`` reads without mutating *because* the
+# key is already present (the "set" branch never triggers); ``.pop(key)`` reads
+# and additionally removes the entry, which is irrelevant to whether the read
+# itself must be caught. Each is a further spelling of the same reflective
+# access the subscript form catches, so all three get identical treatment.
+_REFLECTIVE_DICT_READ_METHODS = frozenset({"get", "setdefault", "pop"})
+
+
+# Longest dangerous getattr name. The only consumer of `_constant_string`
+# compares the resolved value against `_DANGEROUS_GETATTR_NAMES`, so a resolved
+# value longer than this can never match. Capping the prospective join length
+# (computed before allocating) keeps an adversarial literal from expanding into
+# a memory-exhausting payload on untrusted skill source: the source-size gate
+# does not bound the expanded join value. Exceeding the cap returns unresolved
+# so the caller falls back to the existing AST7 dynamic-name treatment.
+_MAX_RESOLVED_GETATTR_NAME_LEN = max(len(name) for name in _DANGEROUS_GETATTR_NAMES)
+
+
+def _constant_string(node: ast.expr) -> str | None:
+    """Resolve a deliberately small safe subset of constant string expressions."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        parts = [_constant_string(item) for item in node.args[0].elts]
+        if all(part is not None for part in parts):
+            separator = node.func.value.value
+            # Bound the prospective output before allocating it. Nested joins
+            # are already bounded because the recursive call above returns None
+            # for any over-cap operand, which fails the `all()` check here.
+            prospective = sum(len(part) for part in parts) + len(separator) * max(len(parts) - 1, 0)
+            if prospective <= _MAX_RESOLVED_GETATTR_NAME_LEN:
+                return separator.join(parts)
+    return None
+
 
 _SUBPROCESS_CALLS = frozenset(
     {
@@ -326,6 +373,47 @@ def _deserialization_message(call_name: str, node: ast.Call) -> str | None:
     return None
 
 
+def _reflective_module_dict_container(container: ast.expr, aliases: dict[str, str]) -> str | None:
+    """Return the module name when *container* is an imported module's namespace.
+
+    Matches ``<module>.__dict__`` and ``vars(<module>)`` as a bare expression, so
+    callers can apply this to either a subscript target (``container[key]``) or a
+    ``.get(key)`` receiver (``container.get(key)``) — both read the module
+    namespace by key, so both must get the same treatment as ``getattr(module,
+    key)``. The base must resolve through the import-alias map to a plain
+    (non-dotted) module (``import os`` / ``import os as o``), which keeps
+    idiomatic instance attribute bags (``self.__dict__[...]``) and from-imported
+    classes out of scope.
+    """
+    base: ast.expr
+    if isinstance(container, ast.Attribute) and container.attr == "__dict__":
+        base = container.value
+    elif (
+        isinstance(container, ast.Call)
+        and isinstance(container.func, ast.Name)
+        and container.func.id == "vars"
+        and len(container.args) == 1
+    ):
+        base = container.args[0]
+    else:
+        return None
+    if not isinstance(base, ast.Name):
+        return None
+    resolved = aliases.get(base.id)
+    if resolved is None or "." in resolved:
+        return None
+    return resolved
+
+
+def _reflective_module_dict_base(node: ast.Subscript, aliases: dict[str, str]) -> str | None:
+    """Return the module name when *node* subscripts an imported module's namespace.
+
+    See :func:`_reflective_module_dict_container` — this is the subscript
+    (``<module>.__dict__[key]`` / ``vars(<module>)[key]``) entry point.
+    """
+    return _reflective_module_dict_container(node.value, aliases)
+
+
 def _analyze_python(
     python_ast: ParsedPythonFile,
     file_path: str,
@@ -338,22 +426,46 @@ def _analyze_python(
     aliases = python_ast.import_aliases
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
+    contexts: dict[tuple[int, int], str] = {}
+
+    def context_for(lineno: int, column: int) -> str:
+        key = (lineno, column)
+        context = contexts.get(key)
+        if context is None:
+            context = get_context_from_lines(lines, lineno, column=column)
+            contexts[key] = context
+        return context
 
     def _emit(
         rule_id: str,
-        lineno: int,
-        end_lineno: int | None,
+        ast_node: ast.Call,
         msg_override: str | None = None,
     ) -> None:
+        lineno = getattr(ast_node, "lineno", 1)
+        end_lineno = getattr(ast_node, "end_lineno", None)
+        complete_match = python_ast.source_segment(ast_node)
+        if complete_match is None:
+            complete_match = get_complete_source_segment(lines, lineno, end_lineno)
+        start_byte_column = getattr(ast_node, "col_offset", 0)
+        end_byte_column = getattr(ast_node, "end_col_offset", start_byte_column)
+        start_column = python_ast.character_column(lineno, start_byte_column)
+        end_column = python_ast.character_column(end_lineno or lineno, end_byte_column)
         finding = AnalyzerFinding(
             rule_id=rule_id,
             message=msg_override or _RULE_MESSAGES[rule_id],
             severity=_RULE_SEVERITIES[rule_id],
-            location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
+            location=Location(
+                file=file_path,
+                start_line=lineno,
+                end_line=end_lineno,
+                start_column=start_column,
+                end_column=end_column,
+            ),
             confidence=_RULE_CONFIDENCES[rule_id],
             tags=[_TAG],
-            context=get_context_from_lines(lines, lineno),
-            matched_text=get_source_segment(lines, lineno, end_lineno),
+            context=context_for(lineno, start_column if start_column is not None else 0),
+            matched_text=complete_match[:200],
+            complete_match=complete_match,
         )
         if budget is None:
             findings.append(finding)
@@ -363,8 +475,56 @@ def _analyze_python(
     for ast_node in ast.walk(tree):
         if budget is not None:
             budget.check_runtime()
+        if isinstance(ast_node, ast.Subscript):
+            module = _reflective_module_dict_base(ast_node, aliases)
+            if module is not None:
+                key = ast_node.slice
+                if isinstance(key, ast.Constant):
+                    if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
+                        _emit(
+                            "AST9",
+                            ast_node,
+                            f"Reflective dangerous access via {module}.__dict__ subscript "
+                            "with a literal sink name",
+                        )
+                else:
+                    _emit(
+                        "AST7",
+                        ast_node,
+                        f"Dynamic attribute access via {module}.__dict__ subscript",
+                    )
+            continue
         if not isinstance(ast_node, ast.Call):
             continue
+
+        if (
+            isinstance(ast_node.func, ast.Attribute)
+            and ast_node.func.attr in _REFLECTIVE_DICT_READ_METHODS
+            and ast_node.args
+        ):
+            # <module>.__dict__.get(key) / .setdefault(key) / .pop(key), and the
+            # same three on vars(<module>), all return the object a subscript
+            # would — further spellings of the same reflective access that must
+            # not evade AST7/AST9 either.
+            method = ast_node.func.attr
+            module = _reflective_module_dict_container(ast_node.func.value, aliases)
+            if module is not None:
+                key = ast_node.args[0]
+                if isinstance(key, ast.Constant):
+                    if isinstance(key.value, str) and key.value in _DANGEROUS_GETATTR_NAMES:
+                        _emit(
+                            "AST9",
+                            ast_node,
+                            f"Reflective dangerous access via {module}.__dict__.{method}() "
+                            "with a literal sink name",
+                        )
+                else:
+                    _emit(
+                        "AST7",
+                        ast_node,
+                        f"Dynamic attribute access via {module}.__dict__.{method}()",
+                    )
+                continue
 
         call_name = resolve_call_name(ast_node, aliases)
         if call_name is None:
@@ -374,9 +534,6 @@ def _analyze_python(
         if call_name is None:
             continue
 
-        lineno = getattr(ast_node, "lineno", 1)
-        end_lineno = getattr(ast_node, "end_lineno", None)
-
         if call_name == "exec":
             if _is_chain_sink(ast_node, aliases) and ast_node.args:
                 source = _contains_dangerous_source(
@@ -385,8 +542,8 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", lineno, end_lineno, f"Dangerous chain: exec() wrapping {source}")
-            _emit("AST1", lineno, end_lineno)
+                    _emit("AST8", ast_node, f"Dangerous chain: exec() wrapping {source}")
+            _emit("AST1", ast_node)
 
         elif call_name == "eval":
             if _is_chain_sink(ast_node, aliases) and ast_node.args:
@@ -396,34 +553,40 @@ def _analyze_python(
                     budget.check_runtime if budget is not None else None,
                 )
                 if source:
-                    _emit("AST8", lineno, end_lineno, f"Dangerous chain: eval() wrapping {source}")
-            _emit("AST2", lineno, end_lineno)
+                    _emit("AST8", ast_node, f"Dangerous chain: eval() wrapping {source}")
+            _emit("AST2", ast_node)
 
         elif call_name == "__import__":
-            _emit("AST3", lineno, end_lineno)
+            _emit("AST3", ast_node)
 
         elif call_name == "compile":
-            _emit("AST6", lineno, end_lineno)
+            _emit("AST6", ast_node)
 
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                _emit("AST4", lineno, end_lineno)
+                _emit("AST4", ast_node)
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
             if attr in _OS_EXEC_CALLS:
-                _emit("AST5", lineno, end_lineno)
+                _emit("AST5", ast_node)
 
         elif (deser_msg := _deserialization_message(call_name, ast_node)) is not None:
-            _emit("AST10", lineno, end_lineno, deser_msg)
+            _emit("AST10", ast_node, deser_msg)
 
         elif call_name == "getattr" and len(ast_node.args) >= 2:
             second_arg = ast_node.args[1]
-            if not isinstance(second_arg, ast.Constant):
-                _emit("AST7", lineno, end_lineno)
-            elif isinstance(second_arg.value, str) and second_arg.value in _DANGEROUS_GETATTR_NAMES:
-                _emit("AST9", lineno, end_lineno)
+            resolved_name = _constant_string(second_arg)
+            # A direct non-string literal cannot name an attribute.  Do not
+            # conflate it with a dynamic or constructed expression, which
+            # remains an AST7 signal unless it resolves to an AST9 sink.
+            if isinstance(second_arg, ast.Constant) and not isinstance(second_arg.value, str):
+                continue
+            if resolved_name in _DANGEROUS_GETATTR_NAMES:
+                _emit("AST9", ast_node)
+            elif resolved_name is None or not isinstance(second_arg, ast.Constant):
+                _emit("AST7", ast_node)
 
     return findings if budget is None else list(budget.current_findings)
 

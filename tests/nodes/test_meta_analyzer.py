@@ -201,6 +201,9 @@ def test_finding_clones_preserve_security_metadata_and_confidence() -> None:
         confidence=0.9,
         file="requirements.txt",
         start_line=4,
+        end_line=4,
+        start_column=7,
+        end_column=19,
         intent="malicious",
         evidence={"source": "static", "nested": {"kind": "deterministic"}},
         match_fingerprint="sha256:deterministic",
@@ -219,6 +222,7 @@ def test_finding_clones_preserve_security_metadata_and_confidence() -> None:
         assert returned.evidence == original.evidence
         assert returned.match_fingerprint == original.match_fingerprint
         assert returned.occurrences == original.occurrences
+        assert (returned.start_column, returned.end_column) == (7, 19)
 
 
 def test_exact_end_line_match_still_works() -> None:
@@ -328,7 +332,10 @@ class TestMetaLedgerResponse:
 
         assert events[0]["outcome"] is LedgerOutcome.FAILED
         assert events[0]["reason_code"] == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
-        assert events[0]["message"] == "LLM connection failed after bounded retries."
+        assert (
+            events[0]["message"]
+            == "Transient LLM provider failure persisted after bounded retries."
+        )
         assert status["status"] == "failed"
 
         completeness, _ = finalize_ledger(

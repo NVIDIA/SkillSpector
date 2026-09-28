@@ -56,7 +56,9 @@ class LedgerReason(StrEnum):
     LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
     LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
+    ANALYZER_LOAD_ERROR = "analyzer_load_error"
     UNACCOUNTED_WORK = "unaccounted_work"
+    SEMANTIC_RUNTIME_INCOMPLETE = "semantic_runtime_incomplete"
     FINDING_ACCOUNTING_ERROR = "finding_accounting_error"
     DISABLED_BY_CONFIGURATION = "disabled_by_configuration"
     MISSING_CREDENTIALS = "missing_credentials"
@@ -81,8 +83,10 @@ class LedgerReason(StrEnum):
     ARCHIVE_TIME_LIMIT = "archive_time_limit"
     VCS_METADATA = "vcs_metadata"
     OPAQUE_CONTENT = "opaque_content"
+    UNSUPPORTED_PRIMARY_CONTENT = "unsupported_primary_content"
     REFERENCED_UNINSPECTED = "referenced_uninspected"
     REFERENCE_EXTRACTION_LIMIT = "reference_extraction_limit"
+    REFERENCE_MISSING = "reference_missing"
     REFERENCE_UNRESOLVED = "reference_unresolved"
     MANIFEST_PARSE_ERROR = "manifest_parse_error"
     MANIFEST_PARSE_LIMIT = "manifest_parse_limit"
@@ -90,7 +94,9 @@ class LedgerReason(StrEnum):
     TRAVERSAL_DEPTH_LIMIT = "traversal_depth_limit"
     TOTAL_BYTES_LIMIT = "total_bytes_limit"
     RUNTIME_LIMIT = "runtime_limit"
+    EXCLUDED_EXECUTABLE_CONTENT = "excluded_executable_content"
     OUTPUT_LIMIT = "output_limit"
+    TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
@@ -113,9 +119,17 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
         "LLM returned a malformed structured response after bounded retries."
     ),
-    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
+    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: (
+        "Transient LLM provider failure persisted after bounded retries."
+    ),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
+    LedgerReason.ANALYZER_LOAD_ERROR: (
+        "Analyzer module failed to load and never began any inspection work."
+    ),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
+    LedgerReason.SEMANTIC_RUNTIME_INCOMPLETE: (
+        "Requested semantic analysis did not produce complete per-source runtime telemetry."
+    ),
     LedgerReason.FINDING_ACCOUNTING_ERROR: (
         "Finding identity could not be reconciled with completed work."
     ),
@@ -160,12 +174,21 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
         "VCS object and history metadata is outside the bounded artifact inspection profile."
     ),
     LedgerReason.OPAQUE_CONTENT: "Artifact contents could not be fully interpreted.",
+    LedgerReason.UNSUPPORTED_PRIMARY_CONTENT: (
+        "The requested file or primary instructions could not be interpreted. "
+        "Provide UTF-8 text, a supported ZIP, or an extracted directory instead."
+    ),
     LedgerReason.REFERENCED_UNINSPECTED: ("A referenced artifact was not completely inspected."),
     LedgerReason.REFERENCE_EXTRACTION_LIMIT: (
         "Reference extraction reached an explicit resource bound before completion."
     ),
+    LedgerReason.REFERENCE_MISSING: (
+        "A local path-like reference does not match any bundled artifact,"
+        " such as a file the skill writes at runtime."
+    ),
     LedgerReason.REFERENCE_UNRESOLVED: (
-        "A local path-like reference could not be resolved unambiguously."
+        "A local path-like reference matched more than one bundled artifact"
+        " and could not be resolved to a single target."
     ),
     LedgerReason.MANIFEST_PARSE_ERROR: (
         "Manifest frontmatter is malformed or uses an unsupported value shape."
@@ -177,7 +200,13 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.TRAVERSAL_DEPTH_LIMIT: ("Bundle discovery reached its directory-depth limit."),
     LedgerReason.TOTAL_BYTES_LIMIT: "Bundle caching reached its aggregate byte limit.",
     LedgerReason.RUNTIME_LIMIT: "Inspection reached its configured runtime limit.",
+    LedgerReason.EXCLUDED_EXECUTABLE_CONTENT: (
+        "Executable content was inventoried but excluded from content analysis."
+    ),
     LedgerReason.OUTPUT_LIMIT: "Inspection reached its configured output limit.",
+    LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED: (
+        "A transitive child scan failed before complete inspection."
+    ),
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
     ),
@@ -246,6 +275,9 @@ class AnalyzerStatusEvent(TypedDict):
     planned_work: list[PlannedWorkTarget]
     reason_code: NotRequired[LedgerReason]
     message: NotRequired[str]
+    source_url: NotRequired[str]
+    source_identity: NotRequired[str]
+    source_digest: NotRequired[str]
 
 
 class InspectionLedgerException(TypedDict):
@@ -860,6 +892,33 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
     ]
     exceptional_rows.extend(unaccounted_exceptions)
     exceptional_rows.extend(accounting_exceptions)
+    raw_inventory = state.get("artifact_inventory", [])
+    inventory = (
+        [item for item in raw_inventory if isinstance(item, dict)]
+        if isinstance(raw_inventory, list)
+        else []
+    )
+    fatal_reasons = {
+        (row["path"], row["reason_code"]) for row in exceptional_rows if row.get("fatal")
+    }
+    # The bounded detail ledger may omit a cache failure. Canonical inventory
+    # still owns the artifact's disposition: truncation cannot restore success.
+    for artifact in inventory:
+        if artifact.get("disposition") != "failed":
+            continue
+        path = _safe_path(artifact.get("path"), components)
+        reason = _reason(artifact.get("reason"), LedgerReason.READ_ERROR)
+        if (path, reason) not in fatal_reasons:
+            exceptional_rows.append(
+                _exception(
+                    outcome=LedgerOutcome.FAILED,
+                    phase="cache",
+                    reason=reason,
+                    path=path,
+                    fatal=True,
+                )
+            )
+            fatal_reasons.add((path, reason))
     ledger_exceptions = _merge_exception_projection(exceptional_rows)
     scope_exclusions = _merge_exception_projection(scope_rows)
 
@@ -885,12 +944,6 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
                 LedgerOutcome.FAILED if component in cache_failures else LedgerOutcome.COMPLETED
             )
 
-    raw_inventory = state.get("artifact_inventory", [])
-    inventory = (
-        [item for item in raw_inventory if isinstance(item, dict)]
-        if isinstance(raw_inventory, list)
-        else []
-    )
     disposition_by_path = {
         str(item.get("path", "")): str(item.get("disposition", "")) for item in inventory
     }

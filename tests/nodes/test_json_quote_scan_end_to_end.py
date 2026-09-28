@@ -92,7 +92,12 @@ async def test_json_quotes_preserve_public_verdict_across_scan_modes(
     tm1 = [finding for finding in verdict["findings"] if finding["id"] == "TM1"]
     if case == "instruction":
         assert len(tm1) == 1
-        assert tm1[0]["location"] == {"file": "SKILL.md", "start_line": 5, "end_line": None}
+        assert tm1[0]["location"] == {
+            "file": "SKILL.md",
+            "start_line": 5,
+            "end_line": None,
+            "start_column": 43,
+        }
         assert "declared-marker-view" in tm1[0]["tags"]
         assert completeness["is_complete"] is True
         assert verdict["recommendation"] != "SAFE"

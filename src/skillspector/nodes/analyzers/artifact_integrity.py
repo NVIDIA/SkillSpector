@@ -8,15 +8,21 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
+from bisect import bisect_right
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+import regex  # type: ignore[import-untyped]
+
 from skillspector.artifacts import (
     ContentKind,
+    SecurityTextView,
     _concealed_instruction_run_spans,
     _contextual_default_ignorable_boundary_spans,
     _obfuscated_instruction_matches,
+    multiline_prompt_injection_view,
+    prompt_injection_letter_spacing_view,
 )
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
@@ -36,6 +42,11 @@ from skillspector.state import (
 from skillspector.unicode_confusables import ASCII_CONFUSABLE_SKELETON
 
 from .common import LINE_BREAK_CHARS, LOGICAL_LINE_BREAK, get_line_number
+from .static_patterns_prompt_injection import (
+    BOUNDARYLESS_P3_P4_PATTERNS,
+    COMPILED_P3_PATTERNS,
+    COMPILED_P4_PATTERNS,
+)
 from .static_runner import MAX_FINDINGS_PER_ANALYZER, MAX_FINDINGS_PER_ARTIFACT
 
 ANALYZER_ID = "artifact_integrity"
@@ -61,6 +72,12 @@ _LETTER_SPACING_SECURITY_TERMS = (
     "unfiltered",
     "unrestricted",
     "userdata",
+    "withoutinforming",
+    "withoutnotifying",
+    "withouttelling",
+    "withouttheuserknowing",
+    "withouttheusernoticing",
+    "withouttheuserrealizing",
 )
 _LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
     {
@@ -73,6 +90,24 @@ _LETTER_SPACING_EXACT_SECURITY_TERMS = frozenset(
         "secrettoken",
         "systemprompt",
     }
+)
+_MAX_AMBIGUOUS_PROMPT_PHRASE = 512
+_MAX_IRREGULAR_SPACING_FRAGMENT_GAP = 2
+_IDENTIFIER_RELAXATION = str.maketrans({"_": " ", **{str(value): " " for value in range(10)}})
+_PROJECTED_PROMPT_PATTERNS = tuple(
+    pattern for pattern, _confidence in (*COMPILED_P3_PATTERNS, *COMPILED_P4_PATTERNS)
+)
+# Removing line breaks can give the existing wildcard patterns a much longer
+# search space. Interrupt the regex itself, not just work between matches.
+_MULTILINE_PROMPT_PATTERN_SECONDS = 0.25
+_MULTILINE_PROMPT_PATTERNS = tuple(
+    regex.compile(pattern.pattern, regex.ASCII | regex.IGNORECASE | regex.MULTILINE)
+    for pattern in _PROJECTED_PROMPT_PATTERNS
+)
+_PROMPT_ASCII_CASE_ALIASES = {"\u0130": "i", "\u0131": "i", "\u017f": "s", "\u212a": "k"}
+_PROMPT_EXTRA_ASCII_WHITESPACE = "\x1c\x1d\x1e\x1f"
+_PROMPT_ASCII_WHITESPACE_TRANSLATION = str.maketrans(
+    dict.fromkeys(_PROMPT_EXTRA_ASCII_WHITESPACE, " ")
 )
 _LETTER_SPACING_PROMPT_ACTIONS = (
     "disclose",
@@ -268,6 +303,7 @@ _LETTER_SPACING_SECURITY_SUFFIXES = (
 _MAX_LETTER_SPACING_SECURITY_CONNECTORS = 3
 _MAX_BENIGN_NOTATION_RUN_CHARS = 96
 _BENIGN_NOTATION_SECURITY_TERMS = frozenset({"bypass", "restrictions"})
+_BENIGN_NUCLEIC_ACID_ALPHABET = frozenset("acgtnu")
 _BENIGN_STANDALONE_BYPASS_SUM = re.compile(r"b *\+ *y *\+ *p *\+ *a *\+ *s *\+ *s")
 _BENIGN_SPELLING_PREFIX = re.compile(
     r"(?:the\s+)?spelling\s+(?:example|exercise)\s*",
@@ -333,6 +369,7 @@ _LETTER_SPACING_ALL_TARGETS = (
 )
 _MAX_LETTER_SPACING_SECURITY_PHRASE = max(
     max(map(len, _LETTER_SPACING_EXACT_SECURITY_TERMS)),
+    _MAX_AMBIGUOUS_PROMPT_PHRASE,
     max(map(len, _LETTER_SPACING_SECURITY_PREFIXES))
     + max(map(len, _LETTER_SPACING_ALL_ACTIONS))
     + _MAX_LETTER_SPACING_SECURITY_CONNECTORS * max(map(len, _LETTER_SPACING_SECURITY_CONNECTORS))
@@ -411,6 +448,11 @@ def _spacing_phrase_has_security_signal(phrase: str) -> bool:
     )
 
 
+def _ambiguous_prompt_phrase_has_security_signal(phrase: str) -> bool:
+    """Match bounded P3/P4 grammar only when source word boundaries are absent."""
+    return any(pattern.search(phrase) is not None for pattern in BOUNDARYLESS_P3_P4_PATTERNS)
+
+
 def _bounded_same_line_context(
     content: str,
     start: int,
@@ -487,11 +529,13 @@ def _spacing_span_has_security_signal(
     """Match bounded security semantics without retaining the full run."""
     if _spacing_span_is_benign_notation(content, span):
         return False
+    has_explicit_boundary = content.find("  ", span[0], span[1]) != -1
     overlap = ""
     letters: list[str] = []
     letter_characters = 0
     phrase_parts: list[str] = []
     phrase_characters = 0
+    phrase_alphabet: set[str] = set()
     phrase_overflow = False
     for offset in range(*span):
         if offset % _RUNTIME_CHECK_INTERVAL_CHARS == 0:
@@ -505,6 +549,7 @@ def _spacing_span_has_security_signal(
         folded = "".join(normalized for normalized in folded if normalized.isalpha())
         if not folded:
             continue
+        phrase_alphabet.update(folded)
         letters.append(folded)
         letter_characters += len(folded)
         if not phrase_overflow:
@@ -527,14 +572,32 @@ def _spacing_span_has_security_signal(
     if any(term in block for term in _LETTER_SPACING_SECURITY_TERMS):
         return True
     if phrase_overflow:
-        return False
-    if _spacing_phrase_has_security_signal("".join(phrase_parts)):
+        # Long letter-delimited DNA/RNA examples are common in prose and
+        # tables. This alphabet cannot spell any owned security grammar; any
+        # appended instruction introduces a non-base letter and still fails
+        # closed below.
+        if phrase_alphabet <= _BENIGN_NUCLEIC_ACID_ALPHABET:
+            return False
+        # A boundary-free letter stream this large cannot be reconstructed
+        # safely. Treat it as ambiguous instead of silently blessing it.
+        return not has_explicit_boundary
+    phrase = "".join(phrase_parts)
+    if _spacing_phrase_has_security_signal(phrase) or (
+        not has_explicit_boundary and _ambiguous_prompt_phrase_has_security_signal(phrase)
+    ):
         return True
+    shortened_phrase = "".join(phrase_parts[:-1])
     return (
         bool(phrase_parts)
         and span[1] < len(content)
         and content[span[1]].isalpha()
-        and _spacing_phrase_has_security_signal("".join(phrase_parts[:-1]))
+        and (
+            _spacing_phrase_has_security_signal(shortened_phrase)
+            or (
+                not has_explicit_boundary
+                and _ambiguous_prompt_phrase_has_security_signal(shortened_phrase)
+            )
+        )
     )
 
 
@@ -591,6 +654,199 @@ def _contextual_ignorable_security_line(
     return None
 
 
+def _projected_prompt_injection_line(
+    content: str,
+    budget: _ArtifactIntegrityBudget,
+) -> int | None:
+    """Return the first raw line whose letter-spacing projection matches P3/P4."""
+    view = prompt_injection_letter_spacing_view(
+        content,
+        budget.check_runtime,
+        preserve_identifier_boundaries=False,
+    )
+    if view.source_offsets is None:
+        return _multiline_prompt_injection_line(content, budget)
+    first_offset: int | None = None
+    identifier_relaxed_text = view.text.translate(_IDENTIFIER_RELAXATION)
+    projected_texts = (
+        (view.text, identifier_relaxed_text)
+        if identifier_relaxed_text != view.text
+        else (view.text,)
+    )
+    for projected_text in projected_texts:
+        for pattern in _PROJECTED_PROMPT_PATTERNS:
+            budget.check_runtime()
+            match = pattern.search(projected_text)
+            if match is None:
+                continue
+            reconstructed_gaps = view.reconstructed_source_spans(match.start(), match.end())
+            if not reconstructed_gaps:
+                continue
+            source_offset = reconstructed_gaps[0][0]
+            if first_offset is None or source_offset < first_offset:
+                first_offset = source_offset
+
+    irregular_projection = _irregular_spacing_prompt_projection(view)
+    if irregular_projection is not None:
+        irregular_text, join_points = irregular_projection
+        relaxed_irregular_text = irregular_text.translate(_IDENTIFIER_RELAXATION)
+        irregular_texts = (
+            (irregular_text, relaxed_irregular_text)
+            if relaxed_irregular_text != irregular_text
+            else (irregular_text,)
+        )
+        candidate_offsets = tuple(point[0] for point in join_points)
+        for projected_text in irregular_texts:
+            for pattern in _PROJECTED_PROMPT_PATTERNS:
+                budget.check_runtime()
+                for match in pattern.finditer(projected_text):
+                    budget.check_runtime()
+                    point_index = bisect_right(candidate_offsets, match.start())
+                    if (
+                        point_index >= len(join_points)
+                        or join_points[point_index][0] >= match.end()
+                    ):
+                        continue
+                    source_offset = join_points[point_index][1]
+                    if first_offset is None or source_offset < first_offset:
+                        first_offset = source_offset
+    if first_offset is not None:
+        return get_line_number(content, first_offset)
+    return _multiline_prompt_injection_line(content, budget)
+
+
+def _multiline_prompt_matching_text(text: str, budget: _ArtifactIntegrityBudget) -> str:
+    """Preserve Python ``re`` semantics in the timeout engine's ASCII alphabet.
+
+    Current P3/P4 grammar has ASCII literals, word/space classes and wildcards;
+    neither ``0`` nor ``~`` is a literal. Keep one character per source character:
+    Python's word members become ``0``, whitespace becomes a space, and other
+    non-ASCII characters become ``~``. The four Unicode aliases of ASCII letters
+    under Python IGNORECASE retain their corresponding letters. Literal newlines
+    stay unchanged, so wildcard boundaries and every match offset are preserved.
+    This is only a matching alphabet, never a replacement source/evidence view.
+    """
+    budget.check_runtime()
+    if text.isascii():
+        if not any(character in text for character in _PROMPT_EXTRA_ASCII_WHITESPACE):
+            return text
+        return text.translate(_PROMPT_ASCII_WHITESPACE_TRANSLATION)
+
+    parts: list[str] = []
+    for start in range(0, len(text), _RUNTIME_CHECK_INTERVAL_CHARS):
+        budget.check_runtime()
+        characters: list[str] = []
+        for character in text[start : start + _RUNTIME_CHECK_INTERVAL_CHARS]:
+            if character in _PROMPT_EXTRA_ASCII_WHITESPACE:
+                characters.append(" ")
+            elif character.isascii():
+                characters.append(character)
+            elif character in _PROMPT_ASCII_CASE_ALIASES:
+                characters.append(_PROMPT_ASCII_CASE_ALIASES[character])
+            elif character.isspace():
+                characters.append(" ")
+            else:
+                characters.append("0" if character.isalnum() else "~")
+        parts.append("".join(characters))
+    return "".join(parts)
+
+
+def _multiline_prompt_injection_line(
+    content: str,
+    budget: _ArtifactIntegrityBudget,
+) -> int | None:
+    """Fail closed for prompt-shaped singleton lines without flattening prose."""
+    view = multiline_prompt_injection_view(content, budget.check_runtime)
+    if view.source_offsets is None:
+        return None
+    matching_text = _multiline_prompt_matching_text(view.text, budget)
+    first_offset: int | None = None
+    for pattern in _MULTILINE_PROMPT_PATTERNS:
+        budget.check_runtime()
+        remaining = transitive_remaining_seconds(budget.state)
+        timeout = _MULTILINE_PROMPT_PATTERN_SECONDS
+        if remaining is not None:
+            timeout = min(timeout, max(0.0, remaining))
+        started_at = time.monotonic()
+        reconstruction_index = 0
+        try:
+            # Keep this short, interruptible search on the current thread.
+            # Releasing the GIL lets another analyzer consume its wall-clock
+            # allowance and turn ordinary prose into a false timeout.
+            for match in pattern.finditer(matching_text, timeout=timeout, concurrent=False):
+                budget.check_runtime()
+                # Matches and reconstruction spans are both ordered. Advance
+                # once per span, including ordinary matches before a spaced
+                # instruction, instead of rescanning all provenance per match.
+                while (
+                    reconstruction_index < len(view.reconstructions)
+                    and view.reconstructions[reconstruction_index].derived_end <= match.start() + 1
+                ):
+                    budget.check_runtime()
+                    reconstruction_index += 1
+                if reconstruction_index == len(view.reconstructions):
+                    break
+                reconstruction = view.reconstructions[reconstruction_index]
+                right = max(match.start() + 1, reconstruction.derived_start + 1)
+                if right < min(match.end(), reconstruction.derived_end):
+                    source_offset = view.source_offset(right - 1) + 1
+                    if first_offset is None or source_offset < first_offset:
+                        first_offset = source_offset
+                    # Later matches cannot precede this pattern's first gap.
+                    break
+        except TimeoutError as exc:
+            raise _ArtifactIntegrityResourceLimitError(
+                LedgerReason.RUNTIME_LIMIT,
+                {
+                    "observed_seconds": max(0.0, time.monotonic() - started_at),
+                    "limit_seconds": timeout,
+                },
+            ) from exc
+    return get_line_number(content, first_offset) if first_offset is not None else None
+
+
+def _irregular_spacing_prompt_projection(
+    view: SecurityTextView,
+) -> tuple[str, tuple[tuple[int, int], ...]] | None:
+    """Join only short gaps that split adjacent reconstructed fragments.
+
+    The primary projection preserves a width change because fully letter-spaced
+    phrases use wider gaps as explicit word boundaries. An alternating one/two
+    character gap can therefore split a short action into two reconstructed
+    fragments. Joining only short gaps *between* those proven fragments creates
+    a fail-closed AE6 view without erasing the wider observed word boundaries.
+    """
+    if view.source_offsets is None or len(view.reconstructions) < 2:
+        return None
+
+    removable_gaps: list[tuple[int, int]] = []
+    for left, right in zip(view.reconstructions, view.reconstructions[1:], strict=False):
+        gap_start = left.derived_end
+        gap_end = right.derived_start
+        gap = view.text[gap_start:gap_end]
+        if (
+            0 < len(gap) <= _MAX_IRREGULAR_SPACING_FRAGMENT_GAP
+            and gap.isspace()
+            and not any(character in LINE_BREAK_CHARS for character in gap)
+        ):
+            removable_gaps.append((gap_start, gap_end))
+    if not removable_gaps:
+        return None
+
+    parts: list[str] = []
+    join_points: list[tuple[int, int]] = []
+    cursor = 0
+    projected_length = 0
+    for gap_start, gap_end in removable_gaps:
+        part = view.text[cursor:gap_start]
+        parts.append(part)
+        projected_length += len(part)
+        join_points.append((projected_length, view.source_offset(gap_start)))
+        cursor = gap_end
+    parts.append(view.text[cursor:])
+    return "".join(parts), tuple(join_points)
+
+
 def _text_signals(
     content: str,
     budget: _ArtifactIntegrityBudget,
@@ -629,12 +885,14 @@ def _text_signals(
         if targeted_instruction is not None
         else None
     )
+    first_projected_prompt_line = _projected_prompt_injection_line(content, budget)
     obfuscation_lines = [
         value
         for value in (
             first_spacing_line,
             first_contextual_ignorable_line,
             first_targeted_instruction_line,
+            first_projected_prompt_line,
         )
         if value is not None
     ]

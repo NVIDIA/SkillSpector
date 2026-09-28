@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 import skillspector.python_ast as python_ast
@@ -14,9 +16,44 @@ from skillspector.nodes.analyzers import (
     behavioral_taint_tracking,
     static_patterns_data_exfiltration,
     static_patterns_output_handling,
+    static_runner,
 )
 from skillspector.nodes.build_context import build_context
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.python_ast import ParsedPythonFile, get_python_ast
+
+
+def test_long_output_flow_uses_complete_ast_source_identity() -> None:
+    def code(tail: str) -> str:
+        shared_arguments = "\n".join(f'        "{"a" * 80}",' for _ in range(5))
+        return (
+            "import subprocess\n"
+            "subprocess.run(\n"
+            "    [\n"
+            "        output,\n"
+            f"{shared_arguments}\n"
+            f'        "{tail}",\n'
+            "    ],\n"
+            "    shell=True,\n"
+            ")\n"
+        )
+
+    first_code = code("UNIQUE_FIRST_TAIL")
+    second_code = code("UNIQUE_SECOND_TAIL")
+    findings = static_patterns_output_handling.node(
+        {
+            "components": ["first.py", "second.py"],
+            "file_cache": {"first.py": first_code, "second.py": second_code},
+        }
+    )["findings"]
+    first = next(f for f in findings if f.rule_id == "OH1" and f.file == "first.py")
+    second = next(f for f in findings if f.rule_id == "OH1" and f.file == "second.py")
+
+    assert first.matched_text == second.matched_text
+    assert len(first.matched_text or "") == 200
+    assert first.fingerprint() != second.fingerprint()
+    assert len(deduplicate([first, second])) == 2
+    assert "UNIQUE_FIRST_TAIL" not in json.dumps(first.to_dict(), sort_keys=True)
 
 
 def test_preparsed_python_is_reused_by_all_ast_analyzers(tmp_path, monkeypatch) -> None:
@@ -92,12 +129,18 @@ def test_uppercase_python_path_reuses_preparsed_ast_for_static_analyzers(
 
 
 def test_graph_scan_parses_python_once_before_parallel_analyzers(tmp_path, monkeypatch) -> None:
-    """The runtime cache shares one parse across the graph's analyzer fan-out."""
+    """The runtime cache shares one parse across the graph's analyzer fan-out.
+
+    The fixture includes a literal ``os.path.join`` call so the test proves
+    the supplemental constructed-path analysis reuses the shared parse rather
+    than parsing again.
+    """
     (tmp_path / "script.py").write_text(
         "import os\n"
         "import subprocess\n"
         "payload = input()\n"
         "environment = os.environ.copy()\n"
+        "credential = os.path.join('/etc', 'passwd')\n"
         "subprocess.run(output)\n"
         "exec(payload)\n",
         encoding="utf-8",
@@ -115,5 +158,36 @@ def test_graph_scan_parses_python_once_before_parallel_analyzers(tmp_path, monke
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
 
     assert {"E2", "OH1", "AST1", "TT5"} <= {finding.rule_id for finding in result["findings"]}
+    assert any(
+        finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        for finding in result["findings"]
+    )
     assert parse_calls == 1
     assert JsonPlusSerializer().dumps_typed(result)
+
+
+def test_graph_scan_reports_constructed_path_above_view_window_chars(tmp_path) -> None:
+    """Windowed lexical scans keep constructed-path PE3 above the view window.
+
+    Regression test: routing the constructed-path analysis through
+    ``peek_python_ast`` dropped findings once the runner sliced content into
+    window views (above ``SECURITY_VIEW_WINDOW_CHARS``), because a slice never
+    matches the scan's whole-file cache entry.  The fragment fallback parses
+    the slice directly so large files keep their findings.  The source spells
+    the call through a renamed import (``from os.path import join as j``) to
+    pin that the cache-miss fallback recognizes renamed join spellings: the
+    plain ``join(`` textual gate never fires on the ``j(`` call site.
+    """
+    filler_line = "# " + "x" * 118 + "\n"
+    body = "from os.path import join as j\ncredential = j('/etc', 'passwd')\n"
+    target_chars = static_runner.SECURITY_VIEW_WINDOW_CHARS + 120_000
+    source = body + filler_line * ((target_chars - len(body)) // len(filler_line))
+    assert len(source) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+    (tmp_path / "large_script.py").write_text(source, encoding="utf-8")
+
+    result = graph.invoke({"skill_path": str(tmp_path), "use_llm": False})
+
+    assert any(
+        finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        for finding in result["findings"]
+    )

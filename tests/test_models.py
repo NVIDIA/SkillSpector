@@ -47,3 +47,36 @@ def test_finding_serializes_structured_evidence() -> None:
         "outer_path": "archive.docx",
         "nested_path": "payload.sh",
     }
+
+
+def test_optional_columns_preserve_legacy_shape_and_serialize_exact_locations() -> None:
+    legacy = Finding(rule_id="P1", message="legacy", file="SKILL.md", start_line=2)
+    precise = Finding(
+        rule_id="P1",
+        message="precise",
+        file="SKILL.md",
+        start_line=2,
+        end_line=2,
+        start_column=4,
+        end_column=12,
+    )
+
+    legacy_data = legacy.to_dict()
+    assert legacy_data["location"] == {
+        "file": "SKILL.md",
+        "start_line": 2,
+        "end_line": None,
+    }
+    assert "start_column" not in legacy_data["occurrences"][0]
+    assert "end_column" not in legacy_data["occurrences"][0]
+
+    precise_data = precise.to_dict()
+    assert precise_data["location"] == {
+        "file": "SKILL.md",
+        "start_line": 2,
+        "end_line": 2,
+        "start_column": 4,
+        "end_column": 12,
+    }
+    assert precise_data["occurrences"][0]["start_column"] == 4
+    assert precise_data["occurrences"][0]["end_column"] == 12

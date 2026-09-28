@@ -43,6 +43,8 @@ from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
 from .annotation import annotate_findings
+from .detection import detect_skill_language
+from .gap_fill import run_gap_fill
 
 logger = get_logger(__name__)
 
@@ -725,6 +727,8 @@ def run_one(
     detected_language: str = "en",
     gap_fill_applied: bool = False,
     gap_fill_findings: int = 0,
+    apply_gap_fill: bool = False,
+    api_pool=None,
 ) -> tuple[dict[str, object], str | None]:
     """Scan a single skill through the full graph pipeline.
 
@@ -737,12 +741,16 @@ def run_one(
     use_llm :
         Passed through to the graph as ``state["use_llm"]``.
     detected_language :
-        Language tag for annotation and reporting.
+        Language tag for annotation and reporting. ``"auto"`` detects it
+        from the graph's provider-eligible cache without rereading files.
     gap_fill_applied :
-        ``True`` when the caller has applied gap-fill (set by
-        :func:`~.batch_scan._scan_skill` after the graph returns).
+        Whether the caller has already applied gap-fill.
     gap_fill_findings :
         Number of gap-fill findings appended post-graph.
+    apply_gap_fill :
+        Run non-English gap-fill against the graph's provider-eligible cache.
+    api_pool :
+        Optional API key pool for gap-fill calls.
 
     Returns
     -------
@@ -754,6 +762,10 @@ def run_one(
     try:
         state = scan_state(skill_dir, use_llm=use_llm)
         result = graph.invoke(state)
+        # Use the validated snapshot; never reread paths or fall back to local-only content.
+        file_cache = result.get("llm_file_cache") or {}
+        if detected_language == "auto":
+            detected_language = detect_skill_language(file_cache)
         entry = entry_from_result(
             result,
             skill_dir,
@@ -762,6 +774,13 @@ def run_one(
             gap_fill_applied=gap_fill_applied,
             gap_fill_findings=gap_fill_findings,
         )
+        if apply_gap_fill and use_llm and detected_language != "en":
+            gap_findings = run_gap_fill(file_cache, detected_language, api_pool=api_pool)
+            entry["issues"] = list(entry.get("issues", [])) + annotate_findings(
+                [finding.to_dict() for finding in gap_findings], detected_language
+            )
+            entry["enhancements"]["gap_fill_applied"] = True
+            entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
         return entry, None
     except Exception as exc:
         rel_name = _rel_name(skill_dir, root)

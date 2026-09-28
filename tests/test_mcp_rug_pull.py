@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import json
+
 from skillspector.nodes.analyzers.mcp_rug_pull import node
 from skillspector.nodes.build_context import build_context
+from skillspector.nodes.deduplicate import deduplicate
 from skillspector.state import SkillspectorState
 
 
@@ -148,6 +151,25 @@ def test_rp3_version_wildcard_from_skill_frontmatter(tmp_path):
     rp3 = [finding for finding in result["findings"] if finding.rule_id == "RP3"]
     assert len(rp3) == 1
     assert rp3[0].matched_text == "*"
+
+
+def test_rp3_broad_version_preview_preserves_full_value_identity() -> None:
+    prefix = "^" + "1" * 200
+    complete_values = (prefix + "first", prefix + "second")
+    findings = [
+        next(
+            finding
+            for finding in node(_state(manifest={"version": value}))["findings"]
+            if finding.rule_id == "RP3"
+        )
+        for value in complete_values
+    ]
+
+    assert findings[0].matched_text == findings[1].matched_text
+    assert len({finding.fingerprint() for finding in findings}) == 2
+    assert len(deduplicate(findings)) == 2
+    for finding, complete_value in zip(findings, complete_values, strict=True):
+        assert complete_value not in json.dumps(finding.to_dict(), sort_keys=True)
 
 
 def test_rp3_version_ok_no_finding():
