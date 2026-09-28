@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -683,10 +685,17 @@ class TestRunBounded:
 
 class TestCliRegistry:
     def test_registry_covers_known_clis(self) -> None:
-        assert set(_agent_cli._REGISTRY) == {"claude", "codex", "gemini", "opencode", "agy"}
+        assert set(_agent_cli._REGISTRY) == {
+            "claude",
+            "codex",
+            "gemini",
+            "opencode",
+            "copilot",
+            "agy",
+        }
 
     def test_get_spec_returns_matching_binary(self) -> None:
-        for name in ("claude", "codex", "gemini", "opencode", "agy"):
+        for name in ("claude", "codex", "gemini", "opencode", "copilot", "agy"):
             assert _agent_cli.get_spec(name).binary == name
 
     def test_get_spec_unknown_raises(self) -> None:
@@ -743,6 +752,79 @@ class TestGeminiArgv:
     def test_parse_handles_multiple_text_keys(self) -> None:
         for key in ("response", "text", "content", "result", "output"):
             assert _agent_cli._parse_gemini_output(json.dumps({key: "answer"})) == "answer"
+
+
+class TestCopilotArgv:
+    """Flags verified against GitHub Copilot CLI 1.0.88; the security invariants
+    (no tool execution, no auto-approve, model validated) must hold."""
+
+    def test_argv_has_binary_and_model_no_bypass(self) -> None:
+        argv = _agent_cli._build_copilot_argv("copilot", "claude-sonnet-5", 4096)
+        assert argv[0] == "copilot"
+        assert "--model" in argv and "claude-sonnet-5" in argv
+        full = " ".join(argv)
+        assert "yolo" not in full
+        assert "--allow-all" not in full
+        # Exclusive allowlist naming no real tool -> every tool is stripped.
+        assert f"--available-tools={_agent_cli._COPILOT_NO_TOOLS_SENTINEL}" in argv
+        assert "--output-format=json" in argv
+
+    def test_prompt_never_placed_in_argv(self) -> None:
+        # No -p/--prompt: the prompt is piped to stdin by run_agent_cli.
+        argv = _agent_cli._build_copilot_argv("copilot", "", 4096)
+        assert "-p" not in argv and "--prompt" not in argv
+
+    def test_model_label_validated_against_injection(self) -> None:
+        with pytest.raises(AgentCLIError):
+            _agent_cli._build_copilot_argv("copilot", "--inject", 4096)
+
+    def test_model_flag_omitted_when_empty(self) -> None:
+        # No SKILLSPECTOR_MODEL -> copilot runs with the user's own model.
+        argv = _agent_cli._build_copilot_argv("copilot", "", 4096)
+        assert "--model" not in argv
+
+    def test_parse_returns_last_assistant_message(self) -> None:
+        raw = "\n".join(
+            json.dumps(obj)
+            for obj in (
+                {"type": "session.info", "data": {"message": "noise"}},
+                {"type": "assistant.message", "data": {"content": "first"}},
+                {"type": "assistant.message", "data": {"content": "final"}},
+                {"type": "result", "exitCode": 0},
+            )
+        )
+        assert _agent_cli._parse_copilot_output(raw) == "final"
+
+    def test_parse_skips_non_json_lines(self) -> None:
+        raw = 'warning: something\n{"type": "assistant.message", "data": {"content": "ok"}}'
+        assert _agent_cli._parse_copilot_output(raw) == "ok"
+
+    def test_parse_empty_stdout_raises(self) -> None:
+        with pytest.raises(AgentCLIError, match="empty stdout"):
+            _agent_cli._parse_copilot_output("   ")
+
+    def test_parse_without_assistant_message_raises(self) -> None:
+        with pytest.raises(AgentCLIError, match="no assistant message"):
+            _agent_cli._parse_copilot_output(json.dumps({"type": "session.info", "data": {}}))
+
+    def test_parse_nonzero_result_exit_code_raises(self) -> None:
+        raw = json.dumps({"type": "result", "exitCode": 1})
+        with pytest.raises(AgentCLIError, match="exitCode"):
+            _agent_cli._parse_copilot_output(raw)
+
+    def test_auth_check_accepts_env_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "ghu_example")
+        assert _agent_cli._copilot_auth_check("copilot") == (True, None)
+
+    def test_auth_check_fails_closed_without_credentials(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(os.path, "expanduser", lambda _p: str(tmp_path))
+        ok, reason = _agent_cli._copilot_auth_check("copilot")
+        assert ok is False
+        assert "copilot login" in (reason or "")
 
 
 class TestAntigravityDisabled:

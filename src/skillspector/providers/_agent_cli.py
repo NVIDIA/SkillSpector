@@ -875,6 +875,112 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# GitHub Copilot CLI invocation  (verified against GitHub Copilot CLI 1.0.88)
+# ---------------------------------------------------------------------------
+
+# A tool allowlist entry that matches no real tool. Copilot's --available-tools
+# is an exclusive allowlist: every tool not named is removed from the model's
+# tool set, so an intentionally unmatchable name strips ALL tools (built-ins and
+# MCP tools alike). Verified: the CLI reports every tool in "Disabled tools".
+_COPILOT_NO_TOOLS_SENTINEL = "skillspector-no-tools"
+
+
+def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
+    """Build a capability-stripped, non-interactive Copilot CLI argv.
+
+    Flags chosen (verified end-to-end against GitHub Copilot CLI 1.0.88):
+
+    no ``-p``
+        The prompt is piped to stdin; Copilot reads piped stdin as the prompt,
+        so untrusted content never reaches argv.
+
+    ``--available-tools=<sentinel>``
+        Exclusive allowlist naming no real tool — removes every built-in and
+        MCP tool from the model. This is the primary capability removal.
+        ``--allow-all-tools`` / ``--allow-all`` / ``--yolo`` (auto-approve) and
+        ``--allow-all-paths`` / ``--allow-all-urls`` are deliberately NEVER used.
+
+    ``--disable-builtin-mcps`` / ``--disallow-temp-dir``
+        Drops the bundled GitHub MCP server and the implicit temp-dir grant.
+
+    ``--output-format=json`` / ``--stream=off`` / ``-s`` / ``--log-level=none``
+        Structured JSONL on stdout with no progress chrome to parse around.
+
+    Variadic options are passed in ``--flag=value`` form so they cannot swallow
+    the flags that follow them.
+    """
+    # --model omitted by default -> copilot uses the user's own configured model
+    # (forwarded only when SKILLSPECTOR_MODEL is set).
+    model_arg = ["--model", _validate_model_label(model)] if model else []
+    return [
+        binary,
+        "-s",  # response only, no stats banner
+        f"--available-tools={_COPILOT_NO_TOOLS_SENTINEL}",  # no tool execution
+        "--disable-builtin-mcps",
+        "--disallow-temp-dir",
+        "--stream=off",
+        "--output-format=json",
+        "--log-level=none",
+        *model_arg,
+    ]
+
+
+def _parse_copilot_output(raw: str) -> str:
+    """Extract assistant text from ``copilot --output-format=json`` JSONL output.
+
+    Copilot emits one JSON object per line. The reply is carried by
+    ``assistant.message`` events; the last one is the final answer. Non-JSON
+    lines and event types we do not care about are skipped.
+
+    Raises:
+        AgentCLIError: on empty stdout or when no assistant message is present.
+    """
+    text = raw.strip()
+    if not text:
+        raise AgentCLIError("copilot returned empty stdout")
+    last_text = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj: Any = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "assistant.message":
+            data = obj.get("data")
+            if isinstance(data, dict):
+                content = data.get("content")
+                if isinstance(content, str) and content.strip():
+                    last_text = content
+        elif obj.get("type") == "result" and obj.get("exitCode") not in (0, None):
+            raise AgentCLIError(f"copilot reported exitCode={obj.get('exitCode')!r}")
+    if not last_text:
+        raise AgentCLIError(
+            f"copilot returned no assistant message in JSONL output; raw={raw[:400]!r}"
+        )
+    return last_text
+
+
+def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
+    """Check Copilot has local credentials available (no inference).
+
+    Copilot CLI 1.0.88 exposes no cheap non-interactive auth-status command.
+    ``copilot login`` resolves credentials from ``COPILOT_GITHUB_TOKEN`` /
+    ``GH_TOKEN`` / ``GITHUB_TOKEN`` or from the system credential store backed
+    by ``~/.copilot``, so we probe for those. A real call still fails closed if
+    the stored session has expired.
+    """
+    if any(os.environ.get(var) for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")):
+        return True, None
+    if os.path.isdir(os.path.join(os.path.expanduser("~"), ".copilot")):
+        return True, None
+    return False, "copilot is not authenticated (run `copilot login`)"
+
+
+# ---------------------------------------------------------------------------
 # Antigravity CLI  (registered but DISABLED — verified incompatible)
 #
 # The Antigravity CLI (binary: ``agy``) was tested end-to-end against the real
@@ -968,6 +1074,7 @@ _REGISTRY: dict[str, CliSpec] = {
         _prepare_opencode_env,
         _preflight_opencode_policy,
     ),
+    "copilot": CliSpec("copilot", _build_copilot_argv, _parse_copilot_output, _copilot_auth_check),
     # Disabled (fails closed via _build_agy_argv). agy's backend is Gemini, so it
     # reuses _parse_gemini_output rather than duplicating it — though parse is
     # never reached while _build_agy_argv raises. See the antigravity note above.
