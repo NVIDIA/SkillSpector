@@ -131,8 +131,8 @@ def test_explicit_import_reestablishes_direct_receivers() -> None:
     assert (
         len(
             _tm1(
-                "subprocess = Proxy()\n"
-                "Popen = Proxy()\n"
+                "subprocess = None\n"
+                "Popen = None\n"
                 "import subprocess\n"
                 "from subprocess import Popen\n"
                 "enabled = True\n"
@@ -157,7 +157,7 @@ def test_function_local_binding_and_outer_fact_are_independent() -> None:
         "def execute(command):\n"
         "    enabled = 'True'\n"
         "    subprocess.run(command, shell=enabled)\n"
-        "subprocess.run(command, shell=outer)\n"
+        "subprocess.run('/usr/bin/true', shell=outer)\n"
     )
 
     assert [finding.start_line for finding in findings] == [4, 5]
@@ -729,19 +729,14 @@ def test_external_name_store_treats_prior_binding_as_finalizer_capable() -> None
 
 def test_protocol_consuming_direct_call_invalidates_later_truth_fact() -> None:
     findings = _tm1(
-        "class MutatingArgs:\n"
-        "    def __iter__(self):\n"
-        "        global enabled\n"
-        "        enabled = False\n"
-        "        return iter(('/usr/bin/true',))\n"
-        "mutator = MutatingArgs()\n"
+        "from helpers import mutator\n"
         "import subprocess\n"
         "enabled = True\n"
         "subprocess.run(mutator, shell=enabled)\n"
         "subprocess.run('/usr/bin/true', shell=enabled)\n"
     )
 
-    assert [finding.start_line for finding in findings] == [9]
+    assert [finding.start_line for finding in findings] == [4]
 
 
 def test_annotated_assignment_is_outside_side_effect_free_contract() -> None:
@@ -817,13 +812,33 @@ def test_normalized_prefix_does_not_duplicate_true_direct_fallback() -> None:
     ],
 )
 def test_true_direct_calls_on_one_line_keep_distinct_locations(call_line: str) -> None:
-    findings = _tm1(f"true = True\n{call_line}\n")
+    findings = _tm1(f"items = [1]\ncommand = '/bin/true'\ntrue = True\n{call_line}\n")
     expected_columns = [
         index for index in range(len(call_line)) if call_line.startswith("subprocess.run", index)
     ]
 
     assert len(findings) == 2
     assert sorted(finding.start_column for finding in findings) == expected_columns
+
+
+def test_unknown_comprehension_protocol_invalidates_receiver_trust() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+def test_unknown_comprehension_protocol_invalidates_called_function_trust() -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "execute()\n"
+    )
 
 
 def test_true_direct_ownership_invalidation_is_per_call() -> None:

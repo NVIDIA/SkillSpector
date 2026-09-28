@@ -404,6 +404,156 @@ def _class_body_changed_direct_names(
     return affected
 
 
+def _nodes_contain_eager_call(nodes: list[ast.AST]) -> bool:
+    """Return whether eager evaluation reaches a call outside deferred bodies."""
+    pending = list(nodes)
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.Call):
+            return True
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not _function_header_is_passive(current):
+                return True
+            continue
+        if isinstance(current, ast.ClassDef):
+            if (
+                not _class_header_is_passive(current)
+                or _class_body_may_release_outer_value(current)
+                or _nodes_contain_eager_call(list(current.body))
+            ):
+                return True
+            continue
+        if isinstance(current, ast.Lambda):
+            defaults = (
+                *current.args.defaults,
+                *(item for item in current.args.kw_defaults if item is not None),
+            )
+            if any(not _is_passive_argument(default) for default in defaults):
+                return True
+            continue
+        pending.extend(ast.iter_child_nodes(current))
+    return False
+
+
+def _class_body_may_release_outer_value(statement: ast.ClassDef) -> bool:
+    """Return whether class execution stores to a declared outer name."""
+    declarations = _DirectBindingCollector(set())
+    for child in statement.body:
+        declarations.visit(child)
+    outer_names = declarations.nonlocal_names
+    if outer_names:
+        bindings = _DirectBindingCollector(outer_names)
+        for child in statement.body:
+            bindings.visit(child)
+        if bindings.bound.intersection(outer_names):
+            return True
+
+    pending: list[ast.AST] = list(statement.body)
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.ClassDef):
+            if _class_body_may_release_outer_value(current):
+                return True
+            continue
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        pending.extend(ast.iter_child_nodes(current))
+    return False
+
+
+def _class_body_has_eager_effects(statement: ast.ClassDef) -> bool:
+    """Return whether class execution can run user code or unsafe finalizers."""
+    declarations = _DirectBindingCollector(set())
+    for child in statement.body:
+        declarations.visit(child)
+    outer_names = declarations.nonlocal_names
+    bound_names: set[str] = set()
+    finalizer_safe_names: set[str] = set()
+
+    for child in statement.body:
+        if isinstance(child, (ast.Global, ast.Nonlocal, ast.Pass)) or (
+            isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant)
+        ):
+            continue
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            releases_unsafe_value = (
+                child.name in bound_names and child.name not in finalizer_safe_names
+            )
+            if (
+                child.name in outer_names
+                or not _function_header_is_passive(child)
+                or releases_unsafe_value
+            ):
+                return True
+            bound_names.add(child.name)
+            finalizer_safe_names.add(child.name)
+            continue
+        if isinstance(child, ast.ClassDef):
+            releases_unsafe_value = (
+                child.name in bound_names and child.name not in finalizer_safe_names
+            )
+            if (
+                child.name in outer_names
+                or not _class_header_is_passive(child)
+                or releases_unsafe_value
+                or _class_body_has_eager_effects(child)
+            ):
+                return True
+            bound_names.add(child.name)
+            finalizer_safe_names.add(child.name)
+            continue
+        if isinstance(child, ast.Assign):
+            if not all(isinstance(target, ast.Name) for target in child.targets):
+                return True
+            target_names = {target.id for target in child.targets if isinstance(target, ast.Name)}
+            if target_names.intersection(outer_names):
+                return True
+            releases_unsafe_value = any(
+                name in bound_names
+                and name not in finalizer_safe_names
+                and not (isinstance(child.value, ast.Name) and child.value.id == name)
+                for name in target_names
+            )
+            if releases_unsafe_value or not _is_finalizer_safe_value(
+                child.value,
+                finalizer_safe_names,
+            ):
+                return True
+            bound_names.update(target_names)
+            finalizer_safe_names.update(target_names)
+            continue
+        if isinstance(child, ast.AnnAssign):
+            if not isinstance(child.target, ast.Name) or not _annotation_is_passive(
+                child.annotation
+            ):
+                return True
+            if child.value is None:
+                continue
+            target_name = child.target.id
+            if target_name in outer_names:
+                return True
+            releases_unsafe_value = (
+                target_name in bound_names
+                and target_name not in finalizer_safe_names
+                and not (isinstance(child.value, ast.Name) and child.value.id == target_name)
+            )
+            if releases_unsafe_value or not _is_finalizer_safe_value(
+                child.value,
+                finalizer_safe_names,
+            ):
+                return True
+            bound_names.add(target_name)
+            finalizer_safe_names.add(target_name)
+            continue
+        if isinstance(child, ast.Assert) and _is_finalizer_safe_value(
+            child.test,
+            finalizer_safe_names,
+        ):
+            continue
+        return True
+    return False
+
+
 def _class_deferred_receiver_trust(
     statement: ast.ClassDef,
     trusted_names: set[str],
@@ -425,22 +575,7 @@ def _class_deferred_receiver_trust(
             if owner is not None:
                 trusted_at_call_by_definition.setdefault(owner, set()).update(deferred)
 
-        pending = [child]
-        contains_call = False
-        while pending:
-            current = pending.pop()
-            if isinstance(current, ast.Call):
-                contains_call = True
-                break
-            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                pending.extend(_DirectBindingCollector._function_header_nodes(current))
-                continue
-            if isinstance(current, ast.Lambda):
-                pending.extend(current.args.defaults)
-                pending.extend(item for item in current.args.kw_defaults if item is not None)
-                continue
-            pending.extend(ast.iter_child_nodes(current))
-        if contains_call:
+        if _nodes_contain_eager_call([child]):
             # Class-body expressions run before any method can be called and may
             # mutate the surrounding module/function receiver binding.
             deferred.clear()
@@ -587,32 +722,31 @@ def _call_arguments_are_passive(call: ast.Call) -> bool:
     )
 
 
-def _comprehension_target_is_simple(target: ast.expr) -> bool:
-    """Return whether binding a comprehension target cannot dispatch user code."""
-    if isinstance(target, ast.Name):
-        return True
-    if isinstance(target, (ast.Tuple, ast.List)):
-        return all(
-            not isinstance(item, ast.Starred) and _comprehension_target_is_simple(item)
-            for item in target.elts
-        )
-    return False
-
-
-def _value_preserves_receiver_trust(expression: ast.expr, trusted_names: set[str]) -> bool:
-    """Return whether evaluating a value cannot replace a trusted receiver."""
+def _value_preserves_receiver_trust(
+    expression: ast.expr,
+    trusted_names: set[str],
+    protocol_safe_names: set[str] | None = None,
+) -> bool:
+    """Return whether eager evaluation cannot replace a direct receiver."""
     if _is_passive_argument(expression):
         return True
-    if (
-        isinstance(expression, ast.Call)
-        and _is_direct_subprocess_call(expression, trusted_names)
-        and _call_arguments_are_passive(expression)
-    ):
-        return True
+    if isinstance(expression, ast.Call):
+        return (
+            _is_direct_subprocess_call(expression, trusted_names)
+            and _call_arguments_are_passive(expression)
+            and (
+                protocol_safe_names is None
+                or _call_arguments_are_protocol_safe(expression, protocol_safe_names)
+            )
+        )
     if isinstance(expression, (ast.Tuple, ast.List)):
         return all(
             not isinstance(item, ast.Starred)
-            and _value_preserves_receiver_trust(item, trusted_names)
+            and _value_preserves_receiver_trust(
+                item,
+                trusted_names,
+                protocol_safe_names,
+            )
             for item in expression.elts
         )
     if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
@@ -621,13 +755,36 @@ def _value_preserves_receiver_trust(expression: ast.expr, trusted_names: set[str
         values = [expression.key, expression.value]
     else:
         return False
-    return all(_value_preserves_receiver_trust(value, trusted_names) for value in values) and all(
-        _comprehension_target_is_simple(generator.target)
-        and _value_preserves_receiver_trust(generator.iter, trusted_names)
-        and all(
-            _value_preserves_receiver_trust(condition, trusted_names) for condition in generator.ifs
+    for generator in expression.generators:
+        if generator.is_async or not _is_simple_comprehension_target(generator.target):
+            return False
+        if protocol_safe_names is not None and (
+            not _is_finalizer_safe_value(generator.iter, protocol_safe_names)
+            or any(
+                not _is_finalizer_safe_value(condition, protocol_safe_names)
+                for condition in generator.ifs
+            )
+        ):
+            return False
+        values.extend((generator.iter, *generator.ifs))
+    # Comprehensions have historically retained ownership for their direct
+    # subprocess calls. Preserve that behavior while still rejecting generic
+    # nested calls and receiver stores.
+    return all(
+        _value_preserves_receiver_trust(
+            value,
+            trusted_names,
+            protocol_safe_names,
         )
-        for generator in expression.generators
+        for value in values
+    )
+
+
+def _is_simple_comprehension_target(target: ast.expr) -> bool:
+    if isinstance(target, ast.Name):
+        return True
+    return isinstance(target, (ast.Tuple, ast.List)) and all(
+        _is_simple_comprehension_target(item) for item in target.elts
     )
 
 
@@ -698,13 +855,12 @@ def _function_header_is_passive(
 
 def _class_header_is_passive(statement: ast.ClassDef) -> bool:
     """Return whether evaluating a class header cannot rebind a receiver."""
-    expressions = [
-        *statement.decorator_list,
-        *statement.bases,
-        *(keyword.value for keyword in statement.keywords),
-        *getattr(statement, "type_params", []),
-    ]
-    return all(_is_passive_argument(expression) for expression in expressions)
+    return not (
+        statement.decorator_list
+        or statement.bases
+        or statement.keywords
+        or getattr(statement, "type_params", [])
+    )
 
 
 def _is_immediate_function(statement: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -738,28 +894,66 @@ def _passive_direct_call(statement: ast.stmt) -> ast.Call | None:
     return None
 
 
-def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None:
-    """Apply one statement's receiver-trust effects."""
-    value = (
-        statement.value if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign)) else None
-    )
-    if value is not None and not _value_preserves_receiver_trust(value, trusted_names):
-        trusted_names.clear()
-        return
-    if isinstance(statement, ast.AnnAssign) and not _annotation_is_passive(statement.annotation):
-        trusted_names.clear()
-        return
+def _advance_trusted_names(
+    statement: ast.stmt,
+    trusted_names: set[str],
+    bound_names: set[str],
+    finalizer_safe_names: set[str],
+    unknown_unsafe_bindings: list[bool],
+) -> None:
+    """Apply one eager statement's receiver-trust and value-release effects."""
     if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        imported_names = _direct_bound_names(statement)
+        releases_unsafe_value = any(
+            name in bound_names and name not in finalizer_safe_names for name in imported_names
+        )
+        bound_names.update(imported_names)
+        finalizer_safe_names.difference_update(imported_names)
         _update_trusted_names_from_import(statement, trusted_names)
+        imports_unknown_names = isinstance(statement, ast.ImportFrom) and any(
+            imported.name == "*" for imported in statement.names
+        )
+        if releases_unsafe_value or imports_unknown_names:
+            unknown_unsafe_bindings[0] = True
+        if releases_unsafe_value or unknown_unsafe_bindings[0]:
+            trusted_names.clear()
         return
     if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        if not _function_header_is_passive(statement):
+        releases_unsafe_value = (
+            statement.name in bound_names and statement.name not in finalizer_safe_names
+        )
+        if not _function_header_is_passive(statement) or releases_unsafe_value:
             trusted_names.clear()
+            unknown_unsafe_bindings[0] = True
+        bound_names.add(statement.name)
+        finalizer_safe_names.discard(statement.name)
         trusted_names.discard(statement.name)
         return
     if isinstance(statement, ast.Assign):
-        if not all(isinstance(target, ast.Name) for target in statement.targets):
+        targets = list(statement.targets)
+        simple_targets = all(isinstance(target, ast.Name) for target in targets)
+        result_is_finalizer_safe = _is_finalizer_safe_value(
+            statement.value,
+            finalizer_safe_names,
+        )
+        preserves_receiver_trust = simple_targets and _value_preserves_receiver_trust(
+            statement.value,
+            trusted_names,
+            finalizer_safe_names,
+        )
+        releases_unsafe_value = simple_targets and any(
+            target.id in bound_names
+            and target.id not in finalizer_safe_names
+            and not (isinstance(statement.value, ast.Name) and statement.value.id == target.id)
+            for target in targets
+            if isinstance(target, ast.Name)
+        )
+        if not preserves_receiver_trust or releases_unsafe_value:
             trusted_names.clear()
+            finalizer_safe_names.clear()
+            unknown_unsafe_bindings[0] = True
+        if not simple_targets:
+            bound_names.update(_direct_bound_names(statement))
             return
         changed = _changed_direct_names(
             [statement.value, *statement.targets],
@@ -774,31 +968,117 @@ def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None
             and target.id in trusted_names
         }
         trusted_names.difference_update(changed.difference(preserved))
+        for target in targets:
+            assert isinstance(target, ast.Name)
+            bound_names.add(target.id)
+            if preserves_receiver_trust and not releases_unsafe_value and result_is_finalizer_safe:
+                finalizer_safe_names.add(target.id)
+            else:
+                finalizer_safe_names.discard(target.id)
         return
     if isinstance(statement, ast.AnnAssign):
-        if not isinstance(statement.target, ast.Name):
+        value = statement.value
+        target = statement.target
+        simple_target = isinstance(target, ast.Name)
+        preserves_receiver_trust = (
+            simple_target
+            and _annotation_is_passive(statement.annotation)
+            and (
+                value is None
+                or _value_preserves_receiver_trust(
+                    value,
+                    trusted_names,
+                    finalizer_safe_names,
+                )
+            )
+        )
+        releases_unsafe_value = (
+            value is not None
+            and simple_target
+            and target.id in bound_names
+            and target.id not in finalizer_safe_names
+            and not (isinstance(value, ast.Name) and value.id == target.id)
+        )
+        result_is_finalizer_safe = value is not None and _is_finalizer_safe_value(
+            value,
+            finalizer_safe_names,
+        )
+        if not preserves_receiver_trust or releases_unsafe_value:
             trusted_names.clear()
-            return
+            finalizer_safe_names.clear()
+            unknown_unsafe_bindings[0] = True
+        if value is not None:
+            bound_names.update(_direct_bound_names(statement))
+            if simple_target:
+                if (
+                    preserves_receiver_trust
+                    and not releases_unsafe_value
+                    and result_is_finalizer_safe
+                ):
+                    finalizer_safe_names.add(target.id)
+                else:
+                    finalizer_safe_names.discard(target.id)
         trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
         return
     if isinstance(statement, ast.ClassDef):
+        releases_unsafe_value = (
+            statement.name in bound_names and statement.name not in finalizer_safe_names
+        )
+        unsafe_class_execution = (
+            not _class_header_is_passive(statement)
+            or _class_body_has_eager_effects(statement)
+            or releases_unsafe_value
+        )
+        if unsafe_class_execution:
+            trusted_names.clear()
+            unknown_unsafe_bindings[0] = True
+            finalizer_safe_names.clear()
+        else:
+            finalizer_safe_names.discard(statement.name)
         trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
         trusted_names.difference_update(_class_body_changed_direct_names(statement, trusted_names))
+        bound_names.update(_direct_bound_names(statement))
         return
     if isinstance(statement, ast.Expr):
-        trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+        value = statement.value
+        preserves_receiver_trust = _value_preserves_receiver_trust(
+            value,
+            trusted_names,
+            finalizer_safe_names,
+        )
+        if not preserves_receiver_trust:
+            trusted_names.clear()
+            unknown_unsafe_bindings[0] = True
+            finalizer_safe_names.clear()
+        else:
+            trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+        bound_names.update(_direct_bound_names(statement))
         return
     if isinstance(statement, ast.Assert):
         expressions = [statement.test]
         if statement.msg is not None:
             expressions.append(statement.msg)
-        if all(_value_preserves_receiver_trust(item, trusted_names) for item in expressions):
-            return
-        trusted_names.clear()
+        if not (
+            _is_finalizer_safe_value(statement.test, finalizer_safe_names)
+            and all(
+                _value_preserves_receiver_trust(
+                    item,
+                    trusted_names,
+                    finalizer_safe_names,
+                )
+                for item in expressions
+            )
+        ):
+            trusted_names.clear()
+            unknown_unsafe_bindings[0] = True
+            finalizer_safe_names.clear()
         return
     if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
         return
+    bound_names.update(_direct_bound_names(statement))
+    finalizer_safe_names.clear()
     trusted_names.clear()
+    unknown_unsafe_bindings[0] = True
 
 
 class _Analyzer:
@@ -869,6 +1149,7 @@ class _Analyzer:
         trusted_names: set[str],
         bound_names: set[str],
         finalizer_safe_names: set[str],
+        unknown_unsafe_bindings: list[bool],
     ) -> None:
         simple_targets = all(isinstance(target, ast.Name) for target in targets)
         releases_unsafe_value = simple_targets and any(
@@ -883,6 +1164,7 @@ class _Analyzer:
         preserves_receiver_trust = simple_targets and _value_preserves_receiver_trust(
             value,
             trusted_names,
+            finalizer_safe_names,
         )
         if isinstance(value, ast.Call):
             self._record_bound_shell_call(value, trusted_names)
@@ -908,6 +1190,7 @@ class _Analyzer:
                     bound_names.add(target.id)
             if not preserves_receiver_trust:
                 trusted_names.clear()
+                unknown_unsafe_bindings[0] = True
             else:
                 trusted_names.difference_update(
                     _changed_direct_names([value, *targets], trusted_names)
@@ -917,10 +1200,12 @@ class _Analyzer:
             facts.clear()
             finalizer_safe_names.clear()
             trusted_names.clear()
+            unknown_unsafe_bindings[0] = True
         if call_has_protocol_effects:
             facts.clear()
             finalizer_safe_names.clear()
             trusted_names.clear()
+            unknown_unsafe_bindings[0] = True
         for target in targets:
             assert isinstance(target, ast.Name)
             bound_names.add(target.id)
@@ -951,17 +1236,30 @@ class _Analyzer:
         facts: dict[str, bool] = {}
         bound_names = set(initial_bound_names or ())
         finalizer_safe_names: set[str] = set()
+        unknown_unsafe_bindings = [False]
 
         last_invalidation_by_name: dict[str, int] = {}
         receiver_trust = set(trusted_names)
+        receiver_bound_names = set(initial_bound_names or ())
+        receiver_finalizer_safe_names: set[str] = set()
+        receiver_unknown_unsafe_bindings = [False]
         for candidate_index, candidate in enumerate(statements):
             before = set(receiver_trust)
-            _advance_trusted_names(candidate, receiver_trust)
+            _advance_trusted_names(
+                candidate,
+                receiver_trust,
+                receiver_bound_names,
+                receiver_finalizer_safe_names,
+                receiver_unknown_unsafe_bindings,
+            )
             for name in before.difference(receiver_trust):
                 last_invalidation_by_name[name] = candidate_index
 
         trusted_at_call_by_definition: dict[int, set[str]] = {}
         receiver_trust = set(trusted_names)
+        receiver_bound_names = set(initial_bound_names or ())
+        receiver_finalizer_safe_names = set()
+        receiver_unknown_unsafe_bindings = [False]
         active_functions: dict[str, int] = {}
         for candidate_index, candidate in enumerate(statements):
             call = _passive_direct_call(candidate)
@@ -980,7 +1278,13 @@ class _Analyzer:
                 and _is_immediate_function(candidate)
             ):
                 active_functions[candidate.name] = candidate_index
-            _advance_trusted_names(candidate, receiver_trust)
+            _advance_trusted_names(
+                candidate,
+                receiver_trust,
+                receiver_bound_names,
+                receiver_finalizer_safe_names,
+                receiver_unknown_unsafe_bindings,
+            )
 
         for index, statement in enumerate(statements):
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1018,14 +1322,27 @@ class _Analyzer:
                     facts.clear()
                     finalizer_safe_names.clear()
                     trusted_names.clear()
+                    unknown_unsafe_bindings[0] = True
                 bound_names.add(statement.name)
                 finalizer_safe_names.discard(statement.name)
                 trusted_names.discard(statement.name)
             elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                imported_names = _direct_bound_names(statement)
+                releases_unsafe_value = any(
+                    name in bound_names and name not in finalizer_safe_names
+                    for name in imported_names
+                )
                 facts.clear()
-                finalizer_safe_names.clear()
-                bound_names.update(_direct_bound_names(statement))
+                finalizer_safe_names.difference_update(imported_names)
+                bound_names.update(imported_names)
                 _update_trusted_names_from_import(statement, trusted_names)
+                imports_unknown_names = isinstance(statement, ast.ImportFrom) and any(
+                    imported.name == "*" for imported in statement.names
+                )
+                if releases_unsafe_value or imports_unknown_names:
+                    unknown_unsafe_bindings[0] = True
+                if releases_unsafe_value or unknown_unsafe_bindings[0]:
+                    trusted_names.clear()
             elif isinstance(statement, ast.Assign):
                 self._scan_assignment(
                     list(statement.targets),
@@ -1034,29 +1351,57 @@ class _Analyzer:
                     trusted_names,
                     bound_names,
                     finalizer_safe_names,
+                    unknown_unsafe_bindings,
                 )
             elif isinstance(statement, ast.AnnAssign):
                 value = statement.value
-                preserves_receiver_trust = isinstance(statement.target, ast.Name) and (
-                    value is None or _value_preserves_receiver_trust(value, trusted_names)
+                target = statement.target
+                simple_target = isinstance(target, ast.Name)
+                releases_unsafe_value = (
+                    value is not None
+                    and simple_target
+                    and target.id in bound_names
+                    and target.id not in finalizer_safe_names
+                    and not (isinstance(value, ast.Name) and value.id == target.id)
+                )
+                result_is_finalizer_safe = value is not None and _is_finalizer_safe_value(
+                    value,
+                    finalizer_safe_names,
+                )
+                preserves_receiver_trust = (
+                    simple_target
+                    and _annotation_is_passive(statement.annotation)
+                    and (
+                        value is None
+                        or _value_preserves_receiver_trust(
+                            value,
+                            trusted_names,
+                            finalizer_safe_names,
+                        )
+                    )
                 )
                 if isinstance(value, ast.Call):
                     self._record_bound_shell_call(value, trusted_names)
                 if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
                     if _shell_argument_is_captured_before_effects(value):
                         self._inspect_call(value, facts)
-                    preserves_receiver_trust = (
-                        preserves_receiver_trust
-                        and _call_arguments_are_protocol_safe(value, finalizer_safe_names)
-                    )
-                if not _annotation_is_passive(statement.annotation):
-                    preserves_receiver_trust = False
                 facts.clear()
-                finalizer_safe_names.clear()
+                if not preserves_receiver_trust or releases_unsafe_value:
+                    finalizer_safe_names.clear()
                 if value is not None:
                     bound_names.update(_direct_bound_names(statement))
-                if not preserves_receiver_trust:
+                    if (
+                        simple_target
+                        and preserves_receiver_trust
+                        and not releases_unsafe_value
+                        and result_is_finalizer_safe
+                    ):
+                        finalizer_safe_names.add(target.id)
+                    elif simple_target:
+                        finalizer_safe_names.discard(target.id)
+                if not preserves_receiver_trust or releases_unsafe_value:
                     trusted_names.clear()
+                    unknown_unsafe_bindings[0] = True
                 else:
                     trusted_names.difference_update(
                         _changed_direct_names([statement], trusted_names)
@@ -1066,6 +1411,7 @@ class _Analyzer:
                 finalizer_safe_names.clear()
                 bound_names.update(_direct_bound_names(statement))
                 trusted_names.clear()
+                unknown_unsafe_bindings[0] = True
             elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
                 call = statement.value
                 self._record_bound_shell_call(call, trusted_names)
@@ -1078,35 +1424,53 @@ class _Analyzer:
                         facts.clear()
                         finalizer_safe_names.clear()
                         trusted_names.clear()
+                        unknown_unsafe_bindings[0] = True
                 else:
                     facts.clear()
                     finalizer_safe_names.clear()
                     trusted_names.clear()
+                    unknown_unsafe_bindings[0] = True
             elif isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)) or (
                 isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
             ):
                 continue
             elif isinstance(statement, ast.Expr):
-                facts.clear()
-                finalizer_safe_names.clear()
+                preserves_receiver_trust = _value_preserves_receiver_trust(
+                    statement.value,
+                    trusted_names,
+                    finalizer_safe_names,
+                )
                 bound_names.update(_direct_bound_names(statement))
-                if _value_preserves_receiver_trust(statement.value, trusted_names):
+                if preserves_receiver_trust:
                     trusted_names.difference_update(
                         _changed_direct_names([statement], trusted_names)
                     )
                 else:
+                    facts.clear()
+                    finalizer_safe_names.clear()
                     trusted_names.clear()
+                    unknown_unsafe_bindings[0] = True
             elif isinstance(statement, ast.Assert):
-                facts.clear()
-                finalizer_safe_names.clear()
                 expressions = [statement.test]
                 if statement.msg is not None:
                     expressions.append(statement.msg)
-                if not all(
-                    _value_preserves_receiver_trust(item, trusted_names) for item in expressions
-                ):
+                preserves_receiver_trust = all(
+                    _value_preserves_receiver_trust(
+                        item,
+                        trusted_names,
+                        finalizer_safe_names,
+                    )
+                    for item in expressions
+                ) and _is_finalizer_safe_value(statement.test, finalizer_safe_names)
+                facts.clear()
+                if not preserves_receiver_trust:
+                    finalizer_safe_names.clear()
                     trusted_names.clear()
+                    unknown_unsafe_bindings[0] = True
             elif isinstance(statement, ast.ClassDef):
+                releases_unsafe_value = (
+                    statement.name in bound_names and statement.name not in finalizer_safe_names
+                )
                 class_trusted_names = set(trusted_names)
                 passive_class_header = _class_header_is_passive(statement)
                 if not passive_class_header:
@@ -1135,17 +1499,30 @@ class _Analyzer:
                     nested_function_trusted_at_call=method_trusted_at_call,
                 )
                 facts.clear()
-                finalizer_safe_names.clear()
                 bound_names.update(_direct_bound_names(statement))
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
-                trusted_names.difference_update(
-                    _class_body_changed_direct_names(statement, trusted_names)
+                unsafe_class_execution = (
+                    not passive_class_header
+                    or releases_unsafe_value
+                    or _class_body_has_eager_effects(statement)
                 )
+                if unsafe_class_execution:
+                    finalizer_safe_names.clear()
+                    trusted_names.clear()
+                    unknown_unsafe_bindings[0] = True
+                else:
+                    finalizer_safe_names.discard(statement.name)
+                    trusted_names.difference_update(
+                        _changed_direct_names([statement], trusted_names)
+                    )
+                    trusted_names.difference_update(
+                        _class_body_changed_direct_names(statement, trusted_names)
+                    )
             else:
                 facts.clear()
                 finalizer_safe_names.clear()
                 bound_names.update(_direct_bound_names(statement))
                 trusted_names.clear()
+                unknown_unsafe_bindings[0] = True
 
     def run(self, tree: ast.Module) -> list[AnalyzerFinding]:
         self._scan_block(tree.body)
