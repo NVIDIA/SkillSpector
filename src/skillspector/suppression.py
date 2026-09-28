@@ -55,16 +55,19 @@ a keyword in ``*`` (e.g. ``"*telemetry*"``) for substring matching.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
 import json
 import os
 import posixpath
 import re
+import sys
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_IMODE, S_ISREG
 from typing import Any
 
 import yaml
@@ -642,12 +645,59 @@ def build_baseline_dict(
     }
 
 
+def _restrict_baseline_temporary(descriptor: int) -> None:
+    """Remove inherited access before a temporary file receives baseline data."""
+    if os.name == "posix":
+        # Also masks named-user/group ACL grants on POSIX ACL implementations.
+        os.fchmod(descriptor, 0o600)
+    if sys.platform != "darwin":
+        return
+
+    # macOS extended ACL grants are independent of permission bits. Use the
+    # already-open descriptor so clearing them cannot follow a swapped path.
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        init_acl = libc.acl_init
+        set_acl = libc.acl_set_fd_np
+        free_acl = libc.acl_free
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "Cannot clear inherited baseline ACLs") from error
+    init_acl.argtypes = [ctypes.c_int]
+    init_acl.restype = ctypes.c_void_p
+    set_acl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    set_acl.restype = ctypes.c_int
+    free_acl.argtypes = [ctypes.c_void_p]
+    free_acl.restype = ctypes.c_int
+    empty_acl = init_acl(0)
+    if not empty_acl:
+        raise OSError(ctypes.get_errno(), "Could not initialize baseline ACL")
+    try:
+        if set_acl(descriptor, empty_acl, 0x100) != 0:  # ACL_TYPE_EXTENDED
+            raise OSError(ctypes.get_errno(), "Could not clear inherited baseline ACLs")
+    finally:
+        free_acl(empty_acl)
+
+
 def dump_baseline(data: dict[str, object], path: str | Path) -> None:
-    """Validate and write YAML (``.json`` extension -> JSON) without truncation."""
+    """Validate and atomically replace a regular baseline (``.json`` -> JSON).
+
+    On POSIX, new files have owner-only permissions. Replacements preserve
+    ownership and existing owner read/write bits, clearing group/other bits;
+    the old file must be writable. Symlinks and special files are rejected.
+    Concurrent writers publish complete documents; the last replacement wins.
+    """
     baseline_from_dict(data)
     p = Path(path)
     if p.suffix.lower() == ".json":
-        content = json.dumps(data, indent=2)
+        # PyYAML does not combine JSON's escaped UTF-16 surrogate pairs. Emit
+        # astral characters directly, escaping only genuine lone surrogates.
+        content = (
+            json.dumps(data, indent=2, ensure_ascii=False)
+            .encode("utf-8", errors="backslashreplace")
+            .decode("utf-8")
+        )
     else:
         header = (
             "# SkillSpector baseline — findings listed here are suppressed on future scans.\n"
@@ -656,7 +706,54 @@ def dump_baseline(data: dict[str, object], path: str | Path) -> None:
         content = header + yaml.safe_dump(data, sort_keys=False)
     # A complete population can exceed the loader's limits even when a compact
     # report fits. Reject it before overwriting an existing, usable baseline.
-    if len(content.encode("utf-8")) > MAX_BASELINE_BYTES:
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_BASELINE_BYTES:
         raise ValueError(f"Baseline file exceeds byte limit ({MAX_BASELINE_BYTES}): {p}")
     yaml.load(content, Loader=_BoundedBaselineLoader)
-    p.write_text(content, encoding="utf-8")
+
+    destination = None
+    try:
+        destination = p.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not S_ISREG(destination.st_mode):
+            raise ValueError(f"Baseline output must be a regular file: {p}")
+        if not destination.st_mode & 0o222:
+            raise PermissionError(errno.EACCES, "Baseline output is not writable", str(p))
+        # Atomic replacement needs directory permissions, but must not bypass an
+        # existing file's write restrictions (including ACLs). Never truncate it.
+        flags = os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(p, flags)
+        try:
+            destination = os.fstat(descriptor)
+            if not S_ISREG(destination.st_mode):
+                raise ValueError(f"Baseline output must be a regular file: {p}")
+        finally:
+            os.close(descriptor)
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=p.parent, prefix=".skillspector-baseline.", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            _restrict_baseline_temporary(temporary.fileno())
+            temporary.write(encoded)
+            temporary.flush()
+            if destination is not None:
+                current = os.fstat(temporary.fileno())
+                if (current.st_uid, current.st_gid) != (destination.st_uid, destination.st_gid):
+                    os.fchown(temporary.fileno(), destination.st_uid, destination.st_gid)
+                # Do not broaden group/other access when replacing a file whose
+                # ACL metadata may be more restrictive than its mode bits.
+                mode = S_IMODE(destination.st_mode) & 0o600
+                if os.name == "posix":
+                    os.fchmod(temporary.fileno(), mode)
+                else:
+                    os.chmod(temporary_path, mode)
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, p)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)

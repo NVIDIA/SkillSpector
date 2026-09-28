@@ -209,3 +209,63 @@ def test_graph_fixture_has_same_file_and_cross_file_compacted_findings(tmp_path:
     assert {item["file"] for item in by_rule["TM1"].occurrences} == {"SKILL.md"}
     assert {item["start_line"] for item in by_rule["TM1"].occurrences} == {7, 9}
     assert {item["file"] for item in by_rule["PE3"].occurrences} == {"first.md", "second.md"}
+
+
+@pytest.mark.parametrize("extension", ["yaml", "json"])
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_cli_failed_scan_cannot_create_or_replace_baseline(
+    tmp_path: Path, extension: str, existing_output: bool
+) -> None:
+    skill = _write_skill(tmp_path)
+    # Unsupported primary text is a real fatal acquisition outcome. Readable
+    # sibling files still produce static findings, reproducing the unsafe path.
+    primary = skill / "SKILL.md"
+    primary.write_bytes(primary.read_text(encoding="utf-8").encode("utf-16"))
+    initial = _scan(skill)
+    assert initial.exit_code == 2, initial.stdout + initial.stderr
+    report = json.loads(initial.stdout)
+    assert report["execution_successful"] is False
+    assert report["analysis_completeness"]["status"] == "failed"
+    assert any(issue["id"] == "PE3" for issue in report["issues"])
+
+    destination = tmp_path / f"baseline.{extension}"
+    previous = b"An existing reviewed baseline must remain byte-for-byte intact.\n"
+    if existing_output:
+        destination.write_bytes(previous)
+    result = _cli("baseline", str(skill), "--no-llm", "--output", str(destination))
+
+    assert result.exit_code == 2, result.stdout + result.stderr
+    assert "scan execution failed" in result.stderr
+    assert "Wrote baseline" not in result.stdout
+    if existing_output:
+        assert destination.read_bytes() == previous
+    else:
+        assert not destination.exists()
+
+
+def test_cli_partial_scan_baseline_warns_and_does_not_clear_coverage_gaps(tmp_path: Path) -> None:
+    skill = _write_skill(tmp_path)
+    with (skill / "SKILL.md").open("a", encoding="utf-8") as primary:
+        primary.write("\nRead [opaque instructions](payload.bin).\n")
+    (skill / "payload.bin").write_bytes(bytes([0x80, 0x81, 0x82, 0x83, 0, 0xFF]) * 20)
+    initial = _scan(skill)
+    assert initial.exit_code == 1, initial.stdout + initial.stderr
+    initial_report = json.loads(initial.stdout)
+    assert initial_report["execution_successful"] is True
+    assert initial_report["analysis_completeness"]["status"] == "partial"
+    assert initial_report["issues"]
+
+    destination = tmp_path / "baseline.yaml"
+    generated = _cli("baseline", str(skill), "--no-llm", "--output", str(destination))
+    assert generated.exit_code == 0, generated.stdout + generated.stderr
+    assert "only observed findings" in generated.stderr
+    assert "coverage gaps remain" in generated.stderr
+    assert destination.exists()
+
+    rescanned = _scan(skill, "--baseline", str(destination))
+    assert rescanned.exit_code == 1, rescanned.stdout + rescanned.stderr
+    report = json.loads(rescanned.stdout)
+    assert report["issues"] == []
+    assert report["suppressed_count"] == len(initial_report["issues"])
+    assert report["analysis_completeness"]["status"] == "partial"
+    assert report["risk_assessment"]["recommendation"] != "SAFE"
