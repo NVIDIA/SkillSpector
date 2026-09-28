@@ -399,9 +399,33 @@ class TestOpenAIProvider:
             "gpt-5.6-sol",
             "gpt-5.6",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
         ):
             assert provider.get_context_length(model) == 1_050_000
             assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_each_model_is_mapped_once(self) -> None:
+        """Every bundled registry maps each model ID exactly once.
+
+        ``yaml.safe_load`` collapses a repeated key to its last mapping,
+        so value-only lookup assertions stay green while the resolved
+        budget becomes loader-dependent. Reading keys via ``yaml.compose``
+        catches the duplication that lookup loops cannot.
+        """
+        root = Path(__file__).resolve().parents[2]
+        registries = [
+            root / "model_registry.yaml",
+            *root.glob("src/skillspector/providers/*/model_registry.yaml"),
+        ]
+        assert registries, "expected at least one bundled model registry"
+        for registry_path in registries:
+            doc = yaml.compose(registry_path.read_text(encoding="utf-8"))
+            models = next(v for k, v in doc.value if k.value == "models")
+            keys = [k.value for k, v in models.value]
+            assert len(keys) == len(set(keys)), (
+                f"{registry_path.name} maps {[k for k in keys if keys.count(k) > 1]} twice"
+            )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

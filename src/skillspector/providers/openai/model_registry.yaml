@@ -72,6 +72,17 @@ models:
   "gpt-6-astra":
     context_length: 1050000
     max_output_tokens: 128000
+  # GPT-6 Sol and Luna (verified 2026-09-28 against
+  # developers.openai.com/api/docs/models/gpt-6-sol,
+  # developers.openai.com/api/docs/models/gpt-6-luna, and
+  # openai.com/index/introducing-gpt-6-sol-and-luna, released 2026-09-22):
+  # 1.05M context, 128K output. Both accept text and image inputs.
+  "gpt-6-sol":
+    context_length: 1050000
+    max_output_tokens: 128000
+  "gpt-6-luna":
+    context_length: 1050000
+    max_output_tokens: 128000
 
   "gemini-3.5-flash":
     context_length: 1048576
