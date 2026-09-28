@@ -331,29 +331,6 @@ class _TaintedVar(NamedTuple):
     lineno: int
 
 
-def _walk_source_order(tree: ast.AST) -> list[ast.AST]:
-    """Depth-first pre-order walk, unlike :func:`ast.walk`'s breadth-first order.
-
-    ``_analyze_python`` records a source assignment into ``tainted`` and later,
-    while still walking the SAME tree, looks that variable up at a sink call
-    site. ``ast.walk`` yields nodes level-by-level, so a source nested two or
-    more AST levels deeper than the sink it feeds (e.g. assigned inside a
-    doubly-nested ``if``/``try`` block, then used at a shallower sink) is
-    visited AFTER the sink, not before, even though it appears earlier in the
-    source text. The lookup then misses and the flow goes unreported. A
-    pre-order walk visits an entire earlier statement's subtree — including
-    any nested assignment — before moving on to a later sibling statement, so
-    it always agrees with a top-to-bottom source-order reading of the file.
-    """
-    ordered: list[ast.AST] = []
-    stack: list[ast.AST] = [tree]
-    while stack:
-        node = stack.pop()
-        ordered.append(node)
-        stack.extend(reversed(list(ast.iter_child_nodes(node))))
-    return ordered
-
-
 def _is_open_for_write(node: ast.Call) -> bool:
     """Heuristic: open() is a write sink if mode arg contains 'w' or 'a'."""
     if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
@@ -474,6 +451,61 @@ def _find_tainted_in_expr(
     return None
 
 
+def _collect_tainted(
+    tree: ast.AST,
+    type_map: dict[str, str],
+    aliases: dict[str, str],
+    check_runtime: Callable[[], None] | None = None,
+) -> dict[str, _TaintedVar]:
+    """Record ``Assign``-based taint to a fixpoint, independent of AST visit order.
+
+    Any single ordered pass over the tree — breadth-first (``ast.walk``) or
+    source-order (pre-order) — misses flows where a sink and the assignment
+    that taints it are visited in the "wrong" relative order for that
+    traversal. Pre-order in particular loses flows where the sink sits inside
+    a function, method or loop body defined BEFORE the tainted assignment in
+    the file: the body is a subtree visited in full before the later sibling
+    statement, even though the code only runs when called, after the
+    assignment has already executed. There is no fixed traversal order that
+    agrees with both "defined before" and "runs after".
+
+    Instead, repeat a full scan of every ``Assign`` node until ``tainted``
+    stops growing. Each pass can propagate taint through one more link of a
+    re-assignment chain (``a = source()``; ``b = a``; ``c = b``), regardless
+    of where each assignment sits in the tree, so the number of passes is
+    bounded by the length of the longest such chain rather than by AST depth
+    or traversal order.
+    """
+    tainted: dict[str, _TaintedVar] = {}
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)]
+    while True:
+        snapshot = dict(tainted)
+        for ast_node in assigns:
+            if check_runtime is not None:
+                check_runtime()
+            src_name = _find_source_in_expr(ast_node.value, type_map, aliases, check_runtime)
+
+            # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
+            if src_name is None and isinstance(ast_node.value, ast.Subscript):
+                base = resolve_dotted_name(ast_node.value.value)
+                if base is not None:
+                    base = apply_import_aliases(base, aliases)
+                if base and base in _CREDENTIAL_SOURCES:
+                    src_name = base
+
+            # Propagate taint through re-assignment and container construction:
+            # data = secret, payload = {"k": secret}, items = [secret], msg = f"{secret}"
+            if src_name is None:
+                tv = _find_tainted_in_expr(ast_node.value, tainted, check_runtime)
+                if tv:
+                    src_name = tv.source_call
+
+            if src_name:
+                _mark_targets(ast_node.targets, tainted, src_name, ast_node.lineno)
+        if tainted == snapshot:
+            return tainted
+
+
 def _analyze_python(
     python_ast: ParsedPythonFile,
     file_path: str,
@@ -487,7 +519,9 @@ def _analyze_python(
     type_map = build_type_map(tree, aliases)
     lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
-    tainted: dict[str, _TaintedVar] = {}
+    tainted = _collect_tainted(
+        tree, type_map, aliases, budget.check_runtime if budget is not None else None
+    )
     seen: set[tuple[str, int, int, int | None, int | None]] = set()
     contexts: dict[int, str] = {}
 
@@ -542,42 +576,12 @@ def _analyze_python(
         else:
             budget.emit(finding)
 
-    for ast_node in _walk_source_order(tree):
+    # `tainted` is fully populated above, independent of traversal order, so
+    # this pass only needs to check sink call sites against it.
+    for ast_node in ast.walk(tree):
         if budget is not None:
             budget.check_runtime()
-        # Record tainted assignments.
-        if isinstance(ast_node, ast.Assign):
-            src_name = _find_source_in_expr(
-                ast_node.value,
-                type_map,
-                aliases,
-                budget.check_runtime if budget is not None else None,
-            )
 
-            # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
-            if src_name is None and isinstance(ast_node.value, ast.Subscript):
-                base = resolve_dotted_name(ast_node.value.value)
-                if base is not None:
-                    base = apply_import_aliases(base, aliases)
-                if base and base in _CREDENTIAL_SOURCES:
-                    src_name = base
-
-            # Propagate taint through re-assignment and container construction:
-            # data = secret, payload = {"k": secret}, items = [secret], msg = f"{secret}"
-            if src_name is None:
-                tv = _find_tainted_in_expr(
-                    ast_node.value,
-                    tainted,
-                    budget.check_runtime if budget is not None else None,
-                )
-                if tv:
-                    src_name = tv.source_call
-
-            if src_name:
-                _mark_targets(ast_node.targets, tainted, src_name, ast_node.lineno)
-            continue
-
-        # Detect flows at sink call sites.
         if not isinstance(ast_node, ast.Call):
             continue
 

