@@ -21,10 +21,11 @@ import fnmatch
 import re
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 
 from skillspector.artifacts import _is_emoji_base, prompt_injection_letter_spacing_view
 from skillspector.logging_config import get_logger
-from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.models import AnalyzerFinding, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -35,6 +36,7 @@ from .whitespace_padding import (
     ZERO_WIDTH_CHARS,
     detect_whitespace_padding,
     padding_run_match_fingerprint,
+    padding_source_span,
 )
 
 logger = get_logger(__name__)
@@ -327,9 +329,6 @@ def analyze(
         if check_runtime is not None:
             check_runtime()
 
-    def loc(ln: int) -> Location:
-        return Location(file=file_path, start_line=ln)
-
     def ctx(start: int) -> str:
         return get_context(content, start)
 
@@ -478,17 +477,37 @@ def analyze(
             else:  # "block" or "ratio"
                 confidence = 0.4
                 severity = Severity.LOW
+            # Ratio signals cover the whole view; all other runs have a span.
+            end_offset = run.end_offset if run.end_offset > run.start_offset else len(content)
+            source_text, source_start, source_end = static_runner.security_view_source_span(
+                content, run.start_offset, end_offset
+            )
+            source_start, source_end = padding_source_span(
+                source_text, run, source_start, source_end
+            )
+            # Alternate views can change a run's spelling without creating a new
+            # occurrence. Hash the complete original span, retaining the kind,
+            # and publish exact coordinates for the runner's existing dedupe.
+            source_run = replace(run, start_offset=source_start, end_offset=source_end)
             findings.append(
                 AnalyzerFinding(
                     rule_id="P9",
                     message="Whitespace Padding",
                     severity=severity,
-                    location=loc(run.start_line),
+                    location=locations.location(run.start_offset, end_offset),
                     confidence=confidence,
                     tags=tag,
                     context=ctx(run.start_offset),
                     matched_text=run.summary,
-                    match_fingerprint=padding_run_match_fingerprint(content, run),
+                    match_fingerprint=padding_run_match_fingerprint(source_text, source_run),
+                    evidence=(
+                        {
+                            static_runner._SOURCE_START_EVIDENCE: source_start,
+                            static_runner._SOURCE_END_EVIDENCE: source_end,
+                        }
+                        if source_text is not content
+                        else {}
+                    ),
                 )
             )
     return findings
