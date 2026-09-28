@@ -341,6 +341,7 @@ class TestDetectSkills:
             "skill-b",
         }
         assert [skill.local_only for skill in result.skills] == [True, False, False]
+        assert result.omitted_symlink_entries == 1
 
     def test_symlinked_skill_directory_marks_discovery_incomplete(self, tmp_path: Path) -> None:
         """Detection must not silently claim complete coverage through a directory symlink."""
@@ -363,6 +364,7 @@ class TestDetectSkills:
         assert result.complete is False
         assert result.limitations[0].reason_code == "read_error"
         assert result.limitations[0].resource == "multi_skill_symlinked_entry"
+        assert result.omitted_symlink_entries == 1
 
     def test_ignored_name_symlinks_do_not_mark_discovery_incomplete(self, tmp_path: Path) -> None:
         """Symlinks with intentionally ignored names are skipped, not recorded.
@@ -445,6 +447,31 @@ class TestDetectSkills:
         assert result.complete is False
         assert [lim.resource for lim in result.limitations] == ["multi_skill_symlinked_entry"]
         assert result.limitations[0].reason_code == "read_error"
+        assert result.omitted_symlink_entries == 1
+
+    def test_ignored_name_symlink_is_not_counted_as_omitted(self, tmp_path: Path) -> None:
+        """An ignored-name symlink does not inflate the omission count."""
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        ignored_target = tmp_path.parent / f"{tmp_path.name}-ignored-target"
+        ignored_target.mkdir()
+        (ignored_target / "SKILL.md").write_text("---\nname: mod\n---\n", encoding="utf-8")
+        linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+        linked_target.mkdir()
+        (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / "node_modules").symlink_to(ignored_target, target_is_directory=True)
+            (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.omitted_symlink_entries == 1
 
     def test_symlinked_root_is_not_detected(self, tmp_path: Path) -> None:
         """Direct callers cannot use detection to inspect a symlinked root."""
