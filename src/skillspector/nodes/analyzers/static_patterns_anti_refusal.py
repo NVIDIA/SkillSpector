@@ -301,10 +301,10 @@ _AR2_GOVERNED_COMPOUND_VERBS = (
 _AR2_GOVERNED_COMPOUND_VERB_RE = "|".join(_AR2_GOVERNED_COMPOUND_VERBS)
 _AR2_NEGATED_WARNING_MANDATE_PATTERN = re.compile(
     r"\b(?:never|do\s+not|don'?t)\b"
-    # "fail to"/"hesitate to" flip the negation's polarity: "never fail to respond" means
-    # "always respond", so a following "without warnings" is a real suppression, not a
-    # mandate to warn, and must not be exempted the way a plain negated verb is.
-    r"(?!\s+(?:fail|hesitate)\s+to\b)"
+    # A "<verb> to <verb>" shape right after the negation ("fail to", "forget to",
+    # "hesitate to") can flip or blur the surface negation; treat the construction
+    # itself, not a named list of verbs, as unproven polarity and leave it scored.
+    r"(?!\s+\w+\s+to\s+\w+\b)"
     r"(?:"
     r"\s+\w+\s+(?:or|and)\s+(?:" + _AR2_GOVERNED_COMPOUND_VERB_RE + r")\b\s+"
     r"(?!without\b|(?:and|or|nor|but|for|yet|so|to)\b)\S+\b"
