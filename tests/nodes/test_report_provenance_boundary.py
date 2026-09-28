@@ -232,3 +232,33 @@ def test_no_llm_cli_report_preserves_long_model_identifiers(
     assert result.exit_code == 0, result.output
     provenance = json.loads(output.read_text())["metadata"]["llm_provenance"]
     assert {item["model"] for item in provenance["analyzers"]} == {_LONG_MODEL}
+
+
+def test_no_llm_cli_report_preserves_sanitized_azure_routing_without_execution(
+    monkeypatch: pytest.MonkeyPatch, safe_skill_dir: Path, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "azure_openai")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "production-v2")
+    monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2025-01-01")
+    output = tmp_path / "report.json"
+
+    result = CliRunner().invoke(
+        app,
+        ["scan", str(safe_skill_dir), "--no-llm", "--format", "json", "--output", str(output)],
+    )
+
+    assert result.exit_code == 0, result.output
+    provider = json.loads(output.read_text())["metadata"]["llm_provenance"]["provider"]
+    assert provider == {
+        "configured_adapter": "azure_openai",
+        "resolved_adapter": "unknown",
+        "effective_adapter": "not_applicable",
+        "effective_adapters": [],
+        "service": "unknown",
+        "routing": {
+            "deployment_override": "production-v2",
+            "deployment_source": "environment",
+            "api_version": "2025-01-01",
+            "api_version_source": "environment",
+        },
+    }

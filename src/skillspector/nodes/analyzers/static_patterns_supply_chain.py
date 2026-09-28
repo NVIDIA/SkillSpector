@@ -389,6 +389,11 @@ _POPULAR_PYPI: set[str] = {
     "pylint",
     "flake8",
     "isort",
+    "colorama",
+    "python-dateutil",
+    "discord.py",
+    "python-dotenv",
+    "pycryptodome",
     "perseus-ctx",
     "mimir-mcp",
 }
@@ -425,7 +430,154 @@ _POPULAR_NPM: set[str] = {
     "body-parser",
     "nodemon",
     "pm2",
+    "electron",
+    "discord.js",
+    "ethers",
+    "cross-env",
+    "jquery",
+    "nodemailer",
+    "bootstrap",
 }
+
+# SC6 known-legitimate neighbours: established packages whose names fall within
+# the typosquat threshold of a _POPULAR_* entry and are never reported. Built by
+# running SC6 against the top 15,000 PyPI packages (hugovk/top-pypi-packages,
+# 30-day list) and npm-high-impact (~17,300 names). Six PyPI names that a manual
+# review keeps flagged (beautifulsoup, dydantic, httpr, pyyml, slack, xoto3) are
+# deliberately left out.
+_KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
+    {
+        "afsapi",
+        "aioftp",
+        "aiortsp",
+        "astrapy",
+        "bcpandas",
+        "blake3",
+        "boto",
+        "canvas",
+        "cpplint",
+        "crick",
+        "djangoql",
+        "djlint",
+        "fasta2a",
+        "fastai",
+        "fastar",
+        "fastui",
+        "grequests",
+        "httpx2",
+        "hyper",
+        "ipytest",
+        "j2lint",
+        "k5test",
+        "lkml",
+        "lml",
+        "mip",
+        "niquests",
+        "open3d",
+        "openapi3",
+        "openbb",
+        "opencc",
+        "opendal",
+        "openlit",
+        "openmim",
+        "openml",
+        "openmm",
+        "p4p",
+        "panda3d",
+        "pandasai",
+        "pandasql",
+        "pandoc",
+        "pantab",
+        "pid",
+        "pin",
+        "pipe",
+        "pipx",
+        "piq",
+        "piqp",
+        "psycopg",
+        "psycopg-c",
+        "pyaml",
+        "pybamm",
+        "pycryptodomex",
+        "pydbml",
+        "pygame",
+        "pygaul",
+        "pylama",
+        "pylast",
+        "pylink",
+        "pymantic",
+        "pymzml",
+        "pynacl",
+        "pynini",
+        "pynvml",
+        "pyqwest",
+        "pyrect",
+        "pysaml2",
+        "pytango",
+        "pytket",
+        "pytoml",
+        "rltest",
+        "ruyaml",
+        "scanpy",
+        "scapy",
+        "scipp",
+        "scramp",
+        "scrapli",
+        "scrapydo",
+        "scrypt",
+        "shyaml",
+        "sip",
+        "sodapy",
+        "syrupy",
+        "tclint",
+        "tensorflowjs",
+        "tftest",
+        "torchx",
+        "unicon",
+        "unicorn",
+        "usort",
+        "vastai",
+        "vyper",
+        "willow",
+        "x-transformers",
+    }
+)
+
+_KNOWN_LEGIT_NPM: frozenset[str] = frozenset(
+    {
+        "angular2",
+        "chat",
+        "commondir",
+        "commoner",
+        "crossvent",
+        "cypress",
+        "docdash",
+        "dtslint",
+        "electrodb",
+        "enquirer",
+        "esquery",
+        "expresso",
+        "ext",
+        "gaxios",
+        "getenv",
+        "jshint",
+        "jslint",
+        "keypress",
+        "mquery",
+        "net",
+        "nuxt",
+        "oxlint",
+        "preact",
+        "radash",
+        "react-dnd",
+        "test",
+        "tether",
+        "tslint",
+        "ttypescript",
+        "vm2",
+        "vuex",
+    }
+)
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -444,18 +596,67 @@ def _edit_distance(a: str, b: str) -> int:
     return prev_row[-1]
 
 
-def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> str | None:
-    """Return the popular package name if pkg_name is a close-but-not-exact match."""
-    normalized = pkg_name.lower().replace("_", "-")
+def _osa_distance(a: str, b: str) -> int:
+    """Optimal string alignment distance between two strings.
+
+    Levenshtein plus adjacent transpositions: swapping two neighbouring
+    characters ("recat" vs "react") is a single typing slip, so it counts as
+    one edit instead of two. Short transposition typosquats then pass the
+    relative-distance guard in ``_is_typosquat``.
+    """
+    rows, cols = len(a) + 1, len(b) + 1
+    d = [[0] * cols for _ in range(rows)]
+    for i in range(rows):
+        d[i][0] = i
+    for j in range(cols):
+        d[0][j] = j
+    for i in range(1, rows):
+        for j in range(1, cols):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[-1][-1]
+
+
+def _typosquat_normalize(name: str, pep503: bool) -> str:
+    """Normalize a package name for SC6 comparisons.
+
+    PyPI treats runs of ``-``, ``_`` and ``.`` as equivalent (PEP 503), so
+    ``discord-py`` *is* ``discord.py``. npm does not (``socket-io`` and
+    ``socket.io`` are distinct packages), so npm keeps the historical rule.
+    """
+    if pep503:
+        return re.sub(r"[-_.]+", "-", name).lower()
+    return name.lower().replace("_", "-")
+
+
+def _is_typosquat(
+    pkg_name: str,
+    popular: set[str],
+    max_distance: int = 2,
+    *,
+    known_legit: frozenset[str] = frozenset(),
+    pep503: bool = False,
+) -> str | None:
+    """Return the popular package name if pkg_name is a close-but-not-exact match.
+
+    ``known_legit`` lists established packages whose names happen to fall
+    within the threshold of a popular one (``psycopg`` vs ``psycopg2``,
+    ``preact`` vs ``react``); they are never reported.
+    """
+    normalized = _typosquat_normalize(pkg_name, pep503)
     # A known package must win over any earlier, similar name (e.g. gunicorn
     # sorts before uvicorn). Apply the same normalization on both sides.
-    if any(normalized == name.lower().replace("_", "-") for name in popular):
+    if any(normalized == _typosquat_normalize(name, pep503) for name in popular):
+        return None
+    if any(normalized == _typosquat_normalize(name, pep503) for name in known_legit):
         return None
     for popular_name in sorted(popular):
-        pop_norm = popular_name.lower().replace("_", "-")
+        pop_norm = _typosquat_normalize(popular_name, pep503)
         if len(normalized) < 3 or len(pop_norm) < 3:
             continue
-        dist = _edit_distance(normalized, pop_norm)
+        dist = _osa_distance(normalized, pop_norm)
         if not 0 < dist <= max_distance:
             continue
         # Relative-distance guard: a genuine typosquat perturbs only a small
@@ -463,8 +664,8 @@ def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> st
         # under an absolute distance of 2 (e.g. "task" is edit-distance 2 from
         # "flask" yet is a real package) and are not typosquats. Require
         # dist/len <= 1/3, so short names need an all-but-one-character match
-        # while longer names may still differ by two (e.g. "reqeusts" vs
-        # "requests").
+        # while longer names may still differ by two (e.g. "reqeuts" vs
+        # "requests": one swap plus one deletion).
         shorter = min(len(normalized), len(pop_norm))
         if dist * 3 > shorter:
             continue
@@ -624,19 +825,6 @@ _DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
     r"['\"]?(?P<phrase>[A-Za-z][\w-]*(?:\s+[A-Za-z][\w-]*){0,7})['\"]?",
     re.IGNORECASE,
 )
-
-# Trailing discourse words that modify the utterance rather than name trigger
-# content. When the captured phrase is a broad single word followed only by
-# these deictics ("says hello there"), the skill names the broad word and the
-# rest is trailing prose, so TR1 still fires; a content word after the broad
-# word ("code review", "the zone") names a multiword phrase and stays TR1
-# negative, matching the legacy trigger grammar.
-_DESCRIPTION_TRAILING_DISCOURSE_WORDS: set[str] = {
-    "there",
-    "here",
-    "now",
-    "then",
-}
 
 # Bare universal-scope statements: the whole clause is a catch-all scope
 # ("all messages"), which the legacy trigger grammar also flags as TR3.
@@ -1961,6 +2149,7 @@ def _analyze_dependencies_detailed(
         ecosystem = ECOSYSTEM_PYPI
         fallback_db = _FALLBACK_VULNERABLE_PYPI
         popular = _POPULAR_PYPI
+        known_legit = _KNOWN_LEGIT_PYPI
     else:
         if is_npm_lock:
             packages = _extract_packages_from_npm_lock(content, limit=extraction_limit)
@@ -1973,6 +2162,7 @@ def _analyze_dependencies_detailed(
         ecosystem = ECOSYSTEM_NPM
         fallback_db = _FALLBACK_VULNERABLE_NPM
         popular = _POPULAR_NPM
+        known_legit = _KNOWN_LEGIT_NPM
 
     if len(packages) > package_limit:
         limitations.append(
@@ -2087,7 +2277,12 @@ def _analyze_dependencies_detailed(
             )
 
         # SC6: Typosquatting
-        similar = _is_typosquat(pkg_name, popular)
+        similar = _is_typosquat(
+            pkg_name,
+            popular,
+            known_legit=known_legit,
+            pep503=ecosystem == ECOSYSTEM_PYPI,
+        )
         if similar:
             retain(
                 [
@@ -2256,17 +2451,11 @@ def _analyze_triggers(
             phrase = phrase_match.group("phrase")
             phrase_lower = phrase.lower()
             phrase_words = phrase_lower.split()
-            # A broad word followed only by trailing discourse words names
-            # the broad word ("says hello there"); anything else multiword
-            # names a phrase and is not an overly broad single-word trigger.
-            broad_head_with_prose_tail = (
-                len(phrase_words) > 1
-                and phrase_words[0] in _OVERLY_BROAD_SINGLE_WORDS
-                and all(word in _DESCRIPTION_TRAILING_DISCOURSE_WORDS for word in phrase_words[1:])
-            )
-            if (
-                len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS
-            ) or broad_head_with_prose_tail:
+            # A multiword phrase names the complete bounded wording, even
+            # when its final word could also be read as discourse prose. In
+            # particular, "go there" and "work now" are valid phrases and
+            # must not be reduced to the broad heads "go" and "work".
+            if len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS:
                 broad_word = phrase_words[0]
                 findings.append(
                     Finding(

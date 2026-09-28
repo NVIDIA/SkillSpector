@@ -54,6 +54,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
+from skillspector.cleanup import remove_temp_tree
 from skillspector.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -828,7 +829,7 @@ class InputHandler:
     def cleanup(self) -> None:
         """Clean up temporary files created during resolution."""
         if self._temp_dir and self._temp_dir.exists():
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            remove_temp_tree(self._temp_dir)
             self._temp_dir = None
 
     def temp_dir_for_cleanup(self) -> Path | None:
@@ -1276,6 +1277,12 @@ class InputHandler:
             self._terminate_git_process(process)
             shutil.rmtree(clone_dir, ignore_errors=True)
             raise ValueError("Failed to clone repository") from exc
+        except BaseException:
+            # An interrupt or a cancellation while Git is still writing: stop
+            # the child before the tree it writes into is removed.
+            self._terminate_git_process(process)
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            raise
         return clone_dir
 
     @staticmethod
