@@ -6078,3 +6078,42 @@ def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: 
     written = yaml.safe_load(out.read_text(encoding="utf-8"))
     assert [entry["file"] for entry in written["fingerprints"]] == [".hidden.md"]
     assert len(written["fingerprints"][0]["hash"]) == len("sha256:") + 64
+
+
+def test_baseline_preserves_distinct_context_for_repeated_findings(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "references").mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo\n---\n\n# Service\n\n"
+        "The upstream service deletes unused files, and the link dies with no warning.\n",
+        encoding="utf-8",
+    )
+    (skill / "references" / "notes.md").write_text(
+        "# Mirror\n\nThe mirror drops stale entries with no warning.\n", encoding="utf-8"
+    )
+    baseline = tmp_path / "baseline.yaml"
+    generated = runner.invoke(app, ["baseline", str(skill), "--no-llm", "-o", str(baseline)])
+    assert generated.exit_code == 0, generated.output
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skill),
+            "--no-llm",
+            "--baseline",
+            str(baseline),
+            "--format",
+            "json",
+            "--show-suppressed",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["issues"] == []
+    entries = yaml.safe_load(baseline.read_text())["fingerprints"]
+    assert {entry["file"] for entry in entries if entry["rule_id"] == "AR2"} == {
+        "SKILL.md",
+        "references/notes.md",
+    }
+    assert data["suppressed_count"] >= 2

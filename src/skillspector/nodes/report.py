@@ -1837,6 +1837,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "risk_recommendation": risk_recommendation,
         "report_body": report_body,
         "filtered_findings": reported_findings,
+        "active_findings": active_findings,
         "suppressed_findings": suppressed,
         "execution_successful": execution_successful,
         "analysis_completeness": dict(analysis_completeness),

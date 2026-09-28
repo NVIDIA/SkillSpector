@@ -280,6 +280,8 @@ class SkillspectorState(TypedDict, total=False):
     # Compatibility projection emitted only by the report after effective-ID
     # selection. Meta analysis never stores a second filtered collection.
     filtered_findings: list[Finding]
+    # Exact kept occurrences before display deduplication, for baseline generation.
+    active_findings: list[Finding]
 
     # LLM runtime telemetry: each LLM-backed node appends one record (built with
     # ``llm_call_record``) so the report can detect a *silent degradation* — the
