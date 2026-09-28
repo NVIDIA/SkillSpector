@@ -170,6 +170,15 @@ class TestMcpRugPullNode:
         assert f.confidence == 0.80
         assert "added: force" in f.message
 
+    def test_rp3_manifest_change_finding_is_short(self) -> None:
+        state = {
+            "manifest": {"parameters": [{"name": "p" * 250}]},
+            "previous_manifest": {"parameters": []},
+        }
+        finding = next(f for f in node(state)["findings"] if f.rule_id == "RP3")
+        assert len(finding.message) > 200
+        assert finding.finding == finding.message[:200]
+
     def test_rp3_parameter_removed(self) -> None:
         """RP3 is triggered when a parameter is removed."""
         state = {

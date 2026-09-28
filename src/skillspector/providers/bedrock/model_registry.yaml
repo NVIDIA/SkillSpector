@@ -7,13 +7,16 @@
 #     "<model-label>":
 #       context_length: <int>          # total context window in tokens (required)
 #       max_output_tokens: <int>       # model's max output cap (optional)
+#       tool_choice: auto              # when the model rejects a forced toolChoice (optional)
 #
-# Keys are public Bedrock cross-region inference profile IDs.  Users can
-# also point SKILLSPECTOR_MODEL at a stock Bedrock model ID or their own
+# Keys are public Bedrock model IDs and cross-region inference profile
+# IDs.  Users can also point SKILLSPECTOR_MODEL at their own
 # application-inference-profile ARN — those won't be in this registry,
 # so the scanner falls back to the default token budget for unknown
 # models.  Add entries here if you have a private ARN you want metadata
-# for.
+# for; an ARN hides the model name, so also declare ``tool_choice: auto``
+# when it serves a model that rejects a forced toolChoice (Fable 5.1,
+# Mythos 5.1).
 
 models:
   "us.anthropic.claude-sonnet-4-6-20250915-v1:0":
@@ -27,3 +30,33 @@ models:
   "us.anthropic.claude-opus-4-5-20250514-v1:0":
     context_length: 200000
     max_output_tokens: 64000
+
+  "anthropic.claude-fable-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    tool_choice: auto
+
+  "us.anthropic.claude-fable-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    tool_choice: auto
+
+  "global.anthropic.claude-fable-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    tool_choice: auto
+
+  "anthropic.claude-mythos-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    tool_choice: auto
+
+  "us.anthropic.claude-mythos-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    tool_choice: auto
+
+  "global.anthropic.claude-mythos-5-1":
+    context_length: 1000000
+    max_output_tokens: 128000
+    tool_choice: auto

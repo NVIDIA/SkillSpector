@@ -131,8 +131,8 @@ def test_explicit_import_reestablishes_direct_receivers() -> None:
     assert (
         len(
             _tm1(
-                "subprocess = Proxy()\n"
-                "Popen = Proxy()\n"
+                "subprocess = None\n"
+                "Popen = None\n"
                 "import subprocess\n"
                 "from subprocess import Popen\n"
                 "enabled = True\n"
@@ -157,7 +157,7 @@ def test_function_local_binding_and_outer_fact_are_independent() -> None:
         "def execute(command):\n"
         "    enabled = 'True'\n"
         "    subprocess.run(command, shell=enabled)\n"
-        "subprocess.run(command, shell=outer)\n"
+        "subprocess.run('/usr/bin/true', shell=outer)\n"
     )
 
     assert [finding.start_line for finding in findings] == [4, 5]
@@ -547,6 +547,653 @@ def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
 @pytest.mark.parametrize(
     "statement",
     [
+        pytest.param("ignored = (replace_subprocess(),)", id="tuple-rhs"),
+        pytest.param("ignored = [replace_subprocess()]", id="list-rhs"),
+        pytest.param(
+            "ignored: tuple[object, ...] = (replace_subprocess(),)",
+            id="annotated-tuple-rhs",
+        ),
+    ],
+)
+def test_nested_generic_call_invalidates_receiver_trust(statement: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        f"{statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_nested_generic_call_invalidates_receiver_trust_for_called_function() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "ignored = (replace_subprocess(),)\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+def test_unsupported_eager_expression_invalidates_receiver_trust() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "assert (replace_subprocess(),)\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_unsupported_eager_expression_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "assert (replace_subprocess(),)\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("(replace_subprocess(),)", id="tuple"),
+        pytest.param("[replace_subprocess()]", id="list"),
+    ],
+)
+def test_eager_container_expression_invalidates_receiver_trust(statement: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        f"{statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("(replace_subprocess(),)", id="tuple"),
+        pytest.param("[replace_subprocess()]", id="list"),
+    ],
+)
+def test_eager_container_expression_invalidates_called_function_trust(
+    statement: str,
+) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{statement}\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+def test_protocol_consuming_direct_call_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import mutator\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/usr/bin/true', shell=enabled)\n"
+        "subprocess.run(mutator, shell=False)\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+def test_unsafe_value_release_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "class Trigger:\n"
+        "    def __del__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = replacement\n"
+        "trigger = Trigger()\n"
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/usr/bin/true', shell=enabled)\n"
+        "trigger = 0\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("replace_subprocess()", id="direct-call"),
+        pytest.param("(replace_subprocess(),)", id="nested-call"),
+    ],
+)
+def test_class_body_eager_call_invalidates_enclosing_receiver_trust(statement: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "class Runner:\n"
+        f"    {statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_class_body_outer_store_release_invalidates_receiver_trust() -> None:
+    findings = _tm1(
+        "from helpers import trigger\n"
+        "import subprocess\n"
+        "class Runner:\n"
+        "    global trigger\n"
+        "    trigger = 0\n"
+        "enabled = True\n"
+        "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_class_body_outer_store_release_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "from helpers import trigger\n"
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        "class Runner:\n"
+        "    global trigger\n"
+        "    trigger = 0\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+def test_nested_class_outer_store_release_invalidates_receiver_trust() -> None:
+    findings = _tm1(
+        "from helpers import trigger\n"
+        "import subprocess\n"
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        global trigger\n"
+        "        trigger = 0\n"
+        "enabled = True\n"
+        "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_nested_class_outer_store_release_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "from helpers import trigger\n"
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        global trigger\n"
+        "        trigger = 0\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        pytest.param("    def trigger():\n        pass\n", id="function"),
+        pytest.param("    class trigger:\n        pass\n", id="class"),
+    ],
+)
+def test_class_body_outer_definition_release_invalidates_receiver_trust(
+    definition: str,
+) -> None:
+    findings = _tm1(
+        "from helpers import trigger\n"
+        "import subprocess\n"
+        "class Outer:\n"
+        "    global trigger\n"
+        + definition
+        + "enabled = True\n"
+        + "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "class_body",
+    [
+        pytest.param(
+            "    @replace_subprocess\n    def run():\n        pass\n",
+            id="method-decorator",
+        ),
+        pytest.param(
+            "    class Inner(Base):\n        pass\n",
+            id="nested-class-base",
+        ),
+        pytest.param(
+            "    @replace_subprocess\n    class Inner:\n        pass\n",
+            id="nested-class-decorator",
+        ),
+    ],
+)
+def test_class_implicit_eager_effect_invalidates_enclosing_receiver_trust(
+    class_body: str,
+) -> None:
+    findings = _tm1(
+        "from helpers import Base, replace_subprocess\n"
+        "import subprocess\n"
+        "class Runner:\n"
+        + class_body
+        + "enabled = True\n"
+        + "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "class_body",
+    [
+        pytest.param("    assert mutator\n", id="assert-truth"),
+        pytest.param("    target.attr = 1\n", id="attribute-store"),
+        pytest.param("    target += 1\n", id="augmented-assignment"),
+        pytest.param(
+            "    with manager:\n        pass\n",
+            id="context-manager",
+        ),
+    ],
+)
+def test_class_protocol_effect_invalidates_enclosing_receiver_trust(
+    class_body: str,
+) -> None:
+    findings = _tm1(
+        "from helpers import manager, mutator, target\n"
+        "import subprocess\n"
+        "class Runner:\n"
+        + class_body
+        + "enabled = True\n"
+        + "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_class_protocol_effect_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "from helpers import mutator\n"
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        "class Runner:\n"
+        "    assert mutator\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        pytest.param("@replace_subprocess\nclass Runner:", id="decorator-name"),
+        pytest.param("class Runner(Base):", id="base-name"),
+    ],
+)
+def test_class_creation_invalidates_enclosing_receiver_trust(header: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import Base, replace_subprocess\n"
+        f"{header}\n"
+        "    pass\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_import_binding_release_invalidates_receiver_trust() -> None:
+    findings = _tm1(
+        "class Trigger:\n"
+        "    def __del__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = replacement\n"
+        "subprocess = Trigger()\n"
+        "import subprocess\n"
+        "enabled = True\n"
+        "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_import_binding_release_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "class Trigger:\n"
+        "    def __del__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = replacement\n"
+        "subprocess = Trigger()\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        "import subprocess\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+def test_class_binding_release_invalidates_receiver_trust() -> None:
+    findings = _tm1(
+        "class Trigger:\n"
+        "    def __del__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = replacement\n"
+        "trigger = Trigger()\n"
+        "import subprocess\n"
+        "class trigger:\n"
+        "    pass\n"
+        "enabled = True\n"
+        "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_class_binding_release_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "class Trigger:\n"
+        "    def __del__(self):\n"
+        "        global subprocess\n"
+        "        subprocess = replacement\n"
+        "trigger = Trigger()\n"
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        "class trigger:\n"
+        "    pass\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+def test_assert_truth_protocol_invalidates_receiver_trust() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import mutator\n"
+        "assert mutator\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_assert_truth_protocol_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import mutator\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "assert mutator\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "unknown_binding",
+    [
+        pytest.param(
+            "class Trigger:\n"
+            "    def __del__(self):\n"
+            "        global subprocess\n"
+            "        subprocess = replacement\n"
+            "globals()['trigger'] = Trigger()\n",
+            id="dynamic-global",
+        ),
+        pytest.param("from helpers import *\n", id="star-import"),
+    ],
+)
+def test_unknown_unsafe_binding_blocks_receiver_reestablishment(
+    unknown_binding: str,
+) -> None:
+    findings = _tm1(
+        unknown_binding
+        + "import subprocess\n"
+        + "trigger = 0\n"
+        + "enabled = True\n"
+        + "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "unknown_binding",
+    [
+        pytest.param(
+            "class Trigger:\n"
+            "    def __del__(self):\n"
+            "        global subprocess\n"
+            "        subprocess = replacement\n"
+            "globals()['trigger'] = Trigger()\n",
+            id="dynamic-global",
+        ),
+        pytest.param("from helpers import *\n", id="star-import"),
+    ],
+)
+def test_unknown_unsafe_binding_blocks_called_function_trust(
+    unknown_binding: str,
+) -> None:
+    findings = _tm1(
+        unknown_binding
+        + "def execute():\n"
+        + "    enabled = True\n"
+        + "    subprocess.run('/bin/true', shell=enabled)\n"
+        + "import subprocess\n"
+        + "trigger = 0\n"
+        + "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "call_line",
+    [
+        "subprocess.run(command, shell=true); "
+        "[subprocess.run(command, shell=true) for item in items]",
+        "[subprocess.run(command, shell=true) for item in items]; "
+        "subprocess.run(command, shell=true)",
+    ],
+)
+def test_true_direct_calls_on_one_line_keep_distinct_locations(call_line: str) -> None:
+    findings = _tm1(f"items = [1]\ncommand = '/bin/true'\ntrue = True\n{call_line}\n")
+    expected_columns = [
+        index for index in range(len(call_line)) if call_line.startswith("subprocess.run", index)
+    ]
+
+    assert len(findings) == 2
+    assert sorted(finding.start_column for finding in findings) == expected_columns
+
+
+def test_unknown_comprehension_protocol_invalidates_receiver_trust() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_unknown_comprehension_protocol_invalidates_called_function_trust() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "[subprocess.run('/bin/true', shell=False) for item in items]\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "passive_expression",
+    [
+        pytest.param("'note'", id="literal"),
+        pytest.param("(1, 2)", id="tuple"),
+        pytest.param("[1, 2]", id="list"),
+    ],
+)
+def test_passive_expression_preserves_safe_state_for_called_function(
+    passive_expression: str,
+) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "items = [1]\n"
+        "command = '/bin/true'\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        f"{passive_expression}\n"
+        "[subprocess.run(command, shell=False) for item in items]\n"
+        "execute()\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [6]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        pytest.param("assert True", id="safe-assert"),
+        pytest.param("class Marker:\n    pass", id="passive-class"),
+    ],
+)
+def test_safe_boundary_preserves_comprehension_state(boundary: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "items = [1]\n"
+        "command = '/bin/true'\n"
+        f"{boundary}\n"
+        "[subprocess.run(command, shell=False) for item in items]\n"
+        "enabled = True\n"
+        "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].matched_text == "subprocess.run('/bin/true', shell=enabled)"
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        pytest.param("assert True", id="safe-assert"),
+        pytest.param("class Marker:\n    pass", id="passive-class"),
+    ],
+)
+def test_safe_boundary_preserves_called_function_trust(boundary: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "items = [1]\n"
+        "command = '/bin/true'\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        f"{boundary}\n"
+        "[subprocess.run(command, shell=False) for item in items]\n"
+        "execute()\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [6]
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        pytest.param("marker: int = 1", id="safe-value"),
+        pytest.param("marker: int", id="annotation-only"),
+    ],
+)
+def test_safe_annotated_assignment_preserves_comprehension_state(annotation: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "items = [1]\n"
+        "command = '/bin/true'\n"
+        f"{annotation}\n"
+        "[subprocess.run(command, shell=False) for item in items]\n"
+        "enabled = True\n"
+        "subprocess.run('/bin/true', shell=enabled)\n"
+    )
+
+    assert len(findings) == 1
+    assert findings[0].matched_text == "subprocess.run('/bin/true', shell=enabled)"
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        pytest.param("marker: int = 1", id="safe-value"),
+        pytest.param("marker: int", id="annotation-only"),
+    ],
+)
+def test_safe_annotated_assignment_preserves_called_function_trust(annotation: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "items = [1]\n"
+        "command = '/bin/true'\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run('/bin/true', shell=enabled)\n"
+        f"{annotation}\n"
+        "[subprocess.run(command, shell=False) for item in items]\n"
+        "execute()\n"
+    )
+
+    assert [finding.start_line for finding in findings] == [6]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
         pytest.param("replace_subprocess()", id="expression"),
         pytest.param("result = replace_subprocess()", id="assignment"),
         pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),
@@ -672,19 +1319,14 @@ def test_external_name_store_treats_prior_binding_as_finalizer_capable() -> None
 
 def test_protocol_consuming_direct_call_invalidates_later_truth_fact() -> None:
     findings = _tm1(
-        "class MutatingArgs:\n"
-        "    def __iter__(self):\n"
-        "        global enabled\n"
-        "        enabled = False\n"
-        "        return iter(('/usr/bin/true',))\n"
-        "mutator = MutatingArgs()\n"
+        "from helpers import mutator\n"
         "import subprocess\n"
         "enabled = True\n"
         "subprocess.run(mutator, shell=enabled)\n"
         "subprocess.run('/usr/bin/true', shell=enabled)\n"
     )
 
-    assert [finding.start_line for finding in findings] == [9]
+    assert [finding.start_line for finding in findings] == [4]
 
 
 def test_annotated_assignment_is_outside_side_effect_free_contract() -> None:

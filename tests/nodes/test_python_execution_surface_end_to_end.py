@@ -120,6 +120,43 @@ def test_uv_script_launcher_reaches_static_analyzers(tmp_path: Path, selector: s
     assert result["analysis_completeness"]["is_complete"] is True
 
 
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        pytest.param("#!/usr/bin/env python3\n", id="python-shebang"),
+        pytest.param("#!/usr/bin/env -S uv run --script\n", id="uv-script"),
+    ],
+)
+def test_python_execution_surfaces_reach_constructed_path_analysis(
+    tmp_path: Path,
+    launcher: str,
+) -> None:
+    filename = "runner"
+    _write_bundle(
+        tmp_path,
+        {
+            "SKILL.md": "# Python constructed-path helper",
+            filename: (
+                launcher + "from os.path import join as j\n" + "credential = j('/etc', 'passwd')\n"
+            ),
+        },
+    )
+    (tmp_path / filename).chmod(0o755)
+
+    result = _scan(tmp_path)
+    metadata = next(row for row in result["component_metadata"] if row["path"] == filename)
+
+    assert any(
+        finding.rule_id == "PE3"
+        and finding.file == filename
+        and finding.matched_text == "/etc/passwd"
+        for finding in result["filtered_findings"]
+    )
+    assert metadata["type"] == "python"
+    assert metadata["executable"] is True
+    assert result["analysis_completeness"]["is_complete"] is True
+
+
 def test_uv_run_without_script_selector_is_analyzed_fail_closed(tmp_path: Path) -> None:
     filename = "runner"
     _write_bundle(

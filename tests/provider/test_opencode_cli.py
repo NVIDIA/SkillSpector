@@ -443,7 +443,7 @@ class TestOpencodeDenyAllPolicy:
 # ---------------------------------------------------------------------------
 
 
-# Real opencode 1.18.31 envelope shapes (Step-0 probe:
+# Real opencode 1.18.32 envelope shapes (Step-0 probe:
 # `opencode run "say hi" --format json` in an empty dir; verbatim raw saved
 # to Temp scratch only). Top-level `type` is one of step_start / text /
 # step_finish; the reply text lives at part.text of `text` events.
@@ -484,7 +484,7 @@ class TestParseOpencodeOutput:
 
     def test_skips_non_json_noise_lines(self) -> None:
         # Banner/TUI noise must never leak into the extracted output.
-        raw = f"opencode v1.18.31\n{_TEXT_EVENT}\nattaching session...\n"
+        raw = f"opencode v1.18.32\n{_TEXT_EVENT}\nattaching session...\n"
         assert _parse_opencode_output(raw) == "hi"
 
     def test_empty_stdout_raises(self) -> None:

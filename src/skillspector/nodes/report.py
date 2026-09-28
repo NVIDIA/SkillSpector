@@ -106,6 +106,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # Finding free-text fields that may carry scanned/LLM content.
 _SANITIZED_FIELDS = (
     "message",
+    "pattern",
     "explanation",
     "remediation",
     "finding",
@@ -155,6 +156,7 @@ def _sanitize_finding(finding: Finding) -> Finding:
     return replace(
         finding,
         message=clean(finding.message) or "",
+        pattern=clean(finding.pattern),
         explanation=clean(finding.explanation),
         remediation=clean(finding.remediation),
         finding=clean(finding.finding),

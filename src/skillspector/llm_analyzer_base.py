@@ -63,6 +63,7 @@ from skillspector.llm_utils import (
     _AgentCLIMessage,
     _ainvoke_with_usage,
     _invoke_with_usage,
+    bind_structured_output,
     chat_model_provider_name,
     get_chat_model,
     new_inference_usage_collector,
@@ -933,7 +934,9 @@ class LLMAnalyzerBase:
             max_retries=native_retries,
         )
         self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
+            bind_structured_output(self._llm, self.response_schema, model)
+            if self.response_schema
+            else None
         )
         self._usage_collector = new_inference_usage_collector(
             node=node,
@@ -986,7 +989,9 @@ class LLMAnalyzerBase:
             chat_model_controls(llm),
         )
         structured = (
-            llm.with_structured_output(self.response_schema) if self.response_schema else None
+            bind_structured_output(llm, self.response_schema, self.model)
+            if self.response_schema
+            else None
         )
         return llm, structured
 

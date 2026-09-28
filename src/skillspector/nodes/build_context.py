@@ -47,6 +47,7 @@ from skillspector.constants import (
     MAX_ANALYZABLE_FILE_BYTES,
     MAX_FILE_BYTES,
     MAX_LLM_TRUNCATED_FILE_CHARS,
+    MODEL_CONFIG,
     build_model_config,
 )
 from skillspector.input_handler import (
@@ -62,7 +63,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
-from skillspector.llm_provenance import capture_llm_provenance
+from skillspector.llm_provenance import capture_llm_provenance, capture_static_llm_provenance
 from skillspector.logging_config import get_logger
 from skillspector.nested_artifacts import (
     expected_container_type,
@@ -2443,6 +2444,15 @@ def _parse_manifest(
                 runtime_limit=runtime_limit,
             )
             return {}
+        while content.startswith("\ufeff"):
+            # decode_text() decodes with plain "utf-8", which never strips a
+            # leading byte-order mark (only "utf-8-sig" does), so a BOM-prefixed
+            # SKILL.md leaves content[0] == "\ufeff" and the delimiter check below
+            # silently sees {} instead of the frontmatter. Strip leading BOMs here,
+            # scoped to delimiter detection — decode_text() itself stays untouched
+            # because P2/TP1/P9 treat U+FEFF as a hidden-character injection signal
+            # in file bodies.
+            content = content[1:]
         if not content.startswith("---"):
             return {}
         end_match = re.search(r"\n---\s*\n", content[3:])
@@ -3577,7 +3587,13 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         if target and target in disposition_by_path:
             reference["disposition"] = disposition_by_path[target]
 
-    model_config = build_model_config()
+    use_llm = state.get("use_llm", True)
+    model_config = build_model_config() if use_llm else {}
+    llm_provenance = (
+        capture_llm_provenance(model_config)
+        if use_llm
+        else capture_static_llm_provenance(MODEL_CONFIG)
+    )
     result: dict[str, object] = {
         "components": components,
         "llm_components": llm_components,
@@ -3618,7 +3634,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "manifest": manifest,
         "previous_manifest": None,
         "model_config": model_config,
-        "llm_provenance": capture_llm_provenance(model_config),
+        "llm_provenance": llm_provenance,
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
         "workflow_resource_budget": workflow_budget,
