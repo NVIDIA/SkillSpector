@@ -98,6 +98,7 @@ class LedgerReason(StrEnum):
     OUTPUT_LIMIT = "output_limit"
     TRANSITIVE_CHILD_SCAN_FAILED = "transitive_child_scan_failed"
     STATIC_PARSE_LIMIT = "static_parse_limit"
+    JSON_QUOTE_OWNERSHIP_LIMIT = "json_quote_ownership_limit"
     OBFUSCATED_INSTRUCTION_TEXT = "obfuscated_instruction_text"
 
 
@@ -210,6 +211,12 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.STATIC_PARSE_LIMIT: (
         "A security-relevant expression exceeded a bounded static parser's span limit."
     ),
+    LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT: (
+        "JSON quote ownership was not validated because a candidate source span exceeds "
+        "the character limit. JSON validity remains unverified; other instruction uncertainty "
+        "may remain. Split the document into smaller complete JSON values without dropping "
+        "required content, then rescan. Increasing the scan timeout does not raise this limit."
+    ),
     LedgerReason.OBFUSCATED_INSTRUCTION_TEXT: (
         "Obfuscated instruction text could not be fully evaluated by the deterministic layer."
     ),
@@ -253,6 +260,8 @@ class InspectionLedgerEvent(TypedDict):
     stage: NotRequired[str]
     observed_characters: NotRequired[int]
     limit_characters: NotRequired[int]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
     observed_bytes: NotRequired[int]
     limit_bytes: NotRequired[int]
     observed_findings: NotRequired[int]
@@ -293,6 +302,10 @@ class InspectionLedgerException(TypedDict):
     error_class: NotRequired[str]
     analyzers: NotRequired[list[str]]
     fatal: NotRequired[bool]
+    observed_characters: NotRequired[int]
+    limit_characters: NotRequired[int]
+    source_start_offset: NotRequired[int]
+    source_end_offset: NotRequired[int]
 
 
 class AnalysisCompleteness(TypedDict):
@@ -615,7 +628,7 @@ def _exception_from_event(
         if outcome == LedgerOutcome.FAILED
         else LedgerReason.NO_APPLICABLE_FILES
     )
-    return _exception(
+    exception = _exception(
         outcome=outcome,
         phase=str(event["phase"]),
         reason=_reason(event.get("reason_code"), fallback),
@@ -626,6 +639,32 @@ def _exception_from_event(
         analyzers=[str(event.get("analyzer_id", ""))],
         fatal=fatal,
     )
+    if exception["reason_code"] is LedgerReason.JSON_QUOTE_OWNERSHIP_LIMIT:
+        # Copy only consistent numeric evidence, never an arbitrary message or
+        # source payload from graph state. Keep distinct spans distinct when
+        # the public projection groups contributing analyzers below.
+        start = event.get("source_start_offset")
+        end = event.get("source_end_offset")
+        observed = event.get("observed_characters")
+        limit = event.get("limit_characters")
+        if (
+            type(start) is int
+            and type(end) is int
+            and type(observed) is int
+            and type(limit) is int
+            and 0 <= start < end
+            and observed == end - start
+            and observed > limit > 0
+        ):
+            exception["source_start_offset"] = start
+            exception["source_end_offset"] = end
+            exception["observed_characters"] = observed
+            exception["limit_characters"] = limit
+            exception["message"] += (
+                f" Observed source character span [{start}, {end}) "
+                f"({observed} characters; limit {limit})."
+            )
+    return exception
 
 
 def _merge_exception_projection(
