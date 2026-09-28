@@ -91,6 +91,36 @@ jobs:
       - run: uv run skillspector --version
       - run: uv run make test-ci
 
+  test-baseline-integration:
+    name: Baseline CLI and MCP Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # These selected suites use static analysis and require no provider credentials.
+      SKILLSPECTOR_PROVIDER: offline-integration-tests
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: make install-dev
+      - name: Run credential-free baseline and real MCP transport regressions
+        run: >-
+          uv run pytest -m integration
+          tests/integration/test_baseline_coverage.py
+          tests/integration/test_baseline_mcp.py
+          --junitxml=baseline-integration-results.xml
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: baseline-integration-results
+          path: baseline-integration-results.xml
+          if-no-files-found: ignore
+
   test-opencode:
     name: OpenCode TypeScript Tests
     runs-on: ubuntu-latest
