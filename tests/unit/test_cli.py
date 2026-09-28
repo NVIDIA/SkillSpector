@@ -6018,7 +6018,11 @@ def test_cli_recursive_summary_count_excludes_suppressed(
     assert row.split() == ["solo", "0", "LOW", "0", "successful"]
 
 
-def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> None:
+@pytest.mark.parametrize("has_baseline_findings", [False, True])
+def test_cli_baseline_command_excludes_filtered_out_findings(
+    tmp_path: Path,
+    has_baseline_findings: bool,
+) -> None:
     """`skillspector baseline` fingerprints what the scan reported, not raw findings.
 
     Closes a mutation survivor: reverting this call site to the old
@@ -6041,6 +6045,10 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
         "file_cache": {"SKILL.md": source},
         "risk_score": 0,
     }
+
+    if has_baseline_findings:
+        result["baseline_findings"] = []
+        result["filtered_findings"] = result["findings"]
 
     with patch("skillspector.cli.graph.invoke", return_value=result):
         invocation = runner.invoke(app, ["baseline", str(skill), "-o", str(out), "--no-llm"])

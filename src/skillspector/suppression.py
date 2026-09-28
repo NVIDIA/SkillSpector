@@ -643,13 +643,20 @@ def build_baseline_dict(
 
 
 def dump_baseline(data: dict[str, object], path: str | Path) -> None:
-    """Write a baseline mapping to *path* as YAML (``.json`` extension -> JSON)."""
+    """Validate and write YAML (``.json`` extension -> JSON) without truncation."""
+    baseline_from_dict(data)
     p = Path(path)
     if p.suffix.lower() == ".json":
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        content = json.dumps(data, indent=2)
     else:
         header = (
             "# SkillSpector baseline — findings listed here are suppressed on future scans.\n"
             "# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.\n"
         )
-        p.write_text(header + yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        content = header + yaml.safe_dump(data, sort_keys=False)
+    # A complete population can exceed the loader's limits even when a compact
+    # report fits. Reject it before overwriting an existing, usable baseline.
+    if len(content.encode("utf-8")) > MAX_BASELINE_BYTES:
+        raise ValueError(f"Baseline file exceeds byte limit ({MAX_BASELINE_BYTES}): {p}")
+    yaml.load(content, Loader=_BoundedBaselineLoader)
+    p.write_text(content, encoding="utf-8")

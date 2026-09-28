@@ -3181,7 +3181,11 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
-        findings = effective_findings(result)
+        # Report compaction retains locations but not each occurrence's exact
+        # context/confidence. Fingerprint the same originals suppression sees.
+        findings = result.get("baseline_findings")
+        if not isinstance(findings, list):
+            findings = effective_findings(result)
         data = build_baseline_dict(
             findings,
             reason=reason,

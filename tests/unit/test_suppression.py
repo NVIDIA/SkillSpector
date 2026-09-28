@@ -1051,3 +1051,33 @@ def test_effective_findings_skips_a_suppressed_entry_with_no_finding() -> None:
     }
 
     assert effective_findings(result) == [kept]
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".json"])
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "message"),
+    [
+        ("MAX_BASELINE_RECORDS", 1, "record limit"),
+        ("MAX_BASELINE_BYTES", 32, "byte limit"),
+        ("MAX_BASELINE_NODES", 3, "node limit"),
+    ],
+)
+def test_dump_baseline_rejects_unloadable_output_without_overwriting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    limit_name: str,
+    limit: int,
+    message: str,
+) -> None:
+    findings = [_finding(start_line=3), _finding(start_line=7)]
+    data = build_baseline_dict(
+        findings, file_cache={findings[0].file: SKILL_CONTENT}, scanner_version=SCANNER_VERSION
+    )
+    output = tmp_path / f"baseline{suffix}"
+    output.write_text("existing baseline", encoding="utf-8")
+    monkeypatch.setattr(suppression_module, limit_name, limit)
+
+    with pytest.raises(ValueError, match=message):
+        dump_baseline(data, output)
+    assert output.read_text(encoding="utf-8") == "existing baseline"
