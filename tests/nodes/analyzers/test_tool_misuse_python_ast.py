@@ -547,6 +547,43 @@ def test_generic_call_invalidates_receiver_trust(statement: str) -> None:
 @pytest.mark.parametrize(
     "statement",
     [
+        pytest.param("ignored = (replace_subprocess(),)", id="tuple-rhs"),
+        pytest.param("ignored = [replace_subprocess()]", id="list-rhs"),
+        pytest.param(
+            "ignored: tuple[object, ...] = (replace_subprocess(),)",
+            id="annotated-tuple-rhs",
+        ),
+    ],
+)
+def test_nested_generic_call_invalidates_receiver_trust(statement: str) -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        f"{statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+    assert not findings
+
+
+def test_nested_generic_call_invalidates_receiver_trust_for_called_function() -> None:
+    findings = _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        "ignored = (replace_subprocess(),)\n"
+        "execute()\n"
+    )
+
+    assert not findings
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
         pytest.param("replace_subprocess()", id="expression"),
         pytest.param("result = replace_subprocess()", id="assignment"),
         pytest.param("result: object = replace_subprocess()", id="annotated-assignment"),

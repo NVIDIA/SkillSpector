@@ -211,6 +211,8 @@ class TestAzureOpenAIProvider:
             "gpt-5.6-sol",
             "gpt-5.6",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
         ):
             assert provider.get_context_length(model) == 1050000
             assert provider.get_max_output_tokens(model) == 128000
