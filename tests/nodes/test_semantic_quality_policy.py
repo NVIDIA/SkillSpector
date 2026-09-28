@@ -25,6 +25,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_core.runnables import Runnable, RunnableConfig
 
+from skillspector.inference_usage import sanitize_inference_usage
 from skillspector.inspection_ledger import LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMFinding
 from skillspector.llm_utils import AgentCLIChatModel
@@ -339,7 +340,8 @@ class TestErrorHandling:
             result = node({"file_cache": {"SKILL.md": "# Skill"}})
 
         assert result["findings"] == []
-        assert result["inference_usage"] == []
+        assert result["inference_usage"][0]["usage_source"] == "provider_response"
+        assert sanitize_inference_usage(result["inference_usage"]) == []
         assert result["inspection_ledger"]
         assert result["inspection_ledger"][0]["outcome"] == "skipped"
         assert result["inspection_ledger"][0]["reason_code"] == (

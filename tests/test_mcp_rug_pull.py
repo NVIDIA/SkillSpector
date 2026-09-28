@@ -22,6 +22,7 @@ import json
 from skillspector.nodes.analyzers.mcp_rug_pull import node
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.nodes.report import report
 from skillspector.state import SkillspectorState
 
 
@@ -47,6 +48,11 @@ def test_rp1_npx_unpinned():
     rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
     assert len(rp1) == 1
     assert "npx @scope/mcp-server" in rp1[0].matched_text
+    issue = json.loads(report({"filtered_findings": rp1, "output_format": "json"})["report_body"])[
+        "issues"
+    ][0]
+    assert issue["pattern"] == rp1[0].message
+    assert issue["finding"] == "npx @scope/mcp-server"
 
 
 def test_rp1_scans_cached_files_without_a_manifest():
@@ -112,6 +118,27 @@ def test_rp1_docker_unpinned():
     )
     rp1 = [f for f in result2["findings"] if f.rule_id == "RP1"]
     assert len(rp1) >= 1
+
+
+def test_rp1_docker_credentials_are_redacted_in_reports():
+    result = node(
+        _state(
+            file_cache={
+                "setup.sh": "docker pull https://deploy:s3cret@registry.example.com/team/image"
+            }
+        )
+    )
+    rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
+    assert len(rp1) == 1
+
+    json_body = report({"filtered_findings": rp1, "output_format": "json"})["report_body"]
+    issue = json.loads(json_body)["issues"][0]
+    assert "https://***@registry.example.com" in issue["pattern"]
+    assert "https://***@registry.example.com" in issue["finding"]
+    sarif_body = report({"filtered_findings": rp1, "output_format": "sarif"})["report_body"]
+    for body in (json_body, sarif_body):
+        assert "deploy:s3cret" not in body
+        assert "s3cret" not in body
 
 
 def test_rp1_multiple_patterns():

