@@ -596,6 +596,46 @@ def test_generic_call_invalidates_receiver_trust_for_called_function(statement: 
     assert not findings
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("assert (replace_subprocess(),)", id="assert"),
+        pytest.param("(replace_subprocess(),)", id="tuple-expression"),
+        pytest.param("[replace_subprocess()]", id="list-expression"),
+    ],
+)
+def test_unsupported_eager_statement_invalidates_receiver_trust(statement: str) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        f"{statement}\n"
+        "enabled = True\n"
+        "subprocess.run(command, shell=enabled)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param("assert (replace_subprocess(),)", id="assert"),
+        pytest.param("(replace_subprocess(),)", id="tuple-expression"),
+        pytest.param("[replace_subprocess()]", id="list-expression"),
+    ],
+)
+def test_unsupported_eager_statement_invalidates_receiver_for_called_function(
+    statement: str,
+) -> None:
+    assert not _tm1(
+        "import subprocess\n"
+        "from helpers import replace_subprocess\n"
+        "def execute():\n"
+        "    enabled = True\n"
+        "    subprocess.run(command, shell=enabled)\n"
+        f"{statement}\n"
+        "execute()\n"
+    )
+
+
 def test_generic_call_invalidates_receiver_trust_for_nested_closure() -> None:
     assert not _tm1(
         "import subprocess\n"

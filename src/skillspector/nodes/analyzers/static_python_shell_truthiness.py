@@ -587,14 +587,47 @@ def _call_arguments_are_passive(call: ast.Call) -> bool:
     )
 
 
+def _comprehension_target_is_simple(target: ast.expr) -> bool:
+    """Return whether binding a comprehension target cannot dispatch user code."""
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return all(
+            not isinstance(item, ast.Starred) and _comprehension_target_is_simple(item)
+            for item in target.elts
+        )
+    return False
+
+
 def _value_preserves_receiver_trust(expression: ast.expr, trusted_names: set[str]) -> bool:
     """Return whether evaluating a value cannot replace a trusted receiver."""
     if _is_passive_argument(expression):
         return True
-    return (
+    if (
         isinstance(expression, ast.Call)
         and _is_direct_subprocess_call(expression, trusted_names)
         and _call_arguments_are_passive(expression)
+    ):
+        return True
+    if isinstance(expression, (ast.Tuple, ast.List)):
+        return all(
+            not isinstance(item, ast.Starred)
+            and _value_preserves_receiver_trust(item, trusted_names)
+            for item in expression.elts
+        )
+    if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        values = [expression.elt]
+    elif isinstance(expression, ast.DictComp):
+        values = [expression.key, expression.value]
+    else:
+        return False
+    return all(_value_preserves_receiver_trust(value, trusted_names) for value in values) and all(
+        _comprehension_target_is_simple(generator.target)
+        and _value_preserves_receiver_trust(generator.iter, trusted_names)
+        and all(
+            _value_preserves_receiver_trust(condition, trusted_names) for condition in generator.ifs
+        )
+        for generator in expression.generators
     )
 
 
@@ -725,6 +758,9 @@ def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None
         trusted_names.discard(statement.name)
         return
     if isinstance(statement, ast.Assign):
+        if not all(isinstance(target, ast.Name) for target in statement.targets):
+            trusted_names.clear()
+            return
         changed = _changed_direct_names(
             [statement.value, *statement.targets],
             trusted_names,
@@ -739,11 +775,30 @@ def _advance_trusted_names(statement: ast.stmt, trusted_names: set[str]) -> None
         }
         trusted_names.difference_update(changed.difference(preserved))
         return
+    if isinstance(statement, ast.AnnAssign):
+        if not isinstance(statement.target, ast.Name):
+            trusted_names.clear()
+            return
+        trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+        return
     if isinstance(statement, ast.ClassDef):
         trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
         trusted_names.difference_update(_class_body_changed_direct_names(statement, trusted_names))
         return
-    trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+    if isinstance(statement, ast.Expr):
+        trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+        return
+    if isinstance(statement, ast.Assert):
+        expressions = [statement.test]
+        if statement.msg is not None:
+            expressions.append(statement.msg)
+        if all(_value_preserves_receiver_trust(item, trusted_names) for item in expressions):
+            return
+        trusted_names.clear()
+        return
+    if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
+        return
+    trusted_names.clear()
 
 
 class _Analyzer:
@@ -825,7 +880,10 @@ class _Analyzer:
         )
         result_is_finalizer_safe = _is_finalizer_safe_value(value, finalizer_safe_names)
         call_has_protocol_effects = False
-        preserves_receiver_trust = _value_preserves_receiver_trust(value, trusted_names)
+        preserves_receiver_trust = simple_targets and _value_preserves_receiver_trust(
+            value,
+            trusted_names,
+        )
         if isinstance(value, ast.Call):
             self._record_bound_shell_call(value, trusted_names)
         if isinstance(value, ast.Call) and _is_direct_subprocess_call(value, trusted_names):
@@ -979,9 +1037,8 @@ class _Analyzer:
                 )
             elif isinstance(statement, ast.AnnAssign):
                 value = statement.value
-                preserves_receiver_trust = value is None or _value_preserves_receiver_trust(
-                    value,
-                    trusted_names,
+                preserves_receiver_trust = isinstance(statement.target, ast.Name) and (
+                    value is None or _value_preserves_receiver_trust(value, trusted_names)
                 )
                 if isinstance(value, ast.Call):
                     self._record_bound_shell_call(value, trusted_names)
@@ -1008,7 +1065,7 @@ class _Analyzer:
                 facts.clear()
                 finalizer_safe_names.clear()
                 bound_names.update(_direct_bound_names(statement))
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+                trusted_names.clear()
             elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
                 call = statement.value
                 self._record_bound_shell_call(call, trusted_names)
@@ -1025,10 +1082,30 @@ class _Analyzer:
                     facts.clear()
                     finalizer_safe_names.clear()
                     trusted_names.clear()
-            elif isinstance(statement, ast.Pass) or (
+            elif isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)) or (
                 isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
             ):
                 continue
+            elif isinstance(statement, ast.Expr):
+                facts.clear()
+                finalizer_safe_names.clear()
+                bound_names.update(_direct_bound_names(statement))
+                if _value_preserves_receiver_trust(statement.value, trusted_names):
+                    trusted_names.difference_update(
+                        _changed_direct_names([statement], trusted_names)
+                    )
+                else:
+                    trusted_names.clear()
+            elif isinstance(statement, ast.Assert):
+                facts.clear()
+                finalizer_safe_names.clear()
+                expressions = [statement.test]
+                if statement.msg is not None:
+                    expressions.append(statement.msg)
+                if not all(
+                    _value_preserves_receiver_trust(item, trusted_names) for item in expressions
+                ):
+                    trusted_names.clear()
             elif isinstance(statement, ast.ClassDef):
                 class_trusted_names = set(trusted_names)
                 passive_class_header = _class_header_is_passive(statement)
@@ -1068,7 +1145,7 @@ class _Analyzer:
                 facts.clear()
                 finalizer_safe_names.clear()
                 bound_names.update(_direct_bound_names(statement))
-                trusted_names.difference_update(_changed_direct_names([statement], trusted_names))
+                trusted_names.clear()
 
     def run(self, tree: ast.Module) -> list[AnalyzerFinding]:
         self._scan_block(tree.body)
