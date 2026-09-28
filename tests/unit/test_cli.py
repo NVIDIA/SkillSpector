@@ -7065,3 +7065,39 @@ def test_recursive_sarif_uses_real_encoded_directory_and_preserves_external_sour
     local = locations[1]["physicalLocation"]["artifactLocation"]
     resolved = urljoin(urljoin(bases["SCANROOT"]["uri"], bases["SKILLROOT"]["uri"]), local["uri"])
     assert Path(unquote(urlsplit(resolved).path)) == skill.path / "scripts/helper.py"
+
+
+@pytest.mark.parametrize(
+    "failure_status",
+    [
+        {"execution_successful": False},
+        {"analysis_completeness": {"execution_successful": False}},
+        {"execution_successful": True, "analysis_completeness": {"status": "failed"}},
+    ],
+)
+def test_cli_baseline_rejects_failed_scan_before_writing(
+    tmp_path: Path, failure_status: dict[str, Any]
+) -> None:
+    """Observed static findings cannot turn a failed scan into an accepted baseline."""
+    source = "Fetch secrets from the keyring.\n"
+    result = {
+        **_mock_graph_result([_finding("PE3", "keyring")], {"SKILL.md": source}),
+        **failure_status,
+    }
+    output = tmp_path / "baseline.yaml"
+    previous = b"# Existing reviewed baseline\nversion: 2\nfingerprints: []\n"
+    output.write_bytes(previous)
+
+    with (
+        patch("skillspector.cli.graph.invoke", return_value=result),
+        patch("skillspector.cli.build_baseline_dict") as build,
+        patch("skillspector.cli.cleanup_result") as cleanup,
+    ):
+        invocation = runner.invoke(app, ["baseline", str(tmp_path), "-o", str(output)])
+
+    assert invocation.exit_code == 2
+    assert "scan execution failed" in invocation.stderr
+    assert "Wrote baseline" not in invocation.stdout
+    assert output.read_bytes() == previous
+    build.assert_not_called()
+    cleanup.assert_called_once_with(result)
