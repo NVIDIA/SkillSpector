@@ -661,6 +661,58 @@ def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -
     assert all(record["target_path"] is None for record in records)
 
 
+def test_scoped_npm_package_spec_is_not_a_reference(tmp_path: Path) -> None:
+    source = (
+        "Run `npx --yes @xerg/cli@0.34.0 doctor --json` after approval.\n"
+        "Install @modelcontextprotocol/server-filesystem or npm i @types/node @babel/core@^7.0.0.\n"
+    )
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source,
+        known_paths=["SKILL.md"],
+    )
+    assert all(record["target_path"] is None for record in records)
+    assert not any(record["status"] in {"resolved", "missing", "ambiguous"} for record in records)
+
+
+def test_explicit_known_at_paths_resolve(tmp_path: Path) -> None:
+    source = "See [@scope/tool.py](@scope/tool.py) and [helper](@pkg/helper.sh) for details.\n"
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source,
+        known_paths=["SKILL.md", "@scope/tool.py", "@pkg/helper.sh"],
+    )
+    assert len(records) == 2
+    assert [record["target_path"] for record in records] == ["@scope/tool.py", "@pkg/helper.sh"]
+    assert all(record["status"] == "resolved" for record in records)
+    assert all(record["disposition"] == ArtifactDisposition.ANALYZED for record in records)
+
+
+def test_paths_followed_by_punctuation_still_resolve(tmp_path: Path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run.sh").write_text("#!/bin/sh", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("guide", encoding="utf-8")
+    source = (
+        "run scripts/run.sh; then stop\n"
+        "open docs/guide.md?v=2 now\n"
+        "cat docs/guide.md> out.txt\n"
+        "<a href=docs/guide.md>\n"
+    )
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source,
+        known_paths=["SKILL.md", "scripts/run.sh", "docs/guide.md"],
+    )
+    resolved = [r for r in records if r["status"] == "resolved"]
+    resolved_targets = {r["target_path"] for r in resolved}
+    assert "scripts/run.sh" in resolved_targets
+    assert "docs/guide.md" in resolved_targets
+
+
 def test_rejected_candidates_do_not_consume_accepted_reference_budget(tmp_path: Path) -> None:
     (tmp_path / ".hidden.md").write_text("hidden", encoding="utf-8")
     rejected = "\n".join(
