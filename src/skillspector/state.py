@@ -236,6 +236,8 @@ class SkillspectorState(TypedDict, total=False):
     # Input: resolve_input node consumes input_path or skill_path, sets skill_path
     input_path: str | None
     skill_path: str | None
+    # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
+    primary_file_path: str | None
     # Set/reset by resolve_input from the actual selected source. None means
     # materialization could not establish a current-skill identity; analyzers
     # must not substitute generated directory names or manifest-only aliases.

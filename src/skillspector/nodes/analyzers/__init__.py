@@ -28,6 +28,7 @@ logger = get_logger(__name__)
 ANALYZER_NODE_IDS: list[str] = []
 ANALYZER_NODES: dict[str, Any] = {}
 ANALYZER_MODULES: dict[str, Any] = {}
+ANALYZER_LOAD_ERRORS: dict[str, str] = {}
 
 
 def _discover_analyzers() -> None:
@@ -44,9 +45,11 @@ def _discover_analyzers() -> None:
             mod = importlib.import_module(full_module_name)
         except ImportError as exc:
             logger.error("Failed to import analyzer module %s: %s", module_name, exc)
+            ANALYZER_LOAD_ERRORS[module_name] = str(exc)
             continue
         except Exception as exc:
             logger.error("Error loading analyzer module %s: %s", module_name, exc)
+            ANALYZER_LOAD_ERRORS[module_name] = str(exc)
             continue
 
         analyzer_id = getattr(mod, "ANALYZER_ID", None)
@@ -60,4 +63,4 @@ def _discover_analyzers() -> None:
 
 _discover_analyzers()
 
-__all__ = ["ANALYZER_NODE_IDS", "ANALYZER_NODES", "ANALYZER_MODULES"]
+__all__ = ["ANALYZER_LOAD_ERRORS", "ANALYZER_MODULES", "ANALYZER_NODE_IDS", "ANALYZER_NODES"]

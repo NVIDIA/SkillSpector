@@ -45,8 +45,13 @@ from skillspector.graph import graph
         ),
         pytest.param(
             "Your data has been encrypted.\nPay the ransom in Bitcoin.\n",
-            False,
+            True,
             id="multiline-bare-imperative",
+        ),
+        pytest.param(
+            "Send 0.5 BTC to <addr>.\nTo receive the decryption key, email us your personal ID.\n",
+            True,
+            id="multiline-payment-key",
         ),
         pytest.param("Your files are encrypted.\n", True, id="encrypted-files-are"),
         pytest.param("Your files have been encrypted.\n", True, id="encrypted-files-have-been"),

@@ -62,6 +62,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             temp_dir = handler.temp_dir_for_cleanup()
             update: dict[str, object] = {
                 "skill_path": str(resolved),
+                "primary_file_path": handler.primary_file_path,
                 "selected_source_identity": selected_source_identity_for_input(
                     input_path.strip(),
                     source_type=source_type,
@@ -86,7 +87,12 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
                 exc.truncation.code,
             )
             raise
-        except (ValueError, FileNotFoundError):
+        except BaseException:
+            # The graph fails before returning temp_dir_for_cleanup, so no caller
+            # can remove a partial download or extraction directory afterwards.
+            # BaseException, not Exception: an interrupt or a cancellation that
+            # lands after the temp directory was allocated must clean up too.
+            handler.cleanup()
             raise
 
     if skill_path and isinstance(skill_path, str) and skill_path.strip():
@@ -94,6 +100,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             resolved = validate_local_input_path(Path(skill_path))
             return {
                 "skill_path": str(resolved),
+                "primary_file_path": None,
                 "selected_source_identity": resolved.name or None,
                 "temp_dir_for_cleanup": None,
                 "workflow_resource_budget": workflow_budget,
@@ -102,6 +109,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
             logger.warning("Could not resolve skill_path: %s", e)
             return {
                 "skill_path": None,
+                "primary_file_path": None,
                 "selected_source_identity": None,
                 "temp_dir_for_cleanup": None,
                 "workflow_resource_budget": workflow_budget,
@@ -109,6 +117,7 @@ def resolve_input(state: SkillspectorState) -> dict[str, object]:
 
     return {
         "skill_path": None,
+        "primary_file_path": None,
         "selected_source_identity": None,
         "temp_dir_for_cleanup": None,
         "workflow_resource_budget": workflow_budget,

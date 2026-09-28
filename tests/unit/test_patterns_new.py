@@ -260,6 +260,21 @@ class TestExcessiveAgency:
             "selection_key": key,
         }
 
+    def test_ea5_frontmatter_pin_detected_through_leading_bom(self) -> None:
+        """A BOM-prefixed SKILL.md must not hide the frontmatter model pin."""
+        content = "\ufeff---\nname: example\nmodel: claude-sonnet-4-6\n---\n\n# Example\n"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.MEDIUM
+        # The BOM is matched, not stripped, so offsets still index the original
+        # content and the reported line matches the no-BOM case exactly.
+        assert ea5[0].location.start_line == 3
+        assert ea5[0].evidence == {
+            "selection_surface": "frontmatter",
+            "selection_key": "model",
+        }
+
     def test_ea5_frontmatter_identity_uses_the_complete_declaration(self) -> None:
         shared = "gpt-" + "a" * 220
         findings = [
@@ -1903,10 +1918,39 @@ class TestRogueAgent:
                 "shell",
                 id="registry_key",
             ),
+            pytest.param(
+                "cp agent.plist ~/Library/LaunchAgents/com.example.agent.plist",
+                "install.sh",
+                "shell",
+                id="launch_agent_plist",
+            ),
+            pytest.param("write_plist(path, data)", "setup.py", "python", id="snake_case_plist"),
         ],
     )
     def test_ra2_detected(self, content: str, filename: str, filetype: str) -> None:
         assert any(f.rule_id == "RA2" for f in ra_mod.analyze(content, filename, filetype))
+
+    @pytest.mark.parametrize(
+        "content,filename,filetype",
+        [
+            pytest.param(
+                "var relationshipList = document.getElementById('list');",
+                "template.html",
+                "other",
+                id="camel_case_identifier",
+            ),
+            pytest.param(
+                '<xsd:complexType name="CT_GradientStopList">',
+                "dml-main.xsd",
+                "other",
+                id="xsd_type_name",
+            ),
+        ],
+    )
+    def test_ra2_plist_substring_inside_identifier_not_detected(
+        self, content: str, filename: str, filetype: str
+    ) -> None:
+        assert not any(f.rule_id == "RA2" for f in ra_mod.analyze(content, filename, filetype))
 
     def test_safe_content_produces_no_findings(self) -> None:
         findings = ra_mod.analyze(
@@ -2061,6 +2105,13 @@ class TestSupplyChainDependencies:
         ]
         assert len(sc6) >= 1
         assert "requests" in sc6[0].message
+
+    def test_sc6_known_legit_neighbours_not_flagged(self) -> None:
+        pypi = _analyze_deps("psycopg==3.2.0\npynacl==1.5.0\n", "requirements.txt")
+        assert [f for f in pypi if f.rule_id == "SC6"] == []
+        content = '{"dependencies": {"preact": "10.0.0", "gaxios": "6.0.0"}}'
+        npm = _analyze_deps(content, "package.json")
+        assert [f for f in npm if f.rule_id == "SC6"] == []
 
     def test_sc6_typosquat_npm(self) -> None:
         content = '{\n  "dependencies": {\n    "expreess": "4.18.0"\n  }\n}'
@@ -2347,6 +2398,273 @@ class TestTriggerAnalysis:
     def test_missing_triggers_key(self) -> None:
         assert sc_mod._analyze_triggers({"name": "myskill"}, "myskill") == []
 
+    def test_description_is_analyzed_when_triggers_are_absent(self) -> None:
+        findings = sc_mod._analyze_triggers({"description": "all messages"}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_realistic_activation_prose_detected(self) -> None:
+        """rng1995 #541 P1: realistic spec prose must not bypass TR3."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user sends any message"},
+            "myskill",
+        )
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_benign_capability_prose_not_shadow_command(self) -> None:
+        """yashrajp22 #541: ordinary capability prose is not command shadowing."""
+        for description in ("Build projects", "Deploy infrastructure"):
+            findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+            assert findings == []
+
+    def test_description_shadow_command_requires_invocation_intent(self) -> None:
+        """TR2 fires for descriptions only with invocation/shadowing intent."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Intercepts the /build command for every request"},
+            "myskill",
+        )
+        assert "TR2" in {finding.rule_id for finding in findings}
+
+    def test_description_without_baiting_signal_is_skipped(self) -> None:
+        findings = sc_mod._analyze_triggers(
+            {"description": "Run tests whenever code changes"}, "myskill"
+        )
+        assert findings == []
+
+    def test_legacy_triggers_bypass_description_calibration(self) -> None:
+        """Explicit triggers keep the legacy whole-string trigger grammar."""
+        findings = sc_mod._analyze_triggers({"triggers": ["Build"]}, "myskill")
+        assert any(finding.rule_id == "TR2" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param(
+                "Always preserves file permissions when copying files",
+                id="behavior_always",
+            ),
+            pytest.param(
+                "Answers any questions about PostgreSQL",
+                id="qualified_subject",
+            ),
+        ],
+    )
+    def test_description_benign_prose_not_tr3(self, description: str) -> None:
+        """rng1995 #541 P1: behavior prose needs a bounded condition + scope."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
+    def test_description_catch_all_positive_still_tr3(self) -> None:
+        """rng1995 #541 P1: bounded condition + scope still fires TR3."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user sends any message"},
+            "myskill",
+        )
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_shadow_command_without_activation_wording(self) -> None:
+        """rng1995 #541 P1: invocation intent alone opens the TR2 path."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Intercepts the /build command"},
+            "myskill",
+        )
+        assert "TR2" in {finding.rule_id for finding in findings}
+
+    def test_description_embedded_slash_not_invocation_intent(self) -> None:
+        """MohammedAlkindi #541: a slash inside a larger token (CI/CD) is not
+        slash-command invocation intent, so 'build' prose stays negative."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Audit CI/CD pipelines and run the build"},
+            "myskill",
+        )
+        assert findings == []
+
+    def test_description_trigger_phrase_skips_filler_words(self) -> None:
+        """MohammedAlkindi #541: TR1 judges the real trigger word, not a
+        filler preposition after the verb."""
+        for description in (
+            "Use when the user asks to create a poster",
+            "Use when the user asks for a poster",
+        ):
+            findings = sc_mod._analyze_triggers(
+                {"description": description},
+                "myskill",
+            )
+            assert findings == [], description
+
+    @pytest.mark.parametrize("target_len", [120, 121])
+    def test_description_long_clause_window_still_analyzed(self, target_len: int) -> None:
+        """rng1995 #541 P1: 120/121-char clauses keep start-of-clause intent."""
+        base = "Use this skill whenever the user sends any message"
+        description = f"{base} {'x' * (target_len - len(base) - 1)}"
+        assert len(description) == target_len
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    @pytest.mark.parametrize("benign_count", [7, 8])
+    def test_description_trigger_clause_after_benign_padding(self, benign_count: int) -> None:
+        """rng1995 #541 P1: benign sentences cannot push a trigger clause out."""
+        benign = ". ".join(
+            f"Benign capability sentence number {n}" for n in range(1, benign_count + 1)
+        )
+        description = f"{benign}. Use this skill whenever the user sends any message"
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_broad_trigger_word_reaches_tr1(self) -> None:
+        """rng1995 #541 P2: TR1 fires on the trigger phrase in a description."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user says hello"},
+            "myskill",
+        )
+        tr1 = [finding for finding in findings if finding.rule_id == "TR1"]
+        assert len(tr1) == 1
+        assert "hello" in tr1[0].message
+
+    @pytest.mark.parametrize("phrase", ["go there", "work now", "hello there", "hello here"])
+    def test_description_bounded_phrase_with_discourse_word_stays_negative(
+        self, phrase: str
+    ) -> None:
+        """#609: a discourse-looking tail must not shrink a phrase to its head."""
+        findings = sc_mod._analyze_triggers(
+            {"description": f"Use this skill whenever the user says {phrase}"},
+            "myskill",
+        )
+        assert not any(finding.rule_id == "TR1" for finding in findings), phrase
+
+    def test_description_article_not_skipped_as_filler(self) -> None:
+        """MohammedAlkindi #541: bare articles are not filler words, so the
+        broad word stays in the captured phrase ("says the zone" captures
+        "the zone", not "zone"). A multiword phrase is still not TR1."""
+        match = sc_mod._DESCRIPTION_TRIGGER_PHRASE_RE.search(
+            "Use this skill whenever the user says the zone"
+        )
+        assert match is not None
+        assert match.group("phrase") == "the zone"
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user says the zone"},
+            "myskill",
+        )
+        assert findings == []
+
+    def test_description_content_word_after_broad_word_not_tr1(self) -> None:
+        """rng1995 #541 P2 boundary: a content word after a broad word names
+        a multiword trigger phrase ("hello world"), which the legacy trigger
+        grammar never flags as TR1."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Use this skill whenever the user says hello world"},
+            "myskill",
+        )
+        assert findings == []
+
+    def test_description_tr1_from_skill_md_frontmatter(self, tmp_path) -> None:
+        """rng1995 #541 P2: TR1 is reachable end to end from SKILL.md frontmatter."""
+        from skillspector.nodes.build_context import _parse_manifest
+
+        skill_dir = tmp_path / "hello-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: hello-skill\n"
+            "description: Use this skill whenever the user says hello\n"
+            "---\n"
+            "# hello-skill\n",
+            encoding="utf-8",
+        )
+        manifest = _parse_manifest(skill_dir)
+        assert manifest["description"] == "Use this skill whenever the user says hello"
+        findings = sc_mod._analyze_triggers(manifest, "hello-skill")
+        assert any(finding.rule_id == "TR1" for finding in findings)
+
+    def test_description_capability_prose_reaches_no_trigger_rules(self) -> None:
+        """rng1995 #541 P2: normal capability prose stays negative on TR1."""
+        findings = sc_mod._analyze_triggers(
+            {"description": "Helps developers review pull requests efficiently"},
+            "myskill",
+        )
+        assert findings == []
+
+    def test_description_middle_signal_window_analyzed(self) -> None:
+        """rng1995 #541 P1: a trigger sentence buried mid-clause is inspected."""
+        core = "Use this skill whenever the user sends any message"
+        description = f"{'x' * 130} {core} {'y' * 130}"
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_signal_clause_beyond_old_budget_analyzed(self) -> None:
+        """rng1995 #541 P1: signal-bearing clauses past the old budget are inspected."""
+        padding = ". ".join(["Run tests whenever code changes"] * 8)
+        description = f"{padding}. Use this skill whenever the user sends any message"
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
+    def test_description_clause_budget_truncation_reported(self) -> None:
+        """rng1995 #541 P1: dropping signal clauses past the budget is reported."""
+        reported: list[tuple[int, int]] = []
+        padding = ". ".join(["Run tests whenever code changes"] * 40)
+        sc_mod._analyze_triggers(
+            {"description": padding},
+            "myskill",
+            on_description_truncated=lambda omitted, limit: reported.append((omitted, limit)),
+        )
+        assert reported == [(8, sc_mod._MAX_DESCRIPTION_CLAUSES)]
+
+    def test_description_clause_budget_not_exceeded_not_reported(self) -> None:
+        """rng1995 #541 P1: no truncation report when the budget is not exceeded."""
+        reported: list[tuple[int, int]] = []
+        padding = ". ".join(["Run tests whenever code changes"] * 8)
+        description = f"{padding}. Use this skill whenever the user sends any message"
+        sc_mod._analyze_triggers(
+            {"description": description},
+            "myskill",
+            on_description_truncated=lambda omitted, limit: reported.append((omitted, limit)),
+        )
+        assert reported == []
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param("Use when the user asks for code review", id="code_review"),
+            pytest.param("Use when the user asks to make a chart", id="make_chart"),
+        ],
+    )
+    def test_description_multiword_trigger_phrase_not_tr1(self, description: str) -> None:
+        """rng1995 #541 P2: specific multiword task descriptions are not TR1."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param("Show available build commands", id="help_lists_commands"),
+            pytest.param(
+                "Documents the build and test commands with examples",
+                id="command_docs",
+            ),
+        ],
+    )
+    def test_description_command_documentation_not_shadow_command(self, description: str) -> None:
+        """rng1995 #541 P1: describing command help is not command shadowing."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param(
+                "Run tests whenever code changes and summarize all messages from the compiler",
+                id="separate_instruction",
+            ),
+            pytest.param(
+                "Use this skill whenever the user asks any questions about PostgreSQL",
+                id="subject_qualified_activation",
+            ),
+        ],
+    )
+    def test_description_scope_bound_to_activation_condition(self, description: str) -> None:
+        """rng1995 #541 P1: the universal scope must sit inside the condition."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert findings == []
+
 
 # ── Supply Chain Helpers ───────────────────────────────────────────────
 
@@ -2384,6 +2702,78 @@ class TestSupplyChainHelpers:
         self, package: str, popular: set[str]
     ) -> None:
         assert sc_mod._is_typosquat(package, popular) is None
+
+    @staticmethod
+    def _sc6(package: str, ecosystem: str) -> str | None:
+        if ecosystem == "pypi":
+            return sc_mod._is_typosquat(
+                package,
+                sc_mod._POPULAR_PYPI,
+                known_legit=sc_mod._KNOWN_LEGIT_PYPI,
+                pep503=True,
+            )
+        return sc_mod._is_typosquat(
+            package, sc_mod._POPULAR_NPM, known_legit=sc_mod._KNOWN_LEGIT_NPM
+        )
+
+    def test_osa_distance_counts_adjacent_swap_once(self) -> None:
+        assert sc_mod._osa_distance("recat", "react") == 1
+        assert sc_mod._osa_distance("requests", "requests") == 0
+        assert sc_mod._osa_distance("reqeuts", "requests") == 2
+        # Plain Levenshtein still counts the swap as two edits.
+        assert sc_mod._edit_distance("recat", "react") == 2
+
+    @pytest.mark.parametrize(
+        "package,ecosystem,expected",
+        [
+            pytest.param("recat", "npm", "react", id="short_swap_react"),
+            pytest.param("axois", "npm", "axios", id="short_swap_axios"),
+            pytest.param("electorn", "npm", "electron", id="electron"),
+            pytest.param("ethres", "npm", "ethers", id="ethers"),
+            pytest.param("crossenv", "npm", "cross-env", id="cross_env"),
+            pytest.param("discordjs", "npm", "discord.js", id="npm_dot_is_distinct"),
+            pytest.param("colourama", "pypi", "colorama", id="colorama"),
+            pytest.param("python-dotnev", "pypi", "python-dotenv", id="python_dotenv"),
+            pytest.param("pycryptodom", "pypi", "pycryptodome", id="pycryptodome"),
+        ],
+    )
+    def test_is_typosquat_detects_known_patterns(
+        self, package: str, ecosystem: str, expected: str
+    ) -> None:
+        assert self._sc6(package, ecosystem) == expected
+
+    @pytest.mark.parametrize(
+        "package,ecosystem",
+        [
+            pytest.param("pynacl", "pypi", id="pynacl"),
+            pytest.param("psycopg", "pypi", id="psycopg"),
+            pytest.param("pipx", "pypi", id="pipx"),
+            pytest.param("boto", "pypi", id="boto"),
+            pytest.param("pycryptodomex", "pypi", id="pycryptodomex"),
+            pytest.param("gaxios", "npm", id="gaxios"),
+            pytest.param("preact", "npm", id="preact"),
+            pytest.param("cypress", "npm", id="cypress"),
+            pytest.param("nuxt", "npm", id="nuxt"),
+            pytest.param("tether", "npm", id="tether"),
+        ],
+    )
+    def test_is_typosquat_known_legit_not_flagged(self, package: str, ecosystem: str) -> None:
+        assert self._sc6(package, ecosystem) is None
+
+    def test_is_typosquat_known_legit_is_needed(self) -> None:
+        # Without the list, an established package collides with a popular one.
+        assert sc_mod._is_typosquat("pynacl", sc_mod._POPULAR_PYPI) == "pyyaml"
+
+    @pytest.mark.parametrize("package", ["discord-py", "discord_py", "Discord.Py"])
+    def test_is_typosquat_pep503_equivalent_not_flagged(self, package: str) -> None:
+        assert self._sc6(package, "pypi") is None
+
+    def test_known_legit_disjoint_from_popular(self) -> None:
+        for popular, legit in (
+            (sc_mod._POPULAR_PYPI, sc_mod._KNOWN_LEGIT_PYPI),
+            (sc_mod._POPULAR_NPM, sc_mod._KNOWN_LEGIT_NPM),
+        ):
+            assert not ({n.lower() for n in popular} & {n.lower() for n in legit})
 
     def test_is_typosquat_too_distant_returns_none(self) -> None:
         assert sc_mod._is_typosquat("completely_different", {"requests"}) is None
