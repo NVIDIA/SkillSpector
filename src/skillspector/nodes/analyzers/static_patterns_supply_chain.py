@@ -1523,7 +1523,9 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 file_type,
                 line_starts,
             )
-            if _is_safe_supply_chain_pattern(mt):
+            if _is_safe_supply_chain_pattern(mt) or _interpreter_reads_stdin_as_data(
+                content, match.end()
+            ):
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:
@@ -1702,6 +1704,93 @@ def _is_trusted_source(text: str) -> bool:
 def _is_safe_supply_chain_pattern(text: str) -> bool:
     """Return True when the matched text is a known-safe install or fetch pattern."""
     return _is_trusted_source(text) or bool(_SAFE_INSTALL_PATTERN.search(text))
+
+
+# A fetch piped into an interpreter that is given an inline script (-c, -e) or a
+# data module (-m json.tool) hands the interpreter the download as data, not as a
+# program, unless the inline script runs what it reads.
+_INTERPRETER_LANGUAGE = re.compile(r"(python|node|ruby|perl)\Z", re.IGNORECASE)
+_INTERPRETER_NAME = re.compile(r"[\w.]*")
+_LEADING_BLANKS = re.compile(r"(?:[ \t]|\\\r?\n)*")
+_LOGICAL_LINE = re.compile(r"(?:\\\r?\n|[^\n])*")
+_INLINE_SCRIPT_FLAGS = {
+    "python": ("-c",),
+    "node": ("-e", "--eval", "-p", "--print"),
+    "ruby": ("-e",),
+    "perl": ("-e", "-E"),
+}
+_BUNDLED_INLINE_FLAG = {"ruby": re.compile(r"-[a-zA-Z]*e"), "perl": re.compile(r"-[a-zA-Z]*[eE]")}
+_PYTHON_DATA_MODULES = frozenset({"json.tool", "base64"})
+_RUNS_STDIN = re.compile(
+    r"\b(?:exec|execfile|eval|instance_eval|compile|runpy|interact|InteractiveConsole|"
+    r"InteractiveInterpreter|subprocess|system|popen|spawn|execSync|child_process|vm|"
+    r"Function|pickle|marshal|Marshal|shelve|dill|qx|load_module)\b|\bimport\s*\(|`|%x",
+)
+_PIPES_ON_TO_RUNNER = re.compile(
+    r"\|\s*(?:sudo\s+)?(?:(?:ba|z|da)?sh|python\d*|node|ruby|perl|eval)\b|\$\(",
+)
+
+
+def _logical_line(text: str) -> str:
+    """Return text up to the first line break that is not a shell continuation."""
+    line = _LOGICAL_LINE.match(text)
+    return line.group(0) if line else text
+
+
+def _inline_script(tail: str) -> tuple[str, str] | None:
+    """Split tail into the script it starts with and the rest of that line.
+
+    Return None when the script cannot be read: a quote that is never closed, or
+    nothing after the flag.
+    """
+    blanks = _LEADING_BLANKS.match(tail)
+    if blanks:
+        tail = tail[blanks.end() :]
+    if tail[:1] in ("'", '"'):
+        quote = tail[0]
+        end = 1
+        while True:
+            end = tail.find(quote, end)
+            if end < 0:
+                return None
+            if quote == '"' and tail[end - 1] == "\\":
+                end += 1
+                continue
+            return tail[1:end], _logical_line(tail[end + 1 :])
+    script = _logical_line(tail)
+    return (script, "") if script.strip() else None
+
+
+def _interpreter_reads_stdin_as_data(content: str, match_end: int) -> bool:
+    """Return whether the interpreter a fetch is piped into treats stdin as data."""
+    language_match = _INTERPRETER_LANGUAGE.search(content, max(0, match_end - 6), match_end)
+    if language_match is None:
+        return False
+    language = language_match.group(1).lower()
+    name_match = _INTERPRETER_NAME.match(content, match_end)
+    rest = content[name_match.end() if name_match else match_end :]
+    while True:
+        token_match = re.match(r"[ \t]+(\S+)", rest)
+        if token_match is None:
+            return False
+        token = token_match.group(1)
+        rest = rest[token_match.end() :]
+        bundled = _BUNDLED_INLINE_FLAG.get(language)
+        if token in _INLINE_SCRIPT_FLAGS[language] or (bundled and bundled.fullmatch(token)):
+            parts = _inline_script(rest)
+            if parts is None:
+                return False
+            script, after = parts
+            return not _RUNS_STDIN.search(script) and not _PIPES_ON_TO_RUNNER.search(script + after)
+        if language == "python" and token == "-m":
+            module_match = re.match(r"[ \t]+([\w.]+)", rest)
+            if module_match is None or module_match.group(1) not in _PYTHON_DATA_MODULES:
+                return False
+            return not _PIPES_ON_TO_RUNNER.search(_logical_line(rest))
+        if not token.startswith("-") or token == "-" or token == "--":
+            return False
+        if language == "python" and token in ("-X", "-W"):
+            return False
 
 
 # ---------------------------------------------------------------------------
