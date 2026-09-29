@@ -218,13 +218,44 @@ _VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
 
 
 # P2 structural-benign carve-out. Only structurally proven benign constructs
-# (license-header-shaped HTML comments, frontmatter-adjacent metadata blocks)
-# may suppress a P2 comment match — and never when the match retains an
+# (anchored license-line forms, per-key metadata lines in complete comments
+# near the top of the file or directly after closed frontmatter) may
+# suppress a P2 comment match — and never when the match retains an
 # exfiltration or override signal.
-_P2_LICENSE_SHAPE = re.compile(
-    r"copyright|\(c\)|spdx(?:-license-identifier)?|licensed under"
-    r"|all rights reserved|permission is hereby granted",
-    re.IGNORECASE,
+#
+# Each license fragment must FULLY match one anchored form below. The
+# substring check these replace let space-joined payloads through
+# ("Copyright ... <arbitrary instruction>" with no separators). The
+# holder is capped at six tokens ("NVIDIA CORPORATION & AFFILIATES" is
+# three); years are \d{1,4} because digit-masking collapses "2026" to
+# "0". One trailing period is allowed ("All rights reserved." is the
+# residual: a very short instruction fits the holder cap
+# ("Copyright 2026 Acme delete everything") — accepted per the
+# anchored-forms spec; the surrounding gates (danger signal first,
+# top-of-file, complete comment, 300 chars) still apply.
+# Shared grammar cores: the year-range + holder cap and the SPDX
+# expression each appear in both a license-line form and a metadata
+# value form. One core per shape so the next cap change edits one place.
+_P2_COPYRIGHT_CORE = (
+    r"(?:\(c\)\s+|©\s+)?\d{1,4}(?:\s*-\s*\d{1,4})?"
+    r"\s+(?:\S+\s+){0,5}\S+\.?"
+)
+_P2_SPDX_ATOM = r"[A-Za-z0-9.+\-]+(?:\s+(?:OR|AND|WITH)\s+[A-Za-z0-9.+\-]+)*"
+_P2_LICENSE_LINE_RES = (
+    re.compile(
+        r"\ACopyright\s+" + _P2_COPYRIGHT_CORE + r"\Z",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\AAll rights reserved\.?\Z", re.IGNORECASE),
+    re.compile(
+        r"\ASPDX-License-Identifier:\s*" + _P2_SPDX_ATOM + r"\.?\Z",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\ALicensed under the\s+(?:\S+\s+){0,3}\S+\s+License"
+        r"(?:, Version \d+\.\d+)?\.?\Z",
+        re.IGNORECASE,
+    ),
 )
 _P2_OVERRIDE_EXTRA = re.compile(
     r"system\s+prompt|respond\s+as|override\s+instructions?|you\s+must",
@@ -265,11 +296,53 @@ _P2_BENIGN_METADATA_KEYS = frozenset(
 )
 _P2_METADATA_LINE = re.compile(r"\A([A-Za-z][\w\- ]{0,40}):\s+(\S.*)\Z")
 _P2_NUMERIC_MASK = re.compile(r"\d+")
-# Clause separators: a pure license line has none of these. A semicolon
-# splits fragments instead (each clause is validated on its own), and
-# spaced hyphens join clauses the same way a separator does.
-_P2_LICENSE_SEPARATOR = re.compile(r"[:!?—,–]|\s-\s")
-_P2_METADATA_VALUE = re.compile(r"\A[\w .+/\-@]{1,40}\Z")
+# Per-key metadata value grammars. The single generic value shape they
+# replace let any imperative instruction through once it contained a
+# digit, dot, slash, @, or hyphen. Each key now fullmatches its own
+# narrow form (years/dates survive digit-masking: "2026" becomes "0",
+# still matched by \d classes). A single sentence-final period is
+# stripped before validation ("contact: me@x.io."), anything else
+# fail-closed. Free-text keys (description/title/status/tags) accept a
+# single token only. Known residual: a bare package name ("requires:
+# send") parses as a package; single-word values carry no payload.
+_P2_VERSION_RE = re.compile(r"\Av?\d[\w.+\-]*\Z")
+_P2_DATE_RE = re.compile(
+    r"\A(?:\d{4}-\d{2}-\d{2}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?"
+    r"|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?"
+    r"|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4})\Z",
+    re.IGNORECASE,
+)
+_P2_NAME_RE = re.compile(r"\A[A-Za-z][A-Za-z .'\-]{0,39}\Z")
+_P2_EMAIL_RE = re.compile(r"\A[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}\Z")
+_P2_SPDX_EXPR_RE = re.compile(r"\A" + _P2_SPDX_ATOM + r"\Z")
+_P2_REQUIREMENTS_RE = re.compile(
+    r"\A[A-Za-z0-9_.\-@/]+(?:\s+[<>=!~^*]*\d[\w.+\-*]*)?"
+    r"(?:\s*[,;]\s*[A-Za-z0-9_.\-@/]+(?:\s+[<>=!~^*]*\d[\w.+\-*]*)?)*\Z"
+)
+_P2_PATH_VALUE_RE = re.compile(r"\A(?=\S*[/.#:])\S{1,120}\Z")
+_P2_SINGLE_TOKEN_RE = re.compile(r"\A\S{1,40}\Z")
+_P2_COPYRIGHT_VALUE_RE = re.compile(
+    r"\A" + _P2_COPYRIGHT_CORE + r"\Z",
+    re.IGNORECASE,
+)
+# Every allowlisted key must appear here or in _P2_FREE_TEXT_KEYS
+# (pinned by test_metadata_keys_all_have_grammars).
+_P2_METADATA_VALUE_RES = {
+    "version": (_P2_VERSION_RE,),
+    "date": (_P2_DATE_RE,),
+    "updated": (_P2_DATE_RE,),
+    "reviewed": (_P2_DATE_RE,),
+    "author": (_P2_NAME_RE, _P2_EMAIL_RE),
+    "contact": (_P2_NAME_RE, _P2_EMAIL_RE),
+    "license": (_P2_SPDX_EXPR_RE,),
+    "spdx-license-identifier": (_P2_SPDX_EXPR_RE,),
+    "requires": (_P2_REQUIREMENTS_RE,),
+    "system dependencies": (_P2_REQUIREMENTS_RE,),
+    "system requirements": (_P2_REQUIREMENTS_RE,),
+    "get started": (_P2_PATH_VALUE_RE,),
+    "copyright": (_P2_COPYRIGHT_VALUE_RE,),
+}
+_P2_FREE_TEXT_KEYS = frozenset({"description", "title", "status", "tags"})
 _P2_FRONTMATTER_ADJACENT_LIMIT = 1500
 _P2_BENIGN_COMMENT_MAX_LEN = 300
 
@@ -326,32 +399,32 @@ def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
 
 
 def _is_license_only_fragment(fragment: str) -> bool:
-    """Return True for a license line with no joined payload clause."""
-    return (
-        _P2_LICENSE_SHAPE.search(fragment) is not None
-        and _P2_LICENSE_SEPARATOR.search(fragment) is None
-    )
+    """Return True when the fragment fully matches an anchored license-line form."""
+    return any(pattern.match(fragment) is not None for pattern in _P2_LICENSE_LINE_RES)
 
 
 def _is_allowlisted_metadata_fragment(fragment: str) -> bool:
-    """Return True for one key:value line with an allowlisted key.
+    """Return True for one key:value line whose value matches its key grammar.
 
-    The value must be a short token run (version, path, date, name):
-    bounded length, few tokens, no clause separators, no inner
-    sentence boundary, and at least one machine token (digit, path,
-    dot, @, hyphen) so a plain instruction sentence cannot ride an
-    allowlisted key.
+    The key must be allowlisted and the value must fully match that key's
+    narrow form (version token, date, name-or-email, SPDX expression,
+    package[version] list, single path/URL, or single token for
+    free-text keys) — never the old generic token-run shape that let an
+    imperative instruction through on a single dot or digit.
     """
     match = _P2_METADATA_LINE.match(fragment.strip())
-    if match is None or match.group(1).lower() not in _P2_BENIGN_METADATA_KEYS:
+    if match is None:
         return False
-    value = match.group(2)
-    return (
-        _P2_METADATA_VALUE.match(value) is not None
-        and len(value.split()) <= 5
-        and re.search(r"[\d/.@-]", value) is not None
-        and re.search(r"[.!?]+\s|\s-\s", value) is None
-    )
+    key = match.group(1).lower()
+    value = match.group(2).strip()
+    if len(value) > 1 and value.endswith("."):
+        value = value[:-1]
+    if key in _P2_FREE_TEXT_KEYS:
+        return _P2_SINGLE_TOKEN_RE.match(value) is not None
+    validators = _P2_METADATA_VALUE_RES.get(key)
+    if not validators:
+        return False
+    return any(pattern.match(value) is not None for pattern in validators)
 
 
 def _is_benign_license_or_metadata_body(inner: str) -> bool:
@@ -388,7 +461,9 @@ def _p2_match_is_complete_comment(content: str, match_start: int, match_end: int
     closed. A match that stops mid-line while comment text follows is
     partial; anything after the match on its line must be whitespace.
     """
-    if content[match_end:].split("\n", 1)[0].strip():
+    line_end = content.find("\n", match_end)
+    tail = content[match_end:] if line_end == -1 else content[match_end:line_end]
+    if tail.strip():
         return False
     stripped = content[match_start:match_end]
     if stripped.startswith("<!--"):
@@ -417,6 +492,10 @@ def _p2_match_is_complete_comment(content: str, match_start: int, match_end: int
 def _is_structurally_benign_p2_comment(content: str, match_start: int, matched_text: str) -> bool:
     """Return True only for structurally proven benign P2 comment matches."""
     stripped = matched_text.strip()
+    # Cheap positional gate first: only matches in the head of the file
+    # can ever qualify, so skip all string work for later matches.
+    if match_start > _P2_FRONTMATTER_ADJACENT_LIMIT:
+        return False
     if not (stripped.startswith("<!--") or stripped.startswith("[//]:")):
         return False
     if not _p2_match_is_complete_comment(content, match_start, match_start + len(matched_text)):
