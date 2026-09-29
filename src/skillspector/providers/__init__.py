@@ -79,6 +79,10 @@ _INJECTED_PROVIDER: ContextVar[LLMProvider | None] = ContextVar(
 )
 
 
+class UnknownProviderError(ValueError):
+    """The configured provider name does not identify a supported provider."""
+
+
 def raise_no_llm_api_key_configured() -> NoReturn:
     """Raise the shared no-LLM-credentials error."""
     raise ValueError(NO_LLM_API_KEY_MESSAGE)
@@ -171,7 +175,7 @@ def _select_active_provider() -> LLMProvider:
         except ImportError:
             return NvBuildProvider()
 
-    raise ValueError(
+    raise UnknownProviderError(
         f"Unknown SKILLSPECTOR_PROVIDER: {name!r}. "
         "Expected one of: openai, anthropic, anthropic_proxy, bedrock, nv_build, "
         "ollama, azure_openai, openai_compatible, "
@@ -314,6 +318,7 @@ __all__ = [
     "LLMProvider",
     "ModelMetadataProvider",
     "NO_LLM_API_KEY_MESSAGE",
+    "UnknownProviderError",
     "create_chat_model",
     "create_chat_model_with_provider",
     "get_active_provider",

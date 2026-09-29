@@ -78,17 +78,24 @@ P1_PATTERNS = [
 # P2: Hidden Instructions. Build the character class from the shared P9
 # constant so hidden-instruction and padding detection cannot drift apart.
 _ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
+# Bidirectional control characters (Trojan Source, CVE-2021-42574). Evaluated
+# unconditionally below, NOT in the markdown-gated P2_PATTERNS list -- see the
+# comment at that check for why.
+# The class is the 9 paired controls only. The direction marks U+200E/U+200F/
+# U+061C are deliberately excluded: they cannot reorder a span the way the
+# paired controls can, which is the same line GCC's -Wbidi-chars draws by
+# default. Do not add them here without revisiting that tradeoff.
+_BIDI_CONTROL_PATTERN = r"[\u202a-\u202e\u2066-\u2069]"
 P2_PATTERNS = [
     (r"<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->", 0.7),
     (r"\[//\]:\s*#\s*\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\)", 0.8),
     (_ZERO_WIDTH_PATTERN, 0.6),
-    (r"[\u202a-\u202e\u2066-\u2069]", 0.85),
     (r"data:text/plain;base64,[A-Za-z0-9+/=]{50,}", 0.7),
 ]
 _SINGLE_CHARACTER_P2_PATTERNS = frozenset(
     {
         _ZERO_WIDTH_PATTERN,
-        r"[\u202a-\u202e\u2066-\u2069]",
+        _BIDI_CONTROL_PATTERN,
     }
 )
 # P3: Exfiltration Commands
@@ -267,9 +274,10 @@ def _p2_pattern_matches(
         candidate = compiled.search(content, cursor)
         if candidate is None:
             return
-        if pattern == _ZERO_WIDTH_PATTERN and _zero_width_match_is_safe_emoji_zwj(
-            content,
-            candidate.start(),
+        if pattern == _ZERO_WIDTH_PATTERN and (
+            # A leading U+FEFF is a byte-order mark, not hidden text.
+            (candidate.start() == 0 and content[0] == "\ufeff")
+            or _zero_width_match_is_safe_emoji_zwj(content, candidate.start())
         ):
             cursor = candidate.end()
             continue
@@ -354,7 +362,7 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
-    if file_type in ("markdown", "other"):
+    if file_type in ("markdown", "perl", "other"):
         for pattern_source, confidence in P2_PATTERNS:
             for match in _p2_pattern_matches(content, pattern_source, check_runtime):
                 runtime_check()
@@ -454,6 +462,28 @@ def analyze(
                 context=ctx(tag_offset),
                 matched_text=repr(content[tag_offset : tag_offset + 40]),
                 complete_match=complete_match,
+            )
+        )
+
+    # P2 (extended): Bidirectional control characters (Trojan Source,
+    # CVE-2021-42574). Runs regardless of file_type, like the Tag-block check
+    # above — bidi overrides are exploitable in scripts and config files too
+    # (issue #39). Zero-width detection stays markdown-gated because
+    # ZERO_WIDTH_CHARS includes U+FEFF (BOM), which would false-positive on
+    # every BOM-prefixed source file; the bidi range never overlaps it.
+    for match in _p2_pattern_matches(content, _BIDI_CONTROL_PATTERN, check_runtime):
+        runtime_check()
+        findings.append(
+            AnalyzerFinding(
+                rule_id="P2",
+                message="Hidden Instructions",
+                severity=Severity.HIGH,
+                location=locations.location(match.start(), match.end()),
+                confidence=0.85,
+                tags=tag,
+                context=ctx(match.start()),
+                matched_text=match.group(0)[:200],
+                complete_match=match.group(0),
             )
         )
 

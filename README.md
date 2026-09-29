@@ -243,7 +243,22 @@ inference gateways.
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `copilot_cli` | _(none — uses local CLI auth)_ | local `copilot` 1.0.89 binary | local Copilot runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.31 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.32 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+
+Structured output is requested through LangChain's `with_structured_output`,
+whose default forces a tool call. Some models reject a forced tool call with
+HTTP 400 (`tool_choice: type "tool" and "any" are not supported for this
+model`). The `anthropic` and `anthropic_proxy` providers route those models
+(`claude-fable-5-1`, `claude-mythos-5-1`, or any registry entry with
+`structured_output: json_schema`) to the native JSON-schema response format.
+Bedrock has no JSON-schema output for them, so the `bedrock` provider leaves
+`toolChoice` at `auto`, asks for the tool call in the prompt, and retries a
+prose answer; it recognises the model from the model ID, a geo/global
+inference-profile ID, or a foundation-model / inference-profile ARN. An
+application-inference-profile ARN hides the model, so add that ARN to the
+registry (`SKILLSPECTOR_MODEL_REGISTRY`) with `tool_choice: auto`.
+`SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=json_schema|function_calling`
+overrides the method for any provider.
 
 ```bash
 # Stock OpenAI
@@ -418,7 +433,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | PE2 | Sudo/Root Execution | MEDIUM | Invoking elevated system privileges |
 | PE3 | Credential Access | HIGH | Reading SSH keys, tokens, passwords |
 
-### Supply Chain (9+ patterns)
+### Supply Chain (10+ patterns)
 
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
@@ -430,6 +445,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | SC6 | Typosquatting | HIGH | Package names similar to popular packages |
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
 | SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
+| SC10 | Dependency Source Redirection | HIGH | Package-manager source added, replaced, or unresolved |
 
 ### Excessive Agency (5 patterns)
 
@@ -614,6 +630,7 @@ Issues (2)
 | `SKILLSPECTOR_OUTPUT_LANGUAGE` | Short, single-line language label (letters, numbers, spaces, `_`, or `-`; maximum 64 characters) for human-readable LLM finding text such as messages, explanations, and remediation. Rule IDs, severity values, paths, code, and other machine-readable values remain unchanged. Unset, blank, or invalid values preserve the default output language. | Optional |
 | `SKILLSPECTOR_TEMPERATURE` | Optional sampling temperature from `0` to `1` for hosted providers. Unset or blank preserves the provider default. Lower values can reduce run-to-run variation but do not guarantee identical output. | Optional |
 | `SKILLSPECTOR_SEED` | Optional integer sampling seed for OpenAI-compatible and Azure OpenAI providers. Other hosted providers and CLI providers do not receive it. Provider support remains model-dependent. | Optional |
+| `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
 | `ANTHROPIC_BASE_URL` | Override the native Anthropic endpoint (default: `https://api.anthropic.com`). | Optional |
 | `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
@@ -634,7 +651,7 @@ Issues (2)
 
 > **CLI providers** (`claude_cli`, `codex_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active, except `copilot_cli` deliberately preserves only `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` (its documented headless auth) while dropping every other `COPILOT_*`. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
-> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.31`, the version whose configuration precedence and deny-all semantics are verified by this release.
+> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.32`, the version whose configuration precedence and deny-all semantics are verified by this release.
 >
 > `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.89`, the version whose tool-deny behavior is verified by this release.
 
@@ -716,6 +733,12 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
 - `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
+- AE1 findings use **Incomplete referenced artifact analysis**. Their source
+  location identifies the reference; `evidence` identifies the affected target,
+  analyzer reasons, and available bounds. Review the target's completeness
+  ledger when `reasons_truncated` is true. See
+  [referenced-artifact diagnostics and Perl help text](docs/ANALYSIS_RESOURCE_BOUNDS.md#diagnosing-incomplete-referenced-artifacts)
+  for interpretation and corrective actions.
 - `metadata.inference_usage` contains one sanitized record per LLM response when the
   provider exposes token counters. It is an empty list when usage is unavailable;
   SkillSpector never estimates missing tokens. Prompt totals are inclusive of cache
