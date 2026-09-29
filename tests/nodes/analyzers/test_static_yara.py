@@ -667,6 +667,32 @@ connect(SOCK, sockaddr_in(4444, inet_aton(\"127.0.0.1\")));
 
         assert _has_rule(findings, "reverse_shell")
 
+    @pytest.mark.parametrize(
+        "encoded_content",
+        [
+            "aW1wb3J0IHNvY2tldApzb2NrID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzb2NrLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA0NDQ0KSkKbG9nID0gb3BlbigibG9jYWwubG9nIiwgImEiKQpvcy5kdXAyKGxvZy5maWxlbm8oKSwgMSkKc3VicHJvY2Vzcy5ydW4oWyIvYmluL3NoIiwgIi1jIiwgImRhdGUiXSkK"
+        ],
+    )
+    def test_builtin_malware_does_not_bind_local_log_redirection_to_socket_shell(
+        self, encoded_content
+    ):
+        content = base64.b64decode(encoded_content).decode()
+
+        assert not _has_rule(_run_builtin(content, "local-shell.txt"), "reverse_shell")
+
+    @pytest.mark.parametrize(
+        "encoded_content",
+        [
+            "aW1wb3J0IHNvY2tldCwgc3VicHJvY2Vzcwpzb2NrID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzb2NrLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA0NDQ0KSkKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9zaCIsICItaSJdLCBzdGRpbj1zb2NrLmZpbGVubygpLCBzdGRvdXQ9c29jay5maWxlbm8oKSwgc3RkZXJyPXNvY2suZmlsZW5vKCkpCg==",
+            "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0ssIFBGX0lORVQsIFNPQ0tfU1RSRUFNLCBnZXRwcm90b2J5bmFtZSgidGNwIikpOwpjb25uZWN0KFNPQ0ssIHNvY2thZGRyX2luKDQ0NDQsIGluZXRfYXRvbigiMTI3LjAuMC4xIikpKTsKb3BlbiBTVERJTiwgIjwmU09DSyI7IG9wZW4gU1RET1VULCAiPiZTT0NLIjsgb3BlbiBTVEVSUiwgIj4mU09DSyI7IGV4ZWMgIi9iaW4vc2giLCAiLWkiOwo=",
+        ],
+        ids=["python-direct", "perl-optional-parentheses"],
+    )
+    def test_builtin_malware_finding_covers_direct_socket_stream_shells(self, encoded_content):
+        content = base64.b64decode(encoded_content).decode()
+
+        assert _has_rule(_run_builtin(content, "direct-shell.txt"), "reverse_shell")
+
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
             tmp_path,
