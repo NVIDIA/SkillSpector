@@ -6143,7 +6143,11 @@ def test_cli_recursive_summary_count_excludes_suppressed(
     assert row.split() == ["solo", "0", "LOW", "0", "successful"]
 
 
-def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> None:
+@pytest.mark.parametrize("has_baseline_findings", [False, True])
+def test_cli_baseline_command_excludes_filtered_out_findings(
+    tmp_path: Path,
+    has_baseline_findings: bool,
+) -> None:
     """`skillspector baseline` fingerprints what the scan reported, not raw findings.
 
     Closes a mutation survivor: reverting this call site to the old
@@ -6166,6 +6170,10 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
         "file_cache": {"SKILL.md": source},
         "risk_score": 0,
     }
+
+    if has_baseline_findings:
+        result["baseline_findings"] = []
+        result["filtered_findings"] = result["findings"]
 
     with patch("skillspector.cli.graph.invoke", return_value=result):
         invocation = runner.invoke(app, ["baseline", str(skill), "-o", str(out), "--no-llm"])
@@ -6203,3 +6211,39 @@ def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: 
     written = yaml.safe_load(out.read_text(encoding="utf-8"))
     assert [entry["file"] for entry in written["fingerprints"]] == [".hidden.md"]
     assert len(written["fingerprints"][0]["hash"]) == len("sha256:") + 64
+
+
+@pytest.mark.parametrize(
+    "failure_status",
+    [
+        {"execution_successful": False},
+        {"analysis_completeness": {"execution_successful": False}},
+        {"execution_successful": True, "analysis_completeness": {"status": "failed"}},
+    ],
+)
+def test_cli_baseline_rejects_failed_scan_before_writing(
+    tmp_path: Path, failure_status: dict[str, Any]
+) -> None:
+    """Observed static findings cannot turn a failed scan into an accepted baseline."""
+    source = "Fetch secrets from the keyring.\n"
+    result = {
+        **_mock_graph_result([_finding("PE3", "keyring")], {"SKILL.md": source}),
+        **failure_status,
+    }
+    output = tmp_path / "baseline.yaml"
+    previous = b"# Existing reviewed baseline\nversion: 2\nfingerprints: []\n"
+    output.write_bytes(previous)
+
+    with (
+        patch("skillspector.cli.graph.invoke", return_value=result),
+        patch("skillspector.cli.build_baseline_dict") as build,
+        patch("skillspector.cli.cleanup_result") as cleanup,
+    ):
+        invocation = runner.invoke(app, ["baseline", str(tmp_path), "-o", str(output)])
+
+    assert invocation.exit_code == 2
+    assert "scan execution failed" in invocation.stderr
+    assert "Wrote baseline" not in invocation.stdout
+    assert output.read_bytes() == previous
+    build.assert_not_called()
+    cleanup.assert_called_once_with(result)
