@@ -1126,7 +1126,7 @@ class TestTP4MarkdownFences:
 
         fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
 
-        assert fences == [("python", "print('accepted')\n", 11, 11)]
+        assert fences == [("python", "print('accepted')\n", 11, 11, "")]
 
     def test_common_markdown_executable_labels_are_normalized(self):
         content = (
@@ -1536,6 +1536,70 @@ class TestTP4MarkdownFences:
         ]
         assert matching_events
         assert finding.finding_id in matching_events[0]["emitted_finding_ids"]
+
+    def test_fence_context_keeps_the_warning_that_marks_code_unsafe(self):
+        content = (
+            "## Before: unsafe example\n"
+            "Do not execute this.\n"
+            "```bash\n"
+            "rm -rf ./data\n"
+            "```\n"
+            "## After: safe alternative\n"
+        )
+
+        fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+
+        assert len(fences) == 1
+        language, body, start_line, end_line, context = fences[0]
+        assert language == "shell"
+        assert body == "rm -rf ./data\n"
+        assert start_line == 4
+        assert end_line == 4
+        assert "Do not execute this." in context
+        assert "Before: unsafe example" in context
+
+    def test_fence_context_is_bounded_and_ignores_leading_blanks(self):
+        content = "\n\n\n" + ("prose line\n" * 40) + "```python\nprint('x')\n```\n"
+
+        _language, _body, _start, _end, context = next(
+            iter(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+        )
+
+        assert context
+        assert len(context) <= mcp_tool_poisoning.TP4_MAX_CONTEXT_CHARS
+        assert len(context.splitlines()) <= 8
+        assert not context.startswith("\n")
+
+    def test_fence_without_preceding_prose_has_empty_context(self):
+        fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences("```python\nprint('x')\n```\n"))
+
+        assert fences[0][4] == ""
+
+    def test_unsafe_example_context_reaches_the_tp4_prompt(self, monkeypatch: pytest.MonkeyPatch):
+        """The document framing must reach the model, with code lines unchanged."""
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        content = (
+            "## Before: unsafe example\n"
+            "Do not execute this.\n"
+            "```bash\n"
+            "rm -rf ./data\n"
+            "```\n"
+            "## After: safe alternative\n"
+        )
+
+        mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents a cleanup example."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        prompt = structured.prompts[0]
+        assert "### guide.md (shell)" in prompt
+        assert "Do not execute this." in prompt
+        assert "rm -rf ./data" in prompt
 
     def test_no_applicable_markdown_keeps_clean_status(self, monkeypatch: pytest.MonkeyPatch):
         structured = _mock_tp4_structured_llm(monkeypatch, [])

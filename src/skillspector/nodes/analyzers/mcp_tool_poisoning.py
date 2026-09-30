@@ -22,7 +22,7 @@ import logging
 import re
 import time
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -941,6 +941,7 @@ class _TP4Candidate:
     content: str
     start_line: int = 1
     end_line: int = 1
+    context: str = ""
 
 
 _TP4_MARKDOWN_TYPES = frozenset({"markdown", "text"})
@@ -964,21 +965,55 @@ _TP4_MARKDOWN_EXECUTABLE_LABELS = {
 }
 _TP4_FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*([^ \t]+)?[ \t]*$")
 _TP4_FENCE_CLOSE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
+TP4_MAX_CONTEXT_CHARS = 2_048
+_TP4_MAX_CONTEXT_LINES = 8
+
+
+def _tp4_fence_context(preceding: Sequence[str]) -> str:
+    """Return the bounded prose that introduces a fence, if any.
+
+    A fenced block is often introduced by text that changes how it should be
+    read, such as a heading marking it as an example that must not be run.
+    The extractor cannot see that framing when only the fence body is sent, so
+    a short trailing window of non-blank prose is retained with the code.
+    """
+    context_lines: list[str] = []
+    for raw in reversed(preceding):
+        stripped = raw.strip()
+        if not stripped:
+            if context_lines:
+                break
+            continue
+        context_lines.append(stripped)
+        if len(context_lines) >= _TP4_MAX_CONTEXT_LINES:
+            break
+    if not context_lines:
+        return ""
+    context = "\n".join(reversed(context_lines))
+    if len(context) > TP4_MAX_CONTEXT_CHARS:
+        context = context[-TP4_MAX_CONTEXT_CHARS:]
+    return context
 
 
 def _iter_tp4_markdown_fences(
     content: str,
-) -> Iterator[tuple[str, str, int, int]]:
-    """Yield exactly labeled, non-empty executable fences from bounded Markdown/text."""
+) -> Iterator[tuple[str, str, int, int, str]]:
+    """Yield labeled, non-empty executable fences and their leading context.
+
+    Yields ``(language, body, start_line, end_line, context)`` where ``context``
+    is the bounded prose immediately preceding the opening fence.
+    """
     lines = content.splitlines(keepends=True)
     active: tuple[str, int, str] | None = None
     body: list[str] = []
     body_start = 0
+    preceding: list[str] = []
     for line_number, line in enumerate(lines, start=1):
         stripped = line.rstrip("\r\n")
         if active is None:
             opening = _TP4_FENCE_OPEN_RE.fullmatch(stripped)
             if opening is None:
+                preceding.append(line)
                 continue
             delimiter, label = opening.groups()
             active = (delimiter[0], len(delimiter), label.casefold() if label else "")
@@ -993,9 +1028,16 @@ def _iter_tp4_markdown_fences(
                 language = _TP4_MARKDOWN_EXECUTABLE_LABELS.get(active[2])
                 body_text = "".join(body)
                 if language is not None and body_text.strip():
-                    yield language, body_text, body_start, line_number - 1
+                    yield (
+                        language,
+                        body_text,
+                        body_start,
+                        line_number - 1,
+                        _tp4_fence_context(preceding),
+                    )
                 active = None
                 body = []
+                preceding = []
                 continue
         body.append(line)
 
@@ -1316,9 +1358,18 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                         )
                     )
                     break
+                # The context block is part of the prompt, so it must also
+                # participate in the same token and byte budgets as the code.
+                context_block = (
+                    f"Document context (verbatim, not part of the code):\n{candidate.context}\n"
+                    if candidate.context
+                    else ""
+                )
                 prompt = (
                     prefix
-                    + f"### {candidate.path} ({candidate.language})\n{chunk.content}"
+                    + f"### {candidate.path} ({candidate.language})\n"
+                    + context_block
+                    + f"{chunk.content}"
                     + _TP4_PROMPT_SUFFIX
                 )
                 if estimate_tokens(prompt) > batch_input_tokens:
@@ -1461,8 +1512,10 @@ def _check_tp4(state: SkillspectorState) -> _TP4CheckOutcome:
                     return
                 if not retained:
                     continue
-                for language, body, start_line, end_line in _iter_tp4_markdown_fences(retained):
-                    yield _TP4Candidate(path, language, body, start_line, end_line)
+                for language, body, start_line, end_line, context in _iter_tp4_markdown_fences(
+                    retained
+                ):
+                    yield _TP4Candidate(path, language, body, start_line, end_line, context)
                     if stop_reason is not None:
                         break
 
