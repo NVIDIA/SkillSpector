@@ -373,14 +373,20 @@ class AgentCLIChatModel:
 STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
 
 
-def structured_output_kwargs(model: str, provider: object | None = None) -> dict[str, str]:
+def structured_output_kwargs(
+    model: str,
+    provider: object | None = None,
+    *,
+    preferred_method: str | None = None,
+) -> dict[str, str]:
     """Keyword arguments for ``with_structured_output`` when binding a schema for *model*.
 
     ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`` wins, then the active provider's
-    ``structured_output_method(model)`` hint, else LangChain's default (no kwargs).
+    ``structured_output_method(model)`` hint, then an analyzer preference, else
+    LangChain's default (no kwargs).
 
     Raises:
-        ValueError: when the environment override is not a known method.
+        ValueError: when the environment override or preference is not a known method.
     """
     override = os.environ.get("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
     if override:
@@ -394,11 +400,24 @@ def structured_output_kwargs(model: str, provider: object | None = None) -> dict
         provider = get_active_provider()
     hint = getattr(provider, "structured_output_method", None)
     method = hint(model) if callable(hint) else None
+    if method:
+        return {"method": method}
+    if preferred_method is not None and preferred_method not in STRUCTURED_OUTPUT_METHODS:
+        raise ValueError(
+            "preferred structured output method must be one of "
+            f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {preferred_method!r}"
+        )
+    method = preferred_method
     return {"method": method} if method else {}
 
 
 def bind_structured_output(
-    llm: object, schema: type, model: str, provider: object | None = None
+    llm: object,
+    schema: type,
+    model: str,
+    provider: object | None = None,
+    *,
+    preferred_method: str | None = None,
 ) -> object:
     """``llm.with_structured_output(schema)`` with the method *model* needs.
 
@@ -408,7 +427,7 @@ def bind_structured_output(
     :class:`StructuredOutputParseError`, which the analyzers retry like any
     other malformed structured response.
     """
-    kwargs = structured_output_kwargs(model, provider)
+    kwargs = structured_output_kwargs(model, provider, preferred_method=preferred_method)
     structured = llm.with_structured_output(schema, **kwargs)  # type: ignore[attr-defined]
     if kwargs or getattr(llm, "supports_tool_choice_values", None) != ("auto",):
         return structured

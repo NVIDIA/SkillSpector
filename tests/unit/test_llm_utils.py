@@ -794,6 +794,26 @@ class TestStructuredOutputMethod:
         }
         assert structured_output_kwargs("other", provider=_HintingProvider()) == {}
 
+    def test_analyzer_preference_applies_only_without_explicit_configuration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        assert structured_output_kwargs(
+            "other", provider=_PlainProvider(), preferred_method="function_calling"
+        ) == {"method": "function_calling"}
+        assert structured_output_kwargs(
+            "needs-json-1", provider=_HintingProvider(), preferred_method="function_calling"
+        ) == {"method": "json_schema"}
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
+        assert structured_output_kwargs(
+            "other", provider=_PlainProvider(), preferred_method="function_calling"
+        ) == {"method": "json_schema"}
+
+    def test_unknown_analyzer_preference_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        with pytest.raises(ValueError, match="preferred structured output method"):
+            structured_output_kwargs("other", provider=_PlainProvider(), preferred_method="xml")
+
     def test_env_override_wins_over_the_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "function_calling")
         assert structured_output_kwargs("needs-json-1", provider=_HintingProvider()) == {

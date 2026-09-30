@@ -1578,6 +1578,85 @@ class TestTP4MarkdownFences:
 
 
 class TestTP4Fallbacks:
+    def test_opus5_openai_tp4_binds_tool_output_for_initial_and_refreshed_models(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from langchain_openai import ChatOpenAI
+
+        from skillspector import llm_analyzer_base
+        from skillspector.llm_utils import register_chat_model_provider
+
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        bindings: list[dict[str, object]] = []
+        original = ChatOpenAI.with_structured_output
+
+        def record_binding(self, schema, **kwargs):
+            bindings.append(kwargs)
+            return original(self, schema, **kwargs)
+
+        monkeypatch.setattr(ChatOpenAI, "with_structured_output", record_binding)
+
+        def openai_model(**kwargs):
+            llm = ChatOpenAI(
+                model=kwargs["model"], api_key="sk-test", base_url="https://example.invalid/v1"
+            )
+            register_chat_model_provider(llm, "openai")
+            return llm
+
+        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", openai_model)
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+
+        assert bindings == [
+            {"method": "function_calling"},
+            {"method": "function_calling"},
+        ]
+
+        # The gateway-specific workaround does not change other OpenAI models.
+        mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-sonnet-4-6")
+        assert bindings[-1] == {}
+
+        # An explicit user override retains precedence over the workaround.
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "json_schema")
+        mcp_tool_poisoning._TP4Analyzer(model="azure/anthropic/claude-opus-5")
+        assert bindings[-1] == {"method": "json_schema"}
+
+    def test_opus5_tp4_does_not_force_tool_output_on_other_providers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from langchain_openai import ChatOpenAI
+
+        from skillspector import llm_analyzer_base
+        from skillspector.llm_utils import register_chat_model_provider
+
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        bindings: list[dict[str, object]] = []
+        original = ChatOpenAI.with_structured_output
+
+        def record_binding(self, schema, **kwargs):
+            bindings.append(kwargs)
+            return original(self, schema, **kwargs)
+
+        def compatible_model(**kwargs):
+            llm = ChatOpenAI(
+                model=kwargs["model"], api_key="sk-test", base_url="https://example.invalid/v1"
+            )
+            register_chat_model_provider(llm, "openai_compatible")
+            return llm
+
+        monkeypatch.setattr(ChatOpenAI, "with_structured_output", record_binding)
+        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", compatible_model)
+
+        analyzer = mcp_tool_poisoning._TP4Analyzer(
+            model="azure/anthropic/claude-opus-5", timeout=lambda: 30.0
+        )
+        monkeypatch.setattr(llm_analyzer_base, "_retarget_request_timeout", lambda *_args: False)
+        analyzer._model_for_call()
+        assert bindings == [{}, {}]
+
     def test_configured_output_language_is_included(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SKILLSPECTOR_OUTPUT_LANGUAGE", "German")
         _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
@@ -1624,6 +1703,74 @@ class TestTP4Fallbacks:
             LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
         )
         assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_wrapped_json_schema_response_stays_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", lambda _delay: None)
+        structured_llm = _mock_tp4_structured_llm(
+            monkeypatch,
+            [{"json": {"is_mismatch": False}} for _ in range(4)],
+        )
+
+        result = node(state)
+
+        assert structured_llm.calls == 4
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+        assert any(
+            event.get("reason_code") is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+            for event in result["inspection_ledger"]
+        )
+
+    def test_tool_refusal_stays_incomplete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        structured_llm = _mock_tp4_structured_llm(monkeypatch, [None])
+
+        result = node(state)
+
+        assert structured_llm.calls == 1
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert any(
+            event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
+        )
+
+    def test_opus5_function_calling_refusal_stays_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from langchain_openai import ChatOpenAI
+
+        from skillspector import llm_analyzer_base
+        from skillspector.llm_utils import register_chat_model_provider
+
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+
+        def openai_model(**kwargs):
+            llm = ChatOpenAI(
+                model=kwargs["model"], api_key="sk-test", base_url="https://example.invalid/v1"
+            )
+            register_chat_model_provider(llm, "openai")
+            return llm
+
+        monkeypatch.setattr(llm_analyzer_base, "get_chat_model", openai_model)
+        monkeypatch.setattr(
+            ChatOpenAI,
+            "_generate",
+            lambda *_args, **_kwargs: ChatResult(
+                generations=[ChatGeneration(message=AIMessage(content="refused"))]
+            ),
+        )
+        state = _make_state("mcp_mismatched_skill", use_llm=True)
+        state["model_config"] = {"default": "azure/anthropic/claude-opus-5"}
+
+        result = node(state)
+
+        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert any(
+            event["outcome"] is LedgerOutcome.FAILED for event in result["inspection_ledger"]
+        )
 
     def test_malformed_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
