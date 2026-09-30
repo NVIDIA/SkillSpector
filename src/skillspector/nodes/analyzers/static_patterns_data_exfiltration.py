@@ -20,7 +20,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
@@ -216,16 +216,95 @@ class _EnvironmentBinding:
     escaped: bool = False
 
 
+@dataclass
+class _Scope:
+    """Open bindings of one lexical scope: module, function, lambda, class or comprehension."""
+
+    # ``None`` for the module, which owns every name no inner scope binds.
+    local_names: set[str] | None
+    declared_global: set[str] = field(default_factory=set)
+    # The body runs when it is called or iterated, not where it is defined.
+    deferred: bool = False
+    is_class: bool = False
+    is_comprehension: bool = False
+    open: dict[str, _EnvironmentBinding] = field(default_factory=dict)
+    read_later: set[str] = field(default_factory=set)
+
+    def owns(self, name: str) -> bool:
+        return self.local_names is None or name in self.local_names
+
+
+def _scope_declarations(body: list[ast.AST]) -> tuple[set[str], set[str]]:
+    """Return the names a scope binds itself and the names it declares ``global``.
+
+    Nested functions, lambdas and classes are scopes of their own, so only their
+    names count here. Comprehension targets stay inside the comprehension, but a
+    walrus inside one binds in this scope. ``nonlocal`` names belong to an
+    enclosing function.
+    """
+    bound: set[str] = set()
+    declared_global: set[str] = set()
+    declared_nonlocal: set[str] = set()
+    pending: list[ast.AST] = list(body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.comprehension):
+            pending.append(node.iter)
+            pending.extend(node.ifs)
+            continue
+        if isinstance(node, ast.Global):
+            declared_global.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            declared_nonlocal.update(node.names)
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update(
+                (alias.asname or alias.name).split(".")[0]
+                for alias in node.names
+                if alias.name != "*"
+            )
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        pending.extend(ast.iter_child_nodes(node))
+    return bound - declared_global - declared_nonlocal, declared_global
+
+
+def _argument_names(arguments: ast.arguments) -> set[str]:
+    return {
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+            arguments.vararg,
+            arguments.kwarg,
+        )
+        if argument is not None
+    }
+
+
 class _EnvironmentFlowVisitor(ast.NodeVisitor):
     """Decide which environment mappings only ever reach a child-process ``env=``.
 
-    Names are followed in evaluation order (assignment values before their
-    targets) until they are rebound, so a later ``env = {}`` handed to a launcher
-    cannot vouch for an earlier ``env = os.environ.copy()``. A binding passes
+    Names are followed per lexical scope, in evaluation order (assignment values
+    before their targets), until they are rebound. A later ``env = {}`` handed to
+    a launcher therefore cannot vouch for an earlier ``env = os.environ.copy()``,
+    and a nested scope's own ``env`` cannot close the outer one. A binding passes
     through only if every use up to the rebinding is a child-process ``env=``
     argument or an in-place edit of the mapping; any other use keeps the finding.
-    Function parameters rebind their name, but closures reading an outer name
-    still count against it, so a leak from a nested function is not hidden.
+    A function or lambda body runs at some later time, so its reads of an
+    enclosing name count against every binding of that name that is open when the
+    body is defined or made after it. Its writes to an enclosing name through
+    ``global`` or ``nonlocal`` cannot be ordered against the enclosing uses and
+    leave those bindings as they are.
     """
 
     def __init__(self, tree: ast.AST, aliases: dict[str, str]) -> None:
@@ -251,18 +330,17 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
                 self._mutated_names.add(id(node.value))
             elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
                 self._mutated_names.add(id(node.target))
-        self._open: dict[str, _EnvironmentBinding] = {}
+        self._scopes: list[_Scope] = [_Scope(local_names=None)]
         self._passed_through: set[int] = set()
         self._escaped: set[int] = set()
 
     def passthrough_ids(self) -> set[int]:
         """Ids of expressions whose only destination is a child-process ``env=``."""
-        for name in list(self._open):
-            self._close(name)
+        self._close_scope(self._scopes[0])
         return (self._passed_through - self._escaped) | self._env_arguments
 
-    def _close(self, name: str) -> None:
-        binding = self._open.pop(name, None)
+    def _close(self, scope: _Scope, name: str) -> None:
+        binding = scope.open.pop(name, None)
         if binding is None:
             return
         if binding.escaped:
@@ -270,12 +348,116 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
         elif binding.reached_child_process:
             self._passed_through.add(binding.value_id)
 
-    def _bind(self, target: ast.expr, value_id: int) -> None:
+    def _close_scope(self, scope: _Scope) -> None:
+        for name in list(scope.open):
+            self._close(scope, name)
+
+    def _resolve(self, name: str, *, walrus: bool = False) -> tuple[_Scope, bool]:
+        """Return the scope that owns ``name`` here, and whether this access runs later."""
+        deferred = False
+        innermost = True
+        for scope in reversed(self._scopes):
+            if walrus and scope.is_comprehension:
+                deferred = deferred or scope.deferred
+                continue
+            # A class body does not enclose the scopes nested inside it.
+            if innermost or not scope.is_class:
+                if scope.owns(name):
+                    return scope, deferred
+                if name in scope.declared_global:
+                    return self._scopes[0], deferred or scope.deferred
+            deferred = deferred or scope.deferred
+            innermost = False
+        return self._scopes[0], deferred
+
+    def _store(self, name: str, value_id: int | None, *, walrus: bool = False) -> None:
+        scope, deferred = self._resolve(name, walrus=walrus)
+        if deferred:
+            return
+        self._close(scope, name)
+        if value_id is not None:
+            scope.open[name] = _EnvironmentBinding(value_id, escaped=name in scope.read_later)
+
+    def _bind(self, target: ast.expr, value_id: int, *, walrus: bool = False) -> None:
         if isinstance(target, ast.Name):
-            self._close(target.id)
-            self._open[target.id] = _EnvironmentBinding(value_id)
+            self._store(target.id, value_id, walrus=walrus)
         else:
             self.visit(target)
+
+    def _visit_scope(self, scope: _Scope, body: list[ast.stmt] | list[ast.expr]) -> None:
+        self._scopes.append(scope)
+        for statement in body:
+            self.visit(statement)
+        self._close_scope(self._scopes.pop())
+
+    def _visit_defaults(self, arguments: ast.arguments) -> None:
+        for default in (*arguments.defaults, *arguments.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_defaults(node.args)
+        bound, declared_global = _scope_declarations(node.body)
+        scope = _Scope(bound | _argument_names(node.args), declared_global, deferred=True)
+        self._visit_scope(scope, node.body)
+        self._store(node.name, None)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._visit_defaults(node.args)
+        bound, _ = _scope_declarations([node.body])
+        scope = _Scope(bound | _argument_names(node.args), deferred=True)
+        self._visit_scope(scope, [node.body])
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for expression in (*node.decorator_list, *node.bases):
+            self.visit(expression)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        bound, declared_global = _scope_declarations(node.body)
+        self._visit_scope(_Scope(bound, declared_global, is_class=True), node.body)
+        self._store(node.name, None)
+
+    def _visit_comprehension(
+        self,
+        node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
+        results: list[ast.expr],
+    ) -> None:
+        # The first iterable is evaluated in the enclosing scope.
+        self.visit(node.generators[0].iter)
+        targets = {
+            name.id
+            for generator in node.generators
+            for name in ast.walk(generator.target)
+            if isinstance(name, ast.Name)
+        }
+        deferred = isinstance(node, ast.GeneratorExp)
+        self._scopes.append(_Scope(targets, deferred=deferred, is_comprehension=True))
+        for index, generator in enumerate(node.generators):
+            if index:
+                self.visit(generator.iter)
+            self.visit(generator.target)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for result in results:
+            self.visit(result)
+        self._close_scope(self._scopes.pop())
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node, [node.key, node.value])
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
@@ -290,7 +472,7 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
-        self._bind(node.target, id(node.value))
+        self._bind(node.target, id(node.value), walrus=True)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
@@ -305,27 +487,21 @@ class _EnvironmentFlowVisitor(ast.NodeVisitor):
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit_For(node)
 
-    def visit_comprehension(self, node: ast.comprehension) -> None:
-        self.visit(node.iter)
-        self.visit(node.target)
-        for condition in node.ifs:
-            self.visit(condition)
-
-    def visit_arg(self, node: ast.arg) -> None:
-        self._close(node.arg)
-
     def visit_Name(self, node: ast.Name) -> None:
         node_id = id(node)
         if not isinstance(node.ctx, ast.Load) and node_id not in self._mutated_names:
-            self._close(node.id)
+            self._store(node.id, None)
             return
-        binding = self._open.get(node.id)
-        if binding is None:
-            return
+        scope, deferred = self._resolve(node.id)
+        binding = scope.open.get(node.id)
         if node_id in self._env_arguments:
-            binding.reached_child_process = True
+            if binding is not None:
+                binding.reached_child_process = True
         elif node_id not in self._mutated_names:
-            binding.escaped = True
+            if deferred:
+                scope.read_later.add(node.id)
+            if binding is not None:
+                binding.escaped = True
 
 
 def _analyze_python_environment_reads(
