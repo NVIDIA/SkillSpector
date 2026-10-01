@@ -21,6 +21,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from skillspector.nodes.analyzers import mcp_least_privilege
@@ -362,6 +363,59 @@ class TestLP3AllowedTools:
         assert lp1_findings == [], (
             f"Bash covers shell capability — no LP1 expected, got: {[f.rule_id for f in findings]}"
         )
+
+    @pytest.mark.parametrize(
+        "allowed_tools",
+        [
+            pytest.param(["Bash(git:*)"], id="list_scoped"),
+            pytest.param("Bash(git:*) Bash(jq:*) Read", id="space_string_scoped"),
+            pytest.param("Bash(git status:*) Read", id="space_string_scoped_with_space"),
+            pytest.param("Bash(git status:*), Read", id="comma_string_scoped"),
+        ],
+    )
+    def test_allowed_tools_scoped_bash_covers_shell_no_lp1(self, allowed_tools):
+        """A scoped grant such as ``Bash(git:*)`` (the Agent Skills spec example
+        form) declares the Bash tool, so it covers the shell capability just
+        like the broader bare ``Bash`` grant does."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = allowed_tools
+        state["file_cache"]["skill.py"] = "import subprocess\nsubprocess.run(['git', 'status'])\n"
+        state["component_metadata"] = [
+            {"path": "skill.py", "type": "python", "executable": True, "lines": 2, "size_bytes": 60}
+        ]
+        state["components"] = ["skill.py"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_findings = [f for f in findings if f.rule_id == "LP1" and "shell" in f.message]
+        assert lp1_findings == [], (
+            "Scoped Bash covers shell capability — no LP1 expected, got: "
+            f"{[(f.rule_id, f.message) for f in findings]}"
+        )
+
+    def test_allowed_tools_scoped_non_shell_tool_still_lp1(self):
+        """A scoped grant only covers its own tool: ``Read(./docs/**)`` does not
+        cover the shell capability."""
+        state = _make_state("mcp_underdeclared_skill")
+        state["manifest"]["permissions"] = None
+        state["manifest"]["allowed-tools"] = ["Read(./docs/**)"]
+        state["file_cache"]["skill.py"] = "import subprocess\nsubprocess.run(['git', 'status'])\n"
+        state["component_metadata"] = [
+            {"path": "skill.py", "type": "python", "executable": True, "lines": 2, "size_bytes": 60}
+        ]
+        state["components"] = ["skill.py"]
+        result = mcp_least_privilege.node(state)
+        findings = result["findings"]
+        lp1_findings = [f for f in findings if f.rule_id == "LP1" and "shell" in f.message]
+        assert len(lp1_findings) == 1, (
+            f"Read(...) does not cover shell — LP1 expected, got: {[f.rule_id for f in findings]}"
+        )
+
+    def test_map_allowed_tools_uses_tool_name_before_specifier(self):
+        categories = mcp_least_privilege._map_allowed_tools_to_categories(
+            ["Bash(git:*)", "WebFetch(domain:example.com)", "Read(./docs/**)", "Edit(src/**)"]
+        )
+        assert categories == {"shell", "network", "file_read", "file_write"}
 
 
 class TestLP4OverDeclared:

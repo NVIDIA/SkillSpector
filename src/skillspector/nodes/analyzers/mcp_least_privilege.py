@@ -350,7 +350,8 @@ def _map_permissions_to_categories(
     return categories
 
 
-# Tool name → capability category (Claude / Agent Skills tool names, case-insensitive exact match)
+# Tool name → capability category (Claude / Agent Skills tool names, case-insensitive exact match
+# on the name before any ``(specifier)``)
 _TOOL_TO_CAPABILITY: dict[str, str] = {
     "bash": "shell",
     "execute": "shell",
@@ -373,14 +374,23 @@ def _map_allowed_tools_to_categories(
     tools: list[str],
     budget: _LeastPrivilegeBudget | None = None,
 ) -> set[str]:
-    """Map Agent Skills ``allowed-tools`` tool names to capability category names."""
+    """Map Agent Skills ``allowed-tools`` tool names to capability category names.
+
+    Scoped grants in the ``Tool(specifier)`` form, such as ``Bash(git:*)`` or
+    ``WebFetch(domain:example.com)``, map by their tool name, so a narrower
+    grant covers the same category as the bare tool.
+    """
     categories: set[str] = set()
     for tool in tools:
         if budget is not None:
             budget.check_runtime("SKILL.md")
-        if len(tool) > 64:
+        # Only the tool name before an optional ``(specifier)`` is looked up;
+        # bound the search so long specifiers are not copied or case-folded.
+        paren = tool.find("(", 0, 65)
+        name = tool[:paren] if paren != -1 else tool
+        if len(name) > 64:
             continue
-        cat = _TOOL_TO_CAPABILITY.get(tool.lower().strip())
+        cat = _TOOL_TO_CAPABILITY.get(name.lower().strip())
         if cat:
             categories.add(cat)
     return categories
