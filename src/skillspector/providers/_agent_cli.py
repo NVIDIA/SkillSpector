@@ -966,6 +966,11 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
         Disable all built-in MCP servers as defense in depth alongside the
         tool allowlist below.
 
+    ``--disallow-temp-dir``
+        Prevent automatic access to the system temporary directory
+        (verified live on 1.0.89: inference from a temp working dir
+        still answers exactly).
+
     Deliberately NOT included:
     - ``--allow-all*`` / ``--yolo`` — auto-approve permissions (dangerous); never use them.
     - ``--no-auto-update`` — disabling updates runs an older cached
@@ -1003,6 +1008,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
         "--no-ask-user",
         "--no-custom-instructions",
         "--disable-builtin-mcps",
+        "--disallow-temp-dir",
         "--available-tools",
         "skillspector-no-tools",
         "--deny-tool",

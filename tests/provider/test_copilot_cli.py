@@ -98,6 +98,7 @@ class TestBuildCopilotArgv:
             "--no-ask-user",
             "--no-custom-instructions",
             "--disable-builtin-mcps",
+            "--disallow-temp-dir",
             "--available-tools",
             "skillspector-no-tools",
             "--deny-tool",
