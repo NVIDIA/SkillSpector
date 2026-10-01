@@ -2665,6 +2665,89 @@ class TestTriggerAnalysis:
         findings = sc_mod._analyze_triggers({"description": description}, "myskill")
         assert findings == []
 
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param(
+                "Use when the user says /ask-matt or wants an ask answered by Matt.",
+                id="noun_ask_with_slash_skill",
+            ),
+            pytest.param(
+                "Use when the user says /grill-me or has a question to ask.",
+                id="verb_ask_with_slash_skill",
+            ),
+        ],
+    )
+    def test_description_noun_matching_builtin_not_shadow_command(self, description: str) -> None:
+        """#669: a slash command whose name merely starts with a built-in word
+        ("/ask-matt") does not shadow that built-in, and the word "ask" in the
+        same clause is not an invocation of the built-in "ask" command."""
+        findings = sc_mod._analyze_triggers({"description": description}, "ask-matt")
+        assert not any(finding.rule_id == "TR2" for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("description", "command"),
+        [
+            pytest.param(
+                "Use when the user says /ask or wants an answer.", "ask", id="slash_builtin"
+            ),
+            pytest.param("Overrides the git commit command", "commit", id="verb_object"),
+            pytest.param("Shadows /help for every request", "help", id="verb_slash_object"),
+        ],
+    )
+    def test_description_shadow_command_object_still_tr2(
+        self, description: str, command: str
+    ) -> None:
+        """#669 risky pair: a built-in named by a slash token or governed by an
+        interception verb is still a shadow command."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        tr2 = [finding for finding in findings if finding.rule_id == "TR2"]
+        assert len(tr2) == 1
+        assert f"built-in command '{command}'" in tr2[0].message
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param(
+                "Use this skill whenever the user wants to do anything with PDF files.",
+                id="pdf_domain",
+            ),
+            pytest.param(
+                "Use this skill whenever the user asks about anything related to Kubernetes.",
+                id="related_to_domain",
+            ),
+            pytest.param(
+                "Use whenever the user asks any questions regarding Terraform state",
+                id="regarding_domain",
+            ),
+        ],
+    )
+    def test_description_domain_qualified_scope_not_tr3(self, description: str) -> None:
+        """#669: a domain qualifier ("with PDF files") bounds "anything", so the
+        trigger is not universal activation."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert not any(finding.rule_id == "TR3" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            pytest.param(
+                "Use this skill whenever the user wants to do anything with it",
+                id="pronoun_object",
+            ),
+            pytest.param(
+                "Use this skill whenever the user sends any message in the chat",
+                id="broad_preposition",
+            ),
+            pytest.param("Use this skill whenever the user asks about anything", id="no_qualifier"),
+        ],
+    )
+    def test_description_unqualified_scope_still_tr3(self, description: str) -> None:
+        """#669 risky pair: a pronoun object or a broad preposition does not
+        bound the scope, so the trigger is still universal activation."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert any(finding.rule_id == "TR3" for finding in findings)
+
 
 # ── Supply Chain Helpers ───────────────────────────────────────────────
 

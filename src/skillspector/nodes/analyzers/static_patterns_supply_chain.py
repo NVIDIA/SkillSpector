@@ -773,13 +773,19 @@ _DESCRIPTION_ACTIVATION_CONDITION_RE = re.compile(
 )
 
 # Universal-scope signals for description clauses. The scope must be
-# unconditional: a subject qualifier such as "about PostgreSQL" keeps the
-# clause describing a capability, not a catch-all trigger.
+# unconditional: a subject or domain qualifier such as "about PostgreSQL",
+# "with PDF files" or "related to Kubernetes" keeps the clause describing a
+# capability, not a catch-all trigger. A qualifier whose object is only a
+# pronoun ("anything with it") bounds nothing and stays universal. Broad
+# prepositions ("in", "for", "on") are deliberately not qualifiers: "any
+# message in the chat" is still every message.
 _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
     r"\b(?:"
     r"anything|everything|whatever|"
     r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)"
-    r")\b(?!\s+about\b)",
+    r")\b"
+    r"(?!\s+(?:about|with|involving|regarding|concerning|(?:related|relating)\s+to)\s+"
+    r"(?!(?:it|this|that|them|anything|everything|whatever)\b)[a-z0-9])",
     re.IGNORECASE,
 )
 
@@ -794,17 +800,27 @@ _DESCRIPTION_INVOCATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Command-interception signals for the TR2 shadow-command rule. Unlike the
+# Command-interception evidence for the TR2 shadow-command rule. Unlike the
 # broader extraction gate above, this requires an actual
 # invocation/interception/override claim (or a literal slash-command token):
 # merely discussing commands as a noun ("Show available build commands",
 # "documents the build and test commands") describes documentation or help
 # prose, not shadowing intent, so it must not establish TR2 on its own.
-_DESCRIPTION_COMMAND_INTERCEPTION_RE = re.compile(
+# The shadowed command must also be the object of that evidence, not any
+# built-in word that happens to share the clause: a slash-command token names
+# a command by its whole name ("/ask-matt" is "ask-matt", not the built-in
+# "ask"), and an interception verb names the command it governs within the
+# next few words ("Overrides the build command"). A built-in word used as an
+# ordinary noun elsewhere in the clause ("wants an ask answered") is not an
+# invocation of that command.
+_DESCRIPTION_SLASH_COMMAND_RE = re.compile(r"(?<![\w/])/([a-z][\w-]*)", re.IGNORECASE)
+_DESCRIPTION_INTERCEPTION_VERB_RE = re.compile(
     r"\b(?:invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
+    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
+_DESCRIPTION_COMMAND_TOKEN_RE = re.compile(r"/?([a-z][\w-]*)", re.IGNORECASE)
+_MAX_INTERCEPTION_OBJECT_WORDS = 4
 
 # Trigger-phrase extraction for the TR1 broad/short-trigger rule on
 # descriptions: the word or phrase the skill claims to activate on, as in
@@ -919,6 +935,28 @@ def _description_condition_has_universal_scope(clause: str) -> bool:
     span = rest[: boundary.start()] if boundary else rest
     span = span[:_MAX_DESCRIPTION_CONDITION_SPAN]
     return _DESCRIPTION_UNIVERSAL_SCOPE_RE.search(span) is not None
+
+
+def _description_shadowed_commands(clause: str) -> list[str]:
+    """Built-in commands a description clause claims to invoke or intercept.
+
+    Only commands tied to interception evidence count: a slash-command token
+    whose whole name is a built-in, or a built-in named within a few words
+    after an invocation/interception/override verb (before any clause
+    boundary). Returns the sorted set of shadowed built-in commands.
+    """
+    shadowed = {
+        match.group(1).lower()
+        for match in _DESCRIPTION_SLASH_COMMAND_RE.finditer(clause)
+        if match.group(1).lower() in _BUILTIN_COMMANDS
+    }
+    for verb in _DESCRIPTION_INTERCEPTION_VERB_RE.finditer(clause):
+        rest = clause[verb.end() :]
+        boundary = _DESCRIPTION_CONDITION_BOUNDARY_RE.search(rest)
+        span = rest[: boundary.start()] if boundary else rest
+        tokens = _DESCRIPTION_COMMAND_TOKEN_RE.findall(span)[:_MAX_INTERCEPTION_OBJECT_WORDS]
+        shadowed.update(t.lower() for t in tokens if t.lower() in _BUILTIN_COMMANDS)
+    return sorted(shadowed)
 
 
 def _extract_description_trigger_clauses(description: str) -> tuple[list[str], int]:
@@ -2440,7 +2478,6 @@ def _analyze_triggers(
 
     for i, clause in enumerate(description_clauses, 1):
         clause_lower = clause.lower().strip()
-        words = clause_lower.split()
 
         # TR1 (description-calibrated): extract the trigger phrase the skill
         # claims to activate on ("whenever the user says hello") and apply
@@ -2501,11 +2538,11 @@ def _analyze_triggers(
         # capability or documentation prose such as "Show available build
         # commands" merely discusses commands and stays out of the trigger
         # path. Invocation clauses pass the extraction gate on their own, so
-        # no broad-activation wording is required.
-        shadowed = sorted(
-            {cmd for cmd in _BUILTIN_COMMANDS if cmd in {w.lstrip("/") for w in words}}
-        )
-        if shadowed and _DESCRIPTION_COMMAND_INTERCEPTION_RE.search(clause):
+        # no broad-activation wording is required. The shadowed command must
+        # be the object of that claim: "/ask-matt" does not shadow "ask", and
+        # the noun "ask" elsewhere in the clause is not an invocation.
+        shadowed = _description_shadowed_commands(clause)
+        if shadowed:
             findings.append(
                 Finding(
                     rule_id="TR2",
