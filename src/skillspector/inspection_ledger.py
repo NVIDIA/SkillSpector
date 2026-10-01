@@ -311,6 +311,7 @@ class AnalysisCompleteness(TypedDict):
     scope_exclusions: list[InspectionLedgerException]
     analyzer_statuses: list[dict[str, object]]
     references: NotRequired[list[dict[str, object]]]
+    image_inventory: NotRequired[dict[str, object]]
     limitations: NotRequired[list[str]]
     findings_before_filtering: NotRequired[int]
     findings_after_filtering: NotRequired[int]
@@ -1051,6 +1052,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         if isinstance(raw_references, list)
         else []
     )
+    raw_image_inventory = state.get("image_inventory", None)
 
     completeness: AnalysisCompleteness = {
         "total_components": total_components,
@@ -1070,6 +1072,11 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    if isinstance(raw_image_inventory, dict):
+        completeness["image_inventory"] = {
+            str(key): [str(item) for item in value] if isinstance(value, list) else value
+            for key, value in raw_image_inventory.items()
+        }
     return completeness, validated_effective
 
 

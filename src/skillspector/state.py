@@ -261,6 +261,9 @@ class SkillspectorState(TypedDict, total=False):
     artifact_inventory: list[ArtifactRecord]
     artifact_references: list[BundleReference]
     reference_resolution: dict[str, object]
+    # Per-skill image inventory: local image files plus remote URLs
+    # cited-but-unfetched. Informational only; no verdicts.
+    image_inventory: dict[str, object]
     # Retained for compatibility with the persisted workflow-state schema.
     ast_cache: dict[str, str]
     # Key for the process-local parsed-AST cache.  The ASTs themselves stay

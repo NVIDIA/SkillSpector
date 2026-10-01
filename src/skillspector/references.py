@@ -9,13 +9,20 @@ import heapq
 import posixpath
 import re
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from skillspector.artifacts import ArtifactDisposition, BundleReference, ReferenceKind
+from skillspector.image_text import IMAGE_SUFFIXES
+from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
+    LedgerOutcome,
+    LedgerRecordType,
+    ledger_event,
+)
 
 MAX_REFERENCE_SOURCE_BYTES = 1_000_000
 MAX_RAW_REFERENCE_CANDIDATES = 4096
@@ -584,3 +591,102 @@ def resolve_bundle_references(
         clock=clock,
         deadline=deadline,
     ).records
+
+
+_MAX_IMAGE_INVENTORY_LINES = 4096
+_MAX_IMAGE_INVENTORY_ENTRIES = 1024
+_MAX_REMOTE_IMAGE_CHARS = 512
+
+
+def _is_remote_image_target(raw: str) -> bool:
+    """Return whether a markdown image destination is cited-but-unfetched."""
+    lowered = raw.strip().lower()
+    return lowered.startswith(("http://", "https://", "data:"))
+
+
+def collect_image_inventory(
+    source_text: str,
+    source_path: str,
+    known_paths: list[str],
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+) -> dict[str, list[str]]:
+    """Inventory per-skill image references without verdicts or network access.
+
+    Local images are markdown ``![]()`` targets resolving inside the skill
+    directory (via the shared passive-image grammar) plus loose image files
+    anywhere in the skill tree. Remote ``http(s)``/``data`` URIs are
+    inventoried as cited-but-unfetched and never retrieved. Shares the
+    caller's deadline: an expired budget truncates the inventory instead
+    of blocking the scan.
+    """
+    local: set[str] = set()
+    remote: set[str] = set()
+    lines_scanned = 0
+    for line in StringIO(source_text):
+        if lines_scanned >= _MAX_IMAGE_INVENTORY_LINES or clock() >= deadline:
+            break
+        lines_scanned += 1
+        candidates = _markdown_candidates(
+            line,
+            deadline=deadline,
+            clock=clock,
+            limitations=set(),
+        )
+        for candidate in candidates:
+            if candidate.kind is not ReferenceKind.MARKDOWN_IMAGE:
+                continue
+            raw = candidate.raw.strip()
+            if not raw or len(local) + len(remote) >= _MAX_IMAGE_INVENTORY_ENTRIES:
+                continue
+            if _is_remote_image_target(raw):
+                remote.add(raw[:_MAX_REMOTE_IMAGE_CHARS])
+                continue
+            target = _normalize_candidate(raw, source_path)
+            if target is None:
+                continue
+            if PurePosixPath(target).suffix.lower() in IMAGE_SUFFIXES:
+                local.add(target)
+    for path in known_paths:
+        if PurePosixPath(path).suffix.lower() in IMAGE_SUFFIXES:
+            local.add(path)
+        if len(local) + len(remote) >= _MAX_IMAGE_INVENTORY_ENTRIES:
+            break
+    return {"local_images": sorted(local), "remote_images": sorted(remote)}
+
+
+def image_inventory_ledger_events(
+    image_inventory: Mapping[str, list[str]],
+    source_path: str,
+) -> list[InspectionLedgerEvent]:
+    """Surface image presence in the ledger with COMPLETED rows and no verdicts.
+
+    One row per local image; a remote-only inventory leaves a single row on
+    the citing source so the citation itself remains accounted for.
+    """
+    local_images = [str(path) for path in image_inventory.get("local_images", [])]
+    remote_images = [str(path) for path in image_inventory.get("remote_images", [])]
+    events: list[InspectionLedgerEvent] = []
+    for path in sorted(set(local_images)):
+        try:
+            events.append(
+                ledger_event(
+                    outcome=LedgerOutcome.COMPLETED,
+                    record_type=LedgerRecordType.SYSTEM,
+                    phase="image_inventory",
+                    path=path,
+                )
+            )
+        except ValueError:
+            continue
+    if not events and remote_images:
+        events.append(
+            ledger_event(
+                outcome=LedgerOutcome.COMPLETED,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="image_inventory",
+                path=source_path,
+            )
+        )
+    return events

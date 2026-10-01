@@ -78,6 +78,8 @@ from skillspector.references import (
     MAX_REFERENCE_RECORDS,
     MAX_REFERENCE_SOURCE_BYTES,
     ReferenceResolutionResult,
+    collect_image_inventory,
+    image_inventory_ledger_events,
     resolve_bundle_references_with_metadata,
 )
 from skillspector.state import (
@@ -2712,6 +2714,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
     reference_events: list[InspectionLedgerEvent] = []
     reference_resolution: dict[str, object] = {}
     inventory_by_path = {item["path"]: item for item in artifact_inventory}
+    primary_text = ""
     if primary_path is not None and primary_path in raw_file_cache:
         primary_raw = raw_file_cache[primary_path]
         reference_started = monotonic()
@@ -2860,6 +2863,21 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             excluded_component_metadata,
         )
     )
+    # Per-skill local image inventory: markdown image targets plus loose image
+    # files, with remote URLs cited-but-unfetched. The primary file matches
+    # reference resolution scope; loose files cover the rest of the skill tree.
+    # Ledger rows are COMPLETED: no verdicts.
+    image_inventory: dict[str, list[str]] = {"local_images": [], "remote_images": []}
+    image_inventory_events: list[InspectionLedgerEvent] = []
+    if primary_path is not None and primary_path in raw_file_cache:
+        image_inventory = collect_image_inventory(
+            primary_text,
+            primary_path,
+            sorted(dict.fromkeys([*inventoried_components, *excluded_artifacts])),
+            clock=monotonic,
+            deadline=processing_deadline,
+        )
+        image_inventory_events = image_inventory_ledger_events(image_inventory, primary_path)
 
     # Omitted paths remain represented in artifact_inventory, but are not fed
     # to analyzers without content. Genuine read failures remain analyzer work
@@ -3396,6 +3414,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "artifact_inventory": artifact_inventory,
         "artifact_references": references,
         "reference_resolution": reference_resolution,
+        "image_inventory": image_inventory,
         "inspection_ledger": _bounded_ledger_output(
             [
                 *discovery_events,
@@ -3404,6 +3423,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                 *baseline_events,
                 *exclusion_audit_events,
                 *reference_events,
+                *image_inventory_events,
                 *cache_events,
                 *nested.ledger_events,
                 *primary_content_events,

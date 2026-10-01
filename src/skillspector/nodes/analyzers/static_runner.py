@@ -40,6 +40,8 @@ from skillspector.artifacts import (
     is_default_ignorable,
     security_text_views,
 )
+from skillspector.constants import MAX_ANALYZABLE_FILE_BYTES
+from skillspector.image_text import extract_image_text, is_image_path
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
@@ -498,6 +500,21 @@ def _infer_file_type(path: str) -> str:
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
+
+
+def _image_extracted_text(state: Mapping[str, object], path: str) -> str:
+    """Return stdlib-extracted image text for one image path, else ``""``.
+
+    Reads canonical raw bytes (never the network, never pixels); images
+    without a text layer yield ``""`` and keep their existing skip accounting.
+    """
+    if not is_image_path(path):
+        return ""
+    raw_cache = state.get("raw_file_cache")
+    raw = raw_cache.get(path) if isinstance(raw_cache, dict) else None
+    if not isinstance(raw, bytes) or not raw or len(raw) > MAX_ANALYZABLE_FILE_BYTES:
+        return ""
+    return extract_image_text(raw)
 
 
 def _is_license_basename(path: str, file_type: str) -> bool:
@@ -2399,7 +2416,12 @@ def run_static_patterns(
             logger.debug("Skipping %s: no content in file_cache", path)
             continue
         if path in binary_paths or (not binary_paths and _is_binary_file(path, content)):
-            continue
+            # Scan stdlib-extracted image text through the
+            # same patterns; textless images keep the existing skip.
+            extracted = _image_extracted_text(state, path)
+            if not extracted:
+                continue
+            content = extracted
         remaining = MAX_FINDINGS_PER_ANALYZER - len(findings)
         if remaining <= 0:
             break
@@ -2488,6 +2510,11 @@ def run_static_patterns_with_ledger(
             )
         else:
             artifact = inventory.get(path, {})
+        # Route stdlib-extracted image text through the same scan below;
+        # textless images keep the existing skip accounting.
+        image_scan_content: str | None = None
+        if path not in container_paths and artifact.get("content_kind") == ContentKind.BINARY:
+            image_scan_content = _image_extracted_text(state, path) or None
         if path not in container_paths and artifact.get("content_kind") == ContentKind.OPAQUE:
             event = ledger_event(
                 outcome=(
@@ -2500,7 +2527,11 @@ def run_static_patterns_with_ledger(
                 path=path,
                 reason=LedgerReason.OPAQUE_CONTENT,
             )
-        elif path not in container_paths and artifact.get("content_kind") == ContentKind.BINARY:
+        elif (
+            path not in container_paths
+            and artifact.get("content_kind") == ContentKind.BINARY
+            and image_scan_content is None
+        ):
             referenced = bool(artifact.get("referenced"))
             event = ledger_event(
                 outcome=LedgerOutcome.PARTIAL if referenced else LedgerOutcome.OUT_OF_SCOPE,
@@ -2513,7 +2544,7 @@ def run_static_patterns_with_ledger(
                 reason=(LedgerReason.OPAQUE_CONTENT if referenced else LedgerReason.BINARY_CONTENT),
             )
         elif path not in container_paths:
-            content = file_cache.get(path)
+            content = image_scan_content if image_scan_content is not None else file_cache.get(path)
             if content is None:
                 event = ledger_event(
                     outcome=LedgerOutcome.FAILED,
