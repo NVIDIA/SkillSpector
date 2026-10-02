@@ -679,6 +679,44 @@ class TestReportNode:
         assert "### Analyzer Statuses" in body
         assert "### Limitations" in body
 
+    @pytest.mark.parametrize("output_format", ["markdown", "terminal"])
+    def test_report_names_the_analyzer_of_each_status_row(self, output_format: str) -> None:
+        """Analyzer status rows show which analyzer each status belongs to."""
+        state: SkillspectorState = {
+            "filtered_findings": [],
+            "component_metadata": [],
+            "has_executable_scripts": False,
+            "manifest": {},
+            "skill_path": None,
+            "output_format": output_format,
+            "execution_successful": True,
+            "analysis_completeness": {
+                "coverage_percent": 100.0,
+                "fully_inspected_files": 1,
+                "partially_inspected_files": 0,
+                "entirely_uninspected_files": 0,
+                "is_complete": False,
+                "execution_successful": True,
+                "ledger_exceptions": [],
+                "scope_exclusions": [],
+                "analyzer_statuses": [
+                    {"analyzer_id": "static_patterns_tool_misuse", "status": "completed"},
+                    {
+                        "analyzer_id": "semantic_quality_policy",
+                        "status": "degraded",
+                        "reason_code": "llm_structured_response_invalid",
+                        "message": "LLM returned a malformed structured response.",
+                    },
+                ],
+                "limitations": [],
+            },
+        }
+
+        body = report(state)["report_body"]
+
+        assert "static_patterns_tool_misuse" in body
+        assert "semantic_quality_policy" in body
+
     def test_report_output_format_terminal(self) -> None:
         """output_format terminal produces Rich-formatted output."""
         state: SkillspectorState = {
