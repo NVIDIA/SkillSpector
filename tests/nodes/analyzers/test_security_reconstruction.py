@@ -1679,7 +1679,15 @@ def test_root_glob_parser_cap_exhaustion_fails_closed() -> None:
 
     result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
 
-    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+    # The first named operand is now a deletion candidate. It does not prove
+    # the root glob beyond the shell parser's bound, which remains incomplete.
+    assert all(
+        finding.severity == "MEDIUM"
+        and finding.evidence["destructive_operation"]["scope"] == "specified"
+        and finding.evidence["destructive_operation"]["target"] == "nonexistent"
+        for finding in result["findings"]
+        if finding.rule_id == "TM1"
+    )
     event = result["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.PARTIAL
     assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
@@ -1701,7 +1709,12 @@ def test_root_glob_parser_cap_exhaustion_is_partial_regardless_of_option_order(
 
     result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
 
-    assert not any(finding.rule_id == "TM1" for finding in result["findings"])
+    assert all(
+        finding.severity == "MEDIUM"
+        and finding.evidence["destructive_operation"]["scope"] == "specified"
+        for finding in result["findings"]
+        if finding.rule_id == "TM1"
+    )
     event = result["inspection_ledger"][0]
     assert event["outcome"] is LedgerOutcome.PARTIAL
     assert event["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
@@ -2818,7 +2831,13 @@ def test_root_glob_parser_cap_accepts_exact_command_terminator(terminator: str) 
 
     result = static_runner.run_static_patterns_with_ledger(state, [tm_module])
 
-    assert result["findings"] == []
+    assert result["findings"]
+    assert all(
+        finding.rule_id == "TM1"
+        and finding.severity == "MEDIUM"
+        and finding.evidence["destructive_operation"]["target"] == "safe"
+        for finding in result["findings"]
+    )
     assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.COMPLETED
 
 
