@@ -55,6 +55,69 @@ def test_rp1_npx_unpinned():
     assert issue["finding"] == "npx @scope/mcp-server"
 
 
+def test_rp1_npx_match_does_not_cross_lines():
+    """A trailing ``npx`` must not combine with the next line as a command."""
+    for content in (
+        "---\nname: npx\ndescription: repro\n---\n",
+        "Install it with npx\nthe package manager.\n",
+    ):
+        result = node(_state(file_cache={"SKILL.md": content}))
+        assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+def test_rp1_pnpx_unpinned():
+    """RP1 also detects pnpm's npx-style runner without a version pin."""
+    result = node(_state(file_cache={"setup.sh": "pnpx @scope/mcp-server\n"}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+    assert len(rp1) == 1
+    assert rp1[0].matched_text == "pnpx @scope/mcp-server"
+
+
+def test_rp1_npx_requires_a_word_boundary():
+    """An unrelated identifier ending in ``npx`` is not a command."""
+    result = node(_state(file_cache={"setup.sh": "foonpx @scope/mcp-server\n"}))
+
+    assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+def test_rp1_yaml_mcp_config_unpinned():
+    """RP1 detects unpinned npx-style commands in YAML MCP config args."""
+    configs = (
+        """mcpServers:\n  fs:\n    command: npx\n    args: ["-y", "@scope/mcp-server"]\n""",
+        """servers:\n  goose:\n    cmd: pnpx\n    args:\n      - "-y"\n      - "@scope/mcp-server"\n""",
+    )
+
+    for config in configs:
+        result = node(_state(file_cache={"mcp.yaml": config}))
+        rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+        assert len(rp1) == 1
+        assert "@scope/mcp-server" in rp1[0].matched_text
+
+
+def test_rp1_yaml_mcp_config_pinned_no_finding():
+    """RP1 skips YAML MCP args whose package token pins a version."""
+    configs = (
+        """mcpServers:\n  fs:\n    command: npx\n    args: ["-y", "@scope/mcp-server@1.2.3"]\n""",
+        """servers:\n  goose:\n    cmd: pnpx\n    args:\n      - "-y"\n      - "@scope/mcp-server@1.2.3"\n""",
+    )
+
+    for config in configs:
+        result = node(_state(file_cache={"mcp.yaml": config}))
+
+        assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+
+def test_rp1_npx_still_matches_flags_on_the_same_line():
+    """Common npx flags remain supported after restricting whitespace."""
+    result = node(_state(file_cache={"setup.sh": "npx -y @scope/mcp-server\n"}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+
+    assert len(rp1) == 1
+    assert rp1[0].matched_text == "npx -y @scope/mcp-server"
+
+
 def test_rp1_scans_cached_files_without_a_manifest():
     """Cache-based RP1 checks remain applicable when manifest parsing failed."""
     result = node(_state(file_cache={"setup.sh": "npx @scope/mcp-server\n"}))

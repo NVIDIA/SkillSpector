@@ -124,9 +124,16 @@ class _RugPullBudget:
 
 # RP1: Unpinned MCP server references in code or manifest
 _RP1_NPX_CMD = re.compile(
-    r"npx\s+(?:-+\w+\s+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
+    r"\bp?npx[ \t]+(?:-+\w+[ \t]+)*((?:@?[a-zA-Z][\w.-]*/)?[a-zA-Z][\w.-]*)",
     re.IGNORECASE,
 )
+_RP1_CONFIG_RUNNER = re.compile(
+    r"^(?P<indent>[ \t]*)(?:command|cmd)[ \t]*:[ \t]*[\"']?(?P<runner>p?npx)[\"']?[ \t]*(?:#.*)?$",
+    re.IGNORECASE,
+)
+_RP1_CONFIG_ARGS = re.compile(r"^(?P<indent>[ \t]*)args[ \t]*:[ \t]*(?P<value>.*)$", re.IGNORECASE)
+_RP1_CONFIG_ARG_TOKEN = re.compile(r"[\"']([^\"']*)[\"']|([^\s,\[\]#]+)")
+_RP1_CONFIG_MAX_LINES = 8
 _RP1_UVX_CMD = re.compile(
     r"(?:uvx|uv\s+tool\s+run)\s+(?:-+\w+\s+)*([a-zA-Z][\w.-]*)",
     re.IGNORECASE,
@@ -159,6 +166,76 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def _find_line(content: str, pos: int) -> int:
     """Return 1-based line number for character position *pos*."""
     return content.count("\n", 0, pos) + 1
+
+
+def _iter_config_npx_commands(
+    content: str, budget: _RugPullBudget, file_path: str
+) -> list[tuple[int, str, str]]:
+    """Find bounded YAML MCP command/args pairs that run an npx-style runner."""
+    lines = content.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+
+    matches: list[tuple[int, str, str]] = []
+    for command_index, command_line in enumerate(lines):
+        budget.check_runtime(file_path)
+        command = _RP1_CONFIG_RUNNER.fullmatch(command_line.rstrip("\r\n"))
+        if command is None:
+            continue
+
+        command_indent = len(command.group("indent"))
+        args_index: int | None = None
+        args_match: re.Match[str] | None = None
+        for index in range(
+            command_index + 1, min(len(lines), command_index + _RP1_CONFIG_MAX_LINES + 1)
+        ):
+            budget.check_runtime(file_path)
+            candidate_line = lines[index].rstrip("\r\n")
+            stripped = candidate_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
+            if indent < command_indent:
+                break
+            candidate_args = _RP1_CONFIG_ARGS.fullmatch(candidate_line)
+            if indent == command_indent:
+                if candidate_args is not None:
+                    args_index = index
+                    args_match = candidate_args
+                break
+
+        if args_index is None or args_match is None:
+            continue
+
+        args_indent = len(args_match.group("indent"))
+        args_lines = [args_match.group("value")]
+        args_end_index = args_index
+        for index in range(args_index + 1, min(len(lines), args_index + _RP1_CONFIG_MAX_LINES + 1)):
+            budget.check_runtime(file_path)
+            candidate_line = lines[index].rstrip("\r\n")
+            stripped = candidate_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
+            if indent <= args_indent:
+                break
+            args_lines.append(candidate_line.lstrip(" \t"))
+            args_end_index = index
+
+        args_text = " ".join(args_lines)
+        for token_match in _RP1_CONFIG_ARG_TOKEN.finditer(args_text):
+            token = token_match.group(1) or token_match.group(2)
+            if token.startswith("-"):
+                continue
+            start = offsets[command_index]
+            full_match = "".join(lines[command_index : args_end_index + 1]).strip()
+            matches.append((start, full_match, token))
+            break
+
+    return matches
 
 
 def _normalize_string_list(
@@ -247,6 +324,35 @@ def _check_rp1(
                         "compromised and publishes a malicious update."
                     ),
                     remediation="Pin the version: npx @scope/server@1.2.3",
+                )
+            )
+
+        # YAML MCP configs often place the runner and package in separate fields.
+        for start, full_match, package in _iter_config_npx_commands(content, budget, file_path):
+            budget.check_runtime(file_path)
+            if _VERSION_PIN_RE.search(package):
+                continue
+            line_num = _find_line(content, start)
+            budget.emit(
+                Finding(
+                    rule_id="RP1",
+                    message=(
+                        f"MCP server referenced without pinned version: '{full_match[:200]}'."
+                    ),
+                    severity="MEDIUM",
+                    confidence=0.70,
+                    file=file_path,
+                    start_line=line_num,
+                    category=_CATEGORY,
+                    tags=list(_TAGS),
+                    matched_text=full_match[:200],
+                    match_fingerprint=compute_match_fingerprint("RP1", full_match),
+                    explanation=(
+                        "npx-style MCP commands without a version suffix "
+                        "create a rug-pull risk if the upstream server is "
+                        "compromised and publishes a malicious update."
+                    ),
+                    remediation="Pin the version in the args list: @scope/server@1.2.3",
                 )
             )
 
