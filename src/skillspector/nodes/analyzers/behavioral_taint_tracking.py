@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -420,35 +421,41 @@ def _mark_targets(
     tainted: dict[str, _TaintedVar],
     src_name: str,
     lineno: int,
-) -> None:
+) -> list[str]:
+    """Taint each assignment target name that is not tainted yet.
+
+    Add-only: an existing entry is never overwritten, so taint can only grow.
+    Returns the names newly added, for the worklist to propagate from.
+    """
+    newly_tainted: list[str] = []
+    names: list[str] = []
     for target in targets:
         if isinstance(target, ast.Name):
-            tainted[target.id] = _TaintedVar(target.id, src_name, lineno)
+            names.append(target.id)
         elif isinstance(target, ast.Tuple):
-            for elt in target.elts:
-                if isinstance(elt, ast.Name):
-                    tainted[elt.id] = _TaintedVar(elt.id, src_name, lineno)
+            names.extend(elt.id for elt in target.elts if isinstance(elt, ast.Name))
+    for name in names:
+        if name not in tainted:
+            tainted[name] = _TaintedVar(name, src_name, lineno)
+            newly_tainted.append(name)
+    return newly_tainted
 
 
-def _find_tainted_in_expr(
-    node: ast.expr,
-    tainted: dict[str, _TaintedVar],
-    check_runtime: Callable[[], None] | None = None,
-) -> _TaintedVar | None:
-    """Return the first tainted variable referenced in *node*, or None.
+def _referenced_names(node: ast.expr) -> list[str]:
+    """Return the distinct variable names (``ast.Name`` ids) referenced in *node*.
 
-    Handles Name references, container literals (dict, list, tuple, set),
-    and f-strings so that taint propagates through re-assignment and
-    data packaging (e.g. ``payload = {"key": secret}``).
+    Mirrors the Name-only domain of taint propagation: a propagating assignment
+    becomes tainted when any name its value reads is tainted. Handles container
+    literals (dict, list, tuple, set) and f-strings because ``ast.walk`` reaches
+    the ``Name`` nodes nested inside them (e.g. ``payload = {"key": secret}``).
     """
+    seen: set[str] = set()
+    names: list[str] = []
     for child in ast.walk(node):
-        if check_runtime is not None:
-            check_runtime()
-        if isinstance(child, ast.Name):
-            tv = tainted.get(child.id)
-            if tv:
-                return tv
-    return None
+        if isinstance(child, ast.Name) and child.id not in seen:
+            seen.add(child.id)
+            names.append(child.id)
+    return names
 
 
 def _collect_tainted(
@@ -457,7 +464,7 @@ def _collect_tainted(
     aliases: dict[str, str],
     check_runtime: Callable[[], None] | None = None,
 ) -> dict[str, _TaintedVar]:
-    """Record ``Assign``-based taint to a fixpoint, independent of AST visit order.
+    """Record ``Assign``-based taint, independent of AST visit order.
 
     Any single ordered pass over the tree — breadth-first (``ast.walk``) or
     source-order (pre-order) — misses flows where a sink and the assignment
@@ -469,41 +476,63 @@ def _collect_tainted(
     assignment has already executed. There is no fixed traversal order that
     agrees with both "defined before" and "runs after".
 
-    Instead, repeat a full scan of every ``Assign`` node until ``tainted``
-    stops growing. Each pass can propagate taint through one more link of a
-    re-assignment chain (``a = source()``; ``b = a``; ``c = b``), regardless
-    of where each assignment sits in the tree, so the number of passes is
-    bounded by the length of the longest such chain rather than by AST depth
-    or traversal order.
+    Taint is therefore computed as reachability in the re-assignment graph,
+    using a monotone worklist:
+
+    * One pass over every ``Assign`` seeds the tainted set from direct sources
+      (source calls and credential subscripts) and indexes every propagating
+      assignment (``b = a``; ``payload = {"k": secret}``) by each name its
+      value reads, as ``referenced_name -> [(targets, lineno), ...]``.
+    * The worklist then drains newly tainted names, tainting the targets of
+      every assignment that reads them, enqueuing only names not already
+      tainted.
+
+    Taint is add-only — an entry is never overwritten or removed — so the set
+    can only grow and is bounded by the number of assigned names. The loop
+    therefore cannot oscillate and is guaranteed to terminate. Each name is
+    dequeued once and each propagating assignment fires once per name it
+    reads, so the work is linear in the number of assignments plus references
+    rather than quadratic in the length of the longest chain.
     """
     tainted: dict[str, _TaintedVar] = {}
-    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)]
-    while True:
-        snapshot = dict(tainted)
-        for ast_node in assigns:
-            if check_runtime is not None:
-                check_runtime()
-            src_name = _find_source_in_expr(ast_node.value, type_map, aliases, check_runtime)
+    worklist: deque[str] = deque()
+    # name read by a propagating assignment -> that assignment's (targets, lineno)
+    propagators: dict[str, list[tuple[list[ast.expr], int]]] = {}
 
-            # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
-            if src_name is None and isinstance(ast_node.value, ast.Subscript):
-                base = resolve_dotted_name(ast_node.value.value)
-                if base is not None:
-                    base = apply_import_aliases(base, aliases)
-                if base and base in _CREDENTIAL_SOURCES:
-                    src_name = base
+    for ast_node in ast.walk(tree):
+        if check_runtime is not None:
+            check_runtime()
+        if not isinstance(ast_node, ast.Assign):
+            continue
 
-            # Propagate taint through re-assignment and container construction:
-            # data = secret, payload = {"k": secret}, items = [secret], msg = f"{secret}"
-            if src_name is None:
-                tv = _find_tainted_in_expr(ast_node.value, tainted, check_runtime)
-                if tv:
-                    src_name = tv.source_call
+        src_name = _find_source_in_expr(ast_node.value, type_map, aliases, check_runtime)
 
-            if src_name:
-                _mark_targets(ast_node.targets, tainted, src_name, ast_node.lineno)
-        if tainted == snapshot:
-            return tainted
+        # Subscript sources like os.environ["KEY"] (also os aliased as `o`)
+        if src_name is None and isinstance(ast_node.value, ast.Subscript):
+            base = resolve_dotted_name(ast_node.value.value)
+            if base is not None:
+                base = apply_import_aliases(base, aliases)
+            if base and base in _CREDENTIAL_SOURCES:
+                src_name = base
+
+        if src_name is not None:
+            # Direct source: seed taint for this assignment's targets.
+            worklist.extend(_mark_targets(ast_node.targets, tainted, src_name, ast_node.lineno))
+        else:
+            # Propagating assignment: index it by each name its value reads, so
+            # it can be tainted later if/when one of those names is tainted.
+            for ref in _referenced_names(ast_node.value):
+                propagators.setdefault(ref, []).append((ast_node.targets, ast_node.lineno))
+
+    while worklist:
+        if check_runtime is not None:
+            check_runtime()
+        name = worklist.popleft()
+        src_call = tainted[name].source_call
+        for targets, lineno in propagators.get(name, ()):
+            worklist.extend(_mark_targets(targets, tainted, src_call, lineno))
+
+    return tainted
 
 
 def _analyze_python(
