@@ -948,7 +948,8 @@ def _render_terminal_completeness(
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
-            location = str(row.get("path", ""))
+            # Analyzer status rows name an analyzer rather than a file.
+            location = str(row.get("path") or row.get("analyzer_id") or "")
             start_line = row.get("start_line")
             end_line = row.get("end_line")
             if isinstance(start_line, int):
@@ -1392,7 +1393,8 @@ def _render_markdown_completeness(
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
-            location = str(row.get("path", ""))
+            # Analyzer status rows name an analyzer rather than a file.
+            location = str(row.get("path") or row.get("analyzer_id") or "")
             start_line = row.get("start_line")
             end_line = row.get("end_line")
             if isinstance(start_line, int):
