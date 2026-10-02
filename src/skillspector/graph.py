@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from langgraph.graph import END, START, StateGraph
 
 from skillspector.inspection_ledger import guard_analyzer_node
@@ -86,3 +88,18 @@ def create_graph():
 
 
 graph = create_graph()
+
+
+def __getattr__(name: str) -> Any:
+    """Delegate invokable graph API when this module shadows the package export.
+
+    Importing ``skillspector.graph`` directly assigns this module to the
+    parent package's ``graph`` attribute (the import system sets it after
+    module execution, so it cannot be restored from here). Delegating
+    ``invoke``/``ainvoke``/``stream`` keeps ``skillspector.graph`` invokable
+    in that import order; prefer ``from skillspector import graph`` for the
+    lazy proxy instead.
+    """
+    if name in {"invoke", "ainvoke", "stream", "astream", "batch", "abatch"}:
+        return getattr(graph, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
