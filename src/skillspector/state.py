@@ -307,6 +307,10 @@ class SkillspectorState(TypedDict, total=False):
     baseline_path: str | None
     show_suppressed: bool
     suppressed_findings: list[object]
+    # Kept findings as baseline suppression saw them: one per occurrence, before
+    # deduplication compacts them. `skillspector baseline` fingerprints these so
+    # every occurrence the next scan checks has its own entry.
+    active_findings: list[Finding]
 
     # Model IDs per LLM-using node: e.g. {"default": "...", "meta_analyzer": "..."}
     model_config: dict[str, str]
