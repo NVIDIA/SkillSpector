@@ -82,3 +82,11 @@ models:
   "gpt-6-luna":
     context_length: 1050000
     max_output_tokens: 128000
+  # GPT-6.1 Sol (verified 2026-09-30: same stock ID as OpenAI,
+  # confirmed on Azure in the Foundry model catalog, Direct from
+  # Azure 2026-09-29): 1.05M context, 128K output. Azure serves the
+  # same OpenAI models, so the same budgets apply when the
+  # deployment name matches.
+  "gpt-6.1-sol":
+    context_length: 1050000
+    max_output_tokens: 128000
