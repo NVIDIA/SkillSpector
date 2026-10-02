@@ -144,6 +144,27 @@ skillspector scan https://github.com/user/my-skill
 skillspector scan ./my-skill.zip
 ```
 
+### Runway video projects
+
+Generate offline, Runway-ready prompt sheets from the built-in project
+templates described in the attached video brief. This command does not call
+Runway, upload media, execute prompts, or require credentials:
+
+```bash
+# List templates
+skillspector runway-project --list-templates
+
+# Export Markdown (the default)
+skillspector runway-project --template automation-legends --output runway.md
+
+# Export machine-readable JSON
+skillspector runway-project --template cerberus-drone --format json --output runway.json
+```
+
+Each clip is composed in the brief's order: camera movement, subject/action,
+environment/light, and style/rendering. The templates are starting points that
+can be edited before pasting prompts into a video-generation workflow.
+
 #### Size limits
 
 SkillSpector enforces two independent caps on remote and archive inputs to bound the impact of oversized downloads and zip bombs:
