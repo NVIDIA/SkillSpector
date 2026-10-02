@@ -244,6 +244,18 @@ RULE_ID_TO_CATEGORY: dict[str, str] = {
     "DS2": PatternCategory.DESERIALIZATION.value,
     "DS3": PatternCategory.DESERIALIZATION.value,
     "DS4": PatternCategory.DESERIALIZATION.value,
+    # Semantic LLM analyzers
+    "SSD-1": PatternCategory.PROMPT_INJECTION.value,
+    "SSD-2": PatternCategory.PROMPT_INJECTION.value,
+    "SSD-3": PatternCategory.DATA_EXFILTRATION.value,
+    "SSD-4": PatternCategory.PROMPT_INJECTION.value,
+    "SDI-1": PatternCategory.EXCESSIVE_AGENCY.value,
+    "SDI-2": PatternCategory.EXCESSIVE_AGENCY.value,
+    "SDI-3": PatternCategory.EXCESSIVE_AGENCY.value,
+    "SDI-4": PatternCategory.EXCESSIVE_AGENCY.value,
+    "SQP-1": PatternCategory.TRIGGER_ABUSE.value,
+    "SQP-2": PatternCategory.OUTPUT_HANDLING.value,
+    "SQP-3": PatternCategory.OUTPUT_HANDLING.value,
 }
 
 # Rule ID -> pattern display name (for report output)
@@ -335,6 +347,18 @@ PATTERN_NAMES: dict[str, str] = {
     "DS2": "Ruby Marshal Deserialization",
     "DS3": "Unsafe Ruby YAML Deserialization",
     "DS4": "Unsafe JavaScript Deserialization",
+    # Semantic LLM analyzers
+    "SSD-1": "Semantic Prompt Injection",
+    "SSD-2": "Novel Attack Phrasing",
+    "SSD-3": "Natural-Language Data Exfiltration",
+    "SSD-4": "Narrative Deception",
+    "SDI-1": "Description-Behavior Mismatch",
+    "SDI-2": "Context-Inappropriate Capability",
+    "SDI-3": "Permission Scope Creep",
+    "SDI-4": "Intent-Code Divergence",
+    "SQP-1": "Vague Trigger",
+    "SQP-2": "Missing User Warning",
+    "SQP-3": "Natural-Language Policy Violation",
 }
 
 # Pattern-specific remediations (how to fix the issue)
