@@ -1419,6 +1419,15 @@ class TestRunStaticPatternsPrivilegeEscalationPE4:
         assert any(f.rule_id == "PE4" for f in result["findings"])
 
 
+_VENDOR_PRIVILEGED_MANIFEST = (
+    "# Vendor deployment requirements\n"
+    "\n"
+    "The collector needs host access to attach probes.\n"
+    "\n"
+    "    docker run --privileged --pid=host vendor/collector:1.4 selftest\n"
+)
+
+
 class TestRunStaticPatternsPrivilegeEscalationPE5:
     """run_static_patterns with privilege_escalation: PE5 (privileged container / container escape)."""
 
@@ -1544,6 +1553,55 @@ class TestRunStaticPatternsPrivilegeEscalationPE5:
         findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
         pe5 = next(f for f in findings if f.rule_id == "PE5")
         assert {"contextual-triage", "likely-benign-context"} <= set(pe5.tags)
+
+    def test_pe5_reference_material_is_downweighted_not_suppressed(self):
+        """A vendor manifest under references/ keeps the PE5 finding at halved confidence."""
+        state = {
+            "components": ["references/vendor.md"],
+            "file_cache": {"references/vendor.md": _VENDOR_PRIVILEGED_MANIFEST},
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe5 = [f for f in findings if f.rule_id == "PE5"]
+        assert len(pe5) == 1
+        assert pe5[0].severity == "HIGH"
+        assert pe5[0].confidence == pytest.approx(0.4)
+        assert {"contextual-triage", "likely-benign-context"} <= set(pe5[0].tags)
+
+    def test_pe5_skill_md_instruction_keeps_full_confidence(self):
+        """The same manifest in SKILL.md is an instruction and is not downweighted."""
+        state = {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": _VENDOR_PRIVILEGED_MANIFEST},
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe5 = [f for f in findings if f.rule_id == "PE5"]
+        assert len(pe5) == 1
+        assert pe5[0].confidence == pytest.approx(0.8)
+        assert "likely-benign-context" not in pe5[0].tags
+
+    def test_pe5_skill_md_under_references_keeps_full_confidence(self):
+        """SKILL.md stays the instruction file even when it sits under references/."""
+        state = {
+            "components": ["references/SKILL.md"],
+            "file_cache": {"references/SKILL.md": _VENDOR_PRIVILEGED_MANIFEST},
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe5 = [f for f in findings if f.rule_id == "PE5"]
+        assert len(pe5) == 1
+        assert pe5[0].confidence == pytest.approx(0.8)
+
+    def test_pe5_reference_script_keeps_full_confidence(self):
+        """Only markdown/text reference material is downweighted, never an executable script."""
+        state = {
+            "components": ["references/setup.sh"],
+            "file_cache": {
+                "references/setup.sh": "docker run --privileged --pid=host vendor/collector:1.4\n",
+            },
+        }
+        findings = static_runner.run_static_patterns(state, [privilege_escalation_module])
+        pe5 = [f for f in findings if f.rule_id == "PE5"]
+        assert len(pe5) == 1
+        assert pe5[0].confidence == pytest.approx(0.8)
 
 
 class TestRunStaticPatternsSSRF:

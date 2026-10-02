@@ -82,6 +82,32 @@ def is_code_example(context: str, *, path: str = "") -> bool:
     return any(ind in ctx_lower for ind in _CODE_EXAMPLE_INDICATORS)
 
 
+# Agent Skills keep on-demand reference material under ``references/``. A
+# vendor manifest reproduced there describes a third-party requirement; the same
+# text in SKILL.md or a script instructs the agent to carry it out.
+_REFERENCE_MATERIAL_DIRS = frozenset({"reference", "references"})
+
+# Reference material is de-emphasised, never suppressed: a skill author controls
+# its own layout, so a malicious instruction parked under ``references/`` must
+# still surface as a finding rather than disappear from the report.
+REFERENCE_MATERIAL_CONFIDENCE_SCALE = 0.5
+
+
+def is_reference_material(file_path: str, file_type: str) -> bool:
+    """Return True when *file_path* is skill documentation that describes rather than instructs.
+
+    SKILL.md is never reference material, wherever it sits: it is the agent's
+    primary instruction file, mirroring the exemption in :func:`is_code_example`.
+    """
+    if file_type not in {"markdown", "text"}:
+        return False
+    normalized = file_path.replace("\\", "/").lower()
+    segments = normalized.split("/")
+    if segments[-1] == "skill.md":
+        return False
+    return any(segment in _REFERENCE_MATERIAL_DIRS for segment in segments[:-1])
+
+
 def get_line_number(content: str, offset: int) -> int:
     """Return the 1-based line number for a character offset in *content*."""
     return sum(1 for _ in LOGICAL_LINE_BREAK.finditer(content, 0, offset)) + 1
