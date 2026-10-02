@@ -237,8 +237,11 @@ _ENV_COMMAND_INJECTION_NAMES: Final = frozenset(
     }
 )
 # NODE_OPTIONS flags that load attacker-chosen modules into the Node runtime.
+# "-r" is Node's own short alias for "--require" and is honored identically
+# when set via NODE_OPTIONS (confirmed via `process.allowedNodeEnvironmentFlags`
+# on Node 22, which lists both). It has no long-form spelling to fall back on.
 _NODE_OPTIONS_CODE_FLAGS: Final = frozenset(
-    {"--require", "--import", "--loader", "--experimental-loader"}
+    {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 )
 _ANTHROPIC_DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
 _HookIdentity = tuple[str, str, str]
