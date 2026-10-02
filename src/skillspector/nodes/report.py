@@ -723,8 +723,11 @@ def _build_sarif(
         path = str(exception.get("path", ""))
         start_line = exception.get("start_line")
         end_line = exception.get("end_line")
+        scope = exception.get("scope")
         locations = None
-        if path:
+        # A rule-set row's path is a label, not an artifact; giving it a
+        # physical location would attribute it to any real file of that name.
+        if path and not scope:
             region = (
                 SarifRegion(
                     startLine=int(start_line),
@@ -748,6 +751,8 @@ def _build_sarif(
         }
         if exception.get("fatal") is not None:
             properties["fatal"] = bool(exception["fatal"])
+        if scope:
+            properties["scope"] = str(scope)
         analyzers = exception.get("analyzers")
         if isinstance(analyzers, list):
             properties["analyzers"] = list(analyzers)

@@ -35,6 +35,10 @@ def _reference_coverage_findings(
     for event in state.get("inspection_ledger") or []:
         if not isinstance(event, Mapping):
             continue
+        if event.get("record_type") == LedgerRecordType.RULE_SET:
+            # A rule set's path is a label, not an artifact: a real file that
+            # happens to share it was not inspected any less completely.
+            continue
         outcome = str(event.get("outcome", ""))
         if outcome in {"partial", "failed", "out_of_scope"}:
             exceptional_outcomes.setdefault(str(event.get("path", "")), set()).add(outcome)

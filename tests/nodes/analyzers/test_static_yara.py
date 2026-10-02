@@ -30,7 +30,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from typer.testing import CliRunner
 
+from skillspector.cli import app
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers import static_yara
 from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
@@ -1692,6 +1694,92 @@ class TestRuleSkipAccounting:
             and event.get("observed_artifacts") == 1
             for event in events
         )
+
+    @pytest.mark.parametrize("referenced_name", ["yara_rules", "normal.txt"])
+    def test_referenced_file_named_like_the_rule_set_is_not_charged_with_its_dropped_rule(
+        self, tmp_path, referenced_name
+    ):
+        """A real file sharing the rule-set label must be scored like any other file.
+
+        The rule-load event is labelled ``yara_rules``. Finalization groups
+        reference outcomes and per-component coverage by path, so a benign,
+        fully read file of that name, linked from ``SKILL.md``, was charged with
+        the rule set's partial outcome: a false HIGH AE1, risk score 25 and 50%
+        coverage, all of which vanished when only the filename changed. The scan
+        must stay partial (a rule really was dropped), but nothing file-specific
+        may be inferred from the label. Driven through the real CLI so the
+        finalizer and report generation are both exercised.
+        """
+        skill = tmp_path / "skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: A harmless demo skill.\n---\n\n"
+            f"# Demo\n\nSee [the notes]({referenced_name}) for details.\n",
+            encoding="utf-8",
+        )
+        (skill / referenced_name).write_text("Plain harmless notes.\n", encoding="utf-8")
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "valid.yar").write_text("rule never_fires { condition: false }\n")
+        (rules_dir / "broken.yar").write_text('rule broken { strings: $a = "x" condition: $a\n')
+
+        def scan(output_format: str, *extra: str) -> tuple[int, dict]:
+            out = tmp_path / f"report-{output_format}-{len(extra)}.json"
+            result = CliRunner().invoke(
+                app,
+                [
+                    "scan",
+                    str(skill),
+                    "--no-llm",
+                    "--yara-rules-dir",
+                    str(rules_dir),
+                    "--format",
+                    output_format,
+                    "--output",
+                    str(out),
+                    *extra,
+                ],
+            )
+            return result.exit_code, json.loads(out.read_text(encoding="utf-8"))
+
+        exit_code, report = scan("json")
+        assert exit_code == 0
+        assert [issue["id"] for issue in report["issues"]] == [], (
+            "a rule-set failure must not invent a finding against a file of the same name"
+        )
+        assert report["risk_assessment"]["score"] == 0
+        completeness = report["analysis_completeness"]
+        assert completeness["coverage_percent"] == 100.0
+        assert completeness["partially_inspected_files"] == 0
+        assert completeness["entirely_uninspected_files"] == 0
+
+        # The dropped rule itself is still reported, as a nonfatal partial scan
+        # explicitly scoped to the rule set rather than to an artifact.
+        assert completeness["is_complete"] is False
+        assert completeness["execution_successful"] is True
+        rule_set_rows = [
+            row for row in completeness["ledger_exceptions"] if row.get("scope") == "rule_set"
+        ]
+        assert len(rule_set_rows) == 1
+        assert rule_set_rows[0]["reason_code"] == LedgerReason.READ_ERROR
+        assert rule_set_rows[0]["fatal"] is False
+        assert all(
+            row.get("scope") == "rule_set"
+            for row in completeness["ledger_exceptions"]
+            if row["reason_code"] == LedgerReason.READ_ERROR
+        )
+
+        strict_exit, _ = scan("json", "--fail-on-incomplete")
+        assert strict_exit == 1
+
+        # SARIF must not point the rule-set notification at an artifact either.
+        _, sarif = scan("sarif")
+        notifications = sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+        rule_set_notifications = [
+            item for item in notifications if item.get("properties", {}).get("scope") == "rule_set"
+        ]
+        assert len(rule_set_notifications) == 1
+        assert not rule_set_notifications[0].get("locations")
 
     @pytest.mark.parametrize(
         ("filename", "content", "expected_fragment"),

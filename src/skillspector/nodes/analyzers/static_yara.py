@@ -1253,17 +1253,23 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
                 # both planned targets resolve to two matching events, and
                 # reconciliation raises a fatal ``unaccounted_work`` instead of
                 # the nonfatal partial scan this is meant to record. Falling
-                # back to ``system:static`` makes the identity disjoint from
+                # back to ``rule_set:static`` makes the identity disjoint from
                 # every analyzer work item by construction, so no choice of
                 # filename can collide -- renaming the synthetic path alone
                 # would only move the collision to the next unlucky name.
                 outcome=LedgerOutcome.PARTIAL,
-                record_type=LedgerRecordType.SYSTEM,
+                # RULE_SET, not SYSTEM: SYSTEM rows describe real artifacts
+                # and feed path-keyed accounting (per-component coverage and
+                # AE1 reference findings). This row describes the rule set,
+                # so finalization excludes it from that accounting by type,
+                # and a benign file named ``yara_rules`` cannot be charged
+                # with this partial outcome.
+                record_type=LedgerRecordType.RULE_SET,
                 phase="static",
-                # Not a scanned skill file: a synthetic scope for the rule
-                # set itself. Ledger paths must be relative POSIX paths, and
-                # the real rules directory (builtin or --yara-rules-dir) is
-                # absolute, so it cannot be used here.
+                # Not a scanned skill file: a report-safe label for the rule
+                # set. Ledger paths must be relative POSIX paths, and the real
+                # rules directory (builtin or --yara-rules-dir) is absolute, so
+                # it cannot be used here.
                 path="yara_rules/",
                 reason=LedgerReason.READ_ERROR,
                 observed_artifacts=rules_skipped,
