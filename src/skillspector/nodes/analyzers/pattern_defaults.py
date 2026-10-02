@@ -418,9 +418,9 @@ DEFAULT_REMEDIATIONS: dict[str, str] = {
     "YR3": "Remove all cryptocurrency mining code, pool references, and miner binaries. Mining in agent skills is unauthorized resource abuse. Report the skill as malicious.",
     "YR4": "Remove offensive tool references and exploit code. Legitimate agent skills should not contain penetration testing tools, exploit frameworks, or reconnaissance utilities.",
     # MCP Least Privilege (B.3.1)
-    "LP1": "Declare the missing capability in the manifest type being scanned: for Agent Skills SKILL.md, add a covering tool to the 'allowed-tools' frontmatter field; for MCP server manifests, add the capability to the 'permissions' list. Otherwise, remove the code that requires it.",
+    "LP1": "Review whether the capability is required and how the host runtime enforces it; runtime permissions are unknown unless separately verified. Remove code that does not need it. For Agent Skills, do not broaden 'allowed-tools' preapproval solely to silence this finding; change preapproval only after reviewing the actual host policy. For MCP server manifests, add the required capability to 'permissions' only after that review.",
     "LP2": "Replace wildcard permissions ('*', 'all', 'full', 'any') with an explicit list of required permissions.",
-    "LP3": "Declare the skill's tool scope: for Claude Code / Agent Skills SKILL.md, list the tools the skill may invoke in the 'allowed-tools' frontmatter field; for MCP server manifests, add a 'permissions' list naming the required capabilities.",
+    "LP3": "Clarify the skill's intended tool scope and review how the host runtime enforces it; runtime permissions are unknown unless separately verified. For Claude Code / Agent Skills SKILL.md, 'allowed-tools' records preapproved tools, not a permission ceiling; add tools only when independently approved as necessary, not to silence this finding. For MCP server manifests, use a 'permissions' list naming the required capabilities.",
     "LP4": "Remove the declared permission if the corresponding capability is no longer used.",
     # MCP Tool Poisoning (B.3.2)
     "TP1": "Remove hidden content (HTML comments, markdown comments, zero-width characters, base64 blobs) from metadata fields. Metadata should contain plain, visible text only.",
