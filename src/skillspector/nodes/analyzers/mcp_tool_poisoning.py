@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import cast
 
+from langchain_openai.chat_models.base import BaseChatOpenAI
 from pydantic import BaseModel, Field, field_validator
 
 from skillspector.inference_usage import InferenceUsageRecord
@@ -45,6 +46,7 @@ from skillspector.llm_analyzer_base import (
     append_output_language_instruction,
     estimate_tokens,
 )
+from skillspector.llm_utils import chat_model_provider_name
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding, compute_match_fingerprint
 from skillspector.nodes.analyzers.static_runner import MAX_FINDINGS_PER_ANALYZER
@@ -901,6 +903,18 @@ class _TP4Analyzer(LLMAnalyzerBase):
     """Run TP4 through the shared structured-output analyzer lifecycle."""
 
     response_schema = _TP4AnalysisResult
+
+    def _structured_output_preference(self, llm: object) -> str | None:
+        # The OpenAI-compatible Opus 5 gateway sometimes wraps json_schema
+        # output in a {"json": ...} object instead of the requested schema.
+        # Tool calling returns the exact TP4 schema on the same gateway.
+        if (
+            isinstance(llm, BaseChatOpenAI)
+            and chat_model_provider_name(llm) == "openai"
+            and self.model == "azure/anthropic/claude-opus-5"
+        ):
+            return "function_calling"
+        return None
 
     def __init__(
         self,
