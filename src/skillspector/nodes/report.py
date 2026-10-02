@@ -37,7 +37,11 @@ from rich.table import Table
 
 from skillspector import __version__ as skillspector_version
 from skillspector.inference_usage import sanitize_inference_usage
-from skillspector.inspection_ledger import MAX_FINDING_OUTPUT_RECORDS, AnalysisCompleteness
+from skillspector.inspection_ledger import (
+    MAX_FINDING_OUTPUT_RECORDS,
+    RULE_SET_SCOPE,
+    AnalysisCompleteness,
+)
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
@@ -871,6 +875,9 @@ def _render_terminal_completeness(
             end_line = row.get("end_line")
             if isinstance(start_line, int):
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
+            if row.get("scope") == RULE_SET_SCOPE:
+                # The path of a rule-set row is a label, not an artifact.
+                location = f"rule set {location}"
             reason = str(row.get("reason_code", row.get("status", "status")))
             message = str(row.get("message", ""))
             console.print(f"  - {escape(reason)} {escape(location)}: {escape(message)}")
@@ -1262,8 +1269,12 @@ def _render_markdown_completeness(
             if isinstance(start_line, int):
                 location += f":{start_line}" + (f"-{end_line}" if end_line else "")
             reason = row.get("reason_code", row.get("status", "status"))
+            location_cell = f"`{_markdown_cell(location)}`"
+            if row.get("scope") == RULE_SET_SCOPE:
+                # The path of a rule-set row is a label, not an artifact.
+                location_cell = f"rule set {location_cell}"
             lines.append(
-                f"| {_markdown_cell(reason)} | `{_markdown_cell(location)}` | "
+                f"| {_markdown_cell(reason)} | {location_cell} | "
                 f"{_markdown_cell(row.get('message', ''))} |"
             )
         lines.append("")
