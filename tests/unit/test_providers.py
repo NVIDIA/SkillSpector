@@ -354,6 +354,7 @@ class TestOpenAIProvider:
             "gpt-6-astra",
             "gpt-6-sol",
             "gpt-6-luna",
+            "gpt-6.1-sol",
         ):
             assert provider.get_context_length(model) == 1_050_000
             assert provider.get_max_output_tokens(model) == 128_000
