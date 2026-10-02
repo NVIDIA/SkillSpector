@@ -31,6 +31,7 @@ Node and analyze() in one module.
 from __future__ import annotations
 
 import codecs
+import functools
 import io
 import json
 import os
@@ -341,110 +342,118 @@ _ABANDONED_PACKAGES: set[str] = {
 # SC6: Typosquatting — popular packages and edit-distance check
 # ---------------------------------------------------------------------------
 
-_POPULAR_PYPI: set[str] = {
-    "requests",
-    "numpy",
-    "pandas",
-    "flask",
-    "django",
-    "boto3",
-    "setuptools",
-    "pip",
-    "urllib3",
-    "pyyaml",
-    "cryptography",
-    "pillow",
-    "pydantic",
-    "sqlalchemy",
-    "pytest",
-    "click",
-    "jinja2",
-    "httpx",
-    "aiohttp",
-    "fastapi",
-    "celery",
-    "paramiko",
-    "beautifulsoup4",
-    "lxml",
-    "scrapy",
-    "redis",
-    "pymongo",
-    "psycopg2",
-    "matplotlib",
-    "scipy",
-    "scikit-learn",
-    "tensorflow",
-    "torch",
-    "keras",
-    "transformers",
-    "openai",
-    "langchain",
-    "gunicorn",
-    "uvicorn",
-    "rich",
-    "typer",
-    "black",
-    "ruff",
-    "mypy",
-    "pylint",
-    "flake8",
-    "isort",
-    "colorama",
-    "python-dateutil",
-    "discord.py",
-    "python-dotenv",
-    "pycryptodome",
-    "perseus-ctx",
-    "mimir-mcp",
-}
+_POPULAR_PYPI: frozenset[str] = frozenset(
+    {
+        "requests",
+        "numpy",
+        "pandas",
+        "flask",
+        "django",
+        "boto3",
+        "setuptools",
+        "pip",
+        "urllib3",
+        "pyyaml",
+        "cryptography",
+        "pillow",
+        "pydantic",
+        "sqlalchemy",
+        "pytest",
+        "click",
+        "jinja2",
+        "httpx",
+        "aiohttp",
+        "fastapi",
+        "celery",
+        "paramiko",
+        "beautifulsoup4",
+        "lxml",
+        "scrapy",
+        "redis",
+        "pymongo",
+        "psycopg2",
+        "matplotlib",
+        "scipy",
+        "scikit-learn",
+        "tensorflow",
+        "torch",
+        "keras",
+        "transformers",
+        "openai",
+        "langchain",
+        "gunicorn",
+        "uvicorn",
+        "rich",
+        "typer",
+        "black",
+        "ruff",
+        "mypy",
+        "pylint",
+        "flake8",
+        "isort",
+        "colorama",
+        "python-dateutil",
+        "discord.py",
+        "python-dotenv",
+        "pycryptodome",
+        "perseus-ctx",
+        "mimir-mcp",
+    }
+)
 
-_POPULAR_NPM: set[str] = {
-    "express",
-    "react",
-    "react-dom",
-    "next",
-    "vue",
-    "angular",
-    "lodash",
-    "axios",
-    "moment",
-    "chalk",
-    "commander",
-    "inquirer",
-    "webpack",
-    "babel",
-    "eslint",
-    "prettier",
-    "typescript",
-    "jest",
-    "mocha",
-    "chai",
-    "puppeteer",
-    "socket.io",
-    "mongoose",
-    "sequelize",
-    "passport",
-    "jsonwebtoken",
-    "dotenv",
-    "cors",
-    "body-parser",
-    "nodemon",
-    "pm2",
-    "electron",
-    "discord.js",
-    "ethers",
-    "cross-env",
-    "jquery",
-    "nodemailer",
-    "bootstrap",
-}
+_POPULAR_NPM: frozenset[str] = frozenset(
+    {
+        "express",
+        "react",
+        "react-dom",
+        "next",
+        "vue",
+        "angular",
+        "lodash",
+        "axios",
+        "moment",
+        "chalk",
+        "commander",
+        "inquirer",
+        "webpack",
+        "babel",
+        "eslint",
+        "prettier",
+        "typescript",
+        "jest",
+        "mocha",
+        "chai",
+        "puppeteer",
+        "socket.io",
+        "mongoose",
+        "sequelize",
+        "passport",
+        "jsonwebtoken",
+        "dotenv",
+        "cors",
+        "body-parser",
+        "nodemon",
+        "pm2",
+        "electron",
+        "discord.js",
+        "ethers",
+        "cross-env",
+        "jquery",
+        "nodemailer",
+        "bootstrap",
+    }
+)
 
 # SC6 known-legitimate neighbours: established packages whose names fall within
 # the typosquat threshold of a _POPULAR_* entry and are never reported. Built by
 # running SC6 against the top 15,000 PyPI packages (hugovk/top-pypi-packages,
 # 30-day list) and npm-high-impact (~17,300 names). Six PyPI names that a manual
 # review keeps flagged (beautifulsoup, dydantic, httpr, pyyml, slack, xoto3) are
-# deliberately left out.
+# deliberately left out. The resulting 97 -> 6 (PyPI) and 26 -> 0 (npm) counts are
+# in-sample: names outside those two lists can still be flagged. Established
+# packages reported from outside the sample in review (#647) were checked one by
+# one (repository, age, downloads) and added: jets, jqueryui, bootstrap3,
+# bootstrap5 (npm), colormap, python-direnv (PyPI).
 _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
     {
         "afsapi",
@@ -455,6 +464,7 @@ _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
         "blake3",
         "boto",
         "canvas",
+        "colormap",
         "cpplint",
         "crick",
         "djangoql",
@@ -514,6 +524,7 @@ _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
         "pyrect",
         "pysaml2",
         "pytango",
+        "python-direnv",
         "pytket",
         "pytoml",
         "rltest",
@@ -546,6 +557,8 @@ _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
 _KNOWN_LEGIT_NPM: frozenset[str] = frozenset(
     {
         "angular2",
+        "bootstrap3",
+        "bootstrap5",
         "chat",
         "commondir",
         "commoner",
@@ -560,6 +573,8 @@ _KNOWN_LEGIT_NPM: frozenset[str] = frozenset(
         "ext",
         "gaxios",
         "getenv",
+        "jets",
+        "jqueryui",
         "jshint",
         "jslint",
         "keypress",
@@ -581,7 +596,11 @@ _KNOWN_LEGIT_NPM: frozenset[str] = frozenset(
 
 
 def _edit_distance(a: str, b: str) -> int:
-    """Compute Levenshtein edit distance between two strings."""
+    """Compute Levenshtein edit distance between two strings.
+
+    SC6 now uses ``_osa_distance``; this plain Levenshtein is kept as the
+    reference the unit tests compare it against (a swap counts as two edits).
+    """
     if len(a) < len(b):
         return _edit_distance(b, a)
     if len(b) == 0:
@@ -631,6 +650,22 @@ def _typosquat_normalize(name: str, pep503: bool) -> str:
     return name.lower().replace("_", "-")
 
 
+@functools.lru_cache(maxsize=32)
+def _typosquat_targets(names: frozenset[str], pep503: bool) -> tuple[tuple[str, str], ...]:
+    """Return ``(name, normalized name)`` pairs sorted by name, once per name set.
+
+    SC6 runs for every dependency, so normalizing and sorting the popular and
+    known-legitimate sets on each call used to dominate the per-scan cost.
+    """
+    return tuple(sorted((name, _typosquat_normalize(name, pep503)) for name in names))
+
+
+@functools.lru_cache(maxsize=32)
+def _typosquat_normalized_set(names: frozenset[str], pep503: bool) -> frozenset[str]:
+    """Return the normalized names of ``names`` (cached, see ``_typosquat_targets``)."""
+    return frozenset(norm for _, norm in _typosquat_targets(names, pep503))
+
+
 def _is_typosquat(
     pkg_name: str,
     popular: set[str],
@@ -646,15 +681,22 @@ def _is_typosquat(
     ``preact`` vs ``react``); they are never reported.
     """
     normalized = _typosquat_normalize(pkg_name, pep503)
+    popular_set = popular if isinstance(popular, frozenset) else frozenset(popular)
+    legit_set = known_legit if isinstance(known_legit, frozenset) else frozenset(known_legit)
     # A known package must win over any earlier, similar name (e.g. gunicorn
     # sorts before uvicorn). Apply the same normalization on both sides.
-    if any(normalized == _typosquat_normalize(name, pep503) for name in popular):
+    if normalized in _typosquat_normalized_set(popular_set, pep503):
         return None
-    if any(normalized == _typosquat_normalize(name, pep503) for name in known_legit):
+    if normalized in _typosquat_normalized_set(legit_set, pep503):
         return None
-    for popular_name in sorted(popular):
-        pop_norm = _typosquat_normalize(popular_name, pep503)
-        if len(normalized) < 3 or len(pop_norm) < 3:
+    if len(normalized) < 3:
+        return None
+    for popular_name, pop_norm in _typosquat_targets(popular_set, pep503):
+        if len(pop_norm) < 3:
+            continue
+        # OSA distance is never below the length difference, so this skip is
+        # exact and avoids the quadratic distance computation for most pairs.
+        if abs(len(normalized) - len(pop_norm)) > max_distance:
             continue
         dist = _osa_distance(normalized, pop_norm)
         if not 0 < dist <= max_distance:
