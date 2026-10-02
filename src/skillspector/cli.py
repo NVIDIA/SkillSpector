@@ -42,7 +42,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from skillspector import __version__, transitive
-from skillspector.cleanup import cleanup_result
+from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
 from skillspector.input_handler import validate_local_input_path
@@ -1397,8 +1397,13 @@ def _run_graph_scan(
     if initial_inspection_ledger:
         state["inspection_ledger"] = initial_inspection_ledger
     trace_config = _build_trace_config(input_path, format, no_llm)
+    # A scan that raises or is interrupted returns no result for the caller to
+    # clean up, so remove the temp directory resolve_input made here instead.
+    temp_dir_tracker = TempDirTracker()
+    trace_config["callbacks"] = [temp_dir_tracker]
     if not stream_progress:
-        return cast(dict[str, object], graph.invoke(state, config=trace_config))
+        with temp_dir_tracker.removing_on_error():
+            return cast(dict[str, object], graph.invoke(state, config=trace_config))
 
     analyzer_node_ids = _wired_analyzer_node_ids()
     total_analyzers = len(analyzer_node_ids)
@@ -1416,6 +1421,7 @@ def _run_graph_scan(
             console=err_console,
             transient=True,
         ) as progress,
+        temp_dir_tracker.removing_on_error(),
     ):
         warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
         task_id = progress.add_task("Resolving input...", total=total_steps)
