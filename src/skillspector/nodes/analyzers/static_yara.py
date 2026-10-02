@@ -27,6 +27,7 @@ import binascii
 import hashlib
 import math
 import os
+import re
 import stat
 import time
 from collections.abc import Callable
@@ -86,6 +87,17 @@ _DEFAULT_CONFIDENCE = 0.7
 _DESTRUCTIVE_AUTONOMY_NAMESPACE = "agent_skills"
 _DESTRUCTIVE_AUTONOMY_RULE = "agent_skill_destructive_autonomous_actions"
 _MAX_DESTRUCTIVE_AUTONOMY_LINE_DISTANCE = 3
+_BUILTIN_RANSOMWARE_NAMESPACE = "malware"
+_BUILTIN_RANSOMWARE_RULE = "ransomware_behavior"
+_RANSOMWARE_PAYMENT_IDENTIFIERS = frozenset(
+    {"$payment_then_context", "$context_then_payment", "$explicit_ransom_payment"}
+)
+_RANSOMWARE_PAYMENT_VERB = re.compile(rb"\b(?:pay|send)\b", re.IGNORECASE)
+_DIRECT_RANSOMWARE_NEGATION = re.compile(
+    rb"\b(?:never|do[ \t]+not|don't|must[ \t]+not|should[ \t]+not|avoid)"
+    rb"(?:[ \t]+[a-z]+){0,3}[ \t]+$",
+    re.IGNORECASE,
+)
 MAX_YARA_MATCH_INSTANCES_PER_RULE = 4_096
 MAX_YARA_RULE_FILES = 1_024
 MAX_YARA_RULE_DIRECTORY_ENTRIES = 10_000
@@ -637,6 +649,47 @@ def _has_local_destructive_autonomy_evidence(
     )
 
 
+def _accepted_builtin_ransomware_instances(
+    match: yara.Match,
+    instances: list[tuple[str, object]],
+    data: bytes,
+) -> list[tuple[str, object]]:
+    """Drop directly negated payment evidence from the bundled ransomware rule.
+
+    The bounded YARA expressions establish local payment and extortion context,
+    while this per-instance check distinguishes an affirmative demand from advice
+    such as ``Never pay the ransom in Bitcoin``. Custom rules are never filtered.
+    """
+    if match.namespace != _BUILTIN_RANSOMWARE_NAMESPACE or match.rule != _BUILTIN_RANSOMWARE_RULE:
+        return instances
+
+    accepted: list[tuple[str, object]] = []
+    for identifier, instance in instances:
+        if identifier not in _RANSOMWARE_PAYMENT_IDENTIFIERS:
+            accepted.append((identifier, instance))
+            continue
+
+        offset = max(0, int(getattr(instance, "offset", 0)))
+        matched_length = max(0, int(getattr(instance, "matched_length", 0)))
+        local_start = max(0, offset - 80)
+        local_end = min(len(data), offset + matched_length)
+        prefix = data[local_start:offset]
+        local_match = prefix + data[offset:local_end]
+        match_start = len(prefix)
+        payment_offsets = [
+            payment.start()
+            for payment in _RANSOMWARE_PAYMENT_VERB.finditer(local_match)
+            if payment.start() >= match_start
+        ]
+        if payment_offsets and all(
+            _DIRECT_RANSOMWARE_NEGATION.search(local_match[max(0, payment - 80) : payment])
+            for payment in payment_offsets
+        ):
+            continue
+        accepted.append((identifier, instance))
+    return accepted
+
+
 def _parse_meta(match: yara.Match) -> tuple[str, Severity, float, str | None]:
     """Extract rule_id, severity, confidence, and description from a YARA match's meta."""
     meta: dict[str, object] = match.meta or {}
@@ -757,6 +810,15 @@ def _match_file(
                 file_path,
             )
             continue
+        if not limited:
+            instances = _accepted_builtin_ransomware_instances(match, instances, data)
+            if not instances:
+                logger.debug(
+                    "%s: ignored directly negated ransomware payment in %s",
+                    ANALYZER_ID,
+                    file_path,
+                )
+                continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(instances)
         fingerprint_limit: _YaraFingerprintLimitError | None = None
