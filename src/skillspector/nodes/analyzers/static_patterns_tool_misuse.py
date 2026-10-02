@@ -212,7 +212,15 @@ TM1_CODE_PATTERNS = [
         0.85,
     ),
     (r"\bshutil\.rmtree\s*\(\s*['\"]\s*/", 0.85),
-    (r"(?:chmod|chown)\s+[^|]*(?:777|666|a\+rwx)", 0.8),
+    # A numeric chmod/chown mode is world-writable when the others-triple
+    # carries the write bit, i.e. its last digit is 2, 3, 6 or 7.  Matching the
+    # mode argument itself rather than a bare `777`/`666` substring also keeps a
+    # path or a trailing comment from being read as the mode (chmod 755 /tmp/6660
+    # is a chmod 755).  This owns the numeric forms that TM1 already owned for
+    # 777/666, plus the 646/757/0662 spellings the privilege-escalation rule used
+    # to catch as a side effect of matching 4/5/6/7 anywhere in the mode.
+    (r"(?:chmod|chown)\s+(?:--?[\w=-]*[ \t]+)*[\"']?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
     # Git force operations
     (r"git\s+push\s+[^|]*--force", 0.7),
     (r"git\s+reset\s+--hard", 0.65),
