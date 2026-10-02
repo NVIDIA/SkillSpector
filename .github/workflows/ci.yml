@@ -89,6 +89,8 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       - run: make install-dev
       - run: uv run skillspector --version
+      - name: Run issue 652 CLI and report integration tests
+        run: uv run pytest -m integration tests/integration/test_defensive_language_reporting.py
       - run: uv run make test-ci
 
   test-opencode:

@@ -50,6 +50,7 @@ from .common import (
     get_line_number,
 )
 from .pattern_defaults import PatternCategory
+from .prohibition_context import PROMPT_REVEAL_TAIL, is_directly_prohibited
 
 logger = get_logger(__name__)
 
@@ -757,6 +758,14 @@ def _analyze(
         for match in static_runner.iter_paragraph_matches(
             pattern, content, re.IGNORECASE | re.MULTILINE
         ):
+            if is_directly_prohibited(
+                content,
+                match.start(),
+                match.end(),
+                allowed_tail=PROMPT_REVEAL_TAIL,
+                allow_yara_continuation=source_view.name == "raw",
+            ):
+                continue
             if prepared.is_report_label(match, source_view):
                 continue
             if _is_benign_print_rules_taxonomy(content, match):
