@@ -233,21 +233,27 @@ _VARIATION_SELECTORS = {0xFE0E, 0xFE0F}
 # Each license fragment must FULLY match one anchored form below. The
 # substring check these replace let space-joined payloads through
 # ("Copyright ... <arbitrary instruction>" with no separators). The
-# holder is capped at six tokens ("NVIDIA CORPORATION & AFFILIATES" is
-# three); years are \d{1,4} because digit-masking collapses "2026" to
-# "0". One trailing period is allowed ("All rights reserved." is the
-# residual: a very short instruction fits the holder cap
-# ("Copyright 2026 Acme delete everything") — accepted per the
-# anchored-forms spec; the surrounding gates (danger signal first,
-# top-of-file, complete comment, 300 chars) still apply.
+# holder is capped at six name-like tokens and about 60 characters
+# ("NVIDIA CORPORATION & AFFILIATES" is three); fragments carrying a
+# standalone trigger word never exempt. One trailing period is
+# allowed ("All rights reserved."). Residual: a very short
+# triggerless instruction fits the holder cap ("Copyright 2026 Acme
+# delete everything") — accepted per the anchored-forms spec; the
+# surrounding gates (danger signal first, top-of-file, complete
+# comment, 300 chars) still apply.
 # Shared grammar cores: the year-range + holder cap and the SPDX
 # expression each appear in both a license-line form and a metadata
 # value form. One core per shape so the next cap change edits one place.
+# Name-like tokens carry letters, digits, and header punctuation only
+# (no colon, slash, or tilde) with at most one inner hyphen, so a
+# hyphen-, colon-, or slash-joined sentence never counts as tokens.
+_P2_NAME_TOKEN = r"[A-Za-z0-9&.,'()+]+(?:-[A-Za-z0-9&.,'()+]+)?"
 _P2_COPYRIGHT_CORE = (
-    r"(?:\(c\)\s+|©\s+)?\d{1,4}(?:\s*-\s*\d{1,4})?"
-    r"\s+(?:\S+\s+){0,5}\S+\.?"
+    r"(?=.{1,60}\Z)(?:\(c\)\s+|©\s+)?\d{1,4}(?:\s*-\s*\d{1,4})?"
+    r"\s+(?:" + _P2_NAME_TOKEN + r"\s+){0,5}" + _P2_NAME_TOKEN + r"\.?"
 )
-_P2_SPDX_ATOM = r"[A-Za-z0-9.+\-]+(?:\s+(?:OR|AND|WITH)\s+[A-Za-z0-9.+\-]+)*"
+_P2_SPDX_ID = r"[A-Za-z0-9.+\-]{1,24}"
+_P2_SPDX_ATOM = _P2_SPDX_ID + r"(?:\s+(?:OR|AND|WITH)\s+" + _P2_SPDX_ID + r")*"
 _P2_LICENSE_LINE_RES = (
     re.compile(
         r"\ACopyright\s+" + _P2_COPYRIGHT_CORE + r"\Z",
@@ -259,7 +265,11 @@ _P2_LICENSE_LINE_RES = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\ALicensed under the\s+(?:\S+\s+){0,3}\S+\s+License"
+        r"\ALicensed under the\s+(?:"
+        + _P2_NAME_TOKEN
+        + r"\s+){0,2}"
+        + _P2_NAME_TOKEN
+        + r"\s+License"
         r"(?:, Version \d+\.\d+)?\.?\Z",
         re.IGNORECASE,
     ),
@@ -277,6 +287,14 @@ _P2_EXTERNAL_DEST = re.compile(
     re.IGNORECASE,
 )
 _P2_EXFIL_STANDALONE = re.compile(r"\bexfiltrat\w*\b", re.IGNORECASE)
+# Standalone instruction-ish words refuse the benign exemption when they
+# appear in a value or license fragment. Keys are never scanned (system
+# requirements, get started). Load-bearing for Title-Case prose, which
+# no name grammar can stop. Fail-closed FP shapes: send feedback, blog
+# post, operating system in values.
+_P2_TRIGGER_STANDALONE = re.compile(
+    r"\b(system|instructions?|ignore|post|get|send|transmit)\b", re.IGNORECASE
+)
 # Metadata keys observed in benign skill headers plus obvious header keys.
 # Matching is exact (case-insensitive): bare instruction words such as
 # system, instructions, or ignore are never here.
@@ -302,32 +320,42 @@ _P2_BENIGN_METADATA_KEYS = frozenset(
     }
 )
 _P2_METADATA_LINE = re.compile(r"\A([A-Za-z][\w\- ]{0,40}):\s+(\S.*)\Z")
-_P2_NUMERIC_MASK = re.compile(r"\d+")
-# Per-key metadata value grammars. The single generic value shape they
-# replace let any imperative instruction through once it contained a
-# digit, dot, slash, @, or hyphen. Each key now fullmatches its own
-# narrow form (years/dates survive digit-masking: "2026" becomes "0",
-# still matched by \d classes). A single sentence-final period is
-# stripped before validation ("contact: me@x.io."), anything else
-# fail-closed. Free-text keys (description/title/status/tags) accept a
-# single token only. Known residual: a bare package name ("requires:
-# send") parses as a package; single-word values carry no payload.
-_P2_VERSION_RE = re.compile(r"\Av?\d[\w.+\-]*\Z")
+# Per-key metadata value grammars. Token content is constrained as
+# well as token count: versions are semver-like (with a trailing + or *
+# for "3.10+"-style floors), SPDX atoms are bounded-length ids, names
+# are 1-4 capitalized tokens or an email, requires entries each carry
+# a version unless the value is one bare name (operators may follow
+# the name directly: "python>=3.10"), free-text keys take one short
+# hyphen-free word, and get-started paths need a dotted final segment
+# so slash-joined prose no longer fits. A standalone trigger word
+# (system, instruction(s), ignore, post, get, send, transmit) in any
+# value refuses exemption; keys are excluded since "system
+# requirements" and "get started" are keys. Known residuals: a bare
+# triggerless package name ("requires: numpy") parses as a package;
+# short triggerless SPDX OR-chains fit the atom cap.
+_P2_REQ_NAME = r"[A-Za-z0-9_.\-@/]+"
+_P2_REQ_VER = r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]{1,20})?[+*]?"
+_P2_REQ_OP = r"(?:>=|<=|==|!=|~=|\^|>|<|=|~)"
+_P2_REQ_VER_SUFFIX = r"(?:\s*" + _P2_REQ_OP + r"\s*" + _P2_REQ_VER + r"|\s+" + _P2_REQ_VER + r")"
+_P2_VERSION_RE = re.compile(r"\A" + _P2_REQ_VER + r"\Z")
 _P2_DATE_RE = re.compile(
     r"\A(?:\d{4}-\d{2}-\d{2}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?"
     r"|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?"
     r"|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4})\Z",
     re.IGNORECASE,
 )
-_P2_NAME_RE = re.compile(r"\A[A-Za-z][A-Za-z .'\-]{0,39}\Z")
+_P2_NAME_RE = re.compile(r"\A[A-Z][A-Za-z']*(?:\s+[A-Z][A-Za-z']*){0,3}\Z")
 _P2_EMAIL_RE = re.compile(r"\A[\w.+\-]+@[\w.\-]+\.[A-Za-z]{2,}\Z")
 _P2_SPDX_EXPR_RE = re.compile(r"\A" + _P2_SPDX_ATOM + r"\Z")
 _P2_REQUIREMENTS_RE = re.compile(
-    r"\A[A-Za-z0-9_.\-@/]+(?:\s+[<>=!~^*]*\d[\w.+\-*]*)?"
-    r"(?:\s*[,;]\s*[A-Za-z0-9_.\-@/]+(?:\s+[<>=!~^*]*\d[\w.+\-*]*)?)*\Z"
+    r"\A" + _P2_REQ_NAME + _P2_REQ_VER_SUFFIX + r"?"
+    r"(?:\s*[,;]\s*" + _P2_REQ_NAME + _P2_REQ_VER_SUFFIX + r")*\Z"
 )
-_P2_PATH_VALUE_RE = re.compile(r"\A(?=\S*[/.#:])\S{1,120}\Z")
-_P2_SINGLE_TOKEN_RE = re.compile(r"\A\S{1,40}\Z")
+_P2_PATH_VALUE_RE = re.compile(
+    r"\A(?=[\w\-./#:?]{1,80}\Z)(?:https?://[\w\-.~]+(?::\d+)?/)?"
+    r"(?:[\w\-]+/){0,3}[\w\-]+\.[\w]{1,10}(?:[#?]\S*)?\Z"
+)
+_P2_SINGLE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9.]{1,24}\Z")
 _P2_COPYRIGHT_VALUE_RE = re.compile(
     r"\A" + _P2_COPYRIGHT_CORE + r"\Z",
     re.IGNORECASE,
@@ -407,6 +435,8 @@ def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
 
 def _is_license_only_fragment(fragment: str) -> bool:
     """Return True when the fragment fully matches an anchored license-line form."""
+    if _P2_TRIGGER_STANDALONE.search(fragment) is not None:
+        return False
     return any(pattern.match(fragment) is not None for pattern in _P2_LICENSE_LINE_RES)
 
 
@@ -426,6 +456,8 @@ def _is_allowlisted_metadata_fragment(fragment: str) -> bool:
     value = match.group(2).strip()
     if len(value) > 1 and value.endswith("."):
         value = value[:-1]
+    if _P2_TRIGGER_STANDALONE.search(value) is not None:
+        return False
     if key in _P2_FREE_TEXT_KEYS:
         return _P2_SINGLE_TOKEN_RE.match(value) is not None
     validators = _P2_METADATA_VALUE_RES.get(key)
@@ -437,21 +469,29 @@ def _is_allowlisted_metadata_fragment(fragment: str) -> bool:
 def _is_benign_license_or_metadata_body(inner: str) -> bool:
     """Return True only when every fragment is license- or metadata-shaped.
 
-    Numbers are masked before sentence splitting so ``3.10`` does not
-    split into fragments. Only digits are masked (dots stay), so a
-    ``2.0.`` boundary still splits. Masking maps digits to ``0`` and
-    cannot create an allowlist hit.
+    Fragments are split and validated on the raw text: digit-masking
+    never affected split points (digits are not split characters), and
+    validating masked text broke real dates. An allowlisted key may
+    appear only once, so an instruction split across repeated keys
+    still fires.
     """
     body = inner.strip()
     if not body:
         return False
-    masked = _P2_NUMERIC_MASK.sub("0", body)
-    for fragment in re.split(r"[.!?]+\s+|\n|;", masked):
+    seen_keys: set[str] = set()
+    for fragment in re.split(r"[.!?]+\s+|\n|;", body):
         fragment = fragment.strip()
         if not fragment:
             continue
         if _is_license_only_fragment(fragment):
             continue
+        key_match = _P2_METADATA_LINE.match(fragment)
+        if key_match is not None:
+            key = key_match.group(1).lower()
+            if key in _P2_BENIGN_METADATA_KEYS:
+                if key in seen_keys:
+                    return False
+                seen_keys.add(key)
         if _is_allowlisted_metadata_fragment(fragment):
             continue
         return False
