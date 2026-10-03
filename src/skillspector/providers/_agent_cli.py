@@ -460,7 +460,8 @@ def _parse_gemini_output(raw: str) -> str:
 
 _OPENCODE_AGENT_PREFIX = "skillspector-deny-all"
 _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
-_OPENCODE_SUPPORTED_VERSION = "1.18.33"
+_OPENCODE_MIN_VERSION = (1, 18, 31)
+_OPENCODE_MAX_VERSION = (1, 18, 34)
 
 
 def _opencode_agent_name(argv: list[str]) -> str:
@@ -502,15 +503,30 @@ def _opencode_config(agent_name: str) -> str:
     )
 
 
-def _parse_opencode_version(raw: bytes) -> str | None:
-    """Parse an exact stable semantic version from ``opencode --version``."""
+def _parse_opencode_version(raw: bytes) -> tuple[int, int, int] | None:
+    """Parse a stable semantic version triple from ``opencode --version``.
+
+    Prereleases and unparsable output return ``None`` (fail closed).
+    """
     text = raw.decode("utf-8", errors="replace").strip()
     match = re.fullmatch(
-        r"(?:opencode(?:\s+version)?\s+)?v?(\d+\.\d+\.\d+)",
+        r"(?:opencode(?:\s+version)?\s+)?v?(\d+)\.(\d+)\.(\d+)",
         text,
         flags=re.IGNORECASE,
     )
-    return match.group(1) if match is not None else None
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _format_opencode_version(version: tuple[int, int, int]) -> str:
+    """Render a version triple for fail-closed error messages."""
+    return f"{version[0]}.{version[1]}.{version[2]}"
+
+
+def _is_supported_opencode_version(version: tuple[int, int, int] | None) -> bool:
+    """Return whether a parsed version is inside the verified range."""
+    return version is not None and _OPENCODE_MIN_VERSION <= version <= _OPENCODE_MAX_VERSION
 
 
 def _prepare_opencode_env(
@@ -632,11 +648,13 @@ def _preflight_opencode_policy(
 
     version_raw = run_probe([binary, "--version"], "version")
     version = _parse_opencode_version(version_raw)
-    if version != _OPENCODE_SUPPORTED_VERSION:
+    if not _is_supported_opencode_version(version):
         version_text = version_raw.decode("utf-8", errors="replace").strip()
         raise AgentCLIError(
-            "OpenCode security policy is verified only for version "
-            f"{_OPENCODE_SUPPORTED_VERSION}; found {version_text[:80]!r}"
+            "OpenCode security policy is verified only for versions "
+            f"{_format_opencode_version(_OPENCODE_MIN_VERSION)} through "
+            f"{_format_opencode_version(_OPENCODE_MAX_VERSION)}; found "
+            f"{version_text[:80]!r}"
         )
 
     agent_name = _opencode_agent_name(argv)
@@ -839,15 +857,15 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
                 timeout=15,
                 env=child_env,
             )
-            if (
-                version_result.returncode != 0
-                or _parse_opencode_version(version_result.stdout or b"")
-                != _OPENCODE_SUPPORTED_VERSION
+            if version_result.returncode != 0 or not _is_supported_opencode_version(
+                _parse_opencode_version(version_result.stdout or b"")
             ):
                 return (
                     False,
-                    "opencode_cli requires exactly OpenCode "
-                    f"{_OPENCODE_SUPPORTED_VERSION} for its verified deny-all policy",
+                    "opencode_cli requires OpenCode "
+                    f"{_format_opencode_version(_OPENCODE_MIN_VERSION)} through "
+                    f"{_format_opencode_version(_OPENCODE_MAX_VERSION)} "
+                    "for its verified deny-all policy",
                 )
             result = subprocess.run(
                 [binary, "auth", "list"],
