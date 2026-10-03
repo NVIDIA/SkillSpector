@@ -656,22 +656,37 @@ def scan(
                     "multi-skill scans; scan each sub-skill with its own baseline"
                 )
                 raise typer.Exit(code=2)
-            _scan_multi_skill(
-                detection,
-                format=format,
-                output=output,
-                no_llm=no_llm,
-                baseline=baseline,
-                show_suppressed=show_suppressed,
-                transitive_enabled=transitive_enabled,
-                transitive_depth=transitive_depth,
-                transitive_allow_prefix=transitive_allow_prefix,
-                transitive_deny_prefix=transitive_deny_prefix,
-                yara_dir=yara_dir,
-                verbose=verbose,
-                fail_on_incomplete=fail_on_incomplete,
-                fail_on_findings=fail_on_findings,
-            )
+            # Same error contract as the single-skill scan below: an error that
+            # escapes the combined report (e.g. an unwritable --output) exits 2,
+            # not with a traceback and exit 1, which means "risk found".
+            try:
+                _scan_multi_skill(
+                    detection,
+                    format=format,
+                    output=output,
+                    no_llm=no_llm,
+                    baseline=baseline,
+                    show_suppressed=show_suppressed,
+                    transitive_enabled=transitive_enabled,
+                    transitive_depth=transitive_depth,
+                    transitive_allow_prefix=transitive_allow_prefix,
+                    transitive_deny_prefix=transitive_deny_prefix,
+                    yara_dir=yara_dir,
+                    verbose=verbose,
+                    fail_on_incomplete=fail_on_incomplete,
+                    fail_on_findings=fail_on_findings,
+                )
+            except typer.Exit:
+                raise
+            except (FileNotFoundError, ValueError) as e:
+                err_console.print(f"[red]Error:[/red] {e}")
+                raise typer.Exit(code=2) from e
+            except Exception as e:
+                if verbose:
+                    err_console.print_exception()
+                else:
+                    err_console.print(f"[red]Error:[/red] {e}")
+                raise typer.Exit(code=2) from e
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
             discovery_console.print(
@@ -3212,7 +3227,9 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
-        findings = effective_findings(result)
+        # Fingerprint every occurrence the next scan checks. The reported
+        # findings are deduplicated and keep only one occurrence's evidence.
+        findings = result["active_findings"]
         data = build_baseline_dict(
             findings,
             reason=reason,

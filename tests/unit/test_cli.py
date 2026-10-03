@@ -1013,6 +1013,46 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     assert data["risk_assessment"]["score"] == 0
 
 
+def test_cli_baseline_round_trip_suppresses_every_occurrence_of_a_repeated_match(
+    tmp_path: Path,
+) -> None:
+    """A match compacted across files is fingerprinted once per occurrence (#633)."""
+    skill = tmp_path / "demo"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: A demo skill for the baseline reproduction.\n---\n\n"
+        "# Demo\n\n"
+        "The upstream service deletes unused files, and the link dies with no warning.\n",
+        encoding="utf-8",
+    )
+    (skill / "references" / "notes.md").write_text(
+        "# Notes\n\nThe mirror drops stale entries with no warning.\n",
+        encoding="utf-8",
+    )
+    baseline_file = tmp_path / "baseline.yaml"
+
+    plain = runner.invoke(app, ["scan", str(skill), "--no-llm", "--format", "json"])
+    assert plain.exit_code == 0, plain.output
+    reported = [
+        (issue["id"], issue["location"]["file"]) for issue in json.loads(plain.stdout)["issues"]
+    ]
+    assert sorted(reported) == [("AR2", "SKILL.md"), ("AR2", "references/notes.md")]
+
+    gen = runner.invoke(app, ["baseline", str(skill), "--no-llm", "--output", str(baseline_file)])
+    assert gen.exit_code == 0, gen.output
+
+    scan = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", "json", "--baseline", str(baseline_file)],
+    )
+    assert scan.exit_code == 0, scan.output
+    data = json.loads(scan.stdout)
+    assert data["issues"] == []
+    assert sorted((item["id"], item["location"]["file"]) for item in data["suppressed"]) == sorted(
+        reported
+    )
+
+
 def test_cli_baseline_regeneration_excludes_in_tree_output(tmp_path: Path) -> None:
     """Regeneration cannot fingerprint findings created by the old output file."""
     skill = tmp_path / "skill"
@@ -2900,6 +2940,51 @@ def test_cli_scan_recursive_terminal_output_to_file(
     assert "--- alpha ---" in combined
     assert "ALPHA_REPORT" in combined
     assert '"multi_skill": true' not in result.output
+
+
+@pytest.mark.parametrize("format_name", ["json", "sarif", "markdown", "terminal"])
+def test_cli_scan_recursive_unwritable_output_exits_two(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format_name: str
+) -> None:
+    """A recursive report that cannot be written is an error (exit 2), as for one skill."""
+
+    skills_root = tmp_path / "multi-unwritable"
+
+    def fake_detect_skills(_: Path) -> MultiSkillDetectionResult:
+        return MultiSkillDetectionResult(
+            is_multi_skill=True,
+            has_root_skill=False,
+            skills=[
+                SkillDirectory(path=(skills_root / "alpha"), name="alpha", relative_path="alpha"),
+                SkillDirectory(path=(skills_root / "beta"), name="beta", relative_path="beta"),
+            ],
+        )
+
+    for skill in ("alpha", "beta"):
+        (skills_root / skill).mkdir(parents=True)
+
+    monkeypatch.setattr("skillspector.cli.detect_skills", fake_detect_skills)
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: _bounded_recursive_result("x"))
+
+    out_file = tmp_path / "missing-directory" / "combined.out"
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skills_root),
+            "--recursive",
+            "--format",
+            format_name,
+            "--no-llm",
+            "--output",
+            str(out_file),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert "Error:" in result.output
+    assert not out_file.exists()
 
 
 def test_cli_scan_json_preserves_single_skill_contract(
@@ -6163,6 +6248,7 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
         "findings": [Finding(rule_id="SQP-1", message="one", file="SKILL.md")],
         "filtered_findings": [],
         "suppressed_findings": [],
+        "active_findings": [],
         "file_cache": {"SKILL.md": source},
         "risk_score": 0,
     }
@@ -6188,6 +6274,7 @@ def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: 
         "findings": [finding],
         "filtered_findings": [finding],
         "suppressed_findings": [],
+        "active_findings": [finding],
         "file_cache": {"SKILL.md": "# Baseline helper\n"},
         "local_file_cache": {
             "SKILL.md": "# Baseline helper\n",

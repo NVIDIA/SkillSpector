@@ -47,6 +47,7 @@ _PNG_BIT_DEPTHS = {
 }
 _MAX_PASSIVE_PNG_CHUNKS = 4_096
 _MAX_REFERENCE_REASONS = 16
+_REFERENCE_CAVEAT_REASONS = (LedgerReason.REFERENCE_MISSING, LedgerReason.REFERENCE_UNRESOLVED)
 _REFERENCE_LIMIT_FIELDS = frozenset(
     f"{prefix}_{unit}"
     for prefix in ("observed", "limit")
@@ -531,6 +532,18 @@ def _reference_coverage_findings(
         else []
     )
     for event in ledger_events:
+        # Reference resolution records a mention of a path that the bundle does
+        # not carry, or that matches more than one bundled file, as a partial
+        # event on the file that contains the mention. Neither leaves bytes of
+        # that file uninspected. The completeness ledger still reports them;
+        # they must not turn a reference to that file (such as `SKILL.md`)
+        # into AE1.
+        if (
+            event.get("outcome") == LedgerOutcome.PARTIAL
+            and event.get("phase") == "reference_resolution"
+            and str(event.get("reason_code")) in _REFERENCE_CAVEAT_REASONS
+        ):
+            continue
         events_by_path.setdefault(str(event.get("path", "")), []).append(event)
     status_shape_complete, invalid_status_paths = _status_paths_with_incomplete_evidence(
         state.get("analyzer_status_events"), ledger_events

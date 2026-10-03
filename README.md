@@ -243,7 +243,7 @@ inference gateways.
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `copilot_cli` | _(none — uses local CLI auth)_ | local `copilot` 1.0.91 binary | local Copilot runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.32 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.33 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
 
 Structured output is requested through LangChain's `with_structured_output`,
 whose default forces a tool call. Some models reject a forced tool call with
@@ -651,7 +651,7 @@ Issues (2)
 
 > **CLI providers** (`claude_cli`, `codex_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active, except `copilot_cli` deliberately preserves only `COPILOT_GITHUB_TOKEN` (its documented headless auth) while dropping every other `COPILOT_*` and `GITHUB_COPILOT_*`. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
-> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.32`, the version whose configuration precedence and deny-all semantics are verified by this release.
+> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.33`, the version whose configuration precedence and deny-all semantics are verified by this release.
 >
 > `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.91`, the version whose tool-deny behavior is verified by this release.
 

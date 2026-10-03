@@ -1732,6 +1732,89 @@ def test_unresolved_primary_reference_blocks_complete_verdict(tmp_path: Path, ca
     assert result["risk_recommendation"] != "SAFE"
 
 
+@pytest.mark.parametrize(
+    ("primary", "mentions", "status", "reason"),
+    [
+        pytest.param(
+            "SKILL.md",
+            "Other skills keep templates under `templates/config.yaml`.\n"
+            "Keep `SKILL.md` under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="backticked-self-reference",
+        ),
+        pytest.param(
+            "SKILL.md",
+            "Other skills keep templates under `templates/config.yaml`.\n"
+            "Keep [this file](SKILL.md) under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="markdown-link-self-reference",
+        ),
+        pytest.param(
+            "SKILL.md",
+            "Other skills keep templates in [config](templates/config.yaml).\n"
+            "Keep `SKILL.md` under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="markdown-link-missing-target",
+        ),
+        pytest.param(
+            "skill.md",
+            "Other skills keep templates under `templates/config.yaml`.\n"
+            "Keep `skill.md` under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="lowercase-primary",
+        ),
+        pytest.param(
+            "SKILL.md",
+            "Edit `config.yaml` before running.\nKeep `SKILL.md` under 500 lines.\n",
+            "ambiguous",
+            "reference_unresolved",
+            id="ambiguous-reference",
+        ),
+    ],
+)
+def test_reference_caveat_does_not_turn_self_reference_into_ae1(
+    tmp_path: Path, primary: str, mentions: str, status: str, reason: str
+) -> None:
+    references = tmp_path / "references"
+    references.mkdir()
+    (references / "guide.md").write_text("# Guide\n\nPlain guide text.\n", encoding="utf-8")
+    if status == "ambiguous":
+        for subdirectory in ("a", "b"):
+            (tmp_path / subdirectory).mkdir()
+            (tmp_path / subdirectory / "config.yaml").write_text("mode: local\n", encoding="utf-8")
+    (tmp_path / primary).write_text(
+        f"# Skill\n\nRead [the guide](references/guide.md).\n{mentions}",
+        encoding="utf-8",
+    )
+
+    result = graph.invoke(
+        {
+            "input_path": str(tmp_path),
+            "output_format": "json",
+            "use_llm": False,
+        }
+    )
+
+    statuses = Counter(
+        (reference["status"], reference["target_path"])
+        for reference in result["artifact_references"]
+    )
+    assert statuses[("resolved", primary)] == 1
+    assert statuses[(status, None)] == 1
+    assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
+    # The unresolved mention is still reported as a completeness caveat.
+    assert [
+        (row["path"], row["reason_code"])
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+    ] == [(primary, reason)]
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["risk_recommendation"] == "CAUTION"
+
+
 @pytest.mark.asyncio
 async def test_unresolved_reference_caveat_does_not_block_mcp_install(tmp_path: Path) -> None:
     """A reference caveat hides no bytes, so it must not fail safe_to_install.
