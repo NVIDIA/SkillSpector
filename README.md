@@ -242,7 +242,22 @@ inference gateways.
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.31 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.33 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+
+Structured output is requested through LangChain's `with_structured_output`,
+whose default forces a tool call. Some models reject a forced tool call with
+HTTP 400 (`tool_choice: type "tool" and "any" are not supported for this
+model`). The `anthropic` and `anthropic_proxy` providers route those models
+(`claude-fable-5-1`, `claude-mythos-5-1`, or any registry entry with
+`structured_output: json_schema`) to the native JSON-schema response format.
+Bedrock has no JSON-schema output for them, so the `bedrock` provider leaves
+`toolChoice` at `auto`, asks for the tool call in the prompt, and retries a
+prose answer; it recognises the model from the model ID, a geo/global
+inference-profile ID, or a foundation-model / inference-profile ARN. An
+application-inference-profile ARN hides the model, so add that ARN to the
+registry (`SKILLSPECTOR_MODEL_REGISTRY`) with `tool_choice: auto`.
+`SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=json_schema|function_calling`
+overrides the method for any provider.
 
 ```bash
 # Stock OpenAI
@@ -635,7 +650,7 @@ Issues (2)
 
 > **CLI providers** (`claude_cli`, `codex_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
-> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.31`, the version whose configuration precedence and deny-all semantics are verified by this release.
+> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.33`, the version whose configuration precedence and deny-all semantics are verified by this release.
 
 ### CLI Options
 

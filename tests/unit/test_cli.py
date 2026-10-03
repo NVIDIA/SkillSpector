@@ -1013,6 +1013,46 @@ def test_cli_baseline_generate_then_scan_round_trip(tmp_path: Path) -> None:
     assert data["risk_assessment"]["score"] == 0
 
 
+def test_cli_baseline_round_trip_suppresses_every_occurrence_of_a_repeated_match(
+    tmp_path: Path,
+) -> None:
+    """A match compacted across files is fingerprinted once per occurrence (#633)."""
+    skill = tmp_path / "demo"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: A demo skill for the baseline reproduction.\n---\n\n"
+        "# Demo\n\n"
+        "The upstream service deletes unused files, and the link dies with no warning.\n",
+        encoding="utf-8",
+    )
+    (skill / "references" / "notes.md").write_text(
+        "# Notes\n\nThe mirror drops stale entries with no warning.\n",
+        encoding="utf-8",
+    )
+    baseline_file = tmp_path / "baseline.yaml"
+
+    plain = runner.invoke(app, ["scan", str(skill), "--no-llm", "--format", "json"])
+    assert plain.exit_code == 0, plain.output
+    reported = [
+        (issue["id"], issue["location"]["file"]) for issue in json.loads(plain.stdout)["issues"]
+    ]
+    assert sorted(reported) == [("AR2", "SKILL.md"), ("AR2", "references/notes.md")]
+
+    gen = runner.invoke(app, ["baseline", str(skill), "--no-llm", "--output", str(baseline_file)])
+    assert gen.exit_code == 0, gen.output
+
+    scan = runner.invoke(
+        app,
+        ["scan", str(skill), "--no-llm", "--format", "json", "--baseline", str(baseline_file)],
+    )
+    assert scan.exit_code == 0, scan.output
+    data = json.loads(scan.stdout)
+    assert data["issues"] == []
+    assert sorted((item["id"], item["location"]["file"]) for item in data["suppressed"]) == sorted(
+        reported
+    )
+
+
 def test_cli_baseline_regeneration_excludes_in_tree_output(tmp_path: Path) -> None:
     """Regeneration cannot fingerprint findings created by the old output file."""
     skill = tmp_path / "skill"
@@ -1855,6 +1895,131 @@ def test_recursive_markdown_report_character_limit_is_explicit(
     assert "Recursive Inspection Completeness" in body
     assert "recursive report character budget 1024 reached" in body
     assert len(body) <= 1_024
+
+
+def test_recursive_symlinked_skills_are_reported_as_omitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Symlinked skill directories surface as omitted, not complete coverage."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True,
+        skills=[skill],
+        limitations=(
+            MultiSkillDetectionLimitation(
+                reason_code="read_error",
+                resource="multi_skill_symlinked_entry",
+            ),
+        ),
+        omitted_symlink_entries=1,
+    )
+    output = tmp_path / "combined.json"
+    monkeypatch.setattr(
+        cli.graph,
+        "invoke",
+        lambda *_args, **_kwargs: _bounded_recursive_result("one", finding_count=0),
+    )
+
+    _scan_multi_skill(detection, FormatChoice.json, output, no_llm=True)
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["skills_scanned"] == 1
+    assert payload["skills_omitted"] == 1
+    assert payload["analysis_completeness"]["is_complete"] is False
+    assert payload["analysis_completeness"]["total_files"] == 2
+    assert payload["analysis_completeness"]["coverage_percent"] == 50.0
+    assert payload["analysis_completeness"]["entirely_uninspected_files"] == 1
+    assert payload["risk_recommendation"] == "CAUTION"
+    assert any(
+        "symlinked recursive skill(s) omitted" in limitation
+        for limitation in payload["analysis_completeness"]["limitations"]
+    )
+    assert not any(
+        "multi_skill_symlinked_entry limit reached" in limitation
+        for limitation in payload["analysis_completeness"]["limitations"]
+    )
+    assert payload["skills"][-1] == {
+        "omitted": True,
+        "omitted_count": 1,
+        "reason": "symlink_not_followed",
+    }
+
+
+def _symlink_only_root(tmp_path: Path, *, with_ignored_name: bool) -> Path:
+    """Build a root holding no real skill, only symlinked children."""
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "SKILL.md").write_text("---\nname: linked\n---\n# benign skill\n", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    try:
+        (root / "linked-skill").symlink_to(external, target_is_directory=True)
+        if with_ignored_name:
+            (root / "node_modules").symlink_to(external, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+    return root
+
+
+def test_recursive_symlink_only_root_fails_strict_gate(tmp_path: Path) -> None:
+    """Zero real children with one eligible link stays partial end to end.
+
+    The fallback dispatch bypasses `_scan_multi_skill`, so this covers the
+    CLI path the direct aggregate test cannot reach: incomplete JSON and a
+    failing `--fail-on-incomplete` gate with no findings to blame.
+    """
+    root = _symlink_only_root(tmp_path, with_ignored_name=False)
+    output = tmp_path / "report.json"
+
+    result = runner.invoke(
+        app,
+        ["scan", str(root), "--recursive", "--format", "json", "--no-llm", "-o", str(output)],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["analysis_completeness"]["is_complete"] is False
+    assert payload["analysis_completeness"]["status"] == "partial"
+
+    strict = runner.invoke(
+        app,
+        [
+            "scan",
+            str(root),
+            "--recursive",
+            "--format",
+            "json",
+            "--no-llm",
+            "-o",
+            str(tmp_path / "strict.json"),
+            "--fail-on-incomplete",
+        ],
+    )
+    assert strict.exit_code == 1
+
+
+def test_recursive_symlink_only_root_keeps_ignored_names_exempt(
+    tmp_path: Path,
+) -> None:
+    """An ignored-name link beside an eligible one adds no discovery gap."""
+    root = _symlink_only_root(tmp_path, with_ignored_name=True)
+    output = tmp_path / "report.json"
+
+    runner.invoke(
+        app,
+        ["scan", str(root), "--recursive", "--format", "json", "--no-llm", "-o", str(output)],
+    )
+
+    assert output.exists()
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["analysis_completeness"]["is_complete"] is False
+    discovery = [
+        event
+        for event in payload["analysis_completeness"]["ledger_exceptions"]
+        if event["phase"] == "multi_skill_discovery"
+    ]
+    assert len(discovery) == 1
+    assert discovery[0]["reason_code"] == "read_error"
 
 
 def test_recursive_json_bounds_the_final_serialized_document(
@@ -2775,6 +2940,51 @@ def test_cli_scan_recursive_terminal_output_to_file(
     assert "--- alpha ---" in combined
     assert "ALPHA_REPORT" in combined
     assert '"multi_skill": true' not in result.output
+
+
+@pytest.mark.parametrize("format_name", ["json", "sarif", "markdown", "terminal"])
+def test_cli_scan_recursive_unwritable_output_exits_two(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, format_name: str
+) -> None:
+    """A recursive report that cannot be written is an error (exit 2), as for one skill."""
+
+    skills_root = tmp_path / "multi-unwritable"
+
+    def fake_detect_skills(_: Path) -> MultiSkillDetectionResult:
+        return MultiSkillDetectionResult(
+            is_multi_skill=True,
+            has_root_skill=False,
+            skills=[
+                SkillDirectory(path=(skills_root / "alpha"), name="alpha", relative_path="alpha"),
+                SkillDirectory(path=(skills_root / "beta"), name="beta", relative_path="beta"),
+            ],
+        )
+
+    for skill in ("alpha", "beta"):
+        (skills_root / skill).mkdir(parents=True)
+
+    monkeypatch.setattr("skillspector.cli.detect_skills", fake_detect_skills)
+    monkeypatch.setattr(cli, "_scan_skill", lambda *args, **kwargs: _bounded_recursive_result("x"))
+
+    out_file = tmp_path / "missing-directory" / "combined.out"
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(skills_root),
+            "--recursive",
+            "--format",
+            format_name,
+            "--no-llm",
+            "--output",
+            str(out_file),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert "Error:" in result.output
+    assert not out_file.exists()
 
 
 def test_cli_scan_json_preserves_single_skill_contract(
@@ -6038,6 +6248,7 @@ def test_cli_baseline_command_excludes_filtered_out_findings(tmp_path: Path) -> 
         "findings": [Finding(rule_id="SQP-1", message="one", file="SKILL.md")],
         "filtered_findings": [],
         "suppressed_findings": [],
+        "active_findings": [],
         "file_cache": {"SKILL.md": source},
         "risk_score": 0,
     }
@@ -6063,6 +6274,7 @@ def test_cli_baseline_uses_local_cache_for_provider_excluded_findings(tmp_path: 
         "findings": [finding],
         "filtered_findings": [finding],
         "suppressed_findings": [],
+        "active_findings": [finding],
         "file_cache": {"SKILL.md": "# Baseline helper\n"},
         "local_file_cache": {
             "SKILL.md": "# Baseline helper\n",

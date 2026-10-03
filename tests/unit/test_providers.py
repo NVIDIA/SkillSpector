@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
@@ -351,13 +352,133 @@ class TestOpenAIProvider:
             "gpt-5.6-sol",
             "gpt-5.6",
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
         ):
             assert provider.get_context_length(model) == 1_050_000
             assert provider.get_max_output_tokens(model) == 128_000
 
+    def test_each_model_is_mapped_once(self) -> None:
+        """Every bundled registry maps each model ID exactly once.
+
+        ``yaml.safe_load`` collapses a repeated key to its last mapping,
+        so value-only lookup assertions stay green while the resolved
+        budget becomes loader-dependent. Reading keys via ``yaml.compose``
+        catches the duplication that lookup loops cannot.
+        """
+        root = Path(__file__).resolve().parents[2]
+        registries = [
+            root / "model_registry.yaml",
+            *root.glob("src/skillspector/providers/*/model_registry.yaml"),
+        ]
+        assert registries, "expected at least one bundled model registry"
+        for registry_path in registries:
+            doc = yaml.compose(registry_path.read_text(encoding="utf-8"))
+            models = next(v for k, v in doc.value if k.value == "models")
+            keys = [k.value for k, v in models.value]
+            assert len(keys) == len(set(keys)), (
+                f"{registry_path.name} maps {[k for k in keys if keys.count(k) > 1]} twice"
+            )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ROOT_MODEL_REGISTRY = REPO_ROOT / "model_registry.yaml"
+MODEL_REGISTRIES = sorted(
+    [ROOT_MODEL_REGISTRY]
+    + list((REPO_ROOT / "src" / "skillspector" / "providers").glob("*/model_registry.yaml"))
+)
+
+
+def _model_keys_as_written(registry_path: Path) -> list[str]:
+    """Return the ``models`` keys in document order, duplicates included.
+
+    ``yaml.safe_load`` keeps only the last of a repeated key, so asserting on
+    resolved budgets cannot see a model that was mapped twice. Composing the
+    node tree preserves every key exactly as the file spells it.
+    """
+    document = yaml.compose(registry_path.read_text(encoding="utf-8"))
+    for key_node, value_node in document.value:
+        if key_node.value == "models":
+            return [key.value for key, _ in value_node.value]
+    raise AssertionError(f"{registry_path} has no top-level 'models' mapping")
+
+
+class TestModelRegistryFiles:
+    """Integrity of the shipped YAML registries themselves."""
+
+    def test_registries_are_discovered(self) -> None:
+        # Guards the glob: an empty list would make the checks below vacuous.
+        assert ROOT_MODEL_REGISTRY in MODEL_REGISTRIES
+        assert len(MODEL_REGISTRIES) > 1
+
+    @pytest.mark.parametrize(
+        "registry_path",
+        MODEL_REGISTRIES,
+        ids=lambda path: path.relative_to(REPO_ROOT).as_posix(),
+    )
+    def test_each_model_is_mapped_once(self, registry_path: Path) -> None:
+        # Loaders disagree on duplicate keys — most keep the last mapping,
+        # strict ones reject the document — so mapping one model twice makes
+        # the resolved budget loader-dependent and lets the copies drift apart
+        # while value-only assertions stay green.
+        keys = _model_keys_as_written(registry_path)
+        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        assert not duplicates, f"{registry_path} maps these models more than once: {duplicates}"
+
+    def test_root_registry_replaces_bundled_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The repo-root file is the documented SKILLSPECTOR_MODEL_REGISTRY sample."""
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(ROOT_MODEL_REGISTRY))
+        provider = OpenAIProvider()
+
+        # Gateway-prefixed ids that only the root registry carries.
+        assert provider.get_context_length("openai/openai/gpt-5.3-chat") == 128_000
+        assert provider.get_max_output_tokens("openai/openai/gpt-5.3-chat") == 16_384
+        assert provider.get_context_length("azure/anthropic/claude-sonnet-4-6") == 1_000_000
+
+        # Budgets the root registry must keep in step with the bundled YAML,
+        # since an override replaces that file instead of merging with it.
+        assert provider.get_context_length("gpt-5.6-sol") == 1_050_000
+        assert provider.get_max_output_tokens("gpt-5.6-sol") == 128_000
+
+        # Same replacement rule from the other side: a bundled-only model has
+        # no budget at all while the override is in force.
+        assert provider.get_context_length("gpt-6-astra") is None
+
 
 class TestAnthropicProvider:
     """Anthropic provider — Claude credentials + bundled YAML metadata."""
+
+    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5-1"])
+    def test_structured_output_method_is_json_schema_for_registry_models(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize("model", ["claude-fable-5-1-20260901", "claude-mythos-5-1-preview"])
+    def test_structured_output_method_accepts_a_version_suffix(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) == "json_schema"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-fable-6",
+            "claude-mythos-5",
+            "gpt-5.4",
+        ],
+    )
+    def test_structured_output_method_is_default_elsewhere(self, model: str) -> None:
+        assert AnthropicProvider().structured_output_method(model) is None
+
+    @pytest.mark.parametrize(
+        "model", ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-4-8"]
+    )
+    def test_current_generation_models_carry_token_limits(self, model: str) -> None:
+        provider = AnthropicProvider()
+        assert provider.get_context_length(model) == 1_000_000
+        assert provider.get_max_output_tokens(model) == 128_000
 
     def test_returns_none_without_env_var(self) -> None:
         assert AnthropicProvider().resolve_credentials() is None

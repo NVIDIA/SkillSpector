@@ -128,6 +128,32 @@ class TestDetectSkills:
         names = {s.name for s in result.skills}
         assert names == {"weather-lookup", "email-sender", "file-manager"}
 
+    def test_skill_name_extracted_from_bom_prefixed_frontmatter(self, tmp_path: Path) -> None:
+        """A BOM-prefixed sub-skill resolves to its declared `name:`, not the directory name.
+
+        Regression guard: `_extract_skill_name` sniffs raw bytes for a leading
+        `b"---"` before decoding. A UTF-8 BOM (`b"\\xef\\xbb\\xbf"`) in front of that
+        delimiter used to defeat the sniff and silently fall back to `skill_dir.name`
+        instead of the frontmatter's declared name.
+        """
+        clean_dir = tmp_path / "clean-skill"
+        clean_dir.mkdir()
+        (clean_dir / "SKILL.md").write_bytes(
+            b"---\nname: clean-declared-name\ndescription: no BOM\n---\n# Clean\n"
+        )
+
+        bom_dir = tmp_path / "bom-dir-name"
+        bom_dir.mkdir()
+        (bom_dir / "SKILL.md").write_bytes(
+            b"\xef\xbb\xbf---\nname: bom-declared-name\ndescription: has a BOM\n---\n# BOM\n"
+        )
+
+        result = detect_skills(tmp_path)
+
+        names = {s.relative_path: s.name for s in result.skills}
+        assert names["clean-skill"] == "clean-declared-name"
+        assert names["bom-dir-name"] == "bom-declared-name"
+
     def test_structured_skill_subdir_detected(self, tmp_path: Path) -> None:
         """An immediate subdirectory with a valid AISOP/AISP bundle is detected."""
         sub = tmp_path / "workflow-bundle"
@@ -315,9 +341,10 @@ class TestDetectSkills:
             "skill-b",
         }
         assert [skill.local_only for skill in result.skills] == [True, False, False]
+        assert result.omitted_symlink_entries == 1
 
-    def test_symlinked_skill_directory_is_skipped(self, tmp_path: Path) -> None:
-        """Detection must not read a skill manifest through a directory symlink."""
+    def test_symlinked_skill_directory_marks_discovery_incomplete(self, tmp_path: Path) -> None:
+        """Detection must not silently claim complete coverage through a directory symlink."""
         for name in ("skill-a", "skill-b"):
             sub = tmp_path / name
             sub.mkdir()
@@ -334,6 +361,117 @@ class TestDetectSkills:
 
         assert result.is_multi_skill is True
         assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.complete is False
+        assert result.limitations[0].reason_code == "read_error"
+        assert result.limitations[0].resource == "multi_skill_symlinked_entry"
+        assert result.omitted_symlink_entries == 1
+
+    def test_ignored_name_symlinks_do_not_mark_discovery_incomplete(self, tmp_path: Path) -> None:
+        """Symlinks with intentionally ignored names are skipped, not recorded.
+
+        Closes rng1995 review on #499: a symlinked `.git`, `.venv`, or
+        `node_modules` must not make an otherwise complete scan incomplete,
+        while a genuinely eligible symlinked child still records the
+        `multi_skill_symlinked_entry` limitation.
+        """
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        external = tmp_path.parent / f"{tmp_path.name}-external-skill-499"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+        try:
+            for ignored in (".git", ".venv", "node_modules"):
+                (tmp_path / ignored).symlink_to(external, target_is_directory=True)
+            (tmp_path / "linked-skill").symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert [lim.resource for lim in result.limitations] == ["multi_skill_symlinked_entry"]
+
+        ignored_only = tmp_path / "ignored-only"
+        ignored_only.mkdir()
+        for name in ("skill-c", "skill-d"):
+            sub = ignored_only / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        try:
+            for ignored in (".git", "node_modules"):
+                (ignored_only / ignored).symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(ignored_only)
+
+        assert result.complete is True
+        assert result.limitations == ()
+        assert {skill.name for skill in result.skills} == {"skill-c", "skill-d"}
+
+    def test_eligible_dot_prefixed_symlink_is_not_silently_excluded(self, tmp_path: Path) -> None:
+        """An eligible dot-prefixed symlinked skill is recorded, not skipped.
+
+        Closes rng1995 review on #499: a symlinked `.review-helper` is an
+        eligible local-only skill name, so it must record the
+        `multi_skill_symlinked_entry` limitation instead of being silently
+        excluded by the blanket dot-name exemption. The genuinely ignored
+        `.git` symlink alongside it is still skipped per the `_SKIP_DIRS`
+        policy and contributes no limitation of its own.
+        """
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        review_helper_target = tmp_path.parent / f"{tmp_path.name}-review-helper-499"
+        review_helper_target.mkdir()
+        (review_helper_target / "SKILL.md").write_text(
+            "---\nname: review-helper\n---\n", encoding="utf-8"
+        )
+        git_target = tmp_path.parent / f"{tmp_path.name}-git-target-499"
+        git_target.mkdir()
+        (git_target / "SKILL.md").write_text("---\nname: ignored\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / ".review-helper").symlink_to(review_helper_target, target_is_directory=True)
+            (tmp_path / ".git").symlink_to(git_target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.complete is False
+        assert [lim.resource for lim in result.limitations] == ["multi_skill_symlinked_entry"]
+        assert result.limitations[0].reason_code == "read_error"
+        assert result.omitted_symlink_entries == 1
+
+    def test_ignored_name_symlink_is_not_counted_as_omitted(self, tmp_path: Path) -> None:
+        """An ignored-name symlink does not inflate the omission count."""
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        ignored_target = tmp_path.parent / f"{tmp_path.name}-ignored-target"
+        ignored_target.mkdir()
+        (ignored_target / "SKILL.md").write_text("---\nname: mod\n---\n", encoding="utf-8")
+        linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+        linked_target.mkdir()
+        (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / "node_modules").symlink_to(ignored_target, target_is_directory=True)
+            (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.omitted_symlink_entries == 1
 
     def test_symlinked_root_is_not_detected(self, tmp_path: Path) -> None:
         """Direct callers cannot use detection to inspect a symlinked root."""
