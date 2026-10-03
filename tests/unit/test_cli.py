@@ -4402,6 +4402,7 @@ def test_scan_transitive_merges_current_effective_finding_ids(monkeypatch) -> No
         "findings": [direct],
         "filtered_findings": [direct],
         "effective_finding_ids": [direct.finding_id],
+        "meta_review_required": False,
         "components": ["SKILL.md"],
         "component_metadata": [
             {
@@ -4431,6 +4432,7 @@ def test_scan_transitive_merges_current_effective_finding_ids(monkeypatch) -> No
             "findings": [child],
             "filtered_findings": [child],
             "effective_finding_ids": [child.finding_id],
+            "meta_review_required": True,
             "components": ["dep.py"],
             "component_metadata": [
                 {
@@ -4471,6 +4473,7 @@ def test_scan_transitive_merges_current_effective_finding_ids(monkeypatch) -> No
     ]
     assert child_output.finding_id != child.finding_id
     assert merged["transitive_finding_count"] == 1
+    assert merged["meta_review_required"] is True
 
 
 @pytest.mark.parametrize("output_format", list(cli.FormatChoice))
