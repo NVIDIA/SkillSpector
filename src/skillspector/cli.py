@@ -560,8 +560,8 @@ def scan(
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
-                                openai_compatible | claude_cli | codex_cli |
-                                copilot_cli | gemini_cli | opencode_cli. Defaults to the NVIDIA path
+                               openai_compatible | claude_cli | codex_cli |
+                               copilot_cli | gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
         SKILLSPECTOR_MODEL     Override the active provider's default

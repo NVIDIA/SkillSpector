@@ -241,7 +241,7 @@ inference gateways.
 | `openai_compatible` | `SKILLSPECTOR_COMPAT_API_KEY` + `SKILLSPECTOR_COMPAT_BASE_URL` | Any OpenAI-compatible endpoint | `llama-3.1-70b-versatile` |
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `copilot_cli` | _(none — uses local CLI auth)_ | local `copilot` 1.0.89 binary | local Copilot runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `copilot_cli` | _(none — uses local CLI auth)_ | local `copilot` 1.0.91 binary | local Copilot runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.32 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
 
@@ -649,11 +649,11 @@ Issues (2)
 | `SKILLSPECTOR_MODEL_REGISTRY` | Override the bundled per-provider YAML registry (`src/skillspector/providers/<provider>/model_registry.yaml`) with a custom path. | Optional |
 | `SKILLSPECTOR_LOG_LEVEL` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `WARNING`). | Optional |
 
-> **CLI providers** (`claude_cli`, `codex_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active, except `copilot_cli` deliberately preserves only `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` (its documented headless auth) while dropping every other `COPILOT_*`. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
+> **CLI providers** (`claude_cli`, `codex_cli`, `copilot_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active, except `copilot_cli` deliberately preserves only `COPILOT_GITHUB_TOKEN` (its documented headless auth) while dropping every other `COPILOT_*` and `GITHUB_COPILOT_*`. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
 > `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.32`, the version whose configuration precedence and deny-all semantics are verified by this release.
 >
-> `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.89`, the version whose tool-deny behavior is verified by this release.
+> `copilot_cli` currently fails closed unless the installed Copilot CLI version is exactly `1.0.91`, the version whose tool-deny behavior is verified by this release.
 
 ### CLI Options
 

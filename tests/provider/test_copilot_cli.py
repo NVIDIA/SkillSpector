@@ -27,11 +27,12 @@ Security invariants verified:
     argv.
   - Ambient instruction files, built-in MCP servers, and mid-scan CLI
     updates stay off (``--no-custom-instructions``,
-    ``--disable-builtin-mcps``); user and plugin
+    ``--disable-builtin-mcps``, ``--disallow-temp-dir``); user and plugin
     lifecycle hooks stay off via preflight refusal (audit rejects
-    ``installed-plugins/``, ``hooks/*.json``, inline ``hooks`` in
-    ``settings.json``, and any repo-level hook material in the temp
-    working dir before stdin moves).
+    ``installed-plugins/``, ``extensions/``, ``hooks/*.json``, inline
+    ``hooks`` in ``settings.json``, user ``mcp-config.json`` /
+    ``lsp-config.json`` with servers defined, and any repo-level hook
+    material in the temp working dir before stdin moves).
   - Only the exactly verified Copilot CLI version is accepted.
   - The auth probe (``copilot --version``) is cheap, non-inference, bounded,
     uses the scrubbed environment, and fail-closed.
@@ -73,11 +74,30 @@ from skillspector.providers.copilot_cli import CopilotCLIProvider
 COPILOT_BINARY = "/usr/bin/copilot"
 MODEL = "gpt-5.2"
 
-_VERSION_OK = b"GitHub Copilot CLI 1.0.89.\nRun 'copilot update' to check for updates.\n"
+_VERSION_OK = b"GitHub Copilot CLI 1.0.91.\nRun 'copilot update' to check for updates.\n"
 
 
 def _version_result(stdout: bytes = _VERSION_OK) -> SimpleNamespace:
     return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate every test from the contributor's real Copilot state.
+
+    The home audit inspects the real ``~/.copilot``,
+    ``~/.config/.copilot`` and ``~/.local/state/.copilot`` whenever the
+    corresponding env is unset, so tests must never inherit the
+    operator environment: on a contributor machine with Copilot
+    plugins or hooks installed, clean-default tests would otherwise
+    fail. Runs each test from its own temp working dir.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("COPILOT_HOME", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +209,7 @@ def test_hostile_prompt_roundtrips_byte_exact(prompt: str) -> None:
 
 class TestCopilotAuthCheck:
     def test_version_parses(self) -> None:
-        assert _parse_copilot_version(_VERSION_OK) == "1.0.89"
+        assert _parse_copilot_version(_VERSION_OK) == "1.0.91"
 
     def test_version_unparseable_returns_none(self) -> None:
         assert _parse_copilot_version(b"") is None
@@ -244,7 +264,7 @@ class TestCopilotAuthCheck:
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
         ok, reason = _copilot_auth_check(COPILOT_BINARY)
         assert ok is False
-        assert "1.0.89" in (reason or "")
+        assert "1.0.91" in (reason or "")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_probe_unparseable_version_is_fail_closed(self, mock_run: MagicMock) -> None:
@@ -269,13 +289,13 @@ class TestPreflightCopilotPolicy:
     def test_synthetic_future_version_rejected_before_stdin(self, mock_run: MagicMock) -> None:
         # The reviewer's repro: a 9.9.99 binary must never receive scan content.
         mock_run.return_value = _version_result(b"GitHub Copilot CLI 9.9.99.\n")
-        with pytest.raises(AgentCLIError, match="1.0.89"):
+        with pytest.raises(AgentCLIError, match="1.0.91"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {"PATH": "/bin"}, "/tmp")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
     def test_nonzero_exit_rejected(self, mock_run: MagicMock) -> None:
         mock_run.return_value = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
-        with pytest.raises(AgentCLIError, match="preflight|1.0.89"):
+        with pytest.raises(AgentCLIError, match="preflight|1.0.91"):
             _preflight_copilot_policy(COPILOT_BINARY, ["copilot"], {}, "/tmp")
 
     @patch("skillspector.providers._agent_cli.subprocess.run")
@@ -289,8 +309,10 @@ class TestPreflightCopilotPolicy:
         self, mock_run: MagicMock, tmp_path: Path
     ) -> None:
         mock_run.return_value = _version_result()
-        # The home must exist: an explicitly set but missing COPILOT_HOME
-        # is unverifiable and refused (see TestAuditCopilotHome).
+        # An explicitly set but missing COPILOT_HOME holds nothing: the
+        # audit covers the default tree below instead (see
+        # TestAuditCopilotHome). The home exists here to keep this
+        # test focused on the subprocess plumbing, not the fallback.
         home = tmp_path / "home"
         home.mkdir()
         child = {"PATH": "/bin", "COPILOT_HOME": str(home)}
@@ -559,9 +581,10 @@ class TestAuditCopilotHome:
 
     def test_xdg_state_plugins_raise(self, tmp_path: Path) -> None:
         # Startup migrates $XDG_STATE_HOME/.copilot/installed-plugins
-        # into the home (1.0.89: hvn/mvn over juo, which still lists
-        # installed-plugins): a plugin-free COPILOT_HOME with plugin
-        # material in the STATE source must still refuse.
+        # into the home (verified in the 1.0.91 release source: the
+        # STATE migration set still lists installed-plugins): a
+        # plugin-free COPILOT_HOME with plugin material in the STATE
+        # source must still refuse.
         home = tmp_path / "home"
         home.mkdir()
         plugins = tmp_path / "xdg-state" / ".copilot" / "installed-plugins" / "evil"
@@ -617,6 +640,81 @@ class TestAuditCopilotHome:
             {"COPILOT_HOME": str(home), "XDG_STATE_HOME": str(tmp_path / "xdg-state")}
         )
 
+    def test_extensions_dir_raises(self, tmp_path: Path) -> None:
+        # Personal extensions fork Node.js processes with hook callbacks
+        # outside --available-tools: a non-empty extensions/ refuses like
+        # installed-plugins/, even with no hooks anywhere.
+        home = tmp_path / "home"
+        ext = home / "extensions" / "evil"
+        ext.mkdir(parents=True)
+        (ext / "extension.mjs").write_text("export {};", encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="extension"):
+            _audit_copilot_home({"COPILOT_HOME": str(home)})
+
+    def test_extensions_default_location_audited(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.delenv("COPILOT_HOME", raising=False)
+        ext = home / ".copilot" / "extensions" / "evil"
+        ext.mkdir(parents=True)
+        (ext / "extension.mjs").write_text("export {};", encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="extension"):
+            _audit_copilot_home({})
+
+    def test_extensions_xdg_source_raises(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        ext = tmp_path / "xdg-state" / ".copilot" / "extensions" / "evil"
+        ext.mkdir(parents=True)
+        (ext / "extension.mjs").write_text("export {};", encoding="utf-8")
+        with pytest.raises(AgentCLIError, match="extension"):
+            _audit_copilot_home(
+                {"COPILOT_HOME": str(home), "XDG_STATE_HOME": str(tmp_path / "xdg-state")}
+            )
+
+    def test_empty_extensions_dir_passes(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        (home / "extensions").mkdir(parents=True)
+        _audit_copilot_home({"COPILOT_HOME": str(home)})
+
+    @pytest.mark.parametrize(
+        ("filename", "content", "pattern"),
+        [
+            (
+                "mcp-config.json",
+                '{"mcpServers": {"gh": {"command": "mcp-server", "env": {"T": "x"}}}}',
+                "mcp-config",
+            ),
+            (
+                "lsp-config.json",
+                '{"servers": [{"command": "lsp-server"}]}',
+                "lsp-config",
+            ),
+        ],
+    )
+    def test_user_server_config_with_servers_raises(
+        self, tmp_path: Path, filename: str, content: str, pattern: str
+    ) -> None:
+        # User servers spawn local commands with env access outside
+        # --available-tools; only --disable-builtin-mcps is argv-denied.
+        # A config defining any server refuses, empty/missing passes.
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / filename).write_text(content, encoding="utf-8")
+        with pytest.raises(AgentCLIError, match=pattern):
+            _audit_copilot_home({"COPILOT_HOME": str(home)})
+
+    def test_empty_server_configs_pass(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "mcp-config.json").write_text("{}", encoding="utf-8")
+        (home / "lsp-config.json").write_text("[]", encoding="utf-8")
+        _audit_copilot_home({"COPILOT_HOME": str(home)})
+
     def test_defaults_to_dot_copilot(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         home = tmp_path / "home"
         (home / ".copilot" / "installed-plugins" / "evil").mkdir(parents=True)
@@ -639,6 +737,7 @@ class TestAuditTmpCwd:
         "rel",
         [
             ".github/hooks/evil.json",
+            ".github/extensions/evil.mjs",
             ".github/copilot/settings.json",
             ".github/copilot/settings.local.json",
             ".claude/settings.json",
@@ -743,13 +842,23 @@ class TestPrepareCopilotEnv:
     def test_preserves_token_vars_including_scrubbed_github_token(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # PIC decision implemented: only COPILOT_GITHUB_TOKEN is
+        # forwarded. GH_TOKEN/GITHUB_TOKEN stay dropped (a CI repo token
+        # must not reach an agent process reading untrusted content),
+        # and GITHUB_COPILOT_* prompt-mode opt-ins never reach the child.
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok-1")
         monkeypatch.setenv("GH_TOKEN", "tok-2")
         monkeypatch.setenv("GITHUB_TOKEN", "tok-3")
+        monkeypatch.setenv("GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS", "1")
+        monkeypatch.setenv("GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS", "1")
+        monkeypatch.setenv("GITHUB_COPILOT_AGENT_GITHUB_TOKEN", "tok-4")
         env = _prepare_copilot_env({}, "/tmp", ["copilot"])
         assert env["COPILOT_GITHUB_TOKEN"] == "tok-1"
-        assert env["GH_TOKEN"] == "tok-2"
-        assert env["GITHUB_TOKEN"] == "tok-3"
+        assert "GH_TOKEN" not in env
+        assert "GITHUB_TOKEN" not in env
+        assert "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS" not in env
+        assert "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS" not in env
+        assert "GITHUB_COPILOT_AGENT_GITHUB_TOKEN" not in env
 
     def test_empty_tokens_are_not_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "")
@@ -815,7 +924,7 @@ class TestHookHomeEndToEnd:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.89"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.91"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -894,8 +1003,8 @@ class TestHookHomeEndToEnd:
 
         COPILOT_HOME and the CONFIG source are clean; plugin material
         lives only in the inherited STATE tree that startup would
-        migrate into the home (1.0.89 confirms installed-plugins is
-        still migrated). Rejection must precede prompt delivery.
+        migrate into the home (verified in the 1.0.91 release source).
+        Rejection must precede prompt delivery.
         """
         home = tmp_path / "copilot-home"
         home.mkdir()
@@ -911,6 +1020,60 @@ class TestHookHomeEndToEnd:
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
         with pytest.raises(AgentCLIError, match="installed plugins"):
+            run_agent_cli("copilot", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_extensions_reject_before_prompt_delivery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Personal extensions reject even with a clean hook tree.
+
+        COPILOT_HOME carries no plugins, hooks, or inline settings, but
+        extensions/evil/extension.mjs would fork with scanner privileges
+        outside --available-tools. Rejection must precede delivery.
+        """
+        home = tmp_path / "copilot-home"
+        home.mkdir()
+        ext = home / "extensions" / "evil"
+        ext.mkdir(parents=True)
+        (ext / "extension.mjs").write_text("export {};", encoding="utf-8")
+        binary = tmp_path / "copilot"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_recording_copilot(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("COPILOT_HOME", str(home))
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="extension"):
+            run_agent_cli("copilot", "use every host tool", model="")
+        assert list(markers.iterdir()) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="test helper uses a POSIX shebang")
+    def test_user_mcp_config_rejects_before_prompt_delivery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """User MCP servers reject even with a clean hook tree.
+
+        COPILOT_HOME carries no plugins, hooks, or extensions, but
+        mcp-config.json defines a server that would spawn with env
+        access outside --available-tools.
+        """
+        home = tmp_path / "copilot-home"
+        home.mkdir()
+        (home / "mcp-config.json").write_text(
+            '{"mcpServers": {"gh": {"command": "mcp-server"}}}', encoding="utf-8"
+        )
+        binary = tmp_path / "copilot"
+        markers = tmp_path / "outside"
+        markers.mkdir()
+        self._write_recording_copilot(binary)
+        monkeypatch.setenv("ATTACK_MARKERS", str(markers))
+        monkeypatch.setenv("COPILOT_HOME", str(home))
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
+
+        with pytest.raises(AgentCLIError, match="mcp-config"):
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []
 
@@ -936,7 +1099,7 @@ class TestAdversarialTransport:
                 from pathlib import Path
 
                 if sys.argv[1:] == ["--version"]:
-                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.89"))
+                    print(os.environ.get("FAKE_COPILOT_VERSION", "1.0.91"))
                     raise SystemExit(0)
 
                 markers = Path(os.environ["ATTACK_MARKERS"])
@@ -1034,6 +1197,6 @@ class TestAdversarialTransport:
         monkeypatch.setenv("FAKE_COPILOT_VERSION", "9.9.99")
         monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: str(binary))
 
-        with pytest.raises(AgentCLIError, match="1.0.89"):
+        with pytest.raises(AgentCLIError, match="1.0.91"):
             run_agent_cli("copilot", "use every host tool", model="")
         assert list(markers.iterdir()) == []

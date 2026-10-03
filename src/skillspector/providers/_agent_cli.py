@@ -876,8 +876,13 @@ def _opencode_auth_check(binary: str) -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI invocation  (verified against copilot 1.0.89)
+# GitHub Copilot CLI invocation  (verified against copilot 1.0.91)
 # ---------------------------------------------------------------------------
+
+
+# Single pin both gates compare against, so a bump cannot update one
+# gate but not the other (mirrors _OPENCODE_SUPPORTED_VERSION).
+_COPILOT_SUPPORTED_VERSION = "1.0.91"
 
 
 def _parse_copilot_version(raw: bytes) -> str | None:
@@ -898,15 +903,17 @@ def _prepare_copilot_env(
 
     ``temp_root``/``argv`` are unused (CliSpec signature uniformity).
     Starts from the already-scrubbed base and applies an explicit allowlist
-    to ``COPILOT_*``: every such variable is dropped EXCEPT the three
-    documented token variables (``COPILOT_GITHUB_TOKEN``, ``GH_TOKEN``,
-    ``GITHUB_TOKEN`` — re-read from the operator environment because the
-    shared scrub strips ``GITHUB_TOKEN``) and ``COPILOT_HOME`` (a path, not
-    a policy control — and, as probed 2026-09-19, the CLI silently refuses
-    inference under ANY redirected home, even a byte-identical copy, so
-    home isolation is not a usable lever; argv-level deny rules take
-    precedence over anything a config file could add). The tokens are the
-    CLI's supported headless auth path and therefore work at inference
+    to ``COPILOT_*``: every such variable is dropped EXCEPT
+    ``COPILOT_GITHUB_TOKEN`` (re-read from the operator environment
+    because the shared scrub strips ``GITHUB_TOKEN``) and ``COPILOT_HOME``
+    (a path, not a policy control — and, as probed 2026-09-19, the CLI
+    silently refuses inference under ANY redirected home, even a
+    byte-identical copy, so home isolation is not a usable lever;
+    argv-level deny rules take precedence over anything a config file
+    could add). ``GITHUB_COPILOT_*`` prompt-mode opt-ins (extensions,
+    repo hooks, workspace MCP) are dropped outright: they reach past
+    the argv posture straight into CLI behavior. The token is the
+    CLI's supported headless auth path and therefore works at inference
     time. In particular ``COPILOT_ALLOW_ALL`` never reaches the child, so
     ambient shell config cannot re-enable tools; ``COPILOT_PROVIDER_*``
     cannot redirect inference to an arbitrary endpoint; and
@@ -922,13 +929,18 @@ def _prepare_copilot_env(
 
     User/plugin lifecycle hooks are handled NOT by home isolation (broken
     as above) but by the preflight audits: inference refuses to run
-    when hook material (``installed-plugins/``, ``hooks/*.json``,
-    inline ``hooks`` in ``settings.json``) is present under the resolved
-    copilot home, or when repo-level hook material appears in the fresh
-    temp working dir. No hook material on disk means no hooks load.
+    when hook material (``installed-plugins/``, ``extensions/``,
+    ``hooks/*.json``, inline ``hooks`` in ``settings.json``) is present
+    under the resolved copilot home, or when repo-level hook material
+    appears in the fresh temp working dir. No hook material on disk
+    means no hooks load.
     """
-    env = {key: value for key, value in base_env.items() if not key.upper().startswith("COPILOT_")}
-    for name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_HOME"):
+    env = {
+        key: value
+        for key, value in base_env.items()
+        if not key.upper().startswith("COPILOT_") and not key.upper().startswith("GITHUB_COPILOT_")
+    }
+    for name in ("COPILOT_GITHUB_TOKEN", "COPILOT_HOME"):
         value = os.environ.get(name, "").strip()
         if value:
             env[name] = value
@@ -942,7 +954,7 @@ def _prepare_copilot_env(
 def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build the argv list for a non-interactive ``copilot`` call.
 
-    Flags chosen (verified against Copilot CLI 1.0.89 ``--help``):
+    Flags chosen (verified against Copilot CLI 1.0.91 ``--help``):
 
     (no ``-p``)
         With no prompt flag, the prompt is piped to stdin by run_agent_cli —
@@ -968,7 +980,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 
     ``--disallow-temp-dir``
         Prevent automatic access to the system temporary directory
-        (verified live on 1.0.89: inference from a temp working dir
+        (verified live on 1.0.91: inference from a temp working dir
         still answers exactly).
 
     Deliberately NOT included:
@@ -977,6 +989,10 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
       generation instead of the newest install (probed 2026-09-23),
       which would brick the version pin; mid-scan drift is covered
       by the per-completion preflight instead.
+    - ``max_output_tokens`` — copilot has no token flag (accepted for
+      CliSpec uniformity and ignored, like codex/gemini).
+
+    ``--available-tools skillspector-no-tools``
 
     ``--available-tools skillspector-no-tools``
         Allowlist holding a fixed implausible name, so the model is offered
@@ -993,11 +1009,6 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
     ``--model <label>``
         Model in plain form (validated). Omitted by default so copilot uses
         the CLI default model (forwarded only when SKILLSPECTOR_MODEL is set).
-
-    Deliberately NOT included:
-    - ``--allow-all*`` / ``--yolo`` — auto-approve permissions (dangerous); never use them.
-    - ``max_output_tokens`` — copilot has no token flag (accepted for
-      CliSpec uniformity and ignored, like codex/gemini).
     """
     # --model omitted by default -> copilot uses the CLI default model
     # (forwarded only when SKILLSPECTOR_MODEL is set).
@@ -1020,7 +1031,7 @@ def _build_copilot_argv(binary: str, model: str, max_output_tokens: int = 0) -> 
 def _parse_copilot_output(raw: str) -> str:
     """Extract the assistant reply from ``copilot -s`` plain-text output.
 
-    Verified against Copilot CLI 1.0.89: ``-s`` emits only the response text.
+    Verified against Copilot CLI 1.0.91: ``-s`` emits only the response text.
     The whole stripped output is the reply; empty output raises fail-closed
     (an empty response must never be mistaken for a clean analysis).
     """
@@ -1037,16 +1048,16 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
     shared scrubbed environment (token re-injection is inference-only and
     version output does not depend on it), performs no inference, and
     completes well under 15s. Fail-closed: probe error/timeout, non-zero
-    exit, or a version other than the verified 1.0.89 all return
+    exit, or a version other than the verified 1.0.91 all return
     ``(False, reason)``.
 
     There is no status subcommand, so a passing probe means the binary runs
     the verified version — not proof of login. Authentication works two
     ways: the persistent login session (``copilot login``), validated by the
-    first inference call failing closed with the CLI's real error; or one of
-    ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``, which
-    ``_prepare_copilot_env`` deliberately preserves through the scrub while
-    dropping every other ``COPILOT_*`` variable.
+    first inference call failing closed with the CLI's real error; or
+    ``COPILOT_GITHUB_TOKEN``, which ``_prepare_copilot_env`` deliberately
+    preserves through the scrub while dropping every other ``COPILOT_*``
+    and ``GITHUB_COPILOT_*`` variable.
     """
     try:
         result = subprocess.run(
@@ -1064,10 +1075,11 @@ def _copilot_auth_check(binary: str) -> tuple[bool, str | None]:
             f"(exit {result.returncode}); check the binary, then `copilot login`"
         )
     version = _parse_copilot_version(result.stdout or b"")
-    if version != "1.0.89":
+    if version != _COPILOT_SUPPORTED_VERSION:
         version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         return False, (
-            "copilot_cli requires exactly GitHub Copilot CLI 1.0.89 "
+            "copilot_cli requires exactly GitHub Copilot CLI "
+            f"{_COPILOT_SUPPORTED_VERSION} "
             f"for its verified tool-deny policy; found {version_text[:80]!r}"
         )
     return True, None
@@ -1086,7 +1098,7 @@ def _preflight_copilot_policy(
        runtime. Re-verifies ``[binary, --version]`` under the isolated
        child env on EVERY completion. ``argv`` is unused (CliSpec
        signature uniformity). Fail-closed: probe error/timeout,
-       non-zero exit, or a version other than the verified 1.0.89 all
+       non-zero exit, or a version other than the verified 1.0.91 all
        raise before any prompt bytes move.
     2. Temp-dir tripwire: repo-level hook sources (``.github/hooks/``,
        repo settings) cannot exist in the fresh ``mkdtemp`` dir; any
@@ -1107,10 +1119,14 @@ def _preflight_copilot_policy(
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         raise AgentCLIError(f"copilot version preflight failed: {exc}") from exc
-    if result.returncode != 0 or _parse_copilot_version(result.stdout or b"") != "1.0.89":
+    if (
+        result.returncode != 0
+        or _parse_copilot_version(result.stdout or b"") != _COPILOT_SUPPORTED_VERSION
+    ):
         version_text = (result.stdout or b"").decode("utf-8", errors="replace").strip()
         raise AgentCLIError(
-            "copilot_cli requires exactly GitHub Copilot CLI 1.0.89 "
+            "copilot_cli requires exactly GitHub Copilot CLI "
+            f"{_COPILOT_SUPPORTED_VERSION} "
             f"for its verified tool-deny policy; found {version_text[:80]!r}"
         )
     _audit_copilot_home(child_env)
@@ -1127,7 +1143,7 @@ def _copilot_home(child_env: dict[str, str]) -> str:
 def _audit_copilot_home(child_env: dict[str, str]) -> None:
     """Refuse inference when user or plugin hook material is present.
 
-    The 1.0.89 CLI loads hooks from policy, user, project, then plugin
+    The 1.0.91 CLI loads hooks from policy, user, project, then plugin
     sources with no argv off-switch (verified: no ``--disable*hook*``
     flag in ``copilot --help``), and — as probed 2026-09-19 — silently
     refuses inference under ANY redirected home, so home isolation is
@@ -1149,13 +1165,24 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
       fallback. A missing default home passes (nothing exists to fall
       back to; missing auth fails later, also fail-closed).
 
+    Surfaces checked, per tree (home, default home, CONFIG explicit +
+    default, STATE explicit + default): user/plugin hooks
+    (``installed-plugins/``, ``hooks/*.json``, inline ``hooks``),
+    personal extensions (``extensions/``), user server configs
+    (``mcp-config.json``, ``lsp-config.json`` — any content beyond an
+    empty object/array refuses, since the schema is version-dependent
+    and any entry may spawn a command with env access). Machine-wide
+    policy hooks stay residual (admin-owned, unauditable); only
+    ``--disable-builtin-mcps`` is argv-denied, so user servers are
+    audited, never assumed off.
+
     Residual risk (documented, not auditable without administrator
     privileges): machine-wide
     policy hooks (``/etc/github-copilot/policy.d/``, ``C:\\ProgramData\\...``,
     HKLM registry) are admin-owned, immune to ``disableAllHooks``, and
     cannot be removed or disabled by this provider. Project-level sources
-    (``.github/hooks/``, repo settings) are covered by ``_audit_tmp_cwd``
-    over the fresh temp working dir.
+    (``.github/hooks/``, ``.github/extensions``, repo settings) are
+    covered by ``_audit_tmp_cwd`` over the fresh temp working dir.
     """
     seen: set[str] = set()
 
@@ -1165,6 +1192,7 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
             return
         seen.add(key)
         _audit_hook_tree(tree, kind)
+        _audit_server_configs(tree, kind)
 
     home = _copilot_home(child_env)
     consider(home, "copilot home")
@@ -1198,24 +1226,68 @@ def _audit_copilot_home(child_env: dict[str, str]) -> None:
     )
 
 
+def _nonempty_dir(path: str) -> bool:
+    """Return True when *path* exists and holds any entry (fail-closed on error)."""
+    try:
+        return any(os.scandir(path))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
+
+
+def _audit_server_configs(home: str, kind: str) -> None:
+    """Refuse inference when user server configs define any servers.
+
+    ``mcp-config.json`` / ``lsp-config.json`` entries spawn local
+    commands with environment access outside ``--available-tools``,
+    and only built-in MCP servers are argv-denied. The schema is
+    version-dependent, so anything beyond an empty object/array
+    refuses; missing or empty files pass. Messages name paths only.
+    """
+    for filename in ("mcp-config.json", "lsp-config.json"):
+        path = os.path.join(home, filename)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
+        try:
+            document = json.loads(raw) if raw.strip() else {}
+        except ValueError as exc:
+            raise AgentCLIError(
+                f"{kind} {filename} cannot be verified server-free: {path}"
+            ) from exc
+        if document not in ({}, []):
+            raise AgentCLIError(
+                f"{kind} {filename} defines user servers, which spawn "
+                f"commands with env access outside --available-tools: {path}"
+            )
+
+
 def _audit_hook_tree(home: str, kind: str) -> None:
     """Refuse inference when one hook tree carries hook material.
 
     ``kind`` names the tree in error messages (``copilot home`` or the
     XDG migration source). Checks ``installed-plugins/``,
-    ``hooks/*.json``, and an inline ``hooks`` block in
+    ``extensions/``, ``hooks/*.json``, and an inline ``hooks`` block in
     ``settings.json``; messages name paths only, never contents.
+    Personal extensions fork Node.js processes with hook callbacks
+    outside ``--available-tools``, so a non-empty ``extensions/``
+    refuses exactly like installed plugins.
     """
     plugins = os.path.join(home, "installed-plugins")
-    try:
-        has_plugins = any(os.scandir(plugins))
-    except FileNotFoundError:
-        has_plugins = False
-    except OSError as exc:
-        raise AgentCLIError(f"copilot home audit failed: {exc}") from exc
-    if has_plugins:
+    if _nonempty_dir(plugins):
         raise AgentCLIError(
             f"{kind} contains installed plugins, which may carry lifecycle hooks: {plugins}"
+        )
+    extensions = os.path.join(home, "extensions")
+    if _nonempty_dir(extensions):
+        raise AgentCLIError(
+            f"{kind} contains personal extensions, which fork with scanner "
+            f"privileges outside --available-tools: {extensions}"
         )
     hooks = os.path.join(home, "hooks")
     try:
@@ -1251,6 +1323,7 @@ def _audit_hook_tree(home: str, kind: str) -> None:
 
 _REPO_HOOK_PATHS = (
     ".github/hooks",
+    ".github/extensions",
     ".github/copilot/settings.json",
     ".github/copilot/settings.local.json",
     ".claude/settings.json",

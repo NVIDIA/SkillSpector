@@ -24,7 +24,7 @@ All behaviour is inherited from
 "copilot"-specific argv (``copilot -s --no-ask-user`` with an implausible
 ``--available-tools`` allowlist plus ``--deny-tool shell,write``;
 ``--no-custom-instructions``, ``--disable-builtin-mcps`` and
-``--no-auto-update``; never ``--allow-all*``), output parsing, and auth
+``--disallow-temp-dir``; never ``--allow-all*``), output parsing, and auth
 probe live in the :mod:`skillspector.providers._agent_cli` registry.
 """
 
