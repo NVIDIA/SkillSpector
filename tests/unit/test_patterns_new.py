@@ -2668,6 +2668,19 @@ class TestTriggerAnalysis:
     @pytest.mark.parametrize(
         "description",
         [
+            pytest.param("Use when the user opens ~/build", id="home_relative_path"),
+            pytest.param("Use when the user edits ~/deploy/config.yaml", id="home_path_dir"),
+        ],
+    )
+    def test_description_relative_path_not_shadow_command(self, description: str) -> None:
+        """#669: a home-relative path ("~/build") is not a slash command, so it
+        does not shadow the built-in it happens to contain."""
+        findings = sc_mod._analyze_triggers({"description": description}, "myskill")
+        assert not any(finding.rule_id == "TR2" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "description",
+        [
             pytest.param(
                 "Use when the user says /ask-matt or wants an ask answered by Matt.",
                 id="noun_ask_with_slash_skill",
@@ -2693,6 +2706,24 @@ class TestTriggerAnalysis:
             ),
             pytest.param("Overrides the git commit command", "commit", id="verb_object"),
             pytest.param("Shadows /help for every request", "help", id="verb_slash_object"),
+            pytest.param(
+                "Intercepts and replaces the built-in deploy command",
+                "deploy",
+                id="verb_then_conjunction",
+            ),
+            pytest.param(
+                "Overrides the default behavior of the git commit command",
+                "commit",
+                id="verb_distant_object",
+            ),
+            pytest.param(
+                "Intercepts every invocation of the deploy command",
+                "deploy",
+                id="verb_invocation_of",
+            ),
+            pytest.param(
+                "Invoked whenever the user types deploy", "deploy", id="verb_whenever_types"
+            ),
         ],
     )
     def test_description_shadow_command_object_still_tr2(
@@ -2740,6 +2771,21 @@ class TestTriggerAnalysis:
                 id="broad_preposition",
             ),
             pytest.param("Use this skill whenever the user asks about anything", id="no_qualifier"),
+            pytest.param(
+                "Use this skill whenever the user discusses anything with you",
+                id="pronoun_you",
+            ),
+            pytest.param(
+                "Use this skill whenever the user discusses anything with me", id="pronoun_me"
+            ),
+            pytest.param(
+                "Use this skill whenever the user asks anything related to any topic",
+                id="quantifier_any_topic",
+            ),
+            pytest.param(
+                "Use whenever the user sends any messages with any content",
+                id="quantifier_any_content",
+            ),
         ],
     )
     def test_description_unqualified_scope_still_tr3(self, description: str) -> None:
