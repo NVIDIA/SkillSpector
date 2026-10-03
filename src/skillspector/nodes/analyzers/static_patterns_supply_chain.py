@@ -1998,6 +1998,15 @@ def _sc4_from_osv_detailed(
                 f" — {len(vulns)} advisory(ies): {vuln_desc}"
             )
             matched_text = f"{pkg_name}=={pkg_version}"
+            explanation = (
+                "OSV returned vulnerability advisories matching the dependency's resolved "
+                "version. Review the matched advisories to assess their impact."
+            )
+            remediation = (
+                "Review the matched advisories in OSV (osv.dev) for affected and fixed releases. "
+                "If a fixed release is available, update to a release that addresses the "
+                "matched advisories; otherwise remove or replace the affected dependency."
+            )
         else:
             # No resolvable version: OSV was queried by name only, so these advisories are
             # NOT matched against the release that will actually be installed — they are the
@@ -2013,6 +2022,17 @@ def _sc4_from_osv_detailed(
                 " whether the installed release is affected"
             )
             matched_text = pkg_name
+            explanation = (
+                "OSV returned advisories for this package, but its resolved version is "
+                "unknown. A package-name lookup does not establish whether the installed "
+                "release is affected by those advisories."
+            )
+            remediation = (
+                "Determine the dependency's exact resolved version from the environment or "
+                "lockfile and compare it with the advisories in OSV (osv.dev). If it is "
+                "affected, use a verified fixed release or remove or replace the dependency "
+                "when no fix is available."
+            )
         findings.append(
             AnalyzerFinding(
                 rule_id="SC4",
@@ -2022,6 +2042,8 @@ def _sc4_from_osv_detailed(
                 confidence=confidence,
                 tags=tag,
                 matched_text=matched_text,
+                explanation=explanation,
+                remediation=remediation,
             )
         )
     limitations = (
@@ -2053,6 +2075,16 @@ def _sc4_from_fallback(
                         confidence=confidence,
                         tags=tag,
                         matched_text=pkg_name,
+                        explanation=(
+                            "The static fallback database identifies this package as vulnerable "
+                            "or malicious without a version threshold. This evidence does not "
+                            "identify an available fixed release."
+                        ),
+                        remediation=(
+                            "Review the cited advisory and remove or replace the affected "
+                            "dependency with a maintained alternative. Do not assume a version "
+                            "upgrade resolves the issue without verifying the advisory."
+                        ),
                     )
                 )
             elif pkg_version and _version_lt(pkg_version, max_safe):
@@ -2068,6 +2100,16 @@ def _sc4_from_fallback(
                         confidence=confidence,
                         tags=tag,
                         matched_text=f"{pkg_name}=={pkg_version}",
+                        explanation=(
+                            "The dependency's resolved version is below the fixed-version "
+                            "threshold recorded in the static fallback database. Review the "
+                            "cited advisory to confirm applicability."
+                        ),
+                        remediation=(
+                            f"Update the dependency to version {max_safe} or later, as recorded "
+                            "in the static fallback database, and verify the cited advisory "
+                            "and compatibility before installing."
+                        ),
                     )
                 )
     return findings
@@ -2252,6 +2294,18 @@ def _analyze_dependencies_detailed(
                     confidence=1.0,
                     tags=tag,
                     matched_text="SC4 fallback active",
+                    explanation=(
+                        "The live vulnerability lookup failed, and the limited static fallback "
+                        "database found no matching advisory. Vulnerability coverage is "
+                        "incomplete; this does not establish that the dependencies are "
+                        "vulnerable or safe."
+                    ),
+                    remediation=(
+                        "Retry the scan and verify dependency versions against current "
+                        "advisories before relying on the incomplete results. If the lookup "
+                        "timed out or the network was unavailable, check connectivity to "
+                        "api.osv.dev or adjust SKILLSPECTOR_OSV_TIMEOUT before retrying."
+                    ),
                 )
             ]
         )

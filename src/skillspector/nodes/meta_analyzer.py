@@ -397,8 +397,13 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                 if conf < 0.6:
                     continue
                 pattern_id = str(pattern_id)
-                explanation = (item.get("explanation") or "").strip() or get_explanation(pattern_id)
-                remediation = (item.get("remediation") or "").strip() or get_remediation(pattern_id)
+                explanation = (item.get("explanation") or "").strip()
+                remediation = (item.get("remediation") or "").strip()
+                # SC4 needs the matched finding's evidence-specific fallback, not
+                # a shared rule default (especially for coarse confirmations).
+                if pattern_id != "SC4":
+                    explanation = explanation or get_explanation(pattern_id)
+                    remediation = remediation or get_remediation(pattern_id)
                 file_path = item.get("_file", batch.file_path)
                 enrichment: _enrichment = (explanation, remediation, conf)
                 start_line = item.get("start_line")
@@ -448,6 +453,9 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                     )
                 )
                 continue
+            if f.rule_id == "SC4":
+                expl = expl or (f.explanation or "").strip() or get_explanation(f.rule_id)
+                rem = rem or (f.remediation or "").strip() or get_remediation(f.rule_id)
             result.append(
                 replace(
                     f,
