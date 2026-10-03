@@ -68,6 +68,7 @@ from skillspector.security_reconstruction import (
     build_declared_marker_views,
 )
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState, transitive_remaining_seconds
+from skillspector.surface import COMMENTS, infer_surface
 
 from .common import (
     LINE_BREAK_CHARS,
@@ -610,8 +611,15 @@ def _is_env_file_reference_in_docs(
 def analyzer_finding_to_finding(
     af: AnalyzerFinding,
     get_remediation_fn: Callable[[str], str] | None = None,
+    *,
+    line_text: str | None = None,
 ) -> Finding:
-    """Convert an AnalyzerFinding (from any analyzer) to graph-state Finding."""
+    """Convert an AnalyzerFinding (from any analyzer) to graph-state Finding.
+
+    ``line_text`` is the matched source line when the caller has it. It only
+    refines a ``code``/``config`` path into the ``comments`` surface, so callers
+    that cannot supply content still receive a path-derived classification.
+    """
     rem_fn = get_remediation_fn or get_remediation
     remediation = af.remediation or rem_fn(af.rule_id)
     category = (af.tags[0] if af.tags else None) or get_category(af.rule_id)
@@ -639,6 +647,7 @@ def analyzer_finding_to_finding(
         intent=None,
         evidence=dict(af.evidence),
         match_fingerprint=af.match_fingerprint,
+        surface=infer_surface(af.location.file, line_text),
     )
 
 
@@ -861,7 +870,18 @@ def _convert_analyzer_finding(
         for triage_tag in ("contextual-triage", "likely-benign-context"):
             if triage_tag not in af.tags:
                 af.tags.append(triage_tag)
-    return analyzer_finding_to_finding(af)
+    start_line = af.location.start_line
+    end_line = af.location.end_line or start_line
+    start_index = max(0, start_line - 1)
+    end_index = min(len(content_lines), end_line)
+    covered_lines = content_lines[start_index:end_index]
+    line_text = (
+        covered_lines[0]
+        if covered_lines
+        and all(infer_surface(path, line_text) == COMMENTS for line_text in covered_lines)
+        else None
+    )
+    return analyzer_finding_to_finding(af, line_text=line_text)
 
 
 def _scan_path(

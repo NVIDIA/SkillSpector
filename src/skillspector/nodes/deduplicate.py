@@ -11,6 +11,7 @@ from hashlib import sha256
 
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding
+from skillspector.surface import SURFACES, infer_surface
 
 logger = get_logger(__name__)
 
@@ -149,6 +150,23 @@ def _output_key(finding: Finding) -> tuple[object, ...]:
     )
 
 
+def _occurrence_surface(finding: Finding, occurrence: dict[str, object]) -> str:
+    """Return the surface label to record against one occurrence.
+
+    The finding's own label is reused when the occurrence sits in the finding's
+    file. An occurrence pointing at another file (exact-match dedup aggregates
+    across files) falls back to a path-only inference, because the matched line
+    for that other file is not retained here.
+    """
+    recorded_surface = occurrence.get("surface")
+    if isinstance(recorded_surface, str) and recorded_surface in SURFACES:
+        return recorded_surface
+    file = str(occurrence.get("file", finding.file))
+    if file == finding.file and finding.surface:
+        return finding.surface
+    return infer_surface(file)
+
+
 def deduplicate(findings: list[Finding]) -> list[Finding]:
     """Aggregate classification-equivalent exact matches while preserving occurrences."""
     groups: dict[tuple[str, str, str, tuple[object, ...]], list[Finding]] = {}
@@ -188,7 +206,7 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 str(occurrence.get("source_digest") or finding.source_digest or ""),
                 str(occurrence.get("source_url") or finding.source_url or ""),
                 _line(occurrence.get("transitive_depth"), finding.transitive_depth),
-            )
+            ): _occurrence_surface(finding, occurrence)
             for finding in group
             for occurrence in _occurrences(finding)
         }
@@ -203,6 +221,7 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 **({"source_digest": source_digest} if source_digest else {}),
                 **({"source_url": source_url} if source_url else {}),
                 **({"transitive_depth": transitive_depth} if transitive_depth else {}),
+                **({"surface": surface} if surface else {}),
             }
             for (
                 file,
@@ -214,18 +233,18 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
                 source_digest,
                 source_url,
                 transitive_depth,
-            ) in sorted(
-                occurrences,
+            ), surface in sorted(
+                occurrences.items(),
                 key=lambda item: (
-                    item[5],
-                    item[6],
-                    item[7],
-                    item[8],
-                    item[0],
-                    item[1],
-                    _line(item[2], item[1]),
-                    _line(item[3], -1),
-                    _line(item[4], -1),
+                    item[0][5],
+                    item[0][6],
+                    item[0][7],
+                    item[0][8],
+                    item[0][0],
+                    item[0][1],
+                    _line(item[0][2], item[0][1]),
+                    _line(item[0][3], -1),
+                    _line(item[0][4], -1),
                 ),
             )
         ]

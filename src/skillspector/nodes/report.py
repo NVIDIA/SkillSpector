@@ -253,10 +253,17 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
             start_column, end_column = _occurrence_columns(finding, occurrence)
             provenance = _occurrence_provenance(finding, occurrence)
             depth_value = provenance.get("transitive_depth")
+            occurrence_file = str(occurrence.get("file", finding.file))
+            recorded_surface = occurrence.get("surface")
+            occurrence_surface = (
+                str(recorded_surface)
+                if isinstance(recorded_surface, str) and recorded_surface
+                else (finding.surface if occurrence_file == finding.file else None)
+            )
             expanded.append(
                 replace(
                     finding,
-                    file=str(occurrence.get("file", finding.file)),
+                    file=occurrence_file,
                     start_line=start_line,
                     end_line=end_line,
                     start_column=start_column,
@@ -274,6 +281,10 @@ def _expand_occurrences(findings: list[Finding]) -> list[Finding]:
                     ),
                     transitive_depth=depth_value if isinstance(depth_value, int) else 0,
                     occurrences=[],
+                    # Prefer the occurrence's own recorded label. An occurrence
+                    # aggregated from another file keeps the surface that file's
+                    # finding carried; ``None`` falls back to a path-only label.
+                    surface=occurrence_surface,
                 )
             )
     return expanded
@@ -343,6 +354,12 @@ def _build_sarif_properties(
 ) -> dict[str, object] | None:
     """Project selected finding metadata into a SARIF properties dictionary."""
     finding_dict = finding.to_dict()
+    recorded_surface = (occurrence or {}).get("surface")
+    surface = (
+        str(recorded_surface)
+        if isinstance(recorded_surface, str) and recorded_surface
+        else finding_dict["surface"]
+    )
     metadata: dict[str, object] = {
         "findingId": finding.finding_id,
         "severity": finding_dict["severity"],
@@ -356,6 +373,7 @@ def _build_sarif_properties(
         "intent": finding_dict["intent"],
         "tags": finding_dict["tags"],
         "evidence": finding_dict["evidence"],
+        "surface": surface,
     }
     provenance = _occurrence_provenance(finding, occurrence)
     for key, sarif_key in (

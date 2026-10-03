@@ -702,7 +702,7 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
   "skill": { "name": "...", "source": "...", "scanned_at": "<ISO 8601>" },
   "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
-  "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 } } ],
+  "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 }, "surface": "code" } ],
   "metadata": {
     "has_executable_scripts": false,
     "skillspector_version": "...",
@@ -729,6 +729,10 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
 
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
+- `issues[].surface` and `suppressed[].surface` are advisory, heuristic labels for where a finding landed:
+  `code | instructions | docs | tests | comments | config`. Findings in compacted groups also expose a per-occurrence
+  `occurrences[].surface`; SARIF emits the label as `properties.surface` on each result occurrence. The label is
+  path/line-based and the scanned author can influence it, so do not use it as the sole suppression or security signal.
 - `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
 - AE1 findings use **Incomplete referenced artifact analysis**. Their source
   location identifies the reference; `evidence` identifies the affected target,
