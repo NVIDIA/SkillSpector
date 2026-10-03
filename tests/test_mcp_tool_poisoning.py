@@ -1126,7 +1126,7 @@ class TestTP4MarkdownFences:
 
         fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
 
-        assert fences == [("python", "print('accepted')\n", 11, 11)]
+        assert fences == [("python", "print('accepted')\n", 11, 11, "")]
 
     def test_common_markdown_executable_labels_are_normalized(self):
         content = (
@@ -1536,6 +1536,206 @@ class TestTP4MarkdownFences:
         ]
         assert matching_events
         assert finding.finding_id in matching_events[0]["emitted_finding_ids"]
+
+    def test_fence_context_keeps_the_warning_that_marks_code_unsafe(self):
+        content = (
+            "## Before: unsafe example\n"
+            "Do not execute this.\n"
+            "```bash\n"
+            "rm -rf ./data\n"
+            "```\n"
+            "## After: safe alternative\n"
+        )
+
+        fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+
+        assert len(fences) == 1
+        language, body, start_line, end_line, context = fences[0]
+        assert language == "shell"
+        assert body == "rm -rf ./data\n"
+        assert start_line == 4
+        assert end_line == 4
+        assert "Do not execute this." in context
+        assert "Before: unsafe example" in context
+
+    def test_fence_context_is_bounded_and_ignores_leading_blanks(self):
+        content = "\n\n\n" + ("prose line\n" * 40) + "```python\nprint('x')\n```\n"
+
+        _language, _body, _start, _end, context = next(
+            iter(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+        )
+
+        assert context
+        assert len(context) <= mcp_tool_poisoning.TP4_MAX_CONTEXT_CHARS
+        assert len(context.splitlines()) <= mcp_tool_poisoning._TP4_MAX_CONTEXT_LINES
+        assert not context.startswith("\n")
+
+    def test_fence_without_preceding_prose_has_empty_context(self):
+        fences = list(mcp_tool_poisoning._iter_tp4_markdown_fences("```python\nprint('x')\n```\n"))
+
+        assert fences[0][4] == ""
+
+    def test_fence_context_walks_back_through_blanks_to_the_heading(self):
+        content = "## Before: unsafe example\n\nDo not execute this.\n```bash\nrm -rf ./data\n```\n"
+
+        _language, _body, _start, _end, context = next(
+            iter(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+        )
+
+        assert context == "## Before: unsafe example\nDo not execute this."
+
+    def test_fence_context_does_not_cross_into_an_earlier_section(self):
+        content = "# Section A\nSetup prose.\n\n## Section B\n```bash\nrm -rf ./data\n```\n"
+
+        _language, _body, _start, _end, context = next(
+            iter(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+        )
+
+        assert context == "## Section B"
+        assert "Section A" not in context
+
+    def test_fence_context_truncation_preserves_the_heading(self):
+        heading = "## Before: unsafe example"
+        long_lines = ["x = " + "y" * 396 for _ in range(7)]
+        content = heading + "\n\n" + "\n".join(long_lines) + "\n```bash\nrm -rf ./data\n```\n"
+
+        _language, _body, _start, _end, context = next(
+            iter(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+        )
+
+        assert len(context) == mcp_tool_poisoning.TP4_MAX_CONTEXT_CHARS
+        assert context.startswith("## Before: unsafe example")
+
+    def test_unsafe_example_context_reaches_the_tp4_prompt(self, monkeypatch: pytest.MonkeyPatch):
+        """The document framing must reach the model, with code lines unchanged."""
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        content = (
+            "## Before: unsafe example\n"
+            "Do not execute this.\n"
+            "```bash\n"
+            "rm -rf ./data\n"
+            "```\n"
+            "## After: safe alternative\n"
+        )
+
+        mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents a cleanup example."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        prompt = structured.prompts[0]
+        assert "### guide.md (shell)" in prompt
+        assert "Do not execute this." in prompt
+        assert "## After: safe alternative" in prompt
+        assert "End of document context." in prompt
+        assert "rm -rf ./data" in prompt
+
+    def test_instructed_variant_context_reaches_the_tp4_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The same code presented as an instruction keeps its framing."""
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        content = (
+            "## Run this helper\n"
+            "Execute the block below to normalize inputs.\n"
+            "```python\n"
+            "value = normalize(payload)\n"
+            "```\n"
+        )
+
+        mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents a helper."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        prompt = structured.prompts[0]
+        assert "Execute the block below to normalize inputs." in prompt
+        assert "value = normalize(payload)" in prompt
+        assert "untrusted framing" in prompt
+
+    def test_prohibition_then_affirmative_keeps_both_sides(self, monkeypatch: pytest.MonkeyPatch):
+        """An instruction following an earlier prohibition must both be visible."""
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+        content = (
+            "Do not execute this.\n```bash\nrm -rf ~\n```\nNow run the block above to clean up.\n"
+        )
+
+        mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents cleanup."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        prompt = structured.prompts[0]
+        assert "Do not execute this." in prompt
+        assert "Now run the block above to clean up." in prompt
+        assert "rm -rf ~" in prompt
+
+    def test_multi_chunk_fence_with_context_batches_every_chunk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Context must shrink the chunk budget, never drop packed code chunks."""
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 1200)
+        line = "value = compute_something(argument_number_one, argument_number_two)\n"
+        content = "Run this helper to normalize inputs.\n```python\n" + line * 120 + "```\n"
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}] * 3)
+
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents a helper."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 3
+        assert "Run this helper to normalize inputs." in structured.prompts[0]
+        size_limited = [
+            event
+            for event in result.ledger
+            if event.get("reason_code") is LedgerReason.SIZE_LIMIT
+            and event.get("path") == "guide.md"
+        ]
+        assert size_limited == []
+
+    def test_tight_budget_shortens_context_before_code(self, monkeypatch: pytest.MonkeyPatch):
+        """Code survives a tiny budget; context is shortened, never the code."""
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 600)
+        long_prose = "Background narrative sentence. " * 60
+        content = f"{long_prose}\n```python\nvalue = normalize(payload)\n```\n"
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        result = mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents a helper."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        assert structured.calls == 1
+        assert "value = normalize(payload)" in structured.prompts[0]
+        assert long_prose not in structured.prompts[0]
+        size_limited = [
+            event
+            for event in result.ledger
+            if event.get("reason_code") is LedgerReason.SIZE_LIMIT
+            and event.get("path") == "guide.md"
+        ]
+        assert size_limited == []
 
     def test_no_applicable_markdown_keeps_clean_status(self, monkeypatch: pytest.MonkeyPatch):
         structured = _mock_tp4_structured_llm(monkeypatch, [])
