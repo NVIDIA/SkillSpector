@@ -22,7 +22,6 @@ hack tools) based on industry open-source patterns. Users can supply additional 
 
 from __future__ import annotations
 
-import ast
 import base64
 import binascii
 import hashlib
@@ -638,164 +637,6 @@ def _has_local_destructive_autonomy_evidence(
     )
 
 
-def _python_shell_streams_are_local_files(instances: list[tuple[str, object]], data: bytes) -> bool:
-    """Suppress only affirmative local-file redirects, never uncertain source.
-
-    YARA cannot correlate a fileno receiver with its Python binding. Parse only
-    small, straight-line Python inputs and retain candidates for dynamic syntax,
-    other reverse-shell alternatives, or exhausted inspection bounds. No code is
-    evaluated. Socket-backed and unknown receivers remain suspicious.
-    """
-    if not instances or len(instances) > 16 or len(data) > 8192:
-        return False
-    if any(identifier != "$python_socket" for identifier, _ in instances):
-        return False
-    try:
-        tree = ast.parse(data)
-    except (SyntaxError, ValueError, RecursionError):
-        return False
-    nodes = list(ast.walk(tree))
-    if len(nodes) > 1024 or any(
-        isinstance(
-            node,
-            (
-                ast.NamedExpr,
-                ast.Lambda,
-                ast.IfExp,
-                ast.ListComp,
-                ast.SetComp,
-                ast.DictComp,
-                ast.GeneratorExp,
-                ast.Await,
-                ast.Yield,
-                ast.YieldFrom,
-            ),
-        )
-        for node in nodes
-    ):
-        return False
-    spans = [
-        (int(instance.offset), int(instance.offset) + int(instance.matched_length))
-        for _, instance in instances
-    ]
-    line_starts = [0]
-    for line in data.splitlines(keepends=True):
-        line_starts.append(line_starts[-1] + len(line))
-    local_files: set[str] = set()
-    sockets: set[str] = set()
-    evidence: list[bool] = []
-
-    def is_open(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "open"
-            and 1 <= len(node.args) <= 2
-            and not node.keywords
-            and all(
-                isinstance(arg, ast.Constant) and isinstance(arg.value, str) for arg in node.args
-            )
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and not node.args[0].value.startswith(("/dev/", "/proc/"))
-        )
-
-    def is_local_fd(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "fileno"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in local_files
-        )
-
-    def inspect(statements: list[ast.stmt]) -> bool:
-        for statement in statements:
-            if isinstance(statement, ast.With):
-                for item in statement.items:
-                    if not is_open(item.context_expr) or not isinstance(
-                        item.optional_vars, ast.Name
-                    ):
-                        return False
-                    if item.optional_vars.id in {"open", "os", "socket", "subprocess"}:
-                        return False
-                    local_files.add(item.optional_vars.id)
-                    sockets.discard(item.optional_vars.id)
-                if not inspect(statement.body):
-                    return False
-                local_files.clear()
-                sockets.clear()
-                continue
-            if not isinstance(
-                statement, (ast.Import, ast.ImportFrom, ast.Expr, ast.Assign, ast.Pass)
-            ):
-                return False
-            if isinstance(statement, ast.ImportFrom):
-                return False
-            if isinstance(statement, ast.Import) and any(
-                alias.asname is not None or alias.name not in {"os", "socket", "subprocess"}
-                for alias in statement.names
-            ):
-                return False
-            for call in ast.walk(statement):
-                if not isinstance(call, ast.Call):
-                    continue
-                # exec/eval, reflective calls, or arbitrary helpers can change
-                # a tracked binding; do not use stale local-file evidence.
-                if isinstance(call.func, ast.Name):
-                    if call.func.id != "open":
-                        return False
-                    continue
-                if not isinstance(call.func, ast.Attribute) or not isinstance(
-                    call.func.value, ast.Name
-                ):
-                    return False
-                receiver = call.func.value.id
-                method = call.func.attr
-                if not (
-                    (receiver == "socket" and method == "socket")
-                    or (receiver == "os" and method == "dup2")
-                    or (receiver == "subprocess" and method in {"call", "Popen", "run"})
-                    or (receiver in sockets and method in {"connect", "fileno", "sendall", "close"})
-                    or (receiver in local_files and method in {"fileno", "close"})
-                ):
-                    return False
-                offset = line_starts[call.lineno - 1] + call.col_offset
-                if not any(start <= offset < end for start, end in spans):
-                    continue
-                owner = call.func.value
-                if not isinstance(owner, ast.Name):
-                    continue
-                if owner.id == "os" and call.func.attr == "dup2" and len(call.args) >= 2:
-                    evidence.append(is_local_fd(call.args[0]))
-                elif owner.id == "subprocess" and call.func.attr in {"call", "Popen", "run"}:
-                    streams = [
-                        kw.value for kw in call.keywords if kw.arg in {"stdin", "stdout", "stderr"}
-                    ]
-                    evidence.extend(is_local_fd(stream) for stream in streams)
-            if isinstance(statement, ast.Assign):
-                for target in statement.targets:
-                    if not isinstance(target, ast.Name):
-                        return False
-                    if target.id in {"open", "os", "socket", "subprocess"}:
-                        return False
-                    local_files.discard(target.id)
-                    sockets.discard(target.id)
-                    if is_open(statement.value):
-                        local_files.add(target.id)
-                    elif (
-                        isinstance(statement.value, ast.Call)
-                        and isinstance(statement.value.func, ast.Attribute)
-                        and isinstance(statement.value.func.value, ast.Name)
-                        and statement.value.func.value.id == "socket"
-                        and statement.value.func.attr == "socket"
-                    ):
-                        sockets.add(target.id)
-        return True
-
-    return inspect(tree.body) and bool(evidence) and all(evidence)
-
-
 def _parse_meta(match: yara.Match) -> tuple[str, Severity, float, str | None]:
     """Extract rule_id, severity, confidence, and description from a YARA match's meta."""
     meta: dict[str, object] = match.meta or {}
@@ -915,13 +756,6 @@ def _match_file(
                 ANALYZER_ID,
                 file_path,
             )
-            continue
-        if (
-            match.namespace == "malware"
-            and match.rule == "reverse_shell"
-            and not limited
-            and _python_shell_streams_are_local_files(instances, data)
-        ):
             continue
         rule_id, severity, confidence, description = _parse_meta(match)
         first_offset, matched_text = _extract_match_strings(instances)

