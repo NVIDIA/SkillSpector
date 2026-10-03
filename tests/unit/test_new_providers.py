@@ -51,6 +51,9 @@ def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
         "SKILLSPECTOR_COMPAT_BASE_URL",
         "SKILLSPECTOR_TEMPERATURE",
         "SKILLSPECTOR_SEED",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
     ):
         monkeypatch.delenv(key, raising=False)
     registry._load.cache_clear()
