@@ -9,7 +9,7 @@ import heapq
 import posixpath
 import re
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path, PurePosixPath
@@ -20,6 +20,7 @@ from skillspector.image_text import IMAGE_SUFFIXES
 from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
+    LedgerReason,
     LedgerRecordType,
     ledger_event,
 )
@@ -595,37 +596,78 @@ def resolve_bundle_references(
 
 _MAX_IMAGE_INVENTORY_LINES = 4096
 _MAX_IMAGE_INVENTORY_ENTRIES = 1024
-_MAX_REMOTE_IMAGE_CHARS = 512
+_MAX_INLINE_IMAGES = 8
+_MAX_INLINE_IMAGE_BYTES = 1_000_000
 
 
-def _is_remote_image_target(raw: str) -> bool:
-    """Return whether a markdown image destination is cited-but-unfetched."""
-    lowered = raw.strip().lower()
-    return lowered.startswith(("http://", "https://", "data:"))
+def _remote_scheme_host(raw: str) -> str | None:
+    """Return the ``scheme://host`` of a remote image target, or None.
+
+    Paths, queries, fragments, and userinfo never reach ledger or
+    report output: signed URLs and ``user:token@host`` forms reduce to
+    their origin. Malformed URLs (bad port, broken IPv6) yield None
+    instead of raising on hostile markdown.
+    """
+    try:
+        split = urlsplit(raw.strip())
+        if split.scheme not in ("http", "https") or not split.hostname:
+            return None
+        port = f":{split.port}" if split.port else ""
+        return f"{split.scheme}://{split.hostname}{port}"
+    except ValueError:
+        return None
 
 
 def collect_image_inventory(
     source_text: str,
     source_path: str,
     known_paths: list[str],
+    records: Sequence[BundleReference],
     *,
     clock: Callable[[], float],
     deadline: float,
-) -> dict[str, list[str]]:
-    """Inventory per-skill image references without verdicts or network access.
+) -> tuple[dict[str, list[str]], bool]:
+    """Inventory per-skill image references, reporting truncation.
 
-    Local images are markdown ``![]()`` targets resolving inside the skill
-    directory (via the shared passive-image grammar) plus loose image files
-    anywhere in the skill tree. Remote ``http(s)``/``data`` URIs are
-    inventoried as cited-but-unfetched and never retrieved. Shares the
-    caller's deadline: an expired budget truncates the inventory instead
-    of blocking the scan.
+    Local images come from resolved ``markdown_image`` reference records
+    (which already apply fence, code, and HTML state) intersected with
+    known paths, plus loose image files anywhere in the skill tree.
+    The known-membership check is what excludes phantom entries for
+    missing files; the records add citation provenance on top.
+    Remote ``http(s)`` targets are cited as scheme-plus-host and never
+    retrieved; ``data:`` image URIs are kept inline for bounded decoding
+    downstream (at most 8 per skill, 1 MB each; anything beyond reports
+    truncation). Shares the caller's deadline: an expired budget stops
+    parsing and reports truncation instead of blocking the scan.
+    Returns ``(inventory, truncated)``.
     """
+    known = set(known_paths)
     local: set[str] = set()
     remote: set[str] = set()
+    inline: list[str] = []
+    truncated = False
+    for record in records:
+        if record.get("reference_kind") != ReferenceKind.MARKDOWN_IMAGE:
+            continue
+        if record.get("status") != "resolved":
+            continue
+        target = record.get("target_path")
+        if (
+            isinstance(target, str)
+            and target in known
+            and PurePosixPath(target).suffix.lower() in IMAGE_SUFFIXES
+        ):
+            local.add(target)
+    for path in known_paths:
+        if PurePosixPath(path).suffix.lower() in IMAGE_SUFFIXES:
+            local.add(path)
+        if len(local) + len(remote) + len(inline) >= _MAX_IMAGE_INVENTORY_ENTRIES:
+            truncated = True
+            break
     lines_scanned = 0
     for line in StringIO(source_text):
         if lines_scanned >= _MAX_IMAGE_INVENTORY_LINES or clock() >= deadline:
+            truncated = True
             break
         lines_scanned += 1
         candidates = _markdown_candidates(
@@ -638,32 +680,44 @@ def collect_image_inventory(
             if candidate.kind is not ReferenceKind.MARKDOWN_IMAGE:
                 continue
             raw = candidate.raw.strip()
-            if not raw or len(local) + len(remote) >= _MAX_IMAGE_INVENTORY_ENTRIES:
+            if not raw or len(local) + len(remote) + len(inline) >= _MAX_IMAGE_INVENTORY_ENTRIES:
+                truncated = truncated or bool(raw)
                 continue
-            if _is_remote_image_target(raw):
-                remote.add(raw[:_MAX_REMOTE_IMAGE_CHARS])
+            if raw.strip().lower().startswith("data:"):
+                if (
+                    raw.lower().startswith("data:image/")
+                    and "," in raw
+                    and len(raw) <= _MAX_INLINE_IMAGE_BYTES
+                    and len(inline) < _MAX_INLINE_IMAGES
+                ):
+                    inline.append(raw)
+                else:
+                    truncated = True
                 continue
-            target = _normalize_candidate(raw, source_path)
-            if target is None:
-                continue
-            if PurePosixPath(target).suffix.lower() in IMAGE_SUFFIXES:
-                local.add(target)
-    for path in known_paths:
-        if PurePosixPath(path).suffix.lower() in IMAGE_SUFFIXES:
-            local.add(path)
-        if len(local) + len(remote) >= _MAX_IMAGE_INVENTORY_ENTRIES:
-            break
-    return {"local_images": sorted(local), "remote_images": sorted(remote)}
+            origin = _remote_scheme_host(raw)
+            if origin is not None:
+                remote.add(origin)
+    return (
+        {
+            "local_images": sorted(local),
+            "remote_images": sorted(remote),
+            "inline_images": inline,
+        },
+        truncated,
+    )
 
 
 def image_inventory_ledger_events(
     image_inventory: Mapping[str, list[str]],
     source_path: str,
+    truncated: bool = False,
 ) -> list[InspectionLedgerEvent]:
     """Surface image presence in the ledger with COMPLETED rows and no verdicts.
 
     One row per local image; a remote-only inventory leaves a single row on
-    the citing source so the citation itself remains accounted for.
+    the citing source so the citation itself remains accounted for. A
+    truncated inventory appends a PARTIAL row naming the entry limit, so a
+    bound reads as incomplete analysis, never silent success.
     """
     local_images = [str(path) for path in image_inventory.get("local_images", [])]
     remote_images = [str(path) for path in image_inventory.get("remote_images", [])]
@@ -687,6 +741,18 @@ def image_inventory_ledger_events(
                 record_type=LedgerRecordType.SYSTEM,
                 phase="image_inventory",
                 path=source_path,
+            )
+        )
+    if truncated:
+        events.append(
+            ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                record_type=LedgerRecordType.SYSTEM,
+                phase="image_inventory",
+                path=source_path,
+                reason=LedgerReason.OUTPUT_LIMIT,
+                observed_records=len(local_images) + len(remote_images),
+                limit_records=_MAX_IMAGE_INVENTORY_ENTRIES,
             )
         )
     return events

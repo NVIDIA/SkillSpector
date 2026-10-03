@@ -710,6 +710,27 @@ def _legacy_effective_ids(
     return selected
 
 
+def image_inventory_public_view(raw_inventory: Mapping[str, object]) -> dict[str, list[str]]:
+    """Return the report-safe projection of the image inventory.
+
+    Local and remote entries pass through verbatim (remotes are already
+    scheme-plus-host); inline ``data:`` URIs reduce to a MIME-plus-size
+    summary so embedded content never reaches JSON/MCP output.
+    """
+    view: dict[str, list[str]] = {"local_images": [], "remote_images": [], "inline_images": []}
+    for key in ("local_images", "remote_images"):
+        value = raw_inventory.get(key, [])
+        if isinstance(value, list):
+            view[key] = [str(item) for item in value]
+    inline = raw_inventory.get("inline_images", [])
+    if isinstance(inline, list):
+        for item in inline:
+            uri = str(item)
+            head, _, data = uri.partition(",")
+            view["inline_images"].append(f"{head[:128]}({len(data)} bytes)")
+    return view
+
+
 def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, list[str]]:
     """Validate ledger accounting and derive the canonical public projection.
 
@@ -1052,6 +1073,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         if isinstance(raw_references, list)
         else []
     )
+
     raw_image_inventory = state.get("image_inventory", None)
 
     completeness: AnalysisCompleteness = {
@@ -1073,10 +1095,7 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_after_filtering": len(validated_effective),
     }
     if isinstance(raw_image_inventory, dict):
-        completeness["image_inventory"] = {
-            str(key): [str(item) for item in value] if isinstance(value, list) else value
-            for key, value in raw_image_inventory.items()
-        }
+        completeness["image_inventory"] = image_inventory_public_view(raw_image_inventory)
     return completeness, validated_effective
 
 
