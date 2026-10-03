@@ -220,6 +220,47 @@ _RULE_CONFIDENCES: dict[str, float] = {
 
 _TAG = "Dangerous Code Execution"
 
+_AST4_FIXED_ARGV_EXPLANATION = (
+    "Fixed argument vector: subprocess launches a named executable with literal arguments, "
+    "and shell expansion is disabled. This still starts an external process, but these literal "
+    "arguments do not create the generic shell-injection path."
+)
+_AST4_FIXED_ARGV_REMEDIATION = (
+    "Keep the explicit argument vector and shell=False. Validate the executable, its resolved path, "
+    "and any dynamic arguments before launch; do not switch to shell=True."
+)
+_AST4_SHELL_BUILD_EXPLANATION = (
+    "Shell command construction: subprocess runs a command string with shell=True, so "
+    "concatenated input and shell metacharacters can change the invocation or inject additional "
+    "commands."
+)
+_AST4_SHELL_BUILD_REMEDIATION = (
+    "Replace the shell command string with an explicit argument vector and shell=False, then "
+    "validate or allowlist every dynamic argument before launch."
+)
+_AST4_SHELL_STRING_EXPLANATION = (
+    "Shell command string: subprocess runs the command with shell expansion enabled, so shell "
+    "metacharacters in the command can change the invocation or inject additional commands."
+)
+_AST4_SHELL_STRING_REMEDIATION = _AST4_SHELL_BUILD_REMEDIATION
+_AST4_UNKNOWN_EXPLANATION = (
+    "Unknown caller input: the executable or argument values are not statically known, while "
+    "shell expansion is disabled by default. If those values are attacker-controlled, they can "
+    "select a different program or alter that program's behavior."
+)
+_AST4_UNKNOWN_REMEDIATION = (
+    "Make the executable and argument vector explicit, avoid shell=True, resolve the executable "
+    "from an allowlist, and validate every dynamic argument before launch."
+)
+_AST4_UNKNOWN_SHELL_EXPLANATION = (
+    "Dynamic subprocess invocation: the effective shell mode is not statically known, so "
+    "command-injection risk cannot be ruled out from this call alone."
+)
+_AST4_UNKNOWN_SHELL_REMEDIATION = (
+    "Make shell mode explicit, keep it False unless a shell is required, and validate or allowlist "
+    "the executable and every dynamic argument before launch."
+)
+
 
 class _BehavioralResourceLimitError(RuntimeError):
     """Internal signal that retains findings constructed before a hard limit."""
@@ -331,6 +372,113 @@ def _is_true_constant(node: ast.expr) -> bool:
     return isinstance(node, ast.Constant) and node.value is True
 
 
+def _subprocess_shell_mode(node: ast.Call, attr: str) -> bool | None:
+    """Return the literal shell mode for *node*, or None when it is dynamic."""
+    if attr in {"getoutput", "getstatusoutput"}:
+        return True
+    if any(keyword.arg is None for keyword in node.keywords):
+        return None
+    for keyword in reversed(node.keywords):
+        if keyword.arg != "shell":
+            continue
+        if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool):
+            return keyword.value.value
+        return None
+    return False
+
+
+_SHELL_INTERPRETERS = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
+_CMD_INTERPRETERS = frozenset({"cmd", "cmd.exe"})
+_POWERSHELL_INTERPRETERS = frozenset({"powershell", "powershell.exe", "pwsh", "pwsh.exe"})
+
+
+def _literal_inline_shell_command(node: ast.expr | None) -> tuple[bool, ast.expr | None]:
+    """Return the command argument when literal argv explicitly invokes a shell."""
+    if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 2:
+        return False, None
+    executable = _constant_string(node.elts[0])
+    flag = _constant_string(node.elts[1])
+    if executable is None or flag is None:
+        return False, None
+
+    basename = executable.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    normalized_flag = flag.lower()
+    if basename in _SHELL_INTERPRETERS:
+        inline = flag == "-c" or (
+            flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]
+        )
+    elif basename in _CMD_INTERPRETERS:
+        inline = normalized_flag == "/c"
+    elif basename in _POWERSHELL_INTERPRETERS:
+        inline = normalized_flag in {"-c", "-command"}
+    else:
+        inline = False
+    if not inline:
+        return False, None
+    return True, node.elts[2] if len(node.elts) >= 3 else None
+
+
+def _has_dynamic_executable(node: ast.Call) -> bool:
+    """Return whether ``executable=`` is present but not a literal string."""
+    return any(
+        keyword.arg == "executable" and _constant_string(keyword.value) is None
+        for keyword in node.keywords
+    )
+
+
+def _subprocess_command_arg(node: ast.Call) -> ast.expr | None:
+    """Return the positional or keyword ``args`` expression for a subprocess call."""
+    if node.args:
+        return node.args[0]
+    for keyword in reversed(node.keywords):
+        if keyword.arg == "args":
+            return keyword.value
+    return None
+
+
+def _is_fixed_argv(node: ast.expr | None) -> bool:
+    """Return True when *node* is a literal list/tuple argument vector."""
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return False
+    return all(_constant_string(item) is not None for item in node.elts)
+
+
+def _is_constructed_shell_command(node: ast.expr | None) -> bool:
+    """Return True when *node* builds a shell command from multiple parts."""
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"format", "format_map", "join"}
+    )
+
+
+def _ast4_guidance(node: ast.Call, attr: str) -> tuple[str, str]:
+    """Return contextual AST4 guidance without changing detection or scoring."""
+    command = _subprocess_command_arg(node)
+    shell_mode = _subprocess_shell_mode(node, attr)
+    inline_shell, inline_command = _literal_inline_shell_command(command)
+
+    if shell_mode is True:
+        if _is_constructed_shell_command(command):
+            return _AST4_SHELL_BUILD_EXPLANATION, _AST4_SHELL_BUILD_REMEDIATION
+        return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
+    if inline_shell:
+        if _is_constructed_shell_command(inline_command):
+            return _AST4_SHELL_BUILD_EXPLANATION, _AST4_SHELL_BUILD_REMEDIATION
+        return _AST4_SHELL_STRING_EXPLANATION, _AST4_SHELL_STRING_REMEDIATION
+    if _has_dynamic_executable(node):
+        return _AST4_UNKNOWN_EXPLANATION, _AST4_UNKNOWN_REMEDIATION
+    if shell_mode is False and _is_fixed_argv(command):
+        return _AST4_FIXED_ARGV_EXPLANATION, _AST4_FIXED_ARGV_REMEDIATION
+    if shell_mode is None:
+        return _AST4_UNKNOWN_SHELL_EXPLANATION, _AST4_UNKNOWN_SHELL_REMEDIATION
+    return _AST4_UNKNOWN_EXPLANATION, _AST4_UNKNOWN_REMEDIATION
+
+
 def _kwarg_is_true(node: ast.Call, name: str) -> bool:
     """True if keyword *name* is passed as a literal ``True``."""
     return any(kw.arg == name and _is_true_constant(kw.value) for kw in node.keywords)
@@ -440,6 +588,9 @@ def _analyze_python(
         rule_id: str,
         ast_node: ast.Call,
         msg_override: str | None = None,
+        *,
+        explanation: str | None = None,
+        remediation: str | None = None,
     ) -> None:
         lineno = getattr(ast_node, "lineno", 1)
         end_lineno = getattr(ast_node, "end_lineno", None)
@@ -466,6 +617,8 @@ def _analyze_python(
             context=context_for(lineno, start_column if start_column is not None else 0),
             matched_text=complete_match[:200],
             complete_match=complete_match,
+            explanation=explanation,
+            remediation=remediation,
         )
         if budget is None:
             findings.append(finding)
@@ -565,7 +718,13 @@ def _analyze_python(
         elif call_name.startswith("subprocess."):
             attr = call_name.split(".", 1)[1]
             if attr in _SUBPROCESS_CALLS:
-                _emit("AST4", ast_node)
+                explanation, remediation = _ast4_guidance(ast_node, attr)
+                _emit(
+                    "AST4",
+                    ast_node,
+                    explanation=explanation,
+                    remediation=remediation,
+                )
 
         elif call_name.startswith("os."):
             attr = call_name.split(".", 1)[1]
