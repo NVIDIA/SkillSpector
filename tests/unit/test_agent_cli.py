@@ -683,10 +683,17 @@ class TestRunBounded:
 
 class TestCliRegistry:
     def test_registry_covers_known_clis(self) -> None:
-        assert set(_agent_cli._REGISTRY) == {"claude", "codex", "gemini", "opencode", "agy"}
+        assert set(_agent_cli._REGISTRY) == {
+            "claude",
+            "codex",
+            "copilot",
+            "gemini",
+            "opencode",
+            "agy",
+        }
 
     def test_get_spec_returns_matching_binary(self) -> None:
-        for name in ("claude", "codex", "gemini", "opencode", "agy"):
+        for name in ("claude", "codex", "copilot", "gemini", "opencode", "agy"):
             assert _agent_cli.get_spec(name).binary == name
 
     def test_get_spec_unknown_raises(self) -> None:
