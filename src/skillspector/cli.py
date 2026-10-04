@@ -182,6 +182,7 @@ class _CachedTransitiveResult:
     artifact_references: list[dict[str, object]]
     has_executable_scripts: bool
     execution_successful: bool
+    meta_review_required: bool
     refs: list[str]
 
 
@@ -1349,6 +1350,7 @@ def _cache_transitive_result(
         has_executable_scripts=bool(child_result.get("has_executable_scripts", False))
         or any(bool(entry.get("executable", False)) for entry in child_metadata),
         execution_successful=child_result.get("execution_successful") is not False,
+        meta_review_required=child_result.get("meta_review_required") is True,
         refs=extraction.references,
     )
 
@@ -1965,6 +1967,7 @@ def _scan_transitive(
         _coerce_component_metadata(initial_result.get("component_metadata")), None
     )[: traversal.budget.max_components]
     has_executable_scripts = bool(initial_result.get("has_executable_scripts", False))
+    merged_meta_review_required = initial_result.get("meta_review_required") is True
 
     root_extraction = transitive.extract_external_refs_with_metadata(
         local_file_cache,
@@ -2179,6 +2182,8 @@ def _scan_transitive(
                 )
                 if cached.has_executable_scripts:
                     has_executable_scripts = True
+                if cached.meta_review_required:
+                    merged_meta_review_required = True
                 _bounded_extend(
                     merged_components,
                     cached.components,
@@ -2313,6 +2318,7 @@ def _scan_transitive(
         "artifact_inventory": merged_artifact_inventory,
         "artifact_references": merged_artifact_references,
         "has_executable_scripts": has_executable_scripts,
+        "meta_review_required": merged_meta_review_required,
         "use_llm": initial_result.get("use_llm", not no_llm),
         "llm_requested": initial_result.get("llm_requested", not no_llm),
         "llm_call_log": merged_llm_call_log,
@@ -2363,6 +2369,7 @@ def _scan_transitive(
         merged_result["effective_finding_ids"] = effective_ids
     report_result = cast(dict[str, object], report(merged_result))
     report_result["analysis_completeness"] = merged_result.get("analysis_completeness", {})
+    report_result["meta_review_required"] = merged_meta_review_required
     report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
     active_findings = _coerce_findings_list(report_result.get("filtered_findings"))
     report_result["transitive_finding_count"] = sum(
