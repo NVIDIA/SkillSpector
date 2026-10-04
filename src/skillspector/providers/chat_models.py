@@ -112,8 +112,13 @@ def create_openai_compatible_chat_model(
     max_tokens: int,
     timeout: float | None = 120,
     default_headers: dict[str, str] | None = None,
+    disabled_params: dict[str, object] | None = None,
 ) -> BaseChatModel | None:
-    """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints."""
+    """Create ``ChatOpenAI`` for providers serving OpenAI-compatible endpoints.
+
+    *disabled_params* is passed to ``ChatOpenAI``; ``{"tool_choice": None}``
+    keeps ``with_structured_output`` from forcing a tool call.
+    """
     if credentials is None:
         return None
 
@@ -127,6 +132,8 @@ def create_openai_compatible_chat_model(
         "timeout": timeout,
         "default_headers": default_headers,
     }
+    if disabled_params:
+        kwargs["disabled_params"] = disabled_params
     reasoning_effort = resolve_reasoning_effort()
     if reasoning_effort:
         kwargs["reasoning_effort"] = reasoning_effort
