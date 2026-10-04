@@ -256,6 +256,9 @@ prose answer; it recognises the model from the model ID, a geo/global
 inference-profile ID, or a foundation-model / inference-profile ARN. An
 application-inference-profile ARN hides the model, so add that ARN to the
 registry (`SKILLSPECTOR_MODEL_REGISTRY`) with `tool_choice: auto`.
+The `openai_compatible` provider honours the same `tool_choice: auto` entry
+for endpoints that ignore both `response_format` and a forced `tool_choice`
+and answer in prose (for example iFlytek's `spark-x2.5`, which is bundled).
 `SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=json_schema|function_calling`
 overrides the method for any provider.
 
