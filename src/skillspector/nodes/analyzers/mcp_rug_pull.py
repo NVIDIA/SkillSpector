@@ -113,6 +113,8 @@ class _RugPullBudget:
                     "limit_findings": MAX_FINDINGS_PER_ANALYZER,
                 },
             )
+        finding.pattern = finding.pattern or finding.message
+        finding.finding = (finding.finding or finding.matched_text or finding.message)[:200]
         self.findings.append(finding)
         self.artifact_findings[finding.file] = artifact_observed
 
@@ -126,10 +128,17 @@ _RP1_NPX_CMD = re.compile(
     re.IGNORECASE,
 )
 _RP1_CONFIG_RUNNER = re.compile(
-    r"^(?P<indent>[ \t]*)(?:command|cmd)[ \t]*:[ \t]*[\"']?(?P<runner>p?npx)[\"']?[ \t]*(?:#.*)?$",
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:command|cmd)[ \t]*:[ \t]*"
+    r"(?P<quote>[\"']?)(?P<runner>(?:[^\s\"'#]*/)?p?npx)(?P=quote)[ \t]*(?:#.*)?$",
     re.IGNORECASE,
 )
-_RP1_CONFIG_ARGS = re.compile(r"^(?P<indent>[ \t]*)args[ \t]*:[ \t]*(?P<value>.*)$", re.IGNORECASE)
+_RP1_CONFIG_ARGS = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?args[ \t]*:[ \t]*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+_RP1_CONFIG_KEY = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<item>-[ \t]+)?(?:[\w-]+|\"[^\"]+\"|'[^']+')[ \t]*:"
+)
 _RP1_CONFIG_ARG_TOKEN = re.compile(r"[\"']([^\"']*)[\"']|([^\s,\[\]#]+)")
 _RP1_CONFIG_MAX_LINES = 8
 _RP1_UVX_CMD = re.compile(
@@ -166,6 +175,29 @@ def _find_line(content: str, pos: int) -> int:
     return content.count("\n", 0, pos) + 1
 
 
+def _strip_yaml_comment(line: str) -> str:
+    """Remove an unquoted YAML comment without treating quoted hashes as comments."""
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                if quote == "'" and index + 1 < len(line) and line[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+        index += 1
+    return line
+
+
 def _iter_config_npx_commands(
     content: str, budget: _RugPullBudget, file_path: str
 ) -> list[tuple[int, str, str]]:
@@ -184,32 +216,56 @@ def _iter_config_npx_commands(
         if command is None:
             continue
 
-        command_indent = len(command.group("indent"))
+        # The key in "- command:" starts after the sequence marker. Sibling
+        # keys align with that column, not with the marker's indentation.
+        command_indent = len(command.group("indent")) + len(command.group("item") or "")
         args_index: int | None = None
         args_match: re.Match[str] | None = None
-        for index in range(
-            command_index + 1, min(len(lines), command_index + _RP1_CONFIG_MAX_LINES + 1)
-        ):
-            budget.check_runtime(file_path)
-            candidate_line = lines[index].rstrip("\r\n")
-            stripped = candidate_line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
-            if indent < command_indent:
-                break
-            candidate_args = _RP1_CONFIG_ARGS.fullmatch(candidate_line)
-            if indent == command_indent:
-                if candidate_args is not None:
-                    args_index = index
-                    args_match = candidate_args
+        for direction in (-1, 1):
+            if direction == -1 and command.group("item"):
+                continue  # This command is already the first key in its list item.
+            for distance in range(1, _RP1_CONFIG_MAX_LINES + 1):
+                index = command_index + direction * distance
+                if not 0 <= index < len(lines):
+                    break
+                budget.check_runtime(file_path)
+                candidate_line = lines[index].rstrip("\r\n")
+                stripped = candidate_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
+                key = _RP1_CONFIG_KEY.match(candidate_line)
+                key_indent = (
+                    len(key.group("indent")) + len(key.group("item") or "")
+                    if key is not None
+                    else indent
+                )
+                # Backward traversal may reach the first key of this list item.
+                # Forward traversal must never enter the next item, even when
+                # its key has the same effective column.
+                first_item_key = key is not None and key.group("item") is not None
+                if indent < command_indent and not (
+                    direction == -1 and first_item_key and key_indent == command_indent
+                ):
+                    break
+                if key_indent == command_indent:
+                    if key is None:
+                        break
+                    candidate_args = _RP1_CONFIG_ARGS.fullmatch(candidate_line)
+                    if candidate_args is not None:
+                        args_index = index
+                        args_match = candidate_args
+                        break
+                if direction == -1 and first_item_key and key_indent == command_indent:
+                    break
+            if args_match is not None:
                 break
 
         if args_index is None or args_match is None:
             continue
 
-        args_indent = len(args_match.group("indent"))
-        args_lines = [args_match.group("value")]
+        args_indent = len(args_match.group("indent")) + len(args_match.group("item") or "")
+        args_lines = [_strip_yaml_comment(args_match.group("value"))]
         args_end_index = args_index
         for index in range(args_index + 1, min(len(lines), args_index + _RP1_CONFIG_MAX_LINES + 1)):
             budget.check_runtime(file_path)
@@ -220,7 +276,7 @@ def _iter_config_npx_commands(
             indent = len(candidate_line) - len(candidate_line.lstrip(" \t"))
             if indent <= args_indent:
                 break
-            args_lines.append(candidate_line.lstrip(" \t"))
+            args_lines.append(_strip_yaml_comment(candidate_line.lstrip(" \t")))
             args_end_index = index
 
         args_text = " ".join(args_lines)
@@ -229,7 +285,9 @@ def _iter_config_npx_commands(
             if token.startswith("-"):
                 continue
             start = offsets[command_index]
-            full_match = "".join(lines[command_index : args_end_index + 1]).strip()
+            full_match = "".join(
+                lines[min(command_index, args_index) : max(command_index, args_end_index) + 1]
+            ).strip()
             matches.append((start, full_match, token))
             break
 
@@ -282,6 +340,16 @@ def _get_parameters_map(
 # ---------------------------------------------------------------------------
 
 
+def _operand_has_version_pin(line_remainder: str) -> bool:
+    """Return whether a version pin is attached to the matched package operand.
+
+    Only the operand's own token counts, so a version on a later argument or on a
+    neighboring command on the same line does not pin this package.
+    """
+    operand_suffix = re.split(r"\s", line_remainder, maxsplit=1)[0]
+    return _VERSION_PIN_RE.search(operand_suffix) is not None
+
+
 def _check_rp1(
     manifest: dict,
     file_cache: dict[str, str],
@@ -298,7 +366,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             line_num = _find_line(content, m.start())
             budget.emit(
@@ -362,7 +430,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             line_num = _find_line(content, m.start())
             budget.emit(
@@ -395,7 +463,7 @@ def _check_rp1(
             if line_end == -1:
                 line_end = len(content)
             line_remainder = content[m.end() : min(line_end, m.end() + 256)]
-            if _VERSION_PIN_RE.search(full_match) or _VERSION_PIN_RE.search(line_remainder):
+            if _VERSION_PIN_RE.search(full_match) or _operand_has_version_pin(line_remainder):
                 continue
             pkg = m.group(1)
             if "mcp" not in pkg.lower():

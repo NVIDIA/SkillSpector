@@ -63,6 +63,7 @@ from skillspector.llm_utils import (
     _AgentCLIMessage,
     _ainvoke_with_usage,
     _invoke_with_usage,
+    bind_structured_output,
     chat_model_provider_name,
     get_chat_model,
     new_inference_usage_collector,
@@ -614,14 +615,22 @@ class LLMFinding(BaseModel):
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`Finding` for the graph state."""
+        # Keep the core LLM module independent from analyzer discovery.  The
+        # discovery package imports this module while loading analyzers.
+        from skillspector.nodes.analyzers.pattern_defaults import get_category, get_pattern_name
+
+        message = self.message[:4096]
         return Finding(
             rule_id=self.rule_id,
-            message=self.message,
+            message=message,
             severity=self.severity,
             confidence=self.confidence,
             file=file,
             start_line=self.start_line,
             end_line=self.end_line,
+            category=get_category(self.rule_id),
+            pattern=message or get_pattern_name(self.rule_id),
+            finding=message,
             explanation=self.explanation,
             remediation=self.remediation,
         )
@@ -933,7 +942,9 @@ class LLMAnalyzerBase:
             max_retries=native_retries,
         )
         self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
+            bind_structured_output(self._llm, self.response_schema, model)
+            if self.response_schema
+            else None
         )
         self._usage_collector = new_inference_usage_collector(
             node=node,
@@ -986,7 +997,9 @@ class LLMAnalyzerBase:
             chat_model_controls(llm),
         )
         structured = (
-            llm.with_structured_output(self.response_schema) if self.response_schema else None
+            bind_structured_output(llm, self.response_schema, self.model)
+            if self.response_schema
+            else None
         )
         return llm, structured
 

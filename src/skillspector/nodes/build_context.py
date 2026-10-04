@@ -28,6 +28,7 @@ import os
 import re
 import tarfile
 from collections.abc import Callable, Mapping
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from time import monotonic
@@ -46,6 +47,7 @@ from skillspector.constants import (
     MAX_ANALYZABLE_FILE_BYTES,
     MAX_FILE_BYTES,
     MAX_LLM_TRUNCATED_FILE_CHARS,
+    MODEL_CONFIG,
     build_model_config,
 )
 from skillspector.input_handler import (
@@ -61,7 +63,7 @@ from skillspector.inspection_ledger import (
     LedgerRecordType,
     ledger_event,
 )
-from skillspector.llm_provenance import capture_llm_provenance
+from skillspector.llm_provenance import capture_llm_provenance, capture_static_llm_provenance
 from skillspector.logging_config import get_logger
 from skillspector.nested_artifacts import (
     expected_container_type,
@@ -928,7 +930,9 @@ def _build_component_metadata(
             size_bytes = 0
             mode = 0
         data = raw_file_cache.get(path, b"")
-        executable = is_executable_content(path, data, mode)
+        executable = is_executable_content(
+            path, data, mode, complete_content=len(data) == size_bytes
+        )
         if executable:
             has_executable = True
         component: dict[str, object] = {
@@ -1353,7 +1357,12 @@ def _inspect_excluded_artifacts(
                             executable=executable,
                         )
                         continue
-                    executable = is_executable_content(path, probe, file_stat.st_mode)
+                    executable = is_executable_content(
+                        path,
+                        probe,
+                        file_stat.st_mode,
+                        complete_content=len(probe) == size_bytes,
+                    )
                 archive_candidate = is_zip_content(probe)
                 expected_archive = expected_container_type(path) is not None
                 if expected_archive and not archive_candidate:
@@ -2404,6 +2413,15 @@ def _parse_manifest(
                 runtime_limit=runtime_limit,
             )
             return {}
+        while content.startswith("\ufeff"):
+            # decode_text() decodes with plain "utf-8", which never strips a
+            # leading byte-order mark (only "utf-8-sig" does), so a BOM-prefixed
+            # SKILL.md leaves content[0] == "\ufeff" and the delimiter check below
+            # silently sees {} instead of the frontmatter. Strip leading BOMs here,
+            # scoped to delimiter detection — decode_text() itself stays untouched
+            # because P2/TP1/P9 treat U+FEFF as a hidden-character injection signal
+            # in file bodies.
+            content = content[1:]
         if not content.startswith("---"):
             return {}
         end_match = re.search(r"\n---\s*\n", content[3:])
@@ -2576,6 +2594,43 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         excluded_artifacts,
         excluded_inspection_gaps,
     ) = _walk_skill_files(skill_dir, state)
+    patterns = state.get("exclude_patterns", [])
+    if len(patterns) > 128 or any(
+        not isinstance(pattern, str)
+        or not pattern
+        or len(pattern) > 1024
+        or pattern.startswith("/")
+        or "\\" in pattern
+        or ".." in pattern.split("/")
+        or any(ord(char) < 32 for char in pattern)
+        for pattern in patterns
+    ):
+        raise ValueError("Exclusions require at most 128 relative POSIX globs (1-1024 characters)")
+    if any(
+        fnmatchcase(manifest, pattern)
+        for manifest in ("SKILL.md", "skill.md")
+        for pattern in patterns
+    ):
+        raise ValueError("--exclude must not match the required SKILL.md manifest")
+    user_excluded = sorted(
+        path
+        for path in inventoried_components
+        if any(fnmatchcase(path, pattern) for pattern in patterns)
+    )
+    user_excluded_set = set(user_excluded)
+    inventoried_components = [
+        path for path in inventoried_components if path not in user_excluded_set
+    ]
+    user_exclusion_events = [
+        ledger_event(
+            outcome=LedgerOutcome.SKIPPED,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="explicit_exclusion",
+            path=path,
+            reason=LedgerReason.USER_EXCLUSION,
+        )
+        for path in user_excluded
+    ]
     selected_baseline = _selected_baseline_component(state, skill_dir, inventoried_components)
     selected_baselines = frozenset({selected_baseline} if selected_baseline else set())
     for path in selected_baselines:
@@ -2619,6 +2674,20 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
             MAX_TOTAL_CACHED_BYTES - sum(len(data) for data in raw_file_cache.values()),
         ),
         incomplete_exclusions=excluded_inspection_gaps,
+    )
+    artifact_inventory.extend(
+        {
+            "path": path,
+            "content_kind": ContentKind.OPAQUE,
+            "disposition": ArtifactDisposition.PARTIAL,
+            "size_bytes": 0,
+            "decodable": False,
+            "contains_nul": False,
+            "misleading_extension": False,
+            "referenced": False,
+            "reason": LedgerReason.USER_EXCLUSION.value,
+        }
+        for path in user_excluded
     )
     artifact_inventory = sorted(
         [*artifact_inventory, *excluded_inventory], key=lambda item: item["path"]
@@ -2736,12 +2805,17 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
                     source_path=primary_path,
                     source_text=primary_text,
                     known_paths=sorted(
-                        dict.fromkeys([*inventoried_components, *excluded_artifacts])
+                        dict.fromkeys(
+                            [*inventoried_components, *excluded_artifacts, *user_excluded]
+                        )
                     ),
                     clock=monotonic,
                     deadline=processing_deadline,
                 )
         references = resolution.records
+        for reference in references:
+            if reference.get("target_path") in user_excluded_set:
+                reference["disposition"] = ArtifactDisposition.PARTIAL
         primary_artifact = inventory_by_path.get(primary_path)
         primary_partial = (
             primary_artifact is not None
@@ -3368,7 +3442,13 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         or any(bool(metadata.get("executable")) for metadata in excluded_component_metadata)
     )
 
-    model_config = build_model_config()
+    use_llm = state.get("use_llm", True)
+    model_config = build_model_config() if use_llm else {}
+    llm_provenance = (
+        capture_llm_provenance(model_config)
+        if use_llm
+        else capture_static_llm_provenance(MODEL_CONFIG)
+    )
     result: dict[str, object] = {
         "components": components,
         "llm_components": llm_components,
@@ -3383,6 +3463,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "inspection_ledger": _bounded_ledger_output(
             [
                 *discovery_events,
+                *user_exclusion_events,
                 *prework_events,
                 *signature_events,
                 *baseline_events,
@@ -3403,7 +3484,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "manifest": manifest,
         "previous_manifest": None,
         "model_config": model_config,
-        "llm_provenance": capture_llm_provenance(model_config),
+        "llm_provenance": llm_provenance,
         "component_metadata": component_metadata,
         "has_executable_scripts": has_executable_scripts,
         "workflow_resource_budget": workflow_budget,

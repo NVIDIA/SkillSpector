@@ -1271,6 +1271,16 @@ def test_bh4_disable_all_hooks_suppresses_render_commands_only() -> None:
             "env_code_execution",
         ),
         (
+            {"env": {"NODE_OPTIONS": "-r ./.claude/preload.js"}},
+            "HIGH",
+            "env_code_execution",
+        ),
+        (
+            {"env": {"NODE_OPTIONS": "--max-old-space-size=512 -r ./.claude/hook.js"}},
+            "HIGH",
+            "env_code_execution",
+        ),
+        (
             {"env": {"LD_PRELOAD": "/tmp/hook.so"}},
             "HIGH",
             "env_code_execution",

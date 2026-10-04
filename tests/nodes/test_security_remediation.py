@@ -661,6 +661,58 @@ def test_reference_resolver_rejects_external_and_parent_escape(tmp_path: Path) -
     assert all(record["target_path"] is None for record in records)
 
 
+def test_scoped_npm_package_spec_is_not_a_reference(tmp_path: Path) -> None:
+    source = (
+        "Run `npx --yes @xerg/cli@0.34.0 doctor --json` after approval.\n"
+        "Install @modelcontextprotocol/server-filesystem or npm i @types/node @babel/core@^7.0.0.\n"
+    )
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source,
+        known_paths=["SKILL.md"],
+    )
+    assert all(record["target_path"] is None for record in records)
+    assert not any(record["status"] in {"resolved", "missing", "ambiguous"} for record in records)
+
+
+def test_explicit_known_at_paths_resolve(tmp_path: Path) -> None:
+    source = "See [@scope/tool.py](@scope/tool.py) and [helper](@pkg/helper.sh) for details.\n"
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source,
+        known_paths=["SKILL.md", "@scope/tool.py", "@pkg/helper.sh"],
+    )
+    assert len(records) == 2
+    assert [record["target_path"] for record in records] == ["@scope/tool.py", "@pkg/helper.sh"]
+    assert all(record["status"] == "resolved" for record in records)
+    assert all(record["disposition"] == ArtifactDisposition.ANALYZED for record in records)
+
+
+def test_paths_followed_by_punctuation_still_resolve(tmp_path: Path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run.sh").write_text("#!/bin/sh", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("guide", encoding="utf-8")
+    source = (
+        "run scripts/run.sh; then stop\n"
+        "open docs/guide.md?v=2 now\n"
+        "cat docs/guide.md> out.txt\n"
+        "<a href=docs/guide.md>\n"
+    )
+    records = resolve_bundle_references(
+        tmp_path,
+        source_path="SKILL.md",
+        source_text=source,
+        known_paths=["SKILL.md", "scripts/run.sh", "docs/guide.md"],
+    )
+    resolved = [r for r in records if r["status"] == "resolved"]
+    resolved_targets = {r["target_path"] for r in resolved}
+    assert "scripts/run.sh" in resolved_targets
+    assert "docs/guide.md" in resolved_targets
+
+
 def test_rejected_candidates_do_not_consume_accepted_reference_budget(tmp_path: Path) -> None:
     (tmp_path / ".hidden.md").write_text("hidden", encoding="utf-8")
     rejected = "\n".join(
@@ -1678,6 +1730,89 @@ def test_unresolved_primary_reference_blocks_complete_verdict(tmp_path: Path, ca
         for row in result["analysis_completeness"]["ledger_exceptions"]
     )
     assert result["risk_recommendation"] != "SAFE"
+
+
+@pytest.mark.parametrize(
+    ("primary", "mentions", "status", "reason"),
+    [
+        pytest.param(
+            "SKILL.md",
+            "Other skills keep templates under `templates/config.yaml`.\n"
+            "Keep `SKILL.md` under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="backticked-self-reference",
+        ),
+        pytest.param(
+            "SKILL.md",
+            "Other skills keep templates under `templates/config.yaml`.\n"
+            "Keep [this file](SKILL.md) under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="markdown-link-self-reference",
+        ),
+        pytest.param(
+            "SKILL.md",
+            "Other skills keep templates in [config](templates/config.yaml).\n"
+            "Keep `SKILL.md` under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="markdown-link-missing-target",
+        ),
+        pytest.param(
+            "skill.md",
+            "Other skills keep templates under `templates/config.yaml`.\n"
+            "Keep `skill.md` under 500 lines.\n",
+            "missing",
+            "reference_missing",
+            id="lowercase-primary",
+        ),
+        pytest.param(
+            "SKILL.md",
+            "Edit `config.yaml` before running.\nKeep `SKILL.md` under 500 lines.\n",
+            "ambiguous",
+            "reference_unresolved",
+            id="ambiguous-reference",
+        ),
+    ],
+)
+def test_reference_caveat_does_not_turn_self_reference_into_ae1(
+    tmp_path: Path, primary: str, mentions: str, status: str, reason: str
+) -> None:
+    references = tmp_path / "references"
+    references.mkdir()
+    (references / "guide.md").write_text("# Guide\n\nPlain guide text.\n", encoding="utf-8")
+    if status == "ambiguous":
+        for subdirectory in ("a", "b"):
+            (tmp_path / subdirectory).mkdir()
+            (tmp_path / subdirectory / "config.yaml").write_text("mode: local\n", encoding="utf-8")
+    (tmp_path / primary).write_text(
+        f"# Skill\n\nRead [the guide](references/guide.md).\n{mentions}",
+        encoding="utf-8",
+    )
+
+    result = graph.invoke(
+        {
+            "input_path": str(tmp_path),
+            "output_format": "json",
+            "use_llm": False,
+        }
+    )
+
+    statuses = Counter(
+        (reference["status"], reference["target_path"])
+        for reference in result["artifact_references"]
+    )
+    assert statuses[("resolved", primary)] == 1
+    assert statuses[(status, None)] == 1
+    assert not any(finding.rule_id == "AE1" for finding in result["filtered_findings"])
+    # The unresolved mention is still reported as a completeness caveat.
+    assert [
+        (row["path"], row["reason_code"])
+        for row in result["analysis_completeness"]["ledger_exceptions"]
+    ] == [(primary, reason)]
+    assert result["analysis_completeness"]["is_complete"] is False
+    assert result["risk_recommendation"] == "CAUTION"
 
 
 @pytest.mark.asyncio

@@ -222,6 +222,29 @@ directory, SkillSpector excludes that exact file from content analysis so its
 suppression text cannot create findings or enter regenerated fingerprints;
 sibling files remain in normal scan scope.
 
+### Explicit scan scope
+
+For a local directory containing one `SKILL.md` or `skill.md`, repeat `--exclude` to omit
+selected files before content analysis:
+
+```bash
+skillspector scan ./my-skill --exclude 'tests/*' --exclude 'fixtures/*.json'
+```
+
+Patterns are case-sensitive globs matched against the entire relative POSIX path;
+`*` also matches `/`. Quote patterns so your shell does not expand them. This is
+an explicit caller option, not an author-controlled ignore file. Patterns matching
+either manifest name (`SKILL.md` or `skill.md`) are rejected, as are recursive, multi-skill, transitive, registry, and
+non-directory inputs. No-match patterns are still recorded in the report.
+
+Files already outside the scan inventory, such as policy-excluded dependencies,
+retain their existing policy handling and are not counted as caller exclusions.
+Explicitly excluded inventory files remain in the coverage denominator as entirely uninspected. The
+report lists the applied patterns, excluded count and individual skipped paths;
+any matched exclusion makes coverage partial and prevents a `SAFE` recommendation.
+Use `--fail-on-incomplete` when partial scope should fail CI. These exclusions do
+not suppress findings in included files or override existing safety limits.
+
 ### LLM Analysis
 
 For the best results, configure an OpenAI-compatible LLM endpoint for
@@ -242,7 +265,25 @@ inference gateways.
 | `claude_cli` | _(none — uses local CLI auth)_ | local `claude` binary | local Claude runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `codex_cli` | _(none — uses local CLI auth)_ | local `codex` binary | local Codex runtime fallback, or `SKILLSPECTOR_MODEL` |
 | `gemini_cli` | _(none — uses local CLI auth)_ | local `gemini` binary | local Gemini runtime fallback, or `SKILLSPECTOR_MODEL` |
-| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.31 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+| `opencode_cli` | _(none — uses local CLI auth)_ | local `opencode` 1.18.33 binary | local OpenCode runtime fallback, or `SKILLSPECTOR_MODEL` |
+
+Structured output is requested through LangChain's `with_structured_output`,
+whose default forces a tool call. Some models reject a forced tool call with
+HTTP 400 (`tool_choice: type "tool" and "any" are not supported for this
+model`). The `anthropic` and `anthropic_proxy` providers route those models
+(`claude-fable-5-1`, `claude-mythos-5-1`, or any registry entry with
+`structured_output: json_schema`) to the native JSON-schema response format.
+Bedrock has no JSON-schema output for them, so the `bedrock` provider leaves
+`toolChoice` at `auto`, asks for the tool call in the prompt, and retries a
+prose answer; it recognises the model from the model ID, a geo/global
+inference-profile ID, or a foundation-model / inference-profile ARN. An
+application-inference-profile ARN hides the model, so add that ARN to the
+registry (`SKILLSPECTOR_MODEL_REGISTRY`) with `tool_choice: auto`.
+The `openai_compatible` provider honours the same `tool_choice: auto` entry
+for endpoints that ignore both `response_format` and a forced `tool_choice`
+and answer in prose (for example iFlytek's `spark-x2.5`, which is bundled).
+`SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD=json_schema|function_calling`
+overrides the method for any provider.
 
 ```bash
 # Stock OpenAI
@@ -617,6 +658,7 @@ Issues (2)
 | `SKILLSPECTOR_COMPACT_PROMPTS` | Opt-in compact line numbering in LLM prompts: numbered lines render as `L1:`, `L2:` instead of zero-padded `L01:`, `L02:`. Accepted truthy values are `1`, `true`, and `yes` (case-insensitive; surrounding whitespace is trimmed). Unset or any other value keeps the default zero-padded format. | Optional |
 | `ANTHROPIC_API_KEY` | Credential for the Anthropic provider (`SKILLSPECTOR_PROVIDER=anthropic`). | Required for LLM analysis when `SKILLSPECTOR_PROVIDER=anthropic` |
 | `ANTHROPIC_BASE_URL` | Override the native Anthropic endpoint (default: `https://api.anthropic.com`). | Optional |
+| `ANTHROPIC_AUTH_SCHEME` | Set to `bearer` to send `ANTHROPIC_API_KEY` as `Authorization: Bearer` instead of `x-api-key`, for gateways exposing the Messages API. | Optional |
 | `ANTHROPIC_PROXY_ENDPOINT_URL` | Full endpoint URL for the Anthropic proxy provider (Vertex-style raw-predict). | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
 | `ANTHROPIC_PROXY_API_KEY` | Bearer token for the Anthropic proxy provider. | Required when `SKILLSPECTOR_PROVIDER=anthropic_proxy` |
 | `ANTHROPIC_PROXY_API_VERSION` | `anthropic_version` value sent in the request body (default: `vertex-2023-10-16`). | Optional |
@@ -635,7 +677,7 @@ Issues (2)
 
 > **CLI providers** (`claude_cli`, `codex_cli`, `gemini_cli`, `opencode_cli`): No API key is needed. Authentication is managed entirely by the agent CLI's own login session. SkillSpector never reads or forwards API keys when these providers are active. The subprocess is run with capabilities restricted, and untrusted skill content is delivered only via stdin.
 >
-> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.31`, the version whose configuration precedence and deny-all semantics are verified by this release.
+> `opencode_cli` currently fails closed unless the installed OpenCode version is exactly `1.18.33`, the version whose configuration precedence and deny-all semantics are verified by this release.
 
 ### CLI Options
 

@@ -30,11 +30,14 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import ast
 import codecs
+import functools
 import io
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import tomllib
@@ -341,95 +344,265 @@ _ABANDONED_PACKAGES: set[str] = {
 # SC6: Typosquatting — popular packages and edit-distance check
 # ---------------------------------------------------------------------------
 
-_POPULAR_PYPI: set[str] = {
-    "requests",
-    "numpy",
-    "pandas",
-    "flask",
-    "django",
-    "boto3",
-    "setuptools",
-    "pip",
-    "urllib3",
-    "pyyaml",
-    "cryptography",
-    "pillow",
-    "pydantic",
-    "sqlalchemy",
-    "pytest",
-    "click",
-    "jinja2",
-    "httpx",
-    "aiohttp",
-    "fastapi",
-    "celery",
-    "paramiko",
-    "beautifulsoup4",
-    "lxml",
-    "scrapy",
-    "redis",
-    "pymongo",
-    "psycopg2",
-    "matplotlib",
-    "scipy",
-    "scikit-learn",
-    "tensorflow",
-    "torch",
-    "keras",
-    "transformers",
-    "openai",
-    "langchain",
-    "gunicorn",
-    "uvicorn",
-    "rich",
-    "typer",
-    "black",
-    "ruff",
-    "mypy",
-    "pylint",
-    "flake8",
-    "isort",
-    "perseus-ctx",
-    "mimir-mcp",
-}
+_POPULAR_PYPI: frozenset[str] = frozenset(
+    {
+        "requests",
+        "numpy",
+        "pandas",
+        "flask",
+        "django",
+        "boto3",
+        "setuptools",
+        "pip",
+        "urllib3",
+        "pyyaml",
+        "cryptography",
+        "pillow",
+        "pydantic",
+        "sqlalchemy",
+        "pytest",
+        "click",
+        "jinja2",
+        "httpx",
+        "aiohttp",
+        "fastapi",
+        "celery",
+        "paramiko",
+        "beautifulsoup4",
+        "lxml",
+        "scrapy",
+        "redis",
+        "pymongo",
+        "psycopg2",
+        "matplotlib",
+        "scipy",
+        "scikit-learn",
+        "tensorflow",
+        "torch",
+        "keras",
+        "transformers",
+        "openai",
+        "langchain",
+        "gunicorn",
+        "uvicorn",
+        "rich",
+        "typer",
+        "black",
+        "ruff",
+        "mypy",
+        "pylint",
+        "flake8",
+        "isort",
+        "colorama",
+        "python-dateutil",
+        "discord.py",
+        "python-dotenv",
+        "pycryptodome",
+        "perseus-ctx",
+        "mimir-mcp",
+    }
+)
 
-_POPULAR_NPM: set[str] = {
-    "express",
-    "react",
-    "react-dom",
-    "next",
-    "vue",
-    "angular",
-    "lodash",
-    "axios",
-    "moment",
-    "chalk",
-    "commander",
-    "inquirer",
-    "webpack",
-    "babel",
-    "eslint",
-    "prettier",
-    "typescript",
-    "jest",
-    "mocha",
-    "chai",
-    "puppeteer",
-    "socket.io",
-    "mongoose",
-    "sequelize",
-    "passport",
-    "jsonwebtoken",
-    "dotenv",
-    "cors",
-    "body-parser",
-    "nodemon",
-    "pm2",
-}
+_POPULAR_NPM: frozenset[str] = frozenset(
+    {
+        "express",
+        "react",
+        "react-dom",
+        "next",
+        "vue",
+        "angular",
+        "lodash",
+        "axios",
+        "moment",
+        "chalk",
+        "commander",
+        "inquirer",
+        "webpack",
+        "babel",
+        "eslint",
+        "prettier",
+        "typescript",
+        "jest",
+        "mocha",
+        "chai",
+        "puppeteer",
+        "socket.io",
+        "mongoose",
+        "sequelize",
+        "passport",
+        "jsonwebtoken",
+        "dotenv",
+        "cors",
+        "body-parser",
+        "nodemon",
+        "pm2",
+        "electron",
+        "discord.js",
+        "ethers",
+        "cross-env",
+        "jquery",
+        "nodemailer",
+        "bootstrap",
+    }
+)
+
+# SC6 known-legitimate neighbours: established packages whose names fall within
+# the typosquat threshold of a _POPULAR_* entry and are never reported. Built by
+# running SC6 against the top 15,000 PyPI packages (hugovk/top-pypi-packages,
+# 30-day list) and npm-high-impact (~17,300 names). Six PyPI names that a manual
+# review keeps flagged (beautifulsoup, dydantic, httpr, pyyml, slack, xoto3) are
+# deliberately left out. The resulting 97 -> 6 (PyPI) and 26 -> 0 (npm) counts are
+# in-sample: names outside those two lists can still be flagged. Established
+# packages reported from outside the sample in review (#647) were checked one by
+# one (repository, age, downloads) and added: jets, jqueryui, bootstrap3,
+# bootstrap5 (npm), colormap, python-direnv (PyPI).
+_KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
+    {
+        "afsapi",
+        "aioftp",
+        "aiortsp",
+        "astrapy",
+        "bcpandas",
+        "blake3",
+        "boto",
+        "canvas",
+        "colormap",
+        "cpplint",
+        "crick",
+        "djangoql",
+        "djlint",
+        "fasta2a",
+        "fastai",
+        "fastar",
+        "fastui",
+        "grequests",
+        "httpx2",
+        "hyper",
+        "ipytest",
+        "j2lint",
+        "k5test",
+        "lkml",
+        "lml",
+        "mip",
+        "niquests",
+        "open3d",
+        "openapi3",
+        "openbb",
+        "opencc",
+        "opendal",
+        "openlit",
+        "openmim",
+        "openml",
+        "openmm",
+        "p4p",
+        "panda3d",
+        "pandasai",
+        "pandasql",
+        "pandoc",
+        "pantab",
+        "pid",
+        "pin",
+        "pipe",
+        "pipx",
+        "piq",
+        "piqp",
+        "psycopg",
+        "psycopg-c",
+        "pyaml",
+        "pybamm",
+        "pycryptodomex",
+        "pydbml",
+        "pygame",
+        "pygaul",
+        "pylama",
+        "pylast",
+        "pylink",
+        "pymantic",
+        "pymzml",
+        "pynacl",
+        "pynini",
+        "pynvml",
+        "pyqwest",
+        "pyrect",
+        "pysaml2",
+        "pytango",
+        "python-direnv",
+        "pytket",
+        "pytoml",
+        "rltest",
+        "ruyaml",
+        "scanpy",
+        "scapy",
+        "scipp",
+        "scramp",
+        "scrapli",
+        "scrapydo",
+        "scrypt",
+        "shyaml",
+        "sip",
+        "sodapy",
+        "syrupy",
+        "tclint",
+        "tensorflowjs",
+        "tftest",
+        "torchx",
+        "unicon",
+        "unicorn",
+        "usort",
+        "vastai",
+        "vyper",
+        "willow",
+        "x-transformers",
+    }
+)
+
+_KNOWN_LEGIT_NPM: frozenset[str] = frozenset(
+    {
+        "angular2",
+        "bootstrap3",
+        "bootstrap5",
+        "chat",
+        "commondir",
+        "commoner",
+        "crossvent",
+        "cypress",
+        "docdash",
+        "dtslint",
+        "electrodb",
+        "enquirer",
+        "esquery",
+        "expresso",
+        "ext",
+        "gaxios",
+        "getenv",
+        "jets",
+        "jqueryui",
+        "jshint",
+        "jslint",
+        "keypress",
+        "mquery",
+        "net",
+        "nuxt",
+        "oxlint",
+        "preact",
+        "radash",
+        "react-dnd",
+        "test",
+        "tether",
+        "tslint",
+        "ttypescript",
+        "vm2",
+        "vuex",
+    }
+)
 
 
 def _edit_distance(a: str, b: str) -> int:
-    """Compute Levenshtein edit distance between two strings."""
+    """Compute Levenshtein edit distance between two strings.
+
+    SC6 now uses ``_osa_distance``; this plain Levenshtein is kept as the
+    reference the unit tests compare it against (a swap counts as two edits).
+    """
     if len(a) < len(b):
         return _edit_distance(b, a)
     if len(b) == 0:
@@ -444,18 +617,90 @@ def _edit_distance(a: str, b: str) -> int:
     return prev_row[-1]
 
 
-def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> str | None:
-    """Return the popular package name if pkg_name is a close-but-not-exact match."""
-    normalized = pkg_name.lower().replace("_", "-")
+def _osa_distance(a: str, b: str) -> int:
+    """Optimal string alignment distance between two strings.
+
+    Levenshtein plus adjacent transpositions: swapping two neighbouring
+    characters ("recat" vs "react") is a single typing slip, so it counts as
+    one edit instead of two. Short transposition typosquats then pass the
+    relative-distance guard in ``_is_typosquat``.
+    """
+    rows, cols = len(a) + 1, len(b) + 1
+    d = [[0] * cols for _ in range(rows)]
+    for i in range(rows):
+        d[i][0] = i
+    for j in range(cols):
+        d[0][j] = j
+    for i in range(1, rows):
+        for j in range(1, cols):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[-1][-1]
+
+
+def _typosquat_normalize(name: str, pep503: bool) -> str:
+    """Normalize a package name for SC6 comparisons.
+
+    PyPI treats runs of ``-``, ``_`` and ``.`` as equivalent (PEP 503), so
+    ``discord-py`` *is* ``discord.py``. npm does not (``socket-io`` and
+    ``socket.io`` are distinct packages), so npm keeps the historical rule.
+    """
+    if pep503:
+        return re.sub(r"[-_.]+", "-", name).lower()
+    return name.lower().replace("_", "-")
+
+
+@functools.lru_cache(maxsize=32)
+def _typosquat_targets(names: frozenset[str], pep503: bool) -> tuple[tuple[str, str], ...]:
+    """Return ``(name, normalized name)`` pairs sorted by name, once per name set.
+
+    SC6 runs for every dependency, so normalizing and sorting the popular and
+    known-legitimate sets on each call used to dominate the per-scan cost.
+    """
+    return tuple(sorted((name, _typosquat_normalize(name, pep503)) for name in names))
+
+
+@functools.lru_cache(maxsize=32)
+def _typosquat_normalized_set(names: frozenset[str], pep503: bool) -> frozenset[str]:
+    """Return the normalized names of ``names`` (cached, see ``_typosquat_targets``)."""
+    return frozenset(norm for _, norm in _typosquat_targets(names, pep503))
+
+
+def _is_typosquat(
+    pkg_name: str,
+    popular: set[str],
+    max_distance: int = 2,
+    *,
+    known_legit: frozenset[str] = frozenset(),
+    pep503: bool = False,
+) -> str | None:
+    """Return the popular package name if pkg_name is a close-but-not-exact match.
+
+    ``known_legit`` lists established packages whose names happen to fall
+    within the threshold of a popular one (``psycopg`` vs ``psycopg2``,
+    ``preact`` vs ``react``); they are never reported.
+    """
+    normalized = _typosquat_normalize(pkg_name, pep503)
+    popular_set = popular if isinstance(popular, frozenset) else frozenset(popular)
+    legit_set = known_legit if isinstance(known_legit, frozenset) else frozenset(known_legit)
     # A known package must win over any earlier, similar name (e.g. gunicorn
     # sorts before uvicorn). Apply the same normalization on both sides.
-    if any(normalized == name.lower().replace("_", "-") for name in popular):
+    if normalized in _typosquat_normalized_set(popular_set, pep503):
         return None
-    for popular_name in sorted(popular):
-        pop_norm = popular_name.lower().replace("_", "-")
-        if len(normalized) < 3 or len(pop_norm) < 3:
+    if normalized in _typosquat_normalized_set(legit_set, pep503):
+        return None
+    if len(normalized) < 3:
+        return None
+    for popular_name, pop_norm in _typosquat_targets(popular_set, pep503):
+        if len(pop_norm) < 3:
             continue
-        dist = _edit_distance(normalized, pop_norm)
+        # OSA distance is never below the length difference, so this skip is
+        # exact and avoids the quadratic distance computation for most pairs.
+        if abs(len(normalized) - len(pop_norm)) > max_distance:
+            continue
+        dist = _osa_distance(normalized, pop_norm)
         if not 0 < dist <= max_distance:
             continue
         # Relative-distance guard: a genuine typosquat perturbs only a small
@@ -463,8 +708,8 @@ def _is_typosquat(pkg_name: str, popular: set[str], max_distance: int = 2) -> st
         # under an absolute distance of 2 (e.g. "task" is edit-distance 2 from
         # "flask" yet is a real package) and are not typosquats. Require
         # dist/len <= 1/3, so short names need an all-but-one-character match
-        # while longer names may still differ by two (e.g. "reqeusts" vs
-        # "requests").
+        # while longer names may still differ by two (e.g. "reqeuts" vs
+        # "requests": one swap plus one deletion).
         shorter = min(len(normalized), len(pop_norm))
         if dist * 3 > shorter:
             continue
@@ -624,19 +869,6 @@ _DESCRIPTION_TRIGGER_PHRASE_RE = re.compile(
     r"['\"]?(?P<phrase>[A-Za-z][\w-]*(?:\s+[A-Za-z][\w-]*){0,7})['\"]?",
     re.IGNORECASE,
 )
-
-# Trailing discourse words that modify the utterance rather than name trigger
-# content. When the captured phrase is a broad single word followed only by
-# these deictics ("says hello there"), the skill names the broad word and the
-# rest is trailing prose, so TR1 still fires; a content word after the broad
-# word ("code review", "the zone") names a multiword phrase and stays TR1
-# negative, matching the legacy trigger grammar.
-_DESCRIPTION_TRAILING_DISCOURSE_WORDS: set[str] = {
-    "there",
-    "here",
-    "now",
-    "then",
-}
 
 # Bare universal-scope statements: the whole clause is a catch-all scope
 # ("all messages"), which the legacy trigger grammar also flags as TR3.
@@ -1523,7 +1755,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 file_type,
                 line_starts,
             )
-            if _is_safe_supply_chain_pattern(mt):
+            data_consumer = _interpreter_reads_stdin_as_data(
+                content,
+                match.start(),
+                line_starts,
+            )
+            if _is_safe_supply_chain_pattern(mt) or data_consumer:
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:
@@ -1532,31 +1769,43 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             finding_tags = list(tag)
             if warned_internal_installer:
                 finding_tags.extend(["contextual-triage", "explicit-risk-warning"])
+            if data_consumer:
+                finding_tags.append("data-only-stdin-consumer")
+            if warned_internal_installer:
+                message = "Warned Pipe-to-Shell Installer"
+                remediation = (
+                    "Keep the warning adjacent to this command. Prefer a checksum, signature, "
+                    "or inspect-before-execute flow instead of piping fetched content directly "
+                    "to a shell."
+                )
+                explanation = (
+                    "The matched documentation explicitly warns that an internal installer "
+                    "is fetched and piped directly to a shell. The warning provides context, "
+                    "but the command still executes remote code without an inspection step."
+                )
+            elif data_consumer:
+                message = "Inline Program Reads Download as Data"
+                remediation = (
+                    "Prefer structured data formats and validate the fetched content before "
+                    "using it in a program."
+                )
+                explanation = (
+                    "The fetched content is parsed as data by the interpreter program supplied "
+                    "on the command line; the download is not executed as a script."
+                )
+            else:
+                message = "External Script Fetching"
+                remediation = None
+                explanation = None
             findings.append(
                 AnalyzerFinding(
                     rule_id="SC2",
-                    message=(
-                        "Warned Pipe-to-Shell Installer"
-                        if warned_internal_installer
-                        else "External Script Fetching"
-                    ),
+                    message=message,
                     severity=sev,
                     location=loc(line_num),
                     confidence=adj,
-                    remediation=(
-                        "Keep the warning adjacent to this command. Prefer a checksum, signature, "
-                        "or inspect-before-execute flow instead of piping fetched content directly "
-                        "to a shell."
-                        if warned_internal_installer
-                        else None
-                    ),
-                    explanation=(
-                        "The matched documentation explicitly warns that an internal installer "
-                        "is fetched and piped directly to a shell. The warning provides context, "
-                        "but the command still executes remote code without an inspection step."
-                        if warned_internal_installer
-                        else None
-                    ),
+                    remediation=remediation,
+                    explanation=explanation,
                     tags=finding_tags,
                     context=ctx(match.start()),
                     matched_text=mt[:200],
@@ -1702,6 +1951,238 @@ def _is_trusted_source(text: str) -> bool:
 def _is_safe_supply_chain_pattern(text: str) -> bool:
     """Return True when the matched text is a known-safe install or fetch pattern."""
     return _is_trusted_source(text) or bool(_SAFE_INSTALL_PATTERN.search(text))
+
+
+# A fetched program supplied on the interpreter command line leaves the
+# download as data on stdin.  Every other shape stays HIGH.
+_MAX_SC2_LOGICAL_LINE_CHARS = 4_096
+_PYTHON_SAFE_CALLS = frozenset(
+    {
+        "bool",
+        "dict",
+        "float",
+        "int",
+        "json.dump",
+        "json.dumps",
+        "json.load",
+        "json.loads",
+        "len",
+        "list",
+        "print",
+        "str",
+        "sys.stderr.write",
+        "sys.stdin.buffer.read",
+        "sys.stdin.buffer.readline",
+        "sys.stdin.read",
+        "sys.stdin.readline",
+        "sys.stdout.write",
+    }
+)
+_PYTHON_SAFE_CALL_ROOTS = frozenset(name.split(".", 1)[0] for name in _PYTHON_SAFE_CALLS)
+_PYTHON_SAFE_ATTRIBUTES = frozenset(
+    {
+        "buffer",
+        "dump",
+        "dumps",
+        "load",
+        "loads",
+        "read",
+        "readline",
+        "stderr",
+        "stdin",
+        "stdout",
+        "write",
+    }
+)
+_PYTHON_DANGEROUS = re.compile(
+    r"\b(?:exec|eval|compile|execfile|__import__|getattr|setattr|delattr|"
+    r"globals|locals|vars|open|input|system|popen|spawn\w*|runpy|pickle|"
+    r"marshal|dill|shelve|importlib|subprocess|os)\b|__"
+)
+_PYTHON_BINDING_NODES = (
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.FunctionDef,
+    ast.Global,
+    ast.Lambda,
+    ast.Nonlocal,
+)
+
+
+def _sc2_logical_command(
+    content: str,
+    match_start: int,
+    line_starts: tuple[int, ...],
+) -> str | None:
+    """Return the shell logical line containing *match_start*, if it starts it."""
+    line_index = bisect_right(line_starts, match_start) - 1
+    if line_index < 0:
+        return None
+    line_start = line_starts[line_index]
+
+    # Walk back only across escaped shell newlines after locating the current
+    # logical line in O(log n).  Any other logical break is not a shell
+    # command boundary and makes the exemption unsafe.
+    while line_index > 0:
+        separator_start = (
+            line_start - 2
+            if line_start >= 2 and content[line_start - 2 : line_start] == "\r\n"
+            else line_start - 1
+        )
+        separator = LOGICAL_LINE_BREAK.match(content, separator_start)
+        if separator is None:
+            return None
+        if separator.group(0) not in {"\n", "\r\n"}:
+            return None
+        if separator_start == 0 or content[separator_start - 1] != "\\":
+            break
+        line_index -= 1
+        line_start = line_starts[line_index]
+        if match_start - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+            return None
+
+    if match_start - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+        return None
+
+    line_end = len(content)
+    search_pos = match_start
+    search_end = min(len(content), line_start + _MAX_SC2_LOGICAL_LINE_CHARS + 1)
+    while search_pos <= len(content):
+        separator = LOGICAL_LINE_BREAK.search(content, search_pos, search_end)
+        if separator is None:
+            if len(content) - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+                return None
+            break
+        if separator.group(0) not in {"\n", "\r\n"}:
+            return None
+        if separator.start() > 0 and content[separator.start() - 1] == "\\":
+            search_pos = separator.end()
+            if search_pos - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+                return None
+            continue
+        line_end = separator.start()
+        break
+
+    if line_end - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+        return None
+
+    # Only lower a pipeline that begins the logical line.  This rejects
+    # command substitutions, wrappers such as ``bash -c``, and ``eval``.
+    if content[line_start:match_start].strip():
+        return None
+    command = content[line_start:line_end]
+    return re.sub(r"\\\r?\n", " ", command)
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    """Tokenize a conservative subset of shell syntax, or return None."""
+    if re.search(r"[`$]", command):
+        return None
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _dotted_name(node: ast.expr) -> str | None:
+    """Return a dotted name for ``a.b.c`` expressions, otherwise None."""
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _python_stdin_script_is_data_only(script: str) -> bool:
+    """Return whether a Python ``-c`` script only treats stdin as data.
+
+    This is deliberately a structural allowlist rather than a name-based
+    denylist.  Rebinding an allowlisted call root, any attribute or subscript
+    store, and any attribute outside the small data-processing allowlist makes
+    the script ambiguous and therefore ineligible for the SC2 downgrade.
+    """
+    if not script.strip() or len(script) > _MAX_SC2_LOGICAL_LINE_CHARS:
+        return False
+    try:
+        tree = ast.parse(script, mode="exec")
+    except (SyntaxError, ValueError):
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, _PYTHON_BINDING_NODES):
+            return False
+        if isinstance(node, ast.Import):
+            if any(alias.name not in {"json", "sys"} or alias.asname for alias in node.names):
+                return False
+        elif isinstance(node, ast.ImportFrom):
+            return False
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                if node.id in _PYTHON_SAFE_CALL_ROOTS or node.id.startswith("__"):
+                    return False
+            elif _PYTHON_DANGEROUS.search(node.id):
+                return False
+        elif isinstance(node, ast.Attribute):
+            if node.attr not in _PYTHON_SAFE_ATTRIBUTES:
+                return False
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                return False
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                return False
+        elif isinstance(node, ast.Call):
+            name = _dotted_name(node.func)
+            if name is None or name not in _PYTHON_SAFE_CALLS:
+                return False
+    return True
+
+
+def _interpreter_reads_stdin_as_data(
+    content: str,
+    match_start: int,
+    line_starts: tuple[int, ...],
+) -> bool:
+    """Return whether the piped-to interpreter receives a command-line program."""
+    command = _sc2_logical_command(content, match_start, line_starts)
+    if command is None:
+        return False
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return False
+    if any(
+        token in {"|&", "||", "&&", ";", "&", "<", ">", ">>", "<<", "(", ")"} for token in tokens
+    ):
+        return False
+    pipes = [index for index, token in enumerate(tokens) if token == "|"]
+    if len(pipes) != 1:
+        return False
+
+    pipe_index = pipes[0]
+    fetch = tokens[:pipe_index]
+    tail = tokens[pipe_index + 1 :]
+    if not fetch or fetch[0].lower() not in {"curl", "wget"}:
+        return False
+    if tail[:1] == ["sudo"]:
+        tail = tail[1:]
+    if not tail:
+        return False
+
+    interpreter = tail[0].lower()
+    args = tail[1:]
+    if interpreter in {"python", "python3"}:
+        return args == ["-m", "json.tool"] or (
+            len(args) == 2 and args[0] == "-c" and _python_stdin_script_is_data_only(args[1])
+        )
+    # Node remains HIGH: arbitrary JavaScript cannot be proven data-only by
+    # this lightweight allowlist (computed properties can recover Function).
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1961,6 +2442,7 @@ def _analyze_dependencies_detailed(
         ecosystem = ECOSYSTEM_PYPI
         fallback_db = _FALLBACK_VULNERABLE_PYPI
         popular = _POPULAR_PYPI
+        known_legit = _KNOWN_LEGIT_PYPI
     else:
         if is_npm_lock:
             packages = _extract_packages_from_npm_lock(content, limit=extraction_limit)
@@ -1973,6 +2455,7 @@ def _analyze_dependencies_detailed(
         ecosystem = ECOSYSTEM_NPM
         fallback_db = _FALLBACK_VULNERABLE_NPM
         popular = _POPULAR_NPM
+        known_legit = _KNOWN_LEGIT_NPM
 
     if len(packages) > package_limit:
         limitations.append(
@@ -2087,7 +2570,12 @@ def _analyze_dependencies_detailed(
             )
 
         # SC6: Typosquatting
-        similar = _is_typosquat(pkg_name, popular)
+        similar = _is_typosquat(
+            pkg_name,
+            popular,
+            known_legit=known_legit,
+            pep503=ecosystem == ECOSYSTEM_PYPI,
+        )
         if similar:
             retain(
                 [
@@ -2256,17 +2744,11 @@ def _analyze_triggers(
             phrase = phrase_match.group("phrase")
             phrase_lower = phrase.lower()
             phrase_words = phrase_lower.split()
-            # A broad word followed only by trailing discourse words names
-            # the broad word ("says hello there"); anything else multiword
-            # names a phrase and is not an overly broad single-word trigger.
-            broad_head_with_prose_tail = (
-                len(phrase_words) > 1
-                and phrase_words[0] in _OVERLY_BROAD_SINGLE_WORDS
-                and all(word in _DESCRIPTION_TRAILING_DISCOURSE_WORDS for word in phrase_words[1:])
-            )
-            if (
-                len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS
-            ) or broad_head_with_prose_tail:
+            # A multiword phrase names the complete bounded wording, even
+            # when its final word could also be read as discourse prose. In
+            # particular, "go there" and "work now" are valid phrases and
+            # must not be reduced to the broad heads "go" and "work".
+            if len(phrase_words) == 1 and phrase_lower in _OVERLY_BROAD_SINGLE_WORDS:
                 broad_word = phrase_words[0]
                 findings.append(
                     Finding(

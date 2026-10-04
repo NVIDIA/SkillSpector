@@ -260,6 +260,21 @@ class TestExcessiveAgency:
             "selection_key": key,
         }
 
+    def test_ea5_frontmatter_pin_detected_through_leading_bom(self) -> None:
+        """A BOM-prefixed SKILL.md must not hide the frontmatter model pin."""
+        content = "\ufeff---\nname: example\nmodel: claude-sonnet-4-6\n---\n\n# Example\n"
+        findings = ea_mod.analyze(content, "SKILL.md", "markdown")
+        ea5 = [finding for finding in findings if finding.rule_id == "EA5"]
+        assert len(ea5) == 1
+        assert ea5[0].severity == Severity.MEDIUM
+        # The BOM is matched, not stripped, so offsets still index the original
+        # content and the reported line matches the no-BOM case exactly.
+        assert ea5[0].location.start_line == 3
+        assert ea5[0].evidence == {
+            "selection_surface": "frontmatter",
+            "selection_key": "model",
+        }
+
     def test_ea5_frontmatter_identity_uses_the_complete_declaration(self) -> None:
         shared = "gpt-" + "a" * 220
         findings = [
@@ -1903,10 +1918,39 @@ class TestRogueAgent:
                 "shell",
                 id="registry_key",
             ),
+            pytest.param(
+                "cp agent.plist ~/Library/LaunchAgents/com.example.agent.plist",
+                "install.sh",
+                "shell",
+                id="launch_agent_plist",
+            ),
+            pytest.param("write_plist(path, data)", "setup.py", "python", id="snake_case_plist"),
         ],
     )
     def test_ra2_detected(self, content: str, filename: str, filetype: str) -> None:
         assert any(f.rule_id == "RA2" for f in ra_mod.analyze(content, filename, filetype))
+
+    @pytest.mark.parametrize(
+        "content,filename,filetype",
+        [
+            pytest.param(
+                "var relationshipList = document.getElementById('list');",
+                "template.html",
+                "other",
+                id="camel_case_identifier",
+            ),
+            pytest.param(
+                '<xsd:complexType name="CT_GradientStopList">',
+                "dml-main.xsd",
+                "other",
+                id="xsd_type_name",
+            ),
+        ],
+    )
+    def test_ra2_plist_substring_inside_identifier_not_detected(
+        self, content: str, filename: str, filetype: str
+    ) -> None:
+        assert not any(f.rule_id == "RA2" for f in ra_mod.analyze(content, filename, filetype))
 
     def test_safe_content_produces_no_findings(self) -> None:
         findings = ra_mod.analyze(
@@ -2061,6 +2105,13 @@ class TestSupplyChainDependencies:
         ]
         assert len(sc6) >= 1
         assert "requests" in sc6[0].message
+
+    def test_sc6_known_legit_neighbours_not_flagged(self) -> None:
+        pypi = _analyze_deps("psycopg==3.2.0\npynacl==1.5.0\n", "requirements.txt")
+        assert [f for f in pypi if f.rule_id == "SC6"] == []
+        content = '{"dependencies": {"preact": "10.0.0", "gaxios": "6.0.0"}}'
+        npm = _analyze_deps(content, "package.json")
+        assert [f for f in npm if f.rule_id == "SC6"] == []
 
     def test_sc6_typosquat_npm(self) -> None:
         content = '{\n  "dependencies": {\n    "expreess": "4.18.0"\n  }\n}'
@@ -2469,24 +2520,16 @@ class TestTriggerAnalysis:
         assert len(tr1) == 1
         assert "hello" in tr1[0].message
 
-    @pytest.mark.parametrize(
-        "trailing",
-        [
-            pytest.param("there", id="there"),
-            pytest.param("here", id="here"),
-        ],
-    )
-    def test_description_broad_word_with_trailing_prose_reaches_tr1(self, trailing: str) -> None:
-        """MohammedAlkindi #541: a broad word followed by trailing discourse
-        prose still names the broad word ("says hello there"), so TR1 fires.
-        Fixtures must not all end on the trigger phrase."""
+    @pytest.mark.parametrize("phrase", ["go there", "work now", "hello there", "hello here"])
+    def test_description_bounded_phrase_with_discourse_word_stays_negative(
+        self, phrase: str
+    ) -> None:
+        """#609: a discourse-looking tail must not shrink a phrase to its head."""
         findings = sc_mod._analyze_triggers(
-            {"description": ("Use this skill whenever the user says hello " + trailing)},
+            {"description": f"Use this skill whenever the user says {phrase}"},
             "myskill",
         )
-        tr1 = [finding for finding in findings if finding.rule_id == "TR1"]
-        assert len(tr1) == 1
-        assert "activates on 'hello'" in tr1[0].message
+        assert not any(finding.rule_id == "TR1" for finding in findings), phrase
 
     def test_description_article_not_skipped_as_filler(self) -> None:
         """MohammedAlkindi #541: bare articles are not filler words, so the
@@ -2646,6 +2689,18 @@ class TestSupplyChainHelpers:
     def test_is_typosquat_exact_match_returns_none(self) -> None:
         assert sc_mod._is_typosquat("requests", {"requests"}) is None
 
+    def test_is_typosquat_length_difference_boundary(self):
+        # The length-difference skip is exact (OSA distance >= length difference).
+        # A difference of 2 is still within max_distance, a difference of 3 is not;
+        # a ">" -> ">=" slip in the skip would make the first assertion fail.
+        assert sc_mod._is_typosquat("requestsxx", {"requests"}) == "requests"
+        assert sc_mod._is_typosquat("requestsxxx", {"requests"}) is None
+
+    def test_popular_sets_are_frozensets(self):
+        # Module-level target sets are frozensets, so the target cache hits on identity.
+        assert isinstance(sc_mod._POPULAR_PYPI, frozenset)
+        assert isinstance(sc_mod._POPULAR_NPM, frozenset)
+
     @pytest.mark.parametrize(
         "package,popular",
         [
@@ -2659,6 +2714,92 @@ class TestSupplyChainHelpers:
         self, package: str, popular: set[str]
     ) -> None:
         assert sc_mod._is_typosquat(package, popular) is None
+
+    @staticmethod
+    def _sc6(package: str, ecosystem: str) -> str | None:
+        if ecosystem == "pypi":
+            return sc_mod._is_typosquat(
+                package,
+                sc_mod._POPULAR_PYPI,
+                known_legit=sc_mod._KNOWN_LEGIT_PYPI,
+                pep503=True,
+            )
+        return sc_mod._is_typosquat(
+            package, sc_mod._POPULAR_NPM, known_legit=sc_mod._KNOWN_LEGIT_NPM
+        )
+
+    def test_osa_distance_counts_adjacent_swap_once(self) -> None:
+        assert sc_mod._osa_distance("recat", "react") == 1
+        assert sc_mod._osa_distance("requests", "requests") == 0
+        assert sc_mod._osa_distance("reqeuts", "requests") == 2
+        # Plain Levenshtein still counts the swap as two edits.
+        assert sc_mod._edit_distance("recat", "react") == 2
+
+    @pytest.mark.parametrize(
+        "package,ecosystem,expected",
+        [
+            pytest.param("recat", "npm", "react", id="short_swap_react"),
+            pytest.param("axois", "npm", "axios", id="short_swap_axios"),
+            pytest.param("electorn", "npm", "electron", id="electron"),
+            pytest.param("ethres", "npm", "ethers", id="ethers"),
+            pytest.param("crossenv", "npm", "cross-env", id="cross_env"),
+            pytest.param("discordjs", "npm", "discord.js", id="npm_dot_is_distinct"),
+            pytest.param("socket-io", "npm", "socket.io", id="npm_hyphen_is_distinct"),
+            pytest.param("colourama", "pypi", "colorama", id="colorama"),
+            pytest.param("python-dotnev", "pypi", "python-dotenv", id="python_dotenv"),
+            pytest.param("pycryptodom", "pypi", "pycryptodome", id="pycryptodome"),
+        ],
+    )
+    def test_is_typosquat_detects_known_patterns(
+        self, package: str, ecosystem: str, expected: str
+    ) -> None:
+        assert self._sc6(package, ecosystem) == expected
+
+    @pytest.mark.parametrize(
+        "package,ecosystem",
+        [
+            pytest.param("pynacl", "pypi", id="pynacl"),
+            pytest.param("psycopg", "pypi", id="psycopg"),
+            pytest.param("pipx", "pypi", id="pipx"),
+            pytest.param("boto", "pypi", id="boto"),
+            pytest.param("pycryptodomex", "pypi", id="pycryptodomex"),
+            pytest.param("gaxios", "npm", id="gaxios"),
+            pytest.param("preact", "npm", id="preact"),
+            pytest.param("cypress", "npm", id="cypress"),
+            pytest.param("nuxt", "npm", id="nuxt"),
+            pytest.param("tether", "npm", id="tether"),
+            pytest.param("jets", "npm", id="jets"),
+            pytest.param("jqueryui", "npm", id="jqueryui"),
+            pytest.param("bootstrap3", "npm", id="bootstrap3"),
+            pytest.param("bootstrap5", "npm", id="bootstrap5"),
+            pytest.param("colormap", "pypi", id="colormap"),
+            pytest.param("python-direnv", "pypi", id="python_direnv"),
+        ],
+    )
+    def test_is_typosquat_known_legit_not_flagged(self, package: str, ecosystem: str) -> None:
+        assert self._sc6(package, ecosystem) is None
+
+    def test_is_typosquat_known_legit_is_needed(self) -> None:
+        # Without the list, an established package collides with a popular one.
+        assert sc_mod._is_typosquat("pynacl", sc_mod._POPULAR_PYPI) == "pyyaml"
+
+    @pytest.mark.parametrize("package", ["discord-py", "discord_py", "Discord.Py"])
+    def test_is_typosquat_pep503_equivalent_not_flagged(self, package: str) -> None:
+        assert self._sc6(package, "pypi") is None
+
+    def test_is_typosquat_sees_changes_to_a_mutable_set(self) -> None:
+        # Normalized targets are cached per set *content*, not per object.
+        popular = {"requests"}
+        assert sc_mod._is_typosquat("flaks", popular) is None
+        popular.add("flask")
+        assert sc_mod._is_typosquat("flaks", popular) == "flask"
+
+    def test_known_legit_disjoint_from_popular(self) -> None:
+        for popular, legit in (
+            (sc_mod._POPULAR_PYPI, sc_mod._KNOWN_LEGIT_PYPI),
+            (sc_mod._POPULAR_NPM, sc_mod._KNOWN_LEGIT_NPM),
+        ):
+            assert not ({n.lower() for n in popular} & {n.lower() for n in legit})
 
     def test_is_typosquat_too_distant_returns_none(self) -> None:
         assert sc_mod._is_typosquat("completely_different", {"requests"}) is None

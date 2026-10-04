@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import json
 
-from skillspector.nodes.analyzers.mcp_rug_pull import node
+import pytest
+
+from skillspector.nodes.analyzers.mcp_rug_pull import _strip_yaml_comment, node
 from skillspector.nodes.build_context import build_context
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.nodes.report import report
 from skillspector.state import SkillspectorState
 
 
@@ -47,6 +50,11 @@ def test_rp1_npx_unpinned():
     rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
     assert len(rp1) == 1
     assert "npx @scope/mcp-server" in rp1[0].matched_text
+    issue = json.loads(report({"filtered_findings": rp1, "output_format": "json"})["report_body"])[
+        "issues"
+    ][0]
+    assert issue["pattern"] == rp1[0].message
+    assert issue["finding"] == "npx @scope/mcp-server"
 
 
 def test_rp1_npx_match_does_not_cross_lines():
@@ -103,6 +111,107 @@ def test_rp1_yaml_mcp_config_pinned_no_finding():
         assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
 
 
+@pytest.mark.parametrize(
+    "layout",
+    [
+        'mcpServers:\n  fs:\n    command: npx\n    env:\n      FOO: bar\n    args: ["-y", "PACKAGE"]\n',
+        'mcpServers:\n  fs:\n    command: npx\n    type: stdio\n    cwd: /tmp\n    description: server\n    args: ["-y", "PACKAGE"]\n',
+        'servers:\n  - command: npx\n    args: ["-y", "PACKAGE"]\n',
+        'servers:\n  - command: pnpx\n    type: stdio\n    args:\n      - "-y"\n      - "PACKAGE"\n',
+        'mcpServers:\n  fs:\n    args: ["-y", "PACKAGE"]\n    env: {}\n    command: npx\n',
+        'mcpServers:\n  fs:\n    args:\n      - "-y"\n      - "PACKAGE"\n    command: npx\n',
+        'servers:\n  - args: ["-y", "PACKAGE"]\n    command: npx\n',
+        'servers:\n  - name: fs\n    args:\n      - "-y"\n      - "PACKAGE"\n    command: npx\n',
+        'mcpServers:\n  fs:\n    command: /usr/local/bin/npx\n    args: ["-y", "PACKAGE"]\n',
+        'mcpServers:\n  fs:\n    args: ["-y", "PACKAGE"]\n    command: "./node_modules/.bin/pnpx"\n',
+    ],
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_rp1_yaml_sibling_layouts_preserve_pin_behavior(layout, pinned):
+    package = "@scope/server@1.2.3" if pinned else "@scope/server"
+    content = layout.replace("PACKAGE", package)
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (0 if pinned else 1)
+    if rp1:
+        assert "@scope/server" in rp1[0].matched_text
+        assert rp1[0].start_line == next(
+            index for index, line in enumerate(content.splitlines(), 1) if "command:" in line
+        )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        'args: # "@scope/server@1.2.3"\n      - "@scope/server"',
+        'args:\n      - "-y" # "decoy@1.2.3"\n      - "@scope/server"',
+        'args: ["@scope/server"] # "decoy@1.2.3"',
+    ],
+)
+def test_rp1_yaml_comments_cannot_supply_a_fake_package_pin(args):
+    content = "mcpServers:\n  fs:\n    command: npx\n    " + args + "\n"
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'servers:\n  - command: npx\n  - args: ["@scope/server"]\n',
+        'servers:\n  - args: ["@scope/server"]\n  - command: npx\n',
+        'mcpServers:\n  first:\n    command: npx\n  second:\n    args: ["@scope/server"]\n',
+        'mcpServers:\n  first:\n    args: ["@scope/server"]\n  second:\n    command: npx\n',
+        'mcpServers:\n  fs:\n    command: npx\n    env:\n      args: ["@scope/server"]\n',
+    ],
+)
+def test_rp1_yaml_does_not_bind_args_from_another_mapping(content):
+    assert not [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+
+
+@pytest.mark.parametrize("direction", ["before", "after"])
+@pytest.mark.parametrize("distance", [8, 9])
+def test_rp1_yaml_sibling_search_remains_bounded(direction, distance):
+    command = "    command: npx\n"
+    args = '    args: ["@scope/server"]\n'
+    intervening = "    # unrelated config comment\n" * (distance - 1)
+    pair = args + intervening + command if direction == "before" else command + intervening + args
+    content = "mcpServers:\n  fs:\n" + pair
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == (1 if distance == 8 else 0)
+
+
+def test_rp1_yaml_nested_pinned_args_do_not_hide_sibling_package():
+    content = (
+        "servers:\r\n  - command: npx\r\n    env:\r\n"
+        '      args: ["decoy@1.2.3"]\r\n    args: ["@scope/server"]\r\n'
+    )
+    rp1 = [
+        f for f in node(_state(file_cache={"mcp.yaml": content}))["findings"] if f.rule_id == "RP1"
+    ]
+    assert len(rp1) == 1
+    assert rp1[0].start_line == 2
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('"pkg#fragment" # "decoy@1.2.3"', '"pkg#fragment" '),
+        ("'it''s # quoted' # tail", "'it''s # quoted' "),
+        ('"escaped\\" # quoted" # tail', '"escaped\\" # quoted" '),
+        ("pkg#fragment", "pkg#fragment"),
+    ],
+)
+def test_yaml_comment_stripping_preserves_quoted_content(line, expected):
+    assert _strip_yaml_comment(line) == expected
+
+
 def test_rp1_npx_still_matches_flags_on_the_same_line():
     """Common npx flags remain supported after restricting whitespace."""
     result = node(_state(file_cache={"setup.sh": "npx -y @scope/mcp-server\n"}))
@@ -144,6 +253,32 @@ def test_rp1_npx_pinned_no_finding():
     assert len(rp1) == 0
 
 
+def test_rp1_unrelated_version_pin_does_not_suppress():
+    """A pin on another argument or command on the same line does not pin the package."""
+    for content, expected in (
+        ("npx evil-package --label helper@1.2.3\n", "npx evil-package"),
+        ("npx @scope/mcp-server http://localhost:3000/sse\n", "npx @scope/mcp-server"),
+        ("npx @scope/server-a && npx @scope/server-b@1.2.3\n", "npx @scope/server-a"),
+        ("uvx my-mcp-server --with helper==1.2.3\n", "uvx my-mcp-server"),
+        ("pip install my-mcp-server other-package==1.2.3\n", "pip install my-mcp-server"),
+    ):
+        result = node(_state(file_cache={"setup.sh": content}))
+        rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
+        assert [f.matched_text for f in rp1] == [expected], content
+
+
+def test_rp1_version_pin_attached_to_package_no_finding():
+    """A pin attached to the package operand still counts when other arguments follow."""
+    for content in (
+        "npx -y @scope/mcp-server@1.2.3 --label helper\n",
+        "npx -p @scope/mcp-server@1.2.3 mcp-server\n",
+        "uvx my-mcp-server==1.2.3 --host 127.0.0.1:8000\n",
+        "pip install my-mcp-server[cli]==1.2.3\n",
+    ):
+        result = node(_state(file_cache={"setup.sh": content}))
+        assert not [f for f in result["findings"] if f.rule_id == "RP1"], content
+
+
 def test_rp1_uvx_unpinned():
     """RP1 detects uvx without ==version."""
     result = node(
@@ -175,6 +310,27 @@ def test_rp1_docker_unpinned():
     )
     rp1 = [f for f in result2["findings"] if f.rule_id == "RP1"]
     assert len(rp1) >= 1
+
+
+def test_rp1_docker_credentials_are_redacted_in_reports():
+    result = node(
+        _state(
+            file_cache={
+                "setup.sh": "docker pull https://deploy:s3cret@registry.example.com/team/image"
+            }
+        )
+    )
+    rp1 = [f for f in result["findings"] if f.rule_id == "RP1"]
+    assert len(rp1) == 1
+
+    json_body = report({"filtered_findings": rp1, "output_format": "json"})["report_body"]
+    issue = json.loads(json_body)["issues"][0]
+    assert "https://***@registry.example.com" in issue["pattern"]
+    assert "https://***@registry.example.com" in issue["finding"]
+    sarif_body = report({"filtered_findings": rp1, "output_format": "sarif"})["report_body"]
+    for body in (json_body, sarif_body):
+        assert "deploy:s3cret" not in body
+        assert "s3cret" not in body
 
 
 def test_rp1_multiple_patterns():

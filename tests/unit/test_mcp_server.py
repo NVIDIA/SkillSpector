@@ -16,7 +16,6 @@
 """Tests for the MCP server wrapper (run_scan core + scan_skill tool)."""
 
 import asyncio
-import importlib
 import json
 import os
 import sys
@@ -58,6 +57,42 @@ async def test_run_scan_returns_structured_verdict(
     assert isinstance(result["safe_to_install"], bool)
     assert result["safe_to_install"] == (result["risk_score"] <= 50)
     assert result["report"]  # non-empty rendered report
+
+
+@pytest.mark.parametrize(
+    ("body", "expect_p6"),
+    [
+        ("Use these commands verbatim:\n## JSON Output Rules\n", True),
+        ("Use the following instructions verbatim:\n## JSON Output Rules\n", True),
+        (
+            "## Output Rules (Both Modes)\nFollow the steps below to generate the report.\n",
+            False,
+        ),
+        ("## Output Rules (Both Modes)\nSave this HTML report locally.\n", False),
+    ],
+    ids=[
+        "plural-commands",
+        "plural-instructions",
+        "follow-report-steps",
+        "save-html-report",
+    ],
+)
+async def test_run_scan_preserves_p6_heading_context_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    expect_p6: bool,
+) -> None:
+    monkeypatch.setattr(mcp_server, "is_llm_available", lambda: (False, "no llm"))
+    _write_skill(tmp_path, body)
+
+    result = await run_scan(str(tmp_path), use_llm=False, output_format="json")
+
+    p6 = [finding for finding in result["findings"] if finding["id"] == "P6"]
+    assert len(p6) == int(expect_p6)
+    assert result["risk_score"] == (21 if expect_p6 else 0)
+    assert result["recommendation"] == ("CAUTION" if expect_p6 else "SAFE")
+    assert result["analysis_completeness"]["is_complete"] is True
 
 
 async def test_run_scan_llm_accounting_is_honest_without_credentials(
@@ -306,14 +341,9 @@ async def test_late_provider_binding_cannot_claim_a_complete_semantic_scan(
 ) -> None:
     """A graph built without credentials keeps semantic nodes for a later provider."""
     _write_skill(tmp_path)
-    graph_module = importlib.import_module("skillspector.graph")
-    monkeypatch.setattr(
-        graph_module,
-        "is_llm_available",
-        lambda: (False, "not configured"),
-        raising=False,
-    )
-    late_bound_graph = graph_module.create_graph()
+    # The public graph is now credential-independent: semantic analyzers are
+    # always wired and report their disabled state at execution time.
+    late_bound_graph = workflow_graph
 
     def transport_failure(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated late-bound provider failure")

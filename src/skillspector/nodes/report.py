@@ -102,6 +102,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # Finding free-text fields that may carry scanned/LLM content.
 _SANITIZED_FIELDS = (
     "message",
+    "pattern",
     "explanation",
     "remediation",
     "finding",
@@ -144,6 +145,7 @@ def _sanitize_finding(finding: Finding) -> Finding:
     return replace(
         finding,
         message=clean(finding.message) or "",
+        pattern=clean(finding.pattern),
         explanation=clean(finding.explanation),
         remediation=clean(finding.remediation),
         finding=clean(finding.finding),
@@ -771,6 +773,10 @@ def _build_sarif(
         "notificationsTruncated": False,
     }
 
+    if completeness.get("exclude_patterns"):
+        completeness_projection["excludePatterns"] = completeness["exclude_patterns"]
+        completeness_projection["excludedFileCount"] = nonnegative_count("excluded_file_count")
+
     notifications: list[SarifNotification] = []
     observed_notifications = 0
     notifications_truncated = False
@@ -937,6 +943,13 @@ def _render_terminal_completeness(
     table.add_row("Fully inspected", str(completeness.get("fully_inspected_files", 0)))
     table.add_row("Partially inspected", str(completeness.get("partially_inspected_files", 0)))
     table.add_row("Entirely uninspected", str(completeness.get("entirely_uninspected_files", 0)))
+    if completeness.get("exclude_patterns"):
+        table.add_row(
+            "Explicit exclusion patterns", escape(", ".join(completeness["exclude_patterns"]))
+        )
+        table.add_row(
+            "Excluded files (not inspected)", str(completeness.get("excluded_file_count", 0))
+        )
     console.print(table)
 
     def render_rows(title: str, rows: object) -> None:
@@ -946,7 +959,8 @@ def _render_terminal_completeness(
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
-            location = str(row.get("path", ""))
+            # Analyzer status rows name an analyzer rather than a file.
+            location = str(row.get("path") or row.get("analyzer_id") or "")
             start_line = row.get("start_line")
             end_line = row.get("end_line")
             if isinstance(start_line, int):
@@ -1381,6 +1395,17 @@ def _render_markdown_completeness(
     )
     lines.append("")
 
+    patterns = completeness.get("exclude_patterns", [])
+    if patterns:
+        spans = []
+        for pattern in patterns:
+            delimiter = "`" * (max((len(run) for run in re.findall(r"`+", pattern)), default=0) + 1)
+            spans.append(f"{delimiter} {pattern} {delimiter}")
+        lines.append(f"Explicit exclusion patterns: {', '.join(spans)}\n")
+        lines.append(
+            f"Excluded files (not inspected): {completeness.get('excluded_file_count', 0)}\n"
+        )
+
     def render_rows(title: str, rows: object) -> None:
         if not isinstance(rows, list) or not rows:
             return
@@ -1390,7 +1415,8 @@ def _render_markdown_completeness(
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
-            location = str(row.get("path", ""))
+            # Analyzer status rows name an analyzer rather than a file.
+            location = str(row.get("path") or row.get("analyzer_id") or "")
             start_line = row.get("start_line")
             end_line = row.get("end_line")
             if isinstance(start_line, int):
@@ -1838,6 +1864,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "report_body": report_body,
         "filtered_findings": reported_findings,
         "suppressed_findings": suppressed,
+        "active_findings": active_findings,
         "execution_successful": execution_successful,
         "analysis_completeness": dict(analysis_completeness),
         "transitive_targets_scanned": transitive_targets_scanned,
