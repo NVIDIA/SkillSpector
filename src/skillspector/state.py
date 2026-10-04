@@ -274,6 +274,10 @@ class SkillspectorState(TypedDict, total=False):
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
     effective_finding_ids: list[str]
+    # Whether meta-analysis had provider-eligible findings when it ran.  This
+    # snapshot prevents later coverage findings from being mistaken for work
+    # that an earlier meta-analysis phase was required to review.
+    meta_review_required: bool
     analysis_completeness: AnalysisCompleteness
     execution_successful: bool
 
@@ -468,6 +472,7 @@ class MetaAnalyzerResponse(TypedDict):
 
     findings: NotRequired[list[Finding]]
     effective_finding_ids: NotRequired[list[str]]
+    meta_review_required: NotRequired[bool]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
     llm_call_log: NotRequired[list[LLMCallRecord]]
