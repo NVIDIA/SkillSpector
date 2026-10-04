@@ -311,6 +311,7 @@ class AnalysisCompleteness(TypedDict):
     scope_exclusions: list[InspectionLedgerException]
     analyzer_statuses: list[dict[str, object]]
     references: NotRequired[list[dict[str, object]]]
+    image_inventory: NotRequired[dict[str, object]]
     limitations: NotRequired[list[str]]
     findings_before_filtering: NotRequired[int]
     findings_after_filtering: NotRequired[int]
@@ -709,6 +710,27 @@ def _legacy_effective_ids(
     return selected
 
 
+def image_inventory_public_view(raw_inventory: Mapping[str, object]) -> dict[str, list[str]]:
+    """Return the report-safe projection of the image inventory.
+
+    Local and remote entries pass through verbatim (remotes are already
+    scheme-plus-host); inline ``data:`` URIs reduce to a MIME-plus-size
+    summary so embedded content never reaches JSON/MCP output.
+    """
+    view: dict[str, list[str]] = {"local_images": [], "remote_images": [], "inline_images": []}
+    for key in ("local_images", "remote_images"):
+        value = raw_inventory.get(key, [])
+        if isinstance(value, list):
+            view[key] = [str(item) for item in value]
+    inline = raw_inventory.get("inline_images", [])
+    if isinstance(inline, list):
+        for item in inline:
+            uri = str(item)
+            head, _, data = uri.partition(",")
+            view["inline_images"].append(f"{head[:128]}({len(data)} bytes)")
+    return view
+
+
 def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, list[str]]:
     """Validate ledger accounting and derive the canonical public projection.
 
@@ -1052,6 +1074,8 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         else []
     )
 
+    raw_image_inventory = state.get("image_inventory", None)
+
     completeness: AnalysisCompleteness = {
         "total_components": total_components,
         "scanned_components": fully_inspected,
@@ -1070,6 +1094,8 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
         "findings_before_filtering": len(findings_by_id),
         "findings_after_filtering": len(validated_effective),
     }
+    if isinstance(raw_image_inventory, dict):
+        completeness["image_inventory"] = image_inventory_public_view(raw_image_inventory)
     return completeness, validated_effective
 
 
