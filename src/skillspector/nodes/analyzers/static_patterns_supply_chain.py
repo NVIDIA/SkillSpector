@@ -30,12 +30,14 @@ Node and analyze() in one module.
 
 from __future__ import annotations
 
+import ast
 import codecs
 import functools
 import io
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import tomllib
@@ -1753,7 +1755,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 file_type,
                 line_starts,
             )
-            if _is_safe_supply_chain_pattern(mt):
+            data_consumer = _interpreter_reads_stdin_as_data(
+                content,
+                match.start(),
+                line_starts,
+            )
+            if _is_safe_supply_chain_pattern(mt) or data_consumer:
                 adj = min(confidence, 0.15)
                 sev = Severity.LOW
             else:
@@ -1762,31 +1769,43 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             finding_tags = list(tag)
             if warned_internal_installer:
                 finding_tags.extend(["contextual-triage", "explicit-risk-warning"])
+            if data_consumer:
+                finding_tags.append("data-only-stdin-consumer")
+            if warned_internal_installer:
+                message = "Warned Pipe-to-Shell Installer"
+                remediation = (
+                    "Keep the warning adjacent to this command. Prefer a checksum, signature, "
+                    "or inspect-before-execute flow instead of piping fetched content directly "
+                    "to a shell."
+                )
+                explanation = (
+                    "The matched documentation explicitly warns that an internal installer "
+                    "is fetched and piped directly to a shell. The warning provides context, "
+                    "but the command still executes remote code without an inspection step."
+                )
+            elif data_consumer:
+                message = "Inline Program Reads Download as Data"
+                remediation = (
+                    "Prefer structured data formats and validate the fetched content before "
+                    "using it in a program."
+                )
+                explanation = (
+                    "The fetched content is parsed as data by the interpreter program supplied "
+                    "on the command line; the download is not executed as a script."
+                )
+            else:
+                message = "External Script Fetching"
+                remediation = None
+                explanation = None
             findings.append(
                 AnalyzerFinding(
                     rule_id="SC2",
-                    message=(
-                        "Warned Pipe-to-Shell Installer"
-                        if warned_internal_installer
-                        else "External Script Fetching"
-                    ),
+                    message=message,
                     severity=sev,
                     location=loc(line_num),
                     confidence=adj,
-                    remediation=(
-                        "Keep the warning adjacent to this command. Prefer a checksum, signature, "
-                        "or inspect-before-execute flow instead of piping fetched content directly "
-                        "to a shell."
-                        if warned_internal_installer
-                        else None
-                    ),
-                    explanation=(
-                        "The matched documentation explicitly warns that an internal installer "
-                        "is fetched and piped directly to a shell. The warning provides context, "
-                        "but the command still executes remote code without an inspection step."
-                        if warned_internal_installer
-                        else None
-                    ),
+                    remediation=remediation,
+                    explanation=explanation,
                     tags=finding_tags,
                     context=ctx(match.start()),
                     matched_text=mt[:200],
@@ -1932,6 +1951,238 @@ def _is_trusted_source(text: str) -> bool:
 def _is_safe_supply_chain_pattern(text: str) -> bool:
     """Return True when the matched text is a known-safe install or fetch pattern."""
     return _is_trusted_source(text) or bool(_SAFE_INSTALL_PATTERN.search(text))
+
+
+# A fetched program supplied on the interpreter command line leaves the
+# download as data on stdin.  Every other shape stays HIGH.
+_MAX_SC2_LOGICAL_LINE_CHARS = 4_096
+_PYTHON_SAFE_CALLS = frozenset(
+    {
+        "bool",
+        "dict",
+        "float",
+        "int",
+        "json.dump",
+        "json.dumps",
+        "json.load",
+        "json.loads",
+        "len",
+        "list",
+        "print",
+        "str",
+        "sys.stderr.write",
+        "sys.stdin.buffer.read",
+        "sys.stdin.buffer.readline",
+        "sys.stdin.read",
+        "sys.stdin.readline",
+        "sys.stdout.write",
+    }
+)
+_PYTHON_SAFE_CALL_ROOTS = frozenset(name.split(".", 1)[0] for name in _PYTHON_SAFE_CALLS)
+_PYTHON_SAFE_ATTRIBUTES = frozenset(
+    {
+        "buffer",
+        "dump",
+        "dumps",
+        "load",
+        "loads",
+        "read",
+        "readline",
+        "stderr",
+        "stdin",
+        "stdout",
+        "write",
+    }
+)
+_PYTHON_DANGEROUS = re.compile(
+    r"\b(?:exec|eval|compile|execfile|__import__|getattr|setattr|delattr|"
+    r"globals|locals|vars|open|input|system|popen|spawn\w*|runpy|pickle|"
+    r"marshal|dill|shelve|importlib|subprocess|os)\b|__"
+)
+_PYTHON_BINDING_NODES = (
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.FunctionDef,
+    ast.Global,
+    ast.Lambda,
+    ast.Nonlocal,
+)
+
+
+def _sc2_logical_command(
+    content: str,
+    match_start: int,
+    line_starts: tuple[int, ...],
+) -> str | None:
+    """Return the shell logical line containing *match_start*, if it starts it."""
+    line_index = bisect_right(line_starts, match_start) - 1
+    if line_index < 0:
+        return None
+    line_start = line_starts[line_index]
+
+    # Walk back only across escaped shell newlines after locating the current
+    # logical line in O(log n).  Any other logical break is not a shell
+    # command boundary and makes the exemption unsafe.
+    while line_index > 0:
+        separator_start = (
+            line_start - 2
+            if line_start >= 2 and content[line_start - 2 : line_start] == "\r\n"
+            else line_start - 1
+        )
+        separator = LOGICAL_LINE_BREAK.match(content, separator_start)
+        if separator is None:
+            return None
+        if separator.group(0) not in {"\n", "\r\n"}:
+            return None
+        if separator_start == 0 or content[separator_start - 1] != "\\":
+            break
+        line_index -= 1
+        line_start = line_starts[line_index]
+        if match_start - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+            return None
+
+    if match_start - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+        return None
+
+    line_end = len(content)
+    search_pos = match_start
+    search_end = min(len(content), line_start + _MAX_SC2_LOGICAL_LINE_CHARS + 1)
+    while search_pos <= len(content):
+        separator = LOGICAL_LINE_BREAK.search(content, search_pos, search_end)
+        if separator is None:
+            if len(content) - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+                return None
+            break
+        if separator.group(0) not in {"\n", "\r\n"}:
+            return None
+        if separator.start() > 0 and content[separator.start() - 1] == "\\":
+            search_pos = separator.end()
+            if search_pos - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+                return None
+            continue
+        line_end = separator.start()
+        break
+
+    if line_end - line_start > _MAX_SC2_LOGICAL_LINE_CHARS:
+        return None
+
+    # Only lower a pipeline that begins the logical line.  This rejects
+    # command substitutions, wrappers such as ``bash -c``, and ``eval``.
+    if content[line_start:match_start].strip():
+        return None
+    command = content[line_start:line_end]
+    return re.sub(r"\\\r?\n", " ", command)
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    """Tokenize a conservative subset of shell syntax, or return None."""
+    if re.search(r"[`$]", command):
+        return None
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _dotted_name(node: ast.expr) -> str | None:
+    """Return a dotted name for ``a.b.c`` expressions, otherwise None."""
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _python_stdin_script_is_data_only(script: str) -> bool:
+    """Return whether a Python ``-c`` script only treats stdin as data.
+
+    This is deliberately a structural allowlist rather than a name-based
+    denylist.  Rebinding an allowlisted call root, any attribute or subscript
+    store, and any attribute outside the small data-processing allowlist makes
+    the script ambiguous and therefore ineligible for the SC2 downgrade.
+    """
+    if not script.strip() or len(script) > _MAX_SC2_LOGICAL_LINE_CHARS:
+        return False
+    try:
+        tree = ast.parse(script, mode="exec")
+    except (SyntaxError, ValueError):
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, _PYTHON_BINDING_NODES):
+            return False
+        if isinstance(node, ast.Import):
+            if any(alias.name not in {"json", "sys"} or alias.asname for alias in node.names):
+                return False
+        elif isinstance(node, ast.ImportFrom):
+            return False
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                if node.id in _PYTHON_SAFE_CALL_ROOTS or node.id.startswith("__"):
+                    return False
+            elif _PYTHON_DANGEROUS.search(node.id):
+                return False
+        elif isinstance(node, ast.Attribute):
+            if node.attr not in _PYTHON_SAFE_ATTRIBUTES:
+                return False
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                return False
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                return False
+        elif isinstance(node, ast.Call):
+            name = _dotted_name(node.func)
+            if name is None or name not in _PYTHON_SAFE_CALLS:
+                return False
+    return True
+
+
+def _interpreter_reads_stdin_as_data(
+    content: str,
+    match_start: int,
+    line_starts: tuple[int, ...],
+) -> bool:
+    """Return whether the piped-to interpreter receives a command-line program."""
+    command = _sc2_logical_command(content, match_start, line_starts)
+    if command is None:
+        return False
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return False
+    if any(
+        token in {"|&", "||", "&&", ";", "&", "<", ">", ">>", "<<", "(", ")"} for token in tokens
+    ):
+        return False
+    pipes = [index for index, token in enumerate(tokens) if token == "|"]
+    if len(pipes) != 1:
+        return False
+
+    pipe_index = pipes[0]
+    fetch = tokens[:pipe_index]
+    tail = tokens[pipe_index + 1 :]
+    if not fetch or fetch[0].lower() not in {"curl", "wget"}:
+        return False
+    if tail[:1] == ["sudo"]:
+        tail = tail[1:]
+    if not tail:
+        return False
+
+    interpreter = tail[0].lower()
+    args = tail[1:]
+    if interpreter in {"python", "python3"}:
+        return args == ["-m", "json.tool"] or (
+            len(args) == 2 and args[0] == "-c" and _python_stdin_script_is_data_only(args[1])
+        )
+    # Node remains HIGH: arbitrary JavaScript cannot be proven data-only by
+    # this lightweight allowlist (computed properties can recover Function).
+    return False
 
 
 # ---------------------------------------------------------------------------
