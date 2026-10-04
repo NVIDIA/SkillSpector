@@ -930,7 +930,9 @@ def _build_component_metadata(
             size_bytes = 0
             mode = 0
         data = raw_file_cache.get(path, b"")
-        executable = is_executable_content(path, data, mode)
+        executable = is_executable_content(
+            path, data, mode, complete_content=len(data) == size_bytes
+        )
         if executable:
             has_executable = True
         component: dict[str, object] = {
@@ -1355,7 +1357,12 @@ def _inspect_excluded_artifacts(
                             executable=executable,
                         )
                         continue
-                    executable = is_executable_content(path, probe, file_stat.st_mode)
+                    executable = is_executable_content(
+                        path,
+                        probe,
+                        file_stat.st_mode,
+                        complete_content=len(probe) == size_bytes,
+                    )
                 archive_candidate = is_zip_content(probe)
                 expected_archive = expected_container_type(path) is not None
                 if expected_archive and not archive_candidate:
