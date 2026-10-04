@@ -1126,16 +1126,21 @@ def _tp4_finding(
     actual = result.actual_behavior_summary[:1024]
     mismatched = [str(item)[:256] for item in result.mismatched_capabilities[:16]]
     mismatched_text = ", ".join(mismatched)[:2048] if mismatched else "unspecified"
+    message = (
+        f"Description-behavior mismatch: declared purpose is '{declared}' "
+        f"but code also performs: {mismatched_text}."
+    )[:4096]
+    from skillspector.nodes.analyzers.pattern_defaults import get_pattern_name
+
     return Finding(
         rule_id="TP4",
-        message=(
-            f"Description-behavior mismatch: declared purpose is '{declared}' "
-            f"but code also performs: {mismatched_text}."
-        )[:4096],
+        message=message,
         severity="HIGH" if result.confidence >= 0.7 else "MEDIUM",
         confidence=result.confidence,
         file="SKILL.md",
         category=_CATEGORY,
+        pattern=get_pattern_name("TP4"),
+        finding=message,
         tags=list(_FRAMEWORK_TAGS),
         explanation=(result.explanation[:4096] or f"Declared: {declared}. Actual: {actual}."),
         remediation=(

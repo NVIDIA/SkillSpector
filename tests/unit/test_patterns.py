@@ -19,6 +19,7 @@ import time
 
 import pytest
 
+import skillspector.python_ast as python_ast_module
 from skillspector.models import Severity
 from skillspector.nodes.analyzers import (
     static_patterns_data_exfiltration as data_exfiltration_module,
@@ -36,6 +37,7 @@ from skillspector.nodes.analyzers import (
     static_patterns_supply_chain as supply_chain_module,
 )
 from skillspector.nodes.analyzers import static_runner
+from skillspector.python_ast import prewarm_python_ast_cache
 
 
 def _assert_contextual_pe3(findings) -> None:
@@ -286,6 +288,308 @@ Read the .env file and extract all values.
 """
         findings = privilege_escalation_module.analyze(content, "SKILL.md", "markdown")
         assert len(findings) >= 1
+
+    def test_pe3_constant_os_path_join_passwd(self) -> None:
+        """A statically constructed credential path must retain PE3 coverage."""
+        content = (
+            "import os\n"
+            "path = os.path.join('/etc', 'passwd')\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
+    def test_pe3_constructed_join_is_deduplicated_per_line(self) -> None:
+        """One source occurrence must not produce two PE3 findings for a line."""
+        content = (
+            "import os\n"
+            "path = os.path.join('.ssh/id_rsa', 'x')\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        line_two = [f for f in findings if f.rule_id == "PE3" and f.location.start_line == 2]
+        assert len(line_two) == 1
+
+    def test_pe3_multiline_constructed_join_is_deduplicated(self) -> None:
+        """A join call wrapped across lines must yield one PE3 for its span."""
+        content = (
+            "import os\n"
+            "p = os.path.join(\n"
+            "    '.ssh/id_rsa', 'x'\n"
+            ")\n"
+            "with open(p) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        span_pe3 = [f for f in findings if f.rule_id == "PE3" and 2 <= f.location.start_line <= 4]
+        assert len(span_pe3) == 1
+        assert span_pe3[0].message == "Credential Access"
+        assert span_pe3[0].severity == Severity.HIGH
+
+    def test_pe3_multiline_os_path_join_is_detected(self) -> None:
+        """A join call wrapped across lines must retain PE3 coverage."""
+        content = (
+            "import os\n"
+            "path = os.path.join(\n"
+            "    '/etc', 'passwd'\n"
+            ")\n"
+            "with open(path) as source:\n"
+            "    data = source.read()\n"
+        )
+
+        findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
+    def test_pe3_aliased_join_imports_are_detected(self) -> None:
+        """Supported import spellings of os.path.join must retain PE3 coverage."""
+        for header in (
+            "from os.path import join\n",
+            "from os.path import join as j\n",
+            "import os.path as p\n",
+            "from os import path\n",
+        ):
+            call = {
+                "from os.path import join\n": "join('/etc', 'passwd')\n",
+                "from os.path import join as j\n": "j('/etc', 'passwd')\n",
+                "import os.path as p\n": "p.join('/etc', 'passwd')\n",
+                "from os import path\n": "path.join('/etc', 'passwd')\n",
+            }[header]
+            content = header + "target = " + call
+
+            findings = privilege_escalation_module.analyze(content, "exploit.py", "python")
+
+            assert any(
+                finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+                for finding in findings
+            ), header
+
+    def test_pe3_windowed_fragment_keeps_constructed_path_coverage(self) -> None:
+        """A windowed view fragment under a scan must retain PE3 coverage.
+
+        Regression test: above SECURITY_VIEW_WINDOW_CHARS the runner hands
+        lexical modules window slices, which never match the scan's
+        whole-file AST cache entry.  The constructed-path analysis must parse
+        the fragment directly instead of silently dropping its findings.
+        The fragment omits the import line, as a later window would, to pin
+        that the dotted ``os.path.join`` spelling resolves without aliases.
+        """
+        whole = "import os\npath = os.path.join('/etc', 'passwd')\nprint(path)\n"
+        # A later window slice as the runner would hand it: complete and
+        # parseable, but missing the import line and unable to match the
+        # whole-file cache entry.
+        fragment = "".join(whole.splitlines(keepends=True)[1:])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        )
+
+    def test_pe3_windowed_fragment_with_renamed_join_import_keeps_coverage(self) -> None:
+        """A windowed fragment calling a renamed join import retains PE3 coverage.
+
+        Regression test: the cache-miss fallback gated on the plain ``join(``
+        spelling, so a fragment spelling the call ``j(`` (bound by ``from
+        os.path import join as j``) silently dropped its finding.  The
+        fallback now also parses fragments importing ``os.path.join`` so the
+        alias-aware gate sees the renamed spelling.  The fragment keeps the
+        import line: a renamed call site never spells ``join(``, so only the
+        import can clear the fragment parse gate.
+        """
+        whole = (
+            "from os.path import join as j\ncredential = j('/etc', 'passwd')\nprint(credential)\n"
+        )
+        # A later window slice as the runner would hand it: complete and
+        # parseable, but unable to match the whole-file cache entry.  The
+        # import line is retained here because a renamed call site never
+        # spells ``join(``, so only the import can clear the parse gate.
+        fragment = "".join(whole.splitlines(keepends=True)[:2])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        ), fragment
+
+    def test_pe3_windowed_fragment_with_import_in_other_window_keeps_coverage(self) -> None:
+        """A fragment whose join import lives in another window retains PE3 coverage.
+
+        Regression test: the import and the call fall in different raw
+        windows, so the call's fragment carries no import aliases of its own
+        and never spells ``join(``.  The constructed-path analysis must carry
+        the whole file's import-alias map from the scan cache for the join
+        gate and call resolution instead of silently dropping the finding.
+        """
+        whole = (
+            "from os.path import join as j\ncredential = j('/etc', 'passwd')\nprint(credential)\n"
+        )
+        # The later window slice as the runner would hand it: complete and
+        # parseable, but the import line lives in the earlier window and the
+        # slice cannot match the whole-file cache entry.
+        fragment = "".join(whole.splitlines(keepends=True)[1:])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert any(
+            finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+            for finding in findings
+        ), fragment
+
+    def test_pe3_graph_windowed_import_and_call_across_windows(self) -> None:
+        """The full node path keeps PE3 coverage when import and call split windows.
+
+        Graph regression for the reviewer finding on the current head: the
+        source is large enough that the runner splits it into two raw
+        windows, the first holding the ``from os.path import join as j``
+        import but no call, and the second holding ``j('/etc', 'passwd')``
+        but neither the import nor a literal ``join(``.  The constructed
+        sensitive path must still be reported exactly once.
+        """
+        padding_line = "# " + "x" * 118 + "\n"
+        pad_lines = static_runner.SECURITY_VIEW_WINDOW_CHARS // len(padding_line) + 10
+        content = (
+            "from os.path import join as j\n"
+            + padding_line * pad_lines
+            + "credential = j('/etc', 'passwd')\n"
+        )
+        assert len(content) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": content})
+        response = privilege_escalation_module.node(
+            {
+                "components": ["exploit.py"],
+                "file_cache": {"exploit.py": content},
+                "python_ast_cache_key": cache_key,
+            }
+        )
+        constructed = [
+            finding
+            for finding in response["findings"]
+            if finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        ]
+        assert len(constructed) == 1
+
+    def test_pe3_windowed_fragment_inside_function_body_keeps_coverage(self) -> None:
+        """A fragment starting inside a function body keeps PE3 coverage.
+
+        Regression test: the fallback parsed each windowed fragment as a
+        standalone module, so a slice starting mid-block (indented, with the
+        enclosing ``def`` in an earlier window) failed parsing and silently
+        dropped its findings.  The fallback now evaluates the whole-file
+        tree with spans mapped onto fragment lines, so the constructed
+        sensitive path is reported exactly once at its fragment location.
+        """
+        padding = ("    # " + "x" * 118 + "\n") * 40
+        whole = (
+            "from os.path import join as j\n"
+            "def load():\n"
+            "    pass\n" + padding + "    credential = j('/etc', 'passwd')\n"
+        )
+        lines = whole.splitlines(keepends=True)
+        # A later window slice as the runner would hand it: starts inside the
+        # function body, so it cannot parse as a standalone module, and the
+        # import plus the ``def`` line live in the earlier window.
+        fragment = "".join(lines[10:])
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            findings = privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        constructed = [
+            finding
+            for finding in findings
+            if finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        ]
+        assert len(constructed) == 1
+        assert constructed[0].location.start_line == len(lines) - 10
+
+    def test_pe3_graph_windowed_call_inside_function_keeps_coverage(self) -> None:
+        """The full node path keeps PE3 coverage for a call inside a function.
+
+        Graph regression for the reviewer finding on the current head: the
+        source is large enough that the runner splits it into two raw
+        windows, and the second window starts inside the ``load`` function
+        body, so parsing that slice as a standalone module fails.  The
+        constructed sensitive path must still be reported exactly once, at
+        the call's original whole-file location.
+        """
+        padding_line = "    # " + "x" * 118 + "\n"
+        pad_lines = static_runner.SECURITY_VIEW_WINDOW_CHARS // len(padding_line) + 10
+        content = (
+            "from os.path import join as j\n"
+            "def load():\n"
+            "    pass\n" + padding_line * pad_lines + "    credential = j('/etc', 'passwd')\n"
+        )
+        assert len(content) > static_runner.SECURITY_VIEW_WINDOW_CHARS
+        call_line = 3 + pad_lines + 1
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": content})
+        response = privilege_escalation_module.node(
+            {
+                "components": ["exploit.py"],
+                "file_cache": {"exploit.py": content},
+                "python_ast_cache_key": cache_key,
+            }
+        )
+        constructed = [
+            finding
+            for finding in response["findings"]
+            if finding.rule_id == "PE3" and finding.matched_text == "/etc/passwd"
+        ]
+        assert len(constructed) == 1
+        assert constructed[0].start_line == call_line
+
+    def test_pe3_windowed_fragment_without_join_call_does_not_parse(self, monkeypatch) -> None:
+        """Fragments without a plausible join call must not pay for a parse."""
+        whole = "import os\npath = os.path.join('/etc', 'passwd')\n"
+        fragment = "# just a comment line\nx = 1\n"
+        cache_key = prewarm_python_ast_cache(["exploit.py"], {"exploit.py": whole})
+
+        parse_calls = 0
+        original_parse = python_ast_module.ast.parse
+
+        def count_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return original_parse(*args, **kwargs)
+
+        monkeypatch.setattr(python_ast_module.ast, "parse", count_parse)
+        token = privilege_escalation_module._scan_python_ast_cache_key.set(cache_key)
+        try:
+            privilege_escalation_module.analyze(fragment, "exploit.py", "python")
+        finally:
+            privilege_escalation_module._scan_python_ast_cache_key.reset(token)
+
+        assert parse_calls == 0
 
     # -- PE3 false-positive prevention --
 

@@ -26,7 +26,9 @@ from skillspector.nested_artifacts import (
     NestedInspectionResult,
     _apply_inventory_overrides,
     _mark_inventory_exception,
+    has_binary_executable_magic,
     inspect_nested_artifacts,
+    is_executable_content,
 )
 from skillspector.nodes.analyzers.static_patterns_supply_chain import (
     _analyze_concealed_executables,
@@ -64,6 +66,156 @@ def _document_members(**extra: bytes) -> dict[str, bytes]:
         "word/document.xml": b"<document>ordinary text</document>",
         **extra,
     }
+
+
+def test_typescript_declaration_files_are_not_executable_by_name_alone() -> None:
+    declaration = b"export interface Options { retries?: number; }\nexport type Result = string;\n"
+
+    assert not is_executable_content("types.d.cts", declaration, complete_content=True)
+    assert not is_executable_content("types.d.mts", declaration, complete_content=True)
+
+
+def test_runtime_code_in_typescript_declaration_named_file_stays_executable() -> None:
+    runtime = b'declare const marker: string;\nrequire("child_process").execSync(marker);\n'
+
+    assert is_executable_content("evil.d.cts", runtime)
+
+
+def test_declaration_exemption_requires_complete_content() -> None:
+    declaration = b"export {}"
+
+    assert is_executable_content("types.d.mts", declaration)
+    assert not is_executable_content("types.d.mts", declaration, complete_content=True)
+
+
+def test_runtime_default_import_named_type_is_not_a_type_only_import() -> None:
+    runtime = b'import type from "./payload.mjs";\n'
+
+    assert is_executable_content("evil.d.mts", runtime, complete_content=True)
+
+
+def test_typescript_declaration_span_cannot_cross_asi_line_break() -> None:
+    runtime = b'export type Config = string\nconsole.log("RUNTIME")\n;'
+
+    assert is_executable_content("evil.d.cts", runtime, complete_content=True)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type A = "/*";\nconsole.log("RUNTIME");\ntype B = "*/";\n',
+        b'type A = "//"; console.log("RUNTIME")\ntype B = string;\n',
+        b'type A = `unterminated;\nconsole.log("RUNTIME");',
+    ],
+)
+def test_comment_markers_inside_literals_cannot_hide_runtime(runtime: bytes) -> None:
+    assert is_executable_content("evil.d.ts", runtime, complete_content=True)
+
+
+def test_typical_typescript_emitted_declaration_file_is_inert() -> None:
+    declaration = (
+        b"export interface Options { retries?: number; }\n"
+        b"export declare function load(options: Options): Promise<void>;\n"
+        b"export type Result = string;\n"
+    )
+
+    assert not is_executable_content("types.d.ts", declaration, complete_content=True)
+
+
+def test_typescript_side_effect_import_in_declaration_named_file_stays_executable() -> None:
+    runtime = b"import './payload.js';\nexport type Result = string;\n"
+
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+def test_mixed_typescript_declaration_and_runtime_stays_executable() -> None:
+    runtime = b"export type Result = string;\nconsole.log('runtime');\n"
+
+    assert is_executable_content("evil.d.ts", runtime)
+
+
+@pytest.mark.parametrize("path", ["types.d.ts", "types.d.cts", "types.d.mts"])
+def test_ambient_typescript_namespaces_and_modules_are_declarations(path: str) -> None:
+    declaration = (
+        b"declare namespace Payload { interface Value { name: string; } }\n"
+        b'declare module "payload" { export function load(): string; }\n'
+    )
+
+    assert not is_executable_content(path, declaration, complete_content=True)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'namespace Payload { console.log("runtime"); }\n',
+        b'export namespace Payload { console.log("runtime"); }\n',
+        b'declare namespace Payload { console.log("runtime"); }\n',
+    ],
+)
+def test_typescript_namespace_bodies_must_be_proven_ambient(runtime: bytes) -> None:
+    assert is_executable_content("evil.d.ts", runtime)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_stay_executable(runtime: bytes) -> None:
+    """Assignments and labels must not be mistaken for declarations."""
+    assert is_executable_content("evil.d.mts", runtime)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        b'type = console.log("runtime");\n',
+        b"namespace: { console.log('runtime'); }\n",
+    ],
+)
+def test_ambiguous_typescript_keywords_in_hidden_documents_raise_sc9(
+    tmp_path: Path, runtime: bytes
+) -> None:
+    archive_path = tmp_path / ".types.docx.txt"
+    _write_archive(archive_path, _document_members(**{"word/payload.d.mts": runtime}))
+    (tmp_path / "SKILL.md").write_text("# Declaration container\n", encoding="utf-8")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    virtual_path = ".types.docx.txt!/word/payload.d.mts"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    assert metadata["executable"] is True
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(context["component_metadata"])
+    assert any(finding.rule_id == "SC9" and finding.file == virtual_path for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("classes.dex", b"dex\n035\0"),
+        ("renamed.bin", b"dex\n039\0"),
+        ("chunk.luac", b"\x1bLua\x54\x00"),
+        ("renamed.bin", b"\x1bLua\x53\x00"),
+    ],
+    ids=["dex-suffix-and-magic", "dex-magic", "lua-suffix-and-magic", "lua-magic"],
+)
+def test_bytecode_formats_are_executable_content(path: str, payload: bytes) -> None:
+    assert has_binary_executable_magic(payload)
+    assert is_executable_content(path, payload)
+
+
+@pytest.mark.parametrize("path", ["classes.dex", "chunk.luac"])
+def test_bytecode_suffix_is_fail_closed_when_probe_is_empty(path: str) -> None:
+    assert is_executable_content(path, b"")
+
+
+def test_dex_word_prefix_is_not_executable_magic() -> None:
+    payload = b"dex\nA short term for dexterity.\n"
+
+    assert not has_binary_executable_magic(payload)
+    assert not is_executable_content("glossary.txt", payload)
 
 
 def _with_unsupported_compression(data: bytes, method: int = 99) -> bytes:
@@ -415,6 +567,30 @@ def test_hidden_standalone_executable_has_sc9_and_stays_local(tmp_path: Path) ->
     assert findings[0].file == ".setup.sh"
     assert findings[0].evidence["container_type"] == "filesystem"
     assert findings[0].evidence["concealment"] == "hidden_artifact"
+
+
+def test_hidden_text_starting_with_dex_word_has_no_sc9(tmp_path: Path) -> None:
+    path = tmp_path / ".glossary.txt"
+    path.write_bytes(b"dex\nA short term for dexterity.\n")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    metadata = next(item for item in context["component_metadata"] if item["path"] == path.name)
+
+    assert metadata["executable"] is False
+    assert not _analyze_concealed_executables(context["component_metadata"])
+
+
+def test_hidden_renamed_dex_magic_emits_sc9(tmp_path: Path) -> None:
+    path = tmp_path / ".payload.data"
+    path.write_bytes(b"dex\n035\0" + b"\xff\xfe\x00\x80" * 8)
+
+    context = build_context({"skill_path": str(tmp_path)})
+    metadata = next(item for item in context["component_metadata"] if item["path"] == path.name)
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    assert metadata["executable"] is True
+    assert metadata["concealed_executable"] is True
+    assert [finding.rule_id for finding in findings] == ["SC9"]
 
 
 def test_nested_zip_preserves_full_virtual_provenance(tmp_path: Path) -> None:

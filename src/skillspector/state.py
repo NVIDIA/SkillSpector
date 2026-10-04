@@ -236,6 +236,12 @@ class SkillspectorState(TypedDict, total=False):
     # Input: resolve_input node consumes input_path or skill_path, sets skill_path
     input_path: str | None
     skill_path: str | None
+    # Relative identity of a wrapped/downloaded explicit file, distinct from passive assets.
+    primary_file_path: str | None
+    # Set/reset by resolve_input from the actual selected source. None means
+    # materialization could not establish a current-skill identity; analyzers
+    # must not substitute generated directory names or manifest-only aliases.
+    selected_source_identity: str | None
     # Set by resolve_input when a temp dir was created (git/url/zip/file); caller should clean up
     temp_dir_for_cleanup: str | None
     zip_bytes: bytes | None
@@ -268,6 +274,10 @@ class SkillspectorState(TypedDict, total=False):
     inspection_ledger: Annotated[list[InspectionLedgerEvent], merge_inspection_ledger]
     analyzer_status_events: Annotated[list[AnalyzerStatusEvent], operator.add]
     effective_finding_ids: list[str]
+    # Whether meta-analysis had provider-eligible findings when it ran.  This
+    # snapshot prevents later coverage findings from being mistaken for work
+    # that an earlier meta-analysis phase was required to review.
+    meta_review_required: bool
     analysis_completeness: AnalysisCompleteness
     execution_successful: bool
 
@@ -301,9 +311,16 @@ class SkillspectorState(TypedDict, total=False):
     baseline_path: str | None
     show_suppressed: bool
     suppressed_findings: list[object]
+    # Kept findings as baseline suppression saw them: one per occurrence, before
+    # deduplication compacts them. `skillspector baseline` fingerprints these so
+    # every occurrence the next scan checks has its own entry.
+    active_findings: list[Finding]
 
     # Model IDs per LLM-using node: e.g. {"default": "...", "meta_analyzer": "..."}
     model_config: dict[str, str]
+    # Sanitized LLM configuration captured with model resolution. The report
+    # projects this independently from provider token-usage telemetry.
+    llm_provenance: dict[str, object]
 
     # Component metadata for reporting and risk scoring (from build_context)
     component_metadata: list[dict[str, object]]
@@ -325,6 +342,8 @@ class SkillspectorState(TypedDict, total=False):
     # Report generation uses this to distinguish unavailable requested analysis from an
     # explicit static-only scan while analyzers continue to honor use_llm.
     llm_requested: bool
+    # Explicit caller scope, recorded in public coverage accounting.
+    exclude_patterns: list[str]
     # Monotonic provenance flag: content rooted beneath a hidden/local-only
     # source remains in deterministic analysis but never enters provider input.
     source_local_only: bool
@@ -453,6 +472,7 @@ class MetaAnalyzerResponse(TypedDict):
 
     findings: NotRequired[list[Finding]]
     effective_finding_ids: NotRequired[list[str]]
+    meta_review_required: NotRequired[bool]
     inspection_ledger: NotRequired[list[InspectionLedgerEvent]]
     analyzer_status_events: NotRequired[list[AnalyzerStatusEvent]]
     llm_call_log: NotRequired[list[LLMCallRecord]]

@@ -45,6 +45,184 @@ def _rule_ids(findings: list) -> set[str]:
 
 
 class TestCredentialExfiltration:
+    @pytest.mark.parametrize("expected", [False, True])
+    @pytest.mark.parametrize("branch", ["straight", "if", "match"])
+    def test_nested_function_uses_live_closure_binding(self, expected, branch):
+        dangerous = 'getattr(module, "urlopen")'
+        harmless = "lambda value: value"
+        initial, replacement = (harmless, dangerous) if expected else (dangerous, harmless)
+        assignment = f"opener = {replacement}"
+        if branch == "if":
+            assignment = f"if input():\n    {assignment}\nelse:\n    {assignment}"
+        elif branch == "match":
+            assignment = f"match input():\n    case 'yes':\n        {assignment}\n    case _:\n        {assignment}"
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            "def outer():\n"
+            f"    opener = {initial}\n"
+            "    def send():\n"
+            '        opener(os.environ.get("API_KEY"))\n'
+            + textwrap.indent(assignment + "\n", "    ")
+            + "    send()\nouter()\n"
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize("declaration", ["global", "nonlocal"])
+    @pytest.mark.parametrize("expected", [False, True])
+    @pytest.mark.parametrize("conditional", [False, True])
+    def test_called_function_retains_external_binding_effects(
+        self, declaration, expected, conditional
+    ):
+        dangerous = 'getattr(module, "urlopen")'
+        harmless = "lambda value: value"
+        initial, replacement = (harmless, dangerous) if expected else (dangerous, harmless)
+        effect = f"opener = {replacement}\n"
+        if conditional:
+            effect = f"if input():\n    {effect}else:\n    {effect}"
+        body = (
+            f"opener = {initial}\n"
+            "def configure():\n"
+            f"    {declaration} opener\n"
+            + textwrap.indent(effect, "    ")
+            + 'configure()\nopener(os.environ.get("API_KEY"))\n'
+        )
+        if declaration == "nonlocal":
+            body = "def outer():\n" + textwrap.indent(body, "    ") + "outer()\n"
+        code = 'import importlib, os\nmodule = importlib.import_module("urllib.request")\n' + body
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize("expected", [False, True])
+    def test_uncalled_function_analysis_isolates_global_effects(self, expected):
+        dangerous = 'getattr(module, "urlopen")'
+        harmless = "lambda value: value"
+        initial, replacement = (dangerous, harmless) if expected else (harmless, dangerous)
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f"opener = {initial}\n"
+            "def configure():\n"
+            "    global opener\n"
+            f"    opener = {replacement}\n"
+            "def send():\n"
+            '    opener(os.environ.get("API_KEY"))\n'
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize(
+        ("replacement", "expected"),
+        [
+            ("", True),
+            ("send = lambda self: None", False),
+            ("del send", False),
+            ("alias = send\nsend = lambda self: None", True),
+            ("alias = send\ndel send", True),
+        ],
+    )
+    def test_class_fallback_only_analyzes_surviving_methods(self, replacement, expected):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "class Client:\n"
+            "    def send(self):\n"
+            '        opener(os.environ.get("API_KEY"))\n'
+            + textwrap.indent(replacement + "\n", "    ")
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    def test_class_method_fallback_is_not_cached_across_defining_calls(self):
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            "opener = lambda value: value\n"
+            "def factory():\n"
+            "    class Client:\n"
+            "        def send(self):\n"
+            '            opener(os.environ.get("API_KEY"))\n'
+            "factory()\n"
+            'opener = getattr(module, "urlopen")\n'
+            "factory()\n"
+        )
+        assert "TT3" in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("replacement", ["", "send = lambda self: None"])
+    @pytest.mark.parametrize("layout", ["if", "try"])
+    def test_conditional_methods_wait_for_final_class_namespace(self, replacement, layout):
+        method = 'def send(self):\n    opener(os.environ.get("API_KEY"))\n'
+        if layout == "if":
+            definition = "if input():\n" + textwrap.indent(method, "    ")
+        else:
+            definition = (
+                "try:\n" + textwrap.indent(method, "    ") + "except Exception:\n    pass\n"
+            )
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            'opener = getattr(module, "urlopen")\n'
+            "class Client:\n" + textwrap.indent(definition + replacement + "\n", "    ")
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is (not replacement)
+
+    @pytest.mark.parametrize("body_kind", ["conditional_method", "lambda"])
+    def test_class_namespace_does_not_enter_indirect_method_closures(self, body_kind):
+        if body_kind == "lambda":
+            body = 'send = lambda self: opener(os.environ.get("API_KEY"))\n'
+        else:
+            body = 'if input():\n    def send(self):\n        opener(os.environ.get("API_KEY"))\n'
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            "opener = lambda value: value\n"
+            "class Client:\n"
+            '    opener = getattr(module, "urlopen")\n' + textwrap.indent(body, "    ")
+        )
+        assert "TT3" not in _rule_ids(_run(code))
+
+    @pytest.mark.parametrize("expected", [False, True])
+    def test_global_declaration_reads_global_not_captured_binding(self, expected):
+        dangerous = 'getattr(module, "urlopen")'
+        harmless = "lambda value: value"
+        global_binding, local_binding = (dangerous, harmless) if expected else (harmless, dangerous)
+        code = (
+            "import importlib, os\n"
+            'module = importlib.import_module("urllib.request")\n'
+            f"opener = {global_binding}\n"
+            "def outer():\n"
+            f"    opener = {local_binding}\n"
+            "    def send():\n"
+            "        global opener\n"
+            '        opener(os.environ.get("API_KEY"))\n'
+            "    send()\nouter()\n"
+        )
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
+    @pytest.mark.parametrize("expected", [False, True])
+    @pytest.mark.parametrize("body_kind", ["nested", "lambda", "method"])
+    def test_speculative_bodies_do_not_apply_external_effects(self, expected, body_kind):
+        dangerous = 'getattr(module, "urlopen")'
+        harmless = "lambda value: value"
+        initial, replacement = (dangerous, harmless) if expected else (harmless, dangerous)
+        declaration = "nonlocal" if body_kind == "nested" else "global"
+        body = (
+            f"opener = {initial}\n"
+            "def configure():\n"
+            f"    {declaration} opener\n"
+            f"    opener = {replacement}\n"
+        )
+        if body_kind == "nested":
+            body += 'def send():\n    opener(os.environ.get("API_KEY"))\n'
+            body = "def outer():\n" + textwrap.indent(body, "    ") + "outer()\n"
+        elif body_kind == "lambda":
+            body += 'unused = lambda: configure()\nopener(os.environ.get("API_KEY"))\n'
+        else:
+            body += (
+                "class Client:\n    def unused(self):\n        configure()\n"
+                'opener(os.environ.get("API_KEY"))\n'
+            )
+        code = 'import importlib, os\nmodule = importlib.import_module("urllib.request")\n' + body
+        assert ("TT3" in _rule_ids(_run(code))) is expected
+
     def test_starred_assignment_replaces_reflective_handle(self):
         code = (
             "import importlib, os\n"

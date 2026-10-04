@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from skillspector.llm_analyzer_base import LLMFinding
 from skillspector.models import Finding
 from skillspector.nodes.report import _clean_text, _sanitize_finding, report
 from skillspector.state import SkillspectorState
@@ -28,6 +31,7 @@ def _dirty_finding() -> Finding:
     return Finding(
         rule_id="E2",
         message="creds \x1b[31mleak\x1b[0m here\x00",
+        pattern="pattern \x1b[31mleak\x1b[0m here\x00",
         severity="HIGH",
         confidence=0.9,
         file="a/SKILL.md",
@@ -51,8 +55,10 @@ def test_sanitize_finding_cleans_text_fields_only() -> None:
     cleaned = _sanitize_finding(_dirty_finding())
     assert "\x1b" not in cleaned.message and "\x00" not in cleaned.message
     assert "leak" in cleaned.message and "here" in cleaned.message
+    assert cleaned.pattern == "pattern leak here"
     assert "\x1b" not in (cleaned.remediation or "")
     assert "\x07" not in (cleaned.context or "")
+    assert "\x1b" not in (cleaned.pattern or "") and "\x00" not in (cleaned.pattern or "")
     # Non-text fields are unchanged.
     assert cleaned.rule_id == "E2"
     assert cleaned.start_line == 5
@@ -74,3 +80,95 @@ def test_report_emits_clean_utf8_for_all_formats(fmt: str) -> None:
     assert "\x1b" not in body, f"ESC leaked into {fmt}"
     # The readable content survives the sanitization.
     assert "leak" in body and "here" in body
+
+
+@pytest.mark.parametrize("fmt", ["markdown", "json", "sarif", "terminal"])
+@pytest.mark.parametrize("scheme", ["https", "ssh", "git+https", "sparse+https"])
+def test_report_redacts_url_credentials_from_every_finding_field(fmt: str, scheme: str) -> None:
+    username = "output-user-sentinel"
+    password = "output-password-sentinel"
+    token = "output-token-sentinel"
+    url = f"{scheme}://{username}:{password}@packages.example.invalid/?token={token}"
+    finding = Finding(
+        rule_id="E2",
+        message=f"credential-bearing destination {url}",
+        severity="HIGH",
+        confidence=0.9,
+        file="setup.sh",
+        start_line=1,
+        pattern=url,
+        finding=url,
+        explanation=url,
+        remediation=url,
+        context=url,
+        matched_text=url,
+        code_snippet=url,
+        evidence={
+            "destination": url,
+            "redirects": [{"nested": {url: [url, {"destination": url}]}}],
+            "tuple": (url, {"destination": url}),
+        },
+    )
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": fmt,
+    }
+
+    result = report(state)
+    rendered = result["report_body"]
+    serialized_findings = json.dumps([item.to_dict() for item in result["filtered_findings"]])
+    for secret in (username, password, token):
+        assert secret not in rendered
+        assert secret not in serialized_findings
+
+
+@pytest.mark.parametrize("fmt", ["json", "sarif"])
+def test_report_sanitizes_llm_message_copied_to_pattern(fmt: str) -> None:
+    message = "review \x1b[31mhttps://user:secret@example.invalid/?token=secret-token\x1b[0m"
+    finding = LLMFinding(
+        rule_id="E1",
+        message=message,
+        severity="HIGH",
+        start_line=1,
+    ).to_finding("SKILL.md")
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": fmt,
+    }
+
+    result = report(state)
+    rendered = result["report_body"]
+    serialized_findings = json.dumps([item.to_dict() for item in result["filtered_findings"]])
+    assert "\x1b" not in rendered
+    assert "secret" not in rendered
+    assert "secret" not in serialized_findings
+
+
+def test_nested_evidence_preserves_scalar_types_and_original_finding() -> None:
+    scalar_values = [None, True, False, 42, 1.25]
+    finding = _dirty_finding()
+    finding.evidence = {
+        "nested": [{"values": scalar_values, "dirty\x00key": "readable\x1b[31m text\x00"}],
+        "tuple": (None, True, 42),
+    }
+
+    cleaned = _sanitize_finding(finding)
+
+    assert cleaned.evidence == {
+        "nested": [{"values": scalar_values, "dirtykey": "readable text"}],
+        "tuple": (None, True, 42),
+    }
+    for actual, original in zip(
+        cleaned.evidence["nested"][0]["values"], scalar_values, strict=True
+    ):
+        assert type(actual) is type(original)
+    assert "dirty\x00key" in finding.evidence["nested"][0]
+    assert "\x1b" in finding.evidence["nested"][0]["dirty\x00key"]
