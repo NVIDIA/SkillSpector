@@ -281,9 +281,14 @@ def _iter_config_npx_commands(
 
         args_text = " ".join(args_lines)
         for token_match in _RP1_CONFIG_ARG_TOKEN.finditer(args_text):
-            token = token_match.group(1) or token_match.group(2)
+            quoted_token = token_match.group(1)
+            token = quoted_token if quoted_token is not None else token_match.group(2)
             if token.startswith("-"):
                 continue
+            if not token:
+                # The first positional argument is empty, not a package name.
+                # Do not shift a later argument into its position or invent RP1.
+                break
             start = offsets[command_index]
             full_match = "".join(
                 lines[min(command_index, args_index) : max(command_index, args_end_index) + 1]

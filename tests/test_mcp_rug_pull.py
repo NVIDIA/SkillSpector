@@ -111,6 +111,49 @@ def test_rp1_yaml_mcp_config_pinned_no_finding():
         assert not [finding for finding in result["findings"] if finding.rule_id == "RP1"]
 
 
+@pytest.mark.parametrize("style", ["flow", "block"])
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["-y", "@scope/server", ""], 1),
+        (["-y", "@scope/server@1.2.3", ""], 0),
+        (["", "@scope/server"], 0),
+        (["-y", "", "@scope/server"], 0),
+        (["-y", "", "@scope/server@1.2.3"], 0),
+        ([""], 0),
+        (["-y", ""], 0),
+    ],
+)
+def test_rp1_yaml_empty_arguments_do_not_crash_or_shift_package(style, quote, arguments, expected):
+    quoted = [quote + argument + quote for argument in arguments]
+    args = (
+        "    args: [" + ", ".join(quoted) + "]\n"
+        if style == "flow"
+        else "    args:\n" + "".join("      - " + argument + "\n" for argument in quoted)
+    )
+    result = node(_state(file_cache={"mcp.yaml": "mcpServers:\n  fs:\n    command: npx\n" + args}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+    assert len(rp1) == expected
+    if rp1:
+        assert rp1[0].start_line == 3
+        assert "@scope/server" in rp1[0].matched_text
+
+
+def test_rp1_yaml_empty_package_does_not_abort_other_configs_or_files():
+    content = (
+        'mcpServers:\n  empty:\n    command: npx\n    args: ["-y", ""]\n'
+        '  real:\n    command: pnpx\n    args: ["@scope/server"]\n'
+    )
+    result = node(_state(file_cache={"mcp.yaml": content, "setup.sh": "npx another-server\n"}))
+    rp1 = [finding for finding in result["findings"] if finding.rule_id == "RP1"]
+    assert [(finding.file, finding.start_line) for finding in rp1] == [
+        ("mcp.yaml", 6),
+        ("setup.sh", 1),
+    ]
+    assert all(event["outcome"] == "completed" for event in result["inspection_ledger"])
+
+
 @pytest.mark.parametrize(
     "layout",
     [
