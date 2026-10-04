@@ -283,7 +283,10 @@ def test_report_preserves_markup_text_and_canonical_findings() -> None:
     assert result["risk_score"] == 25
 
 
-def test_cli_preserves_prompt_marker_in_suppression_reason(tmp_path: Path) -> None:
+@pytest.mark.parametrize("write_to_file", [False, True])
+def test_cli_preserves_prompt_marker_in_suppression_reason(
+    tmp_path: Path, write_to_file: bool
+) -> None:
     skill = tmp_path / "prompt-review"
     skill.mkdir()
     (skill / "SKILL.md").write_text(
@@ -300,19 +303,12 @@ def test_cli_preserves_prompt_marker_in_suppression_reason(tmp_path: Path) -> No
     )
     output = tmp_path / "report.txt"
 
-    result = CliRunner().invoke(
-        app,
-        [
-            "scan",
-            str(skill),
-            "--no-llm",
-            "--baseline",
-            str(baseline),
-            "--show-suppressed",
-            "--output",
-            str(output),
-        ],
-    )
+    args = ["scan", str(skill), "--no-llm", "--baseline", str(baseline), "--show-suppressed"]
+    if write_to_file:
+        args += ["--output", str(output)]
+
+    result = CliRunner().invoke(app, args)
 
     assert result.exit_code == 0, result.output
-    assert reason in output.read_text(encoding="utf-8")
+    report_text = output.read_text(encoding="utf-8") if write_to_file else result.output
+    assert reason in report_text
