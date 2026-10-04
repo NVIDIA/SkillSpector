@@ -2689,6 +2689,18 @@ class TestSupplyChainHelpers:
     def test_is_typosquat_exact_match_returns_none(self) -> None:
         assert sc_mod._is_typosquat("requests", {"requests"}) is None
 
+    def test_is_typosquat_length_difference_boundary(self):
+        # The length-difference skip is exact (OSA distance >= length difference).
+        # A difference of 2 is still within max_distance, a difference of 3 is not;
+        # a ">" -> ">=" slip in the skip would make the first assertion fail.
+        assert sc_mod._is_typosquat("requestsxx", {"requests"}) == "requests"
+        assert sc_mod._is_typosquat("requestsxxx", {"requests"}) is None
+
+    def test_popular_sets_are_frozensets(self):
+        # Module-level target sets are frozensets, so the target cache hits on identity.
+        assert isinstance(sc_mod._POPULAR_PYPI, frozenset)
+        assert isinstance(sc_mod._POPULAR_NPM, frozenset)
+
     @pytest.mark.parametrize(
         "package,popular",
         [
@@ -2732,6 +2744,7 @@ class TestSupplyChainHelpers:
             pytest.param("ethres", "npm", "ethers", id="ethers"),
             pytest.param("crossenv", "npm", "cross-env", id="cross_env"),
             pytest.param("discordjs", "npm", "discord.js", id="npm_dot_is_distinct"),
+            pytest.param("socket-io", "npm", "socket.io", id="npm_hyphen_is_distinct"),
             pytest.param("colourama", "pypi", "colorama", id="colorama"),
             pytest.param("python-dotnev", "pypi", "python-dotenv", id="python_dotenv"),
             pytest.param("pycryptodom", "pypi", "pycryptodome", id="pycryptodome"),
@@ -2755,6 +2768,12 @@ class TestSupplyChainHelpers:
             pytest.param("cypress", "npm", id="cypress"),
             pytest.param("nuxt", "npm", id="nuxt"),
             pytest.param("tether", "npm", id="tether"),
+            pytest.param("jets", "npm", id="jets"),
+            pytest.param("jqueryui", "npm", id="jqueryui"),
+            pytest.param("bootstrap3", "npm", id="bootstrap3"),
+            pytest.param("bootstrap5", "npm", id="bootstrap5"),
+            pytest.param("colormap", "pypi", id="colormap"),
+            pytest.param("python-direnv", "pypi", id="python_direnv"),
         ],
     )
     def test_is_typosquat_known_legit_not_flagged(self, package: str, ecosystem: str) -> None:
@@ -2767,6 +2786,13 @@ class TestSupplyChainHelpers:
     @pytest.mark.parametrize("package", ["discord-py", "discord_py", "Discord.Py"])
     def test_is_typosquat_pep503_equivalent_not_flagged(self, package: str) -> None:
         assert self._sc6(package, "pypi") is None
+
+    def test_is_typosquat_sees_changes_to_a_mutable_set(self) -> None:
+        # Normalized targets are cached per set *content*, not per object.
+        popular = {"requests"}
+        assert sc_mod._is_typosquat("flaks", popular) is None
+        popular.add("flask")
+        assert sc_mod._is_typosquat("flaks", popular) == "flask"
 
     def test_known_legit_disjoint_from_popular(self) -> None:
         for popular, legit in (
