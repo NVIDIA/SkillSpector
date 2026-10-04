@@ -167,14 +167,30 @@ _INLINE_HOST_DOCUMENTATION = "Use `$(hostname).example` for the host name."
 
 
 @pytest.mark.parametrize(
-    "source",
+    "source,complete",
     [
-        pytest.param(json.dumps([_INLINE_HOST_DOCUMENTATION]), id="standalone"),
-        pytest.param(_quote_fence([_INLINE_HOST_DOCUMENTATION]), id="space-quote"),
+        pytest.param(json.dumps([_INLINE_HOST_DOCUMENTATION]), True, id="standalone"),
+        pytest.param(_quote_fence([_INLINE_HOST_DOCUMENTATION]), False, id="space-quote"),
     ],
 )
-def test_owned_json_inline_host_documentation_remains_complete(source: str) -> None:
-    _assert_complete(source)
+def test_owned_json_host_documentation_retains_original_delimiter_ownership(
+    source: str, complete: bool
+) -> None:
+    if complete:
+        _assert_complete(source)
+    else:
+        # A JSON code fence cannot prove Markdown inline ownership inside its
+        # strings. Literal backticks around a runtime-selected executable must
+        # remain conservative even when the surrounding text resembles prose.
+        result = static_runner.run_static_patterns_with_ledger(
+            {"components": ["SKILL.md"], "file_cache": {"SKILL.md": source}}, [tm_module]
+        )
+        assert result["findings"] == []
+        assert any(
+            row["outcome"] is LedgerOutcome.PARTIAL
+            and row["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
+            for row in result["inspection_ledger"]
+        )
 
 
 def _legacy_source(value: str, embedded: bool) -> str:

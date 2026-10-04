@@ -61,23 +61,14 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from pathlib import Path
-from skillspector.constants import MODEL_CONFIG
 from skillspector.logging_config import set_level
 
-from .annotation import annotate_findings
 from .api_pool import create_api_key_pool_from_env
-from .detection import detect_skill_language
 from .discovery import discover_skills
-from .gap_fill import run_gap_fill
 from .reports import _format_json as format_json
 from .reports import _format_markdown as format_markdown
 from .reports import _format_terminal as format_terminal
 from .runner import run_one
-
-# Directories skipped during file reads (same set as build_context._SKIP_DIRS).
-_SKIP_DIRS: frozenset[str] = frozenset(
-    {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".pytest_cache"}
-)
 
 # Progress-print lock — Rich consoles are not thread-safe; serialize output
 # from the main thread via this lock.
@@ -87,43 +78,6 @@ _print_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _read_skill_files(skill_dir: Path) -> dict[str, str]:
-    """Lightweight file read for language detection and gap-fill.
-
-    Mirrors the file-walk rules in
-    :func:`skillspector.nodes.build_context._walk_skill_files`.
-    """
-    file_cache: dict[str, str] = {}
-    for item in skill_dir.rglob("*"):
-        if not item.is_file():
-            continue
-        if any(skip in item.parts for skip in _SKIP_DIRS):
-            continue
-        if item.name.startswith(".") and not item.name.startswith(".claude"):
-            continue
-        try:
-            file_cache[str(item.relative_to(skill_dir))] = item.read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError:
-            continue
-    return file_cache
-
-
-def _resolve_language(skill_dir: Path, cli_lang: str) -> str:
-    """Determine the language for a skill directory.
-
-    When *cli_lang* is ``"auto"``, reads files and runs heuristic
-    detection.  Otherwise returns *cli_lang* as-is.
-    """
-    if cli_lang != "auto":
-        return cli_lang
-    fc = _read_skill_files(skill_dir)
-    if not fc:
-        return "en"
-    return detect_skill_language(fc)
 
 
 def _scan_skill(
@@ -146,29 +100,15 @@ def _scan_skill(
     except ValueError:
         rel_name = skill_dir.name
 
-    # Core scan via the LangGraph graph
+    # Core scan and optional gap-fill share the graph's validated file cache.
     entry, error_msg = run_one(
         skill_dir,
         root,
         use_llm=use_llm,
         detected_language=lang,
+        apply_gap_fill=True,
+        api_pool=api_pool,
     )
-
-    # Gap-fill for non-English skills (post-graph, appends to issues)
-    if lang != "en" and use_llm and not error_msg:
-        fc = _read_skill_files(skill_dir)
-        gap_findings = run_gap_fill(
-            fc, lang, model=MODEL_CONFIG.get("default"), api_pool=api_pool
-        )
-        if gap_findings:
-            existing = list(entry.get("issues", []))
-            new_issues = annotate_findings(
-                [f.to_dict() for f in gap_findings], lang
-            )
-            entry["issues"] = existing + new_issues  # type: ignore[operator]
-        # Patch enhancements so reports can show what was applied
-        entry["enhancements"]["gap_fill_applied"] = True
-        entry["enhancements"]["gap_fill_findings"] = len(gap_findings)
 
     return entry, error_msg, rel_name
 
@@ -331,11 +271,6 @@ def _main_impl() -> None:
         "ERROR": "red",
     }
 
-    # Pre-resolve languages so worker threads don't contend on file I/O
-    lang_map: dict[Path, str] = {}
-    for skill_dir in skill_dirs:
-        lang_map[skill_dir] = _resolve_language(skill_dir, args.lang)
-
     total = len(skill_dirs)
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -345,7 +280,7 @@ def _main_impl() -> None:
                 skill_dir,
                 root,
                 use_llm=use_llm,
-                lang=lang_map[skill_dir],
+                lang=args.lang,
                 require_llm=args.require_llm,
                 api_pool=api_pool,
             ): idx
@@ -378,7 +313,7 @@ def _main_impl() -> None:
                         f"[red]CRASH[/red]"
                     )
                 continue
-            lang = lang_map[skill_dirs[idx - 1]]
+            lang = entry["skill"]["language"]
             results.append(entry)
 
             # -- Progress (main thread via lock — safe for Rich) ---------

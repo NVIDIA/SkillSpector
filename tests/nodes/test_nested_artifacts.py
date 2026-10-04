@@ -10,17 +10,31 @@ import json
 import stat
 import struct
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from skillspector.artifacts import ArtifactDisposition, ContentKind
+from skillspector.artifacts import (
+    ArtifactDisposition,
+    ArtifactRecord,
+    ContentKind,
+    classify_artifact,
+)
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
-from skillspector.nested_artifacts import inspect_nested_artifacts
+from skillspector.nested_artifacts import (
+    NestedInspectionResult,
+    _apply_inventory_overrides,
+    _mark_inventory_exception,
+    has_binary_executable_magic,
+    inspect_nested_artifacts,
+    is_executable_content,
+)
 from skillspector.nodes.analyzers.static_patterns_supply_chain import (
     _analyze_concealed_executables,
 )
 from skillspector.nodes.build_context import build_context
+from skillspector.nodes.report import _compute_risk_score
 
 
 def _zip_bytes(
@@ -54,6 +68,33 @@ def _document_members(**extra: bytes) -> dict[str, bytes]:
     }
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("classes.dex", b"dex\n035\0"),
+        ("renamed.bin", b"dex\n039\0"),
+        ("chunk.luac", b"\x1bLua\x54\x00"),
+        ("renamed.bin", b"\x1bLua\x53\x00"),
+    ],
+    ids=["dex-suffix-and-magic", "dex-magic", "lua-suffix-and-magic", "lua-magic"],
+)
+def test_bytecode_formats_are_executable_content(path: str, payload: bytes) -> None:
+    assert has_binary_executable_magic(payload)
+    assert is_executable_content(path, payload)
+
+
+@pytest.mark.parametrize("path", ["classes.dex", "chunk.luac"])
+def test_bytecode_suffix_is_fail_closed_when_probe_is_empty(path: str) -> None:
+    assert is_executable_content(path, b"")
+
+
+def test_dex_word_prefix_is_not_executable_magic() -> None:
+    payload = b"dex\nA short term for dexterity.\n"
+
+    assert not has_binary_executable_magic(payload)
+    assert not is_executable_content("glossary.txt", payload)
+
+
 def _with_unsupported_compression(data: bytes, method: int = 99) -> bytes:
     encoded = bytearray(data)
     local_header = encoded.find(b"PK\x03\x04")
@@ -62,6 +103,37 @@ def _with_unsupported_compression(data: bytes, method: int = 99) -> bytes:
     encoded[local_header + 8 : local_header + 10] = method.to_bytes(2, "little")
     encoded[central_header + 10 : central_header + 12] = method.to_bytes(2, "little")
     return bytes(encoded)
+
+
+def test_inventory_exceptions_reconcile_in_one_linear_pass() -> None:
+    """Exception reconciliation remains O(events + inventory), not quadratic."""
+
+    class GuardedInventory(list[ArtifactRecord]):
+        iterations = 0
+
+        def __iter__(self) -> Iterator[ArtifactRecord]:
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("inventory must be reconciled in one pass")
+            return super().__iter__()
+
+        def __reversed__(self) -> Iterator[ArtifactRecord]:
+            raise AssertionError("inventory reconciliation must not scan the list")
+
+    path = "outer.zip!/payload.txt"
+    artifact = classify_artifact(path, b"payload")
+    result = NestedInspectionResult()
+    result.artifact_inventory = GuardedInventory([artifact])
+
+    _mark_inventory_exception(
+        result,
+        path=path,
+        reason=LedgerReason.ARCHIVE_SIZE_LIMIT,
+    )
+    _apply_inventory_overrides(result)
+
+    assert artifact["disposition"] == ArtifactDisposition.PARTIAL
+    assert artifact["reason"] == LedgerReason.ARCHIVE_SIZE_LIMIT.value
 
 
 def _with_zip64_eocd(data: bytes) -> bytes:
@@ -110,6 +182,177 @@ def test_transitive_limit_caps_nested_uncompressed_bytes(tmp_path: Path) -> None
         and event.get("limit_bytes") == 5
         for event in result.ledger_events
     )
+
+
+def test_excluded_archive_member_limit_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An excluded archive that exceeds inspection bounds emits a blocking SC9 finding."""
+    import skillspector.nested_artifacts as nested_artifacts_module
+
+    (tmp_path / "SKILL.md").write_text("# Bounded excluded archive\n", encoding="utf-8")
+    archive = tmp_path / "node_modules" / "cache.zip"
+    archive.parent.mkdir()
+    _write_archive(archive, {"first.txt": b"one", "second.txt": b"two"})
+    monkeypatch.setattr(nested_artifacts_module, "ARCHIVE_MAX_MEMBERS", 1)
+
+    context = build_context({"skill_path": str(tmp_path)})
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    assert any(
+        event.get("reason_code") == LedgerReason.ARCHIVE_MEMBER_LIMIT
+        and event["path"] == "node_modules/cache.zip"
+        for event in context["inspection_ledger"]
+    )
+    finding = next(item for item in findings if item.file == "node_modules/cache.zip")
+    assert finding.rule_id == "SC9"
+    assert finding.evidence["excluded_from_analysis"] is True
+    assert finding.evidence["excluded_inspection_incomplete"] is True
+    assert finding.evidence["inherited_exclusion_reason"] == "excluded_directory"
+    score, _, recommendation = _compute_risk_score(findings, False)
+    assert score >= 51
+    assert recommendation == "DO_NOT_INSTALL"
+
+
+def test_later_excluded_archive_fails_closed_after_shared_member_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A budget halt cannot silently omit a later excluded archive."""
+    import skillspector.nested_artifacts as nested_artifacts_module
+
+    (tmp_path / "SKILL.md").write_text("# Shared archive limit\n", encoding="utf-8")
+    excluded = tmp_path / "node_modules"
+    excluded.mkdir()
+    _write_archive(excluded / "a.zip", {"one.txt": b"one", "two.txt": b"two"})
+    _write_archive(excluded / "b.zip", {"payload.sh": b"#!/bin/sh\necho hidden\n"})
+    monkeypatch.setattr(nested_artifacts_module, "ARCHIVE_MAX_MEMBERS", 1)
+
+    context = build_context({"skill_path": str(tmp_path)})
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    limited_paths = {
+        event["path"]
+        for event in context["inspection_ledger"]
+        if event.get("reason_code") == LedgerReason.ARCHIVE_MEMBER_LIMIT
+    }
+    assert {"node_modules/a.zip", "node_modules/b.zip"}.issubset(limited_paths)
+    later = next(item for item in findings if item.file == "node_modules/b.zip")
+    assert later.rule_id == "SC9"
+    assert later.evidence["excluded_from_analysis"] is True
+    assert later.evidence["excluded_inspection_incomplete"] is True
+    assert later.evidence["inherited_exclusion_reason"] == "excluded_directory"
+    inventory = next(
+        item for item in context["artifact_inventory"] if item["path"] == "node_modules/b.zip"
+    )
+    assert inventory["disposition"] == ArtifactDisposition.PARTIAL
+    assert inventory["reason"] == LedgerReason.ARCHIVE_MEMBER_LIMIT.value
+    assert inventory["inherited_exclusion_reason"] == LedgerReason.EXCLUDED_DIRECTORY.value
+
+
+def test_excluded_archive_outer_byte_limit_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded outer read never downgrades an uninspected excluded archive to SAFE."""
+    import skillspector.nodes.build_context as build_context_module
+
+    skill_bytes = b"# Byte boundary\n"
+    (tmp_path / "SKILL.md").write_bytes(skill_bytes)
+    archive = tmp_path / "node_modules" / "cache.zip"
+    archive.parent.mkdir()
+    _write_archive(archive, {"payload.sh": b"#!/bin/sh\necho hidden\n"})
+    monkeypatch.setattr(
+        build_context_module,
+        "MAX_TOTAL_CACHED_BYTES",
+        len(skill_bytes) + 4,
+    )
+
+    context = build_context({"skill_path": str(tmp_path)})
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    assert any(
+        event.get("reason_code") == LedgerReason.TOTAL_BYTES_LIMIT
+        and event["path"] == "node_modules/cache.zip"
+        for event in context["inspection_ledger"]
+    )
+    finding = next(item for item in findings if item.file == "node_modules/cache.zip")
+    assert finding.evidence["excluded_inspection_incomplete"] is True
+    score, _, recommendation = _compute_risk_score(findings, False)
+    assert score >= 51
+    assert recommendation == "DO_NOT_INSTALL"
+
+
+def test_benign_excluded_archive_retains_safe_policy_semantics(tmp_path: Path) -> None:
+    """A fully inspected excluded archive with only inert members does not raise SC9."""
+    (tmp_path / "SKILL.md").write_text("# Benign excluded archive\n", encoding="utf-8")
+    archive = tmp_path / "node_modules" / "cache.zip"
+    archive.parent.mkdir()
+    _write_archive(archive, {"README.txt": b"cached package metadata\n"})
+
+    context = build_context({"skill_path": str(tmp_path)})
+
+    assert not _analyze_concealed_executables(context["component_metadata"])
+    member = next(
+        item
+        for item in context["artifact_inventory"]
+        if item["path"] == "node_modules/cache.zip!/README.txt"
+    )
+    assert member["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+    assert member["reason"] == LedgerReason.EXCLUDED_DIRECTORY.value
+
+
+def test_excluded_nested_binary_inventory_inherits_policy_reason(tmp_path: Path) -> None:
+    """Binary members retain both their content disposition and exclusion provenance."""
+    (tmp_path / "SKILL.md").write_text("# Excluded binary member\n", encoding="utf-8")
+    archive = tmp_path / "node_modules" / "cache.zip"
+    archive.parent.mkdir()
+    _write_archive(archive, {"payload.exe": b"MZ\x00\x00binary payload"})
+
+    context = build_context({"skill_path": str(tmp_path)})
+
+    virtual_path = "node_modules/cache.zip!/payload.exe"
+    member = next(item for item in context["artifact_inventory"] if item["path"] == virtual_path)
+    assert member["content_kind"] == ContentKind.BINARY
+    assert member["disposition"] == ArtifactDisposition.OUT_OF_SCOPE
+    assert member["reason"] == LedgerReason.EXCLUDED_DIRECTORY.value
+    assert member["inherited_exclusion_reason"] == LedgerReason.EXCLUDED_DIRECTORY.value
+
+
+def test_excluded_nested_wasm_is_blocking_executable_content(tmp_path: Path) -> None:
+    """A loadable WebAssembly member cannot hide in an excluded archive."""
+    (tmp_path / "SKILL.md").write_text("# Excluded WebAssembly member\n", encoding="utf-8")
+    archive = tmp_path / "node_modules" / "cache.zip"
+    archive.parent.mkdir()
+    _write_archive(archive, {"module.wasm": b"\x00asm\x01\x00\x00\x00"})
+
+    context = build_context({"skill_path": str(tmp_path)})
+
+    virtual_path = "node_modules/cache.zip!/module.wasm"
+    metadata = next(item for item in context["component_metadata"] if item["path"] == virtual_path)
+    assert metadata["executable"] is True
+    assert metadata["excluded_from_analysis"] is True
+    assert metadata["inherited_exclusion_reason"] == LedgerReason.EXCLUDED_DIRECTORY.value
+    findings = _analyze_concealed_executables(context["component_metadata"])
+    finding = next(item for item in findings if item.file == virtual_path)
+    assert finding.rule_id == "SC9"
+    score, _, recommendation = _compute_risk_score(findings, False)
+    assert score >= 51
+    assert recommendation == "DO_NOT_INSTALL"
+
+
+def test_excluded_failed_nested_inventory_inherits_policy_reason(tmp_path: Path) -> None:
+    """Failed member rows retain the outer exclusion provenance."""
+    (tmp_path / "SKILL.md").write_text("# Excluded failed member\n", encoding="utf-8")
+    archive = tmp_path / "node_modules" / "cache.zip"
+    archive.parent.mkdir()
+    archive.write_bytes(_zip_bytes({"payload.sh": b"target.sh"}, link="payload.sh"))
+
+    context = build_context({"skill_path": str(tmp_path)})
+
+    virtual_path = "node_modules/cache.zip!/payload.sh"
+    member = next(item for item in context["artifact_inventory"] if item["path"] == virtual_path)
+    assert member["disposition"] == ArtifactDisposition.FAILED
+    assert member["reason"] == LedgerReason.ARCHIVE_LINK_MEMBER.value
+    assert member["inherited_exclusion_reason"] == LedgerReason.EXCLUDED_DIRECTORY.value
 
 
 def test_build_context_accounts_nested_bytes_to_transitive_budget(tmp_path: Path) -> None:
@@ -201,6 +444,30 @@ def test_hidden_standalone_executable_has_sc9_and_stays_local(tmp_path: Path) ->
     assert findings[0].file == ".setup.sh"
     assert findings[0].evidence["container_type"] == "filesystem"
     assert findings[0].evidence["concealment"] == "hidden_artifact"
+
+
+def test_hidden_text_starting_with_dex_word_has_no_sc9(tmp_path: Path) -> None:
+    path = tmp_path / ".glossary.txt"
+    path.write_bytes(b"dex\nA short term for dexterity.\n")
+
+    context = build_context({"skill_path": str(tmp_path)})
+    metadata = next(item for item in context["component_metadata"] if item["path"] == path.name)
+
+    assert metadata["executable"] is False
+    assert not _analyze_concealed_executables(context["component_metadata"])
+
+
+def test_hidden_renamed_dex_magic_emits_sc9(tmp_path: Path) -> None:
+    path = tmp_path / ".payload.data"
+    path.write_bytes(b"dex\n035\0" + b"\xff\xfe\x00\x80" * 8)
+
+    context = build_context({"skill_path": str(tmp_path)})
+    metadata = next(item for item in context["component_metadata"] if item["path"] == path.name)
+    findings = _analyze_concealed_executables(context["component_metadata"])
+
+    assert metadata["executable"] is True
+    assert metadata["concealed_executable"] is True
+    assert [finding.rule_id for finding in findings] == ["SC9"]
 
 
 def test_nested_zip_preserves_full_virtual_provenance(tmp_path: Path) -> None:

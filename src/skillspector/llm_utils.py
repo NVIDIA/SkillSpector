@@ -17,8 +17,9 @@
 
 Credentials are resolved in this order:
     1. The active provider (see :mod:`skillspector.providers`):
-       - CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``): use
-         ``is_available()`` and ``complete()`` — no API key needed.
+       - CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+         ``opencode_cli``): use ``is_available()`` and ``complete()`` — no
+         API key needed.
        - HTTP providers (``anthropic``, ``openai``, ``nv_build``): read their
          respective credential env vars and supply a base URL.
     2. ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` (the langchain-openai
@@ -37,17 +38,24 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import threading
 import weakref
 from collections.abc import Coroutine
 from typing import Any, NoReturn
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableLambda
 
-from skillspector.inference_usage import InferenceUsageCollector, provider_name
+from skillspector.inference_usage import (
+    InferenceUsageCollector,
+    chat_model_controls,
+    chat_model_requested_controls,
+    provider_name,
+)
 from skillspector.model_info import get_max_input_tokens, get_max_output_tokens
 from skillspector.providers import (
+    UnknownProviderError,
     create_chat_model,
     create_chat_model_with_provider,
     get_active_provider,
@@ -126,12 +134,16 @@ def _resolve_default_chat_model() -> str:
 def is_llm_available() -> tuple[bool, str | None]:
     """Return ``(available, error_message)`` describing LLM availability.
 
-    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) are checked
-    through their ``is_available()`` method first.  Other providers probe the
-    same native chat-model path used by :func:`get_chat_model`; unbound HTTP
-    providers keep the credential-resolution and OpenAI fallback path.
+    CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    ``opencode_cli``) are checked through their ``is_available()`` method
+    first. Other providers probe the same native chat-model path used by
+    :func:`get_chat_model`; unbound HTTP providers keep the
+    credential-resolution and OpenAI fallback path.
     """
-    provider = get_active_provider()
+    try:
+        provider = get_active_provider()
+    except UnknownProviderError as exc:
+        return False, str(exc)
     if has_cli_capability(provider):
         return provider.is_available()  # type: ignore[attr-defined]
 
@@ -252,19 +264,11 @@ class _StructuredAgentCLIModel:
     ``complete()``, then parses and validates the response into *schema*.
     """
 
-    def __init__(
-        self,
-        provider: object,
-        model: str,
-        max_output_tokens: int,
-        schema: type,
-        timeout: float | None = None,
-    ) -> None:
-        self._provider = provider
-        self._model = model
-        self._max_output_tokens = max_output_tokens
+    def __init__(self, owner: AgentCLIChatModel, schema: type) -> None:
+        # Read transport settings through the owner so a structured wrapper does not pin the
+        # deadline it happened to be created with.
+        self._owner = owner
         self._schema = schema
-        self._timeout = timeout
 
     def _augment(self, prompt: str) -> str:
         schema_json = json.dumps(self._schema.model_json_schema(), indent=2)
@@ -278,11 +282,11 @@ class _StructuredAgentCLIModel:
     def _complete(self, prompt: str) -> str:
         """Return provider output before structured parsing begins."""
         return _complete_agent_cli(
-            self._provider,
+            self._owner._provider,
             self._augment(prompt),
-            model=self._model,
-            max_output_tokens=self._max_output_tokens,
-            timeout=self._timeout,
+            model=self._owner._model,
+            max_output_tokens=self._owner._max_output_tokens,
+            timeout=self._owner._timeout,
         )
 
     def invoke(self, prompt: str) -> object:
@@ -355,10 +359,82 @@ class AgentCLIChatModel:
     async def ainvoke(self, prompt: str) -> _AgentCLIMessage:
         return await asyncio.to_thread(self.invoke, prompt)
 
-    def with_structured_output(self, schema: type) -> _StructuredAgentCLIModel:
-        return _StructuredAgentCLIModel(
-            self._provider, self._model, self._max_output_tokens, schema, self._timeout
-        )
+    def with_structured_output(
+        self, schema: type, method: str | None = None
+    ) -> _StructuredAgentCLIModel:
+        del method  # parity with LangChain chat models; the CLI transport always asks for JSON
+        return _StructuredAgentCLIModel(self, schema)
+
+    def set_timeout(self, timeout: float | None) -> None:
+        """Retarget this adapter, and its structured wrappers, at a new deadline."""
+        self._timeout = timeout
+
+
+STRUCTURED_OUTPUT_METHODS = ("function_calling", "json_schema")
+
+
+def structured_output_kwargs(model: str, provider: object | None = None) -> dict[str, str]:
+    """Keyword arguments for ``with_structured_output`` when binding a schema for *model*.
+
+    ``SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD`` wins, then the active provider's
+    ``structured_output_method(model)`` hint, else LangChain's default (no kwargs).
+
+    Raises:
+        ValueError: when the environment override is not a known method.
+    """
+    override = os.environ.get("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", "").strip().lower()
+    if override:
+        if override not in STRUCTURED_OUTPUT_METHODS:
+            raise ValueError(
+                "SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD must be one of "
+                f"{', '.join(STRUCTURED_OUTPUT_METHODS)}; got {override!r}"
+            )
+        return {"method": override}
+    if provider is None:
+        provider = get_active_provider()
+    hint = getattr(provider, "structured_output_method", None)
+    method = hint(model) if callable(hint) else None
+    return {"method": method} if method else {}
+
+
+def bind_structured_output(
+    llm: object, schema: type, model: str, provider: object | None = None
+) -> object:
+    """``llm.with_structured_output(schema)`` with the method *model* needs.
+
+    A chat model restricted to ``toolChoice`` ``auto`` (Bedrock models that
+    reject a forced tool call) is bound with LangChain's default tool method,
+    the prompt asks for the tool call explicitly, and a prose answer raises
+    :class:`StructuredOutputParseError`, which the analyzers retry like any
+    other malformed structured response.
+    """
+    kwargs = structured_output_kwargs(model, provider)
+    structured = llm.with_structured_output(schema, **kwargs)  # type: ignore[attr-defined]
+    if kwargs or getattr(llm, "supports_tool_choice_values", None) != ("auto",):
+        return structured
+    return _require_tool_call(structured, schema)
+
+
+_TOOL_CALL_INSTRUCTION = (
+    "Report your result by calling the {tool} tool exactly once. Do not answer in prose."
+)
+
+
+def _require_tool_call(structured: Runnable, schema: type) -> Runnable:
+    """Ask for the tool call in the prompt and fail closed when it does not happen."""
+    tool = schema.__name__ if isinstance(schema, type) else "response"
+
+    def _ask(prompt: str) -> str:
+        return f"{prompt}\n\n{_TOOL_CALL_INSTRUCTION.format(tool=tool)}"
+
+    def _check(result: object) -> object:
+        if result is None:
+            raise StructuredOutputParseError(
+                f"model answered in prose instead of calling the {tool} tool"
+            )
+        return result
+
+    return RunnableLambda(_ask) | structured | RunnableLambda(_check)
 
 
 def get_chat_model(
@@ -366,10 +442,11 @@ def get_chat_model(
 ) -> BaseChatModel | AgentCLIChatModel:
     """Return a chat model for the active provider.
 
-    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``) this
-    returns an :class:`AgentCLIChatModel` adapter backed by the provider's
-    ``complete()`` subprocess transport — so the LLM analyzers (which use
-    ``.invoke()`` and ``.with_structured_output()``) work with no API key.
+    For CLI providers (``claude_cli``, ``codex_cli``, ``gemini_cli``,
+    ``opencode_cli``) this returns an :class:`AgentCLIChatModel` adapter
+    backed by the provider's ``complete()`` subprocess transport — so the
+    LLM analyzers (which use ``.invoke()`` and ``.with_structured_output()``)
+    work with no API key.
 
     For HTTP providers it delegates to
     :func:`skillspector.providers.create_chat_model`, which uses the
@@ -447,6 +524,8 @@ def new_inference_usage_collector(
         request_kind=request_kind,
         provider=effective_provider,
         requested_model=model,
+        requested_controls=chat_model_requested_controls(chat_model),
+        forwarded_controls=chat_model_controls(chat_model),
     )
 
 
@@ -483,8 +562,13 @@ def chat_completion(
         chat_model=chat_model,
     )
     effective_provider = chat_model_provider_name(chat_model)
-    if usage_collector is not None and effective_provider is not None:
-        collector.set_provider(effective_provider)
+    if usage_collector is not None:
+        if effective_provider is not None:
+            collector.set_provider(effective_provider)
+        collector.set_controls(
+            chat_model_requested_controls(chat_model),
+            chat_model_controls(chat_model),
+        )
     response = _invoke_with_usage(chat_model, prompt, collector)
     if hasattr(response, "text"):
         return response.text  # type: ignore[union-attr]

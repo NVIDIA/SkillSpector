@@ -30,6 +30,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from skillspector.constants import _SKILLSPECTOR_DEFAULT_MODEL
+from skillspector.dependency_sources import redact_text
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
     InspectionLedgerEvent,
@@ -230,10 +231,11 @@ def _format_findings_for_prompt(findings: list[Finding]) -> str:
     for i, f in enumerate(findings, 1):
         end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
         loc = f"{f.file}:{f.start_line}{end}"
-        matched = f.matched_text or f.message
-        ctx = f.context or ""
+        message = redact_text(f.message)
+        matched = redact_text(f.matched_text or f.message)
+        ctx = redact_text(f.context or "")
         lines.append(
-            f"{i}. [{f.rule_id}] {f.message} ({f.severity})\n"
+            f"{i}. [{f.rule_id}] {message} ({f.severity})\n"
             f"   Location: {loc}\n"
             f"   Matched: {matched}\n"
             f"   Context:\n   " + "\n   ".join(ctx.splitlines())
@@ -241,10 +243,16 @@ def _format_findings_for_prompt(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
+_AUTHORITATIVE_DETERMINISTIC_RULES = frozenset({"SC9", "SC10"})
+
+
 def _fallback_filtered(findings: list[Finding]) -> list[Finding]:
     """Preserve deterministic findings and add defaults in --no-llm mode."""
     result: list[Finding] = []
     for f in findings:
+        if f.rule_id in _AUTHORITATIVE_DETERMINISTIC_RULES:
+            result.append(f)
+            continue
         result.append(
             replace(
                 f,
@@ -269,12 +277,16 @@ def _passthrough_with_defaults(findings: list[Finding]) -> list[Finding]:
     should fail-closed — showing more findings is safer than silently dropping.
     """
     return [
-        replace(
-            f,
-            remediation=f.remediation or get_remediation(f.rule_id),
-            code_snippet=f.code_snippet or f.context,
-            evidence=dict(f.evidence),
-            occurrences=list(f.occurrences),
+        (
+            f
+            if f.rule_id in _AUTHORITATIVE_DETERMINISTIC_RULES
+            else replace(
+                f,
+                remediation=f.remediation or get_remediation(f.rule_id),
+                code_snippet=f.code_snippet or f.context,
+                evidence=dict(f.evidence),
+                occurrences=list(f.occurrences),
+            )
         )
         for f in findings
     ]
@@ -313,7 +325,7 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
         return estimate_tokens(_format_findings_for_prompt(findings))
 
     def build_prompt(self, batch: Batch, **kwargs: object) -> str:
-        metadata_text = kwargs.get("metadata_text", "No metadata available")
+        metadata_text = redact_text(str(kwargs.get("metadata_text", "No metadata available")))
         findings_text = _format_findings_for_prompt(batch.findings)
         return append_output_language_instruction(
             self.base_prompt.format(
@@ -323,6 +335,19 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
                 static_findings=findings_text,
             )
         )
+
+    def get_batches(
+        self,
+        file_paths: list[str],
+        file_cache: dict[str, str],
+        findings: list[Finding] | None = None,
+    ) -> list[Batch]:
+        """Redact credential-bearing SC10 source text before provider batching."""
+        batches = super().get_batches(file_paths, file_cache, findings)
+        for batch in batches:
+            if any(finding.rule_id == "SC10" for finding in batch.findings):
+                batch.content = redact_text(batch.content)
+        return batches
 
     def parse_response(  # type: ignore[override]  # Base class permits custom parsed values.
         self,
@@ -393,6 +418,9 @@ class LLMMetaAnalyzer(LLMAnalyzerBase):
 
         result: list[Finding] = []
         for f in findings:
+            if f.rule_id in _AUTHORITATIVE_DETERMINISTIC_RULES:
+                result.append(f)
+                continue
             exact_key = (f.file, f.rule_id, f.start_line, f.end_line)
             start_only_key = (f.file, f.rule_id, f.start_line, None)
             coarse_key = (f.file, f.rule_id)

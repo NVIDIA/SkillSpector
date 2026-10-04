@@ -71,6 +71,9 @@ class SkillDirectory:
     path: Path
     name: str
     relative_path: str
+    # Frozen discovery provenance. Re-rooting a dot-prefixed child must not
+    # erase the hidden ancestry that keeps its content out of external models.
+    local_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +132,7 @@ class MultiSkillDetectionResult:
     entries_examined: int = 0
     structured_candidates_examined: int = 0
     structured_input_bytes_examined: int = 0
+    omitted_symlink_entries: int = 0
 
     @property
     def complete(self) -> bool:
@@ -231,10 +235,10 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
 
     A directory is considered multi-skill when it has no root ``SKILL.md`` and
     at least two immediate child directories contain a manifest or supported
-    structured skill bundle. Any discovery limit or filesystem ambiguity
-    discards all partial classifications and returns ``complete == False``.
-    Callers can then fall back to a bounded monolithic scan and propagate the
-    supplied limitation to their public completeness surfaces.
+    structured skill bundle. Discovery limits and filesystem ambiguities return
+    ``complete == False``. A symlinked immediate child is the narrow exception:
+    it is never traversed, but already classified non-link siblings remain
+    available for a bounded recursive scan with the supplied limitation.
     """
     absolute_directory = Path(os.path.abspath(directory))
     try:
@@ -273,18 +277,33 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
             return MultiSkillDetectionResult(is_multi_skill=False, has_root_skill=True)
 
         skills: list[SkillDirectory] = []
+        limitations: list[MultiSkillDetectionLimitation] = []
+        omitted_symlink_entries = 0
         for entry in _bounded_scandir(directory, budget=budget):
             budget.check_runtime()
             child = Path(entry.path)
+            if entry.name in _SKIP_DIRS:
+                # Intentionally ignored names (e.g. `.git`, `.venv`,
+                # `node_modules`) are not a discovery gap even when they are
+                # symlinks; skip them before recording any limitation. Any
+                # other symlinked name is recorded below, so an eligible
+                # dot-prefixed skill such as `.review-helper` is never
+                # silently excluded.
+                continue
             try:
                 if entry.is_symlink() or _is_link_or_junction(child):
+                    limitations.append(
+                        MultiSkillDetectionLimitation(
+                            reason_code="read_error",
+                            resource="multi_skill_symlinked_entry",
+                        )
+                    )
+                    omitted_symlink_entries += 1
                     continue
                 if not entry.is_dir(follow_symlinks=False):
                     continue
             except OSError as exc:
                 raise _read_error("multi_skill_directory_entry") from exc
-            if entry.name in _SKIP_DIRS or entry.name.startswith("."):
-                continue
 
             has_manifest = _has_skill_md(child, budget=budget)
             is_structured = False
@@ -301,6 +320,7 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
                     path=child,
                     name=name,
                     relative_path=_sanitize_display_component(entry.name),
+                    local_only=entry.name.startswith("."),
                 )
             )
     except _DetectionIncompleteError as exc:
@@ -310,9 +330,11 @@ def detect_skills(directory: Path) -> MultiSkillDetectionResult:
         is_multi_skill=len(skills) >= 2,
         skills=skills,
         has_root_skill=False,
+        limitations=tuple(limitations),
         entries_examined=budget.entries,
         structured_candidates_examined=budget.structured_candidates,
         structured_input_bytes_examined=budget.structured_bytes,
+        omitted_symlink_entries=omitted_symlink_entries,
     )
 
 
@@ -520,6 +542,11 @@ def _extract_skill_name(skill_dir: Path, *, budget: _DetectionBudget) -> str:
         raise _read_error("multi_skill_manifest_content") from exc
 
     prefix = observed[:MAX_MULTI_SKILL_MANIFEST_FRONTMATTER_BYTES]
+    while prefix.startswith(b"\xef\xbb\xbf"):
+        # Byte-level counterpart to the BOM strip in build_context._parse_manifest:
+        # this sniff runs on raw bytes before decode, so a BOM-prefixed SKILL.md
+        # would otherwise fall through to `fallback` (the directory name) below.
+        prefix = prefix[3:]
     if not prefix.startswith(b"---"):
         return fallback
     content = prefix.decode("utf-8", errors="replace")
