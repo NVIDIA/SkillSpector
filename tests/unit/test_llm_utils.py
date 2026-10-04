@@ -771,6 +771,33 @@ class _PlainProvider:
     pass
 
 
+class Verdict(BaseModel):
+    summary: str
+
+
+def _stub_chat_openai(
+    monkeypatch: pytest.MonkeyPatch, answers: list[AIMessage]
+) -> tuple[object, list[tuple[str, dict]]]:
+    """A ``ChatOpenAI`` with ``tool_choice`` disabled whose transport returns *answers* in order."""
+    from langchain_core.outputs import ChatResult
+    from langchain_openai import ChatOpenAI
+
+    requests: list[tuple[str, dict]] = []
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        requests.append((messages[-1].content, kwargs))
+        return ChatResult(generations=[ChatGeneration(message=answers.pop(0))])
+
+    monkeypatch.setattr(ChatOpenAI, "_generate", _generate)
+    llm = ChatOpenAI(
+        model="spark-x2.5",
+        api_key="sk-test",
+        base_url="https://maas-token-api.cn-huabei-1.xf-yun.com/v2",
+        disabled_params={"tool_choice": None},
+    )
+    return llm, requests
+
+
 class _RecordingLLM:
     def __init__(self) -> None:
         self.calls: list[tuple[type, dict]] = []
@@ -855,6 +882,84 @@ class TestStructuredOutputMethod:
         llm = _RecordingLLM()
         llm.supports_tool_choice_values = ("auto", "any", "tool")  # type: ignore[attr-defined]
         assert bind_structured_output(llm, dict, "m", provider=_PlainProvider()) is llm
+
+    @pytest.mark.parametrize(
+        ("method", "wrapped"),
+        [("function_calling", True), ("json_schema", False)],
+    )
+    def test_auto_only_tool_choice_with_an_explicit_method(
+        self, monkeypatch: pytest.MonkeyPatch, method: str, wrapped: bool
+    ) -> None:
+        """An explicit ``function_calling`` still asks for the call; ``json_schema`` does not bind a tool."""
+        from langchain_core.runnables import RunnableLambda
+
+        monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", method)
+        structured = RunnableLambda(lambda prompt: {"summary": "ok"})
+
+        class _AutoOnlyLLM(_RecordingLLM):
+            supports_tool_choice_values = ("auto",)
+
+            def with_structured_output(self, schema: type, **kwargs: object) -> RunnableLambda:
+                super().with_structured_output(schema, **kwargs)
+                return structured
+
+        llm = _AutoOnlyLLM()
+        bound = bind_structured_output(llm, dict, "m", provider=_PlainProvider())
+        assert llm.calls == [(dict, {"method": method})]
+        assert (bound is not structured) is wrapped
+
+    def test_chat_openai_with_tool_choice_disabled_asks_for_the_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skillspector.providers.openai_compatible import OpenAICompatibleProvider
+
+        monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
+        llm, requests = _stub_chat_openai(
+            monkeypatch,
+            [
+                AIMessage(content="Verdict: looks fine."),
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "Verdict", "args": {"summary": "ok"}, "id": "call_1"}],
+                ),
+            ],
+        )
+        chain = bind_structured_output(
+            llm, Verdict, "spark-x2.5", provider=OpenAICompatibleProvider()
+        )
+        with pytest.raises(StructuredOutputParseError, match="Verdict"):
+            chain.invoke("analyse this")  # type: ignore[attr-defined]
+        assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
+        prompt, request = requests[0]
+        assert prompt.startswith("analyse this\n\n") and "calling the Verdict tool" in prompt
+        assert "tool_choice" not in request
+        assert request["tools"][0]["function"]["name"] == "Verdict"
+
+    @pytest.mark.parametrize("method", [None, "json_schema"])
+    def test_chat_openai_with_tool_choice_disabled_keeps_a_non_tool_method(
+        self, monkeypatch: pytest.MonkeyPatch, method: str | None
+    ) -> None:
+        """Without an explicit ``function_calling`` the binder sends ``response_format`` unwrapped."""
+        if method:
+            monkeypatch.setenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", method)
+        else:
+            monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+        llm, requests = _stub_chat_openai(
+            monkeypatch,
+            [
+                AIMessage(
+                    content='{"summary": "ok"}',
+                    additional_kwargs={"parsed": Verdict(summary="ok")},
+                )
+            ],
+        )
+        chain = bind_structured_output(llm, Verdict, "spark-x2.5", provider=_PlainProvider())
+        assert chain.invoke("analyse this") == Verdict(summary="ok")  # type: ignore[attr-defined]
+        prompt, request = requests[0]
+        assert prompt == "analyse this"
+        assert request["response_format"] is Verdict
+        assert "tools" not in request
 
     def test_cli_adapter_accepts_the_method_keyword(self) -> None:
         from skillspector.llm_utils import AgentCLIChatModel
