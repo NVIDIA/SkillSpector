@@ -997,7 +997,7 @@ def _format_terminal(
     analysis_completeness: Mapping[str, object] | None = None,
     execution_successful: bool = True,
 ) -> str:
-    """Generate Rich terminal output and export as string."""
+    """Generate Rich output, escaping dynamic text before inserting it into markup."""
     suppressed = suppressed or []
     console = Console(record=True, force_terminal=True, width=80, file=StringIO())
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
@@ -1010,8 +1010,8 @@ def _format_terminal(
             subtitle=f"v{skillspector_version}",
         )
     )
-    console.print(f"\n[bold]Skill:[/bold] {skill_name}")
-    console.print(f"[bold]Source:[/bold] {source}")
+    console.print(f"\n[bold]Skill:[/bold] {escape(str(skill_name))}")
+    console.print(f"[bold]Source:[/bold] {escape(source)}")
     console.print(f"[bold]Scanned:[/bold] {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     severity_colors = {
@@ -1044,7 +1044,7 @@ def _format_terminal(
         lines = comp.get("lines", 0)
         exec_flag = comp.get("executable", False)
         exec_marker = "[yellow]Yes[/yellow]" if exec_flag else "No"
-        comp_table.add_row(path, typ, str(lines), exec_marker)
+        comp_table.add_row(escape(path), escape(typ), str(lines), exec_marker)
     if len(component_metadata) > 15:
         comp_table.add_row(f"... and {len(component_metadata) - 15} more", "", "", "")
     console.print(comp_table)
@@ -1056,7 +1056,7 @@ def _format_terminal(
         console.print()
         console.print(
             Panel(
-                f"[bold]Degraded scan[/bold]\n{effective_degraded_notice}",
+                f"[bold]Degraded scan[/bold]\n{escape(effective_degraded_notice)}",
                 title="[bold red]WARNING[/bold red]",
                 border_style="red",
             )
@@ -1072,18 +1072,20 @@ def _format_terminal(
             "CRITICAL": "[bold red]CRITICAL[/bold red]",
         }
         for f in findings:
-            icon = severity_icons.get((f.severity or "LOW").upper(), f.severity)
-            console.print(f"  {icon}: {f.rule_id} - {f.message[:60]}...")
+            icon = severity_icons.get((f.severity or "LOW").upper(), escape(f.severity or ""))
+            console.print(f"  {icon}: {escape(f.rule_id)} - {escape(f.message[:60])}...")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
-            console.print(f"    [dim]Location:[/dim] {f.file}:{f.start_line}{end}")
+            console.print(f"    [dim]Location:[/dim] {escape(f.file)}:{f.start_line}{end}")
             if f.source_url:
-                console.print(f"    [dim]Source:[/dim] {f.source_url} (depth {f.transitive_depth})")
+                console.print(
+                    f"    [dim]Source:[/dim] {escape(f.source_url)} (depth {f.transitive_depth})"
+                )
             console.print(f"    [dim]Confidence:[/dim] {f.confidence:.0%}")
             if f.remediation:
-                console.print(f"    [dim]Remediation:[/dim] {(f.remediation or '')[:150]}...")
+                console.print(f"    [dim]Remediation:[/dim] {escape(f.remediation[:150])}...")
             if f.evidence:
                 rendered = ", ".join(f"{key}={value}" for key, value in sorted(f.evidence.items()))
-                console.print(f"    [dim]Evidence:[/dim] {rendered}")
+                console.print(f"    [dim]Evidence:[/dim] {escape(rendered)}")
             console.print()
     else:
         console.print("\n[green]No security issues detected.[/green]\n")
@@ -1093,11 +1095,12 @@ def _format_terminal(
         console.print(f"[bold]Structured Skill Summary ({len(structured_summaries)})[/bold]\n")
         for summary in structured_summaries:
             console.print(
-                f"  [cyan]{summary.get('id', 'SSR-1')}[/cyan]: {summary.get('message', '')}"
+                f"  [cyan]{escape(str(summary.get('id', 'SSR-1')))}[/cyan]: "
+                f"{escape(str(summary.get('message', '')))}"
             )
             file = _summary_display_value(summary.get("file"))
             if file:
-                console.print(f"    [dim]File:[/dim] {file}")
+                console.print(f"    [dim]File:[/dim] {escape(file)}")
             for key, label in (
                 ("protocol", "Protocol"),
                 ("layout_kind", "Layout"),
@@ -1109,7 +1112,7 @@ def _format_terminal(
             ):
                 value = _summary_display_value(summary.get(key))
                 if value:
-                    console.print(f"    [dim]{label}:[/dim] {value}")
+                    console.print(f"    [dim]{label}:[/dim] {escape(value)}")
             console.print()
 
     if suppressed:
@@ -1120,7 +1123,8 @@ def _format_terminal(
             for sf in suppressed:
                 f = sf.finding
                 console.print(
-                    f"  [dim]- {f.rule_id} {f.file}:{f.start_line} (reason: {sf.reason})[/dim]"
+                    f"  [dim]- {escape(f.rule_id)} {escape(f.file)}:{f.start_line} "
+                    f"(reason: {escape(sf.reason)})[/dim]"
                 )
         else:
             console.print("[dim]Use --show-suppressed to list them.[/dim]")
