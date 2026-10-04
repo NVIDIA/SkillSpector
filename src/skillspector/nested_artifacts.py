@@ -12,6 +12,7 @@ deterministic analyzers.
 from __future__ import annotations
 
 import io
+import re
 import stat
 import struct
 import time
@@ -389,21 +390,124 @@ _BINARY_EXECUTABLE_MAGICS = (
     b"\xbf\xba\xfe\xca",
 )
 
+_TYPESCRIPT_DECLARATION_SUFFIXES = (".d.ts", ".d.cts", ".d.mts")
+_TYPESCRIPT_AMBIENT_MEMBER = (
+    r"(?:export\s+)?(?:"
+    r"interface\s+[A-Za-z_$][\w$]*(?:\s*<[^\r\n{}]*>)?\s*\{[^\r\n{}]*\}|"
+    r"type\s+[A-Za-z_$][\w$]*(?:\s*<[^\r\n;{}]*>)?\s*=\s*[^\r\n;{}]+;|"
+    r"(?:const|let|var)\s+[A-Za-z_$][\w$]*(?:\s*:\s*[^\r\n;{}]+)?\s*;|"
+    r"function\s+[A-Za-z_$][\w$]*\s*\([^\r\n{}]*\)\s*:\s*[^\r\n;{}]+;|"
+    r"class\s+[A-Za-z_$][\w$]*\s*\{[^\r\n{}]*\}"
+    r")"
+)
+_TYPESCRIPT_DECLARATION_FILE = re.compile(
+    r"\A\s*(?:(?:"
+    r"(?:(?:export\s+)?declare\s+(?:const|let|var|function|class)\b[^\r\n;{}]*;)|"
+    rf"(?:declare\s+(?:export\s+)?namespace\s+[A-Za-z_$][\w$]*\s*\{{(?:\s*{_TYPESCRIPT_AMBIENT_MEMBER})*\s*\}}\s*;?)|"
+    rf"(?:declare\s+module\s+(?:[\"'][^\"']+[\"']|[A-Za-z_$][\w$]*)\s*\{{(?:\s*{_TYPESCRIPT_AMBIENT_MEMBER})*\s*\}}\s*;?)|"
+    r"(?:(?:export\s+)?interface\s+[A-Za-z_$][\w$]*(?:\s*<[^\r\n{}]*>)?\s*\{[^\r\n{}]*\}\s*;?)|"
+    r"(?:(?:export\s+)?type\s+[A-Za-z_$][\w$]*(?:\s*<[^;{}]*>)?\s*=\s*[^;\r\n{}]+;)|"
+    r"(?:import\s+type\s+(?:[A-Za-z_$][\w$]*(?:\s*,\s*\{[^{}]*\})?|\{[^{}]*\}|\*\s+as\s+[A-Za-z_$][\w$]*)\s+from\s+[\"'][^\"'\r\n]+[\"']\s*;)|"
+    r"(?:export\s*\{[^{}]*\}\s*;?)"
+    r")\s*)+\Z",
+    re.DOTALL,
+)
+
+
+def _strip_typescript_comments(text: str) -> str | None:
+    """Remove comments without interpreting comment markers inside literals."""
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character in "'\"`":
+            quote = character
+            start = index
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if quote == "`" and text.startswith("${", index):
+                    # Interpolated templates need a JavaScript parser to prove
+                    # inert; fail closed rather than hide their expression.
+                    return None
+                if text[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            else:
+                return None
+            result.append(text[start:index])
+            continue
+        if text.startswith("//", index):
+            while index < len(text) and text[index] not in "\r\n":
+                result.append(" ")
+                index += 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            if end < 0:
+                return None
+            comment = text[index : end + 2]
+            result.extend(
+                "\n" if char == "\n" else "\r" if char == "\r" else " " for char in comment
+            )
+            index = end + 2
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def _looks_like_typescript_declaration(path: str, data: bytes, *, complete_content: bool) -> bool:
+    """Recognize clearly inert TypeScript declaration content conservatively.
+
+    Declaration suffixes alone are not trusted: a file named ``evil.d.cts``
+    can still contain executable CommonJS. Unknown or non-text content stays
+    executable so this check cannot create a name-based security bypass.
+    """
+    name = Path(path).name.lower()
+    if not complete_content or not name.endswith(_TYPESCRIPT_DECLARATION_SUFFIXES) or not data:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    uncommented = _strip_typescript_comments(text)
+    return bool(
+        uncommented and uncommented.strip() and _TYPESCRIPT_DECLARATION_FILE.fullmatch(uncommented)
+    )
+
 
 def has_binary_executable_magic(data: bytes) -> bool:
     """Return whether canonical bytes begin with supported executable magic."""
     return has_dex_magic(data) or data.startswith(_BINARY_EXECUTABLE_MAGICS)
 
 
-def is_executable_content(path: str, data: bytes, mode: int = 0) -> bool:
-    """Classify filesystem and archive content with one static-only policy."""
+def is_executable_content(
+    path: str, data: bytes, mode: int = 0, *, complete_content: bool = False
+) -> bool:
+    """Classify content; only complete declarations may receive the inert exemption."""
     suffix = Path(path).suffix.lower()
     executable_magic = data.startswith(b"#!") or has_binary_executable_magic(data)
-    return suffix in _EXECUTABLE_SUFFIXES or executable_magic or bool(mode & 0o111)
+    declaration_only = _looks_like_typescript_declaration(
+        path, data, complete_content=complete_content
+    )
+    return (
+        (suffix in _EXECUTABLE_SUFFIXES and not declaration_only)
+        or executable_magic
+        or bool(mode & 0o111)
+    )
 
 
 def _member_executable(info: zipfile.ZipInfo, safe_name: str, data: bytes) -> bool:
-    return is_executable_content(safe_name, data, info.external_attr >> 16)
+    return is_executable_content(
+        safe_name,
+        data,
+        info.external_attr >> 16,
+        complete_content=len(data) == info.file_size,
+    )
 
 
 def _nested_path(outer_path: str, virtual_path: str) -> str:
