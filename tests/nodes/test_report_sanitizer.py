@@ -21,6 +21,7 @@ import json
 
 import pytest
 
+from skillspector.llm_analyzer_base import LLMFinding
 from skillspector.models import Finding
 from skillspector.nodes.report import _clean_text, _sanitize_finding, report
 from skillspector.state import SkillspectorState
@@ -57,6 +58,7 @@ def test_sanitize_finding_cleans_text_fields_only() -> None:
     assert cleaned.pattern == "pattern leak here"
     assert "\x1b" not in (cleaned.remediation or "")
     assert "\x07" not in (cleaned.context or "")
+    assert "\x1b" not in (cleaned.pattern or "") and "\x00" not in (cleaned.pattern or "")
     # Non-text fields are unchanged.
     assert cleaned.rule_id == "E2"
     assert cleaned.start_line == 5
@@ -122,6 +124,32 @@ def test_report_redacts_url_credentials_from_every_finding_field(fmt: str, schem
     for secret in (username, password, token):
         assert secret not in rendered
         assert secret not in serialized_findings
+
+
+@pytest.mark.parametrize("fmt", ["json", "sarif"])
+def test_report_sanitizes_llm_message_copied_to_pattern(fmt: str) -> None:
+    message = "review \x1b[31mhttps://user:secret@example.invalid/?token=secret-token\x1b[0m"
+    finding = LLMFinding(
+        rule_id="E1",
+        message=message,
+        severity="HIGH",
+        start_line=1,
+    ).to_finding("SKILL.md")
+    state: SkillspectorState = {
+        "filtered_findings": [finding],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "skill_path": None,
+        "output_format": fmt,
+    }
+
+    result = report(state)
+    rendered = result["report_body"]
+    serialized_findings = json.dumps([item.to_dict() for item in result["filtered_findings"]])
+    assert "\x1b" not in rendered
+    assert "secret" not in rendered
+    assert "secret" not in serialized_findings
 
 
 def test_nested_evidence_preserves_scalar_types_and_original_finding() -> None:
