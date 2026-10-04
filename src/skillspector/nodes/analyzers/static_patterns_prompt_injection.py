@@ -252,8 +252,13 @@ _P2_COPYRIGHT_CORE = (
     r"(?=.{1,60}\Z)(?:\(c\)\s+|©\s+)?\d{1,4}(?:\s*-\s*\d{1,4})?"
     r"\s+(?:" + _P2_NAME_TOKEN + r"\s+){0,5}" + _P2_NAME_TOKEN + r"\.?"
 )
-_P2_SPDX_ID = r"[A-Za-z0-9.+\-]{1,24}"
-_P2_SPDX_ATOM = _P2_SPDX_ID + r"(?:\s+(?:OR|AND|WITH)\s+" + _P2_SPDX_ID + r")*"
+# SPDX ids allow at most two hyphens (length is scoped to the id run so
+# chains and trailing periods never shrink it); chains cap at three ids.
+_P2_SPDX_ID = (
+    r"(?=[A-Za-z0-9.+\-]{1,24}(?![A-Za-z0-9.+\-]))"
+    r"[A-Za-z0-9.+]+(?:-[A-Za-z0-9.+]+){0,2}"
+)
+_P2_SPDX_ATOM = _P2_SPDX_ID + r"(?:\s+(?:OR|AND|WITH)\s+" + _P2_SPDX_ID + r"){0,2}"
 _P2_LICENSE_LINE_RES = (
     re.compile(
         r"\ACopyright\s+" + _P2_COPYRIGHT_CORE + r"\Z",
@@ -274,6 +279,8 @@ _P2_LICENSE_LINE_RES = (
         re.IGNORECASE,
     ),
 )
+_P2_COPYRIGHT_LINE_INDEX = 0
+_P2_SPDX_LINE_INDEX = 2
 _P2_OVERRIDE_EXTRA = re.compile(
     r"system\s+prompt|respond\s+as|override\s+instructions?|you\s+must",
     re.IGNORECASE,
@@ -295,6 +302,21 @@ _P2_EXFIL_STANDALONE = re.compile(r"\bexfiltrat\w*\b", re.IGNORECASE)
 _P2_TRIGGER_STANDALONE = re.compile(
     r"\b(system|instructions?|ignore|post|get|send|transmit)\b", re.IGNORECASE
 )
+
+
+def _p2_trigger_scan_text(text: str) -> str:
+    """Return a de-obfuscated copy of ``text`` for trigger/danger scans.
+
+    camelCase joints, underscores, and digits become spaces, so
+    IgnorePriorInstructions scans as Ignore Prior Instructions.
+    Grammars always match the raw text; only the scans use the copy.
+    Single benign words (PostgreSQL, Systems) stay whole-word clean.
+    """
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
+    text = re.sub(r"[0-9_]+", " ", text)
+    return re.sub(r"\s+", " ", text)
+
+
 # Metadata keys observed in benign skill headers plus obvious header keys.
 # Matching is exact (case-insensitive): bare instruction words such as
 # system, instructions, or ignore are never here.
@@ -333,7 +355,14 @@ _P2_METADATA_LINE = re.compile(r"\A([A-Za-z][\w\- ]{0,40}):\s+(\S.*)\Z")
 # requirements" and "get started" are keys. Known residuals: a bare
 # triggerless package name ("requires: numpy") parses as a package;
 # short triggerless SPDX OR-chains fit the atom cap.
-_P2_REQ_NAME = r"[A-Za-z0-9_.\-@/]+"
+# Requirement names take a package-name shape: optional @scope/, at most
+# 40 characters, at most two -/_/. separators — a hyphen-joined sentence
+# never counts as one bare name. Length is scoped to the name run so
+# comma-separated lists never shrink it.
+_P2_REQ_NAME = (
+    r"(?=[A-Za-z0-9_.@/\-]{1,40}(?![A-Za-z0-9_.@/\-]))"
+    r"(?:@[A-Za-z0-9_.]+/)?[A-Za-z0-9_.]+(?:[-/.][A-Za-z0-9_.]+){0,2}"
+)
 _P2_REQ_VER = r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]{1,20})?[+*]?"
 _P2_REQ_OP = r"(?:>=|<=|==|!=|~=|\^|>|<|=|~)"
 _P2_REQ_VER_SUFFIX = r"(?:\s*" + _P2_REQ_OP + r"\s*" + _P2_REQ_VER + r"|\s+" + _P2_REQ_VER + r")"
@@ -353,7 +382,7 @@ _P2_REQUIREMENTS_RE = re.compile(
 )
 _P2_PATH_VALUE_RE = re.compile(
     r"\A(?=[\w\-./#:?]{1,80}\Z)(?:https?://[\w\-.~]+(?::\d+)?/)?"
-    r"(?:[\w\-]+/){0,3}[\w\-]+\.[\w]{1,10}(?:[#?]\S*)?\Z"
+    r"(?:" + _P2_NAME_TOKEN + r"/){0,3}" + _P2_NAME_TOKEN + r"\.[\w]{1,10}(?:[#?]\S*)?\Z"
 )
 _P2_SINGLE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9.]{1,24}\Z")
 _P2_COPYRIGHT_VALUE_RE = re.compile(
@@ -400,16 +429,22 @@ def _p2_comment_inner(matched_text: str) -> str:
 
 
 def _p2_has_danger_signal(inner: str) -> bool:
-    """Return True when a comment body carries override or exfiltration intent."""
-    for pattern_source, _confidence in P1_PATTERNS:
-        if re.search(pattern_source, inner, re.IGNORECASE):
+    """Return True when a comment body carries override or exfiltration intent.
+
+    Both the raw body and a de-obfuscated copy are scanned: the copy
+    catches camelCase/underscore-joined intent, the raw body keeps
+    digit-bearing patterns exact. Either firing refuses the exemption.
+    """
+    for text in {inner, _p2_trigger_scan_text(inner)}:
+        for pattern_source, _confidence in P1_PATTERNS:
+            if re.search(pattern_source, text, re.IGNORECASE):
+                return True
+        if _P2_OVERRIDE_EXTRA.search(text):
             return True
-    if _P2_OVERRIDE_EXTRA.search(inner):
-        return True
-    if _P2_EXFIL_STANDALONE.search(inner):
-        return True
-    if _P2_EXFIL_KEYWORD.search(inner) and _P2_EXTERNAL_DEST.search(inner):
-        return True
+        if _P2_EXFIL_STANDALONE.search(text):
+            return True
+        if _P2_EXFIL_KEYWORD.search(text) and _P2_EXTERNAL_DEST.search(text):
+            return True
     return False
 
 
@@ -435,7 +470,7 @@ def _is_frontmatter_adjacent(content: str, match_start: int) -> bool:
 
 def _is_license_only_fragment(fragment: str) -> bool:
     """Return True when the fragment fully matches an anchored license-line form."""
-    if _P2_TRIGGER_STANDALONE.search(fragment) is not None:
+    if _P2_TRIGGER_STANDALONE.search(_p2_trigger_scan_text(fragment)) is not None:
         return False
     return any(pattern.match(fragment) is not None for pattern in _P2_LICENSE_LINE_RES)
 
@@ -456,7 +491,7 @@ def _is_allowlisted_metadata_fragment(fragment: str) -> bool:
     value = match.group(2).strip()
     if len(value) > 1 and value.endswith("."):
         value = value[:-1]
-    if _P2_TRIGGER_STANDALONE.search(value) is not None:
+    if _P2_TRIGGER_STANDALONE.search(_p2_trigger_scan_text(value)) is not None:
         return False
     if key in _P2_FREE_TEXT_KEYS:
         return _P2_SINGLE_TOKEN_RE.match(value) is not None
@@ -479,11 +514,21 @@ def _is_benign_license_or_metadata_body(inner: str) -> bool:
     if not body:
         return False
     seen_keys: set[str] = set()
+    copyright_lines = 0
+    spdx_lines = 0
     for fragment in re.split(r"[.!?]+\s+|\n|;", body):
         fragment = fragment.strip()
         if not fragment:
             continue
         if _is_license_only_fragment(fragment):
+            if _P2_LICENSE_LINE_RES[_P2_COPYRIGHT_LINE_INDEX].match(fragment) is not None:
+                copyright_lines += 1
+                if copyright_lines > 2:
+                    return False
+            elif _P2_LICENSE_LINE_RES[_P2_SPDX_LINE_INDEX].match(fragment) is not None:
+                spdx_lines += 1
+                if spdx_lines > 1:
+                    return False
             continue
         key_match = _P2_METADATA_LINE.match(fragment)
         if key_match is not None:
