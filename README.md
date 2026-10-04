@@ -222,6 +222,29 @@ directory, SkillSpector excludes that exact file from content analysis so its
 suppression text cannot create findings or enter regenerated fingerprints;
 sibling files remain in normal scan scope.
 
+### Explicit scan scope
+
+For a local directory containing one `SKILL.md` or `skill.md`, repeat `--exclude` to omit
+selected files before content analysis:
+
+```bash
+skillspector scan ./my-skill --exclude 'tests/*' --exclude 'fixtures/*.json'
+```
+
+Patterns are case-sensitive globs matched against the entire relative POSIX path;
+`*` also matches `/`. Quote patterns so your shell does not expand them. This is
+an explicit caller option, not an author-controlled ignore file. Patterns matching
+either manifest name (`SKILL.md` or `skill.md`) are rejected, as are recursive, multi-skill, transitive, registry, and
+non-directory inputs. No-match patterns are still recorded in the report.
+
+Files already outside the scan inventory, such as policy-excluded dependencies,
+retain their existing policy handling and are not counted as caller exclusions.
+Explicitly excluded inventory files remain in the coverage denominator as entirely uninspected. The
+report lists the applied patterns, excluded count and individual skipped paths;
+any matched exclusion makes coverage partial and prevents a `SAFE` recommendation.
+Use `--fail-on-incomplete` when partial scope should fail CI. These exclusions do
+not suppress findings in included files or override existing safety limits.
+
 ### LLM Analysis
 
 For the best results, configure an OpenAI-compatible LLM endpoint for
