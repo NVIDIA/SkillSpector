@@ -775,19 +775,30 @@ _DESCRIPTION_ACTIVATION_CONDITION_RE = re.compile(
 # Universal-scope signals for description clauses. The scope must be
 # unconditional: a subject or domain qualifier such as "about PostgreSQL",
 # "with PDF files" or "related to Kubernetes" keeps the clause describing a
-# capability, not a catch-all trigger. A qualifier whose object is only a
-# pronoun or a quantifier ("anything with it", "anything with you",
-# "anything related to any topic") bounds nothing and stays universal. Broad
-# prepositions ("in", "for", "on") are deliberately not qualifiers: "any
-# message in the chat" is still every message.
+# capability, not a catch-all trigger. A leading determiner or quantifier is
+# transparent ("about this codebase", "about any AWS service" are still
+# bounded by the noun after it). A qualifier whose object is only a pronoun or
+# a generic noun ("anything with it", "anything with anyone", "anything
+# related to any topic", "any messages with any content") bounds nothing and
+# stays universal. Broad prepositions ("in", "for", "on") are deliberately not
+# qualifiers: "any message in the chat" is still every message.
+_DESCRIPTION_SCOPE_DETERMINER = (
+    r"(?:the|a|an|this|that|these|those|any|all|every|each|some|"
+    r"my|your|our|their|its|his|her)"
+)
+_DESCRIPTION_UNBOUNDED_OBJECT = (
+    r"(?:it|them|you|me|us|him|her|anything|everything|whatever|something|"
+    r"nothing|anyone|anybody|someone|somebody|everyone|everybody|nobody|"
+    r"topics?|subjects?|things?|content)"
+)
 _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
     r"\b(?:"
     r"anything|everything|whatever|"
     r"(?:all|any|every)\s+(?:messages?|requests?|questions?|queries?|inputs?|tasks?)"
     r")\b"
     r"(?!\s+(?:about|with|involving|regarding|concerning|(?:related|relating)\s+to)\s+"
-    r"(?!(?:it|this|that|them|anything|everything|whatever|"
-    r"any|all|every|each|some|you|me|us|him|her)\b)[a-z0-9])",
+    rf"(?:{_DESCRIPTION_SCOPE_DETERMINER}\s+)?"
+    rf"(?!(?:{_DESCRIPTION_UNBOUNDED_OBJECT}|{_DESCRIPTION_SCOPE_DETERMINER})\b)[a-z0-9])",
     re.IGNORECASE,
 )
 
@@ -798,7 +809,7 @@ _DESCRIPTION_UNIVERSAL_SCOPE_RE = re.compile(
 # "CI/CD" must not read as invocation intent for "build".
 _DESCRIPTION_INVOCATION_RE = re.compile(
     r"\b(?:commands?|slash|invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
+    r"override[sd]?|overriding|overridden|shadow(?:s|ed|ing)?)\b|(?<![\w/])/[a-z]",
     re.IGNORECASE,
 )
 
@@ -818,7 +829,14 @@ _DESCRIPTION_INVOCATION_RE = re.compile(
 _DESCRIPTION_SLASH_COMMAND_RE = re.compile(r"(?<![\w/.~])/([a-z][\w-]*)", re.IGNORECASE)
 _DESCRIPTION_INTERCEPTION_VERB_RE = re.compile(
     r"\b(?:invoke[sd]?|invoking|intercept(?:s|ed|ing)?|"
-    r"override[sd]?|overriding|shadow(?:s|ed|ing)?)\b",
+    r"override[sd]?|overriding|overridden|shadow(?:s|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+# Passive interception claims name the command before the verb: "the built-in
+# deploy command is intercepted", "types deploy it is intercepted".
+_DESCRIPTION_PASSIVE_INTERCEPTION_RE = re.compile(
+    r"(?<![\w/.~-])/?([a-z][\w-]*)\s+(?:commands?\s+|it\s+)?(?:is|are|gets?)\s+"
+    r"(?:intercepted|overridden|shadowed|invoked)\b",
     re.IGNORECASE,
 )
 _DESCRIPTION_COMMAND_TOKEN_RE = re.compile(r"(?<![\w/.~-])/?([a-z][\w-]*)", re.IGNORECASE)
@@ -942,9 +960,10 @@ def _description_shadowed_commands(clause: str) -> list[str]:
     """Built-in commands a description clause claims to invoke or intercept.
 
     Only commands tied to interception evidence count: a slash-command token
-    whose whole name is a built-in, or a built-in named anywhere after an
-    invocation/interception/override verb in the clause. Returns the sorted
-    set of shadowed built-in commands.
+    whose whole name is a built-in, a built-in named anywhere after an
+    invocation/interception/override verb in the clause, or a built-in that a
+    passive claim names right before the verb ("deploy is intercepted").
+    Returns the sorted set of shadowed built-in commands.
     """
     shadowed = {
         match.group(1).lower()
@@ -955,6 +974,11 @@ def _description_shadowed_commands(clause: str) -> list[str]:
     if verb is not None:
         tokens = _DESCRIPTION_COMMAND_TOKEN_RE.findall(clause[verb.end() :])
         shadowed.update(t.lower() for t in tokens if t.lower() in _BUILTIN_COMMANDS)
+    shadowed.update(
+        match.group(1).lower()
+        for match in _DESCRIPTION_PASSIVE_INTERCEPTION_RE.finditer(clause)
+        if match.group(1).lower() in _BUILTIN_COMMANDS
+    )
     return sorted(shadowed)
 
 

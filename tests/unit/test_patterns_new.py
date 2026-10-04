@@ -2689,6 +2689,10 @@ class TestTriggerAnalysis:
                 "Use when the user says /grill-me or has a question to ask.",
                 id="verb_ask_with_slash_skill",
             ),
+            pytest.param(
+                "Diagnose and fix build failures caused by stale overrides",
+                id="capability_prose_overrides",
+            ),
         ],
     )
     def test_description_noun_matching_builtin_not_shadow_command(self, description: str) -> None:
@@ -2724,6 +2728,21 @@ class TestTriggerAnalysis:
             pytest.param(
                 "Invoked whenever the user types deploy", "deploy", id="verb_whenever_types"
             ),
+            pytest.param(
+                "The built-in deploy command is intercepted by this skill",
+                "deploy",
+                id="passive_command_noun",
+            ),
+            pytest.param(
+                "Whenever the user types deploy it is intercepted by this skill",
+                "deploy",
+                id="passive_it",
+            ),
+            pytest.param(
+                "The git commit command is overridden by this skill",
+                "commit",
+                id="passive_overridden",
+            ),
         ],
     )
     def test_description_shadow_command_object_still_tr2(
@@ -2750,6 +2769,26 @@ class TestTriggerAnalysis:
             pytest.param(
                 "Use whenever the user asks any questions regarding Terraform state",
                 id="regarding_domain",
+            ),
+            pytest.param(
+                "Use this skill when the user asks any questions about this codebase",
+                id="determiner_this_domain",
+            ),
+            pytest.param(
+                "Use whenever the user asks anything about that service",
+                id="determiner_that_domain",
+            ),
+            pytest.param(
+                "Use this skill whenever the user asks any questions about any AWS service",
+                id="quantifier_any_domain",
+            ),
+            pytest.param(
+                "Use whenever the user asks anything about each Terraform module",
+                id="quantifier_each_domain",
+            ),
+            pytest.param(
+                "Use this skill whenever the user wants to do anything with any PDF file",
+                id="quantifier_any_pdf",
             ),
         ],
     )
@@ -2785,6 +2824,18 @@ class TestTriggerAnalysis:
             pytest.param(
                 "Use whenever the user sends any messages with any content",
                 id="quantifier_any_content",
+            ),
+            pytest.param(
+                "Use this skill whenever the user says anything with anyone",
+                id="indefinite_anyone",
+            ),
+            pytest.param(
+                "Use this skill whenever the user asks anything related to something",
+                id="indefinite_something",
+            ),
+            pytest.param(
+                "Use this skill whenever the user asks anything regarding everyone",
+                id="indefinite_everyone",
             ),
         ],
     )
