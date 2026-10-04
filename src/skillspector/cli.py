@@ -3158,7 +3158,7 @@ def _scan_multi_skill(
             Path(output).write_text(rendered, encoding="utf-8")
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         elif format is FormatChoice.terminal:
-            console.print(rendered)
+            console.print(rendered, markup=False)
         else:
             sys.stdout.write(rendered)
 
