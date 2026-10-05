@@ -426,3 +426,47 @@ async def test_parallel_scan_of_contractions_remains_complete(tmp_path: Path) ->
     assert result["analysis_completeness"]["is_complete"] is True
     mcp = await run_scan(str(tmp_path), use_llm=False)
     assert mcp["safe_to_install"] is True
+
+
+@pytest.mark.parametrize("irregular", [False, True])
+def test_projected_prompt_regex_timeout_records_incomplete_coverage(
+    monkeypatch: pytest.MonkeyPatch, irregular: bool
+) -> None:
+    calls = []
+
+    class ExpiredPattern:
+        def finditer(self, text, *, timeout, concurrent):
+            calls.append((timeout, concurrent))
+            # Exercise the irregular projection after the normal search.
+            if irregular and len(calls) == 1:
+                return iter(())
+            raise TimeoutError("regex timed out")
+
+    monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERNS", (ExpiredPattern(),))
+    monkeypatch.setattr(artifact_integrity, "transitive_remaining_seconds", lambda _state: 0.01)
+    if irregular:
+        monkeypatch.setattr(
+            artifact_integrity,
+            "_irregular_spacing_prompt_projection",
+            lambda _view: ("without telling the user", ((1, 0),)),
+        )
+    content = "w i t h o u t   t e l l i n g   u s e r"
+    result = node({"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}})
+    assert len(calls) == (2 if irregular else 1)
+    assert all(call == (0.01, False) for call in calls)
+    assert all(event["outcome"] == "partial" for event in result["inspection_ledger"])
+    assert all(
+        event["reason_code"] == LedgerReason.RUNTIME_LIMIT for event in result["inspection_ledger"]
+    )
+
+
+def test_repeated_projected_prompt_prefix_has_engine_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifact_integrity, "_MULTILINE_PROMPT_PATTERN_SECONDS", 0.000001)
+    content = "w i t h o u t   t e l l i n g   u s e r " * 1000
+    with pytest.raises(artifact_integrity._ArtifactIntegrityResourceLimitError) as caught:
+        artifact_integrity._projected_prompt_injection_line(
+            content, artifact_integrity._ArtifactIntegrityBudget({})
+        )
+    assert caught.value.reason == LedgerReason.RUNTIME_LIMIT
