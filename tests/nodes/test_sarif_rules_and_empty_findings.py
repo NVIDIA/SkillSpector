@@ -17,6 +17,10 @@
 
 from __future__ import annotations
 
+from urllib.parse import unquote, urlsplit
+
+import pytest
+
 from skillspector.models import Finding
 from skillspector.nodes.report import _build_sarif
 from skillspector.sarif_models import validate_sarif_report
@@ -216,6 +220,66 @@ class TestSarifResultProperties:
         assert result["properties"]["finding"] == "credential leak"
         assert result["properties"]["explanation"] == "Credential material is exposed in output"
         assert result["properties"]["intent"] == "exposed_secret"
+
+
+@pytest.mark.parametrize("suppressed", [False, True])
+@pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize(
+    "filename,encoded",
+    [
+        ("scripts/a#b.py", "scripts/a%23b.py"),
+        ("scripts/a?b.py", "scripts/a%3Fb.py"),
+        ("scripts/a b.py", "scripts/a%20b.py"),
+        ("scripts/a%20b.py", "scripts/a%2520b.py"),
+        ("scripts/café.py", "scripts/caf%C3%A9.py"),
+        ("scripts\\a#b.py", "scripts/a%23b.py"),
+        ("outer.zip!/a#b.py", "outer.zip!/a%23b.py"),
+        ("scripts/plain.py", "scripts/plain.py"),
+    ],
+)
+def test_sarif_artifact_uri_preserves_literal_filename(
+    filename: str, encoded: str, suppressed: bool, scoped: bool
+) -> None:
+    finding = _make_finding(file=filename)
+    prefix = f"external/{'a' * 64}/" if scoped else ""
+    if scoped:
+        finding.source_identity = prefix.rstrip("/")
+    sarif = (
+        _build_sarif([], [SuppressedFinding(finding=finding, reason="reviewed")])
+        if suppressed
+        else _build_sarif([finding])
+    )
+    validate_sarif_report(sarif)
+    uri = sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"][
+        "uri"
+    ]
+    assert uri == prefix + encoded
+    parsed = urlsplit(uri)
+    assert parsed.query == parsed.fragment == ""
+    assert unquote(parsed.path) == prefix + filename.replace("\\", "/")
+    assert finding.file == filename
+
+
+def test_sarif_occurrence_uri_preserves_literal_filename() -> None:
+    finding = _make_finding()
+    finding.occurrences = [{"file": "nested/a#b.py", "start_line": 7}]
+    result = _build_sarif([finding])["runs"][0]["results"][0]
+    artifact = result["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert artifact["uri"] == "nested/a%23b.py"
+
+
+@pytest.mark.parametrize("category", ["ledger_exceptions", "scope_exclusions"])
+def test_sarif_notification_uri_preserves_literal_filename(category: str) -> None:
+    sarif = _build_sarif(
+        [],
+        analysis_completeness={
+            category: [{"path": "nested/a#b?.py", "message": "File skipped", "start_line": 1}]
+        },
+    )
+    validate_sarif_report(sarif)
+    notification = sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]
+    artifact = notification["locations"][0]["physicalLocation"]["artifactLocation"]
+    assert artifact["uri"] == "nested/a%23b%3F.py"
 
 
 def test_sarif_transitive_properties_validate() -> None:

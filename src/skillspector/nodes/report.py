@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from io import StringIO
 from typing import Literal, cast
+from urllib.parse import quote
 
 from rich.console import Console
 from rich.markup import escape
@@ -207,7 +208,7 @@ def _sarif_artifact_location(
     if source_identity:
         uri = f"{source_identity}/{file_path}"
     else:
-        uri = str(occurrence.get("file", finding.file))
+        uri = str(occurrence.get("file", finding.file)).replace("\\", "/")
     properties = {
         {
             "source_identity": "sourceIdentity",
@@ -217,7 +218,7 @@ def _sarif_artifact_location(
         }[key]: value
         for key, value in provenance.items()
     }
-    return SarifArtifactLocation(uri=uri, properties=properties or None)
+    return SarifArtifactLocation(uri=quote(uri, safe="/!"), properties=properties or None)
 
 
 def _occurrence_columns(
@@ -854,7 +855,9 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=path),
+                        artifactLocation=SarifArtifactLocation(
+                            uri=quote(path.replace("\\", "/"), safe="/!")
+                        ),
                         region=region,
                     )
                 )
