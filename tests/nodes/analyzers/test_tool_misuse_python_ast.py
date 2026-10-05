@@ -130,6 +130,8 @@ def test_explicit_subprocess_shadow_rejects_bound_call(shadow: str) -> None:
     "native_rhs",
     [
         pytest.param("subprocess.check_call", id="native-cross-api"),
+        pytest.param("Popen", id="native-popen"),
+        pytest.param("functools.partial(Popen, command)", id="wrapped-popen"),
         pytest.param("functools.partial(subprocess.run, command)", id="wrapped-native"),
         pytest.param("Proxy(subprocess)", id="receiver-passed-to-constructor"),
     ],
