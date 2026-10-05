@@ -32,11 +32,13 @@ Security invariants verified:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -60,6 +62,7 @@ from skillspector.providers._agent_cli import (
     _parse_opencode_output,
     _prepare_opencode_env,
     _run_bounded,
+    get_spec,
     run_agent_cli,
 )
 from skillspector.providers.opencode_cli import OpencodeCLIProvider
@@ -443,7 +446,7 @@ class TestOpencodeDenyAllPolicy:
 # ---------------------------------------------------------------------------
 
 
-# Real opencode 1.18.32 envelope shapes (Step-0 probe:
+# Real opencode 1.18.33 envelope shapes (Step-0 probe:
 # `opencode run "say hi" --format json` in an empty dir; verbatim raw saved
 # to Temp scratch only). Top-level `type` is one of step_start / text /
 # step_finish; the reply text lives at part.text of `text` events.
@@ -484,7 +487,7 @@ class TestParseOpencodeOutput:
 
     def test_skips_non_json_noise_lines(self) -> None:
         # Banner/TUI noise must never leak into the extracted output.
-        raw = f"opencode v1.18.32\n{_TEXT_EVENT}\nattaching session...\n"
+        raw = f"opencode v1.18.33\n{_TEXT_EVENT}\nattaching session...\n"
         assert _parse_opencode_output(raw) == "hi"
 
     def test_empty_stdout_raises(self) -> None:
@@ -549,3 +552,63 @@ class TestOpencodeCLIProviderWiring:
 
     def test_has_cli_capability(self) -> None:
         assert has_cli_capability(OpencodeCLIProvider())
+
+
+# ---------------------------------------------------------------------------
+# Zen free-tier refusal mapping
+# ---------------------------------------------------------------------------
+
+# Verbatim envelope shape from a Zen 403 (free tier refused
+# under the deny-all isolation; any permission deny trips it).
+_ZEN_REFUSAL_ENVELOPE = (
+    '{"type":"error","timestamp":1789784969134,"sessionID":"ses_probe",'
+    '"error":{"name":"APIError","data":{"message":"Error from provider '
+    "(Console): OpenCode's free tier can only be used from within OpenCode\","
+    '"statusCode":403,"responseBody":"{\\"type\\":\\"error\\",\\"error\\":'
+    '{\\"type\\":\\"FreeTierError\\"}"}}}}}'
+)
+
+
+class _FakePopen:
+    """Minimal Popen stand-in for _run_bounded (cross-platform, no subprocess)."""
+
+    def __init__(self, stdout: bytes, returncode: int) -> None:
+        self.stdin: io.BytesIO | None = io.BytesIO()
+        self.stdout: io.BytesIO | None = io.BytesIO(stdout)
+        self.stderr: io.BytesIO | None = io.BytesIO(b"")
+        self._returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._returncode
+
+    def kill(self) -> None:
+        pass
+
+
+class TestZenFreeTierRefusal:
+    def _run_with_fake_host(
+        self, monkeypatch: pytest.MonkeyPatch, stdout: bytes, returncode: int
+    ) -> str:
+        spec = replace(get_spec("opencode"), preflight=None)
+        monkeypatch.setattr(_agent_cli, "get_spec", lambda _name: spec)
+        monkeypatch.setattr(_agent_cli, "find_binary", lambda _name: "/usr/bin/opencode")
+        monkeypatch.setattr(
+            subprocess,
+            "Popen",
+            lambda *args, **kwargs: _FakePopen(stdout, returncode),
+        )
+        return run_agent_cli("opencode", "probe", model="opencode/nemotron-3-ultra-free")
+
+    def test_free_tier_refusal_raises_actionable_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Zen FreeTierError envelope must fail closed with guidance — never
+        the opaque exit-code message, and never a silent sandbox weakening."""
+        with pytest.raises(AgentCLIError, match="free tier can only be used"):
+            self._run_with_fake_host(monkeypatch, _ZEN_REFUSAL_ENVELOPE.encode(), 1)
+
+    def test_plain_nonzero_exit_keeps_generic_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(AgentCLIError, match="exited with code 1"):
+            self._run_with_fake_host(monkeypatch, b"boom", 1)

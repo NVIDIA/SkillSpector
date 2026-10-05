@@ -5,10 +5,20 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+
+def test_release_workflow_pins_actions_to_immutable_commits() -> None:
+    """Actions with release write permissions must not follow mutable tags."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    action_refs = re.findall(r"\buses:\s*([^\s#]+)", workflow)
+
+    assert action_refs
+    assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", ref) for ref in action_refs)
 
 
 def test_release_workflow_publishes_only_labeled_merged_main_prs() -> None:

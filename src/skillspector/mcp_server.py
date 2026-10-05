@@ -15,8 +15,8 @@
 
 """MCP server exposing SkillSpector scanning as an agent-callable tool.
 
-This lets any MCP-capable agent (Claude Code, Codex CLI, Gemini CLI) or remote
-runtime call ``scan_skill`` and gate skill/MCP installs on the verdict, turning
+This lets local MCP-capable agents (Claude Code, Codex CLI, Gemini CLI) call
+``scan_skill`` and gate skill/MCP installs on the verdict, turning
 SkillSpector from an out-of-band audit tool into a runtime guardrail.
 
 The scan core (:func:`run_scan`) is deliberately independent of the ``mcp`` SDK
@@ -28,19 +28,27 @@ installed.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from ipaddress import ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from skillspector import __version__
-from skillspector.cleanup import cleanup_result
+from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
 from skillspector.graph import graph
+from skillspector.graph_proxy import restore_package_graph_export
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
 from skillspector.nodes.analyzers import ANALYZER_MODULES
 from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
 from skillspector.suppression import effective_findings
+
+# Importing `skillspector.graph` above assigns the submodule to the parent
+# package's `graph` attribute, shadowing the documented lazy proxy. Restore
+# the proxy so `skillspector.graph` stays invokable when MCP is imported
+# before any other graph access.
+restore_package_graph_export()
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -146,10 +154,14 @@ async def run_scan(
     )
 
     result: dict[str, Any] | None = None
+    # A cancelled or failed scan returns no result to clean up; the tracker still
+    # knows the temp directory resolve_input made.
+    temp_dir_tracker = TempDirTracker()
     try:
         result = await graph.ainvoke(
             state,
             config={
+                "callbacks": [temp_dir_tracker],
                 "run_name": "skillspector-mcp-scan",
                 "tags": ["skillspector", "mcp"],
                 "metadata": {
@@ -221,6 +233,8 @@ async def run_scan(
     finally:
         if result is not None:
             cleanup_result(result)
+        else:
+            temp_dir_tracker.remove()
 
 
 def build_server(name: str = "skillspector", *, allow_local_targets: bool = False) -> FastMCP:
@@ -273,7 +287,21 @@ def build_server(name: str = "skillspector", *, allow_local_targets: bool = Fals
 
 
 def run(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Run the MCP server over ``stdio`` (local agents) or ``http`` (remote/A2A)."""
+    """Run the MCP server over ``stdio`` or loopback-only ``http``."""
+    if transport == "http":
+        # Never resolve caller-selected names or expose this unauthenticated server.
+        host = "127.0.0.1" if host.lower() == "localhost" else host
+        try:
+            host = str(ip_address(host))
+            # FastMCP permits these Host headers, not the full IPv4 loopback range.
+            loopback = host in {"127.0.0.1", "::1"}
+        except ValueError:
+            loopback = False
+        if not loopback:
+            raise ValueError(
+                "HTTP MCP has no authentication and must bind to a loopback IP "
+                "(127.0.0.1 or ::1). Use an authenticating reverse proxy for remote access."
+            )
     server = build_server(allow_local_targets=transport == "stdio")
     if transport == "stdio":
         server.run(transport="stdio")

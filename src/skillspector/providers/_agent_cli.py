@@ -454,13 +454,18 @@ def _parse_gemini_output(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# OpenCode CLI invocation  (verified against opencode 1.18.32)
+# OpenCode CLI invocation  (verified against opencode 1.18.33)
 # ---------------------------------------------------------------------------
 
 
 _OPENCODE_AGENT_PREFIX = "skillspector-deny-all"
 _OPENCODE_DENY_ALL = json.dumps({"*": "deny"}, separators=(",", ":"))
-_OPENCODE_SUPPORTED_VERSION = "1.18.32"
+_OPENCODE_SUPPORTED_VERSION = "1.18.33"
+# Markers of a Zen free-tier refusal. Zen answers 403 to
+# any call carrying the deny-all isolation (OPENCODE_CONFIG_CONTENT or
+# OPENCODE_PERMISSION alone suffices; verified by env bisect), so free-tier
+# models and this sandbox are mutually exclusive until Zen's policy changes.
+_ZEN_FREE_TIER_MARKERS = ("FreeTierError", "can only be used from within OpenCode")
 
 
 def _opencode_agent_name(argv: list[str]) -> str:
@@ -578,7 +583,7 @@ def _prepare_opencode_env(
             "OPENCODE_EXPERIMENTAL_PLAN_MODE": "0",
             "OPENCODE_PERMISSION": _OPENCODE_DENY_ALL,
             "OPENCODE_PURE": "1",
-            # OpenCode 1.18.32 uses this internal override for the home paths
+            # OpenCode 1.18.33 uses this internal override for the home paths
             # searched for AGENTS.md, .opencode, .claude, and .agents content.
             "OPENCODE_TEST_HOME": isolated_home,
             # The same pinned version uses this override instead of the
@@ -601,7 +606,7 @@ def _preflight_opencode_policy(
     """Fail closed unless OpenCode's fully resolved sensitive config is exact.
 
     macOS MDM preferences are loaded after ``OPENCODE_CONFIG_CONTENT`` and do
-    not have a supported disable flag in OpenCode 1.18.32. Querying the final
+    not have a supported disable flag in OpenCode 1.18.33. Querying the final
     config with the exact environment and directory prevents a managed
     ``share: auto`` (or another late source) from silently reopening ambient
     capabilities before the inference process is allowed to start.
@@ -674,7 +679,7 @@ def _preflight_opencode_policy(
 def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) -> list[str]:
     """Build argv for a text-only, deny-all ``opencode run`` call.
 
-    Flags chosen (verified against ``opencode`` 1.18.32 ``run --help``):
+    Flags chosen (verified against ``opencode`` 1.18.33 ``run --help``):
 
     ``run``
         Non-interactive single-shot mode. With no positional message, the
@@ -728,7 +733,7 @@ def _build_opencode_argv(binary: str, model: str, max_output_tokens: int = 0) ->
 def _parse_opencode_output(raw: str) -> str:
     """Extract assistant text from ``opencode run --format json`` JSONL events.
 
-    Verified against opencode 1.18.32, whose events look like::
+    Verified against opencode 1.18.33, whose events look like::
 
         {"type": "step_start", ..., "part": {"type": "step-start", ...}}
         {"type": "text", ..., "part": {"type": "text", "text": "hi", ...}}
@@ -1245,6 +1250,17 @@ def run_agent_cli(
         raise AgentCLIError(f"{binary_name} timed out after {timeout}s")
     if returncode != 0:
         stderr_snippet = stderr_raw[:500].decode("utf-8", errors="replace")
+        stdout_snippet = stdout_raw[:2000].decode("utf-8", errors="replace")
+        if binary_name == "opencode" and any(
+            marker in stdout_snippet for marker in _ZEN_FREE_TIER_MARKERS
+        ):
+            raise AgentCLIError(
+                "opencode Zen refused the call: its free tier can only be used "
+                "from within OpenCode, and it rejects the deny-all sandbox "
+                "isolation this provider requires. Use a key-backed model "
+                "instead, or retry if Zen's policy changes. Refusing to "
+                "weaken the sandbox: no fallback without isolation."
+            )
         raise AgentCLIError(
             f"{binary_name} exited with code {returncode}; stderr={stderr_snippet!r}"
         )

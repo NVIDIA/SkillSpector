@@ -17,6 +17,7 @@ import skillspector.nodes.finalize_inspection_ledger as finalizer_module
 import skillspector.nodes.report as report_module
 import skillspector.state as state_module
 from skillspector.inspection_ledger import (
+    InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
     LedgerRecordType,
@@ -692,6 +693,49 @@ def test_resolved_partial_reference_produces_one_canonically_counted_ae1() -> No
     assert completeness["findings_before_filtering"] == 1
     assert completeness["findings_after_filtering"] == 1
     assert completeness["is_complete"] is False
+
+
+def test_finalization_coverage_finding_does_not_require_meta_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coverage finding added after meta-review cannot invent a failed review."""
+    coverage = Finding(
+        rule_id="AE1",
+        message="coverage",
+        finding_id="coverage",
+        severity="HIGH",
+        file="SKILL.md",
+        start_line=1,
+        tags=["coverage"],
+    )
+    monkeypatch.setattr(finalizer_module, "_reference_coverage_findings", lambda _state: [coverage])
+    monkeypatch.setattr(finalizer_module, "_size_coverage_findings", lambda *_args, **_kwargs: [])
+    result = finalize_inspection_ledger(
+        {
+            "components": ["SKILL.md"],
+            "findings": [],
+            "effective_finding_ids": [],
+            "meta_review_required": False,
+            "use_llm": True,
+            "llm_requested": True,
+            "llm_call_log": [],
+            "inspection_ledger": [],
+            "analyzer_status_events": [
+                analyzer_status_event(analyzer_id=analyzer_id, status="not_applicable")
+                for analyzer_id in (
+                    "semantic_developer_intent",
+                    "semantic_quality_policy",
+                    "semantic_security_discovery",
+                )
+            ],
+        }
+    )
+
+    assert [finding.rule_id for finding in result["findings"]] == ["AE1"]
+    assert result["meta_review_required"] is False
+    assert not any(
+        event.get("phase") == "semantic_runtime" for event in result["inspection_ledger"]
+    )
 
 
 def test_ae1_reports_target_specific_parser_diagnostics_for_each_reference() -> None:
@@ -1905,6 +1949,139 @@ def test_unresolved_reference_does_not_synthesize_ae1(status: str) -> None:
 
     assert result["findings"] == []
     assert result["effective_finding_ids"] == []
+
+
+def _reference_caveat(
+    reason: LedgerReason,
+    *,
+    outcome: LedgerOutcome = LedgerOutcome.PARTIAL,
+    phase: str = "reference_resolution",
+) -> InspectionLedgerEvent:
+    """Build the event reference resolution records on SKILL.md for an unresolved mention."""
+    return ledger_event(
+        outcome=outcome,
+        record_type=LedgerRecordType.SYSTEM,
+        phase=phase,
+        path="SKILL.md",
+        start_line=3,
+        end_line=3,
+        reason=reason,
+    )
+
+
+def _self_reference_state(
+    *events: InspectionLedgerEvent, status: str = "missing"
+) -> SkillspectorState:
+    """SKILL.md mentions an unresolved path and then references itself."""
+    return {
+        "artifact_inventory": [{"path": "SKILL.md", "disposition": "analyzed"}],
+        "artifact_references": [
+            {
+                "source_path": "SKILL.md",
+                "line": 3,
+                "evidence": "templates/config.yaml",
+                "target_path": None,
+                "status": status,
+            },
+            {
+                "source_path": "SKILL.md",
+                "line": 5,
+                "evidence": "Keep `SKILL.md` under 500 lines.",
+                "target_path": "SKILL.md",
+                "status": "resolved",
+                "disposition": "analyzed",
+            },
+        ],
+        "inspection_ledger": list(events),
+    }
+
+
+_REFERENCE_CAVEAT_CASES = [
+    pytest.param("missing", LedgerReason.REFERENCE_MISSING, id="missing"),
+    pytest.param("ambiguous", LedgerReason.REFERENCE_UNRESOLVED, id="ambiguous"),
+]
+
+
+@pytest.mark.parametrize(("status", "reason"), _REFERENCE_CAVEAT_CASES)
+def test_reference_caveat_does_not_make_its_source_an_ae1_target(
+    status: str, reason: LedgerReason
+) -> None:
+    state = _self_reference_state(_reference_caveat(reason), status=status)
+
+    assert finalizer_module._reference_coverage_findings(state) == []
+
+
+@pytest.mark.parametrize(("status", "reason"), _REFERENCE_CAVEAT_CASES)
+def test_self_reference_ae1_still_reports_source_content_limitations(
+    status: str, reason: LedgerReason
+) -> None:
+    findings = finalizer_module._reference_coverage_findings(
+        _self_reference_state(
+            _reference_caveat(reason),
+            ledger_event(
+                outcome=LedgerOutcome.PARTIAL,
+                phase="static",
+                analyzer_id="static_patterns_tool_misuse",
+                path="SKILL.md",
+                reason=LedgerReason.STATIC_PARSE_LIMIT,
+                start_line=4,
+                end_line=4,
+            ),
+            status=status,
+        )
+    )
+
+    assert [(finding.rule_id, finding.start_line) for finding in findings] == [("AE1", 5)]
+    reasons = findings[0].to_dict()["evidence"]["reasons"]
+    assert [row["reason_code"] for row in reasons] == ["static_parse_limit"]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "phase", "reason"),
+    [
+        pytest.param(
+            LedgerOutcome.FAILED,
+            "reference_resolution",
+            LedgerReason.REFERENCE_MISSING,
+            id="failed-missing",
+        ),
+        pytest.param(
+            LedgerOutcome.FAILED,
+            "reference_resolution",
+            LedgerReason.REFERENCE_UNRESOLVED,
+            id="failed-unresolved",
+        ),
+        pytest.param(
+            LedgerOutcome.PARTIAL,
+            "static",
+            LedgerReason.REFERENCE_MISSING,
+            id="other-phase-missing",
+        ),
+        pytest.param(
+            LedgerOutcome.PARTIAL,
+            "cache",
+            LedgerReason.REFERENCE_UNRESOLVED,
+            id="other-phase-unresolved",
+        ),
+        pytest.param(
+            LedgerOutcome.PARTIAL,
+            "reference_resolution",
+            LedgerReason.REFERENCE_EXTRACTION_LIMIT,
+            id="extraction-limit",
+        ),
+    ],
+)
+def test_other_reference_event_shapes_still_yield_self_reference_ae1(
+    outcome: LedgerOutcome, phase: str, reason: LedgerReason
+) -> None:
+    findings = finalizer_module._reference_coverage_findings(
+        _self_reference_state(_reference_caveat(reason, outcome=outcome, phase=phase))
+    )
+
+    assert [(finding.rule_id, finding.start_line) for finding in findings] == [("AE1", 5)]
+    evidence = findings[0].to_dict()["evidence"]
+    assert evidence["target_disposition"] == outcome.value
+    assert [row["reason_code"] for row in evidence["reasons"]] == [reason.value]
 
 
 def test_guard_analyzer_node_converts_unexpected_exception_to_fatal_facts() -> None:

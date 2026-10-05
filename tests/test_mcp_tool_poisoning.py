@@ -17,17 +17,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
 from pydantic import BaseModel
 
 from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
+from skillspector.llm_analyzer_base import LLMAnalyzerBase
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
 from skillspector.nodes.deduplicate import deduplicate
@@ -213,6 +215,9 @@ class _FakeStructuredLLM:
             assert self.response_schema is not None
             return self.response_schema.model_validate(response)
         return response
+
+    async def ainvoke_with_usage(self, prompt: str, collector: object) -> object:
+        return self.invoke_with_usage(prompt, collector)
 
 
 class _FakeChatModel:
@@ -1086,6 +1091,8 @@ class TestTP4DescriptionBehaviorMismatch:
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) >= 1
         assert tp4[0].severity in {"HIGH", "MEDIUM"}
+        assert tp4[0].pattern == "Description-Behavior Mismatch"
+        assert tp4[0].finding == tp4[0].message
 
     def test_no_mismatch_clean(self, monkeypatch: pytest.MonkeyPatch):
         _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
@@ -1093,6 +1100,36 @@ class TestTP4DescriptionBehaviorMismatch:
         result = node(state)
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) == 0
+
+
+class TestTP4Finding:
+    def test_finding_maps_result_metadata_for_unit_ci(self):
+        result = mcp_tool_poisoning._TP4AnalysisResult(
+            is_mismatch=True,
+            confidence=0.9,
+            declared_purpose_summary="Local text transformation",
+            actual_behavior_summary="Sends source data to a remote endpoint",
+            mismatched_capabilities=["network access"],
+            explanation="The declared purpose does not disclose network behavior.",
+        )
+        batch = mcp_tool_poisoning.Batch(
+            file_path="scripts/tool.py",
+            content="upload(source)",
+            start_line=12,
+            end_line=12,
+        )
+
+        finding = mcp_tool_poisoning._tp4_finding(result, batch, "A local text utility")
+
+        assert finding is not None
+        assert finding.rule_id == "TP4"
+        assert finding.category == "MCP Tool Poisoning"
+        assert finding.pattern == "Description-Behavior Mismatch"
+        assert finding.finding == finding.message
+        assert "network access" in finding.message
+        assert finding.evidence["code_path"] == "scripts/tool.py"
+        assert finding.evidence["code_start_line"] == 12
+        assert finding.evidence["code_end_line"] == 12
 
 
 class TestTP4MarkdownFences:
@@ -1609,7 +1646,7 @@ class TestTP4Fallbacks:
 
     def test_persistently_malformed_response_returns_empty(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
-        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", lambda _delay: None)
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", AsyncMock())
         structured_llm = _mock_tp4_structured_llm(
             monkeypatch,
             [{}, {}, {}, {}],
@@ -1627,8 +1664,8 @@ class TestTP4Fallbacks:
 
     def test_malformed_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
-        sleep = MagicMock()
-        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", sleep)
+        sleep = AsyncMock()
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
         structured_llm = _mock_tp4_structured_llm(
             monkeypatch,
             [{}, {"is_mismatch": False}],
@@ -1643,8 +1680,8 @@ class TestTP4Fallbacks:
 
     def test_cli_parse_error_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
-        sleep = MagicMock()
-        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", sleep)
+        sleep = AsyncMock()
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
         provider = MagicMock()
         provider.complete.side_effect = ["not JSON", '{"is_mismatch": false}']
         monkeypatch.setattr(
@@ -1660,8 +1697,8 @@ class TestTP4Fallbacks:
 
     def test_out_of_range_confidence_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
-        sleep = MagicMock()
-        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", sleep)
+        sleep = AsyncMock()
+        monkeypatch.setattr(LLMAnalyzerBase, "_asleep_before_retry", sleep)
         structured_llm = _mock_tp4_structured_llm(
             monkeypatch,
             [{"is_mismatch": True, "confidence": 1.7}, {"is_mismatch": False}],
@@ -1673,6 +1710,49 @@ class TestTP4Fallbacks:
         sleep.assert_called_once_with(0.5)
         assert [finding for finding in result["findings"] if finding.rule_id == "TP4"] == []
         assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
+
+
+class TestTP4Concurrency:
+    def test_batches_run_concurrently_within_the_shared_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TP4 fans out its batches like the semantic analyzers instead of one by one."""
+        state = {
+            "manifest": {"name": "concurrency", "description": "Runs local calculations."},
+            "file_cache": {
+                "tool.py": "".join(f"value_{index} = {index}\n" for index in range(300))
+            },
+            "component_metadata": [{"path": "tool.py", "type": "python"}],
+            "use_llm": True,
+            "model_config": {"default": "test-model"},
+        }
+        monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "2")
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 256)
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", 4)
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MIN_CODE_TOKENS", 1)
+        monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 2048)
+        structured = _mock_tp4_structured_llm(
+            monkeypatch, [{"is_mismatch": False} for _ in range(4)]
+        )
+        in_flight = 0
+        peak = 0
+
+        async def slow_ainvoke(llm: _FakeStructuredLLM, prompt: str, collector: object) -> object:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return llm.invoke_with_usage(prompt, collector)
+
+        monkeypatch.setattr(_FakeStructuredLLM, "ainvoke_with_usage", slow_ainvoke)
+
+        result = node(state)
+
+        assert structured.calls == 4
+        assert peak == 2
+        semantic = [event for event in result["inspection_ledger"] if event["phase"] == "semantic"]
+        assert sum(event["outcome"] is LedgerOutcome.COMPLETED for event in semantic) == 4
 
 
 class TestTP4Telemetry:
