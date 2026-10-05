@@ -70,3 +70,12 @@ container or a hidden/disguised artifact. Executability is established from an e
 a shebang, or archive mode bits. A benign document without executable members does not produce SC9.
 
 SC9 reports evidence and risk; it does not execute the member or prescribe an installation decision.
+
+At the scan root, visible source scripts beneath `.agents/skills/<name>/` and
+`.claude/skills/<name>/` are not treated as concealed when that skill directory
+contains a regular `SKILL.md` or `skill.md` manifest. These paths remain hidden
+and local-only: their contents are not sent to an external LLM. The inspection
+ledger records that LLM review was withheld, so the report does not imply that
+those scripts received semantic review. This narrow exception does not cover
+hidden skill names, hidden descendants, mismatched shebangs, unsupported script
+types, or nested client directories.

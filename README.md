@@ -469,7 +469,7 @@ SkillSpector detects **71 vulnerability patterns** across 17 categories:
 | SC5 | Abandoned Dependencies | MEDIUM | Unmaintained packages without security updates |
 | SC6 | Typosquatting | HIGH | Package names similar to popular packages |
 | SC8 | Shipped Python Bytecode | HIGH | `__pycache__` / `.pyc` present (discovery skips; malicious bytecode bypass) |
-| SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact |
+| SC9 | Concealed Executable Artifact | HIGH | Executable nested in a document container or hidden/disguised artifact; root-level visible source helpers in manifested `.agents/skills/<name>/` and `.claude/skills/<name>/` folders are exempted but remain local-only and are marked as not LLM-reviewed |
 | SC10 | Dependency Source Redirection | HIGH | Package-manager source added, replaced, or unresolved |
 
 ### Excessive Agency (5 patterns)

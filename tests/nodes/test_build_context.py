@@ -661,10 +661,77 @@ def test_conventional_skill_scripts_are_not_concealed(tmp_path: Path, client_dir
     visible_path = f"{client_dir}/skills/hello/scripts/hello.py"
     hidden_path = f"{client_dir}/skills/hello/scripts/.hidden.py"
     assert metadata[visible_path]["concealed_executable"] is False
+    assert metadata[visible_path]["hidden_skill_script_llm_review_withheld"] is True
     assert metadata[hidden_path]["concealed_executable"] is True
     findings = _analyze_concealed_executables(result["component_metadata"])
     assert visible_path not in {finding.file for finding in findings}
     assert hidden_path in {finding.file for finding in findings}
+    coverage = next(
+        event
+        for event in result["inspection_ledger"]
+        if event["path"] == visible_path
+        and event.get("reason_code") == LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY
+    )
+    assert coverage["outcome"] == LedgerOutcome.SKIPPED
+    assert "not sent to an external LLM" in coverage["message"]
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "payload", "manifest", "source_local_only"),
+    [
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", False, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            "symlink",
+            False,
+        ),
+        (".claude/skills/demo/scripts/tool.py", b"\x7fELF" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/tool.py", b"MZ" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/run", b"#!/bin/sh\ntrue\n", True, False),
+        (".claude/skills/demo/scripts/run.bat", b"@echo off\r\n", True, False),
+        (".claude/skills/.demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            ".claude/skills/demo/scripts/.cache/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".github/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            "project/.claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, True),
+        (".claude/skills/demo/scripts/run.py", b"#!/bin/bash\nprint(1)\n", True, False),
+    ],
+)
+def test_skill_script_exemption_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    payload: bytes,
+    manifest: bool | str,
+    source_local_only: bool,
+) -> None:
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    skill_root = tmp_path / ".claude" / "skills" / "demo"
+    skill_root.mkdir(parents=True, exist_ok=True)
+    if manifest is True:
+        (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    elif manifest == "symlink":
+        external = tmp_path / "outside.md"
+        external.write_text("# Demo\n", encoding="utf-8")
+        (skill_root / "SKILL.md").symlink_to(external)
+
+    result = build_context({"skill_path": str(tmp_path), "source_local_only": source_local_only})
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert relative_path in {finding.file for finding in findings}
 
 
 def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
