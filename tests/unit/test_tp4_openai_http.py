@@ -162,6 +162,33 @@ def test_reasoning_effort_uses_existing_json_schema_route_over_real_http(
     assert "tool_choice" not in requests[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,attempts,complete",
+    [
+        ("clean", 1, True),
+        ("refusal", 4, False),
+        ("malformed", 4, False),
+    ],
+)
+async def test_async_real_http_tool_results_use_same_validation(
+    openai_http_endpoint, mode, attempts, complete
+):
+    requests, behavior = openai_http_endpoint
+    behavior["mode"] = mode
+    analyzer = tp._TP4Analyzer(model=_MODEL, timeout=30.0)
+    outcome = await analyzer.arun_batches_detailed(
+        [tp.Batch(file_path="format.py", content="Assess the declared formatting behavior.")]
+    )
+    assert behavior["tp4_calls"] == attempts
+    assert bool(outcome.successful) is complete
+    assert bool(outcome.failures) is not complete
+    if not complete:
+        assert outcome.failures[0].reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+    assert analyzer.response_received
+    assert all("response_format" not in request for request in requests)
+
+
 @pytest.mark.parametrize("output_format", ["json", "sarif"])
 @pytest.mark.parametrize("mode", ["clean", "mismatch", "refusal", "malformed"])
 def test_full_scanner_graph_reports_tp4_http_results(
