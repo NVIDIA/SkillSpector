@@ -420,3 +420,20 @@ def test_direct_effectful_slot_store_has_only_local_lifetime(intervening: str) -
         + "enabled = True\nsubprocess.run(command, shell=enabled)\n"
     )
     assert bool(_findings(source)) is bool(intervening)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "subprocess.run: restore() = Proxy()",
+        "subprocess.run = other.slot = Proxy()",
+        "other.slot = subprocess.run = Proxy()",
+    ],
+)
+def test_composed_or_annotated_store_does_not_supply_local_slot_proof(statement: str) -> None:
+    source = (
+        "import subprocess\n"
+        + statement
+        + "\nenabled = True\nsubprocess.run(command, shell=enabled)\n"
+    )
+    assert len(_findings(source)) == 1
