@@ -1645,6 +1645,73 @@ class TestTP4MarkdownFences:
         assert context.startswith("## Before: unsafe example")
         assert long_lines[-1] in context
 
+    def test_heading_directly_above_full_window_is_kept(self):
+        warnings = [f"- Warning note number {index}." for index in range(6)]
+        content = (
+            "## Before: unsafe example\n" + "\n".join(warnings) + "\n```bash\nrm -rf ./data\n```\n"
+        )
+
+        _language, _body, _start, _end, context = next(
+            iter(mcp_tool_poisoning._iter_tp4_markdown_fences(content))
+        )
+
+        assert context.splitlines()[0] == "## Before: unsafe example"
+        assert warnings[-1] in context
+
+    def test_long_block_without_heading_keeps_above_fence_line_in_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Without a heading, truncation keeps the tail nearest the fence."""
+        long_lines = ["x = " + "y" * 396 for _ in range(4)]
+        content = (
+            "\n".join(long_lines)
+            + "\nRun the block below to clean up.\n```bash\nrm -rf ./data\n```\n"
+            + "Now run the block above to clean up.\n"
+        )
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents cleanup."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        prompt = structured.prompts[0]
+        assert "Run the block below to clean up." in prompt
+        assert "Now run the block above to clean up." in prompt
+        assert "rm -rf ./data" in prompt
+
+    def test_oversized_heading_keeps_nearby_lines_in_prompt(self, monkeypatch: pytest.MonkeyPatch):
+        """An overlong heading is capped so nearby lines still fit."""
+        heading = "## " + "x" * 597
+        long_lines = ["x = " + "y" * 396 for _ in range(4)]
+        content = (
+            heading
+            + "\n"
+            + "\n".join(long_lines)
+            + "\nRun the block below to clean up.\n```bash\nrm -rf ./data\n```\n"
+            + "Now run the block above to clean up.\n"
+        )
+        structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
+
+        mcp_tool_poisoning._check_tp4(
+            {
+                "manifest": {"description": "Documents cleanup."},
+                "file_cache": {"guide.md": content},
+                "component_metadata": [{"path": "guide.md", "type": "markdown"}],
+                "model_config": {"default": "test-model"},
+            }
+        )
+
+        prompt = structured.prompts[0]
+        assert heading[:256] in prompt
+        assert "Run the block below to clean up." in prompt
+        assert "Now run the block above to clean up." in prompt
+        assert "rm -rf ./data" in prompt
+
     def test_unsafe_example_context_reaches_the_tp4_prompt(self, monkeypatch: pytest.MonkeyPatch):
         """The document framing must reach the model, with code lines unchanged."""
         structured = _mock_tp4_structured_llm(monkeypatch, [{"is_mismatch": False}])
@@ -1982,7 +2049,10 @@ class TestTP4Concurrency:
             "model_config": {"default": "test-model"},
         }
         monkeypatch.setenv("SKILLSPECTOR_MAX_LLM_CONCURRENCY", "2")
-        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 256)
+        # Batch cap sized to the prompt: the TP4 suffix guidance grows fixed
+        # overhead, so this keeps a small but positive code budget. The
+        # batching and concurrency behavior under test is unchanged.
+        monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCH_INPUT_TOKENS", 320)
         monkeypatch.setattr(mcp_tool_poisoning, "TP4_MAX_BATCHES", 4)
         monkeypatch.setattr(mcp_tool_poisoning, "TP4_MIN_CODE_TOKENS", 1)
         monkeypatch.setattr(mcp_tool_poisoning, "get_max_input_tokens", lambda _model: 2048)

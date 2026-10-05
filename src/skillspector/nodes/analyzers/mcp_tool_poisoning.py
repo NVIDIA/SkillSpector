@@ -998,10 +998,11 @@ def _tp4_preceding_block(preceding: Sequence[str]) -> list[str]:
         collected.append(stripped)
         index -= 1
     full = len(collected) >= TP4_PRE_CONTEXT_LINES
-    # `index` sits on the blank that stopped collection, or on the oldest
-    # collected line when the window is full. Either way the heading search
-    # starts above the collected block.
-    cursor = index - 1 if full else index
+    # `index` sits on the blank that stopped collection, or on the line above
+    # the oldest collected line when the window is full (it was already
+    # decremented past it). Either way the heading search starts above the
+    # collected block.
+    cursor = index
     if collected and not _TP4_HEADING_RE.match(collected[-1]):
         while cursor >= 0 and not lines[cursor].strip():
             cursor -= 1
@@ -1012,22 +1013,29 @@ def _tp4_preceding_block(preceding: Sequence[str]) -> list[str]:
     return list(reversed(collected))
 
 
+_TP4_HEADING_SHARE_CHARS = 256
+
+
 def _truncate_preceding(text: str) -> str:
     """Truncate preceding context, keeping the heading and nearest lines.
 
     A plain head cut would keep the oldest prose and drop the lines nearest
     the fence, including a line that directly introduces the code. Instead the
-    heading (when collected first) is preserved and the cut falls on the
-    middle, so both the framing and the immediate introduction survive.
+    heading (when collected first) keeps a bounded share and the cut falls on
+    the middle, so both the framing and the immediate introduction survive.
+    Without a heading the tail nearest the fence is kept instead, for the
+    same reason: the line just above the fence is the most likely
+    introduction to the code.
     """
     if len(text) <= TP4_PRE_CONTEXT_CHARS:
         return text
     lines = text.split("\n")
     if lines and _TP4_HEADING_RE.match(lines[0]):
-        head, rest = lines[0] + "\n", "\n".join(lines[1:])
-        keep = TP4_PRE_CONTEXT_CHARS - len(head)
-        return head + rest[-keep:] if keep > 0 else head[:TP4_PRE_CONTEXT_CHARS]
-    return text[:TP4_PRE_CONTEXT_CHARS]
+        head = lines[0][:_TP4_HEADING_SHARE_CHARS]
+        rest = "\n".join(lines[1:])
+        keep = TP4_PRE_CONTEXT_CHARS - len(head) - 1
+        return head + "\n" + rest[-keep:] if keep > 0 else head[:TP4_PRE_CONTEXT_CHARS]
+    return text[-TP4_PRE_CONTEXT_CHARS:]
 
 
 def _tp4_trailing_block(following: Sequence[str]) -> list[str]:
