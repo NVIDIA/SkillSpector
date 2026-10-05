@@ -483,7 +483,8 @@ _POPULAR_NPM: frozenset[str] = frozenset(
 # in-sample: names outside those two lists can still be flagged. Established
 # packages reported from outside the sample in review (#647) were checked one by
 # one (repository, age, downloads) and added: jets, jqueryui, bootstrap3,
-# bootstrap5 (npm), colormap, python-direnv (PyPI).
+# bootstrap5 (npm), colormap (PyPI). python-direnv (PyPI) was reviewed too and is
+# kept flagged on purpose (#687): little history, two edits from python-dotenv.
 _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
     {
         "afsapi",
@@ -554,7 +555,6 @@ _KNOWN_LEGIT_PYPI: frozenset[str] = frozenset(
         "pyrect",
         "pysaml2",
         "pytango",
-        "python-direnv",
         "pytket",
         "pytoml",
         "rltest",

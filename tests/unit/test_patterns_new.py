@@ -2773,7 +2773,6 @@ class TestSupplyChainHelpers:
             pytest.param("bootstrap3", "npm", id="bootstrap3"),
             pytest.param("bootstrap5", "npm", id="bootstrap5"),
             pytest.param("colormap", "pypi", id="colormap"),
-            pytest.param("python-direnv", "pypi", id="python_direnv"),
         ],
     )
     def test_is_typosquat_known_legit_not_flagged(self, package: str, ecosystem: str) -> None:
@@ -2782,6 +2781,11 @@ class TestSupplyChainHelpers:
     def test_is_typosquat_known_legit_is_needed(self) -> None:
         # Without the list, an established package collides with a popular one.
         assert sc_mod._is_typosquat("pynacl", sc_mod._POPULAR_PYPI) == "pyyaml"
+
+    def test_is_typosquat_python_direnv_kept_flagged(self) -> None:
+        # Borderline name reviewed in #687 (genuine repository, little history):
+        # deliberately left off _KNOWN_LEGIT_PYPI, so SC6 keeps flagging it.
+        assert self._sc6("python-direnv", "pypi") == "python-dotenv"
 
     @pytest.mark.parametrize("package", ["discord-py", "discord_py", "Discord.Py"])
     def test_is_typosquat_pep503_equivalent_not_flagged(self, package: str) -> None:
