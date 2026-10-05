@@ -227,7 +227,9 @@ def test_full_scanner_graph_reports_tp4_http_results(
     if findings:
         assert findings[0].file == "SKILL.md"
         assert findings[0].evidence["code_path"] == "format.py"
-        assert findings[0].match_fingerprint
+        assert findings[0].evidence["code_start_line"] == 1
+        assert findings[0].evidence["code_end_line"] == 2
+        assert findings[0].fingerprint()
     report = json.loads(result["report_body"])
     complete = mode in {"clean", "mismatch"}
     if output_format == "json":
