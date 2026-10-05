@@ -617,6 +617,17 @@ def _stealer_cookie_path(name: str) -> str:
     return base64.b64decode(_STEALER_COOKIE_PATHS[name]).decode()
 
 
+# Code that names the store before the browser, as the previous pattern did.
+_STEALER_COOKIE_CODE = {
+    "sqlite_connect": "Y29va2llc19kYiA9IHNxbGl0ZTMuY29ubmVjdChjaHJvbWVfcHJvZmlsZSArICIvQ29va2llcyIp",
+    "copy_to_output": "c2h1dGlsLmNvcHkocHJvZmlsZSAvICJDb29raWVzIiwgY2hyb21lX291dCk=",
+    "browser_constant": "ZGIgPSBvcy5wYXRoLmpvaW4oQ0hST01FX0RJUiwgIkRlZmF1bHQiLCAiQ29va2llcyIp",
+    "browser_argument": "c3RlYWwoIkNvb2tpZXMiLCAiZmlyZWZveCIp",
+    "keyword_argument": "Z3JhYl9jb29raWVzKGJyb3dzZXI9ImVkZ2UiKQ==",
+    "attribute_access": "Y29va2llcyA9IHJlYWQob3BlcmEucHJvZmlsZSk=",
+}
+
+
 # Documentation that names the browser store and, later on the same line, a
 # browser or product name (issue #751: a Supabase skill description).
 _COOKIE_PROSE = [
@@ -625,6 +636,8 @@ _COOKIE_PROSE = [
     "Set cookies for Edge Functions with the SSR helper.\n",
     "Cookies set by the Edge middleware are httpOnly.\n",
     "Forward cookies to Chrome headless through the Playwright context.\n",
+    "Clear cookies in Chrome.\n",
+    "Cookies are shared with Edge, Chrome and Firefox.\n",
 ]
 
 
@@ -1891,7 +1904,14 @@ rule agent_skill_destructive_autonomous_actions {
     @pytest.mark.parametrize(
         "content",
         _COOKIE_PROSE,
-        ids=["supabase_description", "edge_functions", "edge_middleware", "chrome_headless"],
+        ids=[
+            "supabase_description",
+            "edge_functions",
+            "edge_middleware",
+            "chrome_headless",
+            "clear_in_chrome",
+            "shared_with_browsers",
+        ],
     )
     def test_info_stealer_ignores_cookie_prose(self, content):
         findings = _run_builtin(content, "SKILL.md")
@@ -1900,6 +1920,12 @@ rule agent_skill_destructive_autonomous_actions {
     @pytest.mark.parametrize("name", sorted(_STEALER_COOKIE_PATHS))
     def test_info_stealer_matches_browser_cookie_store_paths(self, name):
         findings = _run_builtin(_stealer_cookie_path(name) + "\n", "collect.py")
+        assert _has_rule(findings, "info_stealer")
+
+    @pytest.mark.parametrize("name", sorted(_STEALER_COOKIE_CODE))
+    def test_info_stealer_matches_code_naming_the_store_first(self, name):
+        code = base64.b64decode(_STEALER_COOKIE_CODE[name]).decode()
+        findings = _run_builtin(code + "\n", "collect.py")
         assert _has_rule(findings, "info_stealer")
 
     def test_info_stealer_matches_cookie_store_path_next_to_prose(self):
