@@ -198,7 +198,8 @@ def test_full_scanner_graph_reports_tp4_http_results(
     findings = [f for f in result["findings"] if f.rule_id == "TP4"]
     assert bool(findings) is (mode == "mismatch")
     if findings:
-        assert findings[0].file == "format.py"
+        assert findings[0].file == "SKILL.md"
+        assert findings[0].evidence["code_path"] == "format.py"
         assert findings[0].match_fingerprint
     report = json.loads(result["report_body"])
     complete = mode in {"clean", "mismatch"}
