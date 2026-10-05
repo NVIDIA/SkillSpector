@@ -52,6 +52,11 @@ Equivalent CLI:
 
 Static scan is default. To use semantic LLM analysis, configure provider credentials in your shell before launching Pi, then call the tool with `noLlm=false` and a provider.
 
+Static scans have a 120-second process limit. Explicit LLM scans have a
+630-second limit, allowing the CLI's default 600-second workflow budget plus
+startup and report writing. This tool limit stays fixed even if
+`SKILLSPECTOR_MAX_WORKFLOW_SECONDS` is configured above 600.
+
 Example:
 
 ```text
