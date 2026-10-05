@@ -141,20 +141,6 @@ def _main_impl() -> None:
     except ImportError:
         Console = None  # type: ignore[assignment]  # noqa: N806
 
-    c = Console() if Console is not None else None
-
-    def _print(*args: object, **kwargs: object) -> None:
-        """Print through Rich when available, falling back to plain text."""
-        if c:
-            c.print(*args, **{k: v for k, v in kwargs.items() if k != "file"})
-        else:
-            msg = " ".join(str(a) for a in args)
-            file = kwargs.get("file")
-            if file:
-                print(msg, file=file)  # type: ignore[arg-type]
-            else:
-                print(msg)
-
     # -- CLI arguments -------------------------------------------------------
     parser = argparse.ArgumentParser(
         description="Batch-scan a directory of AI agent skills with SkillSpector.",
@@ -219,6 +205,19 @@ def _main_impl() -> None:
         help="Allow non-English scans without LLM (results will be incomplete).",
     )
     args = parser.parse_args()
+
+    # Structured reports must not share stdout with progress or diagnostics.
+    progress_file = sys.stdout if args.format == "terminal" else sys.stderr
+    c = Console(file=progress_file) if Console is not None else None
+
+    def _print(*args: object, **kwargs: object) -> None:
+        """Print to the requested stream, with Rich or plain text."""
+        file = kwargs.pop("file", progress_file)
+        if c:
+            console = c if file is progress_file else Console(file=file)
+            console.print(*args, **kwargs)
+        else:
+            print(" ".join(str(a) for a in args), file=file)  # type: ignore[arg-type]
 
     if args.verbose:
         set_level("DEBUG")

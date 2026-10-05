@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import json
+import sys
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from markdown_it import MarkdownIt
 
+from contrib.batch_scan import batch_scan
 from contrib.batch_scan.reports import _format_json, _format_markdown
 
 
@@ -125,3 +128,132 @@ def test_batch_markdown_strips_complete_ansi_sequences() -> None:
     from contrib.batch_scan.reports import _markdown_plain_text
 
     assert _markdown_plain_text("a\x1b[2Jb\x1b[31mc\x1b[0m") == "abc"
+
+
+@pytest.fixture(params=[True, False], ids=["rich", "plain"])
+def batch_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request):
+    root = tmp_path / "skills"
+    skill = root / "example"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+    entry = {
+        "skill": {"name": "example", "language": "en"},
+        "risk_assessment": {"score": 0, "severity": "LOW", "recommendation": "SAFE"},
+        "components": [],
+        "issues": [],
+    }
+    monkeypatch.setattr(batch_scan, "create_api_key_pool_from_env", lambda: None)
+    monkeypatch.setattr(
+        batch_scan, "_scan_skill", lambda *args, **kwargs: (entry, entry.get("error"), "example")
+    )
+    monkeypatch.setattr(batch_scan, "format_terminal", lambda results: "Terminal report")
+    if not request.param:
+        monkeypatch.setitem(sys.modules, "rich.console", None)
+    return root, entry
+
+
+def _run_batch_cli(monkeypatch: pytest.MonkeyPatch, root: Path, format: str, *args: str) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch_scan", str(root), "--no-llm", "--workers", "1", "--format", format, *args],
+    )
+    batch_scan._main_impl()
+
+
+@pytest.mark.parametrize("format", ["json", "markdown"])
+def test_batch_cli_stdout_contains_only_the_requested_report(
+    batch_cli, monkeypatch: pytest.MonkeyPatch, capsys, format: str
+) -> None:
+    root, _ = batch_cli
+    _run_batch_cli(monkeypatch, root, format)
+
+    captured = capsys.readouterr()
+    if format == "json":
+        assert json.loads(captured.out)["skills"][0]["skill"]["name"] == "example"
+    else:
+        assert captured.out.startswith("# SkillSpector Batch Scan Report")
+    assert "[1/1]" not in captured.out
+    assert "SkillSpector Batch Scan" in captured.err
+    assert "[1/1]" in captured.err
+
+
+def test_batch_cli_terminal_keeps_progress_and_report_on_stdout(
+    batch_cli, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    root, _ = batch_cli
+    _run_batch_cli(monkeypatch, root, "terminal")
+
+    captured = capsys.readouterr()
+    assert "[1/1]" in captured.out
+    assert "Terminal report" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("format", ["terminal", "json", "markdown"])
+def test_batch_cli_language_warning_goes_to_stderr(
+    batch_cli, monkeypatch: pytest.MonkeyPatch, capsys, format: str
+) -> None:
+    root, entry = batch_cli
+    entry["skill"]["language"] = "zh"
+    _run_batch_cli(monkeypatch, root, format)
+
+    captured = capsys.readouterr()
+    assert "WARNING:" in captured.err
+    assert "non-English skill" in captured.err
+    assert "WARNING:" not in captured.out
+    if format == "json":
+        assert json.loads(captured.out)["skills"][0]["skill"]["language"] == "zh"
+
+
+@pytest.mark.parametrize("error,score,exit_code", [("scan failed", 0, 2), (None, 85, 1)])
+def test_batch_cli_json_remains_parseable_when_exit_status_is_nonzero(
+    batch_cli,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    error: str | None,
+    score: int,
+    exit_code: int,
+) -> None:
+    root, entry = batch_cli
+    entry["risk_assessment"]["score"] = score
+    if error:
+        entry["error"] = error
+    with pytest.raises(SystemExit) as exc:
+        _run_batch_cli(monkeypatch, root, "json")
+
+    assert exc.value.code == exit_code
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["skills"][0]["risk_assessment"]["score"] == score
+    assert "[1/1]" in captured.err
+
+
+@pytest.mark.parametrize("format", ["json", "markdown"])
+def test_batch_cli_output_file_leaves_stdout_empty(
+    batch_cli, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path, format: str
+) -> None:
+    root, _ = batch_cli
+    output = tmp_path / "report.txt"
+    _run_batch_cli(monkeypatch, root, format, "--output", str(output))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Batch report saved to:" in captured.err
+    if format == "json":
+        assert json.loads(output.read_text(encoding="utf-8"))["batch"]["total_skills"] == 1
+    else:
+        assert output.read_text(encoding="utf-8").startswith("# SkillSpector Batch Scan Report")
+
+
+@pytest.mark.parametrize("format", ["terminal", "json"])
+def test_batch_cli_validation_errors_go_to_stderr(
+    batch_cli, monkeypatch: pytest.MonkeyPatch, capsys, format: str
+) -> None:
+    root, _ = batch_cli
+    with pytest.raises(SystemExit) as exc:
+        _run_batch_cli(monkeypatch, root / "missing", format)
+
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "is not a directory" in " ".join(captured.err.split())
